@@ -21,8 +21,8 @@ import java.util.Arrays;
  * Assumes a table with a {@code DOUBLE[]} column, e.g. the one
  * {@code WsArrayExample} writes:
  * <pre>
- *   CREATE TABLE book (levels DOUBLE[], ts TIMESTAMP)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE book (levels DOUBLE[], timestamp TIMESTAMP)
+ *       TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class ArrayResultExample {
@@ -54,7 +54,6 @@ public class ArrayResultExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.printf("error: 0x%02X %s%n", status & 0xFF, message);
                             }
                         }
                 ).await();

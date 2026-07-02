@@ -23,31 +23,32 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * (the batch caches one per column index), so a zip-style pass over two
  * columns is a single inner loop.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class ColumnScanExample {
 
     public static void main(String[] args) throws InterruptedException {
         final double[] sumPrice = {0.0};
-        final long[] sumQty = {0};
+        final double[] sumAmount = {0.0};
         final long[] rowCount = {0};
         final long[] nonNullPrice = {0};
 
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
             try {
                 db.executeSql(
-                        "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
+                        "SELECT price, amount FROM trades WHERE symbol = 'ETH-USD'",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 // Pin both columns once. The batch caches one ColumnView per
-                                // column index, so prices and qtys remain valid simultaneously.
+                                // column index, so prices and amounts remain valid simultaneously.
                                 ColumnView prices = batch.column(0);
-                                ColumnView qtys = batch.column(1);
+                                ColumnView amounts = batch.column(1);
 
                                 int rows = batch.getRowCount();
                                 rowCount[0] += rows;
@@ -58,7 +59,7 @@ public class ColumnScanExample {
                                     if (!prices.isNull(r)) {
                                         sumPrice[0] += prices.getDoubleValue(r);
                                     }
-                                    sumQty[0] += qtys.getLongValue(r);
+                                    sumAmount[0] += amounts.getDoubleValue(r);
                                 }
 
                                 // The same view exposes raw addresses for SIMD/JNI consumers:
@@ -73,14 +74,13 @@ public class ColumnScanExample {
                             @Override
                             public void onEnd(long totalRows) {
                                 System.out.printf(
-                                        "rows=%d nonNullPrice=%d sumPrice=%.2f sumQty=%d%n",
-                                        rowCount[0], nonNullPrice[0], sumPrice[0], sumQty[0]
+                                        "rows=%d nonNullPrice=%d sumPrice=%.2f sumAmount=%.5f%n",
+                                        rowCount[0], nonNullPrice[0], sumPrice[0], sumAmount[0]
                                 );
                             }
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

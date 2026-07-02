@@ -22,26 +22,23 @@ import java.util.List;
  * sets" workload. The cache stays warm for the lifetime of the query-
  * execution plan cache on the server side.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
  *   CREATE TABLE trades (
- *       ts    TIMESTAMP,
- *       sym   SYMBOL,
- *       price DOUBLE,
- *       qty   LONG
- *   ) TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class BindRepeatedLookupExample {
 
     public static void main(String[] args) throws InterruptedException {
-        List<String> instruments = Arrays.asList("AAPL", "MSFT", "GOOG", "AMZN", "META");
+        List<String> instruments = Arrays.asList("ETH-USD", "BTC-USD", "SOL-USD", "ADA-USD", "XRP-USD");
 
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
             // SAME SQL TEXT across every iteration. Only the bind values differ.
-            String sql = "SELECT ts, price, qty FROM trades "
-                    + "WHERE sym = $1 AND ts >= $2 ORDER BY ts DESC LIMIT 10";
+            String sql = "SELECT timestamp, price, amount FROM trades "
+                    + "WHERE symbol = $1 AND timestamp >= $2 ORDER BY timestamp DESC LIMIT 10";
 
             long since = 1_700_000_000_000_000L; // micros since epoch
 
@@ -59,10 +56,10 @@ public class BindRepeatedLookupExample {
                                 public void onBatch(QwpColumnBatch batch) {
                                     rowCount[0] += batch.getRowCount();
                                     batch.forEachRow(row -> System.out.printf(
-                                            "  ts=%d price=%.4f qty=%d%n",
+                                            "  timestamp=%d price=%.4f amount=%.5f%n",
                                             row.getLongValue(0),
                                             row.getDoubleValue(1),
-                                            row.getLongValue(2)
+                                            row.getDoubleValue(2)
                                     ));
                                 }
 
@@ -72,7 +69,6 @@ public class BindRepeatedLookupExample {
 
                                 @Override
                                 public void onError(byte status, String message) {
-                                    System.err.println("  query failed: " + message);
                                 }
                             })
                             .submit()

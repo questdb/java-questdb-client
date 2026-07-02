@@ -28,17 +28,23 @@ public class QueryCancellationExample {
                     "SELECT * FROM trades ORDER BY price",
                     new PrintingHandler());
 
-            // Give it 5 seconds; if it's still running, cancel and drain.
-            if (!c.await(5, TimeUnit.SECONDS)) {
-                System.out.println("still running after 5s -- cancelling");
-                c.cancel();
-                try {
-                    c.await();
-                } catch (QueryException cancelled) {
-                    System.out.printf("cancelled: status=0x%02X%n", cancelled.getStatus() & 0xFF);
+            // Give it 5 seconds; if it's still running, cancel and drain. await(...)
+            // also rethrows a server error that lands before the deadline, so the
+            // whole flow is wrapped once.
+            try {
+                if (!c.await(5, TimeUnit.SECONDS)) {
+                    System.out.println("still running after 5s -- cancelling");
+                    c.cancel();
+                    try {
+                        c.await();
+                    } catch (QueryException cancelled) {
+                        System.out.printf("cancelled: status=0x%02X%n", cancelled.getStatus() & 0xFF);
+                    }
+                } else {
+                    System.out.println("finished within the deadline");
                 }
-            } else {
-                System.out.println("finished within the deadline");
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }
         }
     }
@@ -56,7 +62,6 @@ public class QueryCancellationExample {
 
         @Override
         public void onError(byte status, String message) {
-            System.err.printf("error: 0x%02X %s%n", status & 0xFF, message);
         }
     }
 }

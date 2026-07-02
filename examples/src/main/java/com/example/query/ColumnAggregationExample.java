@@ -14,10 +14,11 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * {@link QwpColumnBatch#column(int)} resolves the column layout once per batch;
  * the loop body is then a pure per-row read.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class ColumnAggregationExample {
@@ -31,7 +32,7 @@ public class ColumnAggregationExample {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
             try {
                 db.executeSql(
-                        "SELECT price FROM trades WHERE sym = 'AAPL'",
+                        "SELECT price FROM trades WHERE symbol = 'ETH-USD'",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -61,7 +62,6 @@ public class ColumnAggregationExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

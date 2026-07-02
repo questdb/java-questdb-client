@@ -81,7 +81,6 @@ public final class CompressionExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.printf("query failed [status=%d]: %s%n", status, message);
                             }
                         }
                 ).await();

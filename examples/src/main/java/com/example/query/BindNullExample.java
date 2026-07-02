@@ -72,7 +72,6 @@ public class BindNullExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("  query failed: " + message);
                             }
                         })
                         .submit()
@@ -100,7 +99,6 @@ public class BindNullExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("  query failed: " + message);
                             }
                         })
                         .submit()
@@ -126,7 +124,6 @@ public class BindNullExample {
 
             @Override
             public void onError(byte status, String message) {
-                System.err.println("  query failed: " + message);
             }
         };
     }

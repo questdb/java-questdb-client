@@ -48,7 +48,7 @@ public class BasicQueryExample {
                                     double amount = row.getDoubleValue(4);  // DOUBLE
 
                                     System.out.printf(
-                                            "ts=%d symbol=%s side=%s price=%.4f amount=%.5f%n",
+                                            "timestamp=%d symbol=%s side=%s price=%.4f amount=%.5f%n",
                                             timestamp, symbol, side, price, amount
                                     );
                                 });
@@ -61,7 +61,6 @@ public class BasicQueryExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

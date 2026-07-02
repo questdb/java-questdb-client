@@ -10,16 +10,17 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * Zip-style scan over two pinned columns.
  * <p>
  * Multi-column work that doesn't need every column -- compute notional
- * (price * qty), correlate two series, build a derived column -- is well
+ * (price * amount), correlate two series, build a derived column -- is well
  * served by holding two {@link ColumnView} instances side-by-side.
  * {@link QwpColumnBatch#column(int)} caches one view per column index, so a
  * second call with a different column does not invalidate the first; both
  * views stay valid for the lifetime of the surrounding {@code onBatch}.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class ZipColumnsExample {
@@ -32,18 +33,18 @@ public class ZipColumnsExample {
 
             try {
                 db.executeSql(
-                        "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
+                        "SELECT price, amount FROM trades WHERE symbol = 'ETH-USD'",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 ColumnView prices = batch.column(0);
-                                ColumnView qtys = batch.column(1);
+                                ColumnView amounts = batch.column(1);
                                 int n = batch.getRowCount();
                                 rows[0] += n;
                                 for (int r = 0; r < n; r++) {
                                     // NULL handling: if either side is NULL, skip the contribution.
-                                    if (prices.isNull(r) || qtys.isNull(r)) continue;
-                                    notional[0] += prices.getDoubleValue(r) * qtys.getLongValue(r);
+                                    if (prices.isNull(r) || amounts.isNull(r)) continue;
+                                    notional[0] += prices.getDoubleValue(r) * amounts.getDoubleValue(r);
                                 }
                             }
 
@@ -54,7 +55,6 @@ public class ZipColumnsExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

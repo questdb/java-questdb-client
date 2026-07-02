@@ -50,7 +50,7 @@ public class CreditFlowControlExample {
             final long[] rowsSeen = {0};
             try {
                 db.executeSql(
-                        "SELECT ts, price FROM trades WHERE ts > dateadd('d', -30, now())",
+                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -30, now())",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -67,7 +67,6 @@ public class CreditFlowControlExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.printf("query failed: status=0x%02X %s%n", status & 0xFF, message);
                             }
                         }
                 ).await();

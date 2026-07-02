@@ -39,10 +39,11 @@ import io.questdb.client.std.Unsafe;
  * accessor. In a real SIMD consumer you'd hand {@code valuesAddr} and
  * {@code nonNullCount} to a vector kernel instead.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class RawAddressScanExample {
@@ -55,7 +56,7 @@ public class RawAddressScanExample {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
             try {
                 db.executeSql(
-                        "SELECT price FROM trades WHERE sym = 'AAPL'",
+                        "SELECT price FROM trades WHERE symbol = 'ETH-USD'",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -93,7 +94,6 @@ public class RawAddressScanExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.printf("query failed: status=0x%02X %s%n", status & 0xFF, message);
                             }
                         }
                 ).await();

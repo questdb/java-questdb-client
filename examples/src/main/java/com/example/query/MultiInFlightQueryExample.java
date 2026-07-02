@@ -39,16 +39,16 @@ public class MultiInFlightQueryExample {
             Completion c1 = q1.submit();
             Completion c2 = q2.submit();
 
-            awaitQuietly(c1);
-            awaitQuietly(c2);
+            awaitQuietly("ETH-USD", c1);
+            awaitQuietly("BTC-USD", c2);
         }
     }
 
-    private static void awaitQuietly(Completion c) throws InterruptedException {
+    private static void awaitQuietly(String label, Completion c) throws InterruptedException {
         try {
             c.await();
         } catch (QueryException e) {
-            System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            System.err.printf("%s query failed: status=0x%02X %s%n", label, e.getStatus() & 0xFF, e.getMessage());
         }
     }
 
@@ -70,7 +70,6 @@ public class MultiInFlightQueryExample {
 
         @Override
         public void onError(byte status, String message) {
-            System.err.printf("%s error: 0x%02X %s%n", label, status & 0xFF, message);
         }
     }
 }

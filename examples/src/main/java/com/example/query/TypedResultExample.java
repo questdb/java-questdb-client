@@ -64,7 +64,6 @@ public class TypedResultExample {
 
                     @Override
                     public void onError(byte status, String message) {
-                        System.err.println("query error: " + message);
                     }
                 }).await();
             } catch (QueryException e) {

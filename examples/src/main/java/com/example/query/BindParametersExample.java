@@ -15,10 +15,11 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * keyed factory cache hits on every repeated call because the SQL text is
  * identical.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class BindParametersExample {
@@ -26,12 +27,12 @@ public class BindParametersExample {
     public static void main(String[] args) throws InterruptedException {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
-            String sql = "SELECT ts, sym, price, qty FROM trades "
-                    + "WHERE sym = $1 AND price >= $2 AND ts >= $3 LIMIT 1000";
+            String sql = "SELECT timestamp, symbol, price, amount FROM trades "
+                    + "WHERE symbol = $1 AND price >= $2 AND timestamp >= $3 LIMIT 1000";
 
             // Same SQL, three different parameter sets. Each call reuses the
             // compiled factory on the server side because the text is identical.
-            String[] symbols = {"AAPL", "MSFT", "GOOG"};
+            String[] symbols = {"ETH-USD", "BTC-USD", "SOL-USD"};
             for (String symbol : symbols) {
                 System.out.println("fetching trades for " + symbol);
                 try {
@@ -55,11 +56,11 @@ public class BindParametersExample {
         @Override
         public void onBatch(QwpColumnBatch batch) {
             batch.forEachRow(row -> System.out.printf(
-                    "ts=%d sym=%s price=%.4f qty=%d%n",
+                    "timestamp=%d symbol=%s price=%.4f amount=%.5f%n",
                     row.getLongValue(0),
                     row.getSymbol(1),
                     row.getDoubleValue(2),
-                    row.getLongValue(3)
+                    row.getDoubleValue(3)
             ));
         }
 
@@ -70,7 +71,6 @@ public class BindParametersExample {
 
         @Override
         public void onError(byte status, String message) {
-            System.err.println("query failed: status=" + status + " msg=" + message);
         }
     }
 }

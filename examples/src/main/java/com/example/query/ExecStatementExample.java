@@ -81,7 +81,6 @@ public class ExecStatementExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("SELECT failed: " + message);
                             }
                         }
                 ).await();
@@ -115,7 +114,6 @@ public class ExecStatementExample {
 
                 @Override
                 public void onError(byte status, String message) {
-                    System.err.printf("  failed: status=0x%02X, message=%s%n", status & 0xFF, message);
                 }
 
                 @Override

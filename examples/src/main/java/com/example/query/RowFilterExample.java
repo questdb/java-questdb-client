@@ -14,10 +14,11 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * reusable view is handed back across every iteration -- zero allocations
  * inside the loop.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class RowFilterExample {
@@ -31,7 +32,7 @@ public class RowFilterExample {
 
             try {
                 db.executeSql(
-                        "SELECT ts, sym, price, qty FROM trades",
+                        "SELECT timestamp, symbol, price, amount FROM trades",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -44,11 +45,11 @@ public class RowFilterExample {
                                     }
                                     kept[0]++;
                                     System.out.printf(
-                                            "ts=%d sym=%s price=%.2f qty=%d%n",
+                                            "timestamp=%d symbol=%s price=%.2f amount=%.5f%n",
                                             row.getLongValue(0),
                                             row.getString(1),
                                             row.getDoubleValue(2),
-                                            row.getLongValue(3)
+                                            row.getDoubleValue(3)
                                     );
                                 });
                             }
@@ -60,7 +61,6 @@ public class RowFilterExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

@@ -20,10 +20,11 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  * For the raw-pointer / SIMD read path over the same result batches (through
  * the pooled facade), see {@link RawAddressScanExample}.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class QwpQueryClientExample {
@@ -33,7 +34,7 @@ public class QwpQueryClientExample {
             client.connect();
 
             client.execute(
-                    "SELECT ts, sym, price, qty FROM trades WHERE sym = 'AAPL' LIMIT 1000",
+                    "SELECT timestamp, symbol, price, amount FROM trades WHERE symbol = 'ETH-USD' LIMIT 1000",
                     new QwpColumnBatchHandler() {
                         @Override
                         public void onBatch(QwpColumnBatch batch) {
@@ -41,11 +42,11 @@ public class QwpQueryClientExample {
                             // current row; copy values out before the callback returns if you
                             // need to retain them past the surrounding onBatch call.
                             batch.forEachRow(row -> System.out.printf(
-                                    "ts=%d sym=%s price=%.4f qty=%d%n",
+                                    "timestamp=%d symbol=%s price=%.4f amount=%.5f%n",
                                     row.getLongValue(0),   // TIMESTAMP -> microseconds since epoch
                                     row.getSymbol(1),      // SYMBOL -> String
                                     row.getDoubleValue(2), // DOUBLE
-                                    row.getLongValue(3)    // LONG
+                                    row.getDoubleValue(3)  // DOUBLE
                             ));
                         }
 

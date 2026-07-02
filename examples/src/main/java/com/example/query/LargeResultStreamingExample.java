@@ -34,7 +34,7 @@ public class LargeResultStreamingExample {
 
             try {
                 db.executeSql(
-                        "SELECT ts, price FROM trades WHERE ts > dateadd('d', -7, now())",
+                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -7, now())",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -61,7 +61,6 @@ public class LargeResultStreamingExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.printf("query failed: status=0x%02X %s%n", status & 0xFF, message);
                             }
                         }
                 ).await();

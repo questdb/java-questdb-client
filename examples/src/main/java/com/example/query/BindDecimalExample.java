@@ -103,7 +103,6 @@ public class BindDecimalExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: " + message);
                             }
                         })
                         .submit()
@@ -131,7 +130,6 @@ public class BindDecimalExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: " + message);
                             }
                         })
                         .submit()
@@ -156,7 +154,6 @@ public class BindDecimalExample {
 
             @Override
             public void onError(byte status, String message) {
-                System.err.println("  query failed: " + message);
             }
         };
     }

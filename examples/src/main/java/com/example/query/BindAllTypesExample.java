@@ -120,7 +120,6 @@ public class BindAllTypesExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         })
                         .submit()

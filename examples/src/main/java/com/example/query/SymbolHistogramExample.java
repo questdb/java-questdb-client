@@ -22,10 +22,11 @@ import java.util.Map;
  * Pattern: key the histogram on the dict id (an {@code int}), then resolve
  * names once at the end.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class SymbolHistogramExample {
@@ -39,7 +40,7 @@ public class SymbolHistogramExample {
 
             try {
                 db.executeSql(
-                        "SELECT sym FROM trades",
+                        "SELECT symbol FROM trades",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -89,7 +90,6 @@ public class SymbolHistogramExample {
 
                             @Override
                             public void onError(byte status, String message) {
-                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
                 ).await();

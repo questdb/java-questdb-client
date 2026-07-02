@@ -60,13 +60,12 @@ public class ConcurrentQueryExample {
 
                         @Override
                         public void onError(byte status, String message) {
-                            System.err.printf("%s error: 0x%02X %s%n", symbol, status & 0xFF, message);
                         }
                     })
                     .submit()
                     .await();
         } catch (QueryException e) {
-            System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            System.err.printf("%s query failed: status=0x%02X %s%n", symbol, e.getStatus() & 0xFF, e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

@@ -59,7 +59,6 @@ public class ConnectionErrorExample {
 
                     @Override
                     public void onError(byte status, String message) {
-                        System.err.printf("error: 0x%02X %s%n", status & 0xFF, message);
                     }
                 }).await();
             } catch (QueryException e) {
