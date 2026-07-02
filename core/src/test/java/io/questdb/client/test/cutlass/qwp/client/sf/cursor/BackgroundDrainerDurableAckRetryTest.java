@@ -604,6 +604,58 @@ public class BackgroundDrainerDurableAckRetryTest {
         assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
     }
 
+    @Test
+    public void testTransportWindowDoesNotBurnCapabilityGapWallClock() {
+        // Red-first: the wall-clock half of the settle budget is anchored at
+        // gap #1, and a transport window BETWEEN gap sweeps must PAUSE it --
+        // only gap-to-gap time is the cluster "failing to settle". Under the
+        // bug the deadline keeps ticking while the cluster is unreachable:
+        // gap #1 anchors the deadline, the cluster then drops off the network
+        // for longer than the entire budget (transport errors are retried
+        // "forever" and charge nothing else), and when it comes back still
+        // briefly gapped, gap #2 observes an expired deadline and quarantines
+        // the slot after just 2 gap sweeps -- contradicting both the
+        // 16-attempt settle intent and Invariant B's "transients never
+        // consume the budget". Evasion is not a concern: the attempt counter
+        // survives the window untouched, which
+        // testTransportErrorDoesNotResetCapabilityGapEpisode pins.
+        // Here the cluster actually settles after the outage (two more gap
+        // sweeps, then durable-ack-capable), so the drain must proceed --
+        // no escalation, no sentinel.
+        long budgetMillis = 250L;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.failingTimes(4, () -> {
+            if (sweeps.incrementAndGet() == 2) {
+                // Cluster fully unreachable for ~2.5x the wall-clock budget.
+                // A real outage is time spent inside reconnect() walking
+                // unreachable endpoints, so model it inside the factory.
+                try {
+                    Thread.sleep(budgetMillis * 2 + 100);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                return new LineSenderException("Failed to connect: all 2 endpoint(s) "
+                        + "unreachable; last=127.0.0.1:9000");
+            }
+            return new QwpDurableAckMismatchException("h", 1234, "primary");
+        });
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, budgetMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertSame("cluster recovered after the outage -- the drain must proceed, not "
+                        + "quarantine on a wall clock burned by the transport window",
+                factory.successSentinel(), out);
+        // gap #1 + outage + gap #2 + gap #3 + success = 5 sweeps.
+        assertEquals(5, factory.attempts());
+        assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+        assertEquals("transport window must not trigger persistent-failure escalation",
+                0, listener.persistentFailures.get());
+        assertFalse("no .failed sentinel: the slot was never in a terminal state",
+                Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
     private BackgroundDrainer newDrainer(ScriptedFactory factory) {
         return newDrainerWithBudgets(
                 factory, FAST_RECONNECT_MAX_DURATION_MILLIS,
