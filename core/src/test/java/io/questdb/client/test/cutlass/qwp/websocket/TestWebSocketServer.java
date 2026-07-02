@@ -95,6 +95,13 @@ public class TestWebSocketServer implements Closeable {
     // construction via setRejectWithRole().
     private volatile String rejectingRole;
     private volatile int rejectingStatusCode;
+    // When true, 101 upgrade responses omit the X-QWP-Durable-Ack header even
+    // though the server was constructed with emitDurableAckHeader=true --
+    // simulating a rolling-upgrade window where an endpoint upgrades but does
+    // not advertise durable ack (the drainer's capability-gap condition).
+    // Live-updatable via setSuppressDurableAckHeader(), so a test can start
+    // in the gap and later let the cluster "settle".
+    private volatile boolean suppressDurableAckHeader;
     // When > 0, the next handshake responds with this status code + the
     // reason phrase from {@link #rejectingStatusReason}. Used to simulate
     // 401, 403, 404, 426, 503, etc. that the failover loop should
@@ -252,6 +259,18 @@ public class TestWebSocketServer implements Closeable {
     public void setRejectWithStatus(int statusCode, String reasonPhrase) {
         this.rejectingStatusCode = statusCode;
         this.rejectingStatusReason = reasonPhrase;
+    }
+
+    /**
+     * When enabled, 101 upgrade responses omit the {@code X-QWP-Durable-Ack}
+     * header even on a server constructed with {@code emitDurableAckHeader} —
+     * the next opted-in connect ({@code request_durable_ack=on}) observes a
+     * durable-ack capability gap. Pass {@code false} to clear and resume
+     * advertising, the way a rolling upgrade eventually settles. The setting
+     * applies to every new handshake until cleared.
+     */
+    public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
+        this.suppressDurableAckHeader = suppressDurableAckHeader;
     }
 
     /**
@@ -570,7 +589,7 @@ public class TestWebSocketServer implements Closeable {
                     .append("Upgrade: websocket\r\n")
                     .append("Connection: Upgrade\r\n")
                     .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
-            if (emitDurableAckHeader) {
+            if (emitDurableAckHeader && !suppressDurableAckHeader) {
                 sb.append("X-QWP-Durable-Ack: enabled\r\n");
             }
             String role = advertisedRole;

@@ -39,6 +39,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -205,6 +206,11 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
+    // User-supplied observer for background orphan-slot drainer events.
+    // Volatile: written by setDrainerListener (any thread, before or after
+    // startOrphanDrainers) and read at pool-creation time. Null -> drainers
+    // run without a listener.
+    private volatile BackgroundDrainerListener drainerListener;
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
@@ -2080,6 +2086,33 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Register an async observer for background orphan-slot drainer events.
+     * May be called either before or after {@link #startOrphanDrainers} —
+     * when called before, the drainer pool picks it up as its submit-time
+     * default; when called after, it propagates to the pool AND to every
+     * live drainer (per-drainer re-assignment while running is explicitly
+     * permitted by the drainer's listener contract). Pass {@code null} to
+     * clear. {@code synchronized} to coordinate with
+     * {@code startOrphanDrainers}: a concurrent submit either observes the
+     * pool listener already set or is covered by the snapshot propagation.
+     */
+    public synchronized void setDrainerListener(BackgroundDrainerListener listener) {
+        this.drainerListener = listener;
+        BackgroundDrainerPool pool = drainerPool;
+        if (pool != null) {
+            // Submit-time fallback for drainers not yet submitted...
+            pool.setListener(listener);
+            // ...and direct re-assignment for the ones already running (the
+            // pool listener is only applied at submit time, never after).
+            ObjList<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer> live =
+                    pool.snapshot();
+            for (int i = 0, n = live.size(); i < n; i++) {
+                live.getQuick(i).setListener(listener);
+            }
+        }
+    }
+
+    /**
      * Configure the user-supplied error handler. May be called either before
      * or after {@code connect()} — when called after, the change propagates
      * to the live dispatcher and takes effect on the next delivery. Pass
@@ -2177,6 +2210,9 @@ public class QwpWebSocketSender implements Sender {
         if (drainerPool == null) {
             drainerPool = new io.questdb.client.cutlass.qwp.client.sf.cursor
                     .BackgroundDrainerPool(maxBackgroundDrainers);
+            // Install the user listener as the pool's submit-time default so
+            // the drainers submitted below observe it from their first event.
+            drainerPool.setListener(this.drainerListener);
         }
         for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
             String slot = orphanSlotPaths.get(i);

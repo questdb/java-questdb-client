@@ -25,6 +25,7 @@
 package io.questdb.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
 import io.questdb.client.impl.QuestDBImpl;
@@ -69,6 +70,7 @@ public final class QuestDBBuilder {
     // Optional ingest-side async callbacks. Null -> each pooled Sender uses its
     // loud-not-silent default. Applied to every Sender the pool builds.
     private SenderConnectionListener connectionListener;
+    private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
     private long housekeeperIntervalMillis = UNSET;
     private String config;
@@ -124,6 +126,25 @@ public final class QuestDBBuilder {
      */
     public QuestDBBuilder connectionListener(SenderConnectionListener listener) {
         this.connectionListener = listener;
+        return this;
+    }
+
+    /**
+     * Sets the background orphan-slot drainer listener applied to every pooled
+     * ingest {@link Sender}. The listener observes the background drainer
+     * events of every sender the pool builds: durable-ack capability-gap
+     * retries, transient all-replica failover windows, and the eventual
+     * escalation to a {@code .failed} sentinel. Events are delivered on the
+     * drainers' own threads, so the listener must be thread-safe and must not
+     * block. Only meaningful when the configuration enables
+     * {@code drain_orphans}. Pass {@code null} (the default) to keep the
+     * drainers' default (no listener).
+     *
+     * @param listener the shared drainer listener, or {@code null} for the default
+     * @return this instance for method chaining
+     */
+    public QuestDBBuilder drainerListener(BackgroundDrainerListener listener) {
+        this.drainerListener = listener;
         return this;
     }
 
@@ -209,7 +230,8 @@ public final class QuestDBBuilder {
                 housekeeperIntervalMillis,
                 queryCloseTimeoutMillis,
                 errorHandler,
-                connectionListener
+                connectionListener,
+                drainerListener
         );
     }
 

@@ -29,6 +29,7 @@ import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
@@ -102,6 +103,7 @@ public final class SenderPool implements AutoCloseable {
     // User-supplied ingest callbacks, shared across every pooled Sender this
     // pool builds. Null -> each sender keeps its loud-not-silent default.
     private final SenderConnectionListener connectionListener;
+    private final BackgroundDrainerListener drainerListener;
     private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
     // Test seam. Production builds delegates via defaultSender(); white-box
@@ -195,7 +197,7 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null);
     }
 
     // Test-only constructor exposing the senderFactory seam: production builds
@@ -239,14 +241,14 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null);
+                deferStartupRecovery, null, null, null);
     }
 
-    // Full constructor adding the user-supplied ingest callbacks (error handler
-    // and connection listener), applied to every Sender the pool builds (see
-    // buildManagedSlotSender). The public 6-arg ctor and the test-only
-    // senderFactory overloads above both delegate here with null callbacks; the
-    // pooled QuestDB handle calls this directly.
+    // Full constructor adding the user-supplied ingest callbacks (error
+    // handler, connection listener and background-drainer listener), applied
+    // to every Sender the pool builds (see buildManagedSlotSender). The public
+    // 6-arg ctor and the test-only senderFactory overloads above both delegate
+    // here with null callbacks; the pooled QuestDB handle calls this directly.
     SenderPool(
             String configurationString,
             int minSize,
@@ -257,13 +259,15 @@ public final class SenderPool implements AutoCloseable {
             IntFunction<Sender> senderFactory,
             boolean deferStartupRecovery,
             SenderErrorHandler errorHandler,
-            SenderConnectionListener connectionListener
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
     ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
         this.errorHandler = errorHandler;
         this.connectionListener = connectionListener;
+        this.drainerListener = drainerListener;
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         // An injected factory (tests) drives recovery too, preserving the
         // white-box recovery seam; production recovery forces OFF-mode connects
@@ -1047,6 +1051,9 @@ public final class SenderPool implements AutoCloseable {
         }
         if (connectionListener != null) {
             builder.connectionListener(connectionListener);
+        }
+        if (drainerListener != null) {
+            builder.drainerListener(drainerListener);
         }
         return builder;
     }

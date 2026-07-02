@@ -1022,6 +1022,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async connection-event dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (64).
         private int connectionListenerInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        // Optional user-supplied observer for background orphan-slot drainer
+        // events (durable-ack capability-gap retries, all-replica failover
+        // windows, persistent-failure escalation). When null, drainers run
+        // without a listener. Only meaningful with drainOrphans=true.
+        private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener drainerListener;
         // Orphan adoption: when true, the foreground sender scans
         // <sf_dir>/*/ at startup for sibling slots that hold unacked data
         // and reports them. Default false. Spec calls for spawning
@@ -1585,6 +1590,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // WebSocketClient inside the abandoned `connected`.
                 connected.setTransactional(transactional);
                 try {
+                    // Install the drainer listener BEFORE startOrphanDrainers
+                    // below: drainers must see the listener at submit time so
+                    // no early drainer event is lost to a late installation.
+                    if (drainerListener != null) {
+                        connected.setDrainerListener(drainerListener);
+                    }
                     // Once the foreground sender is up, dispatch drainers
                     // for any sibling orphan slots. Scan AFTER we acquire
                     // our own slot lock so we never accidentally try to
@@ -1784,6 +1795,31 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
             this.autoFlushRows = AUTO_FLUSH_DISABLED;
             this.autoFlushIntervalMillis = Integer.MAX_VALUE;
+            return this;
+        }
+
+        /**
+         * Sets the async listener observing background orphan-slot drainer
+         * events: per-attempt durable-ack capability-gap retries
+         * ({@code onDurableAckUnavailable}), transient all-replica failover
+         * windows ({@code onPrimaryUnavailable}), and the eventual escalation
+         * to a {@code .failed} sentinel
+         * ({@code onDurableAckPersistentFailure}). The listener runs on the
+         * drainers' own threads, so it must be thread-safe and must not block
+         * — hand off to a queue or metrics sink and return. Only meaningful
+         * when {@link #drainOrphans(boolean)} is enabled.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param listener the listener; {@code null} keeps the default (no listener)
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder drainerListener(
+                io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener listener) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("drainer_listener is only supported for WebSocket transport");
+            }
+            this.drainerListener = listener;
             return this;
         }
 

@@ -30,6 +30,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import org.jetbrains.annotations.TestOnly;
 
 import java.util.function.Consumer;
@@ -64,11 +65,13 @@ public final class QuestDBImpl implements QuestDB {
             long housekeeperIntervalMillis,
             long queryCloseTimeoutMillis,
             SenderErrorHandler errorHandler,
-            SenderConnectionListener connectionListener
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null, errorHandler, connectionListener);
+                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null,
+                errorHandler, connectionListener, drainerListener);
     }
 
     // Test-only constructor exposing the senderFactory and connectHook seams:
@@ -95,13 +98,14 @@ public final class QuestDBImpl implements QuestDB {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
                 housekeeperIntervalMillis, QueryClientPool.DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS,
-                senderFactory, connectHook, null, null);
+                senderFactory, connectHook, null, null, null);
     }
 
-    // Full constructor adding the ingest-side errorHandler/connectionListener,
-    // applied by SenderPool to every Sender it builds. The 12-arg overload above
-    // is the unchanged white-box test seam and delegates here with null
-    // callbacks; the public overload delegates here with null test seams.
+    // Full constructor adding the ingest-side errorHandler/connectionListener/
+    // drainerListener, applied by SenderPool to every Sender it builds. The
+    // 12-arg overload above is the unchanged white-box test seam and delegates
+    // here with null callbacks; the public overload delegates here with null
+    // test seams.
     QuestDBImpl(
             String ingestConfig,
             String queryConfig,
@@ -117,7 +121,8 @@ public final class QuestDBImpl implements QuestDB {
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook,
             SenderErrorHandler errorHandler,
-            SenderConnectionListener connectionListener
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
     ) {
         SenderPool builtSenderPool = null;
         QueryClientPool builtQueryPool = null;
@@ -130,7 +135,7 @@ public final class QuestDBImpl implements QuestDB {
                     // build() never blocks on a slow / reachable-but-not-acking
                     // server; the housekeeper drives it via runStartupRecoveryStep().
                     true,
-                    errorHandler, connectionListener);
+                    errorHandler, connectionListener, drainerListener);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook);
