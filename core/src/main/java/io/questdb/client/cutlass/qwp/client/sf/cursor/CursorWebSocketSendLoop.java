@@ -273,9 +273,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code client} may be {@code null} only if {@code reconnectFactory}
      * is non-null — this is the async-initial-connect path: the I/O thread
      * runs the same retry loop on its first iteration to obtain a live
-     * client, and a terminal failure (auth/upgrade reject or budget
-     * exhaustion) is delivered through the dispatcher rather than thrown
-     * to the constructor's caller.
+     * client, and a terminal failure (auth/upgrade reject) is delivered
+     * through the dispatcher rather than thrown to the constructor's
+     * caller; plain connect failures are retried indefinitely
+     * (Invariant B: no wall-clock budget give-up).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -1366,7 +1367,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Mark the loop as fatally failed. Caller has decided no reconnect
-     * is possible (or it ran out of budget) — latch the error so
+     * is possible — latch the error so
      * {@link #checkError} can surface it to the producer thread, then
      * stop the loop. First-writer-wins: only the first failure latches.
      * The check-then-latch is unsynchronized and is safe ONLY because

@@ -38,8 +38,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Regression tests for the close() drain semantics specified in
- * design/qwp-cursor-durability.md.
+ * Regression tests for the close() drain semantics.
  * <p>
  * Without {@code close_flush_timeout_millis}, close() returned as soon as
  * the cursor I/O loop's {@code running} flag flipped — meaning frames

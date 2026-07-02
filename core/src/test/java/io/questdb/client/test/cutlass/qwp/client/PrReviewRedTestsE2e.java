@@ -60,9 +60,9 @@ public class PrReviewRedTestsE2e {
      *   <li>{@code fail()} auth-terminal branch (lines 437-438)</li>
      *   <li>{@code fail()} budget-exhausted branch (lines 484-485)</li>
      * </ul>
-     * The locked spec ({@code design/qwp-cursor-error-api.md} § "Path 2:
-     * producer-side typed throw") requires {@code signal.terminalError = err}
-     * to be written BEFORE {@code errorInbox.offer(err)}.
+     * The error-API contract ("Path 2: producer-side typed throw") requires
+     * {@code signal.terminalError = err} to be written BEFORE
+     * {@code errorInbox.offer(err)}.
      * <p>
      * Concrete consequence the spec calls out: a user-supplied error handler
      * that synchronously calls {@code sender.flush()} from inside
