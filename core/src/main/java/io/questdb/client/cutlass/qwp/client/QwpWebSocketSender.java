@@ -167,6 +167,12 @@ public class QwpWebSocketSender implements Sender {
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
     // WebSocket client (zero-GC native implementation)
     private WebSocketClient client;
+    // Test seam: when non-null, buildAndConnect obtains its per-attempt
+    // client here instead of WebSocketClientFactory, so JVM-error cleanup
+    // tests can observe close() on a client whose connect() throws Error.
+    // Null in production; set reflectively by tests.
+    @TestOnly
+    private volatile java.util.function.Supplier<WebSocketClient> clientFactoryOverride;
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
@@ -2467,6 +2473,21 @@ public class QwpWebSocketSender implements Sender {
         return background && configuredMs <= 0 ? DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS : configuredMs;
     }
 
+    /**
+     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
+     * Production path delegates to {@link WebSocketClientFactory}; tests may
+     * install {@link #clientFactoryOverride} to substitute a stub.
+     */
+    private WebSocketClient newWebSocketClient() {
+        java.util.function.Supplier<WebSocketClient> override = clientFactoryOverride;
+        if (override != null) {
+            return override.get();
+        }
+        return tlsConfig != null
+                ? WebSocketClientFactory.newTlsInstance(tlsConfig)
+                : WebSocketClientFactory.newPlainTextInstance();
+    }
+
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
         // Background (drainer) factories share this connect walk -- endpoint
         // list, hostTracker health and round state -- but must stay INVISIBLE
@@ -2532,9 +2553,7 @@ public class QwpWebSocketSender implements Sender {
             long attemptNumber = background
                     ? SenderConnectionEvent.NO_ATTEMPT_NUMBER
                     : ++roundConnectAttemptSeq;
-            WebSocketClient newClient = tlsConfig != null
-                    ? WebSocketClientFactory.newTlsInstance(tlsConfig)
-                    : WebSocketClientFactory.newPlainTextInstance();
+            WebSocketClient newClient = newWebSocketClient();
             try {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
@@ -2600,6 +2619,24 @@ public class QwpWebSocketSender implements Sender {
                             attemptNumber, roundSeq, e);
                 }
                 continue;
+            } catch (Error e) {
+                // JVM failure (OOM, LinkageError, StackOverflowError) during
+                // connect/upgrade. Without this catch the half-built client
+                // escaped with its fd and native buffers open -- unreachable
+                // by GC, freed only in close(). Close it quietly: under OOM
+                // close() itself can throw, and a secondary failure must not
+                // mask the original Error. Deliberately NO hostTracker penalty
+                // and NO ENDPOINT_ATTEMPT_FAILED event -- a JVM failure is not
+                // endpoint health data, and misclassifying it would poison the
+                // walk. Rethrow: every retry loop upstream (connectWithRetry,
+                // the cursor reconnect loop, BackgroundDrainer) rethrows Error
+                // rather than retrying, so this stays a loud one-shot failure.
+                try {
+                    newClient.close();
+                } catch (Throwable ignored) {
+                    // best-effort; the original Error is what must surface
+                }
+                throw e;
             }
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                 newClient.close();
