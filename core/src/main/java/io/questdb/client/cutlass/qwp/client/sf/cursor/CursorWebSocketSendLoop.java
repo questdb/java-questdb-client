@@ -103,13 +103,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
     /**
-     * Poison-frame detector threshold: consecutive server-active rejections (NACK
-     * or non-orderly close) of the same head-of-line frame, with no ack progress in
-     * between, before the loop declares the frame poisoned and halts with a typed
-     * {@link SenderError.Category#PROTOCOL_VIOLATION} terminal. Below the threshold
-     * a retriable rejection recycles the connection and replays from ackedFsn+1.
+     * Default poison-frame detector threshold: consecutive server-active
+     * rejections (NACK or non-orderly close) of the same head-of-line frame, with
+     * no ack progress in between, before the loop declares the frame poisoned and
+     * halts with a typed {@link SenderError.Category#PROTOCOL_VIOLATION} terminal.
+     * Below the threshold a retriable rejection recycles the connection and
+     * replays from ackedFsn+1. Configurable per sender via the
+     * {@code max_frame_rejections} connect-string key or
+     * {@code LineSenderBuilder.maxFrameRejections(int)}.
      */
-    public static final int MAX_HEAD_FRAME_REJECTIONS = 4;
+    public static final int DEFAULT_MAX_HEAD_FRAME_REJECTIONS = 4;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
@@ -260,13 +263,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // FSN (ackedFsn+1) observed at the most recent server-active rejection (NACK,
     // or non-orderly close after at least one send on the connection);
     // poisonStrikes counts consecutive rejections at that same FSN with no ack
-    // progress in between. Any ACK resets both. At MAX_HEAD_FRAME_REJECTIONS
+    // progress in between. Any ACK resets both. At maxHeadFrameRejections
     // strikes the frame is declared poisoned: the server (or an intermediary)
     // deterministically rejects these exact bytes, so replay cannot succeed and
     // the loop halts with a typed PROTOCOL_VIOLATION terminal instead of
     // reconnect-looping forever.
     private long poisonFsn = -1L;
     private int poisonStrikes;
+    // Poison-frame detector threshold for this loop. Constructor-configured
+    // (connect-string key max_frame_rejections); defaults to
+    // DEFAULT_MAX_HEAD_FRAME_REJECTIONS.
+    private final int maxHeadFrameRejections;
     private volatile boolean running;
     // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
     // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
@@ -345,6 +352,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+    }
+
+    /**
+     * Master constructor — also accepts the poison-frame detector threshold
+     * ({@code max_frame_rejections}): consecutive server-active rejections of
+     * the same head-of-line frame, with no ack progress in between, before the
+     * loop escalates to a typed terminal. Must be {@code >= 1}.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections) {
+        if (maxHeadFrameRejections < 1) {
+            throw new IllegalArgumentException(
+                    "maxHeadFrameRejections must be >= 1: " + maxHeadFrameRejections);
+        }
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -364,6 +396,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.durableAckKeepaliveIntervalNanos = durableAckKeepaliveIntervalMillis > 0
                 ? durableAckKeepaliveIntervalMillis * 1_000_000L
                 : 0L;
+        this.maxHeadFrameRejections = maxHeadFrameRejections;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
@@ -527,7 +560,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * codes carry no policy semantics (policy travels only in QWP NACK frames),
      * every close is reconnect-eligible, and a frame that deterministically
      * kills the connection is caught behaviorally by the poison-frame detector
-     * ({@link #MAX_HEAD_FRAME_REJECTIONS}) rather than by this code list.
+     * ({@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) rather than by this code list.
      * Retained for diagnostics and tests.
      */
     @TestOnly
@@ -1172,7 +1205,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Poison-frame detector: record a server-active rejection (NACK, or non-orderly
      * close after at least one send on this connection) at the current head-of-line
      * frame. Returns true when the same head FSN has now been rejected
-     * {@link #MAX_HEAD_FRAME_REJECTIONS} consecutive times with no ack progress in
+     * {@code maxHeadFrameRejections} consecutive times (configurable; default
+     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) with no ack progress in
      * between — the frame is poisoned and replay is deterministic. I/O thread only.
      */
     private boolean recordHeadRejectionStrike() {
@@ -1183,13 +1217,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             poisonFsn = head;
             poisonStrikes = 1;
         }
-        return poisonStrikes >= MAX_HEAD_FRAME_REJECTIONS;
+        return poisonStrikes >= maxHeadFrameRejections;
     }
 
     /**
      * Escalate a poisoned frame to a typed terminal: the server (or an intermediary)
      * has deterministically rejected the head-of-line frame
-     * {@link #MAX_HEAD_FRAME_REJECTIONS} consecutive times with no ack progress, so
+     * {@code maxHeadFrameRejections} consecutive times with no ack progress, so
      * replaying it cannot succeed and retrying would loop forever. recordFatal runs
      * before dispatchError so the producer-observable terminal is latched before the
      * user's handler is invoked. The rejected bytes remain in the SF log on disk —
@@ -1777,7 +1811,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // without a NACK (e.g. an intermediary's frame-size limit). That is
             // caught behaviorally, not by code list: a non-orderly close arriving
             // after this connection already sent the head frame counts a poison
-            // strike; MAX_HEAD_FRAME_REJECTIONS consecutive strikes at the same
+            // strike; maxHeadFrameRejections consecutive strikes at the same
             // head FSN with no ack progress escalate to a typed terminal. Orderly
             // closes (NORMAL_CLOSURE role-change handoff, GOING_AWAY restart
             // drain) never count strikes — they are the server asking us to go

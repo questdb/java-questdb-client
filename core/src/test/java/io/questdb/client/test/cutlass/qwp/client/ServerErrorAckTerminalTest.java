@@ -142,7 +142,7 @@ public class ServerErrorAckTerminalTest {
      *       drop: {@code getTotalAcks()} stays 0)</li>
      *   <li>A server that keeps NACKing the same head frame trips the
      *       poison-frame detector after
-     *       {@link CursorWebSocketSendLoop#MAX_HEAD_FRAME_REJECTIONS}
+     *       {@link CursorWebSocketSendLoop#DEFAULT_MAX_HEAD_FRAME_REJECTIONS}
      *       consecutive strikes: a typed {@code PROTOCOL_VIOLATION}
      *       terminal is latched and the next {@code flush()} throws —
      *       instead of reconnect-looping forever</li>
@@ -171,11 +171,11 @@ public class ServerErrorAckTerminalTest {
                 sender.flush();
 
                 // Each NACK counts one poison strike and triggers a
-                // reconnect+replay; after MAX_HEAD_FRAME_REJECTIONS strikes
+                // reconnect+replay; after DEFAULT_MAX_HEAD_FRAME_REJECTIONS strikes
                 // the loop escalates to a typed terminal. The server must
                 // therefore observe the frame exactly that many times.
                 waitFor(() -> handler.totalBinaryReceived.get()
-                        >= CursorWebSocketSendLoop.MAX_HEAD_FRAME_REJECTIONS, 10_000);
+                        >= CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, 10_000);
 
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 waitFor(() -> wss.getLastTerminalError() != null, 5_000);
@@ -183,14 +183,14 @@ public class ServerErrorAckTerminalTest {
                 Assert.assertEquals(
                         "the same frame must be replayed once per strike -- no more:"
                                 + " after escalation the loop must stop replaying",
-                        CursorWebSocketSendLoop.MAX_HEAD_FRAME_REJECTIONS,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         handler.totalBinaryReceived.get());
                 Assert.assertTrue(
                         "each RETRIABLE NACK recycles the wire: expected >= "
-                                + (CursorWebSocketSendLoop.MAX_HEAD_FRAME_REJECTIONS - 1)
+                                + (CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS - 1)
                                 + " reconnect attempts, saw " + wss.getTotalReconnectAttempts(),
                         wss.getTotalReconnectAttempts()
-                                >= CursorWebSocketSendLoop.MAX_HEAD_FRAME_REJECTIONS - 1);
+                                >= CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS - 1);
                 Assert.assertEquals(
                         "a rejection must never advance the watermark (no drop)",
                         0L, wss.getTotalAcks());
@@ -222,6 +222,51 @@ public class ServerErrorAckTerminalTest {
                 // close() rethrows an unsurfaced latched terminal; the test
                 // has already observed it via flush() above, but swallow
                 // defensively in case the surfacing raced.
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * The poison threshold is configurable end-to-end: with
+     * {@code max_frame_rejections=2} in the connect string, a server that
+     * NACKs every frame trips the poisoned-frame terminal after exactly TWO
+     * deliveries of the same frame — not the default four. Pins the full
+     * plumbing: connect-string parse → builder → QwpWebSocketSender →
+     * CursorWebSocketSendLoop.
+     */
+    @Test
+    public void testMaxFrameRejectionsConfigurableFromConnectString() throws Exception {
+        WriteErrorAckHandler handler = new WriteErrorAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            int port = server.getPort();
+            String cfg = "ws::addr=localhost:" + port
+                    + ";reconnect_max_duration_millis=10000"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50"
+                    + ";max_frame_rejections=2"
+                    + ";";
+
+            Sender sender = Sender.fromConfig(cfg);
+            try {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+
+                waitFor(() -> handler.totalBinaryReceived.get() >= 2, 10_000);
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                waitFor(() -> wss.getLastTerminalError() != null, 5_000);
+
+                Assert.assertEquals(
+                        "with max_frame_rejections=2 the frame must be delivered exactly"
+                                + " twice before poison escalation",
+                        2, handler.totalBinaryReceived.get());
+            } finally {
                 try {
                     sender.close();
                 } catch (LineSenderException ignored) {

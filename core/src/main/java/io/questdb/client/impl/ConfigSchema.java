@@ -72,6 +72,10 @@ public final class ConfigSchema {
         str("error_inbox_capacity", Side.INGRESS);
         str("initial_connect_retry", Side.INGRESS);
         str("max_background_drainers", Side.INGRESS);
+        // Poison-frame detector threshold (see CursorWebSocketSendLoop): the
+        // Sender applies it; the QwpQueryClient accepts it as a syntactic no-op
+        // (one vocabulary, side-owned application).
+        str("max_frame_rejections", Side.INGRESS);
         str("max_name_len", Side.INGRESS);
         str("reconnect_initial_backoff_millis", Side.INGRESS);
         str("reconnect_max_backoff_millis", Side.INGRESS);

@@ -52,6 +52,23 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testMaxFrameRejectionsAcceptedThroughFacadeConfig() {
+        // max_frame_rejections is an INGRESS key: the facade validates it
+        // against the registry and hands the full string to every pooled
+        // Sender (Sender.fromConfig applies it); the query pool accepts it as
+        // a syntactic no-op. min=0 pools -> parse-only validation, no server.
+        try (QuestDB ignored = QuestDB.connect(
+                "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;max_frame_rejections=6;")) {
+            Assert.assertNotNull(ignored);
+        }
+        // An out-of-range value must be rejected up front, not when the first
+        // pooled Sender is eventually built.
+        assertBuildRejected(
+                "ws::addr=127.0.0.1:1;max_frame_rejections=0;sender_pool_min=0;query_pool_min=0;",
+                "max_frame_rejections");
+    }
+
+    @Test
     public void testConnectSingleStringValidatesAndBuilds() {
         // QuestDB.connect(single string) hands the same ws:: cluster string to
         // both the ingest and query pools. min=0 on both pools validates both

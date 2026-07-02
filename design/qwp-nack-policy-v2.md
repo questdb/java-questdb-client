@@ -53,7 +53,8 @@ is caught *behaviorally*:
 
 > A server-active rejection (NACK, or non-orderly close after at least one
 > send on the connection) at the same head-of-line FSN, with no ack progress
-> in between, counts a strike. `MAX_HEAD_FRAME_REJECTIONS` (4) consecutive
+> in between, counts a strike. `max_frame_rejections` (default 4;
+> connect-string key or `LineSenderBuilder.maxFrameRejections(int)`) consecutive
 > strikes escalate to a typed `PROTOCOL_VIOLATION` TERMINAL naming the FSN.
 > Any ACK resets the counter. Orderly closes (`NORMAL_CLOSURE` role-change
 > handoff, `GOING_AWAY` restart drain) never count strikes.
@@ -111,7 +112,9 @@ until a primary is reachable. Consequently:
   matrix, incl. `NOT_WRITABLE` and fail-open `UNKNOWN`.
 - `ServerErrorAckTerminalTest.testRetriableNackReplaysThenPoisonEscalates` —
   e2e: RETRIABLE NACK → reconnect+replay per strike → typed poison terminal
-  after exactly `MAX_HEAD_FRAME_REJECTIONS` deliveries; watermark untouched.
+  after exactly the configured `max_frame_rejections` deliveries (default 4;
+  `ServerErrorAckTerminalTest` also pins `max_frame_rejections=2` end-to-end);
+  watermark untouched.
 - `CursorWebSocketSendLoopDurableAckTest` — TERMINAL NACKs in durable mode:
   no placeholder, no trim, typed `checkError()` throw.
 - `CloseTerminalConflationTest` — close() safety net with a RETRIABLE

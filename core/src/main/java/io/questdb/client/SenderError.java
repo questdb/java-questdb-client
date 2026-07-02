@@ -205,7 +205,7 @@ public final class SenderError {
         /**
          * A frame the server (or an intermediary) deterministically rejects: the
          * poison-frame detector observed the same head-of-line frame fail
-         * {@link io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#MAX_HEAD_FRAME_REJECTIONS}
+         * {@link io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_MAX_HEAD_FRAME_REJECTIONS}
          * consecutive times with no ack progress — replaying it cannot succeed.
          */
         PROTOCOL_VIOLATION,

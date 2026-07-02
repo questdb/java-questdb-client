@@ -126,6 +126,9 @@ public final class BackgroundDrainer implements Runnable {
      */
     private volatile Thread runnerThread;
     private volatile boolean stopRequested;
+    // Poison-frame detector threshold forwarded to every drain loop this
+    // drainer creates; mirrors the owner sender's max_frame_rejections config.
+    private final int maxHeadFrameRejections;
 
     public BackgroundDrainer(
             String slotPath,
@@ -138,6 +141,31 @@ public final class BackgroundDrainer implements Runnable {
             boolean requestDurableAck,
             long durableAckKeepaliveIntervalMillis
     ) {
+        this(slotPath, segmentSizeBytes, sfMaxTotalBytes, clientFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, requestDurableAck,
+                durableAckKeepaliveIntervalMillis,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+    }
+
+    /**
+     * Master constructor — also accepts the poison-frame detector threshold
+     * ({@code max_frame_rejections}) forwarded to the drain loop's
+     * {@link CursorWebSocketSendLoop}: the drainer replays the owner sender's
+     * SF data, so it must honor the same configured threshold.
+     */
+    public BackgroundDrainer(
+            String slotPath,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes,
+            CursorWebSocketSendLoop.ReconnectFactory clientFactory,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            boolean requestDurableAck,
+            long durableAckKeepaliveIntervalMillis,
+            int maxHeadFrameRejections
+    ) {
         this.slotPath = slotPath;
         this.segmentSizeBytes = segmentSizeBytes;
         this.sfMaxTotalBytes = sfMaxTotalBytes;
@@ -147,6 +175,7 @@ public final class BackgroundDrainer implements Runnable {
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
         this.requestDurableAck = requestDurableAck;
         this.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
+        this.maxHeadFrameRejections = maxHeadFrameRejections;
     }
 
     /**
@@ -506,7 +535,8 @@ public final class BackgroundDrainer implements Runnable {
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
                         requestDurableAck,
-                        durableAckKeepaliveIntervalMillis);
+                        durableAckKeepaliveIntervalMillis,
+                        maxHeadFrameRejections);
                 loop.start();
 
                 while (!stopRequested) {

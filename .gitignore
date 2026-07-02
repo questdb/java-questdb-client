@@ -35,3 +35,4 @@ core/CMakeCache.txt
 
 # pi subagents runtime artifacts
 .pi-subagents/
+core/src/main/resources/io/questdb/client/bin/

@@ -1049,6 +1049,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async error dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1497,6 +1498,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
                                 : durableAckKeepaliveIntervalMillis;
+                int actualMaxFrameRejections = maxFrameRejections != PARAMETER_NOT_SET_EXPLICITLY
+                        ? maxFrameRejections
+                        : CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1568,7 +1572,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             authTimeoutMillis,
                             connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
                             connectionListener,
-                            actualConnectionListenerInboxCapacity
+                            actualConnectionListenerInboxCapacity,
+                            actualMaxFrameRejections
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -2414,6 +2419,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("reconnect_initial_backoff_millis must be > 0: ").put(millis);
             }
             this.reconnectInitialBackoffMillis = millis;
+            return this;
+        }
+
+        /**
+         * Poison-frame detector threshold: consecutive server rejections
+         * (retriable NACK, or non-orderly close after a send) of the SAME
+         * head-of-line frame, with no ack progress in between, before the
+         * sender declares the frame poisoned and latches a typed terminal
+         * instead of reconnect-replaying forever. Retriable rejections below
+         * the threshold recycle the connection and replay from the
+         * store-and-forward log — no data is dropped either way.
+         * Default {@code 4}. WebSocket only.
+         */
+        public LineSenderBuilder maxFrameRejections(int rejections) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("max_frame_rejections is only supported for WebSocket transport");
+            }
+            if (rejections < 1) {
+                throw new LineSenderException("max_frame_rejections must be >= 1: ").put(rejections);
+            }
+            this.maxFrameRejections = rejections;
             return this;
         }
 
@@ -3342,6 +3368,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "reconnect_initial_backoff_millis");
                     reconnectInitialBackoffMillis(parseLongValue(sink, "reconnect_initial_backoff_millis"));
+                } else if (Chars.equals("max_frame_rejections", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("max_frame_rejections is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "max_frame_rejections");
+                    maxFrameRejections(parseIntValue(sink, "max_frame_rejections"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -3607,6 +3639,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("reconnect_max_backoff_millis")) {
                     reconnectMaxBackoffMillis(wsLong(view, v, "reconnect_max_backoff_millis"));
                 }
+                if (view.has("max_frame_rejections")) {
+                    maxFrameRejections(wsInt(view, v, "max_frame_rejections"));
+                }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
@@ -3781,6 +3816,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("reconnect_max_backoff_millis", reconnectMaxBackoffMillis);
             m.put("drain_orphans", drainOrphans);
             m.put("max_background_drainers", maxBackgroundDrainers);
+            m.put("max_frame_rejections", maxFrameRejections);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

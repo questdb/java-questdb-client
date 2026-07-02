@@ -73,6 +73,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("reconnect_max_backoff_millis=2222", "reconnect_max_backoff_millis", 2222L);
         assertHonored("drain_orphans=on", "drain_orphans", true);
         assertHonored("max_background_drainers=6", "max_background_drainers", 6);
+        assertHonored("max_frame_rejections=6", "max_frame_rejections", 6);
         assertHonored("error_inbox_capacity=128", "error_inbox_capacity", 128);
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
