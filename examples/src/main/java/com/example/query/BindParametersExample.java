@@ -1,8 +1,9 @@
 package com.example.query;
 
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 /**
  * Demonstrates typed bind parameters.
@@ -22,9 +23,8 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  */
 public class BindParametersExample {
 
-    public static void main(String[] args) {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+    public static void main(String[] args) throws InterruptedException {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
             String sql = "SELECT ts, sym, price, qty FROM trades "
                     + "WHERE sym = $1 AND price >= $2 AND ts >= $3 LIMIT 1000";
@@ -34,14 +34,19 @@ public class BindParametersExample {
             String[] symbols = {"AAPL", "MSFT", "GOOG"};
             for (String symbol : symbols) {
                 System.out.println("fetching trades for " + symbol);
-                client.execute(
-                        sql,
-                        binds -> binds
-                                .setVarchar(0, symbol)
-                                .setDouble(1, 100.0)
-                                .setTimestampMicros(2, 1_700_000_000_000_000L),
-                        new PrintingHandler()
-                );
+                try {
+                    db.query()
+                            .sql(sql)
+                            .binds(binds -> binds
+                                    .setVarchar(0, symbol)
+                                    .setDouble(1, 100.0)
+                                    .setTimestampMicros(2, 1_700_000_000_000_000L))
+                            .handler(new PrintingHandler())
+                            .submit()
+                            .await();
+                } catch (QueryException e) {
+                    System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+                }
             }
         }
     }

@@ -1,9 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.ColumnView;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 /**
  * Column-first iteration over a QWP egress result.
@@ -30,60 +31,62 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  */
 public class ColumnScanExample {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         final double[] sumPrice = {0.0};
         final long[] sumQty = {0};
         final long[] rowCount = {0};
         final long[] nonNullPrice = {0};
 
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+            try {
+                db.executeSql(
+                        "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
+                        new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                // Pin both columns once. The batch caches one ColumnView per
+                                // column index, so prices and qtys remain valid simultaneously.
+                                ColumnView prices = batch.column(0);
+                                ColumnView qtys = batch.column(1);
 
-            client.execute(
-                    "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            // Pin both columns once. The batch caches one ColumnView per
-                            // column index, so prices and qtys remain valid simultaneously.
-                            ColumnView prices = batch.column(0);
-                            ColumnView qtys = batch.column(1);
+                                int rows = batch.getRowCount();
+                                rowCount[0] += rows;
+                                nonNullPrice[0] += prices.nonNullCount();
 
-                            int rows = batch.getRowCount();
-                            rowCount[0] += rows;
-                            nonNullPrice[0] += prices.nonNullCount();
-
-                            // Typed column-first scan: one layout lookup, then per-row reads.
-                            for (int r = 0; r < rows; r++) {
-                                if (!prices.isNull(r)) {
-                                    sumPrice[0] += prices.getDoubleValue(r);
+                                // Typed column-first scan: one layout lookup, then per-row reads.
+                                for (int r = 0; r < rows; r++) {
+                                    if (!prices.isNull(r)) {
+                                        sumPrice[0] += prices.getDoubleValue(r);
+                                    }
+                                    sumQty[0] += qtys.getLongValue(r);
                                 }
-                                sumQty[0] += qtys.getLongValue(r);
+
+                                // The same view exposes raw addresses for SIMD/JNI consumers:
+                                //   long base = prices.valuesAddr();
+                                //   int stride = prices.bytesPerValue();      // 8 for DOUBLE
+                                //   long bitmap = prices.nullBitmapAddr();    // 0 if no nulls
+                                //   int count = prices.nonNullCount();
+                                // The bytes follow the QWP wire format documented in
+                                // QwpColumnBatch#valuesAddr(int).
                             }
 
-                            // The same view exposes raw addresses for SIMD/JNI consumers:
-                            //   long base = prices.valuesAddr();
-                            //   int stride = prices.bytesPerValue();      // 8 for DOUBLE
-                            //   long bitmap = prices.nullBitmapAddr();    // 0 if no nulls
-                            //   int count = prices.nonNullCount();
-                            // The bytes follow the QWP wire format documented in
-                            // QwpColumnBatch#valuesAddr(int).
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                                System.out.printf(
+                                        "rows=%d nonNullPrice=%d sumPrice=%.2f sumQty=%d%n",
+                                        rowCount[0], nonNullPrice[0], sumPrice[0], sumQty[0]
+                                );
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                            System.out.printf(
-                                    "rows=%d nonNullPrice=%d sumPrice=%.2f sumQty=%d%n",
-                                    rowCount[0], nonNullPrice[0], sumPrice[0], sumQty[0]
-                            );
+                            @Override
+                            public void onError(byte status, String message) {
+                                System.err.println("query failed: status=" + status + " msg=" + message);
+                            }
                         }
-
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("query failed: status=" + status + " msg=" + message);
-                        }
-                    }
-            );
+                ).await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 }

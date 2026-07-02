@@ -1,9 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.ColumnView;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 /**
  * Zip-style scan over two pinned columns.
@@ -23,40 +24,43 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
  */
 public class ZipColumnsExample {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         final double[] notional = {0.0};
         final long[] rows = {0};
 
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
-            client.execute(
-                    "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            ColumnView prices = batch.column(0);
-                            ColumnView qtys = batch.column(1);
-                            int n = batch.getRowCount();
-                            rows[0] += n;
-                            for (int r = 0; r < n; r++) {
-                                // NULL handling: if either side is NULL, skip the contribution.
-                                if (prices.isNull(r) || qtys.isNull(r)) continue;
-                                notional[0] += prices.getDoubleValue(r) * qtys.getLongValue(r);
+            try {
+                db.executeSql(
+                        "SELECT price, qty FROM trades WHERE sym = 'AAPL'",
+                        new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                ColumnView prices = batch.column(0);
+                                ColumnView qtys = batch.column(1);
+                                int n = batch.getRowCount();
+                                rows[0] += n;
+                                for (int r = 0; r < n; r++) {
+                                    // NULL handling: if either side is NULL, skip the contribution.
+                                    if (prices.isNull(r) || qtys.isNull(r)) continue;
+                                    notional[0] += prices.getDoubleValue(r) * qtys.getLongValue(r);
+                                }
+                            }
+
+                            @Override
+                            public void onEnd(long totalRows) {
+                                System.out.printf("rows=%d notional=%.2f%n", rows[0], notional[0]);
+                            }
+
+                            @Override
+                            public void onError(byte status, String message) {
+                                System.err.println("query failed: status=" + status + " msg=" + message);
                             }
                         }
-
-                        @Override
-                        public void onEnd(long totalRows) {
-                            System.out.printf("rows=%d notional=%.2f%n", rows[0], notional[0]);
-                        }
-
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("query failed: status=" + status + " msg=" + message);
-                        }
-                    }
-            );
+                ).await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 }

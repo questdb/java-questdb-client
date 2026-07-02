@@ -1,14 +1,15 @@
 package com.example.query;
 
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 /**
  * Running DDL / INSERT / UPDATE statements over QWP egress.
  * <p>
- * The {@code /read/v1} endpoint accepts any SQL statement the compiler
- * understands, not just {@code SELECT}. Non-SELECT statements skip the
+ * The query path accepts any SQL statement the compiler understands, not just
+ * {@code SELECT}. Non-SELECT statements skip the
  * {@code onBatch} / {@code onEnd} callbacks entirely -- the server executes
  * the statement and replies with a single {@code EXEC_DONE} frame that the
  * client surfaces via {@link QwpColumnBatchHandler#onExecDone}.
@@ -34,17 +35,16 @@ public class ExecStatementExample {
     private static final short INSERT = 2;
     private static final short UPDATE = 14;
 
-    public static void main(String[] args) {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+    public static void main(String[] args) throws InterruptedException {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
             // 1. DDL: CREATE TABLE. rowsAffected is 0 for pure DDL.
-            runExec(client, "CREATE TABLE trades_example (" +
+            runExec(db, "CREATE TABLE trades_example (" +
                     "ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG" +
                     ") TIMESTAMP(ts) PARTITION BY DAY WAL", CREATE_TABLE);
 
             // 2. INSERT with multi-row VALUES. rowsAffected = 3.
-            runExec(client,
+            runExec(db,
                     "INSERT INTO trades_example VALUES " +
                             "(0, 'AAPL', 150.25, 100), " +
                             "(1_000_000, 'AAPL', 150.30, 200), " +
@@ -52,41 +52,45 @@ public class ExecStatementExample {
                     INSERT);
 
             // 3. UPDATE with a predicate. Server reports how many rows matched.
-            runExec(client,
+            runExec(db,
                     "UPDATE trades_example SET qty = qty * 2 WHERE sym = 'AAPL'",
                     UPDATE);
 
             // 4. SELECT the data back to confirm the UPDATE landed. Uses the
             //    standard batch-streaming path (onBatch + onEnd).
             System.out.println("-- verifying UPDATE via SELECT");
-            client.execute(
-                    "SELECT ts, sym, qty FROM trades_example",
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            for (int row = 0; row < batch.getRowCount(); row++) {
-                                System.out.printf(
-                                        "  ts=%d sym=%s qty=%d%n",
-                                        batch.getLongValue(0, row),
-                                        batch.getString(1, row),
-                                        batch.getLongValue(2, row)
-                                );
+            try {
+                db.executeSql(
+                        "SELECT ts, sym, qty FROM trades_example",
+                        new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                for (int row = 0; row < batch.getRowCount(); row++) {
+                                    System.out.printf(
+                                            "  ts=%d sym=%s qty=%d%n",
+                                            batch.getLongValue(0, row),
+                                            batch.getString(1, row),
+                                            batch.getLongValue(2, row)
+                                    );
+                                }
+                            }
+
+                            @Override
+                            public void onEnd(long totalRows) {
+                            }
+
+                            @Override
+                            public void onError(byte status, String message) {
+                                System.err.println("SELECT failed: " + message);
                             }
                         }
-
-                        @Override
-                        public void onEnd(long totalRows) {
-                        }
-
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("SELECT failed: " + message);
-                        }
-                    }
-            );
+                ).await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // 5. Clean up with DROP. Also pure DDL, rowsAffected=0.
-            runExec(client, "DROP TABLE trades_example", DROP);
+            runExec(db, "DROP TABLE trades_example", DROP);
         }
     }
 
@@ -95,34 +99,38 @@ public class ExecStatementExample {
      * fast if the server unexpectedly streams rows or the op type doesn't
      * match what we asked for.
      */
-    private static void runExec(QwpQueryClient client, String sql, short expectedOpType) {
+    private static void runExec(QuestDB db, String sql, short expectedOpType) throws InterruptedException {
         System.out.println("-- executing: " + sql);
-        client.execute(sql, new QwpColumnBatchHandler() {
-            @Override
-            public void onBatch(QwpColumnBatch batch) {
-                System.err.println("(unexpected) batch with " + batch.getRowCount() + " rows");
-            }
-
-            @Override
-            public void onEnd(long totalRows) {
-                System.err.println("(unexpected) onEnd for a non-SELECT; totalRows=" + totalRows);
-            }
-
-            @Override
-            public void onError(byte status, String message) {
-                System.err.printf("  failed: status=0x%02X, message=%s%n", status & 0xFF, message);
-            }
-
-            @Override
-            public void onExecDone(short opType, long rowsAffected) {
-                System.out.printf(
-                        "  done: opType=%d (expected=%d), rowsAffected=%d%n",
-                        opType, expectedOpType, rowsAffected
-                );
-                if (opType != expectedOpType) {
-                    System.err.println("  !! op type mismatch");
+        try {
+            db.executeSql(sql, new QwpColumnBatchHandler() {
+                @Override
+                public void onBatch(QwpColumnBatch batch) {
+                    System.err.println("(unexpected) batch with " + batch.getRowCount() + " rows");
                 }
-            }
-        });
+
+                @Override
+                public void onEnd(long totalRows) {
+                    System.err.println("(unexpected) onEnd for a non-SELECT; totalRows=" + totalRows);
+                }
+
+                @Override
+                public void onError(byte status, String message) {
+                    System.err.printf("  failed: status=0x%02X, message=%s%n", status & 0xFF, message);
+                }
+
+                @Override
+                public void onExecDone(short opType, long rowsAffected) {
+                    System.out.printf(
+                            "  done: opType=%d (expected=%d), rowsAffected=%d%n",
+                            opType, expectedOpType, rowsAffected
+                    );
+                    if (opType != expectedOpType) {
+                        System.err.println("  !! op type mismatch");
+                    }
+                }
+            }).await();
+        } catch (QueryException e) {
+            System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+        }
     }
 }

@@ -1,8 +1,9 @@
 package com.example.query;
 
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 import java.util.Arrays;
 import java.util.List;
@@ -33,11 +34,10 @@ import java.util.List;
  */
 public class BindRepeatedLookupExample {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         List<String> instruments = Arrays.asList("AAPL", "MSFT", "GOOG", "AMZN", "META");
 
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
             // SAME SQL TEXT across every iteration. Only the bind values differ.
             String sql = "SELECT ts, price, qty FROM trades "
@@ -48,33 +48,38 @@ public class BindRepeatedLookupExample {
             for (String symbol : instruments) {
                 System.out.println("latest trades for " + symbol);
                 long[] rowCount = {0};
-                client.execute(
-                        sql,
-                        binds -> binds
-                                .setVarchar(0, symbol)
-                                .setTimestampMicros(1, since),
-                        new QwpColumnBatchHandler() {
-                            @Override
-                            public void onBatch(QwpColumnBatch batch) {
-                                rowCount[0] += batch.getRowCount();
-                                batch.forEachRow(row -> System.out.printf(
-                                        "  ts=%d price=%.4f qty=%d%n",
-                                        row.getLongValue(0),
-                                        row.getDoubleValue(1),
-                                        row.getLongValue(2)
-                                ));
-                            }
+                try {
+                    db.query()
+                            .sql(sql)
+                            .binds(binds -> binds
+                                    .setVarchar(0, symbol)
+                                    .setTimestampMicros(1, since))
+                            .handler(new QwpColumnBatchHandler() {
+                                @Override
+                                public void onBatch(QwpColumnBatch batch) {
+                                    rowCount[0] += batch.getRowCount();
+                                    batch.forEachRow(row -> System.out.printf(
+                                            "  ts=%d price=%.4f qty=%d%n",
+                                            row.getLongValue(0),
+                                            row.getDoubleValue(1),
+                                            row.getLongValue(2)
+                                    ));
+                                }
 
-                            @Override
-                            public void onEnd(long totalRows) {
-                            }
+                                @Override
+                                public void onEnd(long totalRows) {
+                                }
 
-                            @Override
-                            public void onError(byte status, String message) {
-                                System.err.println("  query failed: " + message);
-                            }
-                        }
-                );
+                                @Override
+                                public void onError(byte status, String message) {
+                                    System.err.println("  query failed: " + message);
+                                }
+                            })
+                            .submit()
+                            .await();
+                } catch (QueryException e) {
+                    System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+                }
                 System.out.println("  (" + rowCount[0] + " rows)");
             }
         }
