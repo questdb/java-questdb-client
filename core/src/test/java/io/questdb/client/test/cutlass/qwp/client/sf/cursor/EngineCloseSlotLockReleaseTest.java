@@ -135,6 +135,14 @@ public class EngineCloseSlotLockReleaseTest {
             managerField.setAccessible(true);
             SegmentManager capturedManager = (SegmentManager) managerField.get(engine);
 
+            // The watermark's 16-byte mmap is also unreachable to the sabotaged
+            // close() (it NPEs before getting there), so capture and free it
+            // manually too or the leak check trips on MMAP_DEFAULT.
+            Field watermarkField = CursorSendEngine.class.getDeclaredField("watermark");
+            watermarkField.setAccessible(true);
+            io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark capturedWatermark =
+                    (io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark) watermarkField.get(engine);
+
             ringField.set(engine, null);
 
             try {
@@ -150,6 +158,9 @@ public class EngineCloseSlotLockReleaseTest {
             // are an artifact of the sabotage.
             capturedRing.close();
             capturedManager.close();
+            if (capturedWatermark != null) {
+                capturedWatermark.close();
+            }
 
             // The user-visible test: can a fresh SlotLock acquire the
             // same slot? If the original lock fd is still held, the
