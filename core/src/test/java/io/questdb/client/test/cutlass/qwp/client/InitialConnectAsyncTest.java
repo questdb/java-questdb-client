@@ -49,10 +49,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
  * {@code Sender.fromConfig} must return immediately even when no server
- * is reachable; the I/O thread retries connect in the background, and
- * terminal failures (auth/upgrade reject, budget exhaustion) are
- * delivered through the async error inbox rather than thrown at the
- * call site.
+ * is reachable; the I/O thread retries connect in the background. Plain
+ * connect failures are retried indefinitely (Invariant B: no wall-clock
+ * budget give-up); only genuine terminals (auth/upgrade reject,
+ * durable-ack capability gap) are delivered through the async error
+ * inbox rather than thrown at the call site.
  */
 public class InitialConnectAsyncTest {
 
@@ -283,8 +284,7 @@ public class InitialConnectAsyncTest {
         // before fromConfig returns. wasEverConnected() must therefore
         // already be true the instant the sender becomes visible to the
         // caller — there is no observable "never connected" window in
-        // those modes, so misclassifying a budget exhaustion as
-        // never-connected is impossible.
+        // those modes.
         try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
             int port = server.getPort();
             server.start();
@@ -362,8 +362,11 @@ public class InitialConnectAsyncTest {
 
     /**
      * Returns a unique temp sf_dir snippet for embedding in a config
-     * string. initial_connect_retry on/sync/async requires sf_dir per
-     * spec §3.5; without it the builder rejects construction.
+     * string. The builder does NOT require sf_dir for any
+     * initial_connect_retry mode — without it the sender builds in
+     * memory mode and buffers rows in the in-RAM cursor ring. These
+     * tests set an sf_dir so the rows accumulated before the first
+     * successful connect are disk-backed (the durable SF path).
      */
     private static String sfDirOpt() {
         String dir = java.nio.file.Paths.get(

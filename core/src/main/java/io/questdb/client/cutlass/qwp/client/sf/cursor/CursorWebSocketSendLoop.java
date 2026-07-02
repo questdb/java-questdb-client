@@ -374,11 +374,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
-     * uses on a wire failure, but reusable from {@code ensureConnected} to
-     * implement {@code initial_connect_retry=true}. Returns the connected
-     * client on success; throws on terminal upgrade error (won't retry) or
-     * budget exhaustion.
+     * Same exponential-backoff-with-jitter machinery as the I/O thread's
+     * {@code connectLoop}, but reusable from {@code ensureConnected} to
+     * implement {@code initial_connect_retry=true}. Unlike {@code connectLoop}
+     * (which retries indefinitely under Invariant B), this blocking variant
+     * IS bounded by {@code maxDurationMillis}: it returns the connected
+     * client on success and throws on terminal upgrade error (won't retry)
+     * or budget exhaustion.
      * <p>
      * Caller-supplied {@code factory} is invoked once per attempt and
      * should produce a fresh, connected, upgraded client (or throw). The
