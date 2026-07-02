@@ -57,12 +57,11 @@ import static org.junit.Assert.assertTrue;
  * {@code GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS} (~3s) on a drainer
  * that cannot possibly finish.
  * <p>
- * The factory throws the exact transport-shaped busy exception the
- * connect-walk lock's {@code tryLock} yield produces, which doubles this
- * test as the contract check that lock contention (or any outage-shaped
- * connect failure) is retried under Invariant B — outcome stays PENDING
- * while running, becomes STOPPED on close, and NEVER drops a
- * {@code .failed} sentinel.
+ * The factory throws a plain transport-shaped {@link LineSenderException}
+ * (the shape of every outage-time connect failure), which doubles this
+ * test as the contract check that such failures are retried under
+ * Invariant B — outcome stays PENDING while running, becomes STOPPED on
+ * close, and NEVER drops a {@code .failed} sentinel.
  */
 public class BackgroundDrainerPoolConnectPhaseCloseTest {
 
@@ -102,12 +101,11 @@ public class BackgroundDrainerPoolConnectPhaseCloseTest {
             final CursorWebSocketSendLoop.ReconnectFactory factory = () -> {
                 attempts.incrementAndGet();
                 firstAttempt.countDown();
-                // The exact shape the connect-walk lock's tryLock yield
-                // produces; also the shape of every outage-time connect
-                // failure. Must be retried, never quarantined.
+                // Plain transport-shaped failure: the shape of every
+                // outage-time connect error. Must be retried, never
+                // quarantined.
                 throw new LineSenderException(
-                        "connect walk lock is busy (another connect walk is in progress); "
-                                + "background drainer will retry after backoff");
+                        "Failed to connect: all endpoints unreachable (simulated outage)");
             };
             final BackgroundDrainer drainer = new BackgroundDrainer(
                     slotPath,
@@ -140,8 +138,8 @@ public class BackgroundDrainerPoolConnectPhaseCloseTest {
                     -1L, drainer.getAckedFsn());
             assertTrue("the drainer must have attempted at least one connect sweep",
                     attempts.get() >= 1);
-            assertFalse("lock-contention / outage-shaped connect failures must never "
-                            + "quarantine the slot (.failed sentinel)",
+            assertFalse("outage-shaped connect failures must never quarantine the slot "
+                            + "(.failed sentinel)",
                     Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
     }

@@ -44,36 +44,37 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * Coverage of the connect-walk lock policy (M11): {@code buildAndConnect}
- * holds a dedicated lock across its endpoint walk, foreground walks block
- * on {@code lock()}, background (drainer) walks use {@code tryLock()} and
- * must YIELD on contention instead of queuing behind the foreground's
- * network I/O.
+ * Coverage of the connect-walk concurrency policy (M11): no network I/O
+ * runs under a sender-wide lock for background work. A FOREGROUND walk
+ * holds the connect-walk lock across its sweep (it owns the shared round
+ * state and the lifecycle commits); BACKGROUND (drainer) walks take no
+ * lock at all — each sweeps a private {@code QwpHostHealthTracker
+ * .RoundCursor} and records health-only results — so a drainer sweep
+ * proceeds CONCURRENTLY with a foreground walk that is parked inside a
+ * blocking connect, and the foreground's reconnect and {@code close()}
+ * paths can never queue behind (or be queued behind by) a drainer's
+ * endpoint walk.
  * <p>
- * The contract under test has two halves:
- * <ol>
- *   <li>a background walk attempted while a foreground walk holds the lock
- *       throws a plain {@link LineSenderException} (transport-shaped, never
- *       a typed terminal) BEFORE any network attempt — the drainer's retry
- *       loops route it to indefinite capped-backoff retry (Invariant B), so
- *       lock contention can never quarantine a slot;</li>
- *   <li>once the lock is free, the same background factory proceeds into a
- *       real walk (the busy throw is contention-scoped, not sticky).</li>
- * </ol>
+ * The proof shape: pin a foreground walk inside {@code connect()} (lock
+ * held, I/O in flight), then run TWO full background sweeps to completion
+ * while the foreground is still parked. Under the old walk-wide lock
+ * (monitor or tryLock-yield) both background calls would have blocked or
+ * yielded; lock-free they must reach the client factory and fail with the
+ * ordinary end-of-round error.
  */
-public class QwpConnectWalkLockPriorityTest {
+public class QwpConnectWalkBackgroundIsolationTest {
 
     /** Tracks every stub for defensive close (close() is idempotent). */
     private static final List<StubClient> LIVE_STUBS =
             Collections.synchronizedList(new ArrayList<>());
 
     @Test
-    public void testBackgroundWalkYieldsWhileForegroundHoldsLockThenProceedsWhenFree() throws Exception {
+    public void testBackgroundSweepRunsConcurrentlyWithParkedForegroundWalk() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 19999)) {
                 final CountDownLatch foregroundInConnect = new CountDownLatch(1);
@@ -90,7 +91,8 @@ public class QwpConnectWalkLockPriorityTest {
 
                 // Foreground walk on a helper thread: its stub connect()
                 // parks on releaseForeground, so the walk holds the
-                // connect-walk lock for as long as this test wants.
+                // connect-walk lock with I/O "in flight" for as long as
+                // this test wants.
                 final CursorWebSocketSendLoop.ReconnectFactory foreground =
                         sender.newReconnectFactory();
                 final AtomicReference<Throwable> foregroundError = new AtomicReference<>();
@@ -107,57 +109,54 @@ public class QwpConnectWalkLockPriorityTest {
                     assertTrue("foreground walk must reach its (blocking) connect attempt",
                             foregroundInConnect.await(5, TimeUnit.SECONDS));
 
-                    // HALF 1: background walk while the lock is held. Must
-                    // throw the transport-shaped busy exception without
-                    // touching the client factory (tryLock fires before any
-                    // per-attempt work).
-                    final CursorWebSocketSendLoop.ReconnectFactory background =
-                            sender.newBackgroundReconnectFactory(() -> false);
-                    try {
-                        background.reconnect();
-                        fail("background walk must yield (tryLock) while the foreground "
-                                + "holds the connect-walk lock");
-                    } catch (Exception e) {
-                        assertSame("lock contention must surface as a PLAIN LineSenderException: "
-                                        + "the drainer retry loops route exactly this shape to "
-                                        + "indefinite backoff-retry (Invariant B); any typed "
-                                        + "terminal here could quarantine a slot on contention",
-                                LineSenderException.class, e.getClass());
-                        assertTrue("busy message must name the lock (got: " + e.getMessage() + ")",
-                                e.getMessage() != null
-                                        && e.getMessage().contains("connect walk lock is busy"));
+                    // TWO background sweeps run to completion while the
+                    // foreground is parked mid-connect. Each must reach the
+                    // client factory (lock-free walk, no yield, no blocking)
+                    // and fail with the ordinary end-of-round error. Two
+                    // sweeps prove per-walk cursor independence: the second
+                    // sweep gets its own full walk, not the first's
+                    // exhausted cursor.
+                    for (int sweep = 1; sweep <= 2; sweep++) {
+                        final CursorWebSocketSendLoop.ReconnectFactory background =
+                                sender.newBackgroundReconnectFactory(() -> false);
+                        try {
+                            background.reconnect();
+                            fail("stub connect always throws; background sweep " + sweep
+                                    + " must fail its round");
+                        } catch (Exception e) {
+                            assertTrue("background sweep " + sweep + " must fail with the "
+                                            + "ordinary end-of-round error, not a lock artifact "
+                                            + "(got: " + e.getMessage() + ")",
+                                    e instanceof LineSenderException
+                                            && String.valueOf(e.getMessage())
+                                            .contains("Failed to connect"));
+                        }
+                        assertEquals("background sweep " + sweep + " must have reached the "
+                                        + "client factory while the foreground is parked",
+                                1 + sweep, factoryCalls.get());
+                        assertTrue("foreground must still be parked in connect (background "
+                                        + "sweeps must not disturb it)",
+                                fg.isAlive());
+                        assertNull("foreground walk must not have failed while background "
+                                        + "sweeps ran",
+                                foregroundError.get());
                     }
-                    assertEquals("background contention must not reach the client factory "
-                                    + "(the yield happens before any network attempt)",
-                            1, factoryCalls.get());
                 } finally {
                     releaseForeground.countDown();
                 }
                 fg.join(5_000);
                 assertFalse("foreground walk thread must exit once released", fg.isAlive());
+
+                // The foreground's own outcome is unaffected by the two
+                // background sweeps that ran under it: the ordinary
+                // end-of-round failure for its single-endpoint round.
                 Throwable fgErr = foregroundError.get();
                 assertNotNull("foreground walk fails its (single-endpoint) round once the "
                         + "stub connect throws", fgErr);
-                assertTrue("foreground failure is the ordinary end-of-round connect error",
+                assertTrue("foreground failure is the ordinary end-of-round connect error "
+                                + "(got: " + fgErr.getMessage() + ")",
                         fgErr instanceof LineSenderException
                                 && String.valueOf(fgErr.getMessage()).contains("Failed to connect"));
-
-                // HALF 2: lock is free now — the SAME background factory must
-                // get past tryLock and run a real walk: the factory is
-                // consulted (call 2) and the failure is the ordinary
-                // end-of-round error, NOT the busy throw.
-                final CursorWebSocketSendLoop.ReconnectFactory background2 =
-                        sender.newBackgroundReconnectFactory(() -> false);
-                try {
-                    background2.reconnect();
-                    fail("stub connect always throws; the walk must fail its round");
-                } catch (Exception e) {
-                    assertFalse("with the lock free the background walk must proceed past "
-                                    + "tryLock (got busy throw: " + e.getMessage() + ")",
-                            String.valueOf(e.getMessage()).contains("connect walk lock is busy"));
-                }
-                assertEquals("the free-lock background walk must reach the client factory",
-                        2, factoryCalls.get());
             } finally {
                 closeAllStubs();
             }
@@ -180,9 +179,9 @@ public class QwpConnectWalkLockPriorityTest {
     /**
      * Real-constructor stub (native buffers allocated and freed by the base
      * class; the walk closes failed-attempt clients itself). {@code connect}
-     * optionally parks on a latch to pin the walk — and thus the
-     * connect-walk lock — then always throws, so no walk ever "succeeds"
-     * and reaches upgrade or lifecycle commits.
+     * optionally parks on a latch to pin the walk — and, on the foreground
+     * path, the connect-walk lock — then always throws, so no walk ever
+     * "succeeds" and reaches upgrade or lifecycle commits.
      */
     private static final class StubClient extends WebSocketClient {
         private final CountDownLatch entered;

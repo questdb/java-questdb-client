@@ -153,15 +153,19 @@ public class QwpWebSocketSender implements Sender {
     private final List<Endpoint> endpoints;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
-    // Guards the connect walk (see buildAndConnect): the shared
-    // QwpHostHealthTracker round/health state, roundSeq,
-    // roundConnectAttemptSeq, and the foreground lifecycle commits
-    // (currentEndpointIdx, hasEverConnected, cap-derived sizing). A
-    // dedicated lock rather than the sender monitor so that (a) unrelated
-    // synchronized sender methods (setDrainerListener, startOrphanDrainers)
-    // never contend with a connect walk's network I/O, and (b) background
-    // walks can use tryLock to yield to the foreground instead of queuing
-    // on an unfair monitor.
+    // Serializes FOREGROUND connect walks only (see buildAndConnect): the
+    // shared-round state in hostTracker (pickNext/beginRound/attempted
+    // bits), roundSeq, roundConnectAttemptSeq, and the foreground lifecycle
+    // commits (currentEndpointIdx, hasEverConnected, cap-derived sizing)
+    // all have exactly one writer -- the foreground walk -- and foreground
+    // walks cannot overlap by construction (the I/O loop is single-threaded
+    // and the user-thread initial connect completes before the loop
+    // starts); the lock is cheap insurance for that invariant. Background
+    // (drainer) walks take NO lock at all: they walk a private
+    // QwpHostHealthTracker.RoundCursor and record health-only results, so
+    // no network I/O ever runs under a sender-wide lock for background
+    // work, and neither the foreground's reconnect nor close() can queue
+    // behind a drainer's endpoint walk.
     private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
@@ -968,8 +972,9 @@ public class QwpWebSocketSender implements Sender {
      *       native connect — bounded by {@code connect_timeout}, or by the
      *       OS SYN-retry deadline (60-130s on Linux) when the default
      *       {@code 0} is in effect. Background drainer walks never delay
-     *       this stop: they yield the connect-walk lock to the foreground
-     *       (see {@link #buildAndConnect});</li>
+     *       this stop: they run lock-free on private round cursors and
+     *       never hold anything the foreground waits on (see
+     *       {@link #buildAndConnect});</li>
      *   <li>drainer pool: drainers still in their connect-retry phase are
      *       stop-signaled immediately (exit within ~50ms); drainers actively
      *       replaying frames get a 2.5s grace window plus a 0.5s stop window
@@ -2585,13 +2590,9 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Multi-endpoint connect walk shared by the foreground sender and the
-     * background orphan drainers. One invocation walks every endpoint of the
-     * current round, performing a TCP/TLS connect plus a WebSocket upgrade
-     * per endpoint, all while holding {@link #connectWalkLock} (the lock
-     * protects the shared {@link QwpHostHealthTracker} round/health state,
-     * the round counters, and the foreground lifecycle commits).
-     * <p>
-     * Worst-case lock hold per walk is
+     * background orphan drainers. One invocation sweeps the endpoint list,
+     * performing a TCP/TLS connect plus a WebSocket upgrade per endpoint;
+     * worst-case sweep duration is
      * {@code endpoints x (connect timeout + upgrade timeout)}:
      * <ul>
      *   <li>foreground walk: {@code connect_timeout} verbatim -- the default
@@ -2604,33 +2605,30 @@ public class QwpWebSocketSender implements Sender {
      *       {@link #effectiveConnectTimeoutMs(boolean, int)}.</li>
      * </ul>
      * <p>
-     * Lock policy -- the foreground has absolute priority. Foreground walks
-     * (the producer's initial connect and the I/O loop's reconnects) block
-     * on {@code lock()} and can therefore only ever wait behind another
-     * foreground walk. Background walks use {@code tryLock()} and treat
-     * contention as a transport-shaped transient: the thrown
-     * {@link LineSenderException} lands in the drainer's indefinite
-     * capped-backoff retry (Invariant B) -- both in
-     * {@code BackgroundDrainer.connectWithDurableAckRetry()} and in
-     * {@code CursorWebSocketSendLoop.connectLoop}'s Throwable branch -- so a
-     * drainer sweep is deferred, never failed, and the foreground's
-     * reconnect and {@code close()} paths are never queued behind a
-     * drainer's endpoint walk.
+     * Concurrency policy -- no network I/O under a sender-wide lock for
+     * background work. FOREGROUND walks (the producer's initial connect and
+     * the I/O loop's reconnects) hold {@link #connectWalkLock} across the
+     * sweep: they own the shared round state and the lifecycle commits, and
+     * can only ever wait behind another foreground walk (which cannot
+     * happen by construction -- the lock is insurance). BACKGROUND (drainer)
+     * walks take NO lock: each sweeps a private
+     * {@link QwpHostHealthTracker.RoundCursor} -- full sweep, claim-at-pick,
+     * ordered by the live shared health state -- and records results with
+     * the health-only overloads ({@code markRoundAttempted=false}), so
+     * concurrent drainer sweeps proceed in parallel with each other and
+     * with the foreground, share health observations, and can neither
+     * consume nor poison the foreground's round. The foreground's
+     * reconnect and {@code close()} paths are therefore never queued
+     * behind a drainer's endpoint walk.
      */
     private WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
         if (ctx.isBackground()) {
-            if (!connectWalkLock.tryLock()) {
-                // Transport-shaped on purpose: every drainer retry loop
-                // treats an untyped connect failure as transient and backs
-                // off (Invariant B) -- the sweep is deferred, never failed,
-                // and no .failed sentinel can result from lock contention.
-                throw new LineSenderException(
-                        "connect walk lock is busy (another connect walk is in progress); "
-                                + "background drainer will retry after backoff");
-            }
-        } else {
-            connectWalkLock.lock();
+            // Lock-free: the walk below touches only internally-synchronized
+            // hostTracker health state and walk-local/cursor-local state on
+            // the background path.
+            return connectWalk(ctx);
         }
+        connectWalkLock.lock();
         try {
             return connectWalk(ctx);
         } finally {
@@ -2640,7 +2638,10 @@ public class QwpWebSocketSender implements Sender {
 
     private WebSocketClient connectWalk(ReconnectSupplier ctx) {
         // Background (drainer) factories share this connect walk -- endpoint
-        // list, hostTracker health and round state -- but must stay INVISIBLE
+        // list and hostTracker HEALTH state (never the shared round: a
+        // background sweep walks its own RoundCursor and records with
+        // markRoundAttempted=false, so it cannot consume the foreground's
+        // round or skew roundSeq) -- but must stay INVISIBLE
         // in the foreground sender's observable state. SenderConnectionEvents
         // describe the FOREGROUND connection's lifecycle, and the cap-derived
         // sizing (serverMaxBatchSize / effectiveAutoFlushBytes) guards the
@@ -2651,6 +2652,12 @@ public class QwpWebSocketSender implements Sender {
         // (oversize batch -> ws-close[1009] -> producer-terminal HALT caused
         // by background activity).
         final boolean background = ctx.isBackground();
+        // Private full-sweep cursor for background walks: claim-at-pick over
+        // cursor-local attempted bits makes the pick -> record pair safe
+        // without any walk-wide lock, and guarantees every sweep tries every
+        // endpoint exactly once regardless of concurrent walkers.
+        final QwpHostHealthTracker.RoundCursor cursor =
+                background ? hostTracker.newRoundCursor() : null;
         int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
             // Mid-stream wire failure -- the I/O loop just observed the active
@@ -2673,7 +2680,10 @@ public class QwpWebSocketSender implements Sender {
             hostTracker.recordMidStreamFailure(previousIdx);
             ctx.previousIdx = -1;
         }
-        if (hostTracker.isRoundExhausted()) {
+        // Shared-round lifecycle is foreground-only: a background walk must
+        // not advance the round (or roundSeq, which numbers foreground
+        // events) under the foreground's feet.
+        if (!background && hostTracker.isRoundExhausted()) {
             roundSeq++;
             hostTracker.beginRound(true);
         }
@@ -2693,7 +2703,7 @@ public class QwpWebSocketSender implements Sender {
             if (ctx.isAborted()) {
                 throw new LineSenderException(ctx.abortMessage());
             }
-            int idx = hostTracker.pickNext();
+            int idx = background ? cursor.next() : hostTracker.pickNext();
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
             lastEndpoint = ep;
@@ -2717,7 +2727,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.close();
                 if (classified instanceof QwpIngressRoleRejectedException) {
                     QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
-                    hostTracker.recordRoleReject(idx, re.isTransient());
+                    hostTracker.recordRoleReject(idx, re.isTransient(), !background);
                     lastError = re;
                     lastRoleReject = re;
                     if (!background) {
@@ -2749,7 +2759,7 @@ public class QwpWebSocketSender implements Sender {
                                 && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
                     terminalUpgradeError = classified;
                 }
-                hostTracker.recordTransportError(idx);
+                hostTracker.recordTransportError(idx, !background);
                 lastError = classified;
                 if (!background) {
                     dispatchConnectionEvent(
@@ -2760,7 +2770,7 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             } catch (Exception e) {
                 newClient.close();
-                hostTracker.recordTransportError(idx);
+                hostTracker.recordTransportError(idx, !background);
                 lastError = e;
                 if (!background) {
                     dispatchConnectionEvent(
@@ -2790,7 +2800,7 @@ public class QwpWebSocketSender implements Sender {
             }
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
                 newClient.close();
-                hostTracker.recordRoleReject(idx, false);
+                hostTracker.recordRoleReject(idx, false, !background);
                 QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
                         ep.host, ep.port, null);
                 if (terminalUpgradeError == null) {
@@ -2805,7 +2815,7 @@ public class QwpWebSocketSender implements Sender {
                 }
                 continue;
             }
-            hostTracker.recordSuccess(idx);
+            hostTracker.recordSuccess(idx, !background);
             ctx.previousIdx = idx;
             if (background) {
                 // Walk bookkeeping only: recordSuccess feeds the shared health

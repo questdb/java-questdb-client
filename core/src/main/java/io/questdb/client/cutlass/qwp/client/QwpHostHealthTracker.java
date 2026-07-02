@@ -35,9 +35,19 @@ package io.questdb.client.cutlass.qwp.client;
  * so a known-good cross-zone host is picked before an untried local host.
  * <p>
  * Each method is internally synchronized, but pickNext + recordX is not atomic
- * across the pair. Callers must externally serialize a pick → record sequence
- * (the QWP clients do this via the sender's {@code synchronized buildAndConnect}
- * and the query client's documented one-execute-at-a-time contract).
+ * across the pair. Callers of the SHARED-round API (pickNext / beginRound /
+ * isRoundExhausted) must externally serialize a pick → record sequence (the
+ * ingest sender does this by keeping its foreground connect walk single-file
+ * behind a lock; the query client via its documented one-execute-at-a-time
+ * contract).
+ * <p>
+ * Concurrent walkers that must not consume or poison the shared round --
+ * the ingest sender's background orphan drainers -- use a private
+ * {@link RoundCursor} ({@link #newRoundCursor()}) paired with the
+ * health-only record overloads ({@code markRoundAttempted=false}): the
+ * cursor's attempted set is walker-local (claim-at-pick, so concurrent
+ * cursors never race on the pick → record pair), while state/zone updates
+ * flow into the shared health ledger that orders everyone's picks.
  */
 public final class QwpHostHealthTracker {
     public enum HostState {
@@ -250,24 +260,113 @@ public final class QwpHostHealthTracker {
     }
 
     public void recordRoleReject(int idx, boolean isTransient) {
+        recordRoleReject(idx, isTransient, true);
+    }
+
+    /**
+     * Variant with an explicit round-bit policy. {@code markRoundAttempted =
+     * false} updates only the shared health ledger (state), leaving the
+     * shared round's attempted bit untouched — for walkers on a private
+     * {@link RoundCursor} whose attempts must stay invisible to the shared
+     * round (the ingest sender's background drainers).
+     */
+    public void recordRoleReject(int idx, boolean isTransient, boolean markRoundAttempted) {
         synchronized (lock) {
             states[idx] = isTransient ? HostState.TRANSIENT_REJECT : HostState.TOPOLOGY_REJECT;
-            attemptedThisRound[idx] = true;
+            if (markRoundAttempted) {
+                attemptedThisRound[idx] = true;
+            }
         }
     }
 
     public void recordSuccess(int idx) {
+        recordSuccess(idx, true);
+    }
+
+    /**
+     * Variant with an explicit round-bit policy; see
+     * {@link #recordRoleReject(int, boolean, boolean)}. The success epoch
+     * (sticky-Healthy recency) is recorded either way — a background
+     * walker's success is real health data.
+     */
+    public void recordSuccess(int idx, boolean markRoundAttempted) {
         synchronized (lock) {
             states[idx] = HostState.HEALTHY;
-            attemptedThisRound[idx] = true;
+            if (markRoundAttempted) {
+                attemptedThisRound[idx] = true;
+            }
             lastSuccessEpoch[idx] = ++successEpoch;
         }
     }
 
     public void recordTransportError(int idx) {
+        recordTransportError(idx, true);
+    }
+
+    /**
+     * Variant with an explicit round-bit policy; see
+     * {@link #recordRoleReject(int, boolean, boolean)}.
+     */
+    public void recordTransportError(int idx, boolean markRoundAttempted) {
         synchronized (lock) {
             states[idx] = HostState.TRANSPORT_ERROR;
-            attemptedThisRound[idx] = true;
+            if (markRoundAttempted) {
+                attemptedThisRound[idx] = true;
+            }
+        }
+    }
+
+    /**
+     * Creates a walker-private full-sweep cursor over the host list. Each
+     * {@link RoundCursor#next()} returns the highest-priority host this
+     * cursor has not yet returned — priority is the same live
+     * {@code (state, zone_tier)} tuple {@link #pickNext()} uses — and
+     * claims it at pick time in the cursor's OWN attempted set, so:
+     * <ul>
+     *   <li>every cursor sweeps every host exactly once regardless of what
+     *       other walkers do concurrently (no endpoint stealing);</li>
+     *   <li>the pick → record pair needs no external serialization — the
+     *       claim is cursor-local, and the health records are atomic;</li>
+     *   <li>the shared round (attempted bits, {@link #beginRound},
+     *       {@link #isRoundExhausted}) is never consulted nor mutated.</li>
+     * </ul>
+     * Pair with the {@code markRoundAttempted=false} record overloads so the
+     * walker's results update shared health without touching the shared
+     * round.
+     */
+    public RoundCursor newRoundCursor() {
+        return new RoundCursor();
+    }
+
+    /** See {@link #newRoundCursor()}. Not thread-safe for sharing a single
+     *  instance across walkers; create one per walk. */
+    public final class RoundCursor {
+        private final boolean[] attempted = new boolean[hostCount];
+
+        private RoundCursor() {
+        }
+
+        /**
+         * Highest-priority host this cursor has not yet returned, claimed at
+         * pick time; -1 once the cursor has swept every host. Ordering reads
+         * the LIVE shared health state under the tracker lock, so a state
+         * change recorded by any walker between two calls re-ranks the
+         * remaining hosts.
+         */
+        public int next() {
+            synchronized (lock) {
+                for (HostState p : PRIORITY_ORDER) {
+                    for (ZoneTier z : ZONE_PRIORITY_ORDER) {
+                        for (int i = 0; i < hostCount; i++) {
+                            if (!attempted[i] && states[i] == p && zoneTiers[i] == z) {
+                                attempted[i] = true;
+                                return i;
+                            }
+                        }
+                    }
+                }
+                return -1;
+            }
         }
     }
 
