@@ -58,7 +58,7 @@
     ```
 - name: ilp
   lang: java
-  path: examples/src/main/java/com/example/sender/BasicExample.java
+  path: examples/src/main/java/com/example/sender/TcpExample.java
   header: |-
     Java client library [docs](https://questdb.io/docs/reference/clients/java_ilp)
     and [Maven artifact](https://search.maven.org/artifact/org.questdb/questdb).
@@ -130,7 +130,7 @@
     port: 9009
 - name: ilp-from-conf
   lang: java
-  path: examples/src/main/java/com/example/sender/BasicExample.java
+  path: examples/src/main/java/com/example/sender/TcpExample.java
   header: |-
     Java client library [docs](https://questdb.io/docs/reference/clients/java_ilp)
     and [Maven artifact](https://search.maven.org/artifact/org.questdb/questdb).

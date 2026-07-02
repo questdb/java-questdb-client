@@ -53,7 +53,7 @@ public class WsColumnTypesExample {
                 // microsecond TIMESTAMP.
                 sender.table("ticks")
                         .doubleColumn("d", 1.0)
-                        .at(System.nanoTime(), ChronoUnit.NANOS);
+                        .at(System.currentTimeMillis() * 1_000_000L, ChronoUnit.NANOS);
 
                 // Server-assigned wall-clock time.
                 sender.table("all_types")

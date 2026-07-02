@@ -1,9 +1,9 @@
 package com.example.query;
 
 import io.questdb.client.Completion;
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
-import io.questdb.client.Query;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 

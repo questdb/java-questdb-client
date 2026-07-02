@@ -18,10 +18,13 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * compact; the underlying batch is still column-major and the {@code (col, row)}
  * primitives remain available on {@code batch} for callers that prefer them.
  * <p>
- * Assumes a table exists:
+ * Queries the {@code trades} table the ingest examples
+ * ({@code com.example.sender.WsExample}, {@code com.example.QuestDBExample})
+ * write -- auto-created on first ingest as:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class BasicQueryExample {
@@ -30,7 +33,7 @@ public class BasicQueryExample {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
             try {
                 db.executeSql(
-                        "SELECT ts, sym, price, qty FROM trades WHERE sym = 'AAPL' LIMIT 1000",
+                        "SELECT timestamp, symbol, side, price, amount FROM trades WHERE symbol = 'ETH-USD' LIMIT 1000",
                         new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
@@ -38,14 +41,15 @@ public class BasicQueryExample {
                                 // current row; copy values out before the callback returns if you
                                 // need to retain them past the surrounding onBatch call.
                                 batch.forEachRow(row -> {
-                                    long timestamp = row.getLongValue(0);  // TIMESTAMP -> microseconds since epoch
-                                    String symbol = row.getSymbol(1);      // SYMBOL -> String
-                                    double price = row.getDoubleValue(2);  // DOUBLE
-                                    long qty = row.getLongValue(3);        // LONG
+                                    long timestamp = row.getLongValue(0);   // TIMESTAMP -> microseconds since epoch
+                                    String symbol = row.getSymbol(1);       // SYMBOL -> String
+                                    String side = row.getSymbol(2);         // SYMBOL -> String
+                                    double price = row.getDoubleValue(3);   // DOUBLE
+                                    double amount = row.getDoubleValue(4);  // DOUBLE
 
                                     System.out.printf(
-                                            "ts=%d sym=%s price=%.4f qty=%d%n",
-                                            timestamp, symbol, price, qty
+                                            "ts=%d symbol=%s side=%s price=%.4f amount=%.5f%n",
+                                            timestamp, symbol, side, price, amount
                                     );
                                 });
                             }

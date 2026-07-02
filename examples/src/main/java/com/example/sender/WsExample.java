@@ -20,7 +20,7 @@ import io.questdb.client.Sender;
  * </ul>
  * A {@code Sender} is not thread-safe, so no two threads may share one -- the
  * pool hands each thread its own. Contrast with the low-level ILP examples in
- * this package ({@link BasicExample}, {@link HttpExample}, ...), which open a
+ * this package ({@link TcpExample}, {@link HttpExample}, ...), which open a
  * dedicated {@code Sender.fromConfig(...)} connection per use over HTTP/TCP.
  */
 public class WsExample {

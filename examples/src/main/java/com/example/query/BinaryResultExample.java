@@ -1,4 +1,4 @@
-package com.example;
+package com.example.query;
 
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
@@ -17,7 +17,7 @@ import java.util.Arrays;
  * {@code byte[]}; {@code getBinaryA}/{@code getBinaryB} give reusable native
  * views for allocation-free reads.
  */
-public class BinaryColumnExample {
+public class BinaryResultExample {
 
     public static void main(String[] args) throws InterruptedException {
         byte[] payload = {0x00, 0x01, 0x02, (byte) 0xFF};
