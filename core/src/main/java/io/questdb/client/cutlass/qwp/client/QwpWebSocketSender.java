@@ -1062,6 +1062,27 @@ public class QwpWebSocketSender implements Sender {
                 // The I/O thread may still be using the socket and microbatch
                 // buffers. Freeing them would risk SIGSEGV.
                 LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
+                // The engine, however, need not leak: delegate its close to
+                // the I/O thread's exit path, which runs it strictly after
+                // the thread's last engine access — the mapping and slot
+                // lock release as soon as the stuck wire call resolves
+                // (bounded by OS timeouts). slotLockReleased intentionally
+                // stays false: the lock is released only when the delegated
+                // close actually runs, so the pool must not reuse the slot
+                // meanwhile. A false return means the thread exited between
+                // the failed close() and now — then closing here is safe.
+                if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null
+                        && !cursorSendLoop.delegateEngineClose()) {
+                    try {
+                        cursorEngine.close();
+                    } catch (Throwable t) {
+                        LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                        terminalError = captureCloseError(terminalError, t);
+                    }
+                    cursorEngine = null;
+                    ownsCursorEngine = false;
+                    slotLockReleased = true;
+                }
                 rethrowTerminal(terminalError);
                 return;
             }

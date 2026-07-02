@@ -217,6 +217,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // terminalError: the only writer runs on the I/O thread under the same
     // first-writer-wins latch.
     private volatile QwpDurableAckMismatchException capabilityGapTerminal;
+    // Failed-stop hand-off flag: set by delegateEngineClose() when an owner's
+    // close() could not stop the I/O thread and the engine close is therefore
+    // performed by the I/O thread's exit path. Write-once, owner thread only;
+    // read by the I/O thread strictly after its shutdown-latch countdown (see
+    // the handshake contract on delegateEngineClose).
+    private volatile boolean engineCloseDelegated;
     // The latched terminal failure — THE exception every checkError() call
     // rethrows. Write-once for the loop's lifetime: the only writer is
     // recordFatal on the I/O thread (first-writer-wins). The whole
@@ -576,8 +582,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (t.isAlive()) {
                 try {
                     shutdownLatch.await();
-                } catch (InterruptedException ignored) {
+                } catch (InterruptedException e) {
+                    // Re-assert the flag for the caller's stack, then decide.
+                    // If the I/O thread has genuinely not exited (latch still
+                    // up — it may be inside a blocking native connect/send
+                    // that neither unpark nor interrupt cancels), touching the
+                    // client here would free native buffers under a possibly
+                    // mid-send thread, and returning quietly would let the
+                    // owner unmap the engine under it (C5 SEGV). Signal the
+                    // failed stop loudly instead: QwpWebSocketSender.close()
+                    // keys its ioThreadStopped guard on this throw, and
+                    // BackgroundDrainer switches to delegateEngineClose().
+                    // The I/O thread's own exit path (ioLoop's finally)
+                    // disposes of the client either way. ioThread stays set,
+                    // so a duplicate close() re-signals rather than silently
+                    // succeeding against a still-live thread.
                     Thread.currentThread().interrupt();
+                    if (shutdownLatch.getCount() != 0L) {
+                        throw new LineSenderException(
+                                "cursor I/O thread did not stop: close() was interrupted "
+                                        + "while awaiting shutdown; client/engine teardown "
+                                        + "is delegated to the I/O thread's exit path");
+                    }
+                    // Latch hit zero concurrently with the interrupt: the
+                    // thread is past its last client/engine access — proceed
+                    // with normal teardown.
                 }
             }
             ioThread = null;
@@ -600,6 +629,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             client = null;
         }
+    }
+
+    /**
+     * Failed-stop hand-off for the engine. Called by an owner whose
+     * {@link #close()} threw because the I/O thread would not stop: the owner
+     * must not free the engine (munmap/Unsafe.free of segment memory) while
+     * the thread may still touch it with raw {@code Unsafe} reads. Setting
+     * the delegation flag makes the I/O thread run {@code engine.close()} on
+     * its exit path, strictly after its last engine access and after the
+     * shutdown-latch countdown — releasing the slot lock as soon as the
+     * stuck wire call resolves (bounded by OS timeouts) instead of leaking
+     * the mapping and lock forever.
+     * <p>
+     * Returns {@code true} when the I/O thread is still live and has adopted
+     * the engine close; {@code false} when the thread has already exited —
+     * the caller must close the engine itself.
+     * <p>
+     * Memory model — the classic store/load handshake: this method writes the
+     * volatile flag, then reads the latch count; the exit path counts the
+     * latch down, then reads the flag. Under the sequential consistency of
+     * volatile (and AQS latch state) accesses, if this method observes the
+     * latch still up, the exit path is guaranteed to observe the flag — no
+     * missed close. If both sides act, {@link CursorSendEngine#close()} is
+     * synchronized and idempotent, so the double close is benign.
+     */
+    public boolean delegateEngineClose() {
+        engineCloseDelegated = true;
+        return shutdownLatch.getCount() != 0L;
     }
 
     /**
@@ -1232,6 +1289,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
             shutdownLatch.countDown();
+            // Failed-stop hand-off (see delegateEngineClose): the owner could
+            // not free the engine safely while this thread was alive, so the
+            // engine close — and with it the slot-lock release — happens
+            // here, strictly after this thread's last engine access. The flag
+            // is read only after the countDown: the store/load pairing with
+            // delegateEngineClose's flag-write-then-latch-read guarantees
+            // either this branch or the owner's fallback runs (or both —
+            // engine.close() is idempotent).
+            if (engineCloseDelegated) {
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
         }
     }
 

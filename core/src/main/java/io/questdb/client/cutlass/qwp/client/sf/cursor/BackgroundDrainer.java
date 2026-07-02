@@ -534,7 +534,21 @@ public final class BackgroundDrainer implements Runnable {
                                     slotPath, t.getMessage());
                             try {
                                 loop.close();
-                            } catch (Throwable ignored) {
+                            } catch (Throwable closeFailure) {
+                                // Interrupted shutdown mid-recycle (pool
+                                // shutdownNow): the old I/O thread is still
+                                // alive, so opening a new wire session against
+                                // the same engine would race its exit — and
+                                // closing the client under a possibly mid-send
+                                // thread risks SEGV. Bail out; the finally
+                                // re-runs loop.close(), which re-signals the
+                                // failed stop and routes client/engine
+                                // teardown to the delegation protocol there.
+                                LOG.warn("drainer slot {}: stop requested mid-recycle and the "
+                                                + "I/O thread did not stop ({}); abandoning recycle",
+                                        slotPath, closeFailure.getMessage());
+                                outcome = stopRequested ? DrainOutcome.STOPPED : DrainOutcome.FAILED;
+                                return;
                             }
                             try {
                                 client.close();
@@ -584,23 +598,51 @@ public final class BackgroundDrainer implements Runnable {
             }
             outcome = DrainOutcome.FAILED;
         } finally {
+            boolean ioThreadStopped = true;
             if (loop != null) {
                 try {
                     loop.close();
-                } catch (Throwable ignored) {
+                } catch (Throwable e) {
+                    // The loop's I/O thread would not stop — close() was
+                    // interrupted (the pool's shutdownNow path) while the
+                    // thread sat in a blocking native connect/send that
+                    // neither unpark nor interrupt cancels. Freeing the
+                    // client's buffers or unmapping the engine now would
+                    // race the live thread (C5 SEGV); both are delegated to
+                    // the thread's own exit path below.
+                    ioThreadStopped = false;
+                    LOG.warn("drainer slot {}: I/O thread did not stop during close ({}); "
+                                    + "delegating client/engine teardown to its exit path",
+                            slotPath, e.getMessage());
                 }
             }
-            if (client != null) {
+            if (client != null && ioThreadStopped) {
+                // Skipped on a failed stop: the thread may be mid-send on
+                // this very client; ioLoop's finally closes the loop's
+                // current client (this one, unless a reconnect swapped it —
+                // in which case swapClient already closed this reference).
                 try {
                     client.close();
                 } catch (Throwable ignored) {
                 }
             }
             if (engine != null) {
-                try {
-                    // engine.close() releases the slot lock too.
-                    engine.close();
-                } catch (Throwable ignored) {
+                // Failed-stop hand-off: delegateEngineClose() makes the I/O
+                // thread run engine.close() strictly after its last engine
+                // access, releasing the slot lock as soon as the stuck wire
+                // call resolves — deferred teardown, never abandoned. The
+                // false return covers the race where the thread exited
+                // between the failed close() and now: then it is safe (and
+                // necessary) to close the engine here.
+                if (ioThreadStopped || !loop.delegateEngineClose()) {
+                    try {
+                        // engine.close() releases the slot lock too.
+                        engine.close();
+                    } catch (Throwable ignored) {
+                    }
+                } else {
+                    LOG.warn("drainer slot {}: engine close delegated to the I/O thread; "
+                            + "slot lock releases when it exits", slotPath);
                 }
             }
             // Don't let a later requestStop() unpark an unrelated task that
