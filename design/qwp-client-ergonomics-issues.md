@@ -38,24 +38,29 @@ warning before blocking. A test asserts the warning / non-blocking default.
 ## ERG-2 — `reconnect_max_duration_millis`: misleading name + inconsistent `0` (P2, Candidate)
 
 **Symptom.** Two confusions:
-1. The name implies "reconnect only" but it also bounds the **initial** connect
-   in SYNC/ASYNC modes.
+1. The name implies "reconnect only" but the knob actually bounds **only** the
+   blocking initial connect in SYNC mode — the background reconnect loop
+   (mid-stream outages and ASYNC initial connect) ignores it and retries
+   indefinitely (Invariant B).
 2. `reconnect_max_duration_millis=0` means **give up immediately**, whereas
    `idle_timeout_ms=0` and `max_lifetime_ms=0` in the same config surface mean
-   **infinite**. There is no infinite-retry mode at all.
+   **infinite**.
 
-**Source.** `CursorWebSocketSendLoop.java:827` — `deadlineNanos = start + dur*1e6`,
-loop `while (now < deadline)`; `0` ⇒ zero iterations. Contrast
+**Source.** `CursorWebSocketSendLoop.connectWithRetry` — `deadlineNanos =
+start + dur*1e6`, loop `while (now < deadline)`; `0` ⇒ zero iterations.
+`connectLoop` (background) runs `while (running)` with no deadline. Contrast
 `QuestDBBuilder.idleTimeoutMillis/maxLifetimeMillis` (`0 ⇒ Long.MAX_VALUE`).
 
 **Why it's bad.** Same `0` token, opposite semantics depending on the knob;
-tolerating a long maintenance window forces magic numbers like `86400000`.
+and the knob's real scope (blocking sync startup only) is invisible from its
+name.
 
 **Proposed fix.**
 - Adopt one `0` convention. Recommended: `0 ⇒ infinite`, matching the pool
-  knobs, which also gives a real infinite-retry mode.
-- Consider an alias `connect_retry_budget_ms` that reflects it covers initial +
-  reconnect; keep the old key as a deprecated alias.
+  knobs, which also gives sync startup an infinite-wait option.
+- Consider an alias like `initial_connect_budget_ms` that reflects the knob's
+  real scope (blocking sync startup only); keep the old key as a deprecated
+  alias.
 
 **Acceptance.** Documented, consistent `0` semantics across the config surface;
 test covering `=0` behavior and (if added) infinite mode.

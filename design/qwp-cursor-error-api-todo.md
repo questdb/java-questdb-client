@@ -4,6 +4,11 @@ Branch: `vi_sf` (continues off the cursor SF work).
 Spec: `design/qwp-cursor-error-api.md` (decisions 1–14 locked).
 Depends on: `qwp-cursor-durability.md` (the SF substrate this builds on).
 
+> **Historical note (Invariant B):** step statuses below reflect the state at
+> the time of writing. The reconnect-budget-exhaustion terminal mentioned in
+> step 4 was later removed — the background reconnect loop now retries
+> indefinitely. See `qwp-client-startup-failover-behavior.md`.
+
 ## Shipped on `vi_sf`
 
 | Step | Status | Notes |

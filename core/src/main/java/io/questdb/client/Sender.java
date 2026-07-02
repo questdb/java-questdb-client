@@ -791,11 +791,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. A connect-budget exhaustion or a
-     *       terminal upgrade failure is delivered to the async error inbox
-     *       as a {@link io.questdb.client.SenderError} (no synchronous
-     *       throw on the user call site). Wire {@code error_handler=...}
-     *       to observe these.</li>
+     *       engine until the wire is up. Connect failures are retried
+     *       indefinitely in the background; a terminal upgrade failure
+     *       (auth reject, capability mismatch) is delivered to the async
+     *       error inbox as a {@link io.questdb.client.SenderError} (no
+     *       synchronous throw on the user call site). Wire
+     *       {@code error_handler=...} to observe these.</li>
      * </ul>
      * <p>
      * Default resolution when the caller does not pick a value:
@@ -2388,15 +2389,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Per-outage cap on the cursor I/O loop's reconnect retry budget.
-         * Once a wire failure occurs, the loop retries with exponential
-         * backoff until either reconnect succeeds (timer resets) or this
-         * many millis elapse since the first failure of this outage —
-         * whichever comes first. On budget exhaustion, the next user
-         * thread API call throws.
+         * Cap on the blocking initial-connect retry budget when
+         * {@code initial_connect_retry=sync}. {@code fromConfig} retries
+         * with exponential backoff until connect succeeds or this many
+         * millis elapse, then throws. The background reconnect loop
+         * (mid-stream outages and async initial connect) does NOT consult
+         * this value: it retries indefinitely and halts only on a terminal
+         * auth/upgrade error or {@code close()}.
          * <p>
-         * Default {@code 300_000} (5 minutes). Lower for fail-fast services;
-         * higher for tolerating long maintenance windows. WebSocket only.
+         * Default {@code 300_000} (5 minutes). Lower for fail-fast startup;
+         * higher for tolerating a slow server boot. WebSocket only.
          */
         public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {

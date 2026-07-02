@@ -464,6 +464,36 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test
+    public void testJvmErrorEscapesConnectRetryLoop() {
+        // Regression (M3): catch (Throwable) in connectWithDurableAckRetry used
+        // to swallow java.lang.Error (OOM, LinkageError, StackOverflowError)
+        // into the indefinite "cluster unreachable" retry -- pinning the slot
+        // .lock forever with no .failed sentinel and only a throttled WARN as
+        // a trace. A JVM/programming failure is not a transport outage:
+        // retrying cannot clear it, so it must escape the loop on the FIRST
+        // sweep. run()'s outer catch then quarantines the slot (markFailed +
+        // FAILED) and its finally releases the lock -- quarantine-and-exit.
+        CountingListener listener = new CountingListener();
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(
+                () -> new LinkageError("simulated JVM failure"));
+        BackgroundDrainer drainer = newDrainer(factory);
+        drainer.setListener(listener);
+        try {
+            drainer.connectWithDurableAckRetry();
+            Assert.fail("a JVM Error must escape the retry loop, "
+                    + "not spin as a transport outage");
+        } catch (LinkageError expected) {
+            assertEquals("simulated JVM failure", expected.getMessage());
+        }
+        // No retry: the Error propagated on the very first attempt.
+        assertEquals(1, factory.attempts());
+        // Neither observability callback fires -- this is not a durable-ack
+        // episode, and no escalation decision was made inside the loop.
+        assertEquals(0, listener.unavailableAttempts.size());
+        assertEquals(0, listener.persistentFailures.get());
+    }
+
+    @Test
     public void testRoleRejectChurnDoesNotConsumeCapabilityGapBudgetInvariantB() {
         // Rolling-upgrade interleave: a long all-replica window (role rejects),
         // then an old-build node is promoted and upgrades WITHOUT durable ack

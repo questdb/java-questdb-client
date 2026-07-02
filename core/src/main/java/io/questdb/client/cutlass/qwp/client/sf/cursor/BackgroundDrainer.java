@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -336,6 +337,17 @@ public final class BackgroundDrainer implements Runnable {
                 LOG.warn("drainer slot {} attempt {}: durable-ack unavailable, retrying after backoff",
                         slotPath, capabilityGapAttempts);
             } catch (Throwable t) {
+                if (t instanceof Error) {
+                    // java.lang.Error (OOM, LinkageError, StackOverflowError)
+                    // is a JVM/programming failure, not a transport outage:
+                    // retrying cannot clear it, and spinning here would pin
+                    // the slot .lock forever with no .failed sentinel and only
+                    // a throttled, possibly-null-message WARN as a trace.
+                    // Rethrow: run()'s outer catch quarantines the slot
+                    // (markFailed + FAILED) and its finally releases the lock
+                    // -- quarantine-and-exit, exactly as genuine terminals do.
+                    throw (Error) t;
+                }
                 // INVARIANT B: a transport failure -- the whole cluster is
                 // unreachable right now (server down, network partition) -- is
                 // TRANSIENT, exactly as the live sender's background loop treats
@@ -343,7 +355,11 @@ public final class BackgroundDrainer implements Runnable {
                 // until it does, stopRequested, or SF exhaustion. NEVER quarantine
                 // the slot on a transport error. Genuine terminals (auth /
                 // non-421 upgrade / durable-ack capability gap) are handled by the
-                // catches above and still fail fast.
+                // catches above and still fail fast. A QWP version mismatch also
+                // reaches here (it extends HttpClientException, not
+                // WebSocketUpgradeException) and is intentionally retried under
+                // Invariant B -- but it is NOT a transport outage, so log it
+                // truthfully below rather than mislabelling it "cluster unreachable".
                 lastErrorMessage = t.getMessage();
                 // Pause the episode wall clock: the gap-to-gap interval this
                 // window interrupts is never charged. Attempts and elapsed
@@ -352,8 +368,24 @@ public final class BackgroundDrainer implements Runnable {
                 lastCapabilityGapNanos = 0L;
                 long nowWarn = System.nanoTime();
                 if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {
-                    LOG.warn("drainer slot {}: cluster unreachable ({}), retrying after backoff",
-                            slotPath, t.getMessage());
+                    if (t instanceof QwpVersionMismatchException) {
+                        // The cluster IS reachable: every endpoint completed the
+                        // WebSocket upgrade but advertised a QWP protocol version
+                        // this client cannot speak. A rolling upgrade clears this
+                        // once peers converge, so Invariant B keeps retrying -- but
+                        // if it persists the client binary is version-incompatible
+                        // with the whole cluster and an operator must intervene
+                        // (upgrade the client or the servers). Name the real
+                        // condition so it is diagnosable, not hidden behind a
+                        // network-outage message.
+                        LOG.warn("drainer slot {}: every reachable endpoint advertises an unsupported "
+                                        + "QWP protocol version ({}); retrying (rolling-upgrade window) -- "
+                                        + "if this persists the client is version-incompatible with the cluster",
+                                slotPath, t.getMessage());
+                    } else {
+                        LOG.warn("drainer slot {}: cluster unreachable ({}), retrying after backoff",
+                                slotPath, t.getMessage());
+                    }
                     lastTransportWarnNanos = nowWarn;
                 }
             }

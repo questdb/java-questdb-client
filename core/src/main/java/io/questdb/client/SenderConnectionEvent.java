@@ -223,8 +223,10 @@ public final class SenderConnectionEvent {
         /**
          * Every endpoint in the configured address list was attempted and none
          * accepted the connection in this sweep. The client will back off and
-         * retry the sweep until the reconnect budget is exhausted. Fired once
-         * per failed sweep.
+         * retry the sweep — bounded by {@code reconnect_max_duration_millis}
+         * during a blocking (sync) initial connect, indefinitely otherwise
+         * (Invariant B: the background loop never gives up on a wall-clock
+         * budget). Fired once per failed sweep.
          */
         ALL_ENDPOINTS_UNREACHABLE,
 

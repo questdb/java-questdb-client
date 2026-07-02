@@ -130,7 +130,7 @@ public final class QuestDBBuilder {
     /**
      * Sets the async error handler applied to every pooled ingest
      * {@link Sender}. The handler receives terminal/async ingest errors
-     * (connect-budget exhaustion, terminal upgrade failures, write errors)
+     * (terminal upgrade failures, write errors)
      * from across the whole sender pool; notifications are delivered on the
      * senders' I/O threads, so the handler must be thread-safe and must not
      * block. Pass {@code null} (the default) to keep each sender's

@@ -27,7 +27,6 @@ String cfg = "ws::addr=db-a:9000,db-b:9000;"
         + "sf_dir=/var/lib/my-app/questdb-sf;"   // opt into disk durability
         + "sender_id=writer-1;"                  // unique per process per sf_dir
         + "initial_connect_retry=async;"         // non-blocking startup
-        + "reconnect_max_duration_millis=86400000;" // outage budget (24h)
         + "sf_max_total_bytes=100g;";
 
 // For production, prefer the builder so you can install an error handler:
@@ -45,9 +44,10 @@ Why each line matters:
 - `sf_dir` is the **only** SF enable switch — there is no boolean flag.
 - `initial_connect_retry=async` is what makes `build()` return without a live
   socket. Without it, startup is blocking (see [Mental model](#mental-model)).
-- `reconnect_max_duration_millis` is the outage budget for **both** the initial
-  connect and later reconnects. If it expires, the sender latches terminal and
-  stops; data already in `sf_dir` survives for a future sender on the same slot.
+- There is no outage budget to tune in async mode: the background loop retries
+  indefinitely (Invariant B) and never latches terminal on wall-clock time.
+  `reconnect_max_duration_millis` bounds only the blocking startup of
+  `initial_connect_retry=sync`, so it would be inert in this configuration.
 
 **Error visibility ⚠:** the simplest path (`Sender.fromConfig(...)` + async)
 surfaces terminal async failures only *later*, through a producer call or at
@@ -152,7 +152,7 @@ callers block up to `acquire_timeout_ms` then throw.
 | `sf_max_total_bytes` (SF mode) | `10 GiB` |
 | `sf_durability` | `MEMORY` |
 | `sf_append_deadline_millis` | `30000` |
-| `reconnect_max_duration_millis` | `300000` (`0` ⇒ **give up immediately**, not infinite ⚠) |
+| `reconnect_max_duration_millis` | `300000` (sync initial connect only; `0` ⇒ **give up immediately**, not infinite ⚠) |
 | `reconnect_initial_backoff_millis` | `100` |
 | `reconnect_max_backoff_millis` | `5000` |
 | `close_flush_timeout_millis` | `60000` |
@@ -225,7 +225,7 @@ ergonomic defect worth changing.
 | # | Sharp edge | Status |
 | --- | --- | --- |
 | 1 | `initial_connect_retry` is implicitly promoted to `SYNC` when any `reconnect_*` knob is set — a resilience knob silently makes startup block. | Candidate |
-| 2 | `reconnect_max_duration_millis` name implies "reconnect only" but also governs initial connect; `0` means "give up now" while sibling `0`s mean "infinite"; no infinite mode exists. | Candidate |
+| 2 | `reconnect_max_duration_millis` name implies "reconnect only" but it bounds **only** the blocking sync initial connect — the background reconnect loop ignores it and retries indefinitely (Invariant B); `0` means "give up now" while sibling `0`s mean "infinite". | Candidate |
 | 3 | `failover` sounds like it covers startup but only affects post-connect query `execute()`. Queries have no async/lazy initial connect at all. | Candidate |
 | 4 | No first-class write-only facade: a write-only user must still supply a query config and remember `query_pool_min=0`. | Candidate |
 | 5 | A single endpoint returning `401`/`403` is treated as cluster-wide terminal and aborts the whole endpoint walk, even at startup, even if other endpoints would accept the credentials. | Intended (documented), revisit |
@@ -270,19 +270,22 @@ With `initial_connect_retry=async`:
 - Producer calls and `flush()` can run before the server exists; frames
   accumulate in the cursor engine (and on disk with `sf_dir`).
 - The I/O thread retries in the background using the same loop used after wire
-  failure.
-- If a server appears before the budget expires, buffered frames are
-  sent/replayed and ACK-driven trimming begins.
-- If the budget expires before any connection, the sender latches a terminal
-  `SenderError` whose message contains `never-connected-budget-exhausted`.
-- If it connected at least once and a later outage exhausts the budget, the
-  message contains `connection-lost-budget-exhausted`.
+  failure. This loop retries indefinitely (Invariant B: a store-and-forward
+  drainer never gives up on a wall-clock budget);
+  `reconnect_max_duration_millis` is not consulted here — it bounds only the
+  blocking (sync) initial connect.
+- When a server appears, buffered frames are sent/replayed and ACK-driven
+  trimming begins.
+- The only terminal failures are genuinely non-retriable ones: auth reject,
+  non-421 upgrade reject, or a durable-ack capability mismatch. These latch a
+  terminal `SenderError`.
 - Terminal async errors go to a configured `SenderErrorHandler`; without one
   they surface on later producer calls or at close-time.
 
-There is no infinite-retry mode. For long maintenance windows, set a large
-`reconnect_max_duration_millis`. On budget exhaustion the current sender stops;
-persisted `sf_dir` data remains for a future sender on the same slot.
+The background loop is an infinite-retry mode by design. A bounded wall-clock
+budget applies only to the blocking (sync) initial connect, which throws from
+`fromConfig` on exhaustion. A closed sender leaves persisted `sf_dir` data in
+place for a future sender on the same slot.
 
 ### Ingest endpoint walk (`addr=a:9000,b:9000,...`)
 
@@ -369,8 +372,8 @@ reconnect/replay.
 | server down, reconnect duration set, no mode | `reconnect_max_duration_millis=...` | **synchronous** retry; build blocks ⚠ |
 | server down, async | `initial_connect_retry=async` | build returns; I/O thread retries |
 | server returns `401`/`403` | any mode | terminal auth failure; no endpoint continuation |
-| server appears before async budget | async + budget | buffered frames sent and ACKed |
-| server appears after async budget | async + exhausted | sender terminal; new sender/restart needed |
+| server appears at any later time | async | buffered frames sent and ACKed (background loop retries indefinitely) |
+| server never appears | async | loop retries until `close()`; rows accumulate until SF backpressure |
 
 #### Read-replica startup (one bad endpoint, another replica works)
 
@@ -435,9 +438,11 @@ else                                 -> OFF
 - For immediate background drain of all slots, keep enough `sender_pool_min`
   slots warm or construct direct senders for the slots that must actively retry.
 
-### Reconnect deadline (`CursorWebSocketSendLoop`)
+### Reconnect loops (`CursorWebSocketSendLoop`)
 
-`deadlineNanos = outageStartNanos + reconnect_max_duration_millis * 1e6`; the
-loop runs `while (running && now < deadline)`. Hence `0` ⇒ no iterations ⇒
-immediate give-up. `QwpAuthFailedException` / `WebSocketUpgradeException` inside
-the loop are terminal across all endpoints.
+The background loop (`connectLoop`: mid-stream outages and async initial
+connect) runs `while (running)` with **no** wall-clock deadline (Invariant B);
+it exits only on `close()` or a terminal auth/upgrade/durable-ack error across
+all endpoints. The blocking sync initial connect (`connectWithRetry`) keeps the
+deadline: `deadlineNanos = start + reconnect_max_duration_millis * 1e6`, so `0`
+⇒ no iterations ⇒ immediate give-up, throwing from `fromConfig`.

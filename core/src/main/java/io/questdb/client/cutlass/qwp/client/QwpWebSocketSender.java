@@ -229,13 +229,14 @@ public class QwpWebSocketSender implements Sender {
     // point in buildAndConnect.
     private boolean hasEverConnected;
     // OFF   → startup connect failure is immediately terminal (default).
-    // SYNC  → startup connect goes through the same retry-with-backoff
-    //         loop as in-flight reconnect; auth failures still terminal.
+    // SYNC  → startup connect retries with backoff on the user thread,
+    //         bounded by reconnect_max_duration_millis; auth failures
+    //         still terminal.
     // ASYNC → user thread does not connect at all. The I/O thread runs
-    //         the same retry loop in the background; terminal failures
-    //         (auth/upgrade reject, budget exhaustion) are delivered
-    //         to the SenderError dispatcher rather than thrown from the
-    //         constructor.
+    //         the reconnect loop in the background, indefinitely
+    //         (Invariant B); terminal failures (auth/upgrade reject)
+    //         are delivered to the SenderError dispatcher rather than
+    //         thrown from the constructor.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
@@ -2316,7 +2317,7 @@ public class QwpWebSocketSender implements Sender {
      * True iff this sender has at least once installed a live (connected
      * + upgraded) WebSocket. Sticky — once true, stays true even after a
      * subsequent disconnect. Lets a {@link SenderErrorHandler}
-     * disambiguate a "never reached the server" budget exhaustion (likely
+     * disambiguate a "never reached the server" terminal failure (likely
      * a config typo or firewall block) from a "lost connection after we
      * were up" failure (likely transient). Returns {@code false} if no
      * I/O loop is running.
@@ -2891,8 +2892,9 @@ public class QwpWebSocketSender implements Sender {
                 // version today). Frames written before the first successful
                 // connect commit to V1 because cursor segments are immutable;
                 // a future version bump must account for that. Auth/upgrade
-                // rejects and budget exhaustion are surfaced via the error
-                // inbox by the I/O thread, not thrown here.
+                // rejects are surfaced via the error inbox by the I/O
+                // thread, not thrown here; plain connect failures retry
+                // indefinitely (Invariant B).
                 client = null;
                 break;
             case OFF:

@@ -35,6 +35,7 @@ import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -200,7 +201,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true. Used to
-    // distinguish "never reached the server" budget exhaustion (looks like a
+    // distinguish a "never reached the server" terminal failure (looks like a
     // config typo or firewall block) from "lost connection after we were
     // up" (looks transient).
     private volatile boolean hasEverConnected;
@@ -416,11 +417,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         contextLabel, e.getMessage());
                 throw e;
             } catch (Throwable e) {
+                if (e instanceof Error) {
+                    // JVM/programming failure (OOM, LinkageError): not a
+                    // transport outage, retrying cannot clear it. Propagate
+                    // to the caller instead of burning the connect budget.
+                    throw (Error) e;
+                }
                 lastError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {} failed: {}",
-                            contextLabel, attempts, e.getMessage());
+                    if (e instanceof QwpVersionMismatchException) {
+                        // Reachable but protocol-incompatible: consumes the connect
+                        // budget (walks the cluster across a rolling-upgrade window)
+                        // and, on exhaustion, surfaces as the terminal
+                        // LineSenderException below. Name the condition so a version
+                        // skew is diagnosable, not read as a generic connect failure.
+                        LOG.warn("{} attempt {}: every reachable endpoint advertises an unsupported "
+                                        + "QWP protocol version ({}); retrying within connect budget",
+                                contextLabel, attempts, e.getMessage());
+                    } else {
+                        LOG.warn("{} attempt {} failed: {}",
+                                contextLabel, attempts, e.getMessage());
+                    }
                     lastLogNanos = now;
                 }
             }
@@ -681,7 +699,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * True iff the I/O loop has at least once installed a live (connected
      * + upgraded) WebSocket client. Sticky — once true, stays true even
      * after a subsequent disconnect. Lets a {@code SenderErrorHandler}
-     * disambiguate a "never reached the server" budget exhaustion (likely
+     * disambiguate a "never reached the server" terminal failure (likely
      * a config typo or firewall block) from a "lost connection after we
      * were up" failure (likely transient).
      */
@@ -820,8 +838,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
      * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
-     * a terminal upgrade reject or budget exhaustion is delivered through
-     * the dispatcher, not thrown to the producer.
+     * connect failures are retried indefinitely (Invariant B), and a
+     * terminal upgrade reject is delivered through the dispatcher, not
+     * thrown to the producer.
      */
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(
@@ -948,25 +967,61 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 dispatchError(err);
                 return;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
-                // Role mismatch: cluster reconfigured during this connect, the
-                // previously-writable endpoint is now read-only. Reset backoff
-                // (don't double on each role reject -- failover usually clears
-                // within seconds) and park for the initial interval before the
-                // next attempt.
-                backoffMillis = reconnectInitialBackoffMillis;
-                lastReconnectError = e;
-                if (running) {
-                    // Failover usually clears within seconds -- retry at the
-                    // initial interval. No wall-clock deadline (Invariant B): a
-                    // replica is promotable, so keep retrying until it is.
-                    LockSupport.parkNanos(reconnectInitialBackoffMillis * 1_000_000L);
-                }
-                continue;
-            } catch (Throwable e) {
+                // Role mismatch: every reachable endpoint role-rejected the
+                // upgrade -- right now they are all replicas / primary-catchup.
+                // This is a TRANSIENT failover window (a replica is promotable),
+                // so keep retrying with no wall-clock deadline (Invariant B).
+                // Do NOT reset the backoff or pin it at the initial interval:
+                // fall through to the shared capped exponential backoff-with-
+                // jitter block below. Pinning at reconnectInitialBackoffMillis
+                // turned a persistent all-replica window (e.g. an address list
+                // pointing at replicas only, now surfaced here as a retriable
+                // role reject rather than a terminal durable-ack mismatch) into
+                // a fixed ~10/s storm of fresh TLS handshakes -- new
+                // WebSocketClient, new SSLContext, trust-store re-read -- per
+                // endpoint, forever. Growing to reconnectMaxBackoffMillis
+                // mirrors the orphan drainer's role-reject path and honours the
+                // documented capped-exponential-backoff contract.
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {} failed: {}", phase, attempts, e.getMessage());
+                    LOG.warn("{} attempt {}: every reachable endpoint is a replica "
+                                    + "(transient failover window); retrying with capped backoff -- "
+                                    + "if this persists the configured address list may point at replicas only",
+                            phase, attempts);
+                    lastLogNanos = now;
+                }
+                // fall through to the shared capped-backoff block
+            } catch (Throwable e) {
+                if (e instanceof Error) {
+                    // JVM/programming failure (OOM, LinkageError): retrying
+                    // cannot clear it -- Invariant B covers transport outages
+                    // only. Latch it as terminal FIRST so a producer parked in
+                    // checkError() observes the failure and `running` flips
+                    // false, then rethrow so the I/O thread dies loudly
+                    // instead of reconnect-looping. The fail() call site sits
+                    // inside ioLoop's catch, so ioLoop's finally still counts
+                    // down the shutdown latch and close() cannot hang.
+                    recordFatal(e);
+                    throw (Error) e;
+                }
+                lastReconnectError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    if (e instanceof QwpVersionMismatchException) {
+                        // Not a transport failure: the server completed the WS
+                        // upgrade but advertised a QWP version this client cannot
+                        // speak. Retried indefinitely under Invariant B (a rolling
+                        // upgrade clears it once peers converge), but log the real
+                        // condition so a persistent client/cluster version skew is
+                        // diagnosable instead of reading as a generic connect fail.
+                        LOG.warn("{} attempt {}: every reachable endpoint advertises an unsupported "
+                                        + "QWP protocol version ({}); retrying (rolling-upgrade window) -- "
+                                        + "if this persists the client is version-incompatible with the cluster",
+                                phase, attempts, e.getMessage());
+                    } else {
+                        LOG.warn("{} attempt {} failed: {}", phase, attempts, e.getMessage());
+                    }
                     lastLogNanos = now;
                 }
             }
@@ -1093,9 +1148,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // a reconnect factory is wired. Drive the very first connect on
             // this thread so the producer thread never blocks on it.
             // attemptInitialConnect either sets `client` (success) or records
-            // a terminal failure and clears `running` (auth/upgrade reject or
-            // budget exhaustion). Either way, the main loop below sees the
-            // outcome via the `running` and `client` fields.
+            // a terminal failure and clears `running` (auth/upgrade reject;
+            // plain connect failures retry indefinitely under Invariant B).
+            // Either way, the main loop below sees the outcome via the
+            // `running` and `client` fields.
             if (client == null && running) {
                 attemptInitialConnect();
             }
@@ -1123,6 +1179,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
         } catch (Throwable t) {
+            if (t instanceof Error) {
+                // Never funnel a JVM Error into the reconnect loop: latch it
+                // as terminal so checkError() surfaces it to the producer,
+                // then rethrow so the thread dies loudly. The finally still
+                // counts down the shutdown latch, so close() cannot hang.
+                recordFatal(t);
+                throw (Error) t;
+            }
             fail(t);
         } finally {
             shutdownLatch.countDown();
@@ -1275,7 +1339,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.client = newClient;
         // Sticky: once the wire is up, we've reached the server at least
         // once for this sender's lifetime. Used downstream to classify a
-        // subsequent budget exhaustion as transient vs config-likely.
+        // subsequent terminal failure as transient vs config-likely.
         this.hasEverConnected = true;
         if (old != null) {
             try {

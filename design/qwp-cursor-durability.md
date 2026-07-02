@@ -2,6 +2,13 @@
 
 Status: **draft v3**, working notes for the cursor SF refactor on `vi_sf`.
 
+> **Superseded in part (Invariant B):** the per-outage reconnect give-up
+> described below ("on budget exhaustion the next user-thread API call
+> throws") was later removed. The background reconnect loop now retries
+> indefinitely; `reconnect_max_duration_millis` bounds only the blocking
+> sync initial connect. See `qwp-client-startup-failover-behavior.md` for
+> current behavior.
+
 ## Goals
 - **Reduce data loss.** SF mode preserves every batch the producer has handed to the engine until the server has ACK'd it, surviving JVM crashes, process restarts, and transient network outages.
 - Memory mode (`ws::addr=...;` no `sf_dir`) is reliable enough for typical use under transient network blips.

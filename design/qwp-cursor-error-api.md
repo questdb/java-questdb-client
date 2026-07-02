@@ -2,6 +2,11 @@
 
 Status: **draft v1**, follow-on to `qwp-cursor-durability.md`. Targets branch `vi_sf`.
 
+> **Superseded in part (Invariant B):** "reconnect budget exhaustion remains
+> terminal" no longer holds. The background reconnect loop retries
+> indefinitely and never synthesizes a budget-exhaustion `SenderError`. See
+> `qwp-client-startup-failover-behavior.md` for current behavior.
+
 ## Goals
 - **Surface server-side rejections** (schema mismatch, parse, security, write, internal) to user code without compromising the async `flush()` contract.
 - **Match the wire**: client categories align 1:1 with the stable status bytes already shipped by the server (`WebSocketResponse` + `QwpProcessorState` mapping). No client-side category the wire can't actually distinguish.
