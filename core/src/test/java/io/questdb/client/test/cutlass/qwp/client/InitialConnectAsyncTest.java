@@ -144,7 +144,7 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() {
+    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() throws Exception {
         // Sender opens before the server is listening. Frames are
         // appended to the cursor SF engine on the producer thread. The
         // I/O thread retries connect in the background; once the server
@@ -158,7 +158,10 @@ public class InitialConnectAsyncTest {
                     + ";reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=200"
                     + ";close_flush_timeout_millis=2000;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            // fromConfig/flush/setup failures must fail the test -- only
+            // close() teardown noise is tolerated (see closeQuietly).
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 // wasEverConnected starts false in async mode — the I/O
                 // thread has not yet completed an upgrade.
@@ -187,9 +190,9 @@ public class InitialConnectAsyncTest {
                 Assert.assertTrue(
                         "wasEverConnected() must flip to true after the I/O thread connects",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+            } finally {
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
@@ -222,7 +225,7 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testConnectionLostRetriesForeverNoTerminal() {
+    public void testConnectionLostRetriesForeverNoTerminal() throws Exception {
         // INVARIANT B: after a successful connect, if the server drops, the
         // mid-stream reconnect must retry FOREVER -- it must NEVER surface a
         // connection-lost terminal on a wall-clock budget. The rows are safe in
@@ -266,15 +269,16 @@ public class InitialConnectAsyncTest {
                         "wasEverConnected() must remain true after the outage",
                         ((QwpWebSocketSender) sender).wasEverConnected());
             } finally {
-                sender.close();
+                // closeQuietly (not a bare close()) so a close-path exception
+                // cannot replace a pending AssertionError from the contract
+                // assertions above and mask a genuine failure.
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
     @Test
-    public void testWasEverConnectedTrueImmediatelyInSyncMode() {
+    public void testWasEverConnectedTrueImmediatelyInSyncMode() throws Exception {
         // Default (OFF) and SYNC modes both connect on the user thread
         // before fromConfig returns. wasEverConnected() must therefore
         // already be true the instant the sender becomes visible to the
@@ -287,13 +291,14 @@ public class InitialConnectAsyncTest {
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=0;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 Assert.assertTrue(
                         "wasEverConnected() must be true immediately in OFF/SYNC mode",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+            } finally {
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
@@ -313,6 +318,20 @@ public class InitialConnectAsyncTest {
                         "I/O thread did not log a connect attempt within 5s");
             }
             io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
+    /**
+     * Closes the sender, tolerating close-path teardown noise only. Used
+     * instead of a broad {@code catch (Exception ignored)} around a whole
+     * test body, which would swallow fromConfig/flush/setup failures and
+     * let the contract assertions pass vacuously.
+     */
+    private static void closeQuietly(Sender sender) {
+        try {
+            sender.close();
+        } catch (Exception ignored) {
+            // close() teardown noise only
         }
     }
 

@@ -119,7 +119,10 @@ public class ReconnectTest {
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
             Throwable observed = null;
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            // fromConfig/first-flush/setup failures must fail the test --
+            // only close() teardown noise is tolerated in the finally below.
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
@@ -141,9 +144,13 @@ public class ReconnectTest {
                     }
                     Thread.sleep(50);
                 }
-            } catch (Exception ignored) {
-                // close() teardown noise -- the contract under test is the flush
-                // loop above, captured in `observed`.
+            } finally {
+                try {
+                    sender.close();
+                } catch (Exception ignored) {
+                    // close() teardown noise -- the contract under test is the
+                    // flush loop above, captured in `observed`.
+                }
             }
             Assert.assertNull(
                     "mid-stream reconnect must retry forever, not surface a terminal "
