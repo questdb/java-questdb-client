@@ -44,7 +44,7 @@ import org.jetbrains.annotations.NotNull;
  * <h2>What this callback is for</h2>
  * Dead-lettering rejected data, alerting, metrics. Producer-thread retry/abort logic
  * should not live here — that belongs in the {@code catch (LineSenderServerException)}
- * block on the producer thread, which fires after a {@link SenderError.Policy#HALT}
+ * block on the producer thread, which fires after a {@link SenderError.Policy#TERMINAL}
  * latch on the next API call.
  *
  * @see SenderError

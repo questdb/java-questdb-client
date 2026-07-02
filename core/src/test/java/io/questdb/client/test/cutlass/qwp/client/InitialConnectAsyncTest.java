@@ -93,8 +93,8 @@ public class InitialConnectAsyncTest {
                         "category must be SECURITY_ERROR for ws-upgrade-failed",
                         SenderError.Category.SECURITY_ERROR, err.getCategory());
                 Assert.assertEquals(
-                        "auth failure is HALT",
-                        SenderError.Policy.HALT, err.getAppliedPolicy());
+                        "auth failure is TERMINAL",
+                        SenderError.Policy.TERMINAL, err.getAppliedPolicy());
                 String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
                 Assert.assertTrue(
                         "error message must mention ws-upgrade-failed: " + msg,

@@ -102,6 +102,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Default per-outage reconnect time cap (5 min).
      */
     public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
+    /**
+     * Poison-frame detector threshold: consecutive server-active rejections (NACK
+     * or non-orderly close) of the same head-of-line frame, with no ack progress in
+     * between, before the loop declares the frame poisoned and halts with a typed
+     * {@link SenderError.Category#PROTOCOL_VIOLATION} terminal. Below the threshold
+     * a retriable rejection recycles the connection and replays from ackedFsn+1.
+     */
+    public static final int MAX_HEAD_FRAME_REJECTIONS = 4;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
@@ -170,12 +178,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final AtomicLong totalReconnectAttempts = new AtomicLong();
     private final AtomicLong totalReconnects = new AtomicLong();
     // Total non-OK / non-DURABLE_ACK frames received from the server, classified
-    // by category. Includes both DROP_AND_CONTINUE and HALT outcomes — i.e. every
+    // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
     private WebSocketClient client;
-    // Optional: when non-null, every server-rejection error (DROP and HALT
-    // alike) is offered to the dispatcher for async delivery to the user's
+    // Optional: when non-null, every server-rejection error (retriable and
+    // terminal alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
     // Optional: when non-null, sender-side connection events (CONNECTED,
@@ -248,6 +256,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
+    // Poison-frame detector state (I/O thread only). poisonFsn is the head-of-line
+    // FSN (ackedFsn+1) observed at the most recent server-active rejection (NACK,
+    // or non-orderly close after at least one send on the connection);
+    // poisonStrikes counts consecutive rejections at that same FSN with no ack
+    // progress in between. Any ACK resets both. At MAX_HEAD_FRAME_REJECTIONS
+    // strikes the frame is declared poisoned: the server (or an intermediary)
+    // deterministically rejects these exact bytes, so replay cannot succeed and
+    // the loop halts with a typed PROTOCOL_VIOLATION terminal instead of
+    // reconnect-looping forever.
+    private long poisonFsn = -1L;
+    private int poisonStrikes;
     private volatile boolean running;
     // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
     // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
@@ -368,6 +387,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Category.SECURITY_ERROR;
             case WebSocketResponse.STATUS_WRITE_ERROR:
                 return SenderError.Category.WRITE_ERROR;
+            case WebSocketResponse.STATUS_NOT_WRITABLE:
+                return SenderError.Category.NOT_WRITABLE;
             default:
                 return SenderError.Category.UNKNOWN;
         }
@@ -472,34 +493,42 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Default policy per spec § "Default category → policy". User overrides
-     * (builder + connect-string) plug in here in a later commit; today this is
-     * the only resolver. Exposed for unit tests.
+     * Default category → policy mapping. There is no drop policy: a rejection is
+     * either replayed (RETRIABLE / RETRIABLE_OTHER — the bytes stay in the SF log,
+     * the connection is recycled, replay resumes from ackedFsn+1) or halts the
+     * sender loudly (TERMINAL — reserved for rejections that are deterministic
+     * under byte-identical replay; the bytes stay on disk). UNKNOWN fails open to
+     * RETRIABLE so a status byte from a newer server degrades to retry, not to a
+     * dead sender; a deterministic repeat is caught by the poison-frame detector.
+     * User overrides (builder + connect-string) plug in here in a later commit;
+     * today this is the only resolver. Exposed for unit tests.
      */
     @TestOnly
     public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
         switch (category) {
-            case SCHEMA_MISMATCH:
-            case WRITE_ERROR:
-                return SenderError.Policy.DROP_AND_CONTINUE;
-            case PARSE_ERROR:
-            case INTERNAL_ERROR:
-            case SECURITY_ERROR:
+            case WRITE_ERROR:     // transient server state (disk pressure, suspended table)
+            case INTERNAL_ERROR:  // transient by definition; deterministic repeats poison-escalate
+            case UNKNOWN:         // fail open: status byte from a newer server
+                return SenderError.Policy.RETRIABLE;
+            case NOT_WRITABLE:    // read-only replica / demoting primary: rotate endpoints
+                return SenderError.Policy.RETRIABLE_OTHER;
+            case SCHEMA_MISMATCH: // deterministic: same bytes, same mismatch
+            case PARSE_ERROR:     // deterministic: malformed bytes never parse
+            case SECURITY_ERROR:  // ACL denial on a writable node (read-only refusals arrive as role-change closes)
             case PROTOCOL_VIOLATION:
-            case UNKNOWN:
             default:
-                return SenderError.Policy.HALT;
+                return SenderError.Policy.TERMINAL;
         }
     }
 
     /**
-     * True if a WebSocket close code signals an unrecoverable protocol-layer
-     * violation: replaying the same bytes will produce the same close. Reserved
-     * codes that "MUST NOT be sent in a Close frame" (1004/1005/1006/1015) are
-     * intentionally not classified as terminal here — when they arrive in
-     * practice they signal abnormal disconnect rather than the server's
-     * reasoned rejection of payload bytes, so reconnect is the right reaction.
-     * Exposed for unit tests.
+     * True if a WebSocket close code nominally signals a protocol-layer
+     * violation per RFC 6455. NO LONGER consulted by the policy path: WS close
+     * codes carry no policy semantics (policy travels only in QWP NACK frames),
+     * every close is reconnect-eligible, and a frame that deterministically
+     * kills the connection is caught behaviorally by the poison-frame detector
+     * ({@link #MAX_HEAD_FRAME_REJECTIONS}) rather than by this code list.
+     * Retained for diagnostics and tests.
      */
     @TestOnly
     public static boolean isTerminalCloseCode(int code) {
@@ -750,7 +779,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Total server-side rejection frames observed since the loop started. Counts both
-     * DROP_AND_CONTINUE and HALT outcomes — every non-OK frame the server sent that
+     * retriable and terminal outcomes — every non-OK frame the server sent that
      * the client classified as a {@link SenderError}.
      */
     public long getTotalServerErrors() {
@@ -1004,7 +1033,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long toFsn = Math.max(fromFsn, engine.publishedFsn());
                 SenderError err = new SenderError(
                         SenderError.Category.SECURITY_ERROR,
-                        SenderError.Policy.HALT,
+                        SenderError.Policy.TERMINAL,
                         SenderError.NO_STATUS_BYTE,
                         "ws-upgrade-failed: " + e.getMessage(),
                         SenderError.NO_MESSAGE_SEQUENCE,
@@ -1036,7 +1065,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long toFsn = Math.max(fromFsn, engine.publishedFsn());
                 SenderError err = new SenderError(
                         SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.HALT,
+                        SenderError.Policy.TERMINAL,
                         SenderError.NO_STATUS_BYTE,
                         "durable-ack-mismatch: " + e.getMessage(),
                         SenderError.NO_MESSAGE_SEQUENCE,
@@ -1129,7 +1158,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Send {@code err} to the async-delivery dispatcher if one is configured.
-     * Producer-side typed throw (HALT) goes through {@code recordFatal} +
+     * Producer-side typed throw (TERMINAL) goes through {@code recordFatal} +
      * {@code checkError} regardless — this is purely the async observer path.
      */
     private void dispatchError(SenderError err) {
@@ -1137,6 +1166,55 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (d != null) {
             d.offer(err);
         }
+    }
+
+    /**
+     * Poison-frame detector: record a server-active rejection (NACK, or non-orderly
+     * close after at least one send on this connection) at the current head-of-line
+     * frame. Returns true when the same head FSN has now been rejected
+     * {@link #MAX_HEAD_FRAME_REJECTIONS} consecutive times with no ack progress in
+     * between — the frame is poisoned and replay is deterministic. I/O thread only.
+     */
+    private boolean recordHeadRejectionStrike() {
+        long head = engine.ackedFsn() + 1L;
+        if (head == poisonFsn) {
+            poisonStrikes++;
+        } else {
+            poisonFsn = head;
+            poisonStrikes = 1;
+        }
+        return poisonStrikes >= MAX_HEAD_FRAME_REJECTIONS;
+    }
+
+    /**
+     * Escalate a poisoned frame to a typed terminal: the server (or an intermediary)
+     * has deterministically rejected the head-of-line frame
+     * {@link #MAX_HEAD_FRAME_REJECTIONS} consecutive times with no ack progress, so
+     * replaying it cannot succeed and retrying would loop forever. recordFatal runs
+     * before dispatchError so the producer-observable terminal is latched before the
+     * user's handler is invoked. The rejected bytes remain in the SF log on disk —
+     * nothing is silently discarded.
+     */
+    private void haltOnPoisonedFrame(String lastRejection) {
+        long fromFsn = engine.ackedFsn() + 1L;
+        long toFsn = Math.max(fromFsn, engine.publishedFsn());
+        String msg = "frame at fsn=" + fromFsn + " rejected " + poisonStrikes
+                + " consecutive times with no ack progress -- poisoned frame, replay cannot succeed (last: "
+                + lastRejection + ')';
+        SenderError err = new SenderError(
+                SenderError.Category.PROTOCOL_VIOLATION,
+                SenderError.Policy.TERMINAL,
+                SenderError.NO_STATUS_BYTE,
+                msg,
+                SenderError.NO_MESSAGE_SEQUENCE,
+                fromFsn,
+                toFsn,
+                null,
+                System.nanoTime()
+        );
+        totalServerErrors.incrementAndGet();
+        recordFatal(new LineSenderServerException(err));
+        dispatchError(err);
     }
 
     /**
@@ -1644,6 +1722,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
+                // Any ACK on this connection means the server accepted the current
+                // head of the replay stream -- clear poison-frame suspicion.
+                poisonFsn = -1L;
+                poisonStrikes = 0;
                 if (durableAckMode) {
                     // Durable mode: stash the (wireSeq, table_seqTxns) tuple
                     // and wait for STATUS_DURABLE_ACK to release it. Empty
@@ -1687,34 +1769,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
         @Override
         public void onClose(int code, String reason) {
-            // Terminal close codes signal the server has rejected the wire
-            // bytes themselves — reconnecting and replaying the same bytes
-            // produces the same close. Stash a typed PROTOCOL_VIOLATION
-            // SenderError and halt directly. Reconnect-eligible codes
-            // (NORMAL_CLOSURE, GOING_AWAY, ABNORMAL_CLOSURE, etc.) still go
-            // through fail() so the reconnect retry loop can handle them.
-            if (isTerminalCloseCode(code)) {
-                long fromFsn = engine.ackedFsn() + 1L;
-                long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                String msg = "ws-close[" + code + " " + WebSocketCloseCode.describe(code)
-                        + "]: " + reason;
-                SenderError err = new SenderError(
-                        SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.HALT,
-                        SenderError.NO_STATUS_BYTE,
-                        msg,
-                        SenderError.NO_MESSAGE_SEQUENCE,
-                        fromFsn,
-                        toFsn,
-                        null,
-                        System.nanoTime()
-                );
-                totalServerErrors.incrementAndGet();
-                // recordFatal MUST run before dispatchError so the producer-
-                // observable terminal error is latched before the handler is
-                // invoked.
-                recordFatal(new LineSenderServerException(err));
-                dispatchError(err);
+            // WS close codes carry no policy semantics: policy travels only in
+            // QWP NACK frames (a server rejecting bytes NACKs before it closes).
+            // Every close is therefore a transport event and reconnect-eligible:
+            // fail() enters the retry loop and replays from ackedFsn+1. The one
+            // guarded case is a frame that deterministically kills the connection
+            // without a NACK (e.g. an intermediary's frame-size limit). That is
+            // caught behaviorally, not by code list: a non-orderly close arriving
+            // after this connection already sent the head frame counts a poison
+            // strike; MAX_HEAD_FRAME_REJECTIONS consecutive strikes at the same
+            // head FSN with no ack progress escalate to a typed terminal. Orderly
+            // closes (NORMAL_CLOSURE role-change handoff, GOING_AWAY restart
+            // drain) never count strikes — they are the server asking us to go
+            // elsewhere, not a verdict on the bytes.
+            boolean orderly = code == WebSocketCloseCode.NORMAL_CLOSURE
+                    || code == WebSocketCloseCode.GOING_AWAY;
+            if (!orderly && nextWireSeq > 0 && recordHeadRejectionStrike()) {
+                haltOnPoisonedFrame("ws-close[" + code + ' '
+                        + WebSocketCloseCode.describe(code) + "]: " + reason);
                 return;
             }
             fail(new LineSenderException(
@@ -1747,17 +1819,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     System.nanoTime()
             );
             totalServerErrors.incrementAndGet();
-            if (policy == SenderError.Policy.HALT) {
+            if (policy == SenderError.Policy.TERMINAL) {
                 // Latch the typed terminal error before invoking the handler
                 // so a synchronous probe of getLastTerminalError() / flush()
                 // from inside the handler observes the typed error. Mirrors
-                // the ordering in the post-send HALT path below.
+                // the ordering in the post-send TERMINAL path below.
                 recordFatal(new LineSenderServerException(err));
+                dispatchError(err);
+                return;
             }
-            // DROP_AND_CONTINUE: no watermark advance -- there is nothing
-            // sent on this connection to drop. The dispatch is the user's
-            // only handle to the server's complaint.
+            // RETRIABLE / RETRIABLE_OTHER: nothing was sent on this connection,
+            // so the rejection cannot implicate the head frame -- no poison
+            // strike. Surface for observability, then recycle the wire; the
+            // reconnect path replays from ackedFsn+1. No watermark advance --
+            // nothing is dropped.
             dispatchError(err);
+            fail(new LineSenderException(
+                    "pre-send server rejection (" + category + "): "
+                            + response.getErrorMessage()));
         }
 
         private void handleServerRejection(long wireSeq) {
@@ -1765,10 +1844,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             SenderError.Category category = classify(status);
             SenderError.Policy policy = defaultPolicyFor(category);
             // Same sanity clamp as the success branch above: do not trust a
-            // rejection wireSeq beyond what we've actually sent. Without this
-            // clamp the DROP path advances ackedFsn past publishedFsn, which
-            // makes the segment manager trim sealed segments the I/O thread
-            // is still reading — and the next Unsafe.getInt SEGVs the JVM.
+            // rejection wireSeq beyond what we've actually sent. The clamped
+            // value is only used to attribute an FSN to the error report --
+            // a rejection never advances the watermark.
             long highestSent = nextWireSeq - 1L;
             if (highestSent < 0L) {
                 // Pre-send rejection: server emitted an error frame before
@@ -1810,40 +1888,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             );
             totalServerErrors.incrementAndGet();
 
-            if (policy == SenderError.Policy.HALT) {
+            if (policy == SenderError.Policy.TERMINAL) {
                 // Terminal: stash the typed payload BEFORE dispatching to the
                 // handler. The spec requires signal.terminalError to be latched
                 // before the handler is invoked so a handler that synchronously
                 // probes getLastTerminalError() (or calls flush()) sees the
                 // typed error rather than null. Bytes on disk are the bytes
-                // the server rejected; reconnect/replay cannot fix them.
+                // the server rejected; reconnect/replay cannot fix them. The
+                // bytes stay in the SF log -- nothing is silently discarded.
                 recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
-            } else {
-                // DROP_AND_CONTINUE: advance ackedFsn past the rejected span
-                // so the loop drains subsequent batches. The data is dropped
-                // from the SF disk store via the existing trim path; the
-                // dispatch is the user's only handle to dead-letter.
-                LOG.warn("server rejected wire seq {} (category={}, status=0x{}) -- dropping batch and continuing",
-                        wireSeq, category, Integer.toHexString(status & 0xFF));
-                totalAcks.incrementAndGet();
-                if (durableAckMode) {
-                    // A rejected batch never reaches the WAL, so the server
-                    // will not emit a durable-ack for it. Stash an empty
-                    // entry so the queue still advances past it, but only
-                    // after every preceding OK'd batch is durable -- trimming
-                    // past unfilled durable slots would corrupt SF semantics.
-                    enqueuePendingOk(cappedSeq);
-                    drainPendingDurable();
-                } else if (engine.acknowledge(fsn)) {
-                    // DROP_AND_CONTINUE on the non-durable path advanced the
-                    // watermark past the rejected FSN; observers waiting on
-                    // a target FSN should see that advance, even though it
-                    // represents a drop rather than a successful commit.
-                    dispatchProgress(fsn);
-                }
-                dispatchError(err);
+                return;
             }
+            // RETRIABLE / RETRIABLE_OTHER: never drop, never latch. The bytes
+            // stay in the SF log; recycle the wire and replay from ackedFsn+1
+            // through the same reconnect machinery a transport failure uses
+            // (capped backoff + jitter, endpoint rotation via the reconnect
+            // factory, no wall-clock give-up -- Invariant B). The dispatch is
+            // informational. A frame the server keeps rejecting with no ack
+            // progress escalates to a poisoned-frame terminal instead of
+            // reconnect-looping forever.
+            LOG.warn("server rejected wire seq {} (category={}, policy={}, status=0x{}) -- recycling connection, will replay from fsn {}",
+                    wireSeq, category, policy, Integer.toHexString(status & 0xFF), engine.ackedFsn() + 1L);
+            dispatchError(err);
+            if (recordHeadRejectionStrike()) {
+                haltOnPoisonedFrame("server NACK status=0x"
+                        + Integer.toHexString(status & 0xFF) + " (" + category + "): "
+                        + response.getErrorMessage());
+                return;
+            }
+            fail(new LineSenderException(
+                    "server NACK (" + category + ", " + policy + "): "
+                            + response.getErrorMessage()));
         }
     }
 }

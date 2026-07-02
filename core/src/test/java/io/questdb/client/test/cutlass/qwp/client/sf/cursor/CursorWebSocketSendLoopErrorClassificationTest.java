@@ -33,9 +33,12 @@ import org.junit.Test;
 
 /**
  * Pure-mapping tests for the wire-byte → category → policy classification used
- * by the cursor SF send loop's response handler. End-to-end DROP_AND_CONTINUE
- * vs HALT integration is exercised against a real QuestDB server (questdb
- * repo).
+ * by the cursor SF send loop's response handler. There is no drop policy:
+ * rejections are either RETRIABLE (recycle the wire, replay from ackedFsn+1,
+ * nothing dropped), RETRIABLE_OTHER (same, but rotate endpoints — the node
+ * cannot serve writes), or TERMINAL (deterministic under replay: latch and
+ * halt loudly, bytes preserved on disk). End-to-end integration is exercised
+ * against a real QuestDB server (questdb repo).
  */
 public class CursorWebSocketSendLoopErrorClassificationTest {
 
@@ -70,9 +73,20 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
     }
 
     @Test
+    public void testClassifyNotWritable() {
+        // Reserved wire byte 0x0C: node cannot serve writes (read-only
+        // replica / demoting primary). Current servers signal this with a
+        // reconnect-eligible close instead of a NACK; classification exists
+        // for forward compatibility.
+        Assert.assertEquals(SenderError.Category.NOT_WRITABLE,
+                CursorWebSocketSendLoop.classify(WebSocketResponse.STATUS_NOT_WRITABLE));
+    }
+
+    @Test
     public void testClassifyUnknownStatusByte() {
         // Forward-compat: any byte the client doesn't recognize → UNKNOWN.
-        // Don't crash, don't misclassify — let the policy resolver halt loudly.
+        // Don't crash, don't misclassify — the policy resolver fails open to
+        // RETRIABLE so a status byte from a newer server degrades to retry.
         Assert.assertEquals(SenderError.Category.UNKNOWN,
                 CursorWebSocketSendLoop.classify((byte) 0x42));
         Assert.assertEquals(SenderError.Category.UNKNOWN,
@@ -82,38 +96,52 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
     }
 
     @Test
-    public void testDefaultPolicyDropForSchemaAndWriteErrors() {
-        // Spec: server-side rejection that replay can't fix → drop the batch
-        // and continue draining. Halting would block other tables on the
-        // same connection.
-        Assert.assertEquals(SenderError.Policy.DROP_AND_CONTINUE,
-                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.SCHEMA_MISMATCH));
-        Assert.assertEquals(SenderError.Policy.DROP_AND_CONTINUE,
+    public void testDefaultPolicyRetriableForTransientCategories() {
+        // WRITE_ERROR: transient server state (disk pressure, suspended
+        // table). INTERNAL_ERROR: transient by definition. UNKNOWN: fail
+        // open — a status byte from a newer server must degrade to retry,
+        // not to a dead sender. Deterministic repeats are caught by the
+        // poison-frame detector, not by pessimistic classification.
+        Assert.assertEquals(SenderError.Policy.RETRIABLE,
                 CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.WRITE_ERROR));
+        Assert.assertEquals(SenderError.Policy.RETRIABLE,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.INTERNAL_ERROR));
+        Assert.assertEquals(SenderError.Policy.RETRIABLE,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.UNKNOWN));
     }
 
     @Test
-    public void testDefaultPolicyHaltForBugCategoriesAndUnknown() {
-        // Spec: PARSE_ERROR is a client bug; INTERNAL_ERROR is unspecified;
-        // SECURITY_ERROR is misconfig; PROTOCOL_VIOLATION breaks the
-        // connection; UNKNOWN is forward-compat conservatism. All halt.
-        Assert.assertEquals(SenderError.Policy.HALT,
+    public void testDefaultPolicyRetriableOtherForNotWritable() {
+        // The node cannot serve writes at all — waiting out a backoff
+        // against the same node is pointless; rotate endpoints.
+        Assert.assertEquals(SenderError.Policy.RETRIABLE_OTHER,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.NOT_WRITABLE));
+    }
+
+    @Test
+    public void testDefaultPolicyTerminalForDeterministicRejections() {
+        // Deterministic under byte-identical replay: SCHEMA_MISMATCH (same
+        // bytes, same mismatch), PARSE_ERROR (malformed bytes never parse),
+        // SECURITY_ERROR (ACL denial on a writable node — read-only
+        // refusals arrive as role-change closes, not NACKs),
+        // PROTOCOL_VIOLATION (poison-frame escalation). All halt loudly;
+        // the bytes stay in the SF log — nothing is silently discarded.
+        Assert.assertEquals(SenderError.Policy.TERMINAL,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.SCHEMA_MISMATCH));
+        Assert.assertEquals(SenderError.Policy.TERMINAL,
                 CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.PARSE_ERROR));
-        Assert.assertEquals(SenderError.Policy.HALT,
-                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.INTERNAL_ERROR));
-        Assert.assertEquals(SenderError.Policy.HALT,
+        Assert.assertEquals(SenderError.Policy.TERMINAL,
                 CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.SECURITY_ERROR));
-        Assert.assertEquals(SenderError.Policy.HALT,
+        Assert.assertEquals(SenderError.Policy.TERMINAL,
                 CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.PROTOCOL_VIOLATION));
-        Assert.assertEquals(SenderError.Policy.HALT,
-                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.UNKNOWN));
     }
 
     @Test
     public void testDefaultPolicyCoversEveryCategory() {
         // Defense against silent drift if a category is added without
         // updating defaultPolicyFor. The switch's default branch returns
-        // HALT (forward-compat conservatism), so this also locks that in.
+        // TERMINAL (loud failure for unmapped categories), so this also
+        // locks that in.
         for (SenderError.Category c : SenderError.Category.values()) {
             SenderError.Policy p = CursorWebSocketSendLoop.defaultPolicyFor(c);
             Assert.assertNotNull("default policy must be set for " + c, p);
@@ -122,8 +150,10 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
 
     @Test
     public void testTerminalCloseCodes() {
-        // Per spec § "WS close frames": these codes signal the server has
-        // rejected the wire bytes themselves. Replay won't help; halt.
+        // isTerminalCloseCode is diagnostic-only: WS close codes carry no
+        // policy semantics (every close is reconnect-eligible; deterministic
+        // rejection is caught by the poison-frame detector). The RFC 6455
+        // nominal classification is still pinned here for log fidelity.
         Assert.assertTrue(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.PROTOCOL_ERROR));
         Assert.assertTrue(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.UNSUPPORTED_DATA));
         Assert.assertTrue(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.INVALID_PAYLOAD_DATA));
@@ -135,8 +165,8 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
     @Test
     public void testReconnectEligibleCloseCodes() {
         // Normal/abnormal disconnects: server didn't reject the wire bytes,
-        // it just went away. Reconnect retry loop should pick up — these must
-        // NOT be classified terminal.
+        // it just went away. These are additionally exempt from poison-frame
+        // strikes in onClose (orderly handoff/restart signals).
         Assert.assertFalse(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.NORMAL_CLOSURE));
         Assert.assertFalse(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.GOING_AWAY));
         Assert.assertFalse(CursorWebSocketSendLoop.isTerminalCloseCode(WebSocketCloseCode.NO_STATUS_RECEIVED));
@@ -156,7 +186,8 @@ public class CursorWebSocketSendLoopErrorClassificationTest {
         // classify() were ever called on them (e.g. by a future caller
         // bypassing the success branch), it must not pretend they're real
         // categories. Under the current mapping they fall through to
-        // UNKNOWN, which preserves halt-on-confusion semantics.
+        // UNKNOWN → RETRIABLE: a confused frame recycles the connection
+        // rather than killing the sender.
         Assert.assertEquals(SenderError.Category.UNKNOWN,
                 CursorWebSocketSendLoop.classify(WebSocketResponse.STATUS_OK));
         Assert.assertEquals(SenderError.Category.UNKNOWN,

@@ -601,8 +601,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Highest frame sequence number (FSN) the server has acknowledged, or that the sender
-     * has skipped past on a {@link SenderError.Policy#DROP_AND_CONTINUE} rejection.
+     * Highest frame sequence number (FSN) the server has acknowledged.
      * Returns {@code -1} when no batch has been published yet, and on transports that
      * do not track FSNs (HTTP, TCP, UDP).
      * <br>

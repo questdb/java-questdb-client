@@ -1036,9 +1036,9 @@ public class QwpWebSocketSender implements Sender {
                     //    user-installed custom handler
                     //    (hasDeliveredTerminalToCustomHandler, checked here).
                     //    The test is terminal-specific on purpose: an earlier
-                    //    routine DROP_AND_CONTINUE rejection delivered to the
-                    //    handler must NOT suppress a later genuine HALT
-                    //    terminal (the "any error ever" flag did, silently
+                    //    routine RETRIABLE rejection delivered to the
+                    //    handler must NOT suppress a later genuine TERMINAL
+                    //    error (the "any error ever" flag did, silently
                     //    losing it). It also stays false when the terminal
                     //    reached only the default handler after a
                     //    setErrorHandler(null) revert, or is still
@@ -1585,8 +1585,8 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Highest FSN that has been server-acknowledged (or skipped past on a
-     * {@link SenderError.Policy#DROP_AND_CONTINUE} rejection). {@code -1} if
+     * Highest FSN that has been server-acknowledged. Rejections never advance
+     * the watermark. {@code -1} if
      * the I/O loop has not yet started or no batch has been published.
      * <p>
      * Snapshot accessor — for a bounded wait, use
@@ -1816,7 +1816,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total errors observed by the I/O loop (DROP and HALT combined).
+     * Total errors observed by the I/O loop (retriable and terminal combined).
      */
     public long getTotalServerErrors() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2649,7 +2649,7 @@ public class QwpWebSocketSender implements Sender {
         // fabricate lifecycle transitions the foreground never had, steal the
         // once-per-lifetime CONNECTED classification, and re-size the
         // producer's batch guard for a connection the producer is not on
-        // (oversize batch -> ws-close[1009] -> producer-terminal HALT caused
+        // (oversize batch -> ws-close[1009] -> poison-frame escalation caused
         // by background activity).
         final boolean background = ctx.isBackground();
         // Private full-sweep cursor for background walks: claim-at-pick over

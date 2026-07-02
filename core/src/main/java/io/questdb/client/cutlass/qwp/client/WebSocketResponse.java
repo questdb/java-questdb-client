@@ -75,6 +75,13 @@ public class WebSocketResponse {
      */
     public static final byte STATUS_DURABLE_ACK = 0x02;
     public static final byte STATUS_INTERNAL_ERROR = 0x06;
+    /**
+     * Node cannot serve writes (read-only replica / demoting primary). Reserved:
+     * current servers signal this with a reconnect-eligible close instead of a
+     * NACK; mapped so a future server that NACKs it mid-stream gets
+     * retriable-with-rotation treatment instead of falling into UNKNOWN.
+     */
+    public static final byte STATUS_NOT_WRITABLE = 0x0C;
     // Status codes (must match https://questdb.com/docs/connect/wire-protocols/qwp-ingress-websocket/)
     public static final byte STATUS_OK = 0x00;
     public static final byte STATUS_PARSE_ERROR = 0x05;
@@ -215,6 +222,8 @@ public class WebSocketResponse {
                 return "SECURITY_ERROR";
             case STATUS_INTERNAL_ERROR:
                 return "INTERNAL_ERROR";
+            case STATUS_NOT_WRITABLE:
+                return "NOT_WRITABLE";
             default:
                 return "UNKNOWN(" + (status & 0xFF) + ")";
         }

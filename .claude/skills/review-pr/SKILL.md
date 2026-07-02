@@ -358,6 +358,20 @@ loses data and never hard-fails on a transient outage.
   transport error) must never increment it or burn its wall clock — a
   transient state consuming the terminal budget (shared attempt counter,
   entry-anchored deadline) IS a Critical violation of this checklist.
+- **Mid-stream server NACKs (no drop policy).** The NACK policy must mirror
+  the connect-time tiering. A rejection category that a transient cluster
+  state can produce (`WRITE_ERROR`, `INTERNAL_ERROR`, `UNKNOWN` — and any
+  future status byte) is RETRIABLE: recycle the wire and replay from
+  `ackedFsn+1`. It must NEVER drop the batch and NEVER latch a terminal /
+  quarantine a slot on first sight. Only rejections deterministic under
+  byte-identical replay (`SCHEMA_MISMATCH`, `PARSE_ERROR`, `SECURITY_ERROR`
+  on a writable node) may go TERMINAL. A client that advances the ack
+  watermark past a NACKed frame is silently losing data — Critical. A frame
+  repeatedly rejected with no ack progress must escalate through the
+  poison-frame detector (bounded consecutive strikes at the same head FSN),
+  not through a WS close-code list — close codes carry no policy semantics.
+  `UNKNOWN` must fail OPEN (retry), never closed (terminal): a status byte
+  from a newer server must degrade to retry, not to a dead sender.
 
 **Pool startup — two modes; the mode decides who sees connectivity errors.**
 - `lazy_connect=true`: `build()` MUST succeed with **no server present**. The
