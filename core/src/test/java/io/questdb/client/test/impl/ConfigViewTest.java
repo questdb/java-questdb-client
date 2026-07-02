@@ -130,6 +130,35 @@ public class ConfigViewTest {
     }
 
     @Test
+    public void testGetBoolAcceptsTrueFalseOnOff() {
+        Assert.assertTrue(view("ws::addr=h:9000;lazy_connect=true;").getBool("lazy_connect", false));
+        Assert.assertTrue(view("ws::addr=h:9000;lazy_connect=on;").getBool("lazy_connect", false));
+        Assert.assertFalse(view("ws::addr=h:9000;lazy_connect=false;").getBool("lazy_connect", true));
+        Assert.assertFalse(view("ws::addr=h:9000;lazy_connect=off;").getBool("lazy_connect", true));
+        // absent key -> caller's default, both polarities
+        Assert.assertTrue(view("ws::addr=h:9000;").getBool("lazy_connect", true));
+        Assert.assertFalse(view("ws::addr=h:9000;").getBool("lazy_connect", false));
+    }
+
+    @Test
+    public void testGetBoolInvalidRejected() {
+        assertParseError("ws::addr=h:9000;lazy_connect=maybe;",
+                v -> v.getBool("lazy_connect", false),
+                "invalid lazy_connect: maybe (expected true, false, on, off)");
+    }
+
+    @Test
+    public void testGetBoolIsCaseSensitive() {
+        // The connect-string value surface is exact-match lowercase: the
+        // tokenizer preserves value case and getBool accepts only
+        // true/false/on/off, so TRUE is rejected loudly rather than silently
+        // coerced (or worse, silently treated as the default).
+        assertParseError("ws::addr=h:9000;lazy_connect=TRUE;",
+                v -> v.getBool("lazy_connect", false),
+                "invalid lazy_connect: TRUE (expected true, false, on, off)");
+    }
+
+    @Test
     public void testGetBoolOnOffInvalidRejected() {
         assertParseError("ws::addr=h:9000;failover=maybe;",
                 v -> v.getBoolOnOff("failover", false),

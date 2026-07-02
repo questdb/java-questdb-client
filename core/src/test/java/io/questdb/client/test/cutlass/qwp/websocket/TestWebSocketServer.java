@@ -126,6 +126,23 @@ public class TestWebSocketServer implements Closeable {
      */
     public TestWebSocketServer(WebSocketServerHandler handler,
                                boolean emitDurableAckHeader, String advertisedRole) throws IOException {
+        this(handler, emitDurableAckHeader, advertisedRole, 0);
+    }
+
+    /**
+     * @param requestedPort loopback port to bind, or {@code 0} for an
+     *                      OS-assigned ephemeral port. A caller-chosen port
+     *                      lets a test model a server that goes DOWN and later
+     *                      comes back UP on the SAME endpoint (down-then-up
+     *                      outage realism): allocate via
+     *                      {@code TestPorts.findUnusedPort()}, let the client
+     *                      bang on the refused port, then bind here. Carries
+     *                      the standard bind-close-reuse exposure every
+     *                      pre-selected-port test in this suite accepts.
+     */
+    public TestWebSocketServer(WebSocketServerHandler handler,
+                               boolean emitDurableAckHeader, String advertisedRole,
+                               int requestedPort) throws IOException {
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
         this.advertisedRole = advertisedRole;
@@ -135,7 +152,7 @@ public class TestWebSocketServer implements Closeable {
         // which another process could grab a pre-selected port before start()
         // binds it. Pinning to loopback keeps client "localhost" connections
         // routed here rather than to a wildcard listener on the same port.
-        serverSocket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+        serverSocket = new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
         this.port = serverSocket.getLocalPort();
     }

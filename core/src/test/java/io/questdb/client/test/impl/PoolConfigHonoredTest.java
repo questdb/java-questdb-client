@@ -28,6 +28,7 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.Side;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -43,47 +44,49 @@ import java.util.Map;
 public class PoolConfigHonoredTest {
 
     @Test
-    public void testEveryPoolKeyIsHonored() {
-        // Drive both the value assertions and the drift guard from one map, so the
-        // coverage check cannot drift from what is actually asserted. min=0 keys
-        // let build() resolve the pool keys without pre-warming/connecting. Pool
-        // sizes resolve to int, the timeouts to long (the snapshot's boxed types).
-        Map<String, Object> expected = new LinkedHashMap<>();
-        expected.put("sender_pool_min", 0);
-        expected.put("sender_pool_max", 7);
-        expected.put("query_pool_min", 0);
-        expected.put("query_pool_max", 5);
-        expected.put("acquire_timeout_ms", 1234L);
-        expected.put("query_close_timeout_ms", 2468L);
-        expected.put("idle_timeout_ms", 4321L);
-        expected.put("max_lifetime_ms", 98765L);
-        expected.put("housekeeper_interval_ms", 222L);
+    public void testEveryPoolKeyIsHonored() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Drive both the value assertions and the drift guard from one map, so the
+            // coverage check cannot drift from what is actually asserted. min=0 keys
+            // let build() resolve the pool keys without pre-warming/connecting. Pool
+            // sizes resolve to int, the timeouts to long (the snapshot's boxed types).
+            Map<String, Object> expected = new LinkedHashMap<>();
+            expected.put("sender_pool_min", 0);
+            expected.put("sender_pool_max", 7);
+            expected.put("query_pool_min", 0);
+            expected.put("query_pool_max", 5);
+            expected.put("acquire_timeout_ms", 1234L);
+            expected.put("query_close_timeout_ms", 2468L);
+            expected.put("idle_timeout_ms", 4321L);
+            expected.put("max_lifetime_ms", 98765L);
+            expected.put("housekeeper_interval_ms", 222L);
 
-        StringBuilder cfg = new StringBuilder("ws::addr=127.0.0.1:1;");
-        for (Map.Entry<String, Object> e : expected.entrySet()) {
-            cfg.append(e.getKey()).append('=').append(e.getValue()).append(';');
-        }
-        QuestDBBuilder b = QuestDB.builder().fromConfig(cfg.toString());
-        b.build().close();
-
-        Map<String, Object> snap = b.poolConfigSnapshotForTest();
-        for (Map.Entry<String, Object> e : expected.entrySet()) {
-            Assert.assertEquals("pool key '" + e.getKey() + "' not honored", e.getValue(), snap.get(e.getKey()));
-        }
-
-        // Drift guard: every POOL registry key must appear in the map that drove
-        // the assertions above, so a new pool key with no assertion trips this.
-        for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
-            if (spec.side() == Side.POOL) {
-                // lazy_connect is a facade flag (build()'s tolerant-startup
-                // branch, covered by QuestDBLazyConnectTest), not a numeric
-                // pool-sizing knob resolved into the snapshot.
-                if ("lazy_connect".equals(spec.name())) {
-                    continue;
-                }
-                Assert.assertTrue("registry pool key '" + spec.name() + "' has no honored assertion",
-                        expected.containsKey(spec.name()));
+            StringBuilder cfg = new StringBuilder("ws::addr=127.0.0.1:1;");
+            for (Map.Entry<String, Object> e : expected.entrySet()) {
+                cfg.append(e.getKey()).append('=').append(e.getValue()).append(';');
             }
-        }
+            QuestDBBuilder b = QuestDB.builder().fromConfig(cfg.toString());
+            b.build().close();
+
+            Map<String, Object> snap = b.poolConfigSnapshotForTest();
+            for (Map.Entry<String, Object> e : expected.entrySet()) {
+                Assert.assertEquals("pool key '" + e.getKey() + "' not honored", e.getValue(), snap.get(e.getKey()));
+            }
+
+            // Drift guard: every POOL registry key must appear in the map that drove
+            // the assertions above, so a new pool key with no assertion trips this.
+            for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
+                if (spec.side() == Side.POOL) {
+                    // lazy_connect is a facade flag (build()'s tolerant-startup
+                    // branch, covered by QuestDBLazyConnectTest), not a numeric
+                    // pool-sizing knob resolved into the snapshot.
+                    if ("lazy_connect".equals(spec.name())) {
+                        continue;
+                    }
+                    Assert.assertTrue("registry pool key '" + spec.name() + "' has no honored assertion",
+                            expected.containsKey(spec.name()));
+                }
+            }
+        });
     }
 }

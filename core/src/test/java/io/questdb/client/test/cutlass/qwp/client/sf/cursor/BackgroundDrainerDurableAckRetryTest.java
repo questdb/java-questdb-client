@@ -736,6 +736,115 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
+    @Test
+    public void testRoleRejectGrantsFreshWallClockToNextGapEpisode() {
+        // Companion to testRoleRejectResetsCapabilityGapEpisode, which pins the
+        // ATTEMPT-counter half of the episode reset but runs under a 60s budget
+        // where the wall-clock half is unobservable: a mutant that resets only
+        // capabilityGapAttempts (leaving capabilityGapElapsedNanos /
+        // lastCapabilityGapNanos ticking) passes it. This test pins the
+        // WALL-CLOCK half: gap sweeps burn most of the budget, a role reject
+        // proves the topology churned, and the next gap episode must start
+        // from a zero wall clock -- under the counter-only mutant the stale
+        // elapsed (plus the still-anchored lastCapabilityGapNanos charging
+        // straight across the role-reject window) exhausts the budget and
+        // quarantines a cluster that was about to settle.
+        long budgetMillis = 800L;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.failingTimes(5, () -> {
+            switch (sweeps.incrementAndGet()) {
+                case 2:
+                    // Burn ~600ms of the 800ms budget inside the first gap
+                    // episode (charged by this sweep's gap-to-gap interval).
+                    sleepQuietly(600);
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+                case 3:
+                    // Topology churn: the settle budget must restart in full.
+                    return new QwpIngressRoleRejectedException(
+                            QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+                case 5:
+                    // Second episode burns ~350ms -- well inside a fresh 800ms
+                    // budget, but 600 + 350 > 800 under the mutant's carried-over
+                    // wall clock.
+                    sleepQuietly(350);
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+                default:
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+            }
+        });
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, budgetMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertSame("role reject restarts the episode wall clock -- the second gap "
+                        + "episode must get the full settle budget, not the first "
+                        + "episode's leftovers",
+                factory.successSentinel(), out);
+        // gap, gap(+600ms), roleReject, gap, gap(+350ms), success = 6 sweeps.
+        assertEquals(6, factory.attempts());
+        assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+        assertEquals("a settling cluster must never see a persistent-failure escalation",
+                0, listener.persistentFailures.get());
+        assertFalse("no .failed sentinel: both gap episodes stayed inside their budgets",
+                Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        // Per-mode attempt numbering across the reset: gaps 1,2 -- role reject
+        // 1 -- fresh gap episode 1,2.
+        assertEquals(java.util.Arrays.asList(1, 2, 1, 1, 2), listener.unavailableAttempts);
+    }
+
+    @Test
+    public void testRequestStopInterruptsLongBackoffParkPromptly() throws Exception {
+        // Pins the stop-promptness contract of the backoff park: requestStop()
+        // must break the drainer out of a LONG park (unpark, backstopped by
+        // the 50ms STOP_CHECK_PARK_CHUNK_NANOS chunking) instead of sleeping
+        // out the remainder. testStopRequestedDuringRetryAbortsWithStoppedOutcome
+        // cannot see this: its 5-10ms backoffs complete faster than any
+        // reasonable join timeout, so a monolithic park with no unpark passes
+        // it. Here the backoff is 5s and the exit bound is 2s -- an
+        // implementation that parks the full backoff in one shot fails.
+        CountDownLatch firstFailureSeen = new CountDownLatch(1);
+        ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+            firstFailureSeen.countDown();
+            // Transport error: the un-clamped (boundedByBudget=false) sleep
+            // path, so the park is backoff+jitter (5-10s), never trimmed to
+            // the wall-clock budget.
+            return new LineSenderException(
+                    "Failed to connect: all 2 endpoint(s) unreachable; last=127.0.0.1:9000");
+        });
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, /*reconnectMaxDurationMillis*/ 60_000L,
+                /*backoffInit*/ 5_000L, /*backoffMax*/ 5_000L);
+        Thread t = new Thread(drainer::connectWithDurableAckRetry, "long-park-stop-drainer");
+        t.setDaemon(true);
+        t.start();
+        Assert.assertTrue("first failure must occur promptly",
+                firstFailureSeen.await(2, TimeUnit.SECONDS));
+        // Give the drainer a moment to enter the 5-10s park. If requestStop()
+        // instead lands before the park, the pre-park stopRequested check
+        // skips it entirely -- either way the exit must be prompt.
+        Thread.sleep(100);
+        long stopNanos = System.nanoTime();
+        drainer.requestStop();
+        t.join(2_000);
+        long exitMillis = (System.nanoTime() - stopNanos) / 1_000_000L;
+        Assert.assertFalse("requestStop() must break the drainer out of a 5-10s "
+                        + "backoff park promptly (exit took >" + exitMillis + "ms); "
+                        + "a monolithic park with no unpark sleeps out the full backoff",
+                t.isAlive());
+        assertEquals(BackgroundDrainer.DrainOutcome.STOPPED, drainer.outcome());
+        assertFalse("stop is not a failure: no .failed sentinel",
+                Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private BackgroundDrainer newDrainer(ScriptedFactory factory) {
         return newDrainerWithBudgets(
                 factory, FAST_RECONNECT_MAX_DURATION_MILLIS,

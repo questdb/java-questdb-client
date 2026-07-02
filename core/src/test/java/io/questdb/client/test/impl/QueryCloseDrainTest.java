@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QueryWorker;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -57,67 +58,73 @@ public class QueryCloseDrainTest {
 
     @Test(timeout = 30_000)
     public void testCloseDiscardsWorkerWhenDrainTimesOut() throws Exception {
-        try (QueryClientPool pool = new QueryClientPool(
-                CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
-            setCloseQueryTimeout(pool, 150L);
-            QueryWorker w = pool.acquire();
-            long gen = generation(w);
-            setDone(w, false); // pretend a submit is in flight; nothing will ever signal done
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 150L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                setDone(w, false); // pretend a submit is in flight; nothing will ever signal done
 
-            long startNanos = System.nanoTime();
-            closeQuery(w, gen);
-            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+                long startNanos = System.nanoTime();
+                closeQuery(w, gen);
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
-            Assert.assertTrue("close() must wait about the close budget, elapsed=" + elapsedMs,
-                    elapsedMs >= 120);
-            Assert.assertTrue("close() must be bounded, not block unbounded, elapsed=" + elapsedMs,
-                    elapsedMs < 5_000);
-            Assert.assertFalse("a worker that did not drain must be discarded, not returned to the pool",
-                    allWorkers(pool).contains(w));
-            Assert.assertEquals("the discarded worker must leave the pool so it can grow a fresh one",
-                    0, allWorkers(pool).size());
-            Assert.assertFalse("the discarded worker's dispatch thread must have exited",
-                    dispatchThread(w).isAlive());
-        }
+                Assert.assertTrue("close() must wait about the close budget, elapsed=" + elapsedMs,
+                        elapsedMs >= 120);
+                Assert.assertTrue("close() must be bounded, not block unbounded, elapsed=" + elapsedMs,
+                        elapsedMs < 5_000);
+                Assert.assertFalse("a worker that did not drain must be discarded, not returned to the pool",
+                        allWorkers(pool).contains(w));
+                Assert.assertEquals("the discarded worker must leave the pool so it can grow a fresh one",
+                        0, allWorkers(pool).size());
+                Assert.assertFalse("the discarded worker's dispatch thread must have exited",
+                        dispatchThread(w).isAlive());
+            }
+        });
     }
 
     @Test(timeout = 30_000)
     public void testCloseIsInterruptible() throws Exception {
-        try (QueryClientPool pool = new QueryClientPool(
-                CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
-            // A long budget: the only way close() can return promptly is by
-            // honoring the caller's interrupt.
-            setCloseQueryTimeout(pool, 60_000L);
-            QueryWorker w = pool.acquire();
-            long gen = generation(w);
-            setDone(w, false);
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                // A long budget: the only way close() can return promptly is by
+                // honoring the caller's interrupt.
+                setCloseQueryTimeout(pool, 60_000L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                setDone(w, false);
 
-            Thread.currentThread().interrupt();
-            long startNanos = System.nanoTime();
-            closeQuery(w, gen);
-            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+                Thread.currentThread().interrupt();
+                long startNanos = System.nanoTime();
+                closeQuery(w, gen);
+                long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
-            Assert.assertTrue("close() must preserve the caller's interrupt flag", Thread.interrupted());
-            Assert.assertTrue("interrupt must abort the drain promptly, elapsed=" + elapsedMs,
-                    elapsedMs < 5_000);
-            Assert.assertFalse("an interrupted close() must discard the worker",
-                    allWorkers(pool).contains(w));
-        }
+                Assert.assertTrue("close() must preserve the caller's interrupt flag", Thread.interrupted());
+                Assert.assertTrue("interrupt must abort the drain promptly, elapsed=" + elapsedMs,
+                        elapsedMs < 5_000);
+                Assert.assertFalse("an interrupted close() must discard the worker",
+                        allWorkers(pool).contains(w));
+            }
+        });
     }
 
     @Test(timeout = 30_000)
     public void testCloseReturnsWorkerWhenAlreadyDrained() throws Exception {
-        try (QueryClientPool pool = new QueryClientPool(
-                CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
-            setCloseQueryTimeout(pool, 150L);
-            QueryWorker w = pool.acquire();
-            long gen = generation(w);
-            // done stays true (no in-flight submit): close() must take the fast
-            // path and return the worker to the pool for reuse, not discard it.
-            closeQuery(w, gen);
-            Assert.assertTrue("an already-drained worker must be returned to the pool, not discarded",
-                    allWorkers(pool).contains(w));
-        }
+        TestUtils.assertMemoryLeak(() -> {
+            try (QueryClientPool pool = new QueryClientPool(
+                    CFG, 0, 2, 1_000L, Long.MAX_VALUE, Long.MAX_VALUE, NO_CONNECT)) {
+                setCloseQueryTimeout(pool, 150L);
+                QueryWorker w = pool.acquire();
+                long gen = generation(w);
+                // done stays true (no in-flight submit): close() must take the fast
+                // path and return the worker to the pool for reuse, not discard it.
+                closeQuery(w, gen);
+                Assert.assertTrue("an already-drained worker must be returned to the pool, not discarded",
+                        allWorkers(pool).contains(w));
+            }
+        });
     }
 
     @SuppressWarnings("unchecked")

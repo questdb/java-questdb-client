@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -59,25 +60,27 @@ public class SenderPoolErrorSafetyTest {
     // GREEN: catch (Throwable) -> the cleanup loop closes the 1st delegate.
     @Test(timeout = 30_000)
     public void preWarmClosesBuiltDelegatesWhenBuildThrowsError() throws Exception {
-        AtomicBoolean firstClosed = new AtomicBoolean(false);
-        AtomicInteger calls = new AtomicInteger();
-        IntFunction<Sender> factory = slotIndex -> {
-            if (calls.incrementAndGet() >= 2) {
-                throw new AssertionError("injected native build failure");
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicBoolean firstClosed = new AtomicBoolean(false);
+            AtomicInteger calls = new AtomicInteger();
+            IntFunction<Sender> factory = slotIndex -> {
+                if (calls.incrementAndGet() >= 2) {
+                    throw new AssertionError("injected native build failure");
+                }
+                return fakeSender(firstClosed);
+            };
+
+            try {
+                newPool(CFG, 2, 2, 250, factory);
+                Assert.fail("expected prewarm to propagate the injected Error");
+            } catch (Throwable expected) {
+                // expected -- construction aborts
             }
-            return fakeSender(firstClosed);
-        };
 
-        try {
-            newPool(CFG, 2, 2, 250, factory);
-            Assert.fail("expected prewarm to propagate the injected Error");
-        } catch (Throwable expected) {
-            // expected -- construction aborts
-        }
-
-        Assert.assertTrue(
-                "prewarm leaked an already-built delegate: its close() was never called on an Error",
-                firstClosed.get());
+            Assert.assertTrue(
+                    "prewarm leaked an already-built delegate: its close() was never called on an Error",
+                    firstClosed.get());
+        });
     }
 
     // Companion to the catch (RuntimeException) -> track-normal-completion fix in
@@ -93,38 +96,40 @@ public class SenderPoolErrorSafetyTest {
     //      discardBroken() -> the next borrow() builds a fresh wrapper.
     @Test(timeout = 30_000)
     public void flushErrorDiscardsBrokenSenderInsteadOfRecycling() throws Exception {
-        IntFunction<Sender> factory = slotIndex -> flushThrowingSender();
+        TestUtils.assertMemoryLeak(() -> {
+            IntFunction<Sender> factory = slotIndex -> flushThrowingSender();
 
-        try (SenderPool pool = newPool(CFG, 1, 1, 1_000, factory)) {
-            Sender first = pool.borrow();
-            // Capture the underlying slot before close(): borrow() always hands
-            // out a FRESH PooledSender wrapper, so assertNotSame(first, second)
-            // on the wrappers is vacuously true and proves nothing -- it stays
-            // true whether or not the broken slot was discarded. The pool
-            // recycles slots, not wrappers, so a broken slot leaking back to
-            // the next borrower shows up as the SAME slot. Assert on the slot.
-            Object firstSlot = slotOf(first);
-            try {
-                first.close();
-                Assert.fail("close() must propagate the Error thrown by flush()");
-            } catch (AssertionError expected) {
-                // expected: the original throwable propagates naturally
-            }
-
-            Sender second = pool.borrow();
-            try {
-                Assert.assertNotSame(
-                        "a sender whose flush() exited with an Error must be discarded, not recycled",
-                        firstSlot, slotOf(second));
-            } finally {
-                // second's flush() also throws on close(); swallow on teardown.
+            try (SenderPool pool = newPool(CFG, 1, 1, 1_000, factory)) {
+                Sender first = pool.borrow();
+                // Capture the underlying slot before close(): borrow() always hands
+                // out a FRESH PooledSender wrapper, so assertNotSame(first, second)
+                // on the wrappers is vacuously true and proves nothing -- it stays
+                // true whether or not the broken slot was discarded. The pool
+                // recycles slots, not wrappers, so a broken slot leaking back to
+                // the next borrower shows up as the SAME slot. Assert on the slot.
+                Object firstSlot = slotOf(first);
                 try {
-                    second.close();
-                } catch (AssertionError ignored) {
-                    // expected
+                    first.close();
+                    Assert.fail("close() must propagate the Error thrown by flush()");
+                } catch (AssertionError expected) {
+                    // expected: the original throwable propagates naturally
+                }
+
+                Sender second = pool.borrow();
+                try {
+                    Assert.assertNotSame(
+                            "a sender whose flush() exited with an Error must be discarded, not recycled",
+                            firstSlot, slotOf(second));
+                } finally {
+                    // second's flush() also throws on close(); swallow on teardown.
+                    try {
+                        second.close();
+                    } catch (AssertionError ignored) {
+                        // expected
+                    }
                 }
             }
-        }
+        });
     }
 
     private static Object slotOf(Sender pooledWrapper) throws Exception {
@@ -187,42 +192,44 @@ public class SenderPoolErrorSafetyTest {
     //      succeeds, proving capacity survived the failed grow.
     @Test(timeout = 30_000)
     public void borrowReleasesSfSlotIndexWhenCreationFails() throws Exception {
-        // Unique, non-existent sf_dir: minSize=0 means no pre-warm, so the dir
-        // is never created and the constructor's startup SF recovery is a no-op.
-        // The factory replaces createUnlocked(), so localhost:1 is never dialed.
-        String sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-sf-borrowfail-" + System.nanoTime()).toString();
-        String sfCfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+        TestUtils.assertMemoryLeak(() -> {
+            // Unique, non-existent sf_dir: minSize=0 means no pre-warm, so the dir
+            // is never created and the constructor's startup SF recovery is a no-op.
+            // The factory replaces createUnlocked(), so localhost:1 is never dialed.
+            String sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                    "qdb-sf-borrowfail-" + System.nanoTime()).toString();
+            String sfCfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
 
-        AtomicInteger calls = new AtomicInteger();
-        IntFunction<Sender> factory = slotIndex -> {
-            // First borrow-triggered build fails (the slot index reserved for
-            // it must be released); later builds succeed.
-            if (calls.getAndIncrement() == 0) {
-                throw new AssertionError("injected native build failure on first grow");
-            }
-            return fakeSender(new AtomicBoolean());
-        };
+            AtomicInteger calls = new AtomicInteger();
+            IntFunction<Sender> factory = slotIndex -> {
+                // First borrow-triggered build fails (the slot index reserved for
+                // it must be released); later builds succeed.
+                if (calls.getAndIncrement() == 0) {
+                    throw new AssertionError("injected native build failure on first grow");
+                }
+                return fakeSender(new AtomicBoolean());
+            };
 
-        try (SenderPool pool = newPool(sfCfg, 0, 1, 2_000, factory)) {
-            try {
-                pool.borrow();
-                Assert.fail("borrow() must propagate the Error from the failed build");
-            } catch (AssertionError expected) {
-                // expected: the original throwable propagates out of borrow()
-            }
+            try (SenderPool pool = newPool(sfCfg, 0, 1, 2_000, factory)) {
+                try {
+                    pool.borrow();
+                    Assert.fail("borrow() must propagate the Error from the failed build");
+                } catch (AssertionError expected) {
+                    // expected: the original throwable propagates out of borrow()
+                }
 
-            // The single SF slot index must have been returned to the free set.
-            // If it leaked, this borrow() trips the capacity invariant (or, in
-            // the timeout-only variant, exhausts the acquire budget).
-            Sender second = pool.borrow();
-            try {
-                Assert.assertNotNull(
-                        "after a failed grow the SF slot index must be reusable", second);
-            } finally {
-                second.close();
+                // The single SF slot index must have been returned to the free set.
+                // If it leaked, this borrow() trips the capacity invariant (or, in
+                // the timeout-only variant, exhausts the acquire budget).
+                Sender second = pool.borrow();
+                try {
+                    Assert.assertNotNull(
+                            "after a failed grow the SF slot index must be reusable", second);
+                } finally {
+                    second.close();
+                }
             }
-        }
+        });
     }
 
     private static Sender fakeSender(AtomicBoolean closedFlag) {

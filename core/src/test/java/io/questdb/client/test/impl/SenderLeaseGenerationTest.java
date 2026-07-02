@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -60,59 +61,61 @@ public class SenderLeaseGenerationTest {
     @Test
     @SuppressWarnings("unchecked")
     public void testStaleGiveBackDoesNotEnqueueSlotTwice() throws Exception {
-        Class<?> slotClass = Class.forName("io.questdb.client.impl.SenderSlot");
-        Constructor<?> slotCtor = slotClass.getDeclaredConstructor(Sender.class, SenderPool.class, int.class);
-        slotCtor.setAccessible(true);
-        Method bump = slotClass.getDeclaredMethod("bumpGeneration");
-        bump.setAccessible(true);
-        Method generation = slotClass.getDeclaredMethod("generation");
-        generation.setAccessible(true);
-        Constructor<PooledSender> leaseCtor =
-                PooledSender.class.getDeclaredConstructor(slotClass, long.class);
-        leaseCtor.setAccessible(true);
-        Field availableF = SenderPool.class.getDeclaredField("available");
-        availableF.setAccessible(true);
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> slotClass = Class.forName("io.questdb.client.impl.SenderSlot");
+            Constructor<?> slotCtor = slotClass.getDeclaredConstructor(Sender.class, SenderPool.class, int.class);
+            slotCtor.setAccessible(true);
+            Method bump = slotClass.getDeclaredMethod("bumpGeneration");
+            bump.setAccessible(true);
+            Method generation = slotClass.getDeclaredMethod("generation");
+            generation.setAccessible(true);
+            Constructor<PooledSender> leaseCtor =
+                    PooledSender.class.getDeclaredConstructor(slotClass, long.class);
+            leaseCtor.setAccessible(true);
+            Field availableF = SenderPool.class.getDeclaredField("available");
+            availableF.setAccessible(true);
 
-        try (SenderPool pool = new SenderPool(
-                DEAD_HTTP_CONFIG, /*minSize*/ 0, /*maxSize*/ 2,
-                /*acquireTimeoutMillis*/ 1_000L,
-                /*idleTimeoutMillis*/ Long.MAX_VALUE,
-                /*maxLifetimeMillis*/ Long.MAX_VALUE)) {
-            ArrayDeque<Object> available = (ArrayDeque<Object>) availableF.get(pool);
-            Object slot = slotCtor.newInstance(null, pool, -1);
+            try (SenderPool pool = new SenderPool(
+                    DEAD_HTTP_CONFIG, /*minSize*/ 0, /*maxSize*/ 2,
+                    /*acquireTimeoutMillis*/ 1_000L,
+                    /*idleTimeoutMillis*/ Long.MAX_VALUE,
+                    /*maxLifetimeMillis*/ Long.MAX_VALUE)) {
+                ArrayDeque<Object> available = (ArrayDeque<Object>) availableF.get(pool);
+                Object slot = slotCtor.newInstance(null, pool, -1);
 
-            // borrow #1 stamps generation 1; lease A captures 1.
-            bump.invoke(slot);
-            Assert.assertEquals(1L, generation.invoke(slot));
-            PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
+                // borrow #1 stamps generation 1; lease A captures 1.
+                bump.invoke(slot);
+                Assert.assertEquals(1L, generation.invoke(slot));
+                PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
 
-            // close A -> giveBack(A): matches, enqueues once.
-            pool.giveBack(leaseA);
-            Assert.assertEquals("valid close must enqueue the slot once", 1, available.size());
+                // close A -> giveBack(A): matches, enqueues once.
+                pool.giveBack(leaseA);
+                Assert.assertEquals("valid close must enqueue the slot once", 1, available.size());
 
-            // duplicate close A (e.g. explicit close + try-with-resources)
-            // -> giveBack(A): generation already bumped to 2, so it is dropped.
-            pool.giveBack(leaseA);
-            Assert.assertEquals("duplicate close of the same lease must be dropped",
-                    1, available.size());
+                // duplicate close A (e.g. explicit close + try-with-resources)
+                // -> giveBack(A): generation already bumped to 2, so it is dropped.
+                pool.giveBack(leaseA);
+                Assert.assertEquals("duplicate close of the same lease must be dropped",
+                        1, available.size());
 
-            // borrow #2 hands the slot to a new borrower B: pull it out, stamp 3.
-            available.pollFirst();
-            bump.invoke(slot);
-            Assert.assertEquals(3L, generation.invoke(slot));
-            PooledSender leaseB = leaseCtor.newInstance(slot, 3L);
+                // borrow #2 hands the slot to a new borrower B: pull it out, stamp 3.
+                available.pollFirst();
+                bump.invoke(slot);
+                Assert.assertEquals(3L, generation.invoke(slot));
+                PooledSender leaseB = leaseCtor.newInstance(slot, 3L);
 
-            // A stray close from the long-dead lease A -> dropped, so B's slot is
-            // NOT re-enqueued while B still owns it.
-            pool.giveBack(leaseA);
-            Assert.assertEquals("a post-reborrow stale close must NOT enqueue the slot "
-                    + "while another borrower owns it", 0, available.size());
+                // A stray close from the long-dead lease A -> dropped, so B's slot is
+                // NOT re-enqueued while B still owns it.
+                pool.giveBack(leaseA);
+                Assert.assertEquals("a post-reborrow stale close must NOT enqueue the slot "
+                        + "while another borrower owns it", 0, available.size());
 
-            // B's own close -> giveBack(B): matches, enqueues legitimately.
-            pool.giveBack(leaseB);
-            Assert.assertEquals("the current borrower's close must still work",
-                    1, available.size());
-        }
+                // B's own close -> giveBack(B): matches, enqueues legitimately.
+                pool.giveBack(leaseB);
+                Assert.assertEquals("the current borrower's close must still work",
+                        1, available.size());
+            }
+        });
     }
 
     /**
@@ -122,26 +125,28 @@ public class SenderLeaseGenerationTest {
      */
     @Test
     public void testStaleWriteIsRejected() throws Exception {
-        Class<?> slotClass = Class.forName("io.questdb.client.impl.SenderSlot");
-        Constructor<?> slotCtor = slotClass.getDeclaredConstructor(Sender.class, SenderPool.class, int.class);
-        slotCtor.setAccessible(true);
-        Method bump = slotClass.getDeclaredMethod("bumpGeneration");
-        bump.setAccessible(true);
-        Constructor<PooledSender> leaseCtor =
-                PooledSender.class.getDeclaredConstructor(slotClass, long.class);
-        leaseCtor.setAccessible(true);
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> slotClass = Class.forName("io.questdb.client.impl.SenderSlot");
+            Constructor<?> slotCtor = slotClass.getDeclaredConstructor(Sender.class, SenderPool.class, int.class);
+            slotCtor.setAccessible(true);
+            Method bump = slotClass.getDeclaredMethod("bumpGeneration");
+            bump.setAccessible(true);
+            Constructor<PooledSender> leaseCtor =
+                    PooledSender.class.getDeclaredConstructor(slotClass, long.class);
+            leaseCtor.setAccessible(true);
 
-        Object slot = slotCtor.newInstance(null, null, -1);
-        bump.invoke(slot); // generation -> 1, lease A captures 1
-        PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
-        bump.invoke(slot); // released
-        bump.invoke(slot); // re-borrowed -> generation 3
+            Object slot = slotCtor.newInstance(null, null, -1);
+            bump.invoke(slot); // generation -> 1, lease A captures 1
+            PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
+            bump.invoke(slot); // released
+            bump.invoke(slot); // re-borrowed -> generation 3
 
-        try {
-            leaseA.table("x");
-            Assert.fail("a stale lease's write must throw, not reach the re-borrowed slot");
-        } catch (IllegalStateException expected) {
-            Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("closed"));
-        }
+            try {
+                leaseA.table("x");
+                Assert.fail("a stale lease's write must throw, not reach the re-borrowed slot");
+            } catch (IllegalStateException expected) {
+                Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("closed"));
+            }
+        });
     }
 }

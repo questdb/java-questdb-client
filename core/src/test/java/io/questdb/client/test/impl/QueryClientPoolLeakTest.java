@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -57,51 +58,55 @@ public class QueryClientPoolLeakTest {
 
     @Test(timeout = 10_000)
     public void acquireDoesNotLeakNativeScratchOnConnectFailure() throws Exception {
-        try (FakeStatusServer rejecter = new FakeStatusServer(421, "X-QuestDB-Role: REPLICA")) {
-            rejecter.start();
-            String cfg = "ws::addr=127.0.0.1:" + rejecter.port()
-                    + ";target=primary;failover=off;auth_timeout_ms=1000;";
+        TestUtils.assertMemoryLeak(() -> {
+            try (FakeStatusServer rejecter = new FakeStatusServer(421, "X-QuestDB-Role: REPLICA")) {
+                rejecter.start();
+                String cfg = "ws::addr=127.0.0.1:" + rejecter.port()
+                        + ";target=primary;failover=off;auth_timeout_ms=1000;";
 
-            QueryClientPool pool = new QueryClientPool(
-                    cfg, 0, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
-            try {
-                long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                QueryClientPool pool = new QueryClientPool(
+                        cfg, 0, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
                 try {
-                    pool.acquire();
-                    Assert.fail("expected acquire() to throw on connect rejection");
-                } catch (RuntimeException expected) {
-                    // QueryException wrapping the underlying connect failure.
+                    long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        pool.acquire();
+                        Assert.fail("expected acquire() to throw on connect rejection");
+                    } catch (RuntimeException expected) {
+                        // QueryException wrapping the underlying connect failure.
+                    }
+                    long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                    Assert.assertEquals(
+                            "acquire() leaked NATIVE_DEFAULT bytes on connect failure",
+                            baseline, after);
+                } finally {
+                    pool.close();
                 }
-                long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-                Assert.assertEquals(
-                        "acquire() leaked NATIVE_DEFAULT bytes on connect failure",
-                        baseline, after);
-            } finally {
-                pool.close();
             }
-        }
+        });
     }
 
     @Test(timeout = 10_000)
     public void preWarmDoesNotLeakNativeScratchOnConnectFailure() throws Exception {
-        try (FakeStatusServer rejecter = new FakeStatusServer(421, "X-QuestDB-Role: REPLICA")) {
-            rejecter.start();
-            String cfg = "ws::addr=127.0.0.1:" + rejecter.port()
-                    + ";target=primary;failover=off;auth_timeout_ms=1000;";
+        TestUtils.assertMemoryLeak(() -> {
+            try (FakeStatusServer rejecter = new FakeStatusServer(421, "X-QuestDB-Role: REPLICA")) {
+                rejecter.start();
+                String cfg = "ws::addr=127.0.0.1:" + rejecter.port()
+                        + ";target=primary;failover=off;auth_timeout_ms=1000;";
 
-            long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-            try {
-                new QueryClientPool(cfg, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
-                Assert.fail("expected QueryClientPool ctor to throw on connect rejection");
-            } catch (RuntimeException expected) {
-                // target=primary against role=REPLICA yields a connect failure
-                // out of createUnlocked().
+                long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                try {
+                    new QueryClientPool(cfg, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+                    Assert.fail("expected QueryClientPool ctor to throw on connect rejection");
+                } catch (RuntimeException expected) {
+                    // target=primary against role=REPLICA yields a connect failure
+                    // out of createUnlocked().
+                }
+                long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                Assert.assertEquals(
+                        "pool ctor leaked NATIVE_DEFAULT bytes on connect failure",
+                        baseline, after);
             }
-            long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-            Assert.assertEquals(
-                    "pool ctor leaked NATIVE_DEFAULT bytes on connect failure",
-                    baseline, after);
-        }
+        });
     }
 
     private static final class FakeStatusServer implements AutoCloseable {

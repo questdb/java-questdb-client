@@ -28,6 +28,7 @@ import io.questdb.client.Completion;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QueryWorker;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -64,14 +65,16 @@ public class QueryWorkerTest {
      * connect is needed; {@code newPlainText} only allocates the client.
      */
     @Test
-    public void testClientGetterReturnsConstructorInstance() {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            QueryWorker worker = new QueryWorker(client, null, 0);
-            Assert.assertSame("client() must return the instance passed to the constructor",
-                    client, worker.client());
-            // Idempotent across calls -- the field is final.
-            Assert.assertSame(worker.client(), worker.client());
-        }
+    public void testClientGetterReturnsConstructorInstance() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
+                QueryWorker worker = new QueryWorker(client, null, 0);
+                Assert.assertSame("client() must return the instance passed to the constructor",
+                        client, worker.client());
+                // Idempotent across calls -- the field is final.
+                Assert.assertSame(worker.client(), worker.client());
+            }
+        });
     }
 
     /**
@@ -95,85 +98,87 @@ public class QueryWorkerTest {
      */
     @Test(timeout = 30_000)
     public void testShutdownRacingDispatchMustNotStrandCaller() throws Exception {
-        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
 
-        Field lockF = QueryWorker.class.getDeclaredField("signalLock");
-        Field condF = QueryWorker.class.getDeclaredField("signalCondition");
-        Field currentF = QueryWorker.class.getDeclaredField("current");
-        Field shuttingF = QueryWorker.class.getDeclaredField("shuttingDown");
-        Field threadF = QueryWorker.class.getDeclaredField("thread");
-        for (Field f : new Field[]{lockF, condF, currentF, shuttingF, threadF}) {
-            f.setAccessible(true);
-        }
+            Field lockF = QueryWorker.class.getDeclaredField("signalLock");
+            Field condF = QueryWorker.class.getDeclaredField("signalCondition");
+            Field currentF = QueryWorker.class.getDeclaredField("current");
+            Field shuttingF = QueryWorker.class.getDeclaredField("shuttingDown");
+            Field threadF = QueryWorker.class.getDeclaredField("thread");
+            for (Field f : new Field[]{lockF, condF, currentF, shuttingF, threadF}) {
+                f.setAccessible(true);
+            }
 
-        Field doneF = queryImplClass.getDeclaredField("done");
-        Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
-        doneF.setAccessible(true);
-        unexpectedF.setAccessible(true);
+            Field doneF = queryImplClass.getDeclaredField("done");
+            Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
+            doneF.setAccessible(true);
+            unexpectedF.setAccessible(true);
 
-        // No QwpQueryClient is constructed here: runLoop exits at the
-        // shuttingDown check before reaching the first reference to
-        // {@code client} or {@code pool}, so passing null for both is fine
-        // and keeps the test cleanly isolated from any network or socket state.
-        QueryWorker worker = new QueryWorker(null, null, 0);
-        Thread t = (Thread) threadF.get(worker);
-        t.start();
+            // No QwpQueryClient is constructed here: runLoop exits at the
+            // shuttingDown check before reaching the first reference to
+            // {@code client} or {@code pool}, so passing null for both is fine
+            // and keeps the test cleanly isolated from any network or socket state.
+            QueryWorker worker = new QueryWorker(null, null, 0);
+            Thread t = (Thread) threadF.get(worker);
+            t.start();
 
-        ReentrantLock lock = (ReentrantLock) lockF.get(worker);
-        Condition cond = (Condition) condF.get(worker);
+            ReentrantLock lock = (ReentrantLock) lockF.get(worker);
+            Condition cond = (Condition) condF.get(worker);
 
-        // Wait until the worker thread is parked on its signalCondition.
-        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (true) {
-            boolean parked;
+            // Wait until the worker thread is parked on its signalCondition.
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (true) {
+                boolean parked;
+                lock.lock();
+                try {
+                    parked = lock.hasWaiters(cond);
+                } finally {
+                    lock.unlock();
+                }
+                if (parked) {
+                    break;
+                }
+                if (System.nanoTime() > deadlineNanos) {
+                    Assert.fail("worker thread never parked on its signalCondition");
+                }
+                Thread.sleep(1);
+            }
+
+            // Construct a QueryImpl with done=false, mimicking the state set up
+            // by QueryImpl.submit() just before it calls worker.dispatch().
+            Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
+            ctor.setAccessible(true);
+            Object queryImpl = ctor.newInstance(new Object[]{null});
+            doneF.setBoolean(queryImpl, false);
+
+            // Atomically force the racy state under the worker's own lock:
+            // current set AND shuttingDown set before the worker wakes.
             lock.lock();
             try {
-                parked = lock.hasWaiters(cond);
+                currentF.set(worker, queryImpl);
+                shuttingF.setBoolean(worker, true);
+                cond.signalAll();
             } finally {
                 lock.unlock();
             }
-            if (parked) {
-                break;
-            }
-            if (System.nanoTime() > deadlineNanos) {
-                Assert.fail("worker thread never parked on its signalCondition");
-            }
-            Thread.sleep(1);
-        }
 
-        // Construct a QueryImpl with done=false, mimicking the state set up
-        // by QueryImpl.submit() just before it calls worker.dispatch().
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
-        ctor.setAccessible(true);
-        Object queryImpl = ctor.newInstance(new Object[]{null});
-        doneF.setBoolean(queryImpl, false);
+            // The worker thread must exit (it has observed shuttingDown).
+            t.join(5_000);
+            Assert.assertFalse("worker thread did not exit after shuttingDown=true",
+                    t.isAlive());
 
-        // Atomically force the racy state under the worker's own lock:
-        // current set AND shuttingDown set before the worker wakes.
-        lock.lock();
-        try {
-            currentF.set(worker, queryImpl);
-            shuttingF.setBoolean(worker, true);
-            cond.signalAll();
-        } finally {
-            lock.unlock();
-        }
-
-        // The worker thread must exit (it has observed shuttingDown).
-        t.join(5_000);
-        Assert.assertFalse("worker thread did not exit after shuttingDown=true",
-                t.isAlive());
-
-        // The QueryImpl must have been signalled to done. Without the fix,
-        // done stays false because signalDone is never called, so a caller in
-        // Completion.await() would hang forever. The worker reaches the
-        // shutdown-race branch and calls signalUnexpected("QuestDB handle is
-        // closed"), which sets done=true and records the unexpected error.
-        Assert.assertTrue("BUG: QueryWorker.runLoop returned with shuttingDown=true "
-                + "while current!=null, never invoking runOn or signalUnexpected. "
-                + "The caller's Completion.await() hangs forever.", doneF.getBoolean(queryImpl));
-        Assert.assertNotNull("signalUnexpected must record the closed-handle error",
-                unexpectedF.get(queryImpl));
+            // The QueryImpl must have been signalled to done. Without the fix,
+            // done stays false because signalDone is never called, so a caller in
+            // Completion.await() would hang forever. The worker reaches the
+            // shutdown-race branch and calls signalUnexpected("QuestDB handle is
+            // closed"), which sets done=true and records the unexpected error.
+            Assert.assertTrue("BUG: QueryWorker.runLoop returned with shuttingDown=true "
+                    + "while current!=null, never invoking runOn or signalUnexpected. "
+                    + "The caller's Completion.await() hangs forever.", doneF.getBoolean(queryImpl));
+            Assert.assertNotNull("signalUnexpected must record the closed-handle error",
+                    unexpectedF.get(queryImpl));
+        });
     }
 
     /**
@@ -207,75 +212,77 @@ public class QueryWorkerTest {
      */
     @Test(timeout = 30_000)
     public void testBusyWorkerShutdownStrandsReDispatchedCurrent() throws Exception {
-        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
 
-        Field lockF = QueryWorker.class.getDeclaredField("signalLock");
-        Field currentF = QueryWorker.class.getDeclaredField("current");
-        Field shuttingF = QueryWorker.class.getDeclaredField("shuttingDown");
-        Field threadF = QueryWorker.class.getDeclaredField("thread");
-        Field hookF = QueryWorker.class.getDeclaredField("busyWorkerTestHook");
-        for (Field f : new Field[]{lockF, currentF, shuttingF, threadF, hookF}) {
-            f.setAccessible(true);
-        }
-
-        Field doneF = queryImplClass.getDeclaredField("done");
-        Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
-        doneF.setAccessible(true);
-        unexpectedF.setAccessible(true);
-
-        // client == null: q1.runOn(null) throws NPE, which runLoop catches and
-        // turns into q1's terminal signal -- a fast, deterministic stand-in for
-        // a real job returning from runOn(). pool == null is never touched here.
-        QueryWorker worker = new QueryWorker(null, null, 0);
-
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
-        ctor.setAccessible(true);
-        Object q1 = ctor.newInstance(new Object[]{worker});
-        Object q2 = ctor.newInstance(new Object[]{worker});
-        doneF.setBoolean(q1, false);
-        doneF.setBoolean(q2, false);
-
-        ReentrantLock lock = (ReentrantLock) lockF.get(worker);
-        AtomicBoolean fired = new AtomicBoolean(false);
-
-        // The busy-worker barrier: the FIRST time the worker returns from a
-        // job's runOn(), simulate submit() -> dispatch() re-arming current with
-        // q2 while shutdown() flips shuttingDown -- both set, under signalLock,
-        // before the loop re-checks. Runs on the worker thread.
-        Runnable hook = () -> {
-            if (fired.compareAndSet(false, true)) {
-                lock.lock();
-                try {
-                    currentF.set(worker, q2);
-                    shuttingF.setBoolean(worker, true);
-                } catch (IllegalAccessException e) {
-                    throw new RuntimeException(e);
-                } finally {
-                    lock.unlock();
-                }
+            Field lockF = QueryWorker.class.getDeclaredField("signalLock");
+            Field currentF = QueryWorker.class.getDeclaredField("current");
+            Field shuttingF = QueryWorker.class.getDeclaredField("shuttingDown");
+            Field threadF = QueryWorker.class.getDeclaredField("thread");
+            Field hookF = QueryWorker.class.getDeclaredField("busyWorkerTestHook");
+            for (Field f : new Field[]{lockF, currentF, shuttingF, threadF, hookF}) {
+                f.setAccessible(true);
             }
-        };
-        hookF.set(worker, hook);
 
-        // Pre-arm current with q1 so the worker consumes it immediately on
-        // start (no need to wait for the await park); start() establishes the
-        // happens-before that publishes current and the hook to the worker.
-        currentF.set(worker, q1);
+            Field doneF = queryImplClass.getDeclaredField("done");
+            Field unexpectedF = queryImplClass.getDeclaredField("unexpectedError");
+            doneF.setAccessible(true);
+            unexpectedF.setAccessible(true);
 
-        Thread t = (Thread) threadF.get(worker);
-        t.start();
+            // client == null: q1.runOn(null) throws NPE, which runLoop catches and
+            // turns into q1's terminal signal -- a fast, deterministic stand-in for
+            // a real job returning from runOn(). pool == null is never touched here.
+            QueryWorker worker = new QueryWorker(null, null, 0);
 
-        t.join(5_000);
-        Assert.assertFalse("worker thread must exit after shuttingDown=true", t.isAlive());
+            Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
+            ctor.setAccessible(true);
+            Object q1 = ctor.newInstance(new Object[]{worker});
+            Object q2 = ctor.newInstance(new Object[]{worker});
+            doneF.setBoolean(q1, false);
+            doneF.setBoolean(q2, false);
 
-        Assert.assertTrue(
-                "BUG (df6f7ca regressed): the busy worker returned from runOn() with a "
-                        + "re-dispatched current!=null and shuttingDown=true, then exited the loop "
-                        + "without stranding it. q2 was never signalled; its caller's await() hangs "
-                        + "forever.",
-                doneF.getBoolean(q2));
-        Assert.assertNotNull("the stranded busy-path job must record the closed-handle error",
-                unexpectedF.get(q2));
+            ReentrantLock lock = (ReentrantLock) lockF.get(worker);
+            AtomicBoolean fired = new AtomicBoolean(false);
+
+            // The busy-worker barrier: the FIRST time the worker returns from a
+            // job's runOn(), simulate submit() -> dispatch() re-arming current with
+            // q2 while shutdown() flips shuttingDown -- both set, under signalLock,
+            // before the loop re-checks. Runs on the worker thread.
+            Runnable hook = () -> {
+                if (fired.compareAndSet(false, true)) {
+                    lock.lock();
+                    try {
+                        currentF.set(worker, q2);
+                        shuttingF.setBoolean(worker, true);
+                    } catch (IllegalAccessException e) {
+                        throw new RuntimeException(e);
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            };
+            hookF.set(worker, hook);
+
+            // Pre-arm current with q1 so the worker consumes it immediately on
+            // start (no need to wait for the await park); start() establishes the
+            // happens-before that publishes current and the hook to the worker.
+            currentF.set(worker, q1);
+
+            Thread t = (Thread) threadF.get(worker);
+            t.start();
+
+            t.join(5_000);
+            Assert.assertFalse("worker thread must exit after shuttingDown=true", t.isAlive());
+
+            Assert.assertTrue(
+                    "BUG (df6f7ca regressed): the busy worker returned from runOn() with a "
+                            + "re-dispatched current!=null and shuttingDown=true, then exited the loop "
+                            + "without stranding it. q2 was never signalled; its caller's await() hangs "
+                            + "forever.",
+                    doneF.getBoolean(q2));
+            Assert.assertNotNull("the stranded busy-path job must record the closed-handle error",
+                    unexpectedF.get(q2));
+        });
     }
 
     /**
@@ -293,55 +300,57 @@ public class QueryWorkerTest {
      */
     @Test(timeout = 30_000)
     public void testCloseAndAwaitFromWorkerThreadThrowInsteadOfDeadlocking() throws Exception {
-        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-        Field queryF = QueryWorker.class.getDeclaredField("query");
-        queryF.setAccessible(true);
-        Field threadF = QueryWorker.class.getDeclaredField("thread");
-        threadF.setAccessible(true);
-        Field doneF = queryImplClass.getDeclaredField("done");
-        doneF.setAccessible(true);
-        Method bump = QueryWorker.class.getDeclaredMethod("bumpGeneration");
-        bump.setAccessible(true);
-        Method isWorker = QueryWorker.class.getDeclaredMethod("isCurrentThreadWorker");
-        isWorker.setAccessible(true);
-        Method close = queryImplClass.getDeclaredMethod("close", long.class);
-        close.setAccessible(true);
-        Method awaitNoTimeout = queryImplClass.getDeclaredMethod("await", long.class);
-        awaitNoTimeout.setAccessible(true);
-        Method awaitTimed = queryImplClass.getDeclaredMethod("await", long.class, long.class, TimeUnit.class);
-        awaitTimed.setAccessible(true);
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+            Field queryF = QueryWorker.class.getDeclaredField("query");
+            queryF.setAccessible(true);
+            Field threadF = QueryWorker.class.getDeclaredField("thread");
+            threadF.setAccessible(true);
+            Field doneF = queryImplClass.getDeclaredField("done");
+            doneF.setAccessible(true);
+            Method bump = QueryWorker.class.getDeclaredMethod("bumpGeneration");
+            bump.setAccessible(true);
+            Method isWorker = QueryWorker.class.getDeclaredMethod("isCurrentThreadWorker");
+            isWorker.setAccessible(true);
+            Method close = queryImplClass.getDeclaredMethod("close", long.class);
+            close.setAccessible(true);
+            Method awaitNoTimeout = queryImplClass.getDeclaredMethod("await", long.class);
+            awaitNoTimeout.setAccessible(true);
+            Method awaitTimed = queryImplClass.getDeclaredMethod("await", long.class, long.class, TimeUnit.class);
+            awaitTimed.setAccessible(true);
 
-        QueryClientPool pool = new QueryClientPool(
-                "ws::addr=localhost:9000;",
-                /*minSize*/ 0, /*maxSize*/ 2,
-                /*acquireTimeoutMillis*/ 1_000L,
-                /*idleTimeoutMillis*/ Long.MAX_VALUE,
-                /*maxLifetimeMillis*/ Long.MAX_VALUE);
-        QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000);
-        try {
-            QueryWorker w = new QueryWorker(client, pool, 0);
-            bump.invoke(w); // generation -> 1: a live lease
-            Object impl = queryF.get(w);
-            doneF.setBoolean(impl, false); // a submit is in flight, as during a handler
+            QueryClientPool pool = new QueryClientPool(
+                    "ws::addr=localhost:9000;",
+                    /*minSize*/ 0, /*maxSize*/ 2,
+                    /*acquireTimeoutMillis*/ 1_000L,
+                    /*idleTimeoutMillis*/ Long.MAX_VALUE,
+                    /*maxLifetimeMillis*/ Long.MAX_VALUE);
+            QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000);
+            try {
+                QueryWorker w = new QueryWorker(client, pool, 0);
+                bump.invoke(w); // generation -> 1: a live lease
+                Object impl = queryF.get(w);
+                doneF.setBoolean(impl, false); // a submit is in flight, as during a handler
 
-            // Off the worker thread the guard must NOT fire.
-            Assert.assertFalse("guard must not fire on a normal caller thread",
-                    (Boolean) isWorker.invoke(w));
+                // Off the worker thread the guard must NOT fire.
+                Assert.assertFalse("guard must not fire on a normal caller thread",
+                        (Boolean) isWorker.invoke(w));
 
-            // Stand in for a reentrant call from inside a result handler: the
-            // guard compares Thread.currentThread() to the worker's dispatch
-            // thread, so point that field at this thread.
-            threadF.set(w, Thread.currentThread());
-            Assert.assertTrue((Boolean) isWorker.invoke(w));
+                // Stand in for a reentrant call from inside a result handler: the
+                // guard compares Thread.currentThread() to the worker's dispatch
+                // thread, so point that field at this thread.
+                threadF.set(w, Thread.currentThread());
+                Assert.assertTrue((Boolean) isWorker.invoke(w));
 
-            assertThrowsHandlerReentry("close", () -> close.invoke(impl, 1L));
-            assertThrowsHandlerReentry("await", () -> awaitNoTimeout.invoke(impl, 1L));
-            assertThrowsHandlerReentry("await(timeout)",
-                    () -> awaitTimed.invoke(impl, 1L, 5L, TimeUnit.SECONDS));
-        } finally {
-            client.close();
-            pool.close();
-        }
+                assertThrowsHandlerReentry("close", () -> close.invoke(impl, 1L));
+                assertThrowsHandlerReentry("await", () -> awaitNoTimeout.invoke(impl, 1L));
+                assertThrowsHandlerReentry("await(timeout)",
+                        () -> awaitTimed.invoke(impl, 1L, 5L, TimeUnit.SECONDS));
+            } finally {
+                client.close();
+                pool.close();
+            }
+        });
     }
 
     private static void assertThrowsHandlerReentry(String op, ReflectiveCall call) throws Exception {

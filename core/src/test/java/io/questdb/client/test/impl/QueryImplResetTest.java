@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 import io.questdb.client.std.str.StringSink;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -56,45 +57,47 @@ public class QueryImplResetTest {
      */
     @Test
     public void testResetForBorrowClearsBuilderState() throws Exception {
-        Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-        Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
+            Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
 
-        Constructor<?> ctor = queryImplClass.getDeclaredConstructor(workerClass);
-        ctor.setAccessible(true);
-        // resetForBorrow() never dereferences the worker; a null worker is fine
-        // for this state-only test.
-        Object q = ctor.newInstance(new Object[]{null});
+            Constructor<?> ctor = queryImplClass.getDeclaredConstructor(workerClass);
+            ctor.setAccessible(true);
+            // resetForBorrow() never dereferences the worker; a null worker is fine
+            // for this state-only test.
+            Object q = ctor.newInstance(new Object[]{null});
 
-        Field handlerF = queryImplClass.getDeclaredField("userHandler");
-        Field bindsF = queryImplClass.getDeclaredField("userBinds");
-        Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
-        Field doneF = queryImplClass.getDeclaredField("done");
-        handlerF.setAccessible(true);
-        bindsF.setAccessible(true);
-        sqlBufF.setAccessible(true);
-        doneF.setAccessible(true);
+            Field handlerF = queryImplClass.getDeclaredField("userHandler");
+            Field bindsF = queryImplClass.getDeclaredField("userBinds");
+            Field sqlBufF = queryImplClass.getDeclaredField("sqlBuffer");
+            Field doneF = queryImplClass.getDeclaredField("done");
+            handlerF.setAccessible(true);
+            bindsF.setAccessible(true);
+            sqlBufF.setAccessible(true);
+            doneF.setAccessible(true);
 
-        // Seed builder state as a prior borrow would have left it.
-        handlerF.set(q, new NoopHandler());
-        bindsF.set(q, (QwpBindSetter) values -> {
-            // no-op
+            // Seed builder state as a prior borrow would have left it.
+            handlerF.set(q, new NoopHandler());
+            bindsF.set(q, (QwpBindSetter) values -> {
+                // no-op
+            });
+            ((StringSink) sqlBufF.get(q)).put("SELECT 1");
+            doneF.setBoolean(q, false);
+
+            Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
+            reset.setAccessible(true);
+            reset.invoke(q);
+
+            Assert.assertNull("userHandler must be cleared so a follow-up submit() without .handler() fails fast",
+                    handlerF.get(q));
+            Assert.assertNull("userBinds must be cleared so a follow-up submit() without .binds() does not reuse the prior setter",
+                    bindsF.get(q));
+            CharSequence sqlBuffer = (CharSequence) sqlBufF.get(q);
+            Assert.assertEquals("sqlBuffer must be empty so a follow-up submit() without .sql() throws 'sql is required'",
+                    0, sqlBuffer.length());
+            Assert.assertTrue("done must be true so the handle starts idle, not in flight",
+                    doneF.getBoolean(q));
         });
-        ((StringSink) sqlBufF.get(q)).put("SELECT 1");
-        doneF.setBoolean(q, false);
-
-        Method reset = queryImplClass.getDeclaredMethod("resetForBorrow");
-        reset.setAccessible(true);
-        reset.invoke(q);
-
-        Assert.assertNull("userHandler must be cleared so a follow-up submit() without .handler() fails fast",
-                handlerF.get(q));
-        Assert.assertNull("userBinds must be cleared so a follow-up submit() without .binds() does not reuse the prior setter",
-                bindsF.get(q));
-        CharSequence sqlBuffer = (CharSequence) sqlBufF.get(q);
-        Assert.assertEquals("sqlBuffer must be empty so a follow-up submit() without .sql() throws 'sql is required'",
-                0, sqlBuffer.length());
-        Assert.assertTrue("done must be true so the handle starts idle, not in flight",
-                doneF.getBoolean(q));
     }
 
     /**
@@ -107,29 +110,31 @@ public class QueryImplResetTest {
      */
     @Test
     public void testLeaseWrapsSamePooledQueryImpl() throws Exception {
-        Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
-        Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
-        Class<?> clientClass = Class.forName("io.questdb.client.cutlass.qwp.client.QwpQueryClient");
-        Class<?> leaseClass = Class.forName("io.questdb.client.impl.QueryLease");
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
+            Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
+            Class<?> clientClass = Class.forName("io.questdb.client.cutlass.qwp.client.QwpQueryClient");
+            Class<?> leaseClass = Class.forName("io.questdb.client.impl.QueryLease");
 
-        // lease() never dereferences the client or pool (it only resets the
-        // reused QueryImpl and stamps the current generation), so nulls are fine
-        // for this structure-only test -- mirrors the null-worker shortcut above.
-        Constructor<?> ctor = workerClass.getDeclaredConstructor(clientClass, poolClass, int.class);
-        ctor.setAccessible(true);
-        Object worker = ctor.newInstance(null, null, 0);
+            // lease() never dereferences the client or pool (it only resets the
+            // reused QueryImpl and stamps the current generation), so nulls are fine
+            // for this structure-only test -- mirrors the null-worker shortcut above.
+            Constructor<?> ctor = workerClass.getDeclaredConstructor(clientClass, poolClass, int.class);
+            ctor.setAccessible(true);
+            Object worker = ctor.newInstance(null, null, 0);
 
-        Method leaseM = workerClass.getDeclaredMethod("lease");
-        leaseM.setAccessible(true);
-        Object leaseA = leaseM.invoke(worker);
-        Object leaseB = leaseM.invoke(worker);
+            Method leaseM = workerClass.getDeclaredMethod("lease");
+            leaseM.setAccessible(true);
+            Object leaseA = leaseM.invoke(worker);
+            Object leaseB = leaseM.invoke(worker);
 
-        Assert.assertNotSame("each borrow must hand back a fresh lease wrapper", leaseA, leaseB);
+            Assert.assertNotSame("each borrow must hand back a fresh lease wrapper", leaseA, leaseB);
 
-        Field implF = leaseClass.getDeclaredField("impl");
-        implF.setAccessible(true);
-        Assert.assertSame("both leases must wrap the same pooled QueryImpl (zero-allocation reuse of the heavy state)",
-                implF.get(leaseA), implF.get(leaseB));
+            Field implF = leaseClass.getDeclaredField("impl");
+            implF.setAccessible(true);
+            Assert.assertSame("both leases must wrap the same pooled QueryImpl (zero-allocation reuse of the heavy state)",
+                    implF.get(leaseA), implF.get(leaseB));
+        });
     }
 
     private static final class NoopHandler implements QwpColumnBatchHandler {

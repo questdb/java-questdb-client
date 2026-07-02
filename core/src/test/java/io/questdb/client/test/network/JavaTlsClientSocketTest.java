@@ -285,6 +285,45 @@ public class JavaTlsClientSocketTest {
         });
     }
 
+    /**
+     * Regression guard for the NOT_HANDSHAKING loop exit. Per the JSSE
+     * contract, {@code getHandshakeStatus()} never returns FINISHED -- once a
+     * delegated task is the TERMINAL handshake step, the re-polled status is
+     * NOT_HANDSHAKING. runHandshake must treat that as completion; without
+     * the explicit NOT_HANDSHAKING exit clause the status matches no switch
+     * case and the loop busy-spins forever with no deadline escape (this
+     * method's timeout is the tripwire).
+     */
+    @Test(timeout = 30_000)
+    public void testHandshakeExitsOnNotHandshakingAfterTerminalDelegatedTask() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (JavaTlsClientSocket socket = newSocket()) {
+                invoke(socket, "prepareInternalBuffers");
+                TerminalDelegatedTaskSslEngine engine = new TerminalDelegatedTaskSslEngine();
+                setField(socket, "sslEngine", engine);
+                // Mark the session as TLS so try-with-resources close() frees the internal buffers
+                // allocated above. Without this the socket stays STATE_EMPTY and close() returns early,
+                // leaking the 3x256KB NATIVE_TLS_RSS buffers.
+                setIntField(socket, "state", 2);
+
+                Method runHandshake = JavaTlsClientSocket.class.getDeclaredMethod(
+                        "runHandshake", SocketReadinessWaiter.class);
+                runHandshake.setAccessible(true);
+
+                AtomicInteger waits = new AtomicInteger();
+                SocketReadinessWaiter waiter = op -> waits.incrementAndGet();
+
+                runHandshake.invoke(socket, waiter); // must return: NOT_HANDSHAKING == done
+
+                Assert.assertEquals("the terminal delegated task must run exactly once",
+                        1, engine.tasksRun.get());
+                Assert.assertEquals(
+                        "completion via NOT_HANDSHAKING must not park on socket readiness",
+                        0, waits.get());
+            }
+        });
+    }
+
     private static void assertBytes(String expected, long ptr, int len) {
         Assert.assertEquals(expected.length(), len);
         for (int i = 0; i < len; i++) {
@@ -467,6 +506,38 @@ public class JavaTlsClientSocketTest {
                     0,
                     0
             );
+        }
+    }
+
+    /**
+     * Models the JSSE terminal-delegated-task shape: NEED_TASK until the
+     * handed-out task has run, then NOT_HANDSHAKING (never FINISHED --
+     * getHandshakeStatus() cannot return it per the JSSE contract).
+     */
+    private static final class TerminalDelegatedTaskSslEngine extends StubSslEngine {
+        final AtomicInteger tasksRun = new AtomicInteger();
+        private boolean taskHandedOut;
+
+        @Override
+        public Runnable getDelegatedTask() {
+            if (taskHandedOut) {
+                return null;
+            }
+            taskHandedOut = true;
+            return tasksRun::incrementAndGet;
+        }
+
+        @Override
+        public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
+            return tasksRun.get() == 0
+                    ? SSLEngineResult.HandshakeStatus.NEED_TASK
+                    : SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING;
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) {
+            throw new IllegalStateException(
+                    "NEED_TASK -> NOT_HANDSHAKING completion must not unwrap");
         }
     }
 
