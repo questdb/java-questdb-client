@@ -57,20 +57,42 @@ public interface BackgroundDrainerListener {
     void onDurableAckPersistentFailure(String slotPath, int totalAttempts, long elapsedMillis);
 
     /**
-     * Fired when a connect sweep found durable ack unavailable — either a
-     * genuine capability gap ({@code QwpDurableAckMismatchException}: an
-     * endpoint upgrades but does not advertise durable ack) or a transient
-     * all-replica failover window (role reject). The drainer will back off
-     * and retry; this callback is purely observability. Source data stays
-     * pinned regardless because the loop runs in {@code durableAckMode=true}
-     * and only trims on STATUS_DURABLE_ACK.
+     * Fired when a connect sweep hit a genuine durable-ack capability gap
+     * ({@code QwpDurableAckMismatchException}: an endpoint upgrades but does
+     * not advertise durable ack). The drainer will back off and retry within
+     * its settle budget; this callback is purely observability. Source data
+     * stays pinned regardless because the loop runs in
+     * {@code durableAckMode=true} and only trims on STATUS_DURABLE_ACK.
+     * A transient all-replica failover window (role reject) never fires this
+     * callback — it is surfaced through {@link #onPrimaryUnavailable}.
      *
      * @param slotPath      slot the drainer is processing
-     * @param attemptNumber 1-based attempt count within the current mode:
-     *                      the running role-reject count for a transient
-     *                      window, or the attempt number within the current
-     *                      capability-gap episode (restarts when a role
-     *                      reject resets the episode)
+     * @param attemptNumber 1-based attempt number within the current
+     *                      capability-gap EPISODE. The counter restarts when
+     *                      an intervening role reject resets the episode —
+     *                      topology churn grants the next gap a fresh settle
+     *                      budget, which is correct behavior — and with the
+     *                      streams separated the reset's cause is visible as
+     *                      an {@link #onPrimaryUnavailable} delivery between
+     *                      the two episodes
      */
     void onDurableAckUnavailable(String slotPath, int attemptNumber);
+
+    /**
+     * Fired when a connect sweep found every reachable endpoint to be a
+     * REPLICA — a transient all-replica failover window (role reject). A
+     * replica is promotable and a primary will reappear, so the drainer
+     * retries indefinitely under Invariant B: this condition NEVER escalates
+     * and is never followed by {@link #onDurableAckPersistentFailure}. Runs
+     * on the drainer thread; implementations must not block. The no-op
+     * default keeps every implementor of the released 1.3.4 contract source-
+     * and binary-compatible.
+     *
+     * @param slotPath      slot the drainer is processing
+     * @param attemptNumber 1-based running role-reject count within the
+     *                      current connect loop (resets across connect
+     *                      re-entries)
+     */
+    default void onPrimaryUnavailable(String slotPath, int attemptNumber) {
+    }
 }

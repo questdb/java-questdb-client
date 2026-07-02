@@ -44,6 +44,7 @@ import org.junit.Test;
 
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -562,14 +563,19 @@ public class BackgroundDrainerDurableAckRetryTest {
                     cap, listener.lastPersistentTotalAttempts.get());
             assertEquals("full settle budget must be granted after the transient window",
                     roleRejects + cap, factory.attempts());
-            // Per-mode attempt numbering: 1..20 for the transient window, then a
-            // fresh 1..15 for the gap episode (the 16th fires persistent-failure).
-            assertEquals(roleRejects + cap - 1, listener.unavailableAttempts.size());
+            // M10 split: the transient all-replica window lands on the
+            // onPrimaryUnavailable stream (1..20), the capability-gap episode
+            // on onDurableAckUnavailable (1..15; the 16th fires
+            // persistent-failure instead). Neither stream sees the other's
+            // counter, so a listener alerting on "attemptNumber approaching
+            // the cap" no longer false-positives on role-reject churn.
+            assertEquals(roleRejects, listener.primaryUnavailableAttempts.size());
             for (int i = 0; i < roleRejects; i++) {
-                assertEquals(Integer.valueOf(i + 1), listener.unavailableAttempts.get(i));
+                assertEquals(Integer.valueOf(i + 1), listener.primaryUnavailableAttempts.get(i));
             }
+            assertEquals(cap - 1, listener.unavailableAttempts.size());
             for (int i = 0; i < cap - 1; i++) {
-                assertEquals(Integer.valueOf(i + 1), listener.unavailableAttempts.get(roleRejects + i));
+                assertEquals(Integer.valueOf(i + 1), listener.unavailableAttempts.get(i));
             }
             assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
@@ -646,7 +652,59 @@ public class BackgroundDrainerDurableAckRetryTest {
                     cap, listener.lastPersistentTotalAttempts.get());
             // 15 gap + 1 role reject + 16 gap = 32 sweeps total.
             assertEquals(2 * cap, factory.attempts());
+            // M10 split, per-stream: the DA stream carries both episodes'
+            // per-episode numbering (1..15, then 1..15 again -- the second
+            // episode's 16th attempt fires persistent-failure instead), and
+            // the reset between them is attributable: exactly one role reject
+            // on the primary stream. Before the split the reset was an
+            // ambiguous non-monotonic drop in a single stream.
+            List<Integer> expectedDaStream = new ArrayList<>();
+            for (int episode = 0; episode < 2; episode++) {
+                for (int i = 1; i <= cap - 1; i++) {
+                    expectedDaStream.add(i);
+                }
+            }
+            assertEquals(expectedDaStream, listener.unavailableAttempts);
+            assertEquals(Collections.singletonList(1), listener.primaryUnavailableAttempts);
             assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test
+    public void testRoleRejectAndCapabilityGapLandOnSeparateStreams() throws Exception {
+        assertMemoryLeak(() -> {
+            // M10 discriminator: gap -> role reject -> gap -> success. The
+            // released 1.3.4 contract fed BOTH conditions to
+            // onDurableAckUnavailable, so this script produced the ambiguous
+            // stream [1, 1, 1] -- a listener could not tell a budget-bound
+            // capability-gap episode from a never-escalating role-reject
+            // window, and could not see WHY the episode counter reset. With
+            // the split, the DA stream carries only the two one-attempt gap
+            // episodes ([1, 1] -- the reset stays visible) and the role
+            // reject that caused the reset lands on the primary stream ([1]).
+            CountingListener listener = new CountingListener();
+            AtomicInteger sweeps = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.failingTimes(3, () -> {
+                if (sweeps.incrementAndGet() == 2) {
+                    return new QwpIngressRoleRejectedException(
+                            QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+                }
+                return new QwpDurableAckMismatchException("h", 1234, "primary");
+            });
+            BackgroundDrainer drainer = newDrainer(factory);
+            drainer.setListener(listener);
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+            assertSame(factory.successSentinel(), out);
+            assertEquals(4, factory.attempts());
+            assertEquals("DA stream must carry only the gap episodes, each"
+                            + " restarting at 1 after the role-reject reset",
+                    Arrays.asList(1, 1), listener.unavailableAttempts);
+            assertEquals("role reject must land on the primary stream",
+                    Collections.singletonList(1), listener.primaryUnavailableAttempts);
+            assertEquals(Collections.singletonList(slotPath), listener.primaryUnavailableSlotPaths);
+            assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+            assertEquals(0, listener.persistentFailures.get());
+            assertFalse(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
     }
 
@@ -788,9 +846,11 @@ public class BackgroundDrainerDurableAckRetryTest {
                 0, listener.persistentFailures.get());
         assertFalse("no .failed sentinel: both gap episodes stayed inside their budgets",
                 Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
-        // Per-mode attempt numbering across the reset: gaps 1,2 -- role reject
-        // 1 -- fresh gap episode 1,2.
-        assertEquals(java.util.Arrays.asList(1, 2, 1, 1, 2), listener.unavailableAttempts);
+        // Per-stream attempt numbering across the reset (M10 split): the DA
+        // stream carries gaps 1,2 then the fresh episode's 1,2; the role
+        // reject that restarted the episode lands on the primary stream.
+        assertEquals(Arrays.asList(1, 2, 1, 2), listener.unavailableAttempts);
+        assertEquals(Collections.singletonList(1), listener.primaryUnavailableAttempts);
     }
 
     @Test
@@ -907,6 +967,8 @@ public class BackgroundDrainerDurableAckRetryTest {
         final AtomicInteger lastPersistentElapsedMs = new AtomicInteger(-1);
         final AtomicInteger lastPersistentTotalAttempts = new AtomicInteger(-1);
         final AtomicInteger persistentFailures = new AtomicInteger();
+        final List<Integer> primaryUnavailableAttempts = new ArrayList<>();
+        final List<String> primaryUnavailableSlotPaths = new ArrayList<>();
         final List<Integer> unavailableAttempts = new ArrayList<>();
         final List<String> unavailableSlotPaths = new ArrayList<>();
 
@@ -921,6 +983,12 @@ public class BackgroundDrainerDurableAckRetryTest {
         public synchronized void onDurableAckUnavailable(String slotPath, int attemptNumber) {
             unavailableSlotPaths.add(slotPath);
             unavailableAttempts.add(attemptNumber);
+        }
+
+        @Override
+        public synchronized void onPrimaryUnavailable(String slotPath, int attemptNumber) {
+            primaryUnavailableSlotPaths.add(slotPath);
+            primaryUnavailableAttempts.add(attemptNumber);
         }
     }
 

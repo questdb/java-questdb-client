@@ -274,9 +274,9 @@ public final class BackgroundDrainer implements Runnable {
                 BackgroundDrainerListener l = listener;
                 if (l != null) {
                     try {
-                        l.onDurableAckUnavailable(slotPath, roleRejectAttempts);
+                        l.onPrimaryUnavailable(slotPath, roleRejectAttempts);
                     } catch (Throwable cb) {
-                        LOG.warn("drainer listener onDurableAckUnavailable threw: {}",
+                        LOG.warn("drainer listener onPrimaryUnavailable threw: {}",
                                 cb.getMessage());
                     }
                 }
