@@ -47,6 +47,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
@@ -99,8 +100,11 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final int maxRecvBufSize;
     private final SecureRnd rnd;
     private final WebSocketSendBuffer sendBuffer;
-    // volatile: written by user thread in close(), read by I/O thread in checkConnected()/sendFrame()/receiveFrame()
-    private volatile boolean closed;
+    // Written by whichever closer wins the CAS in close(); read by the I/O
+    // thread in checkConnected()/sendFrame()/receiveFrame(). An AtomicBoolean
+    // (not a bare volatile check-then-act) so concurrent closers cannot both
+    // enter close() and double-run disconnect()/Unsafe.free.
+    private final AtomicBoolean closed = new AtomicBoolean();
     // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
     // timeout and falls back to the OS connect timeout. Seeded from the
     // configuration; the QWP sender may override it via setConnectTimeout().
@@ -197,7 +201,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             this.frameParser = new WebSocketFrameParser();
             this.rnd = new SecureRnd();
             this.upgraded = false;
-            this.closed = false;
+            this.closed.set(false);
         } catch (Throwable t) {
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
@@ -212,8 +216,12 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     @Override
     public void close() {
-        if (!closed) {
-            closed = true;
+        // CAS gate: exactly one closer runs the teardown below. Closers can be
+        // the owner thread, the I/O thread's exit path, or a stale duplicate
+        // reference (see CursorWebSocketSendLoop) -- a bare volatile
+        // check-then-act here would let two concurrent closers both enter and
+        // double-run disconnect()/Unsafe.free (native double-free).
+        if (closed.compareAndSet(false, true)) {
 
             // Try to send close frame
             if (upgraded && !socket.isClosed()) {
@@ -247,7 +255,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * @param port the server port
      */
     public void connect(CharSequence host, int port) {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
 
@@ -380,7 +388,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Returns whether the WebSocket is connected and upgraded.
      */
     public boolean isConnected() {
-        return upgraded && !closed && !socket.isClosed();
+        return upgraded && !closed.get() && !socket.isClosed();
     }
 
     /**
@@ -585,7 +593,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * @param authorizationHeader the Authorization header value (e.g., "Basic ..."), or null
      */
     public void upgrade(CharSequence path, int timeout, CharSequence authorizationHeader) {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
         if (socket.isClosed()) {
@@ -892,7 +900,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     private void checkConnected() {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
         if (!upgraded) {

@@ -37,10 +37,54 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class WebSocketClientTest {
+
+    /**
+     * close() frees native memory (recv/fragment buffers, send buffers), so
+     * its guard must be a CAS, not a volatile check-then-act: two concurrent
+     * closers passing the flag check together would both run
+     * disconnect()/Unsafe.free -- a native double-free. Closers can race in
+     * practice: the owner thread's teardown vs the I/O thread's exit path vs
+     * stale duplicate references (see CursorWebSocketSendLoop). The memory
+     * counters checked by assertMemoryLeak flag a double-free as a counter
+     * mismatch.
+     */
+    @Test
+    public void testConcurrentCloseRunsTeardownExactlyOnce() throws Exception {
+        assertMemoryLeak(() -> {
+            final int threads = 4;
+            final int iterations = 200;
+            for (int i = 0; i < iterations; i++) {
+                StubWebSocketClient client = new StubWebSocketClient();
+                CyclicBarrier barrier = new CyclicBarrier(threads);
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                Thread[] closers = new Thread[threads];
+                for (int t = 0; t < threads; t++) {
+                    closers[t] = new Thread(() -> {
+                        try {
+                            barrier.await();
+                            client.close();
+                        } catch (Throwable e) {
+                            failure.compareAndSet(null, e);
+                        }
+                    });
+                    closers[t].start();
+                }
+                for (Thread closer : closers) {
+                    closer.join();
+                }
+                Throwable t = failure.get();
+                if (t != null) {
+                    throw new AssertionError("concurrent close failed on iteration " + i, t);
+                }
+            }
+        });
+    }
 
     @Test
     public void testExtractMaxBatchSizeAbsentHeaderReturnsZero() throws Exception {

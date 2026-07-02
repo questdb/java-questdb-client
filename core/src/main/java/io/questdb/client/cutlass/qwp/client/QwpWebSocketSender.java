@@ -127,6 +127,9 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
+    // Finite fallback (ms) for BACKGROUND (drainer) TCP connects when the
+    // user left connect_timeout unset. See effectiveConnectTimeoutMs.
+    public static final int DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS = 15_000;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -2445,6 +2448,25 @@ public class QwpWebSocketSender implements Sender {
         sendRow();
     }
 
+    /**
+     * Resolves the connect timeout for one {@code buildAndConnect} walk.
+     * Foreground connects honour the configured value verbatim: 0 (the
+     * default) keeps the historical untimed native connect, bounded only by
+     * the OS (SYN retries, 60-130s on Linux). Background (drainer) connects
+     * get a finite fallback instead: during an outage a drainer is routinely
+     * parked inside a blocking native connect that neither unpark nor
+     * interrupt cancels, so the drainer pool's shutdownNow path (~3s into
+     * sender.close()) reliably lands on the failed-stop protocol -- the
+     * WebSocket client and microbatch buffers are deliberately leaked and
+     * the slot lock is held until the OS deadline resolves the connect. A
+     * finite background deadline bounds that window to seconds without
+     * changing foreground semantics. Exposed for unit tests.
+     */
+    @TestOnly
+    public static int effectiveConnectTimeoutMs(boolean background, int configuredMs) {
+        return background && configuredMs <= 0 ? DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS : configuredMs;
+    }
+
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
         // Background (drainer) factories share this connect walk -- endpoint
         // list, hostTracker health and round state -- but must stay INVISIBLE
@@ -2517,7 +2539,7 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
-                newClient.setConnectTimeout(connectTimeoutMs);
+                newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
