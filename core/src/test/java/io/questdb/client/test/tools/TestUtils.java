@@ -266,20 +266,23 @@ public final class TestUtils {
                 return;
             }
 
-            // Checks that the same tag used for allocation and freeing native memory
+            // Every tag must return to its baseline. The previous shape
+            // (ported from upstream, which exempts NATIVE_SQL_COMPILER only)
+            // absorbed any growth confined to a single tag into a tolerated
+            // diff, so a lone-tag leak (e.g. NATIVE_DEFAULT) passed the check.
+            // This client has no SQL-compiler tag, so no exemption applies:
+            // assert strict per-tag equality, then total equality.
             long memAfter = Unsafe.getMemUsed();
-            long memNativeSqlCompilerDiff = 0;
             Assert.assertTrue(memAfter > -1);
-            if (mem != memAfter) {
-                for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-                    long actualMemByTag = Unsafe.getMemUsedByTag(i);
-                    if (memoryUsageByTag[i] != actualMemByTag) {
-                        Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
-                        memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
-                    }
+            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                long actualMemByTag = Unsafe.getMemUsedByTag(i);
+                if (memoryUsageByTag[i] != actualMemByTag) {
+                    Assert.assertEquals(
+                            "native memory leaked or over-freed under tag " + MemoryTag.nameOf(i),
+                            memoryUsageByTag[i], actualMemByTag);
                 }
-                Assert.assertEquals(mem + memNativeSqlCompilerDiff, memAfter);
             }
+            Assert.assertEquals("total native memory", mem, memAfter);
         }
 
         public void skipChecks() {

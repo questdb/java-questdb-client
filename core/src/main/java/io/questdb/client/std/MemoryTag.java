@@ -38,4 +38,31 @@ public final class MemoryTag {
     public static final int NATIVE_TLS_RSS = NATIVE_TEXT_PARSER_RSS + 1;
     public static final int NATIVE_ND_ARRAY = NATIVE_TLS_RSS + 1;
     public static final int SIZE = NATIVE_ND_ARRAY + 1;
+
+    public static String nameOf(int tag) {
+        switch (tag) {
+            case MMAP_DEFAULT:
+                return "MMAP_DEFAULT";
+            case NATIVE_PATH:
+                return "NATIVE_PATH";
+            case NATIVE_DEFAULT:
+                return "NATIVE_DEFAULT";
+            case NATIVE_DIRECT_UTF8_SINK:
+                return "NATIVE_DIRECT_UTF8_SINK";
+            case NATIVE_HTTP_CONN:
+                return "NATIVE_HTTP_CONN";
+            case NATIVE_ILP_RSS:
+                return "NATIVE_ILP_RSS";
+            case NATIVE_IO_DISPATCHER_RSS:
+                return "NATIVE_IO_DISPATCHER_RSS";
+            case NATIVE_TEXT_PARSER_RSS:
+                return "NATIVE_TEXT_PARSER_RSS";
+            case NATIVE_TLS_RSS:
+                return "NATIVE_TLS_RSS";
+            case NATIVE_ND_ARRAY:
+                return "NATIVE_ND_ARRAY";
+            default:
+                return "unknown[" + tag + "]";
+        }
+    }
 }
