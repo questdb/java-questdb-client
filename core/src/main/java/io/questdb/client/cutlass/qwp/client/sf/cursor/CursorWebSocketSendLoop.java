@@ -586,9 +586,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // replaced the original (and closed it); the owner only retains
         // the stale pre-reconnect reference. Without closing the live
         // client here, its native socket and fds leak past sender.close()
-        // every time the loop reconnected at least once. close() is
-        // idempotent, so the owner's duplicate close on its stale
-        // reference is still safe.
+        // every time the loop reconnected at least once. ioLoop's finally
+        // also closes the current client on I/O-thread exit, so this read
+        // matters chiefly when the loop never started (SYNC construction,
+        // close() before start()) — and doubles as a safety net. close()
+        // is idempotent, so duplicate closes on any path are safe.
         WebSocketClient c = client;
         if (c != null) {
             try {
@@ -898,6 +900,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             try {
                 WebSocketClient newClient = reconnectFactory.reconnect();
                 if (newClient != null) {
+                    if (!running) {
+                        // close() ran while this connect attempt was in
+                        // flight. Its latch await may have been interrupted
+                        // (BackgroundDrainerPool.close()'s shutdownNow path)
+                        // and returned already — the owner's teardown,
+                        // including the engine unmap in BackgroundDrainer's
+                        // finally, can be complete. Installing the client now
+                        // would (a) touch engine memory via positionCursorAt
+                        // after a possible unmap and (b) abandon a live socket
+                        // in a loop nothing will revisit — close() has run,
+                        // its client read saw the pre-connect field. The
+                        // attempt owns the client until it is installed, so
+                        // dispose of it here, on the I/O thread, and exit
+                        // through the quiet stopped path below.
+                        try {
+                            newClient.close();
+                        } catch (Throwable ignored) {
+                            // best-effort
+                        }
+                        break;
+                    }
                     swapClient(newClient);
                     totalReconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
@@ -1189,6 +1212,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             fail(t);
         } finally {
+            // Last act of the I/O thread: dispose of whatever client it
+            // holds. This is the airtight half of the close()-vs-reconnect
+            // race — when close()'s latch await is interrupted (drainer pool
+            // shutdownNow), close() returns before this thread has exited,
+            // and its own client close saw the pre-reconnect field. A client
+            // swapped in by the tail of an in-flight connect attempt (running
+            // flipped false between connectLoop's check and swapClient) would
+            // be abandoned live without this. Runs BEFORE the latch countdown
+            // so a non-interrupted close() observes a fully disposed loop.
+            // Duplicate closes — loop.close()'s own, owners' stale references
+            // — stay safe: WebSocketClient.close() is idempotent.
+            WebSocketClient c = client;
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
             shutdownLatch.countDown();
         }
     }
