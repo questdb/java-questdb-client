@@ -211,7 +211,8 @@ public class QwpWebSocketSender implements Sender {
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
     // under the server's cap even with encoding overhead. Volatile because the
     // I/O thread writes this inside buildAndConnect on every successful
-    // (re)connect while the producer thread reads it from sendRow without
+    // FOREGROUND (re)connect -- background drainer connects never touch it --
+    // while the producer thread reads it from sendRow without
     // holding the sender monitor.
     private volatile int effectiveAutoFlushBytes;
     private SenderErrorDispatcher errorDispatcher;
@@ -222,7 +223,8 @@ public class QwpWebSocketSender implements Sender {
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
     private boolean hasDeferredMessages;
-    // Stickys true once any successful connect has happened. Drives the
+    // Stickys true once any successful FOREGROUND connect has happened
+    // (background drainer connects never set it). Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
     // point in buildAndConnect.
     private boolean hasEverConnected;
@@ -258,8 +260,9 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
     // Monotonic per-attempt counter snapshotted onto every connection event
-    // fired from buildAndConnect. Counts every endpoint try -- successes and
-    // failures alike -- across this sender's lifetime.
+    // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
+    // successes and failures alike -- across this sender's lifetime.
+    // Background (drainer) walks fire no events and do not advance it.
     private long roundConnectAttemptSeq;
     // Monotonic per-round counter incremented inside buildAndConnect on each
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
@@ -270,7 +273,8 @@ public class QwpWebSocketSender implements Sender {
     // arbitrarily large datasets that exceed the server's recv buffer.
     private boolean transactional;
     // Server-advertised hard cap on QWP ingest payload bytes, captured from
-    // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
+    // X-QWP-Max-Batch-Size on each successful FOREGROUND handshake (a
+    // background drainer's endpoint cap is irrelevant to the producer's wire). 0 when the server
     // did not advertise the header (older builds); the sender then falls back
     // to its locally configured budget. Volatile because buildAndConnect can
     // refresh this from the cursor I/O thread on a mid-stream reconnect while
@@ -1020,8 +1024,9 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             // Drainer pool closes after the foreground I/O loop is wound
-            // down. Drainers share buildAndConnect (endpoints, hostTracker,
-            // connection-event dispatcher) with the foreground, but their
+            // down. Drainers share buildAndConnect's endpoint walk and
+            // hostTracker state with the foreground (never its observable
+            // connection state or event stream), but their
             // connect gate is their own stop flag — NOT the foreground
             // loop's liveness — so the pool's graceful-drain window below
             // still lets in-flight drainers finish (including reconnects)
@@ -2419,20 +2424,37 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+        // Background (drainer) factories share this connect walk -- endpoint
+        // list, hostTracker health and round state -- but must stay INVISIBLE
+        // in the foreground sender's observable state. SenderConnectionEvents
+        // describe the FOREGROUND connection's lifecycle, and the cap-derived
+        // sizing (serverMaxBatchSize / effectiveAutoFlushBytes) guards the
+        // FOREGROUND wire: a drainer connect that committed either would
+        // fabricate lifecycle transitions the foreground never had, steal the
+        // once-per-lifetime CONNECTED classification, and re-size the
+        // producer's batch guard for a connection the producer is not on
+        // (oversize batch -> ws-close[1009] -> producer-terminal HALT caused
+        // by background activity).
+        final boolean background = ctx.isBackground();
         int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
             // Mid-stream wire failure -- the I/O loop just observed the active
-            // connection drop and called us via the reconnect factory. Surface
-            // a DISCONNECTED event identifying which endpoint just went away
-            // before we start the per-endpoint walk for a replacement.
-            Endpoint priorEp = endpoints.get(previousIdx);
-            dispatchConnectionEvent(
-                    SenderConnectionEvent.Kind.DISCONNECTED,
-                    priorEp.host, priorEp.port,
-                    null, SenderConnectionEvent.NO_PORT,
-                    SenderConnectionEvent.NO_ATTEMPT_NUMBER,
-                    roundSeq,
-                    null);
+            // connection drop and called us via the reconnect factory. Only a
+            // FOREGROUND drop surfaces DISCONNECTED: a drainer's wire drop is
+            // not a foreground outage, and reporting it would claim an outage
+            // against an endpoint the foreground may be healthily using. The
+            // hostTracker health penalty is recorded either way -- the drop
+            // was real, whichever loop observed it.
+            if (!background) {
+                Endpoint priorEp = endpoints.get(previousIdx);
+                dispatchConnectionEvent(
+                        SenderConnectionEvent.Kind.DISCONNECTED,
+                        priorEp.host, priorEp.port,
+                        null, SenderConnectionEvent.NO_PORT,
+                        SenderConnectionEvent.NO_ATTEMPT_NUMBER,
+                        roundSeq,
+                        null);
+            }
             hostTracker.recordMidStreamFailure(previousIdx);
             ctx.previousIdx = -1;
         }
@@ -2460,7 +2482,12 @@ public class QwpWebSocketSender implements Sender {
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
             lastEndpoint = ep;
-            long attemptNumber = ++roundConnectAttemptSeq;
+            // Attempt numbers exist for foreground observability only. A
+            // background walk fires no events and must not skew the numbering
+            // the user sees on subsequent foreground events.
+            long attemptNumber = background
+                    ? SenderConnectionEvent.NO_ATTEMPT_NUMBER
+                    : ++roundConnectAttemptSeq;
             WebSocketClient newClient = tlsConfig != null
                     ? WebSocketClientFactory.newTlsInstance(tlsConfig)
                     : WebSocketClientFactory.newPlainTextInstance();
@@ -2480,10 +2507,12 @@ public class QwpWebSocketSender implements Sender {
                     hostTracker.recordRoleReject(idx, re.isTransient());
                     lastError = re;
                     lastRoleReject = re;
-                    dispatchConnectionEvent(
-                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                            attemptNumber, roundSeq, re);
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, re);
+                    }
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
@@ -2493,10 +2522,12 @@ public class QwpWebSocketSender implements Sender {
                     // moment the I/O thread gives up, ahead of the producer
                     // thread learning via LineSenderException on the next
                     // API call.
-                    dispatchConnectionEvent(
-                            SenderConnectionEvent.Kind.AUTH_FAILED,
-                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                            attemptNumber, roundSeq, classified);
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.AUTH_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, classified);
+                    }
                     throw classified;
                 }
                 if (terminalUpgradeError == null && (
@@ -2507,19 +2538,23 @@ public class QwpWebSocketSender implements Sender {
                 }
                 hostTracker.recordTransportError(idx);
                 lastError = classified;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, classified);
+                if (!background) {
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, classified);
+                }
                 continue;
             } catch (Exception e) {
                 newClient.close();
                 hostTracker.recordTransportError(idx);
                 lastError = e;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, e);
+                if (!background) {
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, e);
+                }
                 continue;
             }
             if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
@@ -2531,15 +2566,28 @@ public class QwpWebSocketSender implements Sender {
                     terminalUpgradeError = ackErr;
                 }
                 lastError = ackErr;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, ackErr);
+                if (!background) {
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, ackErr);
+                }
                 continue;
             }
-            int previousLiveIdx = currentEndpointIdx;
             hostTracker.recordSuccess(idx);
             ctx.previousIdx = idx;
+            if (background) {
+                // Walk bookkeeping only: recordSuccess feeds the shared health
+                // tracker and ctx.previousIdx arms this factory's own
+                // mid-stream-failure handling on its next reconnect. No
+                // lifecycle event, no CONNECTED/RECONNECTED/FAILED_OVER
+                // classification state, no producer batch re-sizing -- the
+                // drainer's lifecycle is observable via
+                // BackgroundDrainerListener and the drainer counters, never
+                // the foreground connection-event stream.
+                return newClient;
+            }
+            int previousLiveIdx = currentEndpointIdx;
             currentEndpointIdx = idx;
             // Classify the success. CONNECTED only fires once per sender
             // lifetime; subsequent successes are RECONNECTED (same endpoint
@@ -2580,7 +2628,7 @@ public class QwpWebSocketSender implements Sender {
         // which terminal branch fires next. The connectLoop wrapper retries,
         // and each retry that re-enters this method and fails again produces
         // its own ALL_ENDPOINTS_UNREACHABLE event.
-        if (lastEndpoint != null) {
+        if (!background && lastEndpoint != null) {
             dispatchConnectionEvent(
                     SenderConnectionEvent.Kind.ALL_ENDPOINTS_UNREACHABLE,
                     lastEndpoint.host, lastEndpoint.port,
@@ -3383,6 +3431,16 @@ public class QwpWebSocketSender implements Sender {
 
         String abortMessage() {
             return abortCheck != null ? abortMessage : "sender closed during connect";
+        }
+
+        /**
+         * True when this factory serves a background drainer. Background
+         * connects share buildAndConnect's endpoint walk and hostTracker
+         * health state, but commit none of the foreground sender's
+         * observable connection state and fire no connection events.
+         */
+        boolean isBackground() {
+            return abortCheck != null;
         }
 
         boolean isAborted() {
