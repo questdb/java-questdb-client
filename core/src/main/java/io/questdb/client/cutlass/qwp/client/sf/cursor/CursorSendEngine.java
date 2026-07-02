@@ -145,15 +145,30 @@ public final class CursorSendEngine implements QuietCloseable {
         boolean memoryMode = sfDir == null;
         SlotLock acquiredLock = null;
         if (!memoryMode) {
-            if (sfDir.isEmpty()) {
-                throw new IllegalArgumentException("sfDir must not be empty");
+            try {
+                if (sfDir.isEmpty()) {
+                    throw new IllegalArgumentException("sfDir must not be empty");
+                }
+                // Acquire the slot lock BEFORE we touch any *.sfa files. Two
+                // engines pointed at the same slot would otherwise race on
+                // recovery and create overlapping FSN ranges. SlotLock.acquire
+                // also creates the slot dir if it doesn't exist yet — no
+                // separate mkdir step needed here.
+                acquiredLock = SlotLock.acquire(sfDir);
+            } catch (Throwable t) {
+                // The delegating constructors evaluate `new SegmentManager(...)`
+                // BEFORE this body runs, so on a pre-try throw (e.g. slot lock
+                // collision) an owned manager is already alive and would leak
+                // its native path-scratch sink -- 256 bytes per failed
+                // construction attempt. Close it before propagating.
+                if (ownsManager) {
+                    try {
+                        manager.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                throw t;
             }
-            // Acquire the slot lock BEFORE we touch any *.sfa files. Two
-            // engines pointed at the same slot would otherwise race on
-            // recovery and create overlapping FSN ranges. SlotLock.acquire
-            // also creates the slot dir if it doesn't exist yet — no
-            // separate mkdir step needed here.
-            acquiredLock = SlotLock.acquire(sfDir);
         }
         this.slotLock = acquiredLock;
         this.sfDir = sfDir;
@@ -168,7 +183,6 @@ public final class CursorSendEngine implements QuietCloseable {
         // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
-        boolean managerStarted = false;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -277,7 +291,6 @@ public final class CursorSendEngine implements QuietCloseable {
 
             if (ownsManager) {
                 manager.start();
-                managerStarted = true;
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress);
             // All construction succeeded — commit the ring and
@@ -288,7 +301,10 @@ public final class CursorSendEngine implements QuietCloseable {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
             // try/catch so a single failure doesn't strand later cleanups.
-            if (ownsManager && managerStarted) {
+            // Closing an owned-but-never-started manager is safe (no worker to
+            // join) and required: skipping it leaked the manager's native
+            // path-scratch sink whenever construction failed before start().
+            if (ownsManager) {
                 try {
                     manager.close();
                 } catch (Throwable ignored) {
