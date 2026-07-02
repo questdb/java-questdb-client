@@ -205,6 +205,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // up" (looks transient).
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
+    // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
+    // terminalError latch, so a checkError() caller that observes the latch is
+    // guaranteed to observe this marker too) when a reconnect sweep threw
+    // QwpDurableAckMismatchException. The orphan drainer consults it to route
+    // a mid-drain capability gap into its budgeted settle-retry
+    // (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining
+    // the slot on the first sweep; the foreground sender ignores it and keeps
+    // its spec'd loud-fail (sf-client.md section 8.1). Write-once alongside
+    // terminalError: the only writer runs on the I/O thread under the same
+    // first-writer-wins latch.
+    private volatile QwpDurableAckMismatchException capabilityGapTerminal;
     // The latched terminal failure — THE exception every checkError() call
     // rethrows. Write-once for the loop's lifetime: the only writer is
     // recordFatal on the I/O thread (first-writer-wins). The whole
@@ -491,6 +502,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             synchronouslySurfacedError = e;
             throw e;
         }
+    }
+
+    /**
+     * The typed durable-ack capability-gap terminal, or {@code null} if the
+     * loop's terminal (if any) is a different failure class. Non-null only
+     * after {@link #checkError()} started throwing: the marker is written
+     * before the {@code terminalError} latch, both on the I/O thread.
+     * <p>
+     * Consumer contract: the orphan drainer ({@code BackgroundDrainer})
+     * checks this after a {@code checkError()} throw to decide between
+     * re-entering its budgeted settle-retry (capability gap: the rolling
+     * upgrade may still settle) and quarantining the slot (every other
+     * terminal). Package-private on purpose -- the foreground sender must
+     * not branch on it (spec'd loud-fail, sf-client.md section 8.1).
+     */
+    QwpDurableAckMismatchException capabilityGapTerminal() {
+        return capabilityGapTerminal;
     }
 
     /**
@@ -895,6 +923,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // not SECURITY_ERROR -- this is not an auth failure.
                 LOG.error("durable-ack mismatch during {} -- won't retry: {}",
                         phase, e.getMessage());
+                if (terminalError == null) {
+                    // Mirror recordFatal's first-writer-wins latch: only the
+                    // sweep that owns the terminal may mark the gap, and the
+                    // marker must be visible before the terminalError volatile
+                    // write that checkError() keys on.
+                    capabilityGapTerminal = e;
+                }
                 long fromFsn = engine.ackedFsn() + 1L;
                 long toFsn = Math.max(fromFsn, engine.publishedFsn());
                 SenderError err = new SenderError(

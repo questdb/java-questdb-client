@@ -159,7 +159,10 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
-     * Initial connect with retry on whole-cluster durable-ack unavailability.
+     * Budgeted connect with retry on whole-cluster durable-ack unavailability:
+     * the initial connect, and re-entered from {@link #run()} whenever a
+     * mid-drain reconnect sweep hits the same capability gap (each re-entry
+     * is a fresh episode -- a successful connect ended the previous one).
      * The wrapped {@code clientFactory.reconnect()} already walks every
      * configured endpoint per attempt and only throws
      * {@link QwpDurableAckMismatchException} when none of them advertise
@@ -429,37 +432,78 @@ public final class BackgroundDrainer implements Runnable {
                 // already dropped on the FAILED path.
                 return;
             }
-            loop = new CursorWebSocketSendLoop(
-                    client, engine,
-                    0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
-                    clientFactory,
-                    reconnectMaxDurationMillis,
-                    reconnectInitialBackoffMillis,
-                    reconnectMaxBackoffMillis,
-                    requestDurableAck,
-                    durableAckKeepaliveIntervalMillis);
-            loop.start();
-
+            // One iteration per wire session. Re-entered ONLY when a mid-drain
+            // reconnect sweep hit a durable-ack CAPABILITY gap: that is the
+            // exact rolling-upgrade condition the settle budget in
+            // connectWithDurableAckRetry() exists for, so it must not
+            // quarantine on the first sweep the way the initial-connect path
+            // never does. The engine stays alive across sessions (it holds the
+            // slot lock; only loop + client are recycled), and target remains
+            // valid -- the slot is orphaned, nothing appends to it.
+            drain:
             while (!stopRequested) {
-                long acked = engine.ackedFsn();
-                this.ackedFsn = acked;
-                if (acked >= target) {
-                    outcome = DrainOutcome.SUCCESS;
-                    LOG.info("drainer fully drained slot {} (target={}, acked={})",
-                            slotPath, target, acked);
-                    return;
+                loop = new CursorWebSocketSendLoop(
+                        client, engine,
+                        0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        clientFactory,
+                        reconnectMaxDurationMillis,
+                        reconnectInitialBackoffMillis,
+                        reconnectMaxBackoffMillis,
+                        requestDurableAck,
+                        durableAckKeepaliveIntervalMillis);
+                loop.start();
+
+                while (!stopRequested) {
+                    long acked = engine.ackedFsn();
+                    this.ackedFsn = acked;
+                    if (acked >= target) {
+                        outcome = DrainOutcome.SUCCESS;
+                        LOG.info("drainer fully drained slot {} (target={}, acked={})",
+                                slotPath, target, acked);
+                        return;
+                    }
+                    try {
+                        loop.checkError();
+                    } catch (Throwable t) {
+                        if (loop.capabilityGapTerminal() != null) {
+                            // Capability gap mid-drain: recycle the wire, NOT
+                            // the slot. connectWithDurableAckRetry() owns the
+                            // episode budget (16 consecutive gap sweeps /
+                            // wall clock) and drops the sentinel itself if the
+                            // gap persists. The loop's own failed sweep is not
+                            // counted toward the fresh episode -- an off-by-one
+                            // that is immaterial at budget 16.
+                            LOG.warn("drainer slot {}: durable-ack capability gap "
+                                            + "mid-drain ({}), re-entering settle budget",
+                                    slotPath, t.getMessage());
+                            try {
+                                loop.close();
+                            } catch (Throwable ignored) {
+                            }
+                            try {
+                                client.close();
+                            } catch (Throwable ignored) {
+                            }
+                            loop = null;
+                            client = connectWithDurableAckRetry();
+                            if (client == null) {
+                                // outcome already set (FAILED after budget
+                                // exhaustion, or STOPPED); sentinel handled.
+                                return;
+                            }
+                            continue drain;
+                        }
+                        String msg = t.getMessage();
+                        LOG.error("drainer wire error for slot {}: {}", slotPath, msg);
+                        lastErrorMessage = msg;
+                        OrphanScanner.markFailed(slotPath, "wire: " + msg);
+                        outcome = DrainOutcome.FAILED;
+                        return;
+                    }
+                    java.util.concurrent.locks.LockSupport.parkNanos(POLL_NANOS);
                 }
-                try {
-                    loop.checkError();
-                } catch (Throwable t) {
-                    String msg = t.getMessage();
-                    LOG.error("drainer wire error for slot {}: {}", slotPath, msg);
-                    lastErrorMessage = msg;
-                    OrphanScanner.markFailed(slotPath, "wire: " + msg);
-                    outcome = DrainOutcome.FAILED;
-                    return;
-                }
-                java.util.concurrent.locks.LockSupport.parkNanos(POLL_NANOS);
+                // Inner loop exits only on stopRequested; fall through to the
+                // outer condition, which is false for the same reason.
             }
             outcome = DrainOutcome.STOPPED;
         } catch (Throwable t) {
