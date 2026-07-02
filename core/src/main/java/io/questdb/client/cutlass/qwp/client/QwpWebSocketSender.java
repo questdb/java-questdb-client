@@ -2038,6 +2038,30 @@ public class QwpWebSocketSender implements Sender {
         return new ReconnectSupplier();
     }
 
+    /**
+     * Test seam: a BACKGROUND reconnect factory identical to the ones
+     * {@link #startOrphanDrainers} hands to orphan drainers (abort gate =
+     * the supplied stop flag, {@code isBackground()=true}), so tests can
+     * exercise the background side of the connect-walk lock policy (see
+     * {@link #buildAndConnect}) without reflection.
+     */
+    @TestOnly
+    public CursorWebSocketSendLoop.ReconnectFactory newBackgroundReconnectFactory(
+            java.util.function.BooleanSupplier stopFlag
+    ) {
+        return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
+    }
+
+    /**
+     * Test seam: installs the per-attempt WebSocket client factory override
+     * consulted by {@code newWebSocketClient()} inside the connect walk.
+     * Production code never sets it.
+     */
+    @TestOnly
+    public void setClientFactoryOverride(java.util.function.Supplier<WebSocketClient> factory) {
+        this.clientFactoryOverride = factory;
+    }
+
     @Override
     public void reset() {
         checkNotClosed();
