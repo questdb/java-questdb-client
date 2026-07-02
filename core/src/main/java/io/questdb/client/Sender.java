@@ -1840,6 +1840,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Slots flagged with the {@code .failed} sentinel are skipped
          * (manual reset required), and the foreground sender's own slot is
          * never adopted.
+         * <p>
+         * Close-latency note: {@code close()} stops adopted drainers. A
+         * drainer still connecting (e.g. during an outage) is stop-signaled
+         * immediately and exits within ~50ms; a drainer actively replaying
+         * frames is given a ~2.5s grace window to finish, plus a 0.5s stop
+         * window — so {@code close()} may take up to ~3s while orphan
+         * drainers are in flight (and a drainer parked in a blocking native
+         * connect is abandoned to exit on its own daemon thread).
+         * Un-drained slots stay on disk and are re-adopted by the next
+         * sender that enables {@code drain_orphans}.
          */
         public LineSenderBuilder drainOrphans(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {

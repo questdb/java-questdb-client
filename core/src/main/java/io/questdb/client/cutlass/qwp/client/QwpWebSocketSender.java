@@ -73,6 +73,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * QWP v1 WebSocket client sender for streaming data to QuestDB.
@@ -152,6 +153,16 @@ public class QwpWebSocketSender implements Sender {
     private final List<Endpoint> endpoints;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
+    // Guards the connect walk (see buildAndConnect): the shared
+    // QwpHostHealthTracker round/health state, roundSeq,
+    // roundConnectAttemptSeq, and the foreground lifecycle commits
+    // (currentEndpointIdx, hasEverConnected, cap-derived sizing). A
+    // dedicated lock rather than the sender monitor so that (a) unrelated
+    // synchronized sender methods (setDrainerListener, startOrphanDrainers)
+    // never contend with a connect walk's network I/O, and (b) background
+    // walks can use tryLock to yield to the foreground instead of queuing
+    // on an unfair monitor.
+    private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -943,6 +954,30 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Closes the sender: flushes user-thread state into the engine, drains
+     * acked data within {@code close_flush_timeout}, stops the I/O loop,
+     * closes the orphan-drainer pool, and frees buffers.
+     * <p>
+     * Worst-case latency budget (dominant contributors, sequential):
+     * <ul>
+     *   <li>bounded drain: up to {@code close_flush_timeout} when the server
+     *       is slow or unreachable ({@code <= 0} opts out);</li>
+     *   <li>I/O loop stop: the shutdown-latch await is untimed, but the loop
+     *       exits promptly unless the I/O thread sits inside a blocking
+     *       native connect — bounded by {@code connect_timeout}, or by the
+     *       OS SYN-retry deadline (60-130s on Linux) when the default
+     *       {@code 0} is in effect. Background drainer walks never delay
+     *       this stop: they yield the connect-walk lock to the foreground
+     *       (see {@link #buildAndConnect});</li>
+     *   <li>drainer pool: drainers still in their connect-retry phase are
+     *       stop-signaled immediately (exit within ~50ms); drainers actively
+     *       replaying frames get a 2.5s grace window plus a 0.5s stop window
+     *       — worst case ~3s when a drainer sits in a blocking native
+     *       connect (15s background deadline) and must be abandoned to exit
+     *       on its own.</li>
+     * </ul>
+     */
     @Override
     public void close() {
         if (!closed) {
@@ -2524,7 +2559,62 @@ public class QwpWebSocketSender implements Sender {
                 : WebSocketClientFactory.newPlainTextInstance();
     }
 
-    private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+    /**
+     * Multi-endpoint connect walk shared by the foreground sender and the
+     * background orphan drainers. One invocation walks every endpoint of the
+     * current round, performing a TCP/TLS connect plus a WebSocket upgrade
+     * per endpoint, all while holding {@link #connectWalkLock} (the lock
+     * protects the shared {@link QwpHostHealthTracker} round/health state,
+     * the round counters, and the foreground lifecycle commits).
+     * <p>
+     * Worst-case lock hold per walk is
+     * {@code endpoints x (connect timeout + upgrade timeout)}:
+     * <ul>
+     *   <li>foreground walk: {@code connect_timeout} verbatim -- the default
+     *       {@code 0} keeps the untimed native connect, bounded only by the
+     *       OS SYN-retry deadline (60-130s per endpoint on Linux) -- plus
+     *       {@code auth_timeout_ms} (default 15s) for the upgrade;</li>
+     *   <li>background walk: 15s connect fallback
+     *       ({@link #DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS}) plus
+     *       {@code auth_timeout_ms} -- see
+     *       {@link #effectiveConnectTimeoutMs(boolean, int)}.</li>
+     * </ul>
+     * <p>
+     * Lock policy -- the foreground has absolute priority. Foreground walks
+     * (the producer's initial connect and the I/O loop's reconnects) block
+     * on {@code lock()} and can therefore only ever wait behind another
+     * foreground walk. Background walks use {@code tryLock()} and treat
+     * contention as a transport-shaped transient: the thrown
+     * {@link LineSenderException} lands in the drainer's indefinite
+     * capped-backoff retry (Invariant B) -- both in
+     * {@code BackgroundDrainer.connectWithDurableAckRetry()} and in
+     * {@code CursorWebSocketSendLoop.connectLoop}'s Throwable branch -- so a
+     * drainer sweep is deferred, never failed, and the foreground's
+     * reconnect and {@code close()} paths are never queued behind a
+     * drainer's endpoint walk.
+     */
+    private WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+        if (ctx.isBackground()) {
+            if (!connectWalkLock.tryLock()) {
+                // Transport-shaped on purpose: every drainer retry loop
+                // treats an untyped connect failure as transient and backs
+                // off (Invariant B) -- the sweep is deferred, never failed,
+                // and no .failed sentinel can result from lock contention.
+                throw new LineSenderException(
+                        "connect walk lock is busy (another connect walk is in progress); "
+                                + "background drainer will retry after backoff");
+            }
+        } else {
+            connectWalkLock.lock();
+        }
+        try {
+            return connectWalk(ctx);
+        } finally {
+            connectWalkLock.unlock();
+        }
+    }
+
+    private WebSocketClient connectWalk(ReconnectSupplier ctx) {
         // Background (drainer) factories share this connect walk -- endpoint
         // list, hostTracker health and round state -- but must stay INVISIBLE
         // in the foreground sender's observable state. SenderConnectionEvents

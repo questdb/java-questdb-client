@@ -151,11 +151,15 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
      * Bypasses the real constructor -- no wire client, engine or dispatcher
      * needed. The connect walk dereferences only the fields wired below plus
      * primitives whose zero-defaults are valid here (field initializers do
-     * not run under {@code Unsafe.allocateInstance}).
+     * not run under {@code Unsafe.allocateInstance}), plus the connect-walk
+     * lock, which buildAndConnect acquires unconditionally and is therefore
+     * wired here.
      */
     private static QwpWebSocketSender newBareSender() throws Exception {
-        return (QwpWebSocketSender) Unsafe.getUnsafe()
+        QwpWebSocketSender sender = (QwpWebSocketSender) Unsafe.getUnsafe()
                 .allocateInstance(QwpWebSocketSender.class);
+        setField(sender, "connectWalkLock", new java.util.concurrent.locks.ReentrantLock());
+        return sender;
     }
 
     private static QwpHostHealthTracker wireEndpoints(QwpWebSocketSender sender,
