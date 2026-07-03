@@ -1538,7 +1538,7 @@ public class QwpWebSocketSender implements Sender {
      * would short-circuit immediately on an empty flush even when prior
      * publishes remain unacknowledged.
      * <p>
-     * Close-time drain ({@link #drainOnClose()}) already uses the same
+     * Close-time drain ({@code #drainOnClose()}) already uses the same
      * watermark approach directly.
      *
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns
