@@ -284,6 +284,10 @@ public class QwpWebSocketSender implements Sender {
     // Poison-frame detector threshold forwarded to the cursor send loop and to
     // every background drainer (connect-string key max_frame_rejections).
     private int maxFrameRejections = CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
+    // Minimum wall-clock dwell before poison escalation, forwarded alongside
+    // maxFrameRejections (connect-string key poison_min_escalation_window_millis).
+    private long poisonMinEscalationWindowMillis =
+            CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -655,7 +659,8 @@ public class QwpWebSocketSender implements Sender {
                 initialConnectMode, errorHandler, errorInboxCapacity,
                 durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
                 connectionListener, connectionListenerInboxCapacity,
-                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS);
     }
 
     /**
@@ -685,7 +690,8 @@ public class QwpWebSocketSender implements Sender {
             int connectTimeoutMs,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity,
-            int maxFrameRejections
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -702,6 +708,7 @@ public class QwpWebSocketSender implements Sender {
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
             sender.maxFrameRejections = maxFrameRejections;
+            sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
@@ -2353,7 +2360,8 @@ public class QwpWebSocketSender implements Sender {
                             reconnectMaxBackoffMillis,
                             requestDurableAck,
                             durableAckKeepaliveIntervalMillis,
-                            maxFrameRejections);
+                            maxFrameRejections,
+                            poisonMinEscalationWindowMillis);
             ref[0] = drainer;
             drainerPool.submit(drainer);
         }
@@ -3211,7 +3219,8 @@ public class QwpWebSocketSender implements Sender {
                     reconnectMaxBackoffMillis,
                     requestDurableAck,
                     durableAckKeepaliveIntervalMillis,
-                    maxFrameRejections);
+                    maxFrameRejections,
+                    poisonMinEscalationWindowMillis);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles

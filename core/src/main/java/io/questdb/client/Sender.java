@@ -1050,6 +1050,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
+        private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1501,6 +1502,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 int actualMaxFrameRejections = maxFrameRejections != PARAMETER_NOT_SET_EXPLICITLY
                         ? maxFrameRejections
                         : CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
+                long actualPoisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        ? poisonMinEscalationWindowMillis
+                        : CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1573,7 +1577,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
                             connectionListener,
                             actualConnectionListenerInboxCapacity,
-                            actualMaxFrameRejections
+                            actualMaxFrameRejections,
+                            actualPoisonMinEscalationWindowMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -2440,6 +2445,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("max_frame_rejections must be >= 1: ").put(rejections);
             }
             this.maxFrameRejections = rejections;
+            return this;
+        }
+
+        /**
+         * Minimum wall-clock dwell (millis) a suspected frame must stay
+         * poisoned before the poison detector escalates to a typed terminal,
+         * even once {@link #maxFrameRejections(int)} strikes have accrued.
+         * With paced recycles, strikes can accrue in well under a second (e.g.
+         * a middlebox/LB that accepts the connection then non-orderly-closes
+         * each cycle while its backend is briefly down), so a strike count
+         * alone can turn a transient outage into a producer-fatal terminal.
+         * This window guarantees a brief outage a chance to clear (an OK
+         * at/beyond the suspect resets the detector) first. {@code 0} disables
+         * the dwell (legacy immediate escalation at the strike threshold).
+         * Default {@code 5_000} (5 s). WebSocket only.
+         */
+        public LineSenderBuilder poisonMinEscalationWindowMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("poison_min_escalation_window_millis is only supported for WebSocket transport");
+            }
+            if (millis < 0) {
+                throw new LineSenderException("poison_min_escalation_window_millis must be >= 0: ").put(millis);
+            }
+            this.poisonMinEscalationWindowMillis = millis;
             return this;
         }
 
@@ -3378,6 +3407,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "max_frame_rejections");
                     maxFrameRejections(parseIntValue(sink, "max_frame_rejections"));
+                } else if (Chars.equals("poison_min_escalation_window_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("poison_min_escalation_window_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "poison_min_escalation_window_millis");
+                    poisonMinEscalationWindowMillis(parseLongValue(sink, "poison_min_escalation_window_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -3646,6 +3681,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("max_frame_rejections")) {
                     maxFrameRejections(wsInt(view, v, "max_frame_rejections"));
                 }
+                if (view.has("poison_min_escalation_window_millis")) {
+                    poisonMinEscalationWindowMillis(wsLong(view, v, "poison_min_escalation_window_millis"));
+                }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
@@ -3821,6 +3859,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("drain_orphans", drainOrphans);
             m.put("max_background_drainers", maxBackgroundDrainers);
             m.put("max_frame_rejections", maxFrameRejections);
+            m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

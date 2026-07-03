@@ -129,6 +129,9 @@ public final class BackgroundDrainer implements Runnable {
     // Poison-frame detector threshold forwarded to every drain loop this
     // drainer creates; mirrors the owner sender's max_frame_rejections config.
     private final int maxHeadFrameRejections;
+    // Minimum wall-clock dwell before poison escalation, forwarded to every
+    // drain loop; mirrors the owner sender's poison_min_escalation_window_millis.
+    private final long poisonMinEscalationWindowMillis;
 
     public BackgroundDrainer(
             String slotPath,
@@ -145,7 +148,8 @@ public final class BackgroundDrainer implements Runnable {
                 reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, requestDurableAck,
                 durableAckKeepaliveIntervalMillis,
-                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS);
     }
 
     /**
@@ -164,7 +168,8 @@ public final class BackgroundDrainer implements Runnable {
             long reconnectMaxBackoffMillis,
             boolean requestDurableAck,
             long durableAckKeepaliveIntervalMillis,
-            int maxHeadFrameRejections
+            int maxHeadFrameRejections,
+            long poisonMinEscalationWindowMillis
     ) {
         this.slotPath = slotPath;
         this.segmentSizeBytes = segmentSizeBytes;
@@ -176,6 +181,7 @@ public final class BackgroundDrainer implements Runnable {
         this.requestDurableAck = requestDurableAck;
         this.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
         this.maxHeadFrameRejections = maxHeadFrameRejections;
+        this.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
     }
 
     /**
@@ -187,7 +193,8 @@ public final class BackgroundDrainer implements Runnable {
      */
     @TestOnly
     public BackgroundDrainer() {
-        this(null, 0L, 0L, null, 0L, 0L, 0L, false, 0L);
+        this(null, 0L, 0L, null, 0L, 0L, 0L, false, 0L,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, 0L);
     }
 
     /**
@@ -567,7 +574,8 @@ public final class BackgroundDrainer implements Runnable {
                         reconnectMaxBackoffMillis,
                         requestDurableAck,
                         durableAckKeepaliveIntervalMillis,
-                        maxHeadFrameRejections);
+                        maxHeadFrameRejections,
+                        poisonMinEscalationWindowMillis);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {

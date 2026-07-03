@@ -160,6 +160,9 @@ public class ServerErrorAckTerminalTest {
                     + ";reconnect_max_duration_millis=10000"
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
+                    // Escalate on strike count alone (no wall-clock dwell) so
+                    // this test can assert the exact per-strike replay count.
+                    + ";poison_min_escalation_window_millis=0"
                     + ";";
 
             AtomicReference<SenderError> firstError = new AtomicReference<>();
@@ -251,6 +254,7 @@ public class ServerErrorAckTerminalTest {
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";max_frame_rejections=2"
+                    + ";poison_min_escalation_window_millis=0"
                     + ";";
 
             Sender sender = Sender.fromConfig(cfg);

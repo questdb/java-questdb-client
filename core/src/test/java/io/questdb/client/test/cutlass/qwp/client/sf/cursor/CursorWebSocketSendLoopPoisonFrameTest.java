@@ -302,6 +302,116 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         });
     }
 
+    @Test
+    public void testNonOrderlyCloseRecycleIsPacedAgainstAcceptingMiddlebox() throws Exception {
+        // Close-path analogue of testNackRecycleIsPacedAgainstHealthyServer and
+        // the regression guard for the poison-frame false-positive: a
+        // middlebox/LB that completes the WS upgrade, accepts the head frame,
+        // then non-orderly-closes (1006) while its backend is down succeeds at
+        // CONNECT every cycle, so connectLoop's failed-connect backoff never
+        // engages. Before the fix, onClose recycled through the UNPACED fail():
+        // the strike counter climbed at connect+send+close RTT rate and latched
+        // a PROTOCOL_VIOLATION terminal in well under a second on a TRANSIENT
+        // outage. The fix routes the below-threshold close-strike through
+        // failPaced (matching the NACK path), so the recycle parks before the
+        // first reconnect. With the detector held out of the way (huge
+        // maxHeadFrameRejections), the recycle rate must be bounded by the
+        // reconnect backoff. Red behavior: hundreds of full recycles per second.
+        final long initialBackoffMillis = 200L;
+        final long runMillis = 1_200L;
+        // With >=200ms pacing (escalating), a 1.2s window fits at most a
+        // handful of recycles; allow 10 for scheduling noise. The unpaced bug
+        // overshoots this by orders of magnitude, so no flakiness risk.
+        final int maxReconnects = 10;
+
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                final List<Long> reconnectNanos = new ArrayList<>();
+                CursorWebSocketSendLoop.ReconnectFactory factory = () -> {
+                    synchronized (reconnectNanos) {
+                        reconnectNanos.add(System.nanoTime());
+                    }
+                    return new ClosingMiddleboxClient();
+                };
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        new ClosingMiddleboxClient(), engine, 0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        factory,
+                        5_000L, initialBackoffMillis, 1_000L,
+                        false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        // Keep the detector out of the way: this test measures
+                        // close-path pacing, not escalation -- escalation is
+                        // covered by testNonOrderlyClosePoisonKeysOnOkLevelHeadOfLine.
+                        1_000_000);
+                try {
+                    loop.start();
+                    Thread.sleep(runMillis);
+                } finally {
+                    loop.close();
+                }
+                int count;
+                synchronized (reconnectNanos) {
+                    count = reconnectNanos.size();
+                }
+                assertTrue("non-orderly-close recycles against an accepting middlebox must be "
+                                + "paced by the reconnect backoff (" + initialBackoffMillis
+                                + "ms): observed " + count + " reconnects in " + runMillis
+                                + "ms -- the close path is recycling unpaced at connect+close RTT rate",
+                        count <= maxReconnects);
+                assertTrue("sanity: the non-orderly close must actually recycle the connection at least once",
+                        count >= 1);
+            }
+        });
+    }
+
+    @Test
+    public void testPoisonDwellHoldsEscalationUntilWallClockWindowElapses() throws Exception {
+        // P2 guard for the minimum-escalation-window: even once the strike
+        // threshold (here 2) is reached, the detector must NOT escalate until
+        // the suspect has stayed poisoned for at least the configured wall-clock
+        // window. Strikes here accrue synchronously in milliseconds, so a burst
+        // past the threshold must leave the loop ALIVE while the window is open;
+        // only after it elapses may a further same-frame strike escalate. The
+        // window=0 (legacy immediate) path is covered by
+        // testPoisonTerminalNamesTheRejectedFsn.
+        final long windowMillis = 600L;
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoopWithWindow(engine, clients, 2, windowMillis);
+                setSentCount(loop, 2);
+                deliverOk(loop, 0, names("trades"), txns(7L));
+
+                // Burst PAST the strike threshold (2), all within the window.
+                for (int i = 0; i < 3; i++) {
+                    setSentCount(loop, 2);
+                    deliverRetriableNack(loop, 1, "disk full");
+                }
+                // Threshold reached, window still open -> must not have escalated.
+                loop.checkError();
+
+                // Cross the window, then one more same-frame strike escalates.
+                Thread.sleep(windowMillis + 150);
+                setSentCount(loop, 2);
+                deliverRetriableNack(loop, 1, "disk full");
+                try {
+                    loop.checkError();
+                    fail("after the dwell window elapses, the next strike must escalate");
+                } catch (LineSenderServerException e) {
+                    assertEquals(SenderError.Category.PROTOCOL_VIOLATION,
+                            e.getServerError().getCategory());
+                    assertEquals("escalated terminal must still name the poisoned frame (fsn 1)",
+                            1L, e.getServerError().getFromFsn());
+                }
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
     // ---------------------------------------------------------------------
     // harness
     // ---------------------------------------------------------------------
@@ -339,6 +449,47 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
             } finally {
                 Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
             }
+            return true;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+    }
+
+    /**
+     * In-memory transport emulating a middlebox/LB that completes the WS
+     * upgrade and accepts the head frame, then non-orderly-closes (1006)
+     * because its backend is down: accepts the connection, waits for one
+     * send on this connection, then delivers exactly one ABNORMAL_CLOSURE
+     * close. No OK ever arrives, so the poison suspect FSN never advances --
+     * the accepting-middlebox outage scenario.
+     */
+    private static final class ClosingMiddleboxClient extends WebSocketClient {
+        private boolean closeDelivered;
+        private volatile int sentCount;
+
+        ClosingMiddleboxClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+            sentCount++;
+        }
+
+        @Override
+        public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
+            if (closeDelivered || sentCount == 0) {
+                return false;
+            }
+            closeDelivered = true;
+            // 1006 ABNORMAL_CLOSURE: non-orderly, after >=1 send -> counts a strike.
+            handler.onClose(1006, "backend down");
             return true;
         }
 
@@ -502,6 +653,32 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // The loop is driven by reflection, not by its own I/O thread, but
         // the recycle machinery must see a live loop or connectLoop's guard
         // treats the first retriable NACK as fatal.
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
+        f.setAccessible(true);
+        f.setBoolean(loop, true);
+        return loop;
+    }
+
+    /**
+     * Same as {@link #newDurableLoop} but with an explicit strike threshold and
+     * a non-zero poison-escalation dwell window (the 12-arg master constructor),
+     * so a test can exercise the wall-clock gate that holds escalation until the
+     * suspect has stayed poisoned long enough.
+     */
+    private CursorWebSocketSendLoop newDurableLoopWithWindow(CursorSendEngine engine,
+                                                             List<WebSocketClient> clients,
+                                                             int maxRejections,
+                                                             long windowMillis) throws Exception {
+        CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                () -> {
+                    NackingClient c = new NackingClient();
+                    clients.add(c);
+                    return c;
+                },
+                5_000L, 5L, 10L, true,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                maxRejections, windowMillis);
         Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
         f.setAccessible(true);
         f.setBoolean(loop, true);

@@ -113,6 +113,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code LineSenderBuilder.maxFrameRejections(int)}.
      */
     public static final int DEFAULT_MAX_HEAD_FRAME_REJECTIONS = 4;
+    /**
+     * Default minimum wall-clock dwell (millis) a suspected frame must remain
+     * poisoned before the detector escalates to a typed terminal, even once
+     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS} strikes have accrued. Decouples
+     * "how many strikes prove determinism" from "how long a transient is allowed
+     * to look poisoned": with pacing, strikes can accrue in well under a second
+     * (e.g. an accepting middlebox/LB that closes each cycle while its backend is
+     * briefly down), so a strike count alone can false-positive a transient into
+     * a producer-fatal terminal. Requiring the suspect to survive this window
+     * gives a brief outage time to clear (an OK at/beyond the suspect resets the
+     * detector) before escalation. {@code 0} = legacy immediate escalation at the
+     * strike threshold. Configurable per sender via the
+     * {@code poison_min_escalation_window_millis} connect-string key or
+     * {@code LineSenderBuilder.poisonMinEscalationWindowMillis(long)}.
+     */
+    public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
@@ -279,6 +295,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // survive reconnects (swapClient) -- the detector spans connections.
     private long poisonFsn = -1L;
     private int poisonStrikes;
+    // Wall-clock nanos of the FIRST strike of the current poisonFsn run. The
+    // detector escalates only once poisonStrikes >= maxHeadFrameRejections AND
+    // at least poisonMinEscalationWindowNanos have elapsed since this instant,
+    // so a transient shorter than the window always gets a reset chance. I/O
+    // thread only; survives reconnects alongside poisonFsn/poisonStrikes.
+    private long poisonFirstStrikeNanos;
     // Highest FSN the server has acknowledged at the OK level (STATUS_OK),
     // across connections. In default mode this tracks the trim watermark
     // exactly; in durable-ack mode it runs AHEAD of ackedFsn, which waits for
@@ -289,6 +311,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // (connect-string key max_frame_rejections); defaults to
     // DEFAULT_MAX_HEAD_FRAME_REJECTIONS.
     private final int maxHeadFrameRejections;
+    // Minimum wall-clock dwell (nanos) a suspect frame must stay poisoned before
+    // escalation, even after the strike threshold is hit (connect-string key
+    // poison_min_escalation_window_millis). 0 = legacy immediate escalation.
+    private final long poisonMinEscalationWindowNanos;
     private volatile boolean running;
     // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
     // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
@@ -374,10 +400,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Master constructor — also accepts the poison-frame detector threshold
-     * ({@code max_frame_rejections}): consecutive server-active rejections of
-     * the same head-of-line frame, with no ack progress in between, before the
-     * loop escalates to a typed terminal. Must be {@code >= 1}.
+     * Eleven-arg overload — omits the poison-escalation dwell window, which
+     * defaults to {@code 0} (legacy: escalate as soon as maxHeadFrameRejections
+     * strikes accrue, with no minimum wall-clock). The user-facing 5s default
+     * ({@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
+     * config layer (Sender / QwpWebSocketSender), so this raw constructor stays
+     * unopinionated for tests and internal callers that want deterministic
+     * strike-count escalation.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -388,9 +417,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
+    }
+
+    /**
+     * Master constructor — also accepts the poison-frame detector threshold
+     * ({@code max_frame_rejections}): consecutive server-active rejections of
+     * the same head-of-line frame, with no ack progress in between, before the
+     * loop escalates to a typed terminal. Must be {@code >= 1}. The final
+     * argument is the minimum wall-clock dwell (millis) the suspect must stay
+     * poisoned before escalation ({@code poison_min_escalation_window_millis};
+     * {@code >= 0}, where 0 = legacy immediate escalation at the threshold).
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis) {
         if (maxHeadFrameRejections < 1) {
             throw new IllegalArgumentException(
                     "maxHeadFrameRejections must be >= 1: " + maxHeadFrameRejections);
+        }
+        if (poisonMinEscalationWindowMillis < 0) {
+            throw new IllegalArgumentException(
+                    "poisonMinEscalationWindowMillis must be >= 0: " + poisonMinEscalationWindowMillis);
         }
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
@@ -412,6 +470,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 ? durableAckKeepaliveIntervalMillis * 1_000_000L
                 : 0L;
         this.maxHeadFrameRejections = maxHeadFrameRejections;
+        this.poisonMinEscalationWindowNanos = poisonMinEscalationWindowMillis > 0
+                ? poisonMinEscalationWindowMillis * 1_000_000L
+                : 0L;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
@@ -1257,13 +1318,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * replay re-OKs of frames behind the suspect. I/O thread only.
      */
     private boolean recordHeadRejectionStrike(long rejectedFsn) {
+        long now = System.nanoTime();
         if (rejectedFsn == poisonFsn) {
             poisonStrikes++;
         } else {
             poisonFsn = rejectedFsn;
             poisonStrikes = 1;
+            poisonFirstStrikeNanos = now;
         }
-        return poisonStrikes >= maxHeadFrameRejections;
+        if (poisonStrikes < maxHeadFrameRejections) {
+            return false;
+        }
+        // Minimum wall-clock dwell gate: even once the strike count proves
+        // determinism, hold escalation until the suspect has stayed poisoned for
+        // at least poisonMinEscalationWindowNanos. Strikes can accrue in well
+        // under a second (paced recycles against a reachable-but-closing
+        // middlebox, or a fast NACK loop), so the count alone would false-
+        // positive a brief outage into a producer-fatal terminal. Any OK at/
+        // beyond the suspect during the window resets the detector (see the
+        // STATUS_OK handler). Window 0 = legacy immediate escalation.
+        return (now - poisonFirstStrikeNanos) >= poisonMinEscalationWindowNanos;
     }
 
     /**
@@ -1939,15 +2013,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // elsewhere, not a verdict on the bytes.
             boolean orderly = code == WebSocketCloseCode.NORMAL_CLOSURE
                     || code == WebSocketCloseCode.GOING_AWAY;
-            if (!orderly && nextWireSeq > 0
-                    && recordHeadRejectionStrike(Math.max(engine.ackedFsn(), highestOkFsn) + 1L)) {
-                haltOnPoisonedFrame("ws-close[" + code + ' '
-                                + WebSocketCloseCode.describe(code) + "]: " + reason,
-                        engine.publishedFsn());
+            LineSenderException cause = new LineSenderException(
+                    "WebSocket closed by server: code=" + code + " reason=" + reason);
+            if (!orderly && nextWireSeq > 0) {
+                if (recordHeadRejectionStrike(Math.max(engine.ackedFsn(), highestOkFsn) + 1L)) {
+                    haltOnPoisonedFrame("ws-close[" + code + ' '
+                                    + WebSocketCloseCode.describe(code) + "]: " + reason,
+                            engine.publishedFsn());
+                    return;
+                }
+                // Strike recorded but below threshold: pace the recycle exactly
+                // like the below-threshold RETRIABLE NACK path. A middlebox/LB
+                // that completes the WS upgrade, accepts the head frame, then
+                // non-orderly-closes while its backend is down succeeds at
+                // connect every cycle, so connectLoop's failed-connect backoff
+                // never engages -- an unpaced fail() here would burn through
+                // maxHeadFrameRejections strikes at a never-advancing head FSN
+                // in well under a second and latch a PROTOCOL_VIOLATION terminal
+                // on a TRANSIENT outage (Invariant B / qwp-nack-policy-v2.md:
+                // "never false-positives on outages"). failPaced parks before
+                // the first reconnect, and its dose escalates with poisonStrikes
+                // (already incremented above), so the widening replay gaps give
+                // the outage time to clear before the threshold fires.
+                failPaced(cause);
                 return;
             }
-            fail(new LineSenderException(
-                    "WebSocket closed by server: code=" + code + " reason=" + reason));
+            // No strike (orderly close, or a close before any send on this
+            // connection): a genuine transport event -- reconnect immediately,
+            // with backoff only on failed connect attempts.
+            fail(cause);
         }
 
         private void handlePreSendRejection(long wireSeq, byte status,

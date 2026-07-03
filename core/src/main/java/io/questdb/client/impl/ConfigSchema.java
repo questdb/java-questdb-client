@@ -76,6 +76,7 @@ public final class ConfigSchema {
         // Sender applies it; the QwpQueryClient accepts it as a syntactic no-op
         // (one vocabulary, side-owned application).
         str("max_frame_rejections", Side.INGRESS);
+        str("poison_min_escalation_window_millis", Side.INGRESS);
         str("max_name_len", Side.INGRESS);
         str("reconnect_initial_backoff_millis", Side.INGRESS);
         str("reconnect_max_backoff_millis", Side.INGRESS);
