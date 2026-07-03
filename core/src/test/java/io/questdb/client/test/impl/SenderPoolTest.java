@@ -196,14 +196,25 @@ public class SenderPoolTest {
     }
 
     @Test
-    public void testPoolBuildsRequestedNumberOfSenders() {
+    public void testPoolBuildsRequestedNumberOfSenders() throws Exception {
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 3, 3, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender a = pool.borrow();
             Sender b = pool.borrow();
             Sender c = pool.borrow();
-            Assert.assertNotSame(a, b);
-            Assert.assertNotSame(b, c);
-            Assert.assertNotSame(a, c);
+            // borrow() allocates a fresh PooledSender wrapper on every call, so
+            // comparing the wrappers is vacuously true -- it would stay green
+            // even if the pool double-lent a single slot to all three borrowers.
+            // The property this test exists for -- three concurrent borrowers
+            // each hold their own sender -- lives in the underlying slots, so
+            // compare those (same reasoning as testBrokenSenderIsNotReturnedToPool).
+            Object slotA = slotOf(a);
+            Object slotB = slotOf(b);
+            Object slotC = slotOf(c);
+            Assert.assertNotSame("a and b must not share a slot", slotA, slotB);
+            Assert.assertNotSame("b and c must not share a slot", slotB, slotC);
+            Assert.assertNotSame("a and c must not share a slot", slotA, slotC);
+            Assert.assertEquals("pool must build exactly the requested number of senders",
+                    3, pool.totalSize());
             a.close();
             b.close();
             c.close();

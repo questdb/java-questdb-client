@@ -108,7 +108,12 @@ public class SenderPoolSfTest {
                     PooledSender a = pool.borrow();
                     PooledSender b = pool.borrow();
                     try {
-                        Assert.assertNotSame("two borrows must be distinct wrappers", a, b);
+                        // borrow() allocates a fresh PooledSender wrapper on every
+                        // call, so comparing the wrappers is vacuously true.
+                        // Distinctness of the two borrowed senders lives in the
+                        // underlying slots (mirrors SenderPoolTest.slotOf usage).
+                        Assert.assertNotSame("two borrows must hold distinct slots",
+                                slotOf(a), slotOf(b));
                         Assert.assertTrue("slot default-0 must exist", Files.exists(slot("default-0")));
                         Assert.assertTrue("slot default-1 must exist", Files.exists(slot("default-1")));
                         Assert.assertEquals("exactly two slot dirs", 2, countSlotDirs());
@@ -1945,6 +1950,16 @@ public class SenderPoolSfTest {
         Field f = target.getClass().getDeclaredField(name);
         f.setAccessible(true);
         return f.get(target);
+    }
+
+    // Reads the package-private PooledSender.slot -- the identity that the pool
+    // actually recycles. Wrapper identity is useless for aliasing checks because
+    // borrow() allocates a fresh wrapper every call (mirrors SenderPoolTest and
+    // SenderPoolErrorSafetyTest).
+    private static Object slotOf(PooledSender pooledWrapper) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("slot");
+        f.setAccessible(true);
+        return f.get(pooledWrapper);
     }
 
     private static void invokeDiscardBroken(SenderPool pool, PooledSender ps) throws Exception {
