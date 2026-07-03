@@ -200,6 +200,54 @@ public class WebSocketClientTest {
         });
     }
 
+    /**
+     * Fragmented-message variant: the CONTINUATION branch runs
+     * resetFragmentState() after the handler returns and before the
+     * closed-client guard. Pin that an in-callback close from the
+     * reassembled-message dispatch stays safe there too: close() frees
+     * fragmentBufPtr, so resetFragmentState() must only write fields.
+     */
+    @Test
+    public void testInCallbackCloseFromFragmentedMessageLeavesStateCoherent() throws Exception {
+        assertMemoryLeak(() -> {
+            // Two unmasked server->client frames: non-FIN BINARY "ab",
+            // then FIN CONTINUATION "cd" -> one reassembled message "abcd"
+            byte[] frames = {
+                    0x02, 0x02, 'a', 'b',
+                    (byte) 0x80, 0x02, 'c', 'd'
+            };
+            try (FrameFeedWebSocketClient client = new FrameFeedWebSocketClient(frames)) {
+                setUpgradedTrue(client);
+                final int[] messages = {0};
+                WebSocketFrameHandler handler = new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                        messages[0]++;
+                        Assert.assertEquals(4, payloadLen);
+                        client.close();
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                        Assert.fail("unexpected close frame");
+                    }
+                };
+
+                // First call consumes the initial fragment: parsed and
+                // buffered, no dispatch yet.
+                Assert.assertTrue(client.tryReceiveFrame(handler));
+                Assert.assertEquals(0, messages[0]);
+
+                // Second call reassembles and dispatches; the handler
+                // closes the client in-callback.
+                Assert.assertTrue(client.tryReceiveFrame(handler));
+                Assert.assertEquals(1, messages[0]);
+                Assert.assertEquals(0, getIntField(client, "recvPos"));
+                Assert.assertEquals(0, getIntField(client, "recvReadPos"));
+            }
+        });
+    }
+
     @Test
     public void testRecvOrTimeoutPropagatesNonTimeoutError() throws Exception {
         assertMemoryLeak(() -> {
@@ -325,28 +373,24 @@ public class WebSocketClientTest {
         });
     }
 
+    private static int getIntField(Object obj, String name) throws Exception {
+        Class<?> clazz = obj.getClass();
+        while (clazz != null) {
+            try {
+                Field field = clazz.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.getInt(obj);
+            } catch (NoSuchFieldException e) {
+                clazz = clazz.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
     private static int invokeExtractMaxBatchSize(String response) throws Exception {
         Method m = WebSocketClient.class.getDeclaredMethod("extractMaxBatchSize", String.class);
         m.setAccessible(true);
         return (int) m.invoke(null, response);
-    }
-
-    private static int getIntField(Object obj, String name) {
-        try {
-            Class<?> clazz = obj.getClass();
-            while (clazz != null) {
-                try {
-                    Field field = clazz.getDeclaredField(name);
-                    field.setAccessible(true);
-                    return field.getInt(obj);
-                } catch (NoSuchFieldException e) {
-                    clazz = clazz.getSuperclass();
-                }
-            }
-            throw new NoSuchFieldException(name);
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
     }
 
     private static void setUpgradedTrue(Object obj) throws Exception {
@@ -365,24 +409,57 @@ public class WebSocketClientTest {
     }
 
     /**
-     * WebSocketClient over a socket pre-loaded with one server frame;
-     * sends always succeed. Used to drive a real tryReceiveFrame ->
-     * tryParseFrame -> handler dispatch on the test thread.
+     * Minimal Socket that always returns 0 from recv() (no data available),
+     * triggering the ioWait path in recvOrTimeout().
      */
-    private static class FrameFeedWebSocketClient extends WebSocketClient {
+    private static class FakeSocket implements Socket {
 
-        FrameFeedWebSocketClient(byte[] frame) {
-            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FrameFeedSocket(frame));
+        @Override
+        public void close() {
         }
 
         @Override
-        protected void ioWait(int timeout, int op) {
-            // no-op: recv delivers data on the first call
+        public int getFd() {
+            return 0;
         }
 
         @Override
-        protected void setupIoWait() {
-            // no-op
+        public boolean isClosed() {
+            return false;
+        }
+
+        @Override
+        public void of(int fd) {
+        }
+
+        @Override
+        public int recv(long bufferPtr, int bufferLen) {
+            return 0;
+        }
+
+        @Override
+        public int send(long bufferPtr, int bufferLen) {
+            return 0;
+        }
+
+        @Override
+        public void startTlsSession(CharSequence peerName, SocketReadinessWaiter waiter) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean supportsTls() {
+            return false;
+        }
+
+        @Override
+        public int tlsIO(int readinessFlags) {
+            return 0;
+        }
+
+        @Override
+        public boolean wantsTlsWrite() {
+            return false;
         }
     }
 
@@ -453,57 +530,24 @@ public class WebSocketClientTest {
     }
 
     /**
-     * Minimal Socket that always returns 0 from recv() (no data available),
-     * triggering the ioWait path in recvOrTimeout().
+     * WebSocketClient over a socket pre-loaded with canned server frames;
+     * sends always succeed. Used to drive a real tryReceiveFrame ->
+     * tryParseFrame -> handler dispatch on the test thread.
      */
-    private static class FakeSocket implements Socket {
+    private static class FrameFeedWebSocketClient extends WebSocketClient {
 
-        @Override
-        public void close() {
+        FrameFeedWebSocketClient(byte[] frames) {
+            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FrameFeedSocket(frames));
         }
 
         @Override
-        public int getFd() {
-            return 0;
+        protected void ioWait(int timeout, int op) {
+            // no-op: recv delivers data on the first call
         }
 
         @Override
-        public boolean isClosed() {
-            return false;
-        }
-
-        @Override
-        public void of(int fd) {
-        }
-
-        @Override
-        public int recv(long bufferPtr, int bufferLen) {
-            return 0;
-        }
-
-        @Override
-        public int send(long bufferPtr, int bufferLen) {
-            return 0;
-        }
-
-        @Override
-        public void startTlsSession(CharSequence peerName, SocketReadinessWaiter waiter) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public boolean supportsTls() {
-            return false;
-        }
-
-        @Override
-        public int tlsIO(int readinessFlags) {
-            return 0;
-        }
-
-        @Override
-        public boolean wantsTlsWrite() {
-            return false;
+        protected void setupIoWait() {
+            // no-op
         }
     }
 
