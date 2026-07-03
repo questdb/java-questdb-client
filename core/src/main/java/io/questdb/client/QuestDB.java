@@ -134,6 +134,19 @@ public interface QuestDB extends Closeable {
      * query client. Idempotent. Threads currently blocked in
      * {@link #borrowSender()} or {@link Query#submit()} are released with an
      * error.
+     * <p>
+     * Outstanding leases: a borrowed {@link Sender} is never torn down
+     * underneath the thread using it. Instead, close() waits up to the
+     * builder's {@link QuestDBBuilder#acquireTimeoutMillis(long) acquire
+     * timeout} (hard-capped at 5 seconds, so an unbounded acquire timeout can
+     * never hang shutdown) for borrowed senders to be closed; a lease closed
+     * during (or
+     * after) that window is flushed and its connection released safely on the
+     * returning thread, while a lease that is never closed leaks its
+     * connection (logged). Avoid calling close() while holding an unclosed
+     * borrowed sender on the same thread: the lease cannot come home, so the
+     * close stalls for the full timeout and the connection is only released
+     * when that sender is eventually closed.
      */
     @Override
     void close();

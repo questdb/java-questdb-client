@@ -96,6 +96,13 @@ public final class SenderPool implements AutoCloseable {
     // -- the residual window documented on recoverOneSlotStep -- because the
     // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
+    // Hard cap on close()'s outstanding-lease wait. The acquire timeout is a
+    // BORROW policy -- Long.MAX_VALUE legitimately means "block until a slot
+    // frees" -- and must never unbound SHUTDOWN: without this cap a forgotten
+    // lease would hang close() forever. Mirrors the egress twin, whose
+    // shutdown join is capped at QueryWorker.SHUTDOWN_JOIN_MILLIS (same value)
+    // regardless of user config.
+    static final long MAX_CLOSE_LEASE_WAIT_MILLIS = 5_000;
     private final long acquireTimeoutMillis;
     private final ArrayList<SenderSlot> all;
     private final ArrayDeque<SenderSlot> available;
@@ -158,6 +165,11 @@ public final class SenderPool implements AutoCloseable {
     // teardown. Guarded by lock.
     private boolean closeStarted;
     private int inFlightCreations;
+    // Lease teardowns currently running on borrower threads (retireLease's
+    // delegate-close section, outside the lock). close() counts these as
+    // outstanding so it does not return while a delegate is still being torn
+    // down on another thread. Guarded by lock.
+    private int pendingLeaseTeardowns;
     // Slots whose delegate close() returned with the SF flock still held
     // (the I/O thread refused to stop). Permanently consumed: the index is
     // never freed and never reused, so no borrow ever hands out a still-
@@ -751,17 +763,39 @@ public final class SenderPool implements AutoCloseable {
      * so an in-flight startup-recovery step driven on the {@link PoolHousekeeper}
      * thread stops promptly between slots. {@link QuestDBImpl#close()} calls this
      * BEFORE stopping the housekeeper, so the housekeeper join cannot time out
-     * waiting on a fresh slot's recovery drain. Full delegate teardown still
-     * happens in {@link #close()} (guarded by {@code closeStarted}, so this early
-     * signal never short-circuits it). Idempotent; safe to call repeatedly.
+     * waiting on a fresh slot's recovery drain. Idle-delegate teardown and the
+     * outstanding-lease wait still happen in {@link #close()} (guarded by
+     * {@code closeStarted}, so this early signal never short-circuits them);
+     * borrowed delegates returned after this signal are torn down on the
+     * returning thread via {@link #retireLease}. Idempotent; safe to call
+     * repeatedly.
      */
     void markClosing() {
         closed = true;
     }
 
+    /**
+     * Shuts the pool down. NEVER tears down a borrowed delegate: a producer
+     * thread may be inside one right now (mid-append, mid-flush), and closing
+     * it from here would flush table buffers that thread is mutating and then
+     * free their native memory under its feet -- a use-after-free / SEGV, not
+     * an exception (C1). Instead:
+     * <ol>
+     * <li>waits boundedly (up to {@code acquireTimeoutMillis}, hard-capped at
+     * {@link #MAX_CLOSE_LEASE_WAIT_MILLIS}) for outstanding leases to come home -- {@link #giveBack} and {@link #discardBroken}
+     * observe {@code closed} and tear each delegate down on the returning
+     * borrower's own thread, its exclusive user at that point
+     * ({@link #retireLease}); then</li>
+     * <li>closes the delegates of idle slots only, outside the lock.</li>
+     * </ol>
+     * A lease that never returns leaks its delegate (logged): a logged leak is
+     * recoverable, a freed buffer under a live producer is a JVM crash. This
+     * mirrors the egress twin, {@code QueryWorker.shutdown()}'s bounded
+     * interrupt+join before {@code client.close()}. Idempotent.
+     */
     @Override
     public void close() {
-        SenderSlot[] snapshot;
+        SenderSlot[] idleSnapshot;
         lock.lock();
         try {
             if (closeStarted) {
@@ -771,22 +805,50 @@ public final class SenderPool implements AutoCloseable {
             // Raise the shutdown signal too (a direct, non-pooled caller may
             // close() without a prior markClosing()); harmless if already set.
             closed = true;
-            // Snapshot under the lock so the delegate-close loop below is
-            // immune to concurrent mutation of `all`. discardBroken running
-            // on another thread can still bail thanks to the `closed` check
-            // it now performs; the snapshot is belt-and-braces for any
-            // future code path that mutates `all` outside this lock's
-            // happens-before chain.
-            snapshot = all.toArray(new SenderSlot[0]);
+            // Wake parked borrowers so they observe the shutdown and throw.
             slotReleased.signalAll();
+            // Bounded graceful wait for outstanding leases. A slot is borrowed
+            // iff it is in `all` but not in `available`; retireLease's
+            // delegate-close section (running outside the lock on a returning
+            // borrower's thread) is tracked by pendingLeaseTeardowns so this
+            // method does not return while a teardown is still in flight.
+            // The budget is the acquire timeout hard-capped at
+            // MAX_CLOSE_LEASE_WAIT_MILLIS: a huge/infinite acquire timeout is
+            // a borrow policy, not a licence for close() to hang forever on a
+            // lease that never comes home.
+            final long waitMillis = Math.min(acquireTimeoutMillis, MAX_CLOSE_LEASE_WAIT_MILLIS);
+            long remainingNanos = TimeUnit.MILLISECONDS.toNanos(waitMillis);
+            while ((all.size() > available.size() || pendingLeaseTeardowns > 0) && remainingNanos > 0) {
+                try {
+                    remainingNanos = slotReleased.awaitNanos(remainingNanos);
+                } catch (InterruptedException e) {
+                    // Preserve the interrupt and stop waiting: idle delegates
+                    // are still torn down below, and stragglers take the
+                    // delegated-teardown path whenever they return.
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            int outstanding = all.size() - available.size() + pendingLeaseTeardowns;
+            if (outstanding > 0) {
+                LOG.warn("SenderPool.close(): {} borrowed sender lease(s) still outstanding after {}ms; "
+                                + "each connection is torn down when its lease is closed, or leaks if it never is",
+                        outstanding, waitMillis);
+            }
+            // Only idle slots are safe to close from this thread: no lease
+            // means no user thread inside the delegate. `available` cannot
+            // grow after this point -- borrow() throws on `closed` and
+            // giveBack() retires instead of requeueing -- so the snapshot is
+            // complete.
+            idleSnapshot = available.toArray(new SenderSlot[0]);
         } finally {
             lock.unlock();
         }
-        // Close each delegate from the snapshot, outside the lock so a slow
-        // real-close() doesn't keep the pool latched.
-        for (int i = 0; i < snapshot.length; i++) {
+        // Close each idle delegate outside the lock so a slow real-close()
+        // doesn't keep the pool latched.
+        for (int i = 0; i < idleSnapshot.length; i++) {
             try {
-                snapshot[i].delegate().close();
+                idleSnapshot[i].delegate().close();
             } catch (Throwable ignored) {
                 // Best-effort: an Error from one delegate's teardown must not
                 // abort the loop and strand the remaining delegates unclosed.
@@ -801,23 +863,76 @@ public final class SenderPool implements AutoCloseable {
      * The underlying delegate is closed outside the lock so a slow real-close
      * does not stall other borrowers.
      * <p>
-     * Bails when the pool is already closed: {@link #close()} owns the
-     * teardown of every delegate via its snapshot loop, so mutating
-     * {@code all} here would race that iteration on a non-thread-safe
-     * {@code ArrayList} and the {@code delegate.close()} below would be a
-     * double-close on a delegate {@code close()} has already shut down.
+     * Safe during shutdown too: {@link #close()} never touches borrowed
+     * delegates, so the calling (borrower's) thread is the delegate's
+     * exclusive user and {@link #retireLease} can tear it down without racing
+     * the close() loop.
      */
     void discardBroken(PooledSender ps) {
+        retireLease(ps, "");
+    }
+
+    public void giveBack(PooledSender ps) {
+        SenderSlot s = ps.slot();
+        long gen = ps.generation();
+        lock.lock();
+        try {
+            if (!closed) {
+                if (s.generation() != gen) {
+                    // Stale return: this lease was already given back and the slot
+                    // possibly re-borrowed (or this is a duplicate close). Dropping
+                    // it keeps Sender.close() idempotent under a concurrent
+                    // re-borrow -- without it a double close would enqueue the slot
+                    // twice and hand it to two borrowers writing into one delegate.
+                    return;
+                }
+                s.bumpGeneration();
+                s.markIdleAt(System.currentTimeMillis());
+                assert !available.contains(s) : "slot already present in available deque on giveBack";
+                available.addLast(s);
+                slotReleased.signal();
+                return;
+            }
+        } finally {
+            lock.unlock();
+        }
+        // Pool is shutting down: never requeue. close() deliberately does not
+        // close borrowed delegates -- a producer thread could still be inside
+        // one, and freeing its native buffers mid-append is a use-after-free /
+        // SEGV (C1) -- so teardown is delegated HERE, to the returning
+        // borrower's thread, the delegate's exclusive user at this point.
+        // retireLease re-validates the lease generation under the lock and
+        // signals the close() thread waiting for outstanding leases.
+        retireLease(ps, " during pool shutdown");
+    }
+
+    /**
+     * Retires one lease on the calling (borrower's) thread: validates the
+     * lease generation under the lock, removes the slot from {@code all},
+     * closes the delegate OUTSIDE the lock, and reclaims the SF slot index.
+     * Shared by {@link #discardBroken} (broken delegate) and by
+     * {@link #giveBack} when the pool is shutting down (delegated teardown --
+     * see {@link #close()}).
+     * <p>
+     * Single-owner teardown: the caller holds the only live lease on this
+     * slot and {@link #close()} never touches borrowed delegates, so no other
+     * thread can be inside the delegate when it is closed here.
+     * {@code pendingLeaseTeardowns} keeps the out-of-lock close visible to
+     * close()'s outstanding-lease wait, so the pool does not report itself
+     * closed while a delegate is still being torn down.
+     *
+     * @param ps      the lease being retired
+     * @param context phrase woven into the SF retire WARN naming the reclaim
+     *                path (e.g. {@code ""} or {@code " during pool shutdown"})
+     */
+    private void retireLease(PooledSender ps, String context) {
         SenderSlot s = ps.slot();
         long gen = ps.generation();
         boolean reserved = false;
         lock.lock();
         try {
-            if (closed) {
-                return;
-            }
             if (s.generation() != gen) {
-                // Stale discard: the slot was already returned/discarded and
+                // Stale retire: the slot was already returned/discarded and
                 // possibly re-borrowed. Dropping it avoids evicting a slot a
                 // different borrower now owns and double-closing its delegate.
                 return;
@@ -832,9 +947,11 @@ public final class SenderPool implements AutoCloseable {
                 closingSlots++;
                 reserved = true;
             }
-            // Wake one waiter -- the cap check in borrow() may now admit a
-            // creation attempt (on a *different* slot).
-            slotReleased.signal();
+            pendingLeaseTeardowns++;
+            // Wake all waiters: the cap check in borrow() may now admit a
+            // creation attempt (on a *different* slot), and a close() in
+            // progress must re-check its outstanding-lease count.
+            slotReleased.signalAll();
         } finally {
             lock.unlock();
         }
@@ -846,51 +963,24 @@ public final class SenderPool implements AutoCloseable {
         } catch (Throwable ignored) {
             // Best-effort teardown: a delegate close() can throw an Error
             // (e.g. an -ea AssertionError) as well as a RuntimeException.
-            // Either way the slot accounting in the finally below MUST run,
+            // Either way the accounting in the finally below MUST run,
             // otherwise an SF slot stays reserved forever (slotInUse stuck
-            // true, closingSlots over-counted) and the pool leaks capacity
-            // until borrow() can only ever time out.
+            // true, closingSlots over-counted), the pool leaks capacity until
+            // borrow() can only ever time out, and a concurrent close() would
+            // wait out its full budget on a teardown that already happened.
         } finally {
-            if (reserved) {
-                lock.lock();
-                try {
+            lock.lock();
+            try {
+                pendingLeaseTeardowns--;
+                if (reserved) {
                     // Free the index only when the flock was released; a slot
-                    // left locked is retired permanently. Signal a waiter only
-                    // on the free path, where a new creation can now be admitted.
-                    if (reclaimSlot(s, "")) {
-                        slotReleased.signal();
-                    }
-                } finally {
-                    lock.unlock();
+                    // left locked is retired permanently.
+                    reclaimSlot(s, context);
                 }
+                slotReleased.signalAll();
+            } finally {
+                lock.unlock();
             }
-        }
-    }
-
-    public void giveBack(PooledSender ps) {
-        SenderSlot s = ps.slot();
-        long gen = ps.generation();
-        lock.lock();
-        try {
-            if (closed) {
-                // Pool already shut down: don't requeue; let close() finish destroying.
-                return;
-            }
-            if (s.generation() != gen) {
-                // Stale return: this lease was already given back and the slot
-                // possibly re-borrowed (or this is a duplicate close). Dropping
-                // it keeps Sender.close() idempotent under a concurrent
-                // re-borrow -- without it a double close would enqueue the slot
-                // twice and hand it to two borrowers writing into one delegate.
-                return;
-            }
-            s.bumpGeneration();
-            s.markIdleAt(System.currentTimeMillis());
-            assert !available.contains(s) : "slot already present in available deque on giveBack";
-            available.addLast(s);
-            slotReleased.signal();
-        } finally {
-            lock.unlock();
         }
     }
 

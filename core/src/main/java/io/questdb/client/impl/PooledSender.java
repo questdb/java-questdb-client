@@ -133,12 +133,20 @@ public final class PooledSender implements Sender {
     /**
      * Flushes pending rows and returns this lease's slot to the pool. Does not
      * actually close the underlying {@link Sender}; that only happens when the
-     * owning {@code QuestDB} is closed.
+     * owning {@code QuestDB} is closed. If the pool is already shutting down
+     * when this lease comes home, the underlying Sender is torn down here, on
+     * the calling thread (see {@link SenderPool#close()}).
      * <p>
-     * Idempotent: a stale generation (the lease was already returned and the
-     * slot possibly re-borrowed) is a no-op, so a double close cannot flush
-     * into, or re-enqueue, a slot a different borrower now owns. The pool
-     * re-checks the generation under its lock.
+     * Idempotent for sequential reuse: a stale generation (the lease was
+     * already returned and the slot possibly re-borrowed) is a no-op, and the
+     * pool re-checks the generation under its lock, so a duplicate close can
+     * never re-enqueue a slot a different borrower now owns. Concurrent
+     * double-close of ONE lease from two threads is outside the Sender
+     * threading contract; the flush below revalidates the lease via
+     * {@link SenderSlot#live(long)} so a racing duplicate typically fails with
+     * {@code IllegalStateException} rather than flushing into a re-borrowed
+     * slot, but two threads racing inside a single lease are not fully
+     * protected.
      */
     @Override
     public void close() {
@@ -152,7 +160,12 @@ public final class PooledSender implements Sender {
         // abnormal exit as unrecyclable, which is the fail-safe default.
         boolean flushed = false;
         try {
-            slot.delegate().flush();
+            // live(), not delegate(): re-validating the generation right
+            // before the flush narrows the duplicate-close race documented
+            // above. A stale duplicate throws here, and the finally routes it
+            // to discardBroken, which drops it on the same stale-generation
+            // check under the pool lock.
+            slot.live(generation).flush();
             flushed = true;
         } finally {
             if (flushed) {

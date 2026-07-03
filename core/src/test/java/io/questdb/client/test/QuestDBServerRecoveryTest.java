@@ -97,6 +97,12 @@ public class QuestDBServerRecoveryTest {
                 db.borrowQuery().close();
                 awaitTrue("query client must connect after the server comes up",
                         () -> server.handshakeCount() >= handshakesBeforeQuery + 1);
+
+                // (6) return the ingest lease before db.close(): a borrowed
+                // sender left outstanding makes close() wait out the acquire
+                // timeout and then leak the delegate (close() never tears
+                // down a borrowed sender -- C1).
+                sender.close();
             }
         }
     }

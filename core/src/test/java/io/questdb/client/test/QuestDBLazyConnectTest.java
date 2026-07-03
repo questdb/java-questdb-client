@@ -60,6 +60,18 @@ public class QuestDBLazyConnectTest {
             Sender sender = db.borrowSender();
             Assert.assertNotNull("a sender must be available with no server present", sender);
             sender.table("t").longColumn("v", 1L).atNow();
+            // Return the lease before db.close(): a borrowed sender left
+            // outstanding makes close() wait out the acquire timeout and then
+            // leak the delegate (close() never tears down a borrowed sender --
+            // C1). The server never comes up here, so the close-flush may
+            // legitimately fail once the tiny reconnect budget (200ms) is
+            // spent; either way the lease comes home -- a failed flush routes
+            // the delegate to discardBroken on this thread.
+            try {
+                sender.close();
+            } catch (RuntimeException ignored) {
+                // acceptable: flush against the never-up server
+            }
         }
     }
 

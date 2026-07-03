@@ -407,8 +407,17 @@ public class SenderPoolSfTest {
 
     @Test
     public void testCloseReleasesAllSlots() throws Exception {
-        // After the pool closes, every slot flock must be released so the
-        // dirs can be re-acquired -- by a fresh pool or a standalone sender.
+        // After the pool closes AND every lease has come home, every slot
+        // flock must be released so the dirs can be re-acquired -- by a fresh
+        // pool or a standalone sender.
+        //
+        // Note the ordering contract (C1): pool.close() itself never tears
+        // down a BORROWED delegate -- a producer thread could be inside it,
+        // and freeing its native buffers mid-append would be a
+        // use-after-free/SEGV. A lease still outstanding when close() gives
+        // up keeps its flock until the lease is closed, at which point the
+        // returning thread tears the delegate down (retireLease) and releases
+        // the flock.
         TestUtils.assertMemoryLeak(() -> {
             CountingAckHandler handler = new CountingAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -416,12 +425,20 @@ public class SenderPoolSfTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                // Short acquire timeout: it doubles as close()'s bounded
+                // lease-wait budget, which this test intentionally exhausts.
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                SenderPool pool = new SenderPool(config, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+                SenderPool pool = new SenderPool(config, 2, 2, 300, Long.MAX_VALUE, Long.MAX_VALUE);
                 PooledSender a = pool.borrow();
                 PooledSender b = pool.borrow();
-                // Leave them borrowed: close() must still release their flocks.
+                // Close with both leases outstanding: close() waits out its
+                // budget, then returns WITHOUT touching the borrowed
+                // delegates (their flocks stay held -- leak over SEGV).
                 pool.close();
+                // The leases come home after close: each returning thread
+                // tears down its own delegate, releasing the slot flock.
+                a.close();
+                b.close();
 
                 // A fresh pool over the same dirs must re-acquire slot 0 and 1.
                 try (SenderPool reopened = new SenderPool(config, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {

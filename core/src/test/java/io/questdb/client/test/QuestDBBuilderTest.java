@@ -235,7 +235,12 @@ public class QuestDBBuilderTest {
                     + "auth_timeout_ms=2000;"                                           // common
                     + "sender_pool_min=1;sender_pool_max=2;query_pool_min=1;query_pool_max=2;"; // pool
             try (QuestDB db = QuestDB.builder().fromConfig(cfg).build()) {
-                Assert.assertNotNull(db.borrowSender());
+                // Close the lease: a borrowed sender left outstanding makes
+                // db.close() wait out the acquire timeout and then leak the
+                // delegate (close() never tears down a borrowed sender -- C1).
+                try (io.questdb.client.Sender s = db.borrowSender()) {
+                    Assert.assertNotNull(s);
+                }
                 try (io.questdb.client.Query q = db.borrowQuery()) {
                     Assert.assertNotNull(q);
                 }

@@ -123,55 +123,46 @@ public class SenderPoolTest {
     }
 
     @Test
-    public void testDiscardBrokenAfterCloseDoesNotMutatePool() {
-        // Race: pool.close() iterates `all` outside the lock to close each
-        // delegate. Concurrently, a borrower's PooledSender.close() sees its
-        // delegate already closed (closed by pool.close()), the flush throws,
-        // broken=true routes to SenderPool.discardBroken -- which previously
-        // called all.remove(s) and delegate.close() unconditionally,
-        // racing the iteration in pool.close() on a non-thread-safe
-        // ArrayList. Possible outcomes: IndexOutOfBoundsException out of
-        // pool.close(), skipped delegate close (native handle leak), or
-        // two threads simultaneously inside delegate.close().
+    public void testLeaseReturnedAfterCloseTearsDownItsOwnDelegate() {
+        // C1: pool.close() must never tear down a borrowed delegate -- a
+        // producer thread may be inside it, and freeing its native buffers
+        // mid-append is a use-after-free / SEGV. close() instead waits
+        // boundedly for the lease and leaves the borrowed slot alive when the
+        // wait times out; the lease's own close() then tears the delegate
+        // down on the returning thread (retireLease): here the buffered row's
+        // flush fails against the dead address, routing through
+        // discardBroken, which removes the slot from `all` and closes the
+        // delegate -- now safe post-close because close()'s teardown loop
+        // only ever touches idle slots.
         //
-        // The fix gates discardBroken on `closed`: once the pool is shutting
-        // down, close()'s teardown loop owns the delegate close and
-        // discardBroken bails before touching `all`.
-        //
-        // Deterministic reproduction: serialise the race onto one thread by
-        // calling pool.close() first (which closes the delegate of every
-        // pooled wrapper), then driving sender.close() second. Without the
-        // fix, sender.close() routes to discardBroken, which removes the
-        // wrapper from `all` post-close -- visible as totalSize dropping
-        // from 1 to 0. With the fix, discardBroken sees closed=true and
-        // bails, leaving `all` untouched.
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+        // acquireTimeout is kept short: it doubles as close()'s bounded
+        // lease-wait budget, which this test intentionally exhausts.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 150, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender s = pool.borrow();
             // A row in the buffer forces flush() to attempt a real HTTP
             // request on close(); against the unreachable DEAD_HTTP target
-            // (and now also against the closed delegate below) flush throws
-            // and routes the wrapper to discardBroken.
+            // flush throws and routes the wrapper to discardBroken.
             s.table("t").longColumn("v", 1L).atNow();
 
             pool.close();
             Assert.assertEquals(
-                    "pool.close() must not clear `all` -- the teardown loop closes delegates in place",
+                    "close() must leave the borrowed slot in place -- teardown belongs to the returning lease",
                     1, pool.totalSize()
             );
 
-            // sender.close() now hits a closed delegate; flush throws; the
-            // PooledSender.close() finally routes to discardBroken.
+            // The lease comes home after close: flush throws (dead address),
+            // and PooledSender.close()'s finally routes to discardBroken ->
+            // retireLease, the delegated single-owner teardown.
             try {
                 s.close();
-            } catch (LineSenderException expected) {
-                // expected: flush against a closed delegate throws.
+                Assert.fail("flush against the dead address with a buffered row must throw");
             } catch (RuntimeException expected) {
-                // some Sender implementations wrap differently; either is fine.
+                // expected: LineSenderException (or a transport-specific wrap)
             }
 
             Assert.assertEquals(
-                    "discardBroken called after pool close must NOT mutate `all`",
-                    1, pool.totalSize()
+                    "the returning lease must retire its slot (delegated teardown)",
+                    0, pool.totalSize()
             );
         }
     }
