@@ -505,7 +505,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     lastLogNanos = now;
                 }
             }
-            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+            // Math.max guards nextLong's bound>0 contract (IAE on <= 0)
+            // against non-builder callers -- builder-validated config keeps
+            // this > 0. Mirrors BackgroundDrainer's sweep-loop jitter guard.
+            long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
             long sleepMillis = backoffMillis + jitter;
             long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
             if (remainingMillis <= 0) {
@@ -1171,7 +1174,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
             if (running) {
-                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                // Math.max guards nextLong's bound>0 contract (IAE on <= 0):
+                // an IAE here would climb through fail() into ioLoop's
+                // secondary-failure guard and latch a terminal -- correct but
+                // needlessly fatal for a jitter computation. Builder-validated
+                // config keeps this > 0; the guard covers direct constructor
+                // use. Mirrors BackgroundDrainer's sweep-loop jitter guard.
+                long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
                 long sleepMillis = backoffMillis + jitter;
                 LockSupport.parkNanos(sleepMillis * 1_000_000L);
                 backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
@@ -1382,7 +1391,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 recordFatal(t);
                 throw (Error) t;
             }
-            fail(t);
+            try {
+                fail(t);
+            } catch (Throwable secondary) {
+                // fail()/connectLoop itself threw. Without this guard the
+                // secondary failure escapes ioLoop's catch and kills the I/O
+                // thread with `running` still true and no terminal latched:
+                // checkError() stays clean and the producer keeps buffering
+                // into SF against a dead loop -- the exact silent stall
+                // Invariant B exists to prevent. Latch-and-die like the Error
+                // arm above instead; the finally still counts down the
+                // shutdown latch, so close() cannot hang. recordFatal is
+                // first-writer-wins, so a terminal already latched inside
+                // connectLoop (e.g. a throw from dispatchError after
+                // recordFatal) is preserved.
+                if (secondary != t) {
+                    secondary.addSuppressed(t);
+                }
+                recordFatal(secondary);
+                if (secondary instanceof Error) {
+                    throw (Error) secondary;
+                }
+            }
         } finally {
             // Last act of the I/O thread: dispose of whatever client it
             // holds. This is the airtight half of the close()-vs-reconnect
