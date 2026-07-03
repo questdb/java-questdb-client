@@ -259,17 +259,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
-    // Poison-frame detector state (I/O thread only). poisonFsn is the head-of-line
-    // FSN (ackedFsn+1) observed at the most recent server-active rejection (NACK,
-    // or non-orderly close after at least one send on the connection);
-    // poisonStrikes counts consecutive rejections at that same FSN with no ack
-    // progress in between. Any ACK resets both. At maxHeadFrameRejections
-    // strikes the frame is declared poisoned: the server (or an intermediary)
-    // deterministically rejects these exact bytes, so replay cannot succeed and
-    // the loop halts with a typed PROTOCOL_VIOLATION terminal instead of
-    // reconnect-looping forever.
+    // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
+    // frame implicated by the most recent server-active rejection: the NACK-named
+    // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
+    // non-orderly close after at least one send on the connection. poisonStrikes
+    // counts consecutive rejections of that same FSN; an OK at-or-beyond
+    // poisonFsn proves the rejection was not deterministic and resets both.
+    // Progress is deliberately measured against highestOkFsn -- OK-level wire
+    // progress -- and NOT against the engine's trim watermark: in durable-ack
+    // mode ackedFsn advances only on STATUS_DURABLE_ACK coverage, so a
+    // post-NACK recycle replays from the durable watermark and re-OKs frames
+    // BEHIND the poisoned one; keying or resetting on trim would let those
+    // re-OKs launder the strike count every cycle and a deterministically-
+    // NACKing frame would recycle the connection forever. At
+    // maxHeadFrameRejections strikes the frame is declared poisoned: the server
+    // (or an intermediary) deterministically rejects these exact bytes, so
+    // replay cannot succeed and the loop halts with a typed PROTOCOL_VIOLATION
+    // terminal instead of reconnect-looping forever. Both fields deliberately
+    // survive reconnects (swapClient) -- the detector spans connections.
     private long poisonFsn = -1L;
     private int poisonStrikes;
+    // Highest FSN the server has acknowledged at the OK level (STATUS_OK),
+    // across connections. In default mode this tracks the trim watermark
+    // exactly; in durable-ack mode it runs AHEAD of ackedFsn, which waits for
+    // STATUS_DURABLE_ACK coverage. I/O thread only; survives reconnects. Used
+    // by the poison-frame detector to measure genuine acceptance progress.
+    private long highestOkFsn = -1L;
     // Poison-frame detector threshold for this loop. Constructor-configured
     // (connect-string key max_frame_rejections); defaults to
     // DEFAULT_MAX_HEAD_FRAME_REJECTIONS.
@@ -972,7 +987,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(
                         "async initial connect deferred to I/O thread"),
-                "initial connect");
+                "initial connect", 0L);
     }
 
     private void clearDurableAckTracking() {
@@ -995,8 +1010,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link #attemptInitialConnect()} for the async-initial-connect path
      * (phase="initial connect"). The phase string only affects log lines
      * and the {@link SenderError} message — control flow is identical.
+     * {@code paceFirstAttemptMillis} > 0 parks for that long (+jitter)
+     * before the first connect attempt — see {@link #failPaced}.
      */
-    private void connectLoop(Throwable initial, String phase) {
+    private void connectLoop(Throwable initial, String phase, long paceFirstAttemptMillis) {
         if (reconnectFactory == null || !running) {
             recordFatal(initial);
             return;
@@ -1016,6 +1033,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // bounds only the blocking (non-lazy) initial connect in
         // QwpWebSocketSender.buildAndConnect, never this background loop.
         long backoffMillis = reconnectInitialBackoffMillis;
+        if (paceFirstAttemptMillis > 0 && running) {
+            // NACK-initiated recycle against a reachable server: pace the
+            // recycle with a backoff+jitter dose (sized by the caller --
+            // failPaced escalates it with consecutive same-frame strikes),
+            // or the recycle loop runs at server NACK rate. The dose is a
+            // hard pacing guarantee, so ride out spurious parkNanos returns
+            // and stale unpark permits with a deadline loop; close() flips
+            // running=false and unparks, exiting promptly.
+            long jitter = ThreadLocalRandom.current().nextLong(paceFirstAttemptMillis);
+            long deadlineNanos = System.nanoTime()
+                    + (paceFirstAttemptMillis + jitter) * 1_000_000L;
+            long remaining;
+            while (running && (remaining = deadlineNanos - System.nanoTime()) > 0) {
+                LockSupport.parkNanos(remaining);
+            }
+        }
         int attempts = 0;
         long lastLogNanos = 0L;
         Throwable lastReconnectError = initial;
@@ -1212,18 +1245,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Poison-frame detector: record a server-active rejection (NACK, or non-orderly
-     * close after at least one send on this connection) at the current head-of-line
-     * frame. Returns true when the same head FSN has now been rejected
+     * close after at least one send on this connection) of {@code rejectedFsn} —
+     * the NACK-named frame, or the OK-level head-of-line frame for a close.
+     * Returns true when that same FSN has now been rejected
      * {@code maxHeadFrameRejections} consecutive times (configurable; default
-     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) with no ack progress in
-     * between — the frame is poisoned and replay is deterministic. I/O thread only.
+     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) with no OK-level acceptance
+     * at or beyond it in between — the frame is poisoned and replay is
+     * deterministic. Strikes are keyed on the rejected frame itself, never on
+     * the engine's trim watermark: in durable-ack mode the trim watermark lags
+     * OK-level progress, and both the key and the reset must be immune to the
+     * replay re-OKs of frames behind the suspect. I/O thread only.
      */
-    private boolean recordHeadRejectionStrike() {
-        long head = engine.ackedFsn() + 1L;
-        if (head == poisonFsn) {
+    private boolean recordHeadRejectionStrike(long rejectedFsn) {
+        if (rejectedFsn == poisonFsn) {
             poisonStrikes++;
         } else {
-            poisonFsn = head;
+            poisonFsn = rejectedFsn;
             poisonStrikes = 1;
         }
         return poisonStrikes >= maxHeadFrameRejections;
@@ -1231,18 +1268,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Escalate a poisoned frame to a typed terminal: the server (or an intermediary)
-     * has deterministically rejected the head-of-line frame
-     * {@code maxHeadFrameRejections} consecutive times with no ack progress, so
+     * has deterministically rejected the same frame {@code maxHeadFrameRejections}
+     * consecutive times with no OK-level acceptance at or beyond it, so
      * replaying it cannot succeed and retrying would loop forever. recordFatal runs
      * before dispatchError so the producer-observable terminal is latched before the
      * user's handler is invoked. The rejected bytes remain in the SF log on disk —
      * nothing is silently discarded.
      */
-    private void haltOnPoisonedFrame(String lastRejection) {
-        long fromFsn = engine.ackedFsn() + 1L;
-        long toFsn = Math.max(fromFsn, engine.publishedFsn());
+    private void haltOnPoisonedFrame(String lastRejection, long toFsnHint) {
+        // Name the frame the server actually rejected (the strike key), not
+        // ackedFsn+1: in durable-ack mode the trim watermark can sit on
+        // frames the server already ACCEPTED at the OK level, and pointing
+        // the operator at those bytes would misattribute the poison. The
+        // caller supplies the span end: a NACK names the exact frame, so the
+        // span is that single frame; a non-orderly close cannot single one
+        // out, so it spans to publishedFsn.
+        long fromFsn = poisonFsn;
+        long toFsn = Math.max(fromFsn, toFsnHint);
         String msg = "frame at fsn=" + fromFsn + " rejected " + poisonStrikes
-                + " consecutive times with no ack progress -- poisoned frame, replay cannot succeed (last: "
+                + " consecutive times with no acceptance at or beyond it -- poisoned frame, replay cannot succeed (last: "
                 + lastRejection + ')';
         SenderError err = new SenderError(
                 SenderError.Category.PROTOCOL_VIOLATION,
@@ -1331,7 +1375,40 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * (legacy behavior).
      */
     private void fail(Throwable initial) {
-        connectLoop(initial, "reconnect");
+        connectLoop(initial, "reconnect", 0L);
+    }
+
+    /**
+     * Same recycle machinery as {@link #fail}, but parks for a backoff dose
+     * (+jitter) BEFORE the first connect attempt. Used for server-active
+     * RETRIABLE rejections (NACKs): the server is reachable — it just
+     * answered — so the first reconnect attempt will almost always succeed
+     * and connectLoop's failed-connect backoff never engages. This park is
+     * what delivers the "capped backoff + jitter" promise of
+     * design/qwp-nack-policy-v2.md for the RETRIABLE policy against a
+     * healthy server; transport failures keep the unpaced {@link #fail}
+     * (an immediate first reconnect attempt is desirable there).
+     * <p>
+     * The dose escalates with consecutive poison strikes against the same
+     * frame — initial backoff, doubling per strike, capped at the max
+     * backoff. Escalation matters beyond politeness: a TRANSIENT same-frame
+     * rejection (e.g. sustained disk pressure NACKing the head batch) now
+     * accumulates strikes toward the poison terminal even in durable-ack
+     * mode, and the widening gaps between replays are what give a transient
+     * condition time to clear before the threshold fires. A NACK sequence
+     * that IS making progress (different frame each time) resets strikes to
+     * 1 and keeps the dose at the initial backoff.
+     */
+    private void failPaced(Throwable initial) {
+        long dose = reconnectInitialBackoffMillis;
+        if (dose > 0) {
+            int strikes = Math.max(poisonStrikes, 1);
+            dose <<= Math.min(strikes - 1, 6);
+            if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
+                dose = reconnectMaxBackoffMillis;
+            }
+        }
+        connectLoop(initial, "reconnect", dose);
     }
 
     /**
@@ -1786,10 +1863,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
-                // Any ACK on this connection means the server accepted the current
-                // head of the replay stream -- clear poison-frame suspicion.
-                poisonFsn = -1L;
-                poisonStrikes = 0;
+                long okFsn = fsnAtZero + capped;
+                if (okFsn > highestOkFsn) {
+                    highestOkFsn = okFsn;
+                }
+                // Clear poison-frame suspicion only when OK-level progress
+                // reaches the suspected frame itself: acceptance at or beyond
+                // poisonFsn proves the earlier rejections were not
+                // deterministic. Re-OKs of frames BEHIND the suspect -- the
+                // norm in durable-ack mode, where every recycle replays from
+                // the durable trim watermark, which lags the OK level -- say
+                // nothing about the poisoned bytes and must not reset the
+                // count, or a deterministically-NACKing frame recycles the
+                // connection indefinitely.
+                if (poisonFsn != -1L && okFsn >= poisonFsn) {
+                    poisonFsn = -1L;
+                    poisonStrikes = 0;
+                }
                 if (durableAckMode) {
                     // Durable mode: stash the (wireSeq, table_seqTxns) tuple
                     // and wait for STATUS_DURABLE_ACK to release it. Empty
@@ -1848,9 +1938,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // elsewhere, not a verdict on the bytes.
             boolean orderly = code == WebSocketCloseCode.NORMAL_CLOSURE
                     || code == WebSocketCloseCode.GOING_AWAY;
-            if (!orderly && nextWireSeq > 0 && recordHeadRejectionStrike()) {
+            if (!orderly && nextWireSeq > 0
+                    && recordHeadRejectionStrike(Math.max(engine.ackedFsn(), highestOkFsn) + 1L)) {
                 haltOnPoisonedFrame("ws-close[" + code + ' '
-                        + WebSocketCloseCode.describe(code) + "]: " + reason);
+                                + WebSocketCloseCode.describe(code) + "]: " + reason,
+                        engine.publishedFsn());
                 return;
             }
             fail(new LineSenderException(
@@ -1896,11 +1988,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // so the rejection cannot implicate the head frame -- no poison
             // strike. Surface for observability, then recycle the wire; the
             // reconnect path replays from ackedFsn+1. No watermark advance --
-            // nothing is dropped.
+            // nothing is dropped. RETRIABLE is paced for the same reason as
+            // the post-send path: the server is reachable, so the recycle
+            // would otherwise run at its rejection rate.
             dispatchError(err);
-            fail(new LineSenderException(
+            LineSenderException recycleCause = new LineSenderException(
                     "pre-send server rejection (" + category + "): "
-                            + response.getErrorMessage()));
+                            + response.getErrorMessage());
+            if (policy == SenderError.Policy.RETRIABLE) {
+                failPaced(recycleCause);
+            } else {
+                fail(recycleCause);
+            }
         }
 
         private void handleServerRejection(long wireSeq) {
@@ -1975,15 +2074,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             LOG.warn("server rejected wire seq {} (category={}, policy={}, status=0x{}) -- recycling connection, will replay from fsn {}",
                     wireSeq, category, policy, Integer.toHexString(status & 0xFF), engine.ackedFsn() + 1L);
             dispatchError(err);
-            if (recordHeadRejectionStrike()) {
+            if (recordHeadRejectionStrike(fsn)) {
                 haltOnPoisonedFrame("server NACK status=0x"
-                        + Integer.toHexString(status & 0xFF) + " (" + category + "): "
-                        + response.getErrorMessage());
+                                + Integer.toHexString(status & 0xFF) + " (" + category + "): "
+                                + response.getErrorMessage(),
+                        fsn);
                 return;
             }
-            fail(new LineSenderException(
+            // RETRIABLE recycles are paced: the server is reachable and
+            // healthy (it just NACK'd a frame), so the reconnect will succeed
+            // immediately and connectLoop's failed-connect backoff never
+            // engages -- without pacing, a repeatedly-NACKing server drives
+            // full recycle cycles at its NACK rate. RETRIABLE_OTHER stays
+            // immediate: the node cannot serve writes at all, so rotating to
+            // another endpoint matters more than backing off.
+            LineSenderException recycleCause = new LineSenderException(
                     "server NACK (" + category + ", " + policy + "): "
-                            + response.getErrorMessage()));
+                            + response.getErrorMessage());
+            if (policy == SenderError.Policy.RETRIABLE) {
+                failPaced(recycleCause);
+            } else {
+                fail(recycleCause);
+            }
         }
     }
 }

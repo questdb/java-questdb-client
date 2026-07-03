@@ -86,10 +86,10 @@ public class CursorWebSocketSendLoopJvmErrorTest {
         wireReconnectPlumbing(loop, attempts);
 
         Method connectLoop = CursorWebSocketSendLoop.class.getDeclaredMethod(
-                "connectLoop", Throwable.class, String.class);
+                "connectLoop", Throwable.class, String.class, long.class);
         connectLoop.setAccessible(true);
         try {
-            connectLoop.invoke(loop, new LineSenderException("initial wire failure"), "reconnect");
+            connectLoop.invoke(loop, new LineSenderException("initial wire failure"), "reconnect", 0L);
             Assert.fail("a JVM Error must escape connectLoop, not be retried");
         } catch (InvocationTargetException ite) {
             Assert.assertTrue("expected LinkageError, got " + ite.getCause(),

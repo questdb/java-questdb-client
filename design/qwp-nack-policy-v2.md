@@ -52,12 +52,34 @@ kills the connection without a NACK (e.g. an intermediary frame-size limit) —
 is caught *behaviorally*:
 
 > A server-active rejection (NACK, or non-orderly close after at least one
-> send on the connection) at the same head-of-line FSN, with no ack progress
-> in between, counts a strike. `max_frame_rejections` (default 4;
-> connect-string key or `LineSenderBuilder.maxFrameRejections(int)`) consecutive
-> strikes escalate to a typed `PROTOCOL_VIOLATION` TERMINAL naming the FSN.
-> Any ACK resets the counter. Orderly closes (`NORMAL_CLOSURE` role-change
-> handoff, `GOING_AWAY` restart drain) never count strikes.
+> send on the connection) of the same frame counts a strike. Strikes are
+> keyed on the rejected frame's FSN — the NACK-named frame, or the OK-level
+> head-of-line frame for a close — never on the engine's trim watermark.
+> `max_frame_rejections` (default 4; connect-string key or
+> `LineSenderBuilder.maxFrameRejections(int)`) consecutive strikes escalate
+> to a typed `PROTOCOL_VIOLATION` TERMINAL naming that FSN. The counter
+> resets only on OK-level acceptance **at or beyond** the suspected frame:
+> in durable-ack mode the trim watermark advances only on durable coverage,
+> so every post-NACK recycle replays from the durable watermark and re-OKs
+> frames *behind* the suspect — those re-OKs say nothing about the poisoned
+> bytes and must not launder the count. Orderly closes (`NORMAL_CLOSURE`
+> role-change handoff, `GOING_AWAY` restart drain) never count strikes.
+
+Below the escalation threshold, a RETRIABLE NACK's recycle is **paced**: the
+server is reachable (it just answered), so the reconnect succeeds immediately
+and the failed-connect backoff never engages — the recycle parks *before*
+the first connect attempt instead of running full recycle cycles
+(TCP+TLS+upgrade+window replay) at server NACK rate. The dose is the
+reconnect backoff proper: initial backoff, doubling with each consecutive
+strike against the same frame, capped at the max backoff, plus jitter. The
+escalation is also the safety margin for transient same-frame rejections
+(e.g. sustained disk pressure): the widening replay gaps give the condition
+time to clear before `max_frame_rejections` strikes escalate to the poison
+terminal, while a NACK sequence that is making progress (different frame
+each time) resets to the initial dose. RETRIABLE_OTHER recycles stay
+immediate: the node cannot serve writes at all, so endpoint rotation matters
+more than backoff. Transport failures also reconnect immediately (first
+attempt), with backoff on failed attempts as before.
 
 This catches everything `isTerminalCloseCode` caught, plus middlebox closes
 the list missed, and never false-positives on outages (those fail at connect,
