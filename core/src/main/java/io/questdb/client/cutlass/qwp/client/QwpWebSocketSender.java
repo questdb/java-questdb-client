@@ -2768,8 +2768,15 @@ public class QwpWebSocketSender implements Sender {
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
             } catch (HttpClientException e) {
-                HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
+                // Close BEFORE classify: the sibling catch (Error) below does not
+                // guard catch-arm bodies, so an Error thrown inside classify()
+                // (it allocates on the role-reject/auth paths) would escape with
+                // the client's fd and native buffers open. Safe to reorder --
+                // classify reads only heap fields (upgradeRejectRole/Zone,
+                // upgradeStatusCode) that are set during upgrade() and survive
+                // close().
                 newClient.close();
+                HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
                 if (classified instanceof QwpIngressRoleRejectedException) {
                     QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
                     hostTracker.recordRoleReject(idx, re.isTransient(), !background);
