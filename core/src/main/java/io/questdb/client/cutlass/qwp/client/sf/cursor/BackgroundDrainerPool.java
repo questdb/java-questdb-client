@@ -54,7 +54,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * that don't exit in time (typically parked in a blocking native connect
  * that neither unpark nor interrupt cancels) are left to finish on their
  * own — the pool's underlying executor uses daemon threads so they don't
- * block JVM exit.
+ * block JVM exit. An interrupted {@code close()} skips the graceful
+ * window: every active drainer is stop-signaled immediately, then the
+ * executor is shut down hard. A drainer cut down mid-drain exits STOPPED
+ * with its unacked rows still in SF — re-adopted by the next orphan scan,
+ * never dropped.
  */
 public final class BackgroundDrainerPool implements QuietCloseable {
 
@@ -177,6 +181,22 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            // Signal stop BEFORE shutdownNow's interrupts land. Actively-
+            // draining drainers were spared by the split-stop above, and the
+            // graceful-timeout sweep never runs on this path -- without this
+            // sweep they would rely solely on the drainer-side fallback that
+            // folds a pending interrupt into stopRequested
+            // (BackgroundDrainer.stopRequestedOrInterrupted). This sweep is
+            // the authoritative signal: it is synchronous with close() (the
+            // caller observes fully stop-signaled drainers on return) and
+            // covers a drainer that is between park-loop checks when the
+            // interrupt lands. Cutting a mid-drain drainer short here is
+            // deliberate -- an interrupted close() means "leave now", and
+            // its unacked rows stay in SF for the next orphan scan (no data
+            // loss), exactly like the graceful-timeout sweep.
+            for (BackgroundDrainer d : active) {
+                d.requestStop();
+            }
             executor.shutdownNow();
         }
     }

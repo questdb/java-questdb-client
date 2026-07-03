@@ -435,7 +435,7 @@ public final class BackgroundDrainer implements Runnable {
             if (sleepMillis > 0L && !stopRequested) {
                 long parkDeadlineNanos = System.nanoTime() + sleepMillis * 1_000_000L;
                 long remaining;
-                while (!stopRequested
+                while (!stopRequestedOrInterrupted()
                         && (remaining = parkDeadlineNanos - System.nanoTime()) > 0L) {
                     LockSupport.parkNanos(Math.min(remaining, STOP_CHECK_PARK_CHUNK_NANOS));
                 }
@@ -477,6 +477,37 @@ public final class BackgroundDrainer implements Runnable {
 
     /** True once {@link #requestStop()} has been called. */
     public boolean isStopRequested() {
+        return stopRequested;
+    }
+
+    /**
+     * Stop check for the runner thread's park loops that also folds a
+     * pending thread interrupt into the stop protocol. The pool delivers
+     * cancellation as an interrupt ({@code shutdownNow}) and pairs it with a
+     * {@link #requestStop()} sweep — but that pairing is caller discipline.
+     * An interrupt arriving WITHOUT the flag would otherwise be pathological:
+     * every wait here is a {@code LockSupport.parkNanos}, which returns
+     * immediately while the status is pending and never clears it, so the
+     * backoff/poll loops would degrade into a 100% CPU busy-spin (for as
+     * long as an outage lasts) with the slot lock pinned. Mapping the
+     * interrupt onto {@code stopRequested} routes them through the normal
+     * STOPPED exit instead.
+     * <p>
+     * The status is deliberately left set ({@code isInterrupted()}, not
+     * {@code Thread.interrupted()}): the teardown in {@link #run}'s finally
+     * relies on it — {@code loop.close()}'s latch await must throw rather
+     * than block under a wedged I/O thread, routing engine teardown through
+     * the delegation protocol (pinned by
+     * {@code BackgroundDrainerInterruptedTeardownTest}).
+     * <p>
+     * Called on the runner thread only. The unsynchronized check-then-set is
+     * safe against a concurrent {@link #requestStop()}: both writers only
+     * ever transition {@code stopRequested} false→true.
+     */
+    private boolean stopRequestedOrInterrupted() {
+        if (!stopRequested && Thread.currentThread().isInterrupted()) {
+            stopRequested = true;
+        }
         return stopRequested;
     }
 
@@ -539,7 +570,7 @@ public final class BackgroundDrainer implements Runnable {
                         maxHeadFrameRejections);
                 loop.start();
 
-                while (!stopRequested) {
+                while (!stopRequestedOrInterrupted()) {
                     long acked = engine.ackedFsn();
                     this.ackedFsn = acked;
                     if (acked >= target) {
