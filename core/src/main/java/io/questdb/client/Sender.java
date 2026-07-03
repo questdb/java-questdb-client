@@ -39,7 +39,6 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.impl.ConfStringParser;
-import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
 import io.questdb.client.network.NetworkFacade;
@@ -3742,7 +3741,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if ((user == null) != (password == null)) {
                 throw new IllegalArgumentException("username and password must be provided together");
             }
-            if (token != null && user != null) {
+            if (token != null && (user != null || password != null)) {
                 throw new IllegalArgumentException("cannot use both token and username/password authentication");
             }
             String tlsVerify = view.getStr("tls_verify");
