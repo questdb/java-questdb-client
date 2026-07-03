@@ -1321,7 +1321,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Pop every head entry whose tables are all covered by the durable
      * watermarks and call {@link CursorSendEngine#acknowledge} once with
      * the highest popped wireSeq. Trivially-durable entries (tableCount=0,
-     * from empty-WAL OK frames or NACK frames) pop unconditionally.
+     * from empty-WAL OK frames) pop unconditionally.
      */
     private void drainPendingDurable() {
         long highest = Long.MIN_VALUE;
@@ -1343,10 +1343,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Stash a wireSeq + per-table seqTxns from the current OK / NACK frame
-     * for later durable-ack confirmation. {@link #response} must hold the
-     * OK or rejection frame at call time. NACK frames carry no per-table
-     * entries, so they enqueue as trivially-durable empty placeholders.
+     * Stash a wireSeq + per-table seqTxns from the current OK frame for
+     * later durable-ack confirmation. {@link #response} must hold the OK
+     * frame at call time. Only the OK path enqueues: rejections never
+     * advance the durable watermark -- handleServerRejection either latches
+     * a terminal or recycles the connection.
      */
     private void enqueuePendingOk(long wireSeq) {
         PendingDurableEntry e = acquirePendingEntry();
