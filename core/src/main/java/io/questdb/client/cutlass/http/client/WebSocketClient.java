@@ -911,6 +911,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private void compactRecvBuffer() {
         if (recvReadPos > 0) {
             int remaining = recvPos - recvReadPos;
+            // recvPos >= recvReadPos always holds here: a handler-initiated
+            // close() (which zeroes recvPos under our feet) is caught in
+            // tryParseFrame's tail before this method is reached. If this
+            // assert fires, someone reintroduced a post-callback touch of
+            // recv state on a closed/disconnected client.
+            assert remaining >= 0 : "recv buffer positions out of order [recvPos=" + recvPos + ", recvReadPos=" + recvReadPos + ']';
             if (remaining > 0) {
                 Vect.memmove(recvBufPtr, recvBufPtr + recvReadPos, remaining);
             }
@@ -1256,6 +1262,20 @@ public abstract class WebSocketClient implements QuietCloseable {
                         resetFragmentState();
                     }
                     break;
+            }
+
+            // A handler callback above may have close()d this client:
+            // CursorWebSocketSendLoop's NACK/close recycle swaps in a new
+            // client and synchronously closes this one (swapClient), then
+            // control unwinds back here. close() -> disconnect() has already
+            // zeroed recvPos/recvReadPos and freed recvBufPtr -- advancing
+            // the read position or compacting would corrupt that state
+            // (negative recvPos today; a memmove on freed memory if the
+            // zeroing ever moved). The frame was fully dispatched, so
+            // in-callback close is a supported contract: report success
+            // and touch nothing. Same-thread, so the closed read is exact.
+            if (closed.get()) {
+                return PARSE_OK;
             }
 
             // Advance read position

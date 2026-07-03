@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketReadinessWaiter;
+import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -125,6 +126,78 @@ public class WebSocketClientTest {
                 + "X-QWP-Max-Batch-Size: 16777216\r\n"
                 + "\r\n";
         Assert.assertEquals(16 * 1024 * 1024, invokeExtractMaxBatchSize(response));
+    }
+
+    /**
+     * A frame handler may close() the client from inside its callback:
+     * CursorWebSocketSendLoop's NACK-recycle path (handleServerRejection /
+     * handlePreSendRejection -> failPaced()/fail() -> connectLoop ->
+     * swapClient -> oldClient.close()) runs synchronously on the I/O thread
+     * while that thread is still inside this client's tryParseFrame. The
+     * post-callback tail must detect the close and touch no recv state:
+     * before the guard, it left recvPos negative on the closed client and
+     * was one close()-reorder away from a memmove on freed memory.
+     */
+    @Test
+    public void testInCallbackCloseFromBinaryHandlerLeavesStateCoherent() throws Exception {
+        assertMemoryLeak(() -> {
+            // Unmasked server->client binary frame: FIN|BINARY, len=4, "abcd"
+            byte[] frame = {(byte) 0x82, 0x04, 'a', 'b', 'c', 'd'};
+            try (FrameFeedWebSocketClient client = new FrameFeedWebSocketClient(frame)) {
+                setUpgradedTrue(client);
+
+                boolean received = client.tryReceiveFrame(new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                        Assert.assertEquals(4, payloadLen);
+                        client.close();
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                    }
+                });
+
+                Assert.assertTrue("frame must be reported as received", received);
+                Assert.assertEquals("recvPos must stay at disconnect()'s reset, not go negative",
+                        0, getIntField(client, "recvPos"));
+                Assert.assertEquals(0, getIntField(client, "recvReadPos"));
+            }
+        });
+    }
+
+    /**
+     * Same contract for the CLOSE-frame branch: onClose handlers routinely
+     * recycle the connection (every WS close is reconnect-eligible), which
+     * closes this client before tryParseFrame's tail runs.
+     */
+    @Test
+    public void testInCallbackCloseFromCloseHandlerLeavesStateCoherent() throws Exception {
+        assertMemoryLeak(() -> {
+            // Unmasked server->client close frame: FIN|CLOSE, len=2, code=1000
+            byte[] frame = {(byte) 0x88, 0x02, 0x03, (byte) 0xE8};
+            try (FrameFeedWebSocketClient client = new FrameFeedWebSocketClient(frame)) {
+                setUpgradedTrue(client);
+
+                boolean received = client.tryReceiveFrame(new WebSocketFrameHandler() {
+                    @Override
+                    public void onBinaryMessage(long payloadPtr, int payloadLen) {
+                        Assert.fail("unexpected binary frame");
+                    }
+
+                    @Override
+                    public void onClose(int code, String reason) {
+                        Assert.assertEquals(1000, code);
+                        client.close();
+                    }
+                });
+
+                Assert.assertTrue("frame must be reported as received", received);
+                Assert.assertEquals("recvPos must stay at disconnect()'s reset, not go negative",
+                        0, getIntField(client, "recvPos"));
+                Assert.assertEquals(0, getIntField(client, "recvReadPos"));
+            }
+        });
     }
 
     @Test
@@ -258,6 +331,24 @@ public class WebSocketClientTest {
         return (int) m.invoke(null, response);
     }
 
+    private static int getIntField(Object obj, String name) {
+        try {
+            Class<?> clazz = obj.getClass();
+            while (clazz != null) {
+                try {
+                    Field field = clazz.getDeclaredField(name);
+                    field.setAccessible(true);
+                    return field.getInt(obj);
+                } catch (NoSuchFieldException e) {
+                    clazz = clazz.getSuperclass();
+                }
+            }
+            throw new NoSuchFieldException(name);
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
     private static void setUpgradedTrue(Object obj) throws Exception {
         Class<?> clazz = obj.getClass();
         while (clazz != null) {
@@ -271,6 +362,94 @@ public class WebSocketClientTest {
             }
         }
         throw new NoSuchFieldException("upgraded");
+    }
+
+    /**
+     * WebSocketClient over a socket pre-loaded with one server frame;
+     * sends always succeed. Used to drive a real tryReceiveFrame ->
+     * tryParseFrame -> handler dispatch on the test thread.
+     */
+    private static class FrameFeedWebSocketClient extends WebSocketClient {
+
+        FrameFeedWebSocketClient(byte[] frame) {
+            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> new FrameFeedSocket(frame));
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            // no-op: recv delivers data on the first call
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
+        }
+    }
+
+    /**
+     * Socket that serves a fixed byte sequence from recv() and reports
+     * every send() as fully written (so close-frame sends succeed).
+     */
+    private static class FrameFeedSocket implements Socket {
+        private final byte[] data;
+        private int readPos;
+
+        FrameFeedSocket(byte[] data) {
+            this.data = data;
+        }
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public int getFd() {
+            return 0;
+        }
+
+        @Override
+        public boolean isClosed() {
+            return false;
+        }
+
+        @Override
+        public void of(int fd) {
+        }
+
+        @Override
+        public int recv(long bufferPtr, int bufferLen) {
+            int n = Math.min(data.length - readPos, bufferLen);
+            for (int i = 0; i < n; i++) {
+                Unsafe.getUnsafe().putByte(bufferPtr + i, data[readPos + i]);
+            }
+            readPos += n;
+            return n;
+        }
+
+        @Override
+        public int send(long bufferPtr, int bufferLen) {
+            return bufferLen;
+        }
+
+        @Override
+        public void startTlsSession(CharSequence peerName, SocketReadinessWaiter waiter) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean supportsTls() {
+            return false;
+        }
+
+        @Override
+        public int tlsIO(int readinessFlags) {
+            return 0;
+        }
+
+        @Override
+        public boolean wantsTlsWrite() {
+            return false;
+        }
     }
 
     /**
