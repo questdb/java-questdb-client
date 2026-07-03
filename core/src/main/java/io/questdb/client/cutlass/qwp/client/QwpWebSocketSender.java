@@ -2631,6 +2631,20 @@ public class QwpWebSocketSender implements Sender {
      * Production path delegates to {@link WebSocketClientFactory}; tests may
      * install {@link #clientFactoryOverride} to substitute a stub.
      */
+    /**
+     * Best-effort close for a client being abandoned because a JVM Error is
+     * about to be rethrown: under OOM {@code close()} itself can throw, and a
+     * secondary failure must not mask the original Error. {@code close()} is
+     * CAS-gated, so re-closing an already-closed client is a no-op.
+     */
+    private static void closeQuietlyOnError(WebSocketClient client) {
+        try {
+            client.close();
+        } catch (Throwable ignored) {
+            // best-effort; the original Error is what must surface
+        }
+    }
+
     private WebSocketClient newWebSocketClient() {
         java.util.function.Supplier<WebSocketClient> override = clientFactoryOverride;
         if (override != null) {
@@ -2851,77 +2865,90 @@ public class QwpWebSocketSender implements Sender {
                 // walk. Rethrow: every retry loop upstream (connectWithRetry,
                 // the cursor reconnect loop, BackgroundDrainer) rethrows Error
                 // rather than retrying, so this stays a loud one-shot failure.
-                try {
-                    newClient.close();
-                } catch (Throwable ignored) {
-                    // best-effort; the original Error is what must surface
-                }
+                closeQuietlyOnError(newClient);
                 throw e;
             }
-            if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
-                newClient.close();
-                hostTracker.recordRoleReject(idx, false, !background);
-                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
-                        ep.host, ep.port, null);
-                if (terminalUpgradeError == null) {
-                    terminalUpgradeError = ackErr;
+            // Guard the post-upgrade tail: from here until newClient is
+            // returned, an escaping JVM Error would leak the CONNECTED
+            // client's fd and native buffers -- the same class the
+            // connect/upgrade catch (Error) arm above closes over. The
+            // success-event dispatch is the realistic trigger: it allocates
+            // the SenderConnectionEvent plus a deque node, and on a clean
+            // first connect it is also the dispatcher's first offer(), which
+            // lazy-starts the dispatcher thread (Thread.start() can itself
+            // fail with OOM). Same contract as the arm above: close quietly
+            // (a secondary failure must not mask the original Error) and
+            // rethrow. close() is CAS-gated, so re-closing after the
+            // durable-ack arm's own close is a no-op.
+            try {
+                if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
+                    newClient.close();
+                    hostTracker.recordRoleReject(idx, false, !background);
+                    QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
+                            ep.host, ep.port, null);
+                    if (terminalUpgradeError == null) {
+                        terminalUpgradeError = ackErr;
+                    }
+                    lastError = ackErr;
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, ackErr);
+                    }
+                    continue;
                 }
-                lastError = ackErr;
-                if (!background) {
-                    dispatchConnectionEvent(
-                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                            attemptNumber, roundSeq, ackErr);
+                hostTracker.recordSuccess(idx, !background);
+                ctx.previousIdx = idx;
+                if (background) {
+                    // Walk bookkeeping only: recordSuccess feeds the shared health
+                    // tracker and ctx.previousIdx arms this factory's own
+                    // mid-stream-failure handling on its next reconnect. No
+                    // lifecycle event, no CONNECTED/RECONNECTED/FAILED_OVER
+                    // classification state, no producer batch re-sizing -- the
+                    // drainer's lifecycle is observable via
+                    // BackgroundDrainerListener and the drainer counters, never
+                    // the foreground connection-event stream.
+                    return newClient;
                 }
-                continue;
-            }
-            hostTracker.recordSuccess(idx, !background);
-            ctx.previousIdx = idx;
-            if (background) {
-                // Walk bookkeeping only: recordSuccess feeds the shared health
-                // tracker and ctx.previousIdx arms this factory's own
-                // mid-stream-failure handling on its next reconnect. No
-                // lifecycle event, no CONNECTED/RECONNECTED/FAILED_OVER
-                // classification state, no producer batch re-sizing -- the
-                // drainer's lifecycle is observable via
-                // BackgroundDrainerListener and the drainer counters, never
-                // the foreground connection-event stream.
+                int previousLiveIdx = currentEndpointIdx;
+                currentEndpointIdx = idx;
+                // Classify the success. CONNECTED only fires once per sender
+                // lifetime; subsequent successes are RECONNECTED (same endpoint
+                // as before) or FAILED_OVER (different endpoint). hasEverConnected
+                // is set after the classification so the very first success picks
+                // CONNECTED before flipping the flag.
+                SenderConnectionEvent.Kind successKind;
+                String prevHost = null;
+                int prevPort = SenderConnectionEvent.NO_PORT;
+                if (!hasEverConnected) {
+                    successKind = SenderConnectionEvent.Kind.CONNECTED;
+                    hasEverConnected = true;
+                } else if (previousLiveIdx == idx) {
+                    successKind = SenderConnectionEvent.Kind.RECONNECTED;
+                } else {
+                    successKind = SenderConnectionEvent.Kind.FAILED_OVER;
+                    if (previousLiveIdx >= 0) {
+                        Endpoint prevEp = endpoints.get(previousLiveIdx);
+                        prevHost = prevEp.host;
+                        prevPort = prevEp.port;
+                    }
+                }
+                dispatchConnectionEvent(
+                        successKind, ep.host, ep.port, prevHost, prevPort,
+                        attemptNumber, roundSeq, null);
+                // Refresh the cap-derived state before returning the new client so
+                // the producer thread observes the new endpoint's advertised
+                // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
+                // on a mid-stream failover leaves the sender sized for the prior
+                // endpoint's cap; an oversize row then escapes the producer-side
+                // guard and trips a wire-level ws-close[1009] downstream.
+                applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
                 return newClient;
+            } catch (Error e) {
+                closeQuietlyOnError(newClient);
+                throw e;
             }
-            int previousLiveIdx = currentEndpointIdx;
-            currentEndpointIdx = idx;
-            // Classify the success. CONNECTED only fires once per sender
-            // lifetime; subsequent successes are RECONNECTED (same endpoint
-            // as before) or FAILED_OVER (different endpoint). hasEverConnected
-            // is set after the classification so the very first success picks
-            // CONNECTED before flipping the flag.
-            SenderConnectionEvent.Kind successKind;
-            String prevHost = null;
-            int prevPort = SenderConnectionEvent.NO_PORT;
-            if (!hasEverConnected) {
-                successKind = SenderConnectionEvent.Kind.CONNECTED;
-                hasEverConnected = true;
-            } else if (previousLiveIdx == idx) {
-                successKind = SenderConnectionEvent.Kind.RECONNECTED;
-            } else {
-                successKind = SenderConnectionEvent.Kind.FAILED_OVER;
-                if (previousLiveIdx >= 0) {
-                    Endpoint prevEp = endpoints.get(previousLiveIdx);
-                    prevHost = prevEp.host;
-                    prevPort = prevEp.port;
-                }
-            }
-            dispatchConnectionEvent(
-                    successKind, ep.host, ep.port, prevHost, prevPort,
-                    attemptNumber, roundSeq, null);
-            // Refresh the cap-derived state before returning the new client so
-            // the producer thread observes the new endpoint's advertised
-            // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
-            // on a mid-stream failover leaves the sender sized for the prior
-            // endpoint's cap; an oversize row then escapes the producer-side
-            // guard and trips a wire-level ws-close[1009] downstream.
-            applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
-            return newClient;
         }
         // Round walked every endpoint without a success. Surface
         // ALL_ENDPOINTS_UNREACHABLE before any of the typed throws so a

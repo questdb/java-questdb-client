@@ -52,6 +52,11 @@ import java.util.function.Supplier;
  * rethrows without recording endpoint-health penalties: a JVM failure is not
  * endpoint health data.
  * <p>
+ * Also covers the sibling gap (M5): the post-upgrade SUCCESS tail (durable-ack
+ * check, success-event dispatch, cap re-sizing) used to run unguarded, so an
+ * Error there leaked the fully connected client. A second {@code catch (Error)}
+ * guard now closes it under the same quiet-close / rethrow contract.
+ * <p>
  * Uses the same bare-instance pattern as
  * {@code CursorWebSocketSendLoopJvmErrorTest}: {@code Unsafe.allocateInstance}
  * plus reflective wiring of the fields the connect walk dereferences, with the
@@ -112,6 +117,90 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
                     oom, ite.getCause());
         }
         Assert.assertEquals("close must have been attempted", 1, stub.closeCalls);
+    }
+
+    @Test
+    public void testErrorInSuccessTailClosesConnectedClient() throws Exception {
+        // M5 regression: connect and upgrade SUCCEED, then a JVM Error strikes
+        // in the post-upgrade success tail (event dispatch / cap re-sizing,
+        // here injected via getServerMaxBatchSize()). The tail guard must
+        // close the fully CONNECTED client and rethrow the original Error.
+        // recordSuccess bookkeeping stands -- the connect itself was real
+        // health data; only the leak is fixed.
+        QwpWebSocketSender sender = newBareSender();
+        QwpHostHealthTracker tracker = wireEndpoints(sender, 2);
+        List<StubClient> built = new ArrayList<>();
+        OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
+        installFactory(sender, () -> {
+            StubClient c = newStubClient();
+            c.serverMaxBatchSizeError = oom;
+            built.add(c);
+            return c;
+        });
+
+        try {
+            invokeBuildAndConnect(sender);
+            Assert.fail("a JVM Error must propagate out of buildAndConnect");
+        } catch (InvocationTargetException ite) {
+            Assert.assertSame("the original Error must surface", oom, ite.getCause());
+        }
+        Assert.assertEquals("Error must stop the walk on the first attempt", 1, built.size());
+        Assert.assertEquals("connected client must be closed exactly once",
+                1, built.get(0).closeCalls);
+        Assert.assertEquals("success bookkeeping preceded the Error and stands",
+                QwpHostHealthTracker.HostState.HEALTHY, tracker.getState(0));
+        Assert.assertEquals("unattempted endpoint must stay untouched",
+                QwpHostHealthTracker.HostState.UNKNOWN, tracker.getState(1));
+    }
+
+    @Test
+    public void testSuccessTailCloseFailureDoesNotMaskOriginalError() throws Exception {
+        // Same contract as the connect/upgrade arm: the tail guard's cleanup
+        // is best-effort -- a close() failure under memory pressure must not
+        // mask the original Error.
+        QwpWebSocketSender sender = newBareSender();
+        wireEndpoints(sender, 1);
+        OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
+        StubClient stub = newStubClient();
+        stub.serverMaxBatchSizeError = oom;
+        stub.throwOnClose = true;
+        installFactory(sender, () -> stub);
+
+        try {
+            invokeBuildAndConnect(sender);
+            Assert.fail("a JVM Error must propagate out of buildAndConnect");
+        } catch (InvocationTargetException ite) {
+            Assert.assertSame("close() failure must not mask the original Error",
+                    oom, ite.getCause());
+        }
+        Assert.assertEquals("close must have been attempted", 1, stub.closeCalls);
+    }
+
+    @Test
+    public void testErrorAtSuccessTailEntryClosesConnectedClient() throws Exception {
+        // Brackets the tail guard from the front: the durable-ack check is
+        // the FIRST expression after the connect/upgrade try, while the
+        // getServerMaxBatchSize() injection above hits the LAST call before
+        // return. Together they pin the guard to the whole post-upgrade
+        // tail -- narrowing the try block later trips one of the two.
+        QwpWebSocketSender sender = newBareSender();
+        QwpHostHealthTracker tracker = wireEndpoints(sender, 1);
+        setField(sender, "requestDurableAck", true);
+        OutOfMemoryError oom = new OutOfMemoryError("simulated allocation failure");
+        StubClient stub = newStubClient();
+        stub.durableAckCheckError = oom;
+        installFactory(sender, () -> stub);
+
+        try {
+            invokeBuildAndConnect(sender);
+            Assert.fail("a JVM Error must propagate out of buildAndConnect");
+        } catch (InvocationTargetException ite) {
+            Assert.assertSame("the original Error must surface", oom, ite.getCause());
+        }
+        Assert.assertEquals("connected client must be closed exactly once",
+                1, stub.closeCalls);
+        Assert.assertEquals("the Error preceded recordSuccess; no health data recorded",
+                QwpHostHealthTracker.HostState.UNKNOWN, tracker.getState(0));
     }
 
     @Test
@@ -221,6 +310,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         int closeCalls;
         Error connectError;
         RuntimeException connectRuntimeError;
+        Error durableAckCheckError;
+        Error serverMaxBatchSizeError;
         boolean throwOnClose;
 
         private StubClient() {
@@ -244,6 +335,26 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
             if (connectRuntimeError != null) {
                 throw connectRuntimeError;
             }
+        }
+
+        @Override
+        public boolean isServerDurableAckEnabled() {
+            // First expression of the guarded success tail (evaluated only
+            // when requestDurableAck is wired true).
+            if (durableAckCheckError != null) {
+                throw durableAckCheckError;
+            }
+            return true;
+        }
+
+        @Override
+        public int getServerMaxBatchSize() {
+            // Success-tail injection point: called by applyServerBatchSizeLimit
+            // after a successful connect+upgrade, inside the tail Error guard.
+            if (serverMaxBatchSizeError != null) {
+                throw serverMaxBatchSizeError;
+            }
+            return 0;
         }
 
         @Override
