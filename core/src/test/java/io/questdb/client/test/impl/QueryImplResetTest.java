@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
+import io.questdb.client.impl.QueryWorker;
 import io.questdb.client.std.str.StringSink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -59,9 +60,8 @@ public class QueryImplResetTest {
     public void testResetForBorrowClearsBuilderState() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             Class<?> queryImplClass = Class.forName("io.questdb.client.impl.QueryImpl");
-            Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
 
-            Constructor<?> ctor = queryImplClass.getDeclaredConstructor(workerClass);
+            Constructor<?> ctor = queryImplClass.getDeclaredConstructor(QueryWorker.class);
             ctor.setAccessible(true);
             // resetForBorrow() never dereferences the worker; a null worker is fine
             // for this state-only test.
@@ -106,24 +106,21 @@ public class QueryImplResetTest {
      * {@code QueryImpl} -- is pre-allocated once and reused across borrows. This
      * pins that contract: two {@code lease()} calls on the same worker return
      * distinct lease wrappers that delegate to the same pooled {@code QueryImpl}.
-     * Reaches both package-private classes by reflection.
+     * {@code QueryWorker} is public and constructed directly; the
+     * package-private {@code lease()} and {@code QueryLease} are reached by
+     * reflection.
      */
     @Test
     public void testLeaseWrapsSamePooledQueryImpl() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            Class<?> workerClass = Class.forName("io.questdb.client.impl.QueryWorker");
-            Class<?> poolClass = Class.forName("io.questdb.client.impl.QueryClientPool");
-            Class<?> clientClass = Class.forName("io.questdb.client.cutlass.qwp.client.QwpQueryClient");
             Class<?> leaseClass = Class.forName("io.questdb.client.impl.QueryLease");
 
             // lease() never dereferences the client or pool (it only resets the
             // reused QueryImpl and stamps the current generation), so nulls are fine
             // for this structure-only test -- mirrors the null-worker shortcut above.
-            Constructor<?> ctor = workerClass.getDeclaredConstructor(clientClass, poolClass, int.class);
-            ctor.setAccessible(true);
-            Object worker = ctor.newInstance(null, null, 0);
+            QueryWorker worker = new QueryWorker(null, null, 0);
 
-            Method leaseM = workerClass.getDeclaredMethod("lease");
+            Method leaseM = QueryWorker.class.getDeclaredMethod("lease");
             leaseM.setAccessible(true);
             Object leaseA = leaseM.invoke(worker);
             Object leaseB = leaseM.invoke(worker);

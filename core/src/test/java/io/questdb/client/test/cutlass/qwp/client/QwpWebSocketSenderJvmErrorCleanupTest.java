@@ -55,7 +55,7 @@ import java.util.function.Supplier;
  * Uses the same bare-instance pattern as
  * {@code CursorWebSocketSendLoopJvmErrorTest}: {@code Unsafe.allocateInstance}
  * plus reflective wiring of the fields the connect walk dereferences, with the
- * {@code clientFactoryOverride} test seam substituting a stub client whose
+ * {@code setClientFactoryOverride} test seam substituting a stub client whose
  * {@code connect()} throws.
  */
 public class QwpWebSocketSenderJvmErrorCleanupTest {
@@ -175,8 +175,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
     }
 
     private static void installFactory(QwpWebSocketSender sender,
-                                       Supplier<WebSocketClient> factory) throws Exception {
-        setField(sender, "clientFactoryOverride", factory);
+                                       Supplier<WebSocketClient> factory) {
+        sender.setClientFactoryOverride(factory);
     }
 
     /**
