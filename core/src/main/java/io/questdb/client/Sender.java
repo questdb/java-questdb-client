@@ -2469,14 +2469,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * auth/upgrade error or {@code close()}.
          * <p>
          * Default {@code 300_000} (5 minutes). Lower for fail-fast startup;
-         * higher for tolerating a slow server boot. WebSocket only.
+         * higher for tolerating a slow server boot. Must be positive: a zero
+         * budget would make the SYNC initial connect throw without a single
+         * attempt (even against a healthy server) and would collapse the
+         * background drainer's durable-ack settle budget to its first sweep.
+         * WebSocket only.
          */
         public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
             }
-            if (millis < 0) {
-                throw new LineSenderException("reconnect_max_duration_millis must be >= 0: ").put(millis);
+            if (millis <= 0) {
+                throw new LineSenderException("reconnect_max_duration_millis must be > 0: ").put(millis);
             }
             this.reconnectMaxDurationMillis = millis;
             return this;
