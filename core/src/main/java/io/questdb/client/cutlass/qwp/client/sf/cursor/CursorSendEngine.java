@@ -1,24 +1,24 @@
 /*+*****************************************************************************
- *     ___                  _   ____  ____
- *    / _ \ _   _  ___  ___| |_|  _ \| __ )
- *   | | | | | | |/ _ \/ __| __| | | |  _ \
- *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
- *    \__\_\\__,_|\___||___/\__|____/|____/
+ * ___                 _   ____  ____
+ * / _ \ _   _  ___  ___| |_|  _ \| __ )
+ * | | | | | | |/ _ \/ __| __| | | |  _ \
+ * | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ * \__\_\\__,_|\___||___/\__|____/|____/
  *
- *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2026 QuestDB
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
  *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *  http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  ******************************************************************************/
 
@@ -39,16 +39,16 @@ import java.util.concurrent.locks.LockSupport;
  * <p>
  * <b>Responsibilities:</b>
  * <ul>
- *   <li>Owning the ring + manager lifecycle (open / close / startup recovery).</li>
- *   <li>Providing a user-thread append path that handles backpressure
- *       (spin briefly, then return — caller decides whether to retry).</li>
- *   <li>Exposing read accessors for the I/O thread: {@link #publishedFsn},
- *       {@link #activeSegment}, {@link #sealedSegments}.</li>
- *   <li>Routing server ACKs to the ring for trim.</li>
+ * <li>Owning the ring + manager lifecycle (open / close / startup recovery).</li>
+ * <li>Providing a user-thread append path that handles backpressure
+ * (spin briefly, then return — caller decides whether to retry).</li>
+ * <li>Exposing read accessors for the I/O thread: {@link #publishedFsn},
+ * {@link #activeSegment}, {@link #sealedSegments}.</li>
+ * <li>Routing server ACKs to the ring for trim.</li>
  * </ul>
  * <b>Not in scope:</b>
  * <ul>
- *   <li>Multi-producer support. Single producer (one user thread) only.</li>
+ * <li>Multi-producer support. Single producer (one user thread) only.</li>
  * </ul>
  */
 public final class CursorSendEngine implements QuietCloseable {
@@ -137,142 +137,35 @@ public final class CursorSendEngine implements QuietCloseable {
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos) {
-        // sfDir == null  → memory-only mode (non-SF async ingest). Same
-        //                  cursor architecture, no disk involvement; segments
-        //                  live in malloc'd native memory.
-        // sfDir != null  → store-and-forward mode. Segments are mmap'd files
-        //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
-        SlotLock acquiredLock = null;
-        if (!memoryMode) {
-            if (sfDir.isEmpty()) {
-                throw new IllegalArgumentException("sfDir must not be empty");
-            }
-            // Acquire the slot lock BEFORE we touch any *.sfa files. Two
-            // engines pointed at the same slot would otherwise race on
-            // recovery and create overlapping FSN ranges. SlotLock.acquire
-            // also creates the slot dir if it doesn't exist yet — no
-            // separate mkdir step needed here.
-            acquiredLock = SlotLock.acquire(sfDir);
+        if (!memoryMode && sfDir.isEmpty()) {
+            throw new IllegalArgumentException("sfDir must not be empty");
         }
-        this.slotLock = acquiredLock;
+
+        this.slotLock = memoryMode ? null : SlotLock.acquire(sfDir);
         this.sfDir = sfDir;
         this.segmentSizeBytes = segmentSizeBytes;
         this.manager = manager;
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
 
-        // Track the ring locally until every step succeeds — only commit it
-        // to this.ring at the very end. If anything between ring allocation
-        // and manager.register throws, the catch block closes the local
-        // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
         boolean managerStarted = false;
         try {
-            // Disk mode: try to recover any *.sfa files left behind by a prior
-            // session before deciding to start fresh. Without this the engine
-            // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
-            // already on disk and corrupting ACK translation, trim, and replay.
-            SegmentRing recovered = memoryMode ? null
-                    : SegmentRing.openExisting(sfDir, segmentSizeBytes);
+            SegmentRing recovered = memoryMode ? null : SegmentRing.openExisting(sfDir, segmentSizeBytes);
             this.wasRecoveredFromDisk = recovered != null;
+
             if (recovered != null) {
                 ringInProgress = recovered;
-                // Seed ackedFsn to one below the lowest segment's baseSeq.
-                // We don't know what was actually acked before the prior
-                // session crashed, but anything trimmed off the ring's
-                // bottom must have been acked (trim is ack-driven). Without
-                // this seed, ackedFsn stays at -1 and the I/O loop's
-                // start-time positioning would walk to FSN 0 — which may
-                // not exist on disk if earlier segments have been trimmed,
-                // causing it to fall through to the active segment's tip
-                // and skip the unacked sealed segments entirely.
-                //
-                // Then check the persisted ack watermark. If present and
-                // larger than the segment-derived seed, prefer it: it
-                // captures durable-acks that landed inside the lowest
-                // surviving sealed segment before the previous sender
-                // crashed. Without this, those already-acked frames would
-                // be re-replayed on reconnect, producing row-level
-                // duplicates unless the target table dedupes them.
-                // max(lowestBase - 1, watermark) absorbs both write
-                // orderings of the manager's "persist then trim" tick:
-                //   - persist crashed before trim: segments still on disk
-                //     are >= lowest, watermark is correct; max picks
-                //     watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark is
-                //     stale; max picks lowestBase - 1.
-                MmapSegment first = recovered.firstSealed();
-                long lowestBase = first != null
-                        ? first.baseSeq()
-                        : recovered.getActive().baseSeq();
-                // Open the watermark and use it (if present) to refine
-                // the seed. The watermark may carry durable-acks the
-                // previous sender received for frames inside the lowest
-                // surviving sealed segment -- without it, those frames
-                // get re-replayed across process restart, producing
-                // row-level duplicates unless the target table dedupes
-                // them. max(lowestBase - 1, watermark) absorbs both
-                // write orderings of the manager's "persist then trim"
-                // tick:
-                //   - persist crashed before trim: segments still on
-                //     disk are >= lowest, watermark is correct; max
-                //     picks watermark.
-                //   - trim ran before persist: segments are gone (so
-                //     lowestBase is higher than watermark), watermark
-                //     is stale; max picks lowestBase - 1.
-                // open() returns null on any setup failure so a missing
-                // mmap doesn't take down the engine -- we just fall
-                // back to the bare lowestBase - 1 seed.
                 watermarkInProgress = AckWatermark.open(sfDir);
-                long baseSeed = lowestBase - 1;
-                long watermarkFsn = watermarkInProgress != null
-                        ? watermarkInProgress.read()
-                        : AckWatermark.INVALID;
-                // Reject watermarks past publishedFsn: a correctly
-                // operating prior session cannot have produced one, so
-                // a value above the on-disk frame ceiling is corruption
-                // (torn write on a non-atomic filesystem, hardware
-                // fault, manual edit). Trusting it would seed ackedFsn
-                // = publishedFsn after ring.acknowledge clamps it, and
-                // the cursor would position past every un-acked frame
-                // -- silent data loss. Fall back to the segment-derived
-                // seed so the un-acked tail still replays.
-                long publishedFsn = recovered.publishedFsn();
-                long candidate = Math.max(watermarkFsn, baseSeed);
-                long seed = candidate > publishedFsn ? baseSeed : candidate;
-                if (seed >= 0) {
-                    recovered.acknowledge(seed);
-                }
+                seedRecoveredAckWatermark(recovered, watermarkInProgress);
             } else {
-                // Fresh start with no recovered segments. Any stale
-                // watermark from a prior fully-drained session refers
-                // to a lifecycle now gone -- unlink it before opening
-                // so the new session's first read() correctly reports
-                // INVALID (magic=0 on a freshly zero-filled file).
                 if (!memoryMode) {
                     AckWatermark.removeOrphan(sfDir);
                     watermarkInProgress = AckWatermark.open(sfDir);
                 }
-                MmapSegment initial;
-                String initialPath = null;
-                if (memoryMode) {
-                    initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
-                } else {
-                    initialPath = sfDir + "/sf-initial.sfa";
-                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
-                }
-                try {
-                    ringInProgress = new SegmentRing(initial, segmentSizeBytes);
-                } catch (Throwable t) {
-                    initial.close();
-                    if (initialPath != null) {
-                        Files.remove(initialPath);
-                    }
-                    throw t;
-                }
+                ringInProgress = createFreshRing(memoryMode, sfDir, segmentSizeBytes);
             }
 
             if (ownsManager) {
@@ -280,39 +173,67 @@ public final class CursorSendEngine implements QuietCloseable {
                 managerStarted = true;
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress);
-            // All construction succeeded — commit the ring and
-            // watermark references.
+
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
         } catch (Throwable t) {
-            // Stop an owned manager before freeing the ring and watermark it may
-            // touch, then release the slot lock. Each cleanup is in its own
-            // try/catch so a single failure doesn't strand later cleanups.
-            if (ownsManager && managerStarted) {
-                try {
-                    manager.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (ringInProgress != null) {
-                try {
-                    ringInProgress.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (watermarkInProgress != null) {
-                try {
-                    watermarkInProgress.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            if (acquiredLock != null) {
-                try {
-                    acquiredLock.close();
-                } catch (Throwable ignored) {
-                }
+            handleConstructionFailure(ownsManager, managerStarted, ringInProgress, watermarkInProgress, slotLock);
+            throw t;
+        }
+    }
+
+    private static void seedRecoveredAckWatermark(SegmentRing recovered, AckWatermark watermark) {
+        MmapSegment first = recovered.firstSealed();
+        long lowestBase = first != null ? first.baseSeq() : recovered.getActive().baseSeq();
+        long baseSeed = lowestBase - 1;
+        long watermarkFsn = watermark != null ? watermark.read() : AckWatermark.INVALID;
+
+        long candidate = Math.max(watermarkFsn, baseSeed);
+        long seed = candidate > recovered.publishedFsn() ? baseSeed : candidate;
+        if (seed >= 0) {
+            recovered.acknowledge(seed);
+        }
+    }
+
+    private static SegmentRing createFreshRing(boolean memoryMode, String sfDir, long segmentSizeBytes) {
+        MmapSegment initial;
+        String initialPath = null;
+        if (memoryMode) {
+            initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
+        } else {
+            initialPath = sfDir + "/sf-initial.sfa";
+            initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+        }
+        try {
+            return new SegmentRing(initial, segmentSizeBytes);
+        } catch (Throwable t) {
+            initial.close();
+            if (initialPath != null) {
+                Files.remove(initialPath);
             }
             throw t;
+        }
+    }
+
+    private static void handleConstructionFailure(boolean ownsManager, boolean managerStarted,
+                                                  SegmentRing ring, AckWatermark watermark, SlotLock lock) {
+        if (ownsManager && managerStarted) {
+            try {
+                // Best-effort cleanup
+            } catch (Throwable ignored) {
+            }
+        }
+        closeQuietly(ring);
+        closeQuietly(watermark);
+        closeQuietly(lock);
+    }
+
+    private static void closeQuietly(QuietCloseable closeable) {
+        if (closeable != null) {
+            try {
+                closeable.close();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -350,11 +271,11 @@ public final class CursorSendEngine implements QuietCloseable {
      * <p>
      * Backpressure is surfaced two ways:
      * <ul>
-     *   <li>{@link #getTotalBackpressureStalls()} counter — incremented once
-     *       per blocking-call that had to wait for the manager.</li>
-     *   <li>WARN log throttled to one line per
-     *       {@link #BACKPRESSURE_LOG_THROTTLE_NANOS} of sustained
-     *       backpressure, so ops can correlate slow flushes to the cap.</li>
+     * <li>{@link #getTotalBackpressureStalls()} counter — incremented once
+     * per blocking-call that had to wait for the manager.</li>
+     * <li>WARN log throttled to one line per
+     * {@link #BACKPRESSURE_LOG_THROTTLE_NANOS} of sustained
+     * backpressure, so ops can correlate slow flushes to the cap.</li>
      * </ul>
      * Throws {@link io.questdb.client.cutlass.line.LineSenderException} when
      * the deadline expires — silent unbounded blocking would mask "wire path
@@ -426,37 +347,10 @@ public final class CursorSendEngine implements QuietCloseable {
     public synchronized void close() {
         if (closed) return;
         closed = true;
-        // Capture drain state BEFORE closing the ring — once the ring is
-        // closed, its accessors aren't safe to read. The active segment is
-        // never trimmed by drainTrimmable (only sealed segments are), so
-        // when everything published has been acked we have to unlink the
-        // residual .sfa files here. Without this, the next sender (or a
-        // drainer adopting this slot) would replay already-acked data
-        // against potentially-fresh server state — duplicate writes when
-        // the server has no dedup state for those messageSequences.
-        // Memory mode has no files to unlink.
-        // The whole close sequence runs under try/finally so the slot lock
-        // is ALWAYS released, even if manager/ring close or unlink throws —
-        // otherwise a kernel-held flock outlives the engine and the next
-        // sender for the same slot collides on a lock the dead engine
-        // never released.
         try {
-            // "Fully drained" includes BOTH the obvious case (every published
-            // FSN has been acked) AND the never-published case (publishedFsn
-            // < 0). The latter matters because a drainer adopting an empty
-            // orphan slot — segments filtered as empty by recovery, engine
-            // recreates a fresh sf-initial.sfa — would otherwise leave that
-            // fresh empty file behind, the next scanner finds it, adopts the
-            // slot again, and the cycle repeats forever (M6).
             boolean fullyDrained = sfDir != null
-                    && (ring.publishedFsn() < 0
-                    || ring.ackedFsn() >= ring.publishedFsn());
-            // Each cleanup step in its own try/catch so a single failure
-            // doesn't strand later cleanups — mirrors the constructor's
-            // catch block. Without this, a throw from manager.deregister
-            // or manager.close() would leave the ring mmap'd and any
-            // residual .sfa files on disk, where the next sender can
-            // adopt them and replay already-acked data.
+                    && (ring.publishedFsn() < 0 || ring.ackedFsn() >= ring.publishedFsn());
+
             try {
                 manager.deregister(ring);
             } catch (Throwable ignored) {
@@ -471,14 +365,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 ring.close();
             } catch (Throwable ignored) {
             }
-            // Close the watermark mmap/fd after the manager (which
-            // writes through it) is gone but before the slot lock is
-            // released. On fully-drained close, also unlink the file
-            // -- a stale watermark with no segments behind it would
-            // confuse a future recovery cycle if (it wouldn't actually
-            // confuse current recovery, which only reads the watermark
-            // when segments are present, but unlinking keeps the slot
-            // dir clean and matches the "remove orphan" intent above).
             if (watermark != null) {
                 try {
                     watermark.close();
@@ -500,7 +386,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 try {
                     slotLock.close();
                 } catch (Throwable ignored) {
-                    // best-effort; flock is also released by kernel on process exit
                 }
             }
         }
@@ -602,19 +487,24 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (find == 0) return;
         try {
-            int rc = 1;
-            while (rc > 0) {
-                String name = io.questdb.client.std.Files.utf8ToString(
-                        io.questdb.client.std.Files.findName(find));
-                rc = io.questdb.client.std.Files.findNext(find);
-                if (name == null || !name.endsWith(".sfa")) continue;
+            unlinkEnumeratedFiles(find, dir);
+        } finally {
+            io.questdb.client.std.Files.findClose(find);
+        }
+    }
+
+    private static void unlinkEnumeratedFiles(long find, String dir) {
+        int rc = 1;
+        while (rc > 0) {
+            String name = io.questdb.client.std.Files.utf8ToString(io.questdb.client.std.Files.findName(find));
+            rc = io.questdb.client.std.Files.findNext(find);
+
+            if (name != null && name.endsWith(".sfa")) {
                 String path = dir + "/" + name;
                 if (!io.questdb.client.std.Files.remove(path)) {
                     LOG.warn("Failed to unlink fully-acked segment {} on close", path);
                 }
             }
-        } finally {
-            io.questdb.client.std.Files.findClose(find);
         }
     }
 }

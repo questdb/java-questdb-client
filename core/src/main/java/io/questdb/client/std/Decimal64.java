@@ -275,6 +275,14 @@ public class Decimal64 implements Sinkable, Decimal {
             sink.put('-');
         }
 
+        boolean printed = printDigits(sink, value, scale, precision);
+
+        if (!printed) {
+            sink.put('0');
+        }
+    }
+
+    private static boolean printDigits(@NotNull CharSink<?> sink, long value, int scale, int precision) {
         boolean printed = false;
         for (int i = precision; i >= 0; i--) {
             if (i == scale - 1) {
@@ -285,7 +293,6 @@ public class Decimal64 implements Sinkable, Decimal {
                 sink.put('.');
             }
 
-            // Fast path, we expect most digits to be 0
             long pow = TEN_POWERS_TABLE[i];
             if (value < pow) {
                 if (printed) {
@@ -298,13 +305,9 @@ public class Decimal64 implements Sinkable, Decimal {
             sink.putAscii((char) ('0' + mul));
             printed = true;
 
-            // Subtract the value and continue again
             value -= mul * pow;
         }
-
-        if (!printed) {
-            sink.put('0');
-        }
+        return printed;
     }
 
     /**

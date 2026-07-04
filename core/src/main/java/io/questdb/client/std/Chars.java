@@ -1,24 +1,24 @@
 /*+*****************************************************************************
- *     ___                  _   ____  ____
- *    / _ \ _   _  ___  ___| |_|  _ \| __ )
- *   | | | | | | |/ _ \/ __| __| | | |  _ \
- *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
- *    \__\_\\__,_|\___||___/\__|____/|____/
+ * ___                 _   ____  ____
+ * / _ \ _   _  ___  ___| |_|  _ \| __ )
+ * | | | | | | |/ _ \/ __| __| | | |  _ \
+ * | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ * \__\_\\__,_|\___||___/\__|____/|____/
  *
- *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2026 QuestDB
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
  *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *  http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  ******************************************************************************/
 
@@ -307,28 +307,37 @@ public final class Chars {
         if (sequence == null) {
             return 0;
         }
-        final long len = Math.min(maxLength, sequence.length());
-        int pad = 0;
-        for (int i = 0; i < len; i += 3) {
-            int b = ((sequence.byteAt(i) & 0xFF) << 16) & 0xFFFFFF;
-            if (i + 1 < len) {
-                b |= (sequence.byteAt(i + 1) & 0xFF) << 8;
-            } else {
-                pad++;
-            }
-            if (i + 2 < len) {
-                b |= (sequence.byteAt(i + 2) & 0xFF);
-            } else {
-                pad++;
-            }
 
-            for (int j = 0; j < 4 - pad; j++) {
-                int c = (b & 0xFC0000) >> 18;
-                buffer.putAscii(Chars.base64[c]);
-                b <<= 6;
-            }
+        final int len = (int) Math.min(maxLength, sequence.length());
+        final int remainder = len % 3;
+        final int loopLimit = len - remainder;
+
+        for (int i = 0; i < loopLimit; i += 3) {
+            int b = ((sequence.byteAt(i) & 0xFF) << 16)
+                    | ((sequence.byteAt(i + 1) & 0xFF) << 8)
+                    | (sequence.byteAt(i + 2) & 0xFF);
+
+            buffer.putAscii(Chars.base64[(b >>> 18) & 0x3F]);
+            buffer.putAscii(Chars.base64[(b >>> 12) & 0x3F]);
+            buffer.putAscii(Chars.base64[(b >>> 6) & 0x3F]);
+            buffer.putAscii(Chars.base64[b & 0x3F]);
         }
-        return pad;
+
+        if (remainder == 1) {
+            int b = (sequence.byteAt(loopLimit) & 0xFF) << 16;
+            buffer.putAscii(Chars.base64[(b >>> 18) & 0x3F]);
+            buffer.putAscii(Chars.base64[(b >>> 12) & 0x3F]);
+            return 2;
+        } else if (remainder == 2) {
+            int b = ((sequence.byteAt(loopLimit) & 0xFF) << 16)
+                    | ((sequence.byteAt(loopLimit + 1) & 0xFF) << 8);
+            buffer.putAscii(Chars.base64[(b >>> 18) & 0x3F]);
+            buffer.putAscii(Chars.base64[(b >>> 12) & 0x3F]);
+            buffer.putAscii(Chars.base64[(b >>> 6) & 0x3F]);
+            return 1;
+        }
+
+        return 0;
     }
 
     private static boolean equalsChars(@NotNull CharSequence l, @NotNull CharSequence r, int len) {
