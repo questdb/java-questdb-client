@@ -28,6 +28,7 @@ import io.questdb.client.Completion;
 import io.questdb.client.Query;
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 
 import java.util.concurrent.TimeUnit;
 
@@ -106,5 +107,10 @@ final class QueryLease implements Query, Completion {
     public Completion submit() {
         impl.submit(generation);
         return this;
+    }
+
+    @Override
+    public QwpServerInfo serverInfo() {
+        return impl.serverInfo(generation);
     }
 }

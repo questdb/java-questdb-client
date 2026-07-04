@@ -183,6 +183,20 @@ final class QueryImpl {
         return done;
     }
 
+    /**
+     * Returns the leased client's cached {@link QwpServerInfo} (the decoded
+     * {@code SERVER_INFO} frame from its most recent successful bind) without
+     * issuing a query. Read-only: it does not dispatch to the worker or drive
+     * the failover reconnect loop, so it is safe to call between submits to
+     * observe the bound endpoint without perturbing it. Validates the lease
+     * generation like the other builder ops so a stale handle throws rather
+     * than reading a worker a different borrower now owns.
+     */
+    QwpServerInfo serverInfo(long gen) {
+        checkLive(gen);
+        return worker.client().getServerInfo();
+    }
+
     void setBinds(long gen, QwpBindSetter binds) {
         checkLive(gen);
         this.userBinds = binds;

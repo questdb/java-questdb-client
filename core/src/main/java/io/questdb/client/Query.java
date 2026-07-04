@@ -26,6 +26,7 @@ package io.questdb.client;
 
 import io.questdb.client.cutlass.qwp.client.QwpBindSetter;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpServerInfo;
 
 import java.io.Closeable;
 
@@ -113,4 +114,22 @@ public interface Query extends Closeable {
      * @return the single-flight Completion bound to this Query handle
      */
     Completion submit();
+
+    /**
+     * Returns the {@link QwpServerInfo} the leased pooled query client cached on
+     * its most recent successful bind -- the decoded {@code SERVER_INFO} frame:
+     * the live role, zone, cluster/node ids and capabilities of the endpoint
+     * this handle is currently bound to.
+     * <p>
+     * Read-only and non-perturbing: it returns the client's cached snapshot
+     * without issuing a query, so it does NOT drive the per-{@code submit()}
+     * failover reconnect loop. After the bound endpoint dies it keeps reporting
+     * the pre-failover snapshot until the next {@link #submit()} rebinds. This
+     * is what lets a caller observe "which endpoint am I on" without itself
+     * causing a failover walk.
+     *
+     * @return the cached server info for the bound endpoint, or {@code null}
+     * before the first successful bind
+     */
+    QwpServerInfo serverInfo();
 }
