@@ -32,10 +32,7 @@ import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -61,7 +58,9 @@ import java.util.function.Supplier;
  * {@code CursorWebSocketSendLoopJvmErrorTest}: {@code Unsafe.allocateInstance}
  * plus reflective wiring of the fields the connect walk dereferences, with the
  * {@code setClientFactoryOverride} test seam substituting a stub client whose
- * {@code connect()} throws.
+ * {@code connect()} throws. The walk itself is driven without reflection:
+ * the public {@code newReconnectFactory().reconnect()} is a one-line
+ * delegation to the private {@code buildAndConnect}.
  */
 public class QwpWebSocketSenderJvmErrorCleanupTest {
 
@@ -85,8 +84,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("a JVM Error must propagate out of buildAndConnect");
-        } catch (InvocationTargetException ite) {
-            Assert.assertSame("the original Error must surface", oom, ite.getCause());
+        } catch (OutOfMemoryError e) {
+            Assert.assertSame("the original Error must surface", oom, e);
         }
         Assert.assertEquals("Error must stop the walk on the first attempt", 1, built.size());
         Assert.assertEquals("half-built client must be closed exactly once",
@@ -112,9 +111,9 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("a JVM Error must propagate out of buildAndConnect");
-        } catch (InvocationTargetException ite) {
+        } catch (OutOfMemoryError e) {
             Assert.assertSame("close() failure must not mask the original Error",
-                    oom, ite.getCause());
+                    oom, e);
         }
         Assert.assertEquals("close must have been attempted", 1, stub.closeCalls);
     }
@@ -141,8 +140,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("a JVM Error must propagate out of buildAndConnect");
-        } catch (InvocationTargetException ite) {
-            Assert.assertSame("the original Error must surface", oom, ite.getCause());
+        } catch (OutOfMemoryError e) {
+            Assert.assertSame("the original Error must surface", oom, e);
         }
         Assert.assertEquals("Error must stop the walk on the first attempt", 1, built.size());
         Assert.assertEquals("connected client must be closed exactly once",
@@ -169,9 +168,9 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("a JVM Error must propagate out of buildAndConnect");
-        } catch (InvocationTargetException ite) {
+        } catch (OutOfMemoryError e) {
             Assert.assertSame("close() failure must not mask the original Error",
-                    oom, ite.getCause());
+                    oom, e);
         }
         Assert.assertEquals("close must have been attempted", 1, stub.closeCalls);
     }
@@ -194,8 +193,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("a JVM Error must propagate out of buildAndConnect");
-        } catch (InvocationTargetException ite) {
-            Assert.assertSame("the original Error must surface", oom, ite.getCause());
+        } catch (OutOfMemoryError e) {
+            Assert.assertSame("the original Error must surface", oom, e);
         }
         Assert.assertEquals("connected client must be closed exactly once",
                 1, stub.closeCalls);
@@ -222,9 +221,8 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
         try {
             invokeBuildAndConnect(sender);
             Assert.fail("an exhausted round must surface LineSenderException");
-        } catch (InvocationTargetException ite) {
-            Assert.assertTrue("expected LineSenderException, got " + ite.getCause(),
-                    ite.getCause() instanceof LineSenderException);
+        } catch (LineSenderException expected) {
+            // expected: the walk exhausted the round and surfaced the failure
         }
         Assert.assertEquals("an Exception must keep the walk going", 2, built.size());
         for (StubClient c : built) {
@@ -269,20 +267,16 @@ public class QwpWebSocketSenderJvmErrorCleanupTest {
     }
 
     /**
-     * Drives the private connect walk through its private foreground
-     * {@code ReconnectSupplier} (no-arg: abortCheck null means foreground;
-     * the bare sender's null {@code cursorSendLoop} and false {@code closed}
-     * make {@code isAborted()} false).
+     * Drives the private connect walk through its foreground
+     * {@code ReconnectSupplier}, obtained via the public production accessor
+     * {@link QwpWebSocketSender#newReconnectFactory()} (no abort gate: the
+     * bare sender's null {@code cursorSendLoop} and false {@code closed}
+     * make {@code isAborted()} false). {@code ReconnectFactory.reconnect()}
+     * is a one-line delegation to {@code buildAndConnect(this)}, so failures
+     * surface unwrapped.
      */
     private static void invokeBuildAndConnect(QwpWebSocketSender sender) throws Exception {
-        Class<?> supplierClass = Class.forName(
-                "io.questdb.client.cutlass.qwp.client.QwpWebSocketSender$ReconnectSupplier");
-        Constructor<?> ctor = supplierClass.getDeclaredConstructor(QwpWebSocketSender.class);
-        ctor.setAccessible(true);
-        Object ctx = ctor.newInstance(sender);
-        Method m = QwpWebSocketSender.class.getDeclaredMethod("buildAndConnect", supplierClass);
-        m.setAccessible(true);
-        m.invoke(sender, ctx);
+        sender.newReconnectFactory().reconnect();
     }
 
     private static StubClient newStubClient() {
