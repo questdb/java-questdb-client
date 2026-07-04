@@ -139,6 +139,14 @@ public class InitialConnectAsyncTest {
             Assert.assertFalse(
                     "wasEverConnected() stays false while no server is reachable",
                     ((QwpWebSocketSender) sender).wasEverConnected());
+            // LIVENESS: no-terminal-in-window alone cannot distinguish
+            // "retries forever" from "gave up silently" -- an I/O thread
+            // that exits without latching a terminal also delivers nothing,
+            // and the flush above lands in SF regardless of wire liveness.
+            // The retry loop bumps getTotalReconnectAttempts() on every
+            // iteration, so the counter advancing NOW -- long past the
+            // (ignored) 200ms budget -- proves the loop is still running.
+            awaitReconnectAttemptsAdvance((QwpWebSocketSender) sender);
         } finally {
             sender.close();
         }
@@ -269,6 +277,11 @@ public class InitialConnectAsyncTest {
                 Assert.assertTrue(
                         "wasEverConnected() must remain true after the outage",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+                // LIVENESS: same discriminator as the async-init test above.
+                // The mid-stream reconnect loop must still be making connect
+                // attempts long past the (ignored) 200ms budget -- not merely
+                // failing to report that it stopped.
+                awaitReconnectAttemptsAdvance((QwpWebSocketSender) sender);
             } finally {
                 // closeQuietly (not a bare close()) so a close-path exception
                 // cannot replace a pending AssertionError from the contract
@@ -316,6 +329,31 @@ public class InitialConnectAsyncTest {
             if (System.nanoTime() > deadlineNanos) {
                 throw new AssertionError(
                         "I/O thread did not log a connect attempt within 5s");
+            }
+            io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
+    /**
+     * Proves the I/O thread's retry loop is still ALIVE rather than merely
+     * quiet: snapshots {@link QwpWebSocketSender#getTotalReconnectAttempts()}
+     * and spins until it advances past the snapshot. Callers invoke this
+     * after the (ignored) reconnect budget has already elapsed, so a stuck
+     * counter means the loop gave up silently -- exactly the Invariant B
+     * regression a no-terminal-in-window assertion cannot see. A plain
+     * {@code attempts >= 1} check would NOT discriminate: attempts made
+     * before the budget expired would satisfy it even if the loop then
+     * exited.
+     */
+    private static void awaitReconnectAttemptsAdvance(QwpWebSocketSender wss) {
+        long snapshot = wss.getTotalReconnectAttempts();
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (wss.getTotalReconnectAttempts() <= snapshot) {
+            if (System.nanoTime() > deadlineNanos) {
+                throw new AssertionError(
+                        "Invariant B violation: reconnect attempts stuck at "
+                                + snapshot + " for 5s past the budget -- the I/O "
+                                + "thread stopped retrying without surfacing a terminal");
             }
             io.questdb.client.std.Compat.onSpinWait();
         }

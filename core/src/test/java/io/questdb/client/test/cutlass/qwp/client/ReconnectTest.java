@@ -104,10 +104,16 @@ public class ReconnectTest {
     public void testReconnectNeverGivesUpInvariantB() throws Exception {
         // INVARIANT B: server is up at first (initial connect + ACK), then torn
         // down. The I/O loop enters reconnect and must retry FOREVER -- flush()
-        // must keep succeeding (publishing to on-disk SF), never surface a
-        // give-up / budget terminal. The rows are safe in SF and the server may
-        // return, so reconnect_max_duration_millis is ignored as a give-up
-        // deadline.
+        // must keep succeeding (publishing to the in-RAM cursor ring; no sf_dir
+        // is configured here), never surface a give-up / budget terminal. The
+        // rows are buffered and the server may return, so
+        // reconnect_max_duration_millis is ignored as a give-up deadline.
+        // Because flush() succeeds on the user thread regardless of I/O-thread
+        // liveness, the no-throw loop below is backed by two discriminators:
+        // the reconnect-attempt counter must keep advancing past the budget
+        // (loop is alive, not silently exited), and a server revived on the
+        // SAME port must receive the replayed frames (retrying converts into
+        // delivery).
         try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
             int port = server.getPort();
             server.start();
@@ -143,6 +149,42 @@ public class ReconnectTest {
                         break;
                     }
                     Thread.sleep(50);
+                }
+
+                if (observed == null) {
+                    // LIVENESS: snapshot the attempt counter well past the
+                    // (ignored) 300ms budget and require it to advance. A
+                    // silently-exited I/O thread leaves it frozen -- the one
+                    // regression the flush loop above cannot see.
+                    io.questdb.client.cutlass.qwp.client.QwpWebSocketSender wss =
+                            (io.questdb.client.cutlass.qwp.client.QwpWebSocketSender) sender;
+                    long snapshot = wss.getTotalReconnectAttempts();
+                    long spinDeadline = System.currentTimeMillis() + 5_000;
+                    while (wss.getTotalReconnectAttempts() <= snapshot
+                            && System.currentTimeMillis() < spinDeadline) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertTrue(
+                            "Invariant B violation: reconnect attempts stuck at "
+                                    + snapshot + " for 5s past the (ignored) 300ms "
+                                    + "budget -- the I/O loop stopped retrying "
+                                    + "without surfacing a terminal",
+                            wss.getTotalReconnectAttempts() > snapshot);
+
+                    // RECOVERY: bring a server back on the SAME port (the
+                    // requestedPort constructor exists for down-then-up
+                    // outage realism). The still-retrying loop must reconnect
+                    // and replay the frames that accumulated unacked during
+                    // the outage -- a binary frame arriving on the revived
+                    // endpoint is end-to-end proof that "retry forever"
+                    // converts into delivery once the server returns.
+                    ReceiveOnlyHandler revived = new ReceiveOnlyHandler();
+                    try (TestWebSocketServer server2 =
+                                 new TestWebSocketServer(revived, false, null, port)) {
+                        server2.start();
+                        Assert.assertTrue(server2.awaitStart(5, TimeUnit.SECONDS));
+                        waitFor(() -> revived.totalBinaryReceived.get() >= 1, 5_000);
+                    }
                 }
             } finally {
                 try {
@@ -526,6 +568,22 @@ public class ReconnectTest {
                     Thread.currentThread().interrupt();
                 }
             }
+        }
+    }
+
+    /**
+     * Counts binary frames without ACKing. Receipt-only revival probe for
+     * {@link #testReconnectNeverGivesUpInvariantB}: observing a replayed
+     * frame proves reconnect + replay without coupling the test to the
+     * exact FSN sequence a faked ACK would have to carry (a wrong-seq ACK
+     * risks tripping the invalid-ACK terminal and polluting the result).
+     */
+    private static class ReceiveOnlyHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final AtomicLong totalBinaryReceived = new AtomicLong();
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            totalBinaryReceived.incrementAndGet();
         }
     }
 
