@@ -1533,6 +1533,13 @@ public class QwpWebSocketSender implements Sender {
         }
         if (activeBuffer != null && activeBuffer.hasData()) {
             sealAndSwapBuffer();
+            if (!deferCommit) {
+                // Same residual-seal boundary update as close(): a
+                // non-deferred residual publish is commit-bearing and must be
+                // covered by close-time drains, or drainOnClose would return
+                // before its ack and memory-mode data could be lost on exit.
+                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+            }
         }
         cursorSendLoop.checkError();
         checkConnectionError();
