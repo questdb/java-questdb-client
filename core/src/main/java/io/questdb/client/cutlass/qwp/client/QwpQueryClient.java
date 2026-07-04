@@ -390,7 +390,9 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverMaxDurationMs = view.has("failover_max_duration_ms")
                 ? view.getLong("failover_max_duration_ms", 0) : null;
         Long authTimeoutMs = view.has("auth_timeout_ms") ? view.getLong("auth_timeout_ms", 0) : null;
-        Integer connectTimeout = view.has("connect_timeout") ? (int) view.getLong("connect_timeout", 0) : null;
+        // getInt (not getLong + cast): withConnectTimeout takes an int, and an
+        // over-int value must reject, not wrap.
+        Integer connectTimeout = view.has("connect_timeout") ? view.getInt("connect_timeout", 0) : null;
         Long initialCredit = view.has("initial_credit") ? view.getLong("initial_credit", 0) : null;
         int poolSize = view.getInt("buffer_pool_size", DEFAULT_IO_BUFFER_POOL_SIZE);
         String compression = view.getEnum("compression");
@@ -504,7 +506,9 @@ public class QwpQueryClient implements QuietCloseable {
         view.getLong("failover_max_duration_ms", -1);
         view.getLong("initial_credit", -1);
         view.getLong("auth_timeout_ms", -1);
-        view.getLong("connect_timeout", -1);
+        // getInt: connect_timeout feeds an int API, so validation must also
+        // reject values that fit a long but not an int.
+        view.getInt("connect_timeout", -1);
         String username = view.getStr("username");
         String password = view.getStr("password");
         String token = view.getStr("token");

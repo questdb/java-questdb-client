@@ -55,6 +55,26 @@ public class QwpConfigKeysTest {
     }
 
     @Test
+    public void testConnectTimeoutOverIntRejectedOnBoth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // connect_timeout flows into an int API on both clients. A bare
+            // (int) cast would silently wrap 2^32+1 to a 1 ms timeout and turn
+            // 2^31 into a misleading "must be > 0: -2147483648" error. Both
+            // must reject up front, naming the actual limit.
+            assertRejected("ws::addr=h:9000;connect_timeout=4294967297;",
+                    "connect_timeout must be <= 2147483647: 4294967297");
+            assertRejected("ws::addr=h:9000;connect_timeout=2147483648;",
+                    "connect_timeout must be <= 2147483647: 2147483648");
+            // The schema lower bound is intact end-to-end...
+            assertRejected("ws::addr=h:9000;connect_timeout=0;",
+                    "connect_timeout must be > 0");
+            // ...and a valid value still builds on both clients.
+            Sender.builder("ws::addr=h:9000;connect_timeout=7000;");
+            QwpQueryClient.fromConfig("ws::addr=h:9000;connect_timeout=7000;").close();
+        });
+    }
+
+    @Test
     public void testJunkKeyRejectedOnBoth() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             assertRejected("ws::addr=h:9000;not_a_real_key=foo;",

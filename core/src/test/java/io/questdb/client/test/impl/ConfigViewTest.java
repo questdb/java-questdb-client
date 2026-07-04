@@ -116,6 +116,29 @@ public class ConfigViewTest {
     }
 
     @Test
+    public void testGetIntOverIntRangeRejectedActionably() {
+        // An int key fed a numeric value beyond int range must name the real
+        // limit -- not report a wrapped/garbage value. 2^32+1 would wrap to 1
+        // (a silent 1 ms timeout) through a bare (int) cast; 2^31 would wrap
+        // to Integer.MIN_VALUE and produce a misleading "must be > 0" error.
+        assertParseError("ws::addr=h:9000;connect_timeout=4294967297;",
+                v -> v.getInt("connect_timeout", -1),
+                "connect_timeout must be <= 2147483647: 4294967297");
+        assertParseError("ws::addr=h:9000;connect_timeout=2147483648;",
+                v -> v.getInt("connect_timeout", -1),
+                "connect_timeout must be <= 2147483647: 2147483648");
+    }
+
+    @Test
+    public void testGetIntSpecRangeStillWinsOverIntBound() {
+        // A value that is both over the schema max and over int range reports
+        // the schema range -- the tighter, key-specific constraint.
+        assertParseError("ws::addr=h:9000;compression_level=4294967297;",
+                v -> v.getInt("compression_level", -1),
+                "compression_level must be in [1, 22]");
+    }
+
+    @Test
     public void testGetIntNonNumericRejected() {
         assertParseError("ws::addr=h:9000;compression_level=abc;",
                 v -> v.getInt("compression_level", -1),

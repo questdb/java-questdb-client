@@ -178,17 +178,29 @@ public final class ConfigView {
         if (v == null) {
             return unset;
         }
-        int parsed;
+        // Parse in the long domain so a numeric-but-over-int value (e.g.
+        // 4294967297) is distinguishable from garbage: it must fail with the
+        // actual int limit, not wrap through an (int) cast or report a generic
+        // "invalid" for a perfectly numeric string.
+        long parsed;
         try {
-            parsed = Numbers.parseInt(v);
+            parsed = Numbers.parseLong(v);
         } catch (NumericException e) {
             throw new IllegalArgumentException("invalid " + key + ": " + v);
         }
         ConfigSchema.KeySpec spec = ConfigSchema.spec(key);
+        // Schema range first: it is the tighter, key-specific constraint, so
+        // "compression_level=4294967297" says "must be in [1, 22]".
         if (outOfRange(spec, parsed)) {
             throw new IllegalArgumentException(rangeMessage(spec));
         }
-        return parsed;
+        if (parsed > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(key + " must be <= " + Integer.MAX_VALUE + ": " + v);
+        }
+        if (parsed < Integer.MIN_VALUE) {
+            throw new IllegalArgumentException(key + " must be >= " + Integer.MIN_VALUE + ": " + v);
+        }
+        return (int) parsed;
     }
 
     public long getLong(String key, long unset) {

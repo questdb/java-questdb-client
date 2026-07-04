@@ -3599,7 +3599,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     authTimeoutMillis(view.getLong("auth_timeout_ms", 0));
                 }
                 if (view.has("connect_timeout")) {
-                    connectTimeoutMillis((int) view.getLong("connect_timeout", 0));
+                    // getInt (not getLong + cast): connectTimeoutMillis takes an
+                    // int, and an over-int value must reject, not wrap.
+                    connectTimeoutMillis(view.getInt("connect_timeout", 0));
                 }
 
                 s = view.getStr("auto_flush_rows");
