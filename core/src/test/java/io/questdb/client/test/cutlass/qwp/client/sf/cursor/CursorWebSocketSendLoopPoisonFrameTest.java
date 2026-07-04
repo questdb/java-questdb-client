@@ -367,6 +367,179 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     @Test
+    public void testOrderlyCloseChurnIsPacedAfterFirstRecycle() throws Exception {
+        // Orderly closes (GOING_AWAY / NORMAL_CLOSURE) are deliberately
+        // strike-exempt -- the server is asking us to go elsewhere, not
+        // judging the bytes -- and connect always SUCCEEDS against a draining
+        // LB, so neither failPaced's strike-keyed dose nor connectLoop's
+        // failed-connect backoff ever engages, and no poison terminal bounds
+        // the loop (correct: Invariant B). Before the fix these recycles ran
+        // through the unpaced fail(): a drain window churned full reconnects
+        // (fresh WebSocketClient + SSLContext + trust-store read) at
+        // handshake RTT rate, forever. The zero-progress pacer must keep the
+        // FIRST recycle immediate (failover latency) and pace consecutive
+        // zero-progress repeats with the escalating reconnect backoff.
+        // Red behavior: hundreds of full recycles per second.
+        final long initialBackoffMillis = 200L;
+        final long runMillis = 1_200L;
+        // First recycle is immediate, then doses escalate from 200ms; a 1.2s
+        // window fits a handful of recycles. Allow 10 for scheduling noise --
+        // the unpaced bug overshoots by orders of magnitude.
+        final int maxReconnects = 10;
+
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                final List<Long> reconnectNanos = new ArrayList<>();
+                CursorWebSocketSendLoop.ReconnectFactory factory = () -> {
+                    synchronized (reconnectNanos) {
+                        reconnectNanos.add(System.nanoTime());
+                    }
+                    return new OrderlyClosingClient();
+                };
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        new OrderlyClosingClient(), engine, 0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        factory,
+                        5_000L, initialBackoffMillis, 1_000L,
+                        false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        // Detector out of the way -- orderly closes must not
+                        // strike anyway; this test measures pacing.
+                        1_000_000);
+                try {
+                    loop.start();
+                    Thread.sleep(runMillis);
+                    // Orderly closes are exempt from the poison detector:
+                    // pacing must not have turned into a terminal.
+                    loop.checkError();
+                } finally {
+                    loop.close();
+                }
+                int count;
+                synchronized (reconnectNanos) {
+                    count = reconnectNanos.size();
+                }
+                assertTrue("orderly-close (GOING_AWAY) recycles against a draining peer must "
+                                + "be paced by the reconnect backoff after the first recycle ("
+                                + initialBackoffMillis + "ms): observed " + count
+                                + " reconnects in " + runMillis + "ms -- the orderly-close path "
+                                + "is recycling unpaced at connect+close RTT rate",
+                        count <= maxReconnects);
+                assertTrue("sanity: the orderly close must actually recycle the connection at least once",
+                        count >= 1);
+            }
+        });
+    }
+
+    @Test
+    public void testPreSendCloseChurnIsPaced() throws Exception {
+        // A peer that completes the WS upgrade then drops the connection
+        // BEFORE the client sends anything (health-checked frontend with a
+        // dead backend, idle-timeout proxy) hits the close-before-any-send
+        // branch: strike-exempt (nextWireSeq resets to 0 on every
+        // swapClient, so EVERY cycle re-arms the exemption) and, before the
+        // fix, unpaced -- an idle sender churned full reconnects at handshake
+        // RTT rate forever without ever accruing a strike. Zero-progress
+        // recycles must be paced; the exemption from the poison DETECTOR
+        // must survive (pacing, not a terminal -- Invariant B).
+        final long initialBackoffMillis = 200L;
+        final long runMillis = 1_200L;
+        final int maxReconnects = 10;
+
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                // Deliberately NO frames: the engine is idle, so nothing is
+                // ever sent and every close arrives with nextWireSeq == 0.
+                final List<Long> reconnectNanos = new ArrayList<>();
+                CursorWebSocketSendLoop.ReconnectFactory factory = () -> {
+                    synchronized (reconnectNanos) {
+                        reconnectNanos.add(System.nanoTime());
+                    }
+                    return new PreSendClosingClient();
+                };
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        new PreSendClosingClient(), engine, 0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        factory,
+                        5_000L, initialBackoffMillis, 1_000L,
+                        false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        1_000_000);
+                try {
+                    loop.start();
+                    Thread.sleep(runMillis);
+                    // Close-before-any-send is strike-exempt: the pacer must
+                    // not have escalated to a poison terminal.
+                    loop.checkError();
+                } finally {
+                    loop.close();
+                }
+                int count;
+                synchronized (reconnectNanos) {
+                    count = reconnectNanos.size();
+                }
+                assertTrue("pre-send close recycles (close before any send, nextWireSeq == 0) "
+                                + "must be paced by the reconnect backoff (" + initialBackoffMillis
+                                + "ms): observed " + count + " reconnects in " + runMillis
+                                + "ms -- the strike-exempt close path is recycling unpaced at "
+                                + "connect+close RTT rate",
+                        count <= maxReconnects);
+                assertTrue("sanity: the pre-send close must actually recycle the connection at least once",
+                        count >= 1);
+            }
+        });
+    }
+
+    @Test
+    public void testExemptRecyclePacerFirstImmediateThenEscalatesAndResetsOnProgress() throws Exception {
+        // The zero-progress pacer's contract, pinned at the recycle level:
+        // (1) the FIRST exempt recycle is immediate -- a one-off GOING_AWAY
+        // handoff must rotate endpoints without delay (failover latency);
+        // (2) a CONSECUTIVE exempt recycle with no acceptance progress in
+        // between parks for at least the initial reconnect backoff;
+        // (3) OK-level progress resets the pacer, so the next exempt recycle
+        // is treated as a fresh failover, not churn.
+        final long initialBackoffMillis = 500L;
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newExemptPacerLoop(engine, clients, initialBackoffMillis);
+
+                long t0 = System.nanoTime();
+                deliverOrderlyClose(loop);
+                long firstNanos = System.nanoTime() - t0;
+                assertTrue("the FIRST zero-progress exempt recycle must stay immediate "
+                                + "(failover latency): took " + (firstNanos / 1_000_000L) + "ms",
+                        firstNanos < 300_000_000L);
+
+                t0 = System.nanoTime();
+                deliverOrderlyClose(loop);
+                long secondNanos = System.nanoTime() - t0;
+                assertTrue("a CONSECUTIVE zero-progress exempt recycle must park for at least "
+                                + "the initial reconnect backoff (" + initialBackoffMillis
+                                + "ms): took " + (secondNanos / 1_000_000L) + "ms",
+                        secondNanos >= initialBackoffMillis * 1_000_000L);
+
+                // OK-level acceptance progress (fsn 0 accepted) resets the
+                // pacer: the next exempt recycle is a fresh failover.
+                setSentCount(loop, 1);
+                deliverOk(loop, 0, names("trades"), txns(7L));
+                t0 = System.nanoTime();
+                deliverOrderlyClose(loop);
+                long thirdNanos = System.nanoTime() - t0;
+                assertTrue("OK-level progress must reset the zero-progress pacer -- the next "
+                                + "exempt recycle is a fresh failover, not churn: took "
+                                + (thirdNanos / 1_000_000L) + "ms",
+                        thirdNanos < 300_000_000L);
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
     public void testPoisonDwellHoldsEscalationUntilWallClockWindowElapses() throws Exception {
         // P2 guard for the minimum-escalation-window: even once the strike
         // threshold (here 2) is reached, the detector must NOT escalate until
@@ -502,6 +675,81 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         }
     }
 
+    /**
+     * In-memory transport emulating a load balancer draining connections: the
+     * WS upgrade completes, then the peer sends an orderly GOING_AWAY close.
+     * Orderly closes are strike-exempt by design, so before the zero-progress
+     * pacer the recycle loop churned at connect+close RTT rate.
+     */
+    private static final class OrderlyClosingClient extends WebSocketClient {
+        private boolean closeDelivered;
+
+        OrderlyClosingClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+        }
+
+        @Override
+        public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
+            if (closeDelivered) {
+                return false;
+            }
+            closeDelivered = true;
+            // 1001 GOING_AWAY: orderly, never a strike.
+            handler.onClose(1001, "server draining");
+            return true;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+    }
+
+    /**
+     * In-memory transport emulating a health-checked frontend with a dead
+     * backend: the WS upgrade completes, then the connection dies non-orderly
+     * (1006) before the client sends anything. With nothing sent on the
+     * connection (nextWireSeq == 0) the close is strike-exempt -- the
+     * exemption re-arms every cycle because swapClient resets nextWireSeq.
+     */
+    private static final class PreSendClosingClient extends WebSocketClient {
+        private boolean closeDelivered;
+
+        PreSendClosingClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+        }
+
+        @Override
+        public boolean tryReceiveFrame(WebSocketFrameHandler handler) {
+            if (closeDelivered) {
+                return false;
+            }
+            closeDelivered = true;
+            // 1006 ABNORMAL_CLOSURE before any send on this connection.
+            handler.onClose(1006, "backend down");
+            return true;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+    }
+
     private static void appendFrames(CursorSendEngine engine, int count) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -567,6 +815,15 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         } finally {
             Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
         }
+    }
+
+    private static void deliverOrderlyClose(CursorWebSocketSendLoop loop) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
+        f.setAccessible(true);
+        Object handler = f.get(loop);
+        Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
+        m.setAccessible(true);
+        m.invoke(handler, 1001, "server draining"); // GOING_AWAY: orderly, strike-exempt
     }
 
     private static void deliverNonOrderlyClose(CursorWebSocketSendLoop loop) throws Exception {
@@ -653,6 +910,32 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // The loop is driven by reflection, not by its own I/O thread, but
         // the recycle machinery must see a live loop or connectLoop's guard
         // treats the first retriable NACK as fatal.
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
+        f.setAccessible(true);
+        f.setBoolean(loop, true);
+        return loop;
+    }
+
+    /**
+     * Same wiring as {@link #newDurableLoop} but with caller-chosen reconnect
+     * backoffs large enough to measure: the zero-progress pacer's park is the
+     * observable under test, so the doses must dominate scheduling noise.
+     * The detector threshold is huge -- these tests exercise pacing on
+     * strike-EXEMPT paths, never escalation.
+     */
+    private CursorWebSocketSendLoop newExemptPacerLoop(CursorSendEngine engine,
+                                                       List<WebSocketClient> clients,
+                                                       long initialBackoffMillis) throws Exception {
+        CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                () -> {
+                    NackingClient c = new NackingClient();
+                    clients.add(c);
+                    return c;
+                },
+                5_000L, initialBackoffMillis, 5 * initialBackoffMillis, true,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                1_000_000);
         Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
         f.setAccessible(true);
         f.setBoolean(loop, true);

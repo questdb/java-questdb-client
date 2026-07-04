@@ -319,6 +319,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // STATUS_DURABLE_ACK coverage. I/O thread only; survives reconnects. Used
     // by the poison-frame detector to measure genuine acceptance progress.
     private long highestOkFsn = -1L;
+    // Zero-progress recycle pacer (I/O thread only; survives reconnects).
+    // Counts consecutive strike-EXEMPT recycles -- orderly closes
+    // (NORMAL_CLOSURE/GOING_AWAY), non-orderly closes before any send on the
+    // connection, and pre-send RETRIABLE_OTHER rejections -- with no
+    // acceptance progress in between. These paths deliberately carry no
+    // poison strike (they are not a verdict on the bytes), which also exempts
+    // them from failPaced's strike-keyed dose; and a peer that completes
+    // TCP+TLS+upgrade before closing makes every connect attempt "succeed",
+    // so connectLoop's failed-connect backoff never engages either. Without
+    // this counter such recycles churn at handshake RTT rate with no bound
+    // (Invariant B removed the wall-clock cap), each cycle burning a fresh
+    // WebSocketClient + SSLContext/trust-store read. Progress is measured as
+    // max(ackedFsn, highestOkFsn): both watermarks are monotonic and advance
+    // only on genuine new acceptance (replayed re-OKs of already-OK'd frames
+    // advance neither), so replay cannot launder the counter. Pacing only --
+    // this counter NEVER escalates to a terminal (Invariant B).
+    private int zeroProgressRecycles;
+    private long progressAtLastExemptRecycle = Long.MIN_VALUE;
     // Poison-frame detector threshold for this loop. Constructor-configured
     // (connect-string key max_frame_rejections); defaults to
     // DEFAULT_MAX_HEAD_FRAME_REJECTIONS.
@@ -1508,6 +1526,50 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Recycle path for strike-exempt wire events: orderly closes
+     * (NORMAL_CLOSURE / GOING_AWAY), non-orderly closes before any send on
+     * the connection, and pre-send RETRIABLE_OTHER rejections. None of these
+     * implicate the head frame, so they carry no poison strike -- but that
+     * also means neither existing pacer can bound them: {@link #failPaced}
+     * keys its dose on poisonStrikes, and connectLoop's backoff engages only
+     * on FAILED connect attempts, while a peer that completes the upgrade
+     * before closing makes every attempt succeed. A load balancer draining
+     * with GOING_AWAY, a health-checking middlebox that upgrades then drops,
+     * or an all-replica window answering NOT_WRITABLE pre-send would
+     * otherwise drive full recycles -- fresh WebSocketClient, SSLContext,
+     * trust-store read -- at handshake RTT rate, forever (Invariant B
+     * deliberately removed the wall-clock cap).
+     * <p>
+     * The first recycle after any acceptance progress stays IMMEDIATE: a
+     * one-off orderly handoff must rotate endpoints without delay (failover
+     * latency). Consecutive recycles with no OK-level progress in between
+     * park for the same doubling, capped dose failPaced applies. Pacing
+     * only, never a terminal: unlike the poison detector these events are
+     * not a verdict on the bytes, so under Invariant B they retry forever --
+     * just not at wire speed.
+     */
+    private void failExemptPaced(Throwable cause) {
+        long progress = Math.max(engine.ackedFsn(), highestOkFsn);
+        if (progress > progressAtLastExemptRecycle) {
+            zeroProgressRecycles = 0;
+        }
+        progressAtLastExemptRecycle = progress;
+        int level = zeroProgressRecycles++;
+        if (level == 0) {
+            fail(cause);
+            return;
+        }
+        long dose = reconnectInitialBackoffMillis;
+        if (dose > 0) {
+            dose <<= Math.min(level - 1, 6);
+            if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
+                dose = reconnectMaxBackoffMillis;
+            }
+        }
+        connectLoop(cause, "reconnect", dose);
+    }
+
+    /**
      * True when {@link #terminalError} is set AND no synchronous user-thread
      * caller has yet seen that same instance via {@link #checkError()}.
      * The {@link #checkUnsurfacedError()} safety net composes this with
@@ -2134,9 +2196,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return;
             }
             // No strike (orderly close, or a close before any send on this
-            // connection): a genuine transport event -- reconnect immediately,
-            // with backoff only on failed connect attempts.
-            fail(cause);
+            // connection): not a verdict on the bytes. But strike-exempt must
+            // not mean pace-exempt: a peer that completes the upgrade then
+            // closes (LB drain window, GOING_AWAY rolling restart, health-
+            // checking middlebox in front of a dead backend) succeeds at
+            // connect every cycle, so connectLoop's failed-connect backoff
+            // never engages, and with no strikes there is no poison-terminal
+            // bound either -- an unpaced fail() here churns full recycles at
+            // handshake RTT rate, forever. failExemptPaced keeps the first
+            // recycle immediate (failover latency) and paces consecutive
+            // zero-progress repeats with the escalating reconnect backoff.
+            failExemptPaced(cause);
         }
 
         private void handlePreSendRejection(long wireSeq, byte status,
@@ -2188,7 +2258,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (policy == SenderError.Policy.RETRIABLE) {
                 failPaced(recycleCause);
             } else {
-                fail(recycleCause);
+                // RETRIABLE_OTHER pre-send (NOT_WRITABLE before we sent
+                // anything): rotate endpoints -- but through the zero-
+                // progress pacer, not raw fail(). An all-replica window
+                // answers NOT_WRITABLE on every fresh connection, each
+                // connect attempt "succeeds", and pre-send rejections record
+                // no strike, so nothing else bounds the churn. The first
+                // recycle stays immediate so a genuine failover rotates
+                // without delay.
+                failExemptPaced(recycleCause);
             }
         }
 
