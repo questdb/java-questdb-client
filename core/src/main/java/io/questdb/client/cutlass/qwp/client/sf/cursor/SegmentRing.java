@@ -510,6 +510,31 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /** Active segment -- exposed for the I/O thread's "send next batch" path. */
+    /**
+     * Walks every published frame in the ring (sealed segments plus the active
+     * segment) and returns the FSN of the LAST frame whose payload does NOT
+     * carry the given flag bit, or {@code -1} when every published frame
+     * carries it (or the ring is empty). All frames above the returned FSN
+     * carry the flag.
+     * <p>
+     * Recovery-time helper: locates the last commit-bearing QWP frame below a
+     * potentially orphaned FLAG_DEFER_COMMIT tail left behind by a producer
+     * that crashed (or closed) mid-transaction. Call before the I/O loop and
+     * producer start appending; the walk is not synchronized against appends
+     * into the active segment.
+     */
+    public synchronized long findLastFsnWithoutPayloadFlag(int flagsOffset, int flagMask) {
+        long best = -1L;
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            long fsn = sealedSegments.get(i).findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask);
+            if (fsn > best) {
+                best = fsn;
+            }
+        }
+        long fsn = active.findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask);
+        return Math.max(best, fsn);
+    }
+
     public MmapSegment getActive() {
         return active;
     }

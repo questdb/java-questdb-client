@@ -253,6 +253,13 @@ public class QwpWebSocketSender implements Sender {
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
     private boolean hasDeferredMessages;
+    // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
+    // published, or -1 when none. Frames above it are deferred and uncommitted:
+    // the server withholds their acks by design (their rows are rolled back on
+    // any error, demote, or disconnect), so close-time drains must never wait
+    // for them. Updated on every non-deferred publish; combined with the
+    // engine's recovered boundary in drainOnClose.
+    private long lastCommitBoundaryFsn = -1L;
     // Stickys true once any successful FOREGROUND connect has happened
     // (background drainer connects never set it). Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
@@ -1076,6 +1083,9 @@ public class QwpWebSocketSender implements Sender {
                     }
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
+                        if (!deferCommit) {
+                            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+                        }
                     }
                     // 2) Safety-net rethrow: surface the latched terminal
                     //    error only when no other channel has already
@@ -3149,7 +3159,22 @@ public class QwpWebSocketSender implements Sender {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
-        long target = cursorEngine.publishedFsn();
+        long published = cursorEngine.publishedFsn();
+        // Never wait for uncommitted deferred frames: the server withholds
+        // their acks by design (FLAG_DEFER_COMMIT rows are rolled back on
+        // error/demote/disconnect and must stay replayable client-side), so a
+        // drain targeting them can only time out. The drain target is the last
+        // commit-bearing frame this session published, or -- for a ring
+        // recovered from disk with no commit published this session -- the
+        // recovered commit boundary.
+        long boundary = Math.max(lastCommitBoundaryFsn, cursorEngine.recoveredCommitBoundaryFsn());
+        long target = Math.min(published, boundary);
+        if (target < published) {
+            LOG.warn("close() abandoning {} uncommitted deferred frame(s) [commitBoundaryFsn={}, publishedFsn={}] "
+                            + "-- their transaction was never committed; the server rolls their rows back. "
+                            + "Call flush() before close() to commit, or ignore if the abort is intentional.",
+                    published - target, target, published);
+        }
         if (cursorEngine.ackedFsn() >= target) {
             return;
         }
@@ -3169,7 +3194,7 @@ public class QwpWebSocketSender implements Sender {
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",
                         closeFlushTimeoutMillis, target, acked);
                 throw new LineSenderException("close() drain timed out after ")
-                        .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")
+                        .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
                         .put(target).put(", ackedFsn=").put(acked)
                         .put("] - server did not acknowledge ")
                         .put(target - acked)
@@ -3430,6 +3455,9 @@ public class QwpWebSocketSender implements Sender {
         sealAndSwapBuffer();
 
         hasDeferredMessages = deferCommit;
+        if (!deferCommit) {
+            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+        }
 
         resetTableBuffersAfterFlush(keys);
     }
@@ -3502,6 +3530,11 @@ public class QwpWebSocketSender implements Sender {
 
         encoder.setDeferCommit(false);
         hasDeferredMessages = deferCommit;
+        if (!deferCommit) {
+            // The last message of the split carried no defer flag -- it
+            // committed the whole group.
+            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+        }
         resetTableBuffersAfterFlush(keys);
     }
 
@@ -3543,6 +3576,7 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
         hasDeferredMessages = false;
+        lastCommitBoundaryFsn = cursorEngine.publishedFsn();
     }
 
     private void resetSymbolDictStateForNewConnection() {

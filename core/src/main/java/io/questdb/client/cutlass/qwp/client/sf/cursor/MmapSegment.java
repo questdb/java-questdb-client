@@ -444,6 +444,34 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Walks every published frame in this segment and returns the FSN of the
+     * LAST frame whose payload does NOT carry the given flag bit, or {@code -1}
+     * when every frame carries it (or the segment is empty). Frames shorter
+     * than {@code flagsOffset + 1} bytes are treated as not carrying the flag.
+     * <p>
+     * Producer-thread only, and only meaningful before new appends race the
+     * walk (recovery time). Used to locate the last commit-bearing QWP frame
+     * below a potentially orphaned FLAG_DEFER_COMMIT tail: frames above the
+     * returned FSN all carry the flag, i.e. they belong to a transaction whose
+     * commit frame was never published.
+     */
+    public long findLastFrameFsnWithoutPayloadFlag(int flagsOffset, int flagMask) {
+        long best = -1L;
+        long off = HEADER_SIZE;
+        long frames = frameCount;
+        for (long i = 0; i < frames; i++) {
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
+            boolean flagSet = payloadLen > flagsOffset
+                    && (Unsafe.getUnsafe().getByte(mmapAddress + off + FRAME_HEADER_SIZE + flagsOffset) & flagMask) != 0;
+            if (!flagSet) {
+                best = baseSeq + i;
+            }
+            off += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return best;
+    }
+
+    /**
      * Number of frames written since {@link #create} (or recovered by
      * {@link #openExisting}). Used by {@code SegmentRing} to compute
      * {@code lastSeq = baseSeq + frameCount - 1} for ACK / trim decisions.

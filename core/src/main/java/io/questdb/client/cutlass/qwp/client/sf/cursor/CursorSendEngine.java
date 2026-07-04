@@ -88,6 +88,14 @@ public final class CursorSendEngine implements QuietCloseable {
     // full symbol-dict delta), so producer-side schema reset on recovery
     // is not required.
     private final boolean wasRecoveredFromDisk;
+    // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame found in a
+    // ring recovered from disk, or -1 for fresh/memory rings and recovered
+    // rings whose every frame is deferred. Frames above this FSN in the
+    // recovered ring belong to a transaction whose commit frame was never
+    // published; the server will never ack them until some later commit
+    // covers them. Read by the sender's close-time drain to avoid waiting on
+    // acks that cannot arrive.
+    private long recoveredCommitBoundaryFsn = -1L;
     // Engine-owned mmap'd watermark file. {@code null} in memory mode and
     // in disk mode if open() failed (we proceed without it; recovery just
     // falls back to lowestBase - 1). Lifetime tied to the engine: opened
@@ -259,6 +267,29 @@ public final class CursorSendEngine implements QuietCloseable {
                 long seed = candidate > publishedFsn ? baseSeed : candidate;
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
+                }
+                // Locate the last commit-bearing frame below a potentially
+                // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
+                // closed) mid-transaction leaves deferred frames with no
+                // covering commit frame at the top of the ring. The server
+                // never acks uncommitted deferred frames, so (a) close-time
+                // drains must not wait for them (see the sender's
+                // drainOnClose), and (b) replaying them into a NEW session's
+                // commit would resurrect half a transaction -- see the WARN
+                // below. Computed before the I/O loop or producer append.
+                this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT
+                );
+                if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
+                    LOG.warn("recovered SF log ends with {} deferred frame(s) whose transaction was never "
+                                    + "committed [commitBoundaryFsn={}, publishedFsn={}]. On replay these frames "
+                                    + "re-append rows the server will only commit when THIS session sends a "
+                                    + "commit-bearing frame -- which would resurrect a partial transaction. "
+                                    + "If the prior transaction must stay aborted, clear the sf_dir before "
+                                    + "restarting the producer.",
+                            publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
+                            recoveredCommitBoundaryFsn, publishedFsn);
                 }
             } else {
                 // Fresh start with no recovered segments. Any stale
@@ -598,6 +629,16 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public boolean wasRecoveredFromDisk() {
         return wasRecoveredFromDisk;
+    }
+
+    /**
+     * FSN of the last commit-bearing frame in a disk-recovered ring, or
+     * {@code -1} for fresh/memory rings. Frames above it are an orphaned
+     * deferred tail (transaction never committed) that the server will not
+     * ack until a later commit-bearing frame covers them.
+     */
+    public long recoveredCommitBoundaryFsn() {
+        return recoveredCommitBoundaryFsn;
     }
 
     /**
