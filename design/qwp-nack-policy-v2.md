@@ -41,7 +41,7 @@ Concrete failures:
 | Policy | Behavior | Categories |
 |---|---|---|
 | `RETRIABLE` | Recycle the connection (same `fail()` → `connectLoop` machinery as a wire failure: capped backoff + jitter, endpoint rotation via the reconnect factory, no wall-clock give-up), replay from `ackedFsn+1`. Dispatch to `SenderErrorHandler` is informational. | `WRITE_ERROR`, `INTERNAL_ERROR`, `UNKNOWN` (fail open), any WS close without a preceding terminal NACK |
-| `RETRIABLE_OTHER` | Same replay semantics; the node cannot serve writes at all, so rotation matters more than backoff. | `NOT_WRITABLE` (reserved wire byte 0x0C — see below) |
+| `RETRIABLE_OTHER` | Same replay semantics; the node cannot serve writes at all, so rotation matters more than backoff. A node-state verdict, not a frame verdict: never counts poison strikes, recycles through the zero-progress pacer (first recycle immediate, consecutive no-progress recycles paced). | `NOT_WRITABLE` (reserved wire byte 0x0C — see below) |
 | `TERMINAL` | `recordFatal` latch: next producer call throws `LineSenderServerException`; drainer quarantines its slot. Reserved for rejections **deterministic under byte-identical replay**. Bytes stay on disk. | `SCHEMA_MISMATCH`, `PARSE_ERROR`, `SECURITY_ERROR` (ACL denial on a writable node), `PROTOCOL_VIOLATION` (poison escalation) |
 
 ## Poison-frame detector (replaces the WS close-code list)
@@ -51,8 +51,12 @@ event → reconnect + replay. The guarded case — a frame that deterministicall
 kills the connection without a NACK (e.g. an intermediary frame-size limit) —
 is caught *behaviorally*:
 
-> A server-active rejection (NACK, or non-orderly close after at least one
-> send on the connection) of the same frame counts a strike. Strikes are
+> A server-active rejection (RETRIABLE NACK, or non-orderly close after at
+> least one send on the connection) of the same frame counts a strike.
+> RETRIABLE_OTHER (`NOT_WRITABLE`) never counts one: it is a verdict on the
+> node's ability to serve writes, not on the bytes, and an all-replica
+> window emitting it on every rotated endpoint is transient by Invariant B
+> — striking it would escalate that window to a producer-fatal terminal. Strikes are
 > keyed on the rejected frame's FSN — the NACK-named frame, or the OK-level
 > head-of-line frame for a close — never on the engine's trim watermark.
 > `max_frame_rejections` (default 4; connect-string key or
@@ -76,10 +80,15 @@ escalation is also the safety margin for transient same-frame rejections
 (e.g. sustained disk pressure): the widening replay gaps give the condition
 time to clear before `max_frame_rejections` strikes escalate to the poison
 terminal, while a NACK sequence that is making progress (different frame
-each time) resets to the initial dose. RETRIABLE_OTHER recycles stay
-immediate: the node cannot serve writes at all, so endpoint rotation matters
-more than backoff. Transport failures also reconnect immediately (first
-attempt), with backoff on failed attempts as before.
+each time) resets to the initial dose. RETRIABLE_OTHER recycles route
+through the zero-progress pacer (`failExemptPaced`, both pre- and
+post-send): the node cannot serve writes at all, so the FIRST recycle stays
+immediate — endpoint rotation matters more than backoff for a genuine
+failover — but consecutive recycles with no OK-level progress park for the
+same doubling, capped dose, so an all-replica window does not drive full
+recycle cycles at handshake RTT rate for its whole duration. Transport
+failures reconnect immediately (first attempt), with backoff on failed
+attempts as before.
 
 This catches everything `isTerminalCloseCode` caught, plus middlebox closes
 the list missed, and never false-positives on outages (those fail at connect,

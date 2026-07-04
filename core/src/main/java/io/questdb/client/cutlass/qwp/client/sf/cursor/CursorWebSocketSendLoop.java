@@ -1528,14 +1528,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Recycle path for strike-exempt wire events: orderly closes
      * (NORMAL_CLOSURE / GOING_AWAY), non-orderly closes before any send on
-     * the connection, and pre-send RETRIABLE_OTHER rejections. None of these
-     * implicate the head frame, so they carry no poison strike -- but that
+     * the connection, and RETRIABLE_OTHER rejections (pre- and post-send:
+     * NOT_WRITABLE is a node-state verdict, not a frame verdict). None of
+     * these implicate the head frame, so they carry no poison strike -- but that
      * also means neither existing pacer can bound them: {@link #failPaced}
      * keys its dose on poisonStrikes, and connectLoop's backoff engages only
      * on FAILED connect attempts, while a peer that completes the upgrade
      * before closing makes every attempt succeed. A load balancer draining
      * with GOING_AWAY, a health-checking middlebox that upgrades then drops,
-     * or an all-replica window answering NOT_WRITABLE pre-send would
+     * or an all-replica window answering NOT_WRITABLE would
      * otherwise drive full recycles -- fresh WebSocketClient, SSLContext,
      * trust-store read -- at handshake RTT rate, forever (Invariant B
      * deliberately removed the wall-clock cap).
@@ -2336,33 +2337,45 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // through the same reconnect machinery a transport failure uses
             // (capped backoff + jitter, endpoint rotation via the reconnect
             // factory, no wall-clock give-up -- Invariant B). The dispatch is
-            // informational. A frame the server keeps rejecting with no ack
-            // progress escalates to a poisoned-frame terminal instead of
-            // reconnect-looping forever.
+            // informational. A RETRIABLE frame the server keeps rejecting with
+            // no ack progress escalates to a poisoned-frame terminal instead
+            // of reconnect-looping forever.
             LOG.warn("server rejected wire seq {} (category={}, policy={}, status=0x{}) -- recycling connection, will replay from fsn {}",
                     wireSeq, category, policy, Integer.toHexString(status & 0xFF), engine.ackedFsn() + 1L);
             dispatchError(err);
-            if (recordHeadRejectionStrike(fsn)) {
-                haltOnPoisonedFrame("server NACK status=0x"
-                                + Integer.toHexString(status & 0xFF) + " (" + category + "): "
-                                + response.getErrorMessage(),
-                        fsn);
-                return;
-            }
-            // RETRIABLE recycles are paced: the server is reachable and
-            // healthy (it just NACK'd a frame), so the reconnect will succeed
-            // immediately and connectLoop's failed-connect backoff never
-            // engages -- without pacing, a repeatedly-NACKing server drives
-            // full recycle cycles at its NACK rate. RETRIABLE_OTHER stays
-            // immediate: the node cannot serve writes at all, so rotating to
-            // another endpoint matters more than backing off.
             LineSenderException recycleCause = new LineSenderException(
                     "server NACK (" + category + ", " + policy + "): "
                             + response.getErrorMessage());
             if (policy == SenderError.Policy.RETRIABLE) {
+                // Only RETRIABLE rejections implicate the head frame: the node
+                // accepted the stream and judged the bytes, so a deterministic
+                // repeat counts toward the poison terminal.
+                if (recordHeadRejectionStrike(fsn)) {
+                    haltOnPoisonedFrame("server NACK status=0x"
+                                    + Integer.toHexString(status & 0xFF) + " (" + category + "): "
+                                    + response.getErrorMessage(),
+                            fsn);
+                    return;
+                }
+                // RETRIABLE recycles are paced: the server is reachable and
+                // healthy (it just NACK'd a frame), so the reconnect will
+                // succeed immediately and connectLoop's failed-connect backoff
+                // never engages -- without pacing, a repeatedly-NACKing server
+                // drives full recycle cycles at its NACK rate.
                 failPaced(recycleCause);
             } else {
-                fail(recycleCause);
+                // RETRIABLE_OTHER (NOT_WRITABLE): a node-state verdict, not a
+                // frame verdict -- the node cannot serve writes at all, so the
+                // rejection says nothing about the bytes and must never count
+                // a poison strike (a transient all-replica window would
+                // otherwise escalate to a producer-fatal terminal, violating
+                // Invariant B). Mirror the pre-send path: rotate endpoints
+                // through the zero-progress pacer -- the first recycle stays
+                // immediate so a genuine failover rotates without delay, but
+                // consecutive recycles with no OK progress park for the capped
+                // dose instead of churning full TLS reconnects at handshake
+                // RTT rate for the whole window.
+                failExemptPaced(recycleCause);
             }
         }
     }

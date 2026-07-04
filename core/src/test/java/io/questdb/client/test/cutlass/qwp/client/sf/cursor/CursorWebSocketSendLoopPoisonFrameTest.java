@@ -585,6 +585,87 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         });
     }
 
+    @Test
+    public void testPostSendNotWritableNackNeverEscalatesToPoisonTerminal() throws Exception {
+        // RETRIABLE_OTHER (NOT_WRITABLE) is a node-state verdict, not a frame
+        // verdict: an all-replica window answers it on every rotated endpoint
+        // for the SAME head frame, with no OK progress in between -- transient
+        // by Invariant B (a replica gets promoted). It must therefore never
+        // count a poison strike. Before the fix, handleServerRejection struck
+        // unconditionally: the deliveries below crossed the threshold and
+        // latched a producer-fatal PROTOCOL_VIOLATION terminal for a transient
+        // cluster condition. The loop must instead stay alive and recycle the
+        // wire on every rejection (endpoint rotation).
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                setSentCount(loop, 2);
+                deliverOk(loop, 0, names("trades"), txns(7L));
+
+                int recyclesBefore = clients.size();
+                for (int i = 0; i < MAX_REJECTIONS + 2; i++) {
+                    setSentCount(loop, 2);
+                    deliverNotWritableNack(loop, 1, "read-only replica");
+                }
+                // Well past the strike threshold (dwell window is 0 here, so a
+                // single wrongly-counted run would have escalated already):
+                // must NOT have latched a terminal.
+                loop.checkError();
+                // ...and every rejection must still have recycled the wire
+                // (rotate endpoints), not stalled.
+                assertTrue("each NOT_WRITABLE rejection must recycle the connection: expected >= "
+                                + (MAX_REJECTIONS + 2) + " reconnects, observed "
+                                + (clients.size() - recyclesBefore),
+                        clients.size() - recyclesBefore >= MAX_REJECTIONS + 2);
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
+    public void testNotWritableRecycleFirstImmediateThenPaced() throws Exception {
+        // Routing pin for the post-send RETRIABLE_OTHER recycle: it must go
+        // through the zero-progress pacer (failExemptPaced) -- not raw fail(),
+        // which leaves every recycle immediate so an all-replica window churns
+        // full TLS reconnects at handshake RTT rate for its whole duration;
+        // and not failPaced, which parks even the FIRST recycle while a
+        // genuine failover must rotate endpoints without delay.
+        final long initialBackoffMillis = 500L;
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newExemptPacerLoop(engine, clients, initialBackoffMillis);
+
+                setSentCount(loop, 2);
+                long t0 = System.nanoTime();
+                deliverNotWritableNack(loop, 1, "read-only replica");
+                long firstNanos = System.nanoTime() - t0;
+                assertTrue("the FIRST NOT_WRITABLE recycle must stay immediate (failover "
+                                + "latency): took " + (firstNanos / 1_000_000L) + "ms",
+                        firstNanos < 300_000_000L);
+
+                setSentCount(loop, 2);
+                t0 = System.nanoTime();
+                deliverNotWritableNack(loop, 1, "read-only replica");
+                long secondNanos = System.nanoTime() - t0;
+                assertTrue("a CONSECUTIVE zero-progress NOT_WRITABLE recycle must park for at "
+                                + "least the initial reconnect backoff (" + initialBackoffMillis
+                                + "ms): took " + (secondNanos / 1_000_000L) + "ms",
+                        secondNanos >= initialBackoffMillis * 1_000_000L);
+
+                // Pacing only, never a terminal: NOT_WRITABLE says nothing
+                // about the bytes.
+                loop.checkError();
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
     // ---------------------------------------------------------------------
     // harness
     // ---------------------------------------------------------------------
@@ -833,6 +914,18 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
         m.setAccessible(true);
         m.invoke(handler, 1006, "connection reset"); // ABNORMAL_CLOSURE
+    }
+
+    private static void deliverNotWritableNack(CursorWebSocketSendLoop loop, long wireSeq,
+                                               String msg) throws Exception {
+        long packed = buildErrorPayload(wireSeq, WebSocketResponse.STATUS_NOT_WRITABLE, msg);
+        long ptr = packed & 0xFFFFFFFFFFFFL;
+        int size = (int) (packed >>> 48);
+        try {
+            invokeOnBinaryMessage(loop, ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     private static void deliverRetriableNack(CursorWebSocketSendLoop loop, long wireSeq,
