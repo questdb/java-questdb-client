@@ -446,8 +446,18 @@ public final class MmapSegment implements QuietCloseable {
     /**
      * Walks every published frame in this segment and returns the FSN of the
      * LAST frame whose payload does NOT carry the given flag bit, or {@code -1}
-     * when every frame carries it (or the segment is empty). Frames shorter
-     * than {@code flagsOffset + 1} bytes are treated as not carrying the flag.
+     * when every frame carries it (or the segment is empty).
+     * <p>
+     * A frame counts as carrying the flag ONLY when it positively parses as a
+     * message of the expected protocol: payload at least {@code minPayloadLen}
+     * bytes AND the little-endian u32 at payload offset 0 equals
+     * {@code headerMagic} AND the byte at {@code flagsOffset} has
+     * {@code flagMask} set. Anything else -- short frames, foreign payloads,
+     * magic mismatches -- counts as NOT carrying the flag. This direction is
+     * deliberate: the caller retires (trims) frames ABOVE the returned FSN,
+     * so a frame we cannot positively identify must act as a retirement
+     * barrier, never as trimmable. Misclassifying an unknown frame as
+     * deferred would silently discard data that should replay.
      * <p>
      * Producer-thread only, and only meaningful before new appends race the
      * walk (recovery time). Used to locate the last commit-bearing QWP frame
@@ -455,14 +465,17 @@ public final class MmapSegment implements QuietCloseable {
      * returned FSN all carry the flag, i.e. they belong to a transaction whose
      * commit frame was never published.
      */
-    public long findLastFrameFsnWithoutPayloadFlag(int flagsOffset, int flagMask) {
+    public long findLastFrameFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
         long best = -1L;
         long off = HEADER_SIZE;
         long frames = frameCount;
         for (long i = 0; i < frames; i++) {
             int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
-            boolean flagSet = payloadLen > flagsOffset
-                    && (Unsafe.getUnsafe().getByte(mmapAddress + off + FRAME_HEADER_SIZE + flagsOffset) & flagMask) != 0;
+            long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+            boolean flagSet = payloadLen >= minPayloadLen
+                    && payloadLen > flagsOffset
+                    && Unsafe.getUnsafe().getInt(payload) == headerMagic
+                    && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagMask) != 0;
             if (!flagSet) {
                 best = baseSeq + i;
             }

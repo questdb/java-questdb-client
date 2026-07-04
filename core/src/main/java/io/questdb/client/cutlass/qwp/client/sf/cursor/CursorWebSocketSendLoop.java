@@ -275,6 +275,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
+    // Recovered orphaned deferred tail: frames [orphanSkipStartFsn ..
+    // orphanSkipTipFsn] carry FLAG_DEFER_COMMIT with no covering commit frame
+    // -- a transaction whose commit was never published (producer crashed or
+    // closed mid-transaction). They must never reach the wire: a
+    // commit-bearing frame from THIS session would commit them server-side
+    // and resurrect a partial transaction. trySendOne stops the cursor at the
+    // tail; tryRetireOrphanTail retires it with a cumulative self-acknowledge
+    // once everything below is server-acked. -1 when none/retired. Written by
+    // the constructor and start() (user thread, before the I/O thread exists)
+    // and by the I/O thread afterwards -- never concurrently.
+    private long orphanSkipStartFsn = -1L;
+    private long orphanSkipTipFsn = -1L;
     // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
     // frame implicated by the most recent server-active rejection: the NACK-named
     // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
@@ -478,6 +490,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
         this.hasEverConnected = client != null;
+        // Adopt the engine's recovered orphaned-deferred-tail range (if any).
+        // See the field docs on orphanSkipStartFsn/orphanSkipTipFsn; the
+        // BackgroundDrainer path builds its loop through this same
+        // constructor, so drained orphan slots get the identical containment.
+        long orphanTip = engine.recoveredOrphanTipFsn();
+        if (orphanTip >= 0) {
+            this.orphanSkipStartFsn = engine.recoveredCommitBoundaryFsn() + 1L;
+            this.orphanSkipTipFsn = orphanTip;
+        }
     }
 
     /**
@@ -1759,6 +1780,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // best-effort
             }
         }
+        // A recovered orphaned deferred tail may be retirable now (e.g. the
+        // acks covering everything below it arrived just before the drop).
+        // Retiring before computing replayStart anchors the new connection
+        // past the tail instead of replaying into it.
+        tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
@@ -1794,6 +1820,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * scheduling fairness.
      */
     private boolean trySendOne() {
+        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+            // The send cursor reached the orphaned deferred tail. Its frames
+            // belong to an aborted transaction and must never be transmitted
+            // (a commit-bearing frame from this session would commit them --
+            // partial-transaction resurrection).
+            if (!tryRetireOrphanTail()) {
+                // Frames below the tail still await server acks; keep ticking
+                // (tryReceiveAcks runs every loop iteration) until the ack
+                // watermark reaches the tail's lower edge.
+                return false;
+            }
+            if (nextWireSeq == 0) {
+                // Nothing sent on this connection yet: re-anchor in place past
+                // the retired tail. The wireSeq<->FSN mapping is untouched
+                // because no wire sequence has been consumed.
+                positionCursorForStart();
+                return true;
+            }
+            // Frames were already sent on this connection: the linear
+            // fsnAtZero + wireSeq mapping cannot express the gap the retired
+            // tail leaves behind. Recycle; swapClient re-anchors the mapping
+            // at ackedFsn + 1 = the first frame past the tail. One reconnect,
+            // once per recovery -- and only on the slow path (unacked
+            // committed frames existed below the tail).
+            fail(new LineSenderException(
+                    "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
+            return false;
+        }
         long pub = sendingSegment.publishedOffset();
         if (sendOffset >= pub) {
             // Nothing more in the current segment. If it's a sealed segment
@@ -1859,10 +1913,51 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * real I/O thread + WebSocket.
      */
     void positionCursorForStart() {
+        // Fast path for a recovered orphaned deferred tail: when everything
+        // below the tail is already acked (the common crash profile -- acks
+        // were flowing until the crash, only the in-flight transaction is
+        // unacked; and trivially when the WHOLE recovered log is the tail),
+        // the tail retires before any connection exists and the cursor
+        // starts past it. Zero wire cost, no recycle.
+        tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
         positionCursorAt(replayStart);
+    }
+
+    /**
+     * Retires the recovered orphaned deferred tail once retirable.
+     * <p>
+     * The tail's frames all carry FLAG_DEFER_COMMIT with no covering commit
+     * frame: the producer died (or closed) mid-transaction, so the
+     * transaction is aborted by definition. Retirement is a cumulative
+     * self-acknowledge of the tail's top FSN -- legal once every frame BELOW
+     * the tail is server-acked, because the tail frames were never
+     * transmitted and no wire sequence references them. The freed slots are
+     * trimmed by the normal ack-driven machinery.
+     * <p>
+     * Crash-safe: dying before the self-ack leaves the tail in place; the
+     * next recovery re-detects the same range and retries. Idempotent once
+     * retired.
+     *
+     * @return true when no orphan tail remains (retired now, previously, or
+     *         never existed); false while frames below the tail are unacked
+     */
+    private boolean tryRetireOrphanTail() {
+        if (orphanSkipTipFsn < 0) {
+            return true;
+        }
+        if (engine.ackedFsn() < orphanSkipStartFsn - 1L) {
+            return false;
+        }
+        LOG.warn("retiring orphaned deferred tail: {} frame(s) [fsn {}..{}] belong to a transaction "
+                        + "whose commit was never published; aborting them (never transmitted, slots trimmed)",
+                orphanSkipTipFsn - orphanSkipStartFsn + 1, orphanSkipStartFsn, orphanSkipTipFsn);
+        engine.acknowledge(orphanSkipTipFsn);
+        orphanSkipStartFsn = -1L;
+        orphanSkipTipFsn = -1L;
+        return true;
     }
 
     /**

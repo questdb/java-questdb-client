@@ -96,6 +96,14 @@ public final class CursorSendEngine implements QuietCloseable {
     // covers them. Read by the sender's close-time drain to avoid waiting on
     // acks that cannot arrive.
     private long recoveredCommitBoundaryFsn = -1L;
+    // FSN of the last frame of a recovered orphaned deferred tail, or -1 when
+    // the recovered ring has no such tail. When >= 0, frames
+    // [recoveredCommitBoundaryFsn + 1 .. recoveredOrphanTipFsn] all carry
+    // FLAG_DEFER_COMMIT with no covering commit frame -- an aborted
+    // transaction. The send loop must never transmit them; it retires the
+    // range with a cumulative self-acknowledge once everything below is
+    // server-acked (CursorWebSocketSendLoop.tryRetireOrphanTail).
+    private long recoveredOrphanTipFsn = -1L;
     // Engine-owned mmap'd watermark file. {@code null} in memory mode and
     // in disk mode if open() failed (we proceed without it; recovery just
     // falls back to lowestBase - 1). Lifetime tied to the engine: opened
@@ -279,15 +287,16 @@ public final class CursorSendEngine implements QuietCloseable {
                 // below. Computed before the I/O loop or producer append.
                 this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
                         io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE
                 );
                 if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
+                    this.recoveredOrphanTipFsn = publishedFsn;
                     LOG.warn("recovered SF log ends with {} deferred frame(s) whose transaction was never "
-                                    + "committed [commitBoundaryFsn={}, publishedFsn={}]. On replay these frames "
-                                    + "re-append rows the server will only commit when THIS session sends a "
-                                    + "commit-bearing frame -- which would resurrect a partial transaction. "
-                                    + "If the prior transaction must stay aborted, clear the sf_dir before "
-                                    + "restarting the producer.",
+                                    + "committed [commitBoundaryFsn={}, publishedFsn={}]. The tail belongs to an "
+                                    + "aborted transaction: it will never be transmitted and its slots are "
+                                    + "retired (trimmed) once every frame below it is server-acked.",
                             publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
                             recoveredCommitBoundaryFsn, publishedFsn);
                 }
@@ -639,6 +648,15 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long recoveredCommitBoundaryFsn() {
         return recoveredCommitBoundaryFsn;
+    }
+
+    /**
+     * FSN of the last frame of a recovered orphaned deferred tail, or
+     * {@code -1} when none. See {@link #recoveredCommitBoundaryFsn()}: the
+     * orphan range is {@code [recoveredCommitBoundaryFsn() + 1 .. this]}.
+     */
+    public long recoveredOrphanTipFsn() {
+        return recoveredOrphanTipFsn;
     }
 
     /**
