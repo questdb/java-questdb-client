@@ -34,7 +34,10 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 // Error-safety of the three QueryClientPool creation paths the teardown-hardening
@@ -218,6 +221,75 @@ public class QueryClientPoolErrorSafetyTest {
             Assert.assertEquals(
                     "prewarm leaked NATIVE_DEFAULT scratch of a start()-failed worker",
                     baseline, after);
+        });
+    }
+
+    // Site: acquire()'s closed-mid-creation branch. When acquire() re-locks
+    // after building a fresh worker and finds the pool closed, it must tear the
+    // worker down on its own thread -- outside the pool lock (shutdown() joins
+    // the dispatch thread for up to SHUTDOWN_JOIN_MILLIS; cancelIfCurrent's
+    // contract is that this lock is "held only briefly") -- and still reclaim
+    // everything: the client's NATIVE_DEFAULT scratch and the creation slot.
+    // RED (teardown dropped in the restructure): the scratch leaks and the
+    //      baseline assertion fails.
+    // GREEN: shutdown() runs after the lock is released -> no leak, accounting
+    //        restored, acquire() surfaces the closed pool.
+    @Test(timeout = 30_000)
+    public void closedMidCreationTearsDownFreshWorkerWithoutLeak() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inConnect = new CountDownLatch(1);
+            CountDownLatch releaseConnect = new CountDownLatch(1);
+            Consumer<QwpQueryClient> connectHook = client -> {
+                inConnect.countDown();
+                try {
+                    if (!releaseConnect.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("test never released the parked connect");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("interrupted in parked connect", e);
+                }
+            };
+            // No-op startHook: the dispatch thread stays unstarted, so the
+            // closed-mid-creation shutdown()'s interrupt+join is instant.
+            QueryClientPool pool = newPool(CFG, 0, 1, 10_000, connectHook, w -> {
+            });
+            try {
+                long baseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                AtomicReference<Throwable> acquireOutcome = new AtomicReference<>();
+                Thread acquirer = new Thread(() -> {
+                    try {
+                        pool.acquire();
+                    } catch (Throwable t) {
+                        acquireOutcome.set(t);
+                    }
+                }, "mid-creation-acquirer");
+                acquirer.start();
+                Assert.assertTrue("acquirer never reached connect()",
+                        inConnect.await(10, TimeUnit.SECONDS));
+
+                // Close the pool while the worker build is in flight (the fresh
+                // worker never entered `all`, so close()'s snapshot skips it),
+                // then let the build finish: acquire() must observe `closed`,
+                // tear the worker down on its own thread and throw.
+                pool.close();
+                releaseConnect.countDown();
+                acquirer.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("acquirer did not finish", acquirer.isAlive());
+
+                Assert.assertTrue(
+                        "acquire() must surface the closed pool, got: " + acquireOutcome.get(),
+                        acquireOutcome.get() instanceof QueryException
+                                && String.valueOf(acquireOutcome.get().getMessage()).contains("closed"));
+                long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+                Assert.assertEquals(
+                        "closed-mid-creation acquire() leaked the fresh worker's NATIVE_DEFAULT scratch",
+                        baseline, after);
+                Assert.assertEquals("in-flight creation accounting must be restored",
+                        0, inFlightCreations(pool));
+            } finally {
+                pool.close();
+            }
         });
     }
 

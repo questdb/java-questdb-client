@@ -255,6 +255,16 @@ public final class QueryClientPool implements AutoCloseable {
                     lock.lock();
                     inFlightCreations--;
                     if (closed) {
+                        // Pool was closed mid-creation -- tear the fresh worker
+                        // down rather than leaking it, but OUTSIDE the lock:
+                        // shutdown() joins the dispatch thread for up to
+                        // SHUTDOWN_JOIN_MILLIS, and close()/release()/discard()/
+                        // cancelIfCurrent() all contend on this lock (whose
+                        // contract is "held only briefly"). The accounting above
+                        // already ran under the lock, and the worker never
+                        // entered `all`, so close()'s snapshot loop cannot race
+                        // this teardown.
+                        lock.unlock();
                         try {
                             created.shutdown();
                         } catch (Throwable ignored) {

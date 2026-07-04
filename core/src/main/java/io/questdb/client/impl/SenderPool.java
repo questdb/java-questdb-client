@@ -726,13 +726,41 @@ public final class SenderPool implements AutoCloseable {
                     if (closed) {
                         // Pool was closed mid-creation -- destroy the new connection
                         // rather than leaking it. Other waiters have been signaled
-                        // by close() already.
-                        freeSlotIndex(slotIndex);
+                        // by close() already. The delegate is closed OUTSIDE the
+                        // lock (mirroring retireLease): its close() can block for
+                        // seconds (bounded ack drain, drainer-pool wind-down) or
+                        // longer (unbounded I/O-thread latch await behind an
+                        // OS-level connect), which held here would stall close(),
+                        // giveBack/retireLease and reapIdle behind the pool lock.
+                        // Accounting first, under the lock: for an SF slot the
+                        // index reservation moves from inFlightCreations to
+                        // closingSlots until the close below releases the flock,
+                        // and pendingLeaseTeardowns keeps the out-of-lock close
+                        // visible to close()'s outstanding-teardown wait.
+                        boolean reserved = created.slotIndex() >= 0;
+                        if (reserved) {
+                            closingSlots++;
+                        }
+                        pendingLeaseTeardowns++;
+                        lock.unlock();
                         try {
                             created.delegate().close();
                         } catch (Throwable ignored) {
                             // Best-effort: an Error (e.g. -ea AssertionError)
                             // from teardown must not mask the closed-pool signal.
+                        } finally {
+                            // Re-lock to reclaim the SF slot index and signal a
+                            // close() waiting on this teardown. MUST run even if
+                            // the delegate close threw, otherwise the slot stays
+                            // reserved forever and close() waits out its full
+                            // budget on a teardown that already happened.
+                            lock.lock();
+                            pendingLeaseTeardowns--;
+                            if (reserved) {
+                                reclaimSlot(created, " after closed-mid-creation teardown");
+                            }
+                            slotReleased.signalAll();
+                            lock.unlock();
                         }
                         throw new LineSenderException("QuestDB handle is closed");
                     }

@@ -25,12 +25,15 @@
 package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -244,6 +247,226 @@ public class SenderPoolCloseLifecycleTest {
                 Assert.assertEquals("no delegate teardown before pool close", 0, delegateCloses.get());
             }
         });
+    }
+
+    // Closed-mid-creation regression: when borrow() re-locks after building a
+    // fresh delegate and finds the pool closed, it must tear that delegate down
+    // OUTSIDE the pool lock (mirroring retireLease). A delegate close() can
+    // block for seconds (bounded ack drain, drainer-pool wind-down) or longer
+    // (unbounded I/O-thread latch await behind an OS-level connect); held under
+    // the lock it would stall close(), giveBack/retireLease and reapIdle.
+    // RED (teardown under the lock): the concurrent close() probe below parks
+    // behind the borrower's delegate close and the join times out.
+    @Test(timeout = 30_000)
+    public void closedMidCreationTeardownRunsOutsideThePoolLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicInteger delegateCloses = new AtomicInteger();
+            AtomicReference<Thread> closerThread = new AtomicReference<>();
+            CountDownLatch inCreate = new CountDownLatch(1);
+            CountDownLatch releaseCreate = new CountDownLatch(1);
+            CountDownLatch inDelegateClose = new CountDownLatch(1);
+            CountDownLatch releaseDelegateClose = new CountDownLatch(1);
+            IntFunction<Sender> factory = slotIndex -> {
+                inCreate.countDown();
+                awaitOrFail(releaseCreate, "test never released the parked creation");
+                return parkingCloseSender(
+                        delegateCloses, closerThread, inDelegateClose, releaseDelegateClose);
+            };
+
+            try (SenderPool pool = newPool(CFG, 0, 1, 10_000, factory)) {
+                AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+                Thread borrower = new Thread(() -> {
+                    try {
+                        pool.borrow();
+                    } catch (Throwable t) {
+                        borrowOutcome.set(t);
+                    }
+                }, "mid-creation-borrower");
+                borrower.start();
+                Assert.assertTrue("borrower never reached the factory",
+                        inCreate.await(10, TimeUnit.SECONDS));
+
+                // Close the pool while the creation is in flight: nothing is
+                // outstanding (the new slot never entered `all`), so this
+                // returns promptly with `closed` raised.
+                pool.close();
+
+                // Let the creation finish: the borrower re-locks, observes the
+                // closed pool and starts the delegate teardown, which parks.
+                releaseCreate.countDown();
+                Assert.assertTrue("borrower never reached the delegate teardown",
+                        inDelegateClose.await(10, TimeUnit.SECONDS));
+
+                // With the teardown parked mid-close, the pool lock must be
+                // FREE: a concurrent lock-taking call (an idempotent re-close)
+                // has to complete promptly instead of stalling behind it.
+                Thread probe = new Thread(pool::close, "pool-lock-probe");
+                probe.start();
+                probe.join(TimeUnit.SECONDS.toMillis(5));
+                boolean lockFree = !probe.isAlive();
+                // Always unpark the teardown, even when the probe failed,
+                // so the test fails on the assertion and not its timeout.
+                releaseDelegateClose.countDown();
+                Assert.assertTrue(
+                        "pool lock is held across the closed-mid-creation delegate teardown: "
+                                + "a concurrent close() stalled behind it",
+                        lockFree);
+
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("borrower did not finish", borrower.isAlive());
+                Assert.assertTrue(
+                        "borrow() must surface the closed pool, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof LineSenderException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+                Assert.assertEquals("the mid-creation delegate must be torn down exactly once",
+                        1, delegateCloses.get());
+                Assert.assertSame("teardown must run on the borrower's thread",
+                        borrower, closerThread.get());
+            }
+        });
+    }
+
+    // pendingLeaseTeardowns contract for the closed-mid-creation path: once the
+    // out-of-lock teardown has started, close() must NOT return before it
+    // completes (the delegate may still hold an SF flock / native resources).
+    // Uses the production interleaving: markClosing() raises `closed` first
+    // (QuestDBImpl.close() does this before SenderPool.close()), the borrower
+    // starts its teardown, THEN close() runs and has to wait. SF config so the
+    // reserved-slot branch (closingSlots move + reclaimSlot) executes too.
+    // RED (pendingLeaseTeardowns not bumped on this path): close() returns
+    // while the teardown is still parked and the first assertion fails.
+    @Test(timeout = 30_000)
+    public void closeWaitsForClosedMidCreationTeardownToComplete() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Unique, non-existent sf_dir: minSize=0 means no pre-warm, so the
+            // dir is never created and startup SF recovery is a no-op. The
+            // factory replaces createUnlocked(), so localhost:1 is never dialed.
+            String sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                    "qdb-sf-midcreation-" + System.nanoTime()).toString();
+            String sfCfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+            AtomicInteger delegateCloses = new AtomicInteger();
+            CountDownLatch inCreate = new CountDownLatch(1);
+            CountDownLatch releaseCreate = new CountDownLatch(1);
+            CountDownLatch inDelegateClose = new CountDownLatch(1);
+            CountDownLatch releaseDelegateClose = new CountDownLatch(1);
+            IntFunction<Sender> factory = slotIndex -> {
+                inCreate.countDown();
+                awaitOrFail(releaseCreate, "test never released the parked creation");
+                return parkingCloseSender(delegateCloses, new AtomicReference<>(),
+                        inDelegateClose, releaseDelegateClose);
+            };
+
+            try (SenderPool pool = newPool(sfCfg, 0, 1, 10_000, factory)) {
+                AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+                Thread borrower = new Thread(() -> {
+                    try {
+                        pool.borrow();
+                    } catch (Throwable t) {
+                        borrowOutcome.set(t);
+                    }
+                }, "sf-mid-creation-borrower");
+                borrower.start();
+                Assert.assertTrue("borrower never reached the factory",
+                        inCreate.await(10, TimeUnit.SECONDS));
+
+                // Raise the shutdown signal WITHOUT running close() yet --
+                // exactly what QuestDBImpl.close() does via markClosing()
+                // before it stops the housekeeper and closes the pool.
+                Method markClosing = SenderPool.class.getDeclaredMethod("markClosing");
+                markClosing.setAccessible(true);
+                markClosing.invoke(pool);
+
+                // The borrower observes `closed` and parks inside the
+                // out-of-lock delegate teardown.
+                releaseCreate.countDown();
+                Assert.assertTrue("borrower never reached the delegate teardown",
+                        inDelegateClose.await(10, TimeUnit.SECONDS));
+
+                // close() must wait on the in-flight teardown, not return.
+                Thread closer = new Thread(pool::close, "pool-closer");
+                closer.start();
+                closer.join(300);
+                boolean closeWaited = closer.isAlive();
+                releaseDelegateClose.countDown();
+                Assert.assertTrue(
+                        "close() returned while a closed-mid-creation delegate teardown "
+                                + "was still in flight (pendingLeaseTeardowns not accounted)",
+                        closeWaited);
+
+                // Once the teardown completes, close() must return promptly
+                // (well before its 5s lease-wait cap) and the teardown must
+                // have run exactly once.
+                closer.join(TimeUnit.SECONDS.toMillis(4));
+                Assert.assertFalse("close() did not return after the teardown completed",
+                        closer.isAlive());
+                Assert.assertEquals("the mid-creation delegate must be torn down exactly once",
+                        1, delegateCloses.get());
+
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("borrower did not finish", borrower.isAlive());
+                Assert.assertTrue(
+                        "borrow() must surface the closed pool, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof LineSenderException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+            }
+        });
+    }
+
+    private static void awaitOrFail(CountDownLatch latch, String message) {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                throw new IllegalStateException(message);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(message, e);
+        }
+    }
+
+    /**
+     * Like {@link #fakeSender}, but {@code close()} signals {@code inClose} and
+     * parks on {@code releaseClose} before counting -- a teardown frozen
+     * mid-close, so tests can probe what the pool does while it runs.
+     */
+    private static Sender parkingCloseSender(
+            AtomicInteger closes,
+            AtomicReference<Thread> closerThread,
+            CountDownLatch inClose,
+            CountDownLatch releaseClose
+    ) {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "close":
+                            closerThread.set(Thread.currentThread());
+                            inClose.countDown();
+                            awaitOrFail(releaseClose, "test never released the parked close");
+                            closes.incrementAndGet();
+                            return null;
+                        case "toString":
+                            return "ParkingCloseFakeSender";
+                        case "hashCode":
+                            return System.identityHashCode(proxy);
+                        case "equals":
+                            return proxy == args[0];
+                        default:
+                            Class<?> rt = method.getReturnType();
+                            if (rt == boolean.class) return false;
+                            if (rt == byte.class) return (byte) 0;
+                            if (rt == short.class) return (short) 0;
+                            if (rt == int.class) return 0;
+                            if (rt == long.class) return 0L;
+                            if (rt == float.class) return 0f;
+                            if (rt == double.class) return 0d;
+                            if (rt == char.class) return (char) 0;
+                            if (rt == void.class) return null;
+                            if (rt.isInstance(proxy)) return proxy;
+                            return null;
+                    }
+                });
     }
 
     private static SenderPool newPool(
