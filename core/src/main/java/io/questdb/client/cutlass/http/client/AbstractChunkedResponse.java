@@ -1,24 +1,24 @@
 /*+*****************************************************************************
- *     ___                  _   ____  ____
- *    / _ \ _   _  ___  ___| |_|  _ \| __ )
- *   | | | | | | |/ _ \/ __| __| | | |  _ \
- *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
- *    \__\_\\__,_|\___||___/\__|____/|____/
+ * ___                 _   ____  ____
+ * / _ \ _   _  ___  ___| |_|  _ \| __ )
+ * | | | | | | |/ _ \/ __| __| | | |  _ \
+ * | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ * \__\_\\__,_|\___||___/\__|____/|____/
  *
- *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2026 QuestDB
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
  *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *  http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  ******************************************************************************/
 
@@ -90,123 +90,173 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         return dataAddr;
     }
 
+    /**
+     * Reads the next fragment of chunked response data, blocking on I/O as needed.
+     * <p>
+     * This method drives a small state machine with three states: reading the
+     * chunk-size header, consuming chunk data, and consuming the chunk terminator.
+     * Each state's logic is delegated to a dedicated helper method to keep this
+     * driver method simple and easy to follow.
+     */
     public Fragment recv(int timeout) {
         while (true) {
             if (receive || dataLo == dataHi) {
                 compactBuffer();
                 dataHi += recvOrDie(dataHi, bufHi, timeout);
             }
-            long p; // moving data pointer for scanning buffer
-            switch (state) {
-                case STATE_CHUNK_SIZE:
-                    p = dataLo;
-                    // chunk size is hex encoded integer terminated with CRLF
-                    long res = -1;
 
-                    // this loop is looking at the CRLF after chunk size
-                    while (p < dataHi) {
-                        if (getByte(p) == '\r') {
-                            p++;
-                            if (p < dataHi) {
-                                if (getByte(p) == '\n') {
-                                    res = p - CRLF_LEN;
-                                    break;
-                                } else {
-                                    throw new HttpClientException("malformed chunk size");
-                                }
-                            } else {
-                                // CRLF at chunk size is incomplete, we have to
-                                // wait until we receive the full thing
-                                break;
-                            }
-                        }
-                        p++;
-                    }
-
-                    if (res != -1) {
-                        // at this stage we consumed the chunk size end (CRLF)
-                        chunkSize.of(dataLo, res + 1);
-                        try {
-                            size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
-                            consumed = 0;
-                            // consume data buffer ignoring chunk size value and its furniture
-                            state = STATE_CHUNK_DATA;
-                            dataLo = res + CRLF_LEN + 1;
-                        } catch (NumericException e) {
-                            throw new HttpClientException("malformed chunk size");
-                        }
-
-                        // fall thru the switch to process remaining data buffer
-                    } else {
-                        // we have not received complete chunk size value yet
-                        receive = true;
-                        break;
-                    }
-
-                case STATE_CHUNK_DATA:
-                    // there is data in the buffer
-                    if (size > 0 && dataLo < dataHi) {
-                        long chunkBytesRemaining = size - consumed;
-                        long bufBytesRemaining = dataHi - dataLo;
-
-                        // chunk data starts with dataLo address
-                        dataAddr = dataLo;
-
-                        if (chunkBytesRemaining <= bufBytesRemaining) {
-                            // chunk data fits in the buffer
-                            available = chunkBytesRemaining;
-                            consumed += chunkBytesRemaining;
-                            // skip chunk data to begin processing chunk end
-                            dataLo += chunkBytesRemaining;
-                            state = STATE_CHUNK_DATA_END;
-                            receive = false;
-                        } else {
-                            available = bufBytesRemaining;
-                            consumed += bufBytesRemaining;
-                            // we consumed the entire buffer for chunk data
-                            // we must recv more data
-                            dataLo = dataHi;
-                            receive = true;
-                        }
-                        return this;
-                    }
-
-                    if (size != 0) {
-                        // no chunk data in the buffer
-                        break;
-                    }
-                    // fall thru to read chunk end
-
-                case STATE_CHUNK_DATA_END:
-                    // we are here to consume CRLF
-                    // we have to have two bytes here
-                    if (dataLo < dataHi && (dataHi - dataLo) >= CRLF_LEN) {
-                        if (getByte(dataLo) == '\r' && getByte(dataLo + 1) == '\n') {
-                            state = STATE_CHUNK_SIZE;
-                            dataLo += CRLF_LEN;
-                            receive = false;
-                            // we had to consume the tail CRLF after the last chunk
-                            // not to leave garbage in the recv buffer
-                            if (size == 0) {
-                                return null;
-                            }
-                            break;
-                        } else {
-                            throw new HttpClientException("malformed chunk");
-                        }
-                    } else {
-                        receive = true;
-                    }
-                    break;
-                default:
-                    throw new HttpClientException("internal error [state=" + state + ']');
+            StateOutcome outcome = processState();
+            if (outcome == StateOutcome.RETURN_FRAGMENT) {
+                return this;
             }
+            if (outcome == StateOutcome.RETURN_NULL) {
+                return null;
+            }
+        }
+    }
+
+    private StateOutcome processState() {
+        switch (state) {
+            case STATE_CHUNK_SIZE:
+                if (!tryParseChunkSize()) {
+                    receive = true;
+                    return StateOutcome.CONTINUE;
+                }
+                // fall through: chunk size parsed, state is now STATE_CHUNK_DATA
+
+            case STATE_CHUNK_DATA:
+                ChunkDataOutcome dataOutcome = tryConsumeChunkData();
+                if (dataOutcome == ChunkDataOutcome.FRAGMENT_READY) {
+                    return StateOutcome.RETURN_FRAGMENT;
+                }
+                if (dataOutcome == ChunkDataOutcome.NEED_MORE_DATA) {
+                    return StateOutcome.CONTINUE;
+                }
+                // dataOutcome == CHUNK_EXHAUSTED: fall through to consume the terminator
+
+            case STATE_CHUNK_DATA_END:
+                if (tryConsumeChunkEnd() == ChunkEndOutcome.END_OF_STREAM) {
+                    return StateOutcome.RETURN_NULL;
+                }
+                return StateOutcome.CONTINUE;
+
+            default:
+                throw new HttpClientException("internal error [state=" + state + ']');
         }
     }
 
     @Override
     public Fragment recv() {
         return recv(defaultTimeout);
+    }
+
+    /**
+     * Attempts to locate and parse the hex-encoded chunk-size header terminated by CRLF.
+     *
+     * @return {@code true} if the chunk size was fully parsed and {@code state} advanced
+     * to {@code STATE_CHUNK_DATA}; {@code false} if more data must be received
+     * before the header can be completed
+     */
+    private boolean tryParseChunkSize() {
+        long terminatorPos = findChunkSizeTerminator();
+        if (terminatorPos == -1) {
+            return false;
+        }
+
+        chunkSize.of(dataLo, terminatorPos + 1);
+        try {
+            size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
+        } catch (NumericException e) {
+            throw new HttpClientException("malformed chunk size");
+        }
+        consumed = 0;
+        state = STATE_CHUNK_DATA;
+        dataLo = terminatorPos + CRLF_LEN + 1;
+        return true;
+    }
+
+    /**
+     * Scans the buffer for the CRLF that terminates the chunk-size header.
+     *
+     * @return the index of the CRLF start position, or -1 if the buffer does not
+     * yet contain a complete chunk-size header
+     */
+    private long findChunkSizeTerminator() {
+        long p = dataLo;
+        while (p < dataHi) {
+            if (getByte(p) == '\r') {
+                p++;
+                if (p >= dataHi) {
+                    // incomplete CRLF, must wait for more data
+                    return -1;
+                }
+                if (getByte(p) != '\n') {
+                    throw new HttpClientException("malformed chunk size");
+                }
+                return p - CRLF_LEN;
+            }
+            p++;
+        }
+        return -1;
+    }
+
+    /**
+     * Attempts to consume as much chunk data as is currently available in the buffer.
+     *
+     * @return {@link ChunkDataOutcome#FRAGMENT_READY} if a data fragment is ready to
+     * be returned to the caller; {@link ChunkDataOutcome#NEED_MORE_DATA} if the
+     * buffer must be refilled; {@link ChunkDataOutcome#CHUNK_EXHAUSTED} if the
+     * current chunk has zero remaining bytes and the terminator should be read
+     */
+    private ChunkDataOutcome tryConsumeChunkData() {
+        if (size > 0 && dataLo < dataHi) {
+            long chunkBytesRemaining = size - consumed;
+            long bufBytesRemaining = dataHi - dataLo;
+            dataAddr = dataLo;
+
+            if (chunkBytesRemaining <= bufBytesRemaining) {
+                available = chunkBytesRemaining;
+                consumed += chunkBytesRemaining;
+                dataLo += chunkBytesRemaining;
+                state = STATE_CHUNK_DATA_END;
+                receive = false;
+            } else {
+                available = bufBytesRemaining;
+                consumed += bufBytesRemaining;
+                dataLo = dataHi;
+                receive = true;
+            }
+            return ChunkDataOutcome.FRAGMENT_READY;
+        }
+
+        if (size != 0) {
+            return ChunkDataOutcome.NEED_MORE_DATA;
+        }
+
+        return ChunkDataOutcome.CHUNK_EXHAUSTED;
+    }
+
+    /**
+     * Attempts to consume the CRLF that terminates a chunk's data.
+     *
+     * @return {@link ChunkEndOutcome#END_OF_STREAM} if the zero-length terminating
+     * chunk was consumed; {@link ChunkEndOutcome#NEED_MORE_DATA} otherwise,
+     * meaning either more data is required or the next chunk is ready to process
+     */
+    private ChunkEndOutcome tryConsumeChunkEnd() {
+        if (dataLo >= dataHi || (dataHi - dataLo) < CRLF_LEN) {
+            receive = true;
+            return ChunkEndOutcome.NEED_MORE_DATA;
+        }
+
+        if (getByte(dataLo) != '\r' || getByte(dataLo + 1) != '\n') {
+            throw new HttpClientException("malformed chunk");
+        }
+
+        state = STATE_CHUNK_SIZE;
+        dataLo += CRLF_LEN;
+        receive = false;
+        return size == 0 ? ChunkEndOutcome.END_OF_STREAM : ChunkEndOutcome.NEED_MORE_DATA;
     }
 
     private void compactBuffer() {
@@ -239,4 +289,21 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
      * @return the number of bytes received
      */
     protected abstract int recvOrDie(long bufLo, long bufHi, int timeout);
+
+    private enum ChunkDataOutcome {
+        FRAGMENT_READY,
+        NEED_MORE_DATA,
+        CHUNK_EXHAUSTED
+    }
+
+    private enum ChunkEndOutcome {
+        END_OF_STREAM,
+        NEED_MORE_DATA
+    }
+
+    private enum StateOutcome {
+        CONTINUE,
+        RETURN_FRAGMENT,
+        RETURN_NULL
+    }
 }

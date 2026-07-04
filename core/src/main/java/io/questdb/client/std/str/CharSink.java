@@ -1,24 +1,24 @@
 /*+*****************************************************************************
- *     ___                  _   ____  ____
- *    / _ \ _   _  ___  ___| |_|  _ \| __ )
- *   | | | | | | |/ _ \/ __| __| | | |  _ \
- *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
- *    \__\_\\__,_|\___||___/\__|____/|____/
+ * ___                 _   ____  ____
+ * / _ \ _   _  ___  ___| |_|  _ \| __ )
+ * | | | | | | |/ _ \/ __| __| | | |  _ \
+ * | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ * \__\_\\__,_|\___||___/\__|____/|____/
  *
- *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2026 QuestDB
+ * Copyright (c) 2014-2019 Appsicle
+ * Copyright (c) 2019-2026 QuestDB
  *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *  http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  ******************************************************************************/
 
@@ -148,12 +148,27 @@ public interface CharSink<T extends CharSink<?>> {
 
     default T putSize(long bytes) {
         long b = bytes == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(bytes);
-        return (T) (b < 1024L ? put(bytes).put(' ').put('B')
-                : b <= 0xfffccccccccccccL >> 40 ? put(Math.round(bytes / 0x1p10 * 1000.0) / 1000.0).put(" KiB")
-                : b <= 0xfffccccccccccccL >> 30 ? put(Math.round(bytes / 0x1p20 * 1000.0) / 1000.0).put(" MiB")
-                : b <= 0xfffccccccccccccL >> 20 ? put(Math.round(bytes / 0x1p30 * 1000.0) / 1000.0).put(" GiB")
-                : b <= 0xfffccccccccccccL >> 10 ? put(Math.round(bytes / 0x1p40 * 1000.0) / 1000.0).put(" TiB")
-                : b <= 0xfffccccccccccccL ? put(Math.round((bytes >> 10) / 0x1p40 * 1000.0) / 1000.0).put(" PiB")
-                : put(Math.round((bytes >> 20) / 0x1p40 * 1000.0) / 1000.0).put(" EiB"));
+        if (b < 1024L) {
+            return (T) put(bytes).put(' ').put('B');
+        }
+
+        final String[] units = {" KiB", " MiB", " GiB", " TiB", " PiB", " EiB"};
+        final int[] shifts = {10, 20, 30, 40, 40, 40};
+        final long baseLimit = 0xfffccccccccccccL;
+
+        for (int i = 0; i < units.length; i++) {
+            if (i >= 4 || b <= (baseLimit >> shifts[i])) {
+                long inputBytes = bytes;
+                if (i == 4) {
+                    inputBytes >>= 10;
+                } else if (i == 5) {
+                    inputBytes >>= 20;
+                }
+                double divisor = Double.longBitsToDouble(0x3ff0000000000000L + (((long) shifts[i]) << 52)); // 0x1p10, 0x1p20, etc.
+                double value = Math.round(inputBytes / divisor * 1000.0) / 1000.0;
+                return (T) put(value).put(units[i]);
+            }
+        }
+        return (T) this;
     }
 }
