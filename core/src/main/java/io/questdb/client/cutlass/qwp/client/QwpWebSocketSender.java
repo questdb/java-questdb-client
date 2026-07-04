@@ -2761,8 +2761,13 @@ public class QwpWebSocketSender implements Sender {
         // non-421 WebSocketUpgradeException (4xx/5xx). The catch block walks
         // remaining endpoints in case the failure is per-endpoint, then surfaces
         // this latched typed exception when the round ends without a successful
-        // connect. Auth failures are NOT latched here -- they throw immediately
-        // because a rejected credential is uniformly rejected across the cluster.
+        // connect -- except that a plain non-421 WebSocketUpgradeException is
+        // demoted below role-reject evidence in the epilogue: when any endpoint
+        // answered 421+role in the same sweep, the window is transient and the
+        // retriable role-mismatch classification wins (the demoted error rides
+        // along as a suppressed diagnostic). Auth failures are NOT latched here
+        // -- they throw immediately because a rejected credential is uniformly
+        // rejected across the cluster.
         HttpClientException terminalUpgradeError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
@@ -2963,15 +2968,32 @@ public class QwpWebSocketSender implements Sender {
                     null, SenderConnectionEvent.NO_PORT,
                     SenderConnectionEvent.NO_ATTEMPT_NUMBER, roundSeq, lastError);
         }
-        if (terminalUpgradeError != null) {
+        // Role-reject evidence outranks a latched plain non-421 upgrade
+        // error. In a mixed sweep -- e.g. [replica(421+role),
+        // replica(421+role), node(503)] -- the co-occurring 421+role
+        // responses are positive evidence of a transient failover/promotion
+        // window; throwing the latched 5xx/4xx here would misclassify that
+        // window as terminal (dead foreground sender, or a drainer slot
+        // quarantine via BackgroundDrainer markFailed). Only plain
+        // WebSocketUpgradeException is demoted: the typed capability gaps
+        // (QwpVersionMismatchException, QwpDurableAckMismatchException)
+        // extend HttpClientException directly, so they fall through this
+        // check and stay terminal even when replicas role-rejected in the
+        // same sweep -- the contract the durable-ack paragraph below
+        // documents and relies on.
+        if (terminalUpgradeError != null
+                && !(lastRoleReject != null
+                && terminalUpgradeError instanceof WebSocketUpgradeException)) {
             throw terminalUpgradeError;
         }
         if (lastRoleReject != null) {
-            // Every endpoint role-rejected the /write/v4 upgrade: right now the
-            // reachable nodes are all replicas (or primary-catchup). That is a
-            // TRANSIENT failover window, not a terminal condition -- a replica
-            // can be promoted and a primary will reappear. Surface it as a
-            // retriable QwpRoleMismatchException so the SYNC/ASYNC connect and
+            // Every endpoint either role-rejected the /write/v4 upgrade or
+            // failed with a demoted non-421 upgrade error: right now the
+            // reachable, role-classified nodes are all replicas (or
+            // primary-catchup). That is a TRANSIENT failover window, not a
+            // terminal condition -- a replica can be promoted and a primary
+            // will reappear. Surface it as a retriable
+            // QwpRoleMismatchException so the SYNC/ASYNC connect and
             // reconnect loops keep the rows in store-and-forward and retry
             // within reconnect_max_duration_millis (for an SF sender the only
             // terminal condition is SF exhaustion).
@@ -2993,6 +3015,11 @@ public class QwpWebSocketSender implements Sender {
                             + "; last observed role=" + lastRoleReject.getRole()
                             + " at " + lastRoleReject.getHost() + ':' + lastRoleReject.getPort());
             ex.initCause(lastRoleReject);
+            if (terminalUpgradeError != null) {
+                // Keep the demoted non-421 upgrade error observable for
+                // diagnostics without changing the surfaced classification.
+                ex.addSuppressed(terminalUpgradeError);
+            }
             throw ex;
         }
         LineSenderException ex = new LineSenderException(lastError);
