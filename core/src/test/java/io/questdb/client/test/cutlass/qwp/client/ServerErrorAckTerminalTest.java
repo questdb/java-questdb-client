@@ -38,6 +38,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -279,6 +281,101 @@ public class ServerErrorAckTerminalTest {
         }
     }
 
+    /**
+     * Client half of the server stop-at-gap contract: the server acks the head,
+     * RETRIABLE-NACKs the next frame, then goes silent for the frames the client
+     * already pipelined behind it (never committed, never acked past the gap).
+     * The client must recycle, replay its unacked tail from ackedFsn+1, and
+     * deliver every row -- no hang on the unanswered tail, no data loss, no
+     * poison escalation.
+     */
+    @Test
+    public void testRecoversFromRetriableNackWithSilentTail() throws Exception {
+        StopAtGapHandler handler = new StopAtGapHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            int port = server.getPort();
+            String cfg = "ws::addr=localhost:" + port
+                    + ";reconnect_max_duration_millis=10000"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50"
+                    + ";close_flush_timeout_millis=5000"
+                    + ";";
+
+            Sender sender = Sender.fromConfig(cfg);
+            try {
+                // Pipeline four frames so the head NACK can leave a tail behind.
+                for (int i = 0; i < 4; i++) {
+                    sender.table("foo").longColumn("v", i).atNow();
+                    sender.flush();
+                }
+
+                // The RETRIABLE NACK must recycle and replay the unacked tail on
+                // a fresh connection.
+                waitFor(() -> handler.connections.size() >= 2, 10_000);
+
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                Assert.assertTrue("a RETRIABLE NACK must recycle the connection", wss.getTotalReconnectAttempts() >= 1);
+
+                // The replayed tail is OK-acked on the new connection, so nothing
+                // escalates to a terminal.
+                Thread.sleep(300);
+                Assert.assertNull("retriable NACK + silent tail must recover, not latch a terminal", wss.getLastTerminalError());
+
+                // End to end: a further row flushes and drain-on-close completes
+                // without throwing -- no stall, no loss.
+                sender.table("foo").longColumn("v", 4).atNow();
+                sender.flush();
+                sender.close();
+            } catch (LineSenderException e) {
+                try {
+                    sender.close();
+                } catch (LineSenderException ignored) {
+                }
+                throw new AssertionError("sender must recover from the retriable NACK, but flush/close threw", e);
+            }
+        }
+    }
+
+    /**
+     * First connection: ack the head, RETRIABLE-NACK the next frame, then stay
+     * silent for the pipelined tail. Any later connection is the reconnect --
+     * ack every replayed frame so the tail lands.
+     */
+    private static class StopAtGapHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final Set<TestWebSocketServer.ClientHandler> connections = ConcurrentHashMap.newKeySet();
+        final AtomicLong tailSilenced = new AtomicLong();
+        private TestWebSocketServer.ClientHandler firstClient;
+        private int firstConnFrameIdx;
+        private long okAckSeq;
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            connections.add(client);
+            if (firstClient == null) {
+                firstClient = client;
+            }
+            try {
+                if (client == firstClient) {
+                    int idx = firstConnFrameIdx++;
+                    if (idx == 0) {
+                        client.sendBinary(buildAck(okAckSeq++));
+                    } else if (idx == 1) {
+                        client.sendBinary(buildErrorAck(1, WebSocketResponse.STATUS_WRITE_ERROR, "test: retriable"));
+                    } else {
+                        tailSilenced.incrementAndGet();
+                    }
+                } else {
+                    client.sendBinary(buildAck(okAckSeq++));
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     /** Server returns {@code STATUS_WRITE_ERROR} (RETRIABLE policy) for every received frame. */
     private static class WriteErrorAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicLong totalBinaryReceived = new AtomicLong();
@@ -313,6 +410,16 @@ public class ServerErrorAckTerminalTest {
                 throw new RuntimeException(e);
             }
         }
+    }
+
+    // Mirrors WebSocketResponse STATUS_OK layout: status u8 | sequence u64 | table_count u16
+    private static byte[] buildAck(long seq) {
+        byte[] buf = new byte[1 + 8 + 2];
+        ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        bb.put(WebSocketResponse.STATUS_OK);
+        bb.putLong(seq);
+        bb.putShort((short) 0);
+        return buf;
     }
 
     // Mirrors WebSocketResponse error layout: status u8 | seq u64 | msgLen u16 | msg UTF-8
