@@ -1,9 +1,8 @@
 # Builds the native libquestdb shared library on the test runner itself.
 #
-# The Linux (.so) and Windows (.dll) binaries are no longer committed to the
-# repository -- they are produced and committed only by the release
-# "Build and Push Release CXX Libraries" GitHub Action. So the test CI has to
-# compile them locally before running the tests.
+# The native binaries are no longer committed to the repository -- they are
+# built from source in CI and at release time (see maven_central_release.yml).
+# So the test CI has to compile them locally before running the tests.
 #
 # All three platforms are built on their own native runner: Linux (.so),
 # Windows (.dll) and macOS (.dylib). None of these binaries are committed.
