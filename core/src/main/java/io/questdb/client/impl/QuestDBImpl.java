@@ -24,27 +24,31 @@
 
 package io.questdb.client.impl;
 
-import io.questdb.client.Completion;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Query;
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
 
 /**
- * Implementation of {@link QuestDB}. Owns the elastic {@link SenderPool}
- * and {@link QueryClientPool}, a {@link PoolHousekeeper} that reaps idle
- * slots, and a {@link ThreadLocal} of {@link QueryImpl} instances so that
- * {@link #query()} is allocation-free after the first call on each thread.
+ * Implementation of {@link QuestDB}. Owns the elastic {@link SenderPool} and
+ * {@link QueryClientPool} and a {@link PoolHousekeeper} that reaps idle slots.
+ * {@link #borrowQuery()} leases a pooled {@link QueryWorker} and hands back a
+ * thin {@link QueryLease} over its reused {@link QueryImpl}; the heavy per-query
+ * state is pre-allocated on the worker and the per-submit path is
+ * allocation-free, so only the small lease handle is created per borrow (and is
+ * routinely scalar-replaced by the JIT in the try-with-resources case).
  */
 public final class QuestDBImpl implements QuestDB {
 
     private final PoolHousekeeper housekeeper;
     private final QueryClientPool queryPool;
-    private final ThreadLocal<QueryImpl> queryThreadLocal;
     private final SenderPool senderPool;
     private volatile boolean closed;
 
@@ -58,20 +62,26 @@ public final class QuestDBImpl implements QuestDB {
             long acquireTimeoutMillis,
             long idleTimeoutMillis,
             long maxLifetimeMillis,
-            long housekeeperIntervalMillis
+            long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, null, null);
+                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null,
+                errorHandler, connectionListener, drainerListener);
     }
 
-    // Package-private constructor exposing the senderFactory and connectHook test
-    // seams: production passes null for both (-> the real native build/connect
-    // paths). White-box tests in io.questdb.client.test.impl reach this by
-    // reflection (the main module is declared `open`) to make SenderPool prewarm
-    // an observable delegate while QueryClientPool construction throws an Error,
+    // Test-only constructor exposing the senderFactory and connectHook seams:
+    // production uses the public overload above, which passes null for both ->
+    // the real native build/connect paths. White-box error-safety tests in
+    // io.questdb.client.test.impl call this to make SenderPool prewarm an
+    // observable delegate while QueryClientPool construction throws an Error,
     // exercising the cleanup catch below.
-    QuestDBImpl(
+    @TestOnly
+    public QuestDBImpl(
             String ingestConfig,
             String queryConfig,
             int senderMin,
@@ -85,6 +95,35 @@ public final class QuestDBImpl implements QuestDB {
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook
     ) {
+        this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
+                acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
+                housekeeperIntervalMillis, QueryClientPool.DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS,
+                senderFactory, connectHook, null, null, null);
+    }
+
+    // Full constructor adding the ingest-side errorHandler/connectionListener/
+    // drainerListener, applied by SenderPool to every Sender it builds. The
+    // 12-arg overload above is the unchanged white-box test seam and delegates
+    // here with null callbacks; the public overload delegates here with null
+    // test seams.
+    QuestDBImpl(
+            String ingestConfig,
+            String queryConfig,
+            int senderMin,
+            int senderMax,
+            int queryMin,
+            int queryMax,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
+            IntFunction<Sender> senderFactory,
+            Consumer<QwpQueryClient> connectHook,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
+    ) {
         SenderPool builtSenderPool = null;
         QueryClientPool builtQueryPool = null;
         PoolHousekeeper builtHousekeeper = null;
@@ -95,10 +134,12 @@ public final class QuestDBImpl implements QuestDB {
                     // Defer SF startup recovery to the PoolHousekeeper thread so
                     // build() never blocks on a slow / reachable-but-not-acking
                     // server; the housekeeper drives it via runStartupRecoveryStep().
-                    true);
+                    true,
+                    errorHandler, connectionListener, drainerListener);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
                     idleTimeoutMillis, maxLifetimeMillis, connectHook);
+            builtQueryPool.closeQueryTimeoutMillis(queryCloseTimeoutMillis);
             builtHousekeeper = new PoolHousekeeper(builtSenderPool, builtQueryPool, housekeeperIntervalMillis);
             builtHousekeeper.start();
         } catch (Throwable e) {
@@ -128,7 +169,11 @@ public final class QuestDBImpl implements QuestDB {
         this.senderPool = builtSenderPool;
         this.queryPool = builtQueryPool;
         this.housekeeper = builtHousekeeper;
-        this.queryThreadLocal = ThreadLocal.withInitial(() -> new QueryImpl(queryPool));
+    }
+
+    @Override
+    public Query borrowQuery() {
+        return queryPool.acquire().lease();
     }
 
     @Override
@@ -182,30 +227,4 @@ public final class QuestDBImpl implements QuestDB {
         }
     }
 
-    @Override
-    public Completion executeSql(CharSequence sql, QwpColumnBatchHandler handler) {
-        return query().sql(sql).handler(handler).submit();
-    }
-
-    @Override
-    public Query newQuery() {
-        return new QueryImpl(queryPool);
-    }
-
-    @Override
-    public Query query() {
-        QueryImpl q = queryThreadLocal.get();
-        q.resetIfDone();
-        return q;
-    }
-
-    @Override
-    public void releaseSender() {
-        senderPool.releaseCurrentThread();
-    }
-
-    @Override
-    public Sender sender() {
-        return senderPool.pinToCurrentThread();
-    }
 }

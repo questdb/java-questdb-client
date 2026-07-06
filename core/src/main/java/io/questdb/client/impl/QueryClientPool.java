@@ -26,6 +26,7 @@ package io.questdb.client.impl;
 
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -49,6 +50,12 @@ import java.util.function.Consumer;
  */
 public final class QueryClientPool implements AutoCloseable {
 
+    // Default upper bound, in milliseconds, on how long Query.close() waits for
+    // an in-flight query to drain (after issuing a cancel) before discarding the
+    // worker. Mirrors the ingest side's close_flush_timeout_millis default so a
+    // close() can never block the caller unbounded. Tunable per pool via
+    // closeQueryTimeoutMillis(long).
+    static final long DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS = 5_000;
     private final long acquireTimeoutMillis;
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
@@ -75,6 +82,10 @@ public final class QueryClientPool implements AutoCloseable {
     private final AtomicInteger nextSlotIndex = new AtomicInteger();
     private final Condition workerReleased;
     private volatile boolean closed;
+    // Upper bound on the Query.close() drain wait; see
+    // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
+    // once at build time on a different thread than the borrowers that read it.
+    private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -89,11 +100,12 @@ public final class QueryClientPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, null);
     }
 
-    // Package-private constructor exposing the connectHook test seam: production
-    // passes null (-> the real QwpQueryClient.connect()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a hook that
-    // throws a non-RuntimeException Throwable from the native connect path.
-    QueryClientPool(
+    // Constructor exposing the connectHook seam. Production (QuestDBImpl) passes
+    // null -> the real QwpQueryClient.connect(); white-box tests pass a hook that
+    // throws a non-RuntimeException Throwable from the native connect path. This
+    // is the construction path QuestDBImpl uses, so it is a real (public) ctor,
+    // not test-only.
+    public QueryClientPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -106,13 +118,12 @@ public final class QueryClientPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, connectHook, null);
     }
 
-    // Package-private constructor exposing both the connectHook and startHook
-    // test seams: production passes null for each (-> the real
-    // QwpQueryClient.connect() and QueryWorker.start()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a hook that
-    // throws a Throwable from either the native connect path (connectHook) or
-    // the worker thread-start path (startHook).
-    QueryClientPool(
+    // Constructor exposing both the connectHook and startHook seams. Production
+    // reaches it via the overload above (both null -> the real
+    // QwpQueryClient.connect() and QueryWorker.start()); white-box tests pass a
+    // hook that throws a Throwable from either the native connect path
+    // (connectHook) or the worker thread-start path (startHook).
+    public QueryClientPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -197,7 +208,12 @@ public final class QueryClientPool implements AutoCloseable {
                     throw new QueryException((byte) 0, "QuestDB handle is closed");
                 }
                 if (!available.isEmpty()) {
-                    return available.pollFirst();
+                    QueryWorker w = available.pollFirst();
+                    // Stamp a fresh lease id under the lock so the QueryLease
+                    // about to be handed out can be distinguished from any
+                    // prior, now-stale borrow of the same worker.
+                    w.bumpGeneration();
+                    return w;
                 }
                 if (all.size() + inFlightCreations < maxSize) {
                     inFlightCreations++;
@@ -239,6 +255,16 @@ public final class QueryClientPool implements AutoCloseable {
                     lock.lock();
                     inFlightCreations--;
                     if (closed) {
+                        // Pool was closed mid-creation -- tear the fresh worker
+                        // down rather than leaking it, but OUTSIDE the lock:
+                        // shutdown() joins the dispatch thread for up to
+                        // SHUTDOWN_JOIN_MILLIS, and close()/release()/discard()/
+                        // cancelIfCurrent() all contend on this lock (whose
+                        // contract is "held only briefly"). The accounting above
+                        // already ran under the lock, and the worker never
+                        // entered `all`, so close()'s snapshot loop cannot race
+                        // this teardown.
+                        lock.unlock();
                         try {
                             created.shutdown();
                         } catch (Throwable ignored) {
@@ -248,6 +274,8 @@ public final class QueryClientPool implements AutoCloseable {
                         throw new QueryException((byte) 0, "QuestDB handle is closed");
                     }
                     all.add(created);
+                    // Stamp the first lease id for this freshly built worker.
+                    created.bumpGeneration();
                     return created;
                 }
                 if (remainingNanos <= 0) {
@@ -297,6 +325,87 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
+    /**
+     * Cancels the in-flight query on {@code w} only while its lease generation
+     * still equals {@code gen}, holding the pool lock across both the check and
+     * the wire cancel. acquire() and release() bump the generation under this
+     * same lock, so once this method holds it the generation cannot change: a
+     * cancel whose lease has already gone stale (the worker was released and
+     * re-borrowed) is dropped instead of aborting the new borrower's query. The
+     * cancel itself is non-blocking -- a volatile flag plus an AtomicLong set --
+     * so the lock is held only briefly.
+     */
+    void cancelIfCurrent(QueryWorker w, long gen) {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            if (w.generation() != gen) {
+                return;
+            }
+            w.cancelInFlight();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    long closeQueryTimeoutMillis() {
+        return closeQueryTimeoutMillis;
+    }
+
+    void closeQueryTimeoutMillis(long millis) {
+        this.closeQueryTimeoutMillis = millis;
+    }
+
+    /**
+     * Evicts a worker whose lease {@link QueryImpl#close(long)} could not drain
+     * the in-flight query within {@link #closeQueryTimeoutMillis} (the cancel
+     * was not honored in time, or the caller was interrupted). The worker's
+     * connection is left in an unknown protocol state -- a late {@code RESULT_*}
+     * frame for the abandoned query could corrupt the next borrower's stream --
+     * so it must NOT return to the pool. Removes it from {@code all} (freeing
+     * capacity for a fresh worker) and tears it down outside the lock via
+     * {@link QueryWorker#shutdown()}, which interrupts the dispatch thread so a
+     * stuck {@code execute()} returns promptly.
+     * <p>
+     * Bails when the pool is already closed: {@link #close()} owns the teardown
+     * of every worker via its snapshot loop, so mutating {@code all} here would
+     * race that iteration on a non-thread-safe {@code ArrayList}. Also bails on a
+     * stale generation -- the worker was already released/discarded and possibly
+     * re-borrowed, so discarding it would evict a worker a different borrower now
+     * owns. Mirrors {@link SenderPool#discardBroken} on the ingest side.
+     */
+    void discard(QueryWorker w, long gen) {
+        lock.lock();
+        try {
+            if (closed) {
+                return;
+            }
+            if (w.generation() != gen) {
+                return;
+            }
+            // Invalidate the lease so a duplicate close()/release with the same
+            // generation is dropped and the in-flight handle can no longer drive
+            // this worker.
+            w.bumpGeneration();
+            all.remove(w);
+            // Capacity freed -- a waiter in acquire() may now create a fresh
+            // worker in this slot's place.
+            workerReleased.signal();
+        } finally {
+            lock.unlock();
+        }
+        // Tear down outside the lock so a slow join doesn't keep the pool
+        // latched. shutdown() is best-effort and idempotent.
+        try {
+            w.shutdown();
+        } catch (Throwable ignored) {
+            // Best-effort: a teardown Error (e.g. an -ea AssertionError) must
+            // not propagate out of Query.close().
+        }
+    }
+
     void reapIdle() {
         if (closed) {
             return;
@@ -340,14 +449,30 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    void release(QueryWorker w) {
-        long now = System.currentTimeMillis();
-        w.markIdleAt(now);
+    void release(QueryWorker w, long gen) {
         lock.lock();
         try {
             if (closed) {
                 return;
             }
+            if (w.generation() != gen) {
+                // Stale release: this lease was already returned and the worker
+                // has since been re-borrowed (or this is a duplicate close of an
+                // already-released lease). Dropping it is what makes
+                // Query.close() idempotent even under a concurrent re-borrow --
+                // without this guard a double close would enqueue the worker
+                // twice and hand it to two borrowers at once, corrupting the
+                // whole pool. The flag a stale close() reads is no longer its
+                // own lease's, so a non-validated release path could not catch
+                // this; the generation captured at borrow time can.
+                return;
+            }
+            // Invalidate the just-returned lease so a duplicate release with the
+            // same generation is also dropped and the in-flight handle can no
+            // longer drive this worker.
+            w.bumpGeneration();
+            w.markIdleAt(System.currentTimeMillis());
+            assert !available.contains(w) : "worker already present in available deque on release";
             available.addLast(w);
             workerReleased.signal();
         } finally {
@@ -355,11 +480,12 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    // Package-private white-box accessor for tests: reports the current
-    // in-flight creation count under the pool lock. A non-zero value after a
-    // failed acquire() means the slot reservation was never released -- the
-    // capacity-shrink bug this guards against.
-    int inFlightCreations() {
+    // White-box accessor for tests: reports the current in-flight creation count
+    // under the pool lock. A non-zero value after a failed acquire() means the
+    // slot reservation was never released -- the capacity-shrink bug this guards
+    // against.
+    @TestOnly
+    public int inFlightCreations() {
         lock.lock();
         try {
             return inFlightCreations;

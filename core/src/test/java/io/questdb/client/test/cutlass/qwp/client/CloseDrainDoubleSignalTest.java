@@ -58,7 +58,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>{@code close_flush_timeout_millis > 0} (so the bounded drain runs),
  *       and</li>
  *   <li>an unacked tail remains ({@code ackedFsn < publishedFsn} — the
- *       natural state after a HALT rejection, which never advances
+ *       natural state after a TERMINAL rejection, which never advances
  *       {@code ackedFsn}),</li>
  * </ul>
  * then {@code QwpWebSocketSender.close()} re-throws the same terminal error
@@ -90,7 +90,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * will never reach target) but re-throws only when no custom handler owns the
  * error, mirroring the step-2 safety-net gate.
  * <p>
- * Determinism: the server fixture holds the HALT rejection behind a gate that
+ * Determinism: the server fixture holds the TERMINAL rejection behind a gate that
  * the test releases only AFTER {@code flush()} has returned. Without the gate,
  * the rejection could latch before {@code flush()}'s own
  * {@code checkError()} runs, surfacing the error synchronously, populating
@@ -123,14 +123,14 @@ public class CloseDrainDoubleSignalTest {
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
-                // Now let the server emit the HALT rejection. It latches the
+                // Now let the server emit the TERMINAL rejection. It latches the
                 // terminal (recordFatal) and dispatches it to the async
-                // handler (dispatchError). ackedFsn stays at 0 (HALT never
+                // handler (dispatchError). ackedFsn stays at 0 (TERMINAL never
                 // advances the watermark) -> the unacked tail precondition.
                 server.releaseRejection();
 
                 Assert.assertTrue(
-                        "precondition: HALT terminal must reach the async custom handler within 10s",
+                        "precondition: TERMINAL terminal must reach the async custom handler within 10s",
                         inbox.await(10, TimeUnit.SECONDS));
 
                 SenderError delivered = inbox.get();
@@ -139,8 +139,8 @@ public class CloseDrainDoubleSignalTest {
                         "precondition: server status 0x05 must map to PARSE_ERROR",
                         SenderError.Category.PARSE_ERROR, delivered.getCategory());
                 Assert.assertEquals(
-                        "precondition: PARSE_ERROR is a HALT-policy rejection",
-                        SenderError.Policy.HALT, delivered.getAppliedPolicy());
+                        "precondition: PARSE_ERROR is a TERMINAL-policy rejection",
+                        SenderError.Policy.TERMINAL, delivered.getAppliedPolicy());
 
                 // Sanity-check the remaining preconditions are actually live
                 // before we exercise close(): the terminal is latched and an
@@ -175,7 +175,7 @@ public class CloseDrainDoubleSignalTest {
 
     /**
      * Server fixture that responds to the first binary frame with a
-     * {@code STATUS_PARSE_ERROR} (HALT-policy) rejection, but only once the
+     * {@code STATUS_PARSE_ERROR} (TERMINAL-policy) rejection, but only once the
      * test releases the gate. Blocking inside {@code onBinaryMessage} mirrors
      * the established {@code DelayingAckHandler} pattern in {@link CloseDrainTest}.
      */
@@ -188,7 +188,7 @@ public class CloseDrainDoubleSignalTest {
             try {
                 gate.await();
                 client.sendBinary(buildErrorAck(nextSeq.getAndIncrement(),
-                        WebSocketResponse.STATUS_PARSE_ERROR, "test: parse error (HALT)"));
+                        WebSocketResponse.STATUS_PARSE_ERROR, "test: parse error (TERMINAL)"));
             } catch (IOException | InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);

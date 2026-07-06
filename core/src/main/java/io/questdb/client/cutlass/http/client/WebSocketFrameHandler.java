@@ -32,6 +32,15 @@ package io.questdb.client.cutlass.http.client;
  * <p>
  * Thread safety: Callbacks are invoked from the thread that called receiveFrame().
  * Implementations must handle their own synchronization if accessed from multiple threads.
+ * <p>
+ * In-callback close: a callback may {@code close()} the client that is
+ * delivering it — connection recycling does exactly this (see
+ * CursorWebSocketSendLoop, whose NACK/close handling swaps in a new client
+ * and synchronously closes the old one before the callback returns). The
+ * client detects the close when the callback returns, touches no further
+ * receive state, and reports the frame as received. Note that
+ * {@code close()} frees the buffers the payload pointers point into: read
+ * everything you need from the payload BEFORE closing.
  */
 public interface WebSocketFrameHandler {
 

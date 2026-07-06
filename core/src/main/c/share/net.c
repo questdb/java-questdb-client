@@ -33,6 +33,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <poll.h>
+#include <time.h>
+#include "glibc_compat.h"
 #include "net.h"
 #include <netdb.h>
 #include "sysutil.h"
@@ -296,6 +299,100 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connectAddrInfo
 
     result = connect((int) fd, addr->ai_addr, (int) addr->ai_addrlen);
     return handleEintrInConnect(fd, result);
+}
+
+// Waits up to timeout_millis for an in-progress non-blocking connect on fd to
+// finish. Returns 0 on success, -1 on connection failure (errno set so the
+// caller can read it via Os.errno()), or com_questdb_network_Net_ECONNTIMEOUT
+// on timeout.
+static jint awaitConnectComplete(int fd, jint timeout_millis) {
+    // Fix a single absolute deadline up front. Recomputing the remaining budget
+    // against a moving baseline on each EINTR (reset start = now, then subtract
+    // whole milliseconds) lets a high-frequency signal storm extend the timeout:
+    // under sub-millisecond interrupts every interval truncates to 0 ms, the
+    // budget never decrements, and poll is re-armed with the full budget each
+    // time. A fixed deadline is immune to interrupt frequency -- the remaining
+    // time can only ever decrease.
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    long budget_millis = timeout_millis > 0 ? timeout_millis : 0;
+    deadline.tv_sec += budget_millis / 1000L;
+    deadline.tv_nsec += (budget_millis % 1000L) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        // Remaining time until the deadline, truncated to whole milliseconds for
+        // poll(). Truncation only ever under-shoots by < 1 ms (it never extends
+        // the wait), which keeps the timeout a strict upper bound.
+        long remaining_millis = (deadline.tv_sec - now.tv_sec) * 1000L
+                                + (deadline.tv_nsec - now.tv_nsec) / 1000000L;
+        if (remaining_millis <= 0) {
+            errno = ETIMEDOUT;
+            return com_questdb_network_Net_ECONNTIMEOUT;
+        }
+
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+
+        int rc = poll(&pfd, 1, (int) remaining_millis);
+        if (rc > 0) {
+            // The connect attempt has finished one way or another; the only
+            // authoritative result is SO_ERROR (POLLOUT alone does not mean
+            // success -- a refused connection is also reported as writable).
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) {
+                return -1;
+            }
+            if (so_error != 0) {
+                errno = so_error;
+                return -1;
+            }
+            return 0;
+        }
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+            return com_questdb_network_Net_ECONNTIMEOUT;
+        }
+        if (errno != EINTR) {
+            return -1;
+        }
+        // Interrupted by a signal: loop and recompute the remaining time against
+        // the fixed deadline. EINTR storms cannot extend the timeout.
+    }
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connectAddrInfoTimeout
+        (JNIEnv *e, jclass cl, jint fd, jlong lpAddrInfo, jint timeoutMillis) {
+    struct addrinfo *addr = (struct addrinfo *) lpAddrInfo;
+
+    // Switch to non-blocking BEFORE connect so connect() returns immediately
+    // with EINPROGRESS instead of blocking on the OS connect timeout. The
+    // socket is left non-blocking on success, matching the post-connect
+    // configureNonBlocking() the callers already perform.
+    int flags = fcntl((int) fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    if (fcntl((int) fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return -1;
+    }
+
+    int result = connect((int) fd, addr->ai_addr, (int) addr->ai_addrlen);
+    if (result == 0) {
+        return 0; // connected immediately (e.g. loopback)
+    }
+    if (errno == EINPROGRESS || errno == EINTR || errno == EWOULDBLOCK) {
+        return awaitConnectComplete((int) fd, timeoutMillis);
+    }
+    return -1; // immediate failure, errno set
 }
 
 JNIEXPORT void JNICALL Java_io_questdb_client_network_Net_freeAddrInfo0

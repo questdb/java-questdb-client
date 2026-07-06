@@ -143,10 +143,16 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
+        // The pathScratch field initializer has already allocated its native
+        // buffer by the time this body runs, so a validation throw must free
+        // it or every failed construction leaks 256 bytes of native memory
+        // (e.g. a drainer retry loop hitting the same bad config).
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
+            pathScratch.close();
             throw new IllegalArgumentException("segmentSizeBytes too small: " + segmentSizeBytes);
         }
         if (maxTotalBytes < segmentSizeBytes) {
+            pathScratch.close();
             throw new IllegalArgumentException(
                     "maxTotalBytes (" + maxTotalBytes + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");

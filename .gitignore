@@ -30,3 +30,9 @@ core/CMakeCache.txt
 **/CMakeFiles
 .envrc
 .vscode
+# Root-level Maven build output
+/target
+
+# pi subagents runtime artifacts
+.pi-subagents/
+core/src/main/resources/io/questdb/client/bin/

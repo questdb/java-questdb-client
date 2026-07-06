@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -53,6 +54,10 @@ import java.util.Map;
  * (table, seqTxn) is covered by the watermarks reported so far. Any drift
  * either advances trim past undurable data (corruption) or stalls trim
  * behind durable data (correctness leak).
+ * <p>
+ * A NACK (SCHEMA_MISMATCH) is TERMINAL: it latches the typed error and the
+ * loop is dead — the iteration ends there, after asserting that trim never
+ * crossed the rejected frame (nothing is dropped, nothing silently trimmed).
  */
 public class CursorWebSocketSendLoopDurableAckFuzzTest {
 
@@ -231,12 +236,26 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
                         if (op == 0 && nextOk < frames) {
                             // Send OK or NACK for nextOk
                             if (isNack[nextOk]) {
+                                // TERMINAL: the NACK latches the typed error;
+                                // no placeholder is enqueued and trim must
+                                // never cross the rejected frame. A production
+                                // loop is dead at this point -- end the
+                                // iteration after checking both facts.
                                 deliver(loop, buildErrorPayload(nextOk));
-                                frameTables[nextOk] = new String[0];
-                                frameSeqTxns[nextOk] = new long[0];
-                            } else {
-                                deliver(loop, buildOkPayload(nextOk, frameTables[nextOk], frameSeqTxns[nextOk]));
+                                try {
+                                    loop.checkError();
+                                    Assert.fail("iter=" + iter + ": NACK at wireSeq=" + nextOk
+                                            + " must latch a terminal error");
+                                } catch (LineSenderServerException expected) {
+                                }
+                                long acked = engine.ackedFsn();
+                                Assert.assertTrue(
+                                        "iter=" + iter + " trim crossed a rejected frame:"
+                                                + " ackedFsn=" + acked + " nackedWireSeq=" + nextOk,
+                                        acked < nextOk);
+                                return; // iteration over: the loop is terminal
                             }
+                            deliver(loop, buildOkPayload(nextOk, frameTables[nextOk], frameSeqTxns[nextOk]));
                             nextOk++;
                         } else {
                             // Emit a durable-ack covering some random prefix of seqTxns.
@@ -263,8 +282,8 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
                         }
 
                         // Compute oracle expected ackedFsn: largest k such that
-                        // every entry 0..k is durable. NACK entries are trivially
-                        // durable (no WAL writes).
+                        // every entry 0..k is durable. (Only OK'd frames reach
+                        // here -- a NACK ends the iteration above.)
                         long expected = -1L;
                         for (int i = 0; i < nextOk; i++) {
                             boolean durable = true;

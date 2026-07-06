@@ -63,6 +63,11 @@ public class NetworkFacadeImpl implements NetworkFacade {
     }
 
     @Override
+    public int connectAddrInfoTimeout(int fd, long pAddrInfo, int timeoutMillis) {
+        return Net.connectAddrInfoTimeout(fd, pAddrInfo, timeoutMillis);
+    }
+
+    @Override
     public int errno() {
         return Os.errno();
     }

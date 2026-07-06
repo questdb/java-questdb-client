@@ -84,9 +84,12 @@ public interface Socket extends QuietCloseable {
      * on server connections.
      *
      * @param peerName server name to use for SNI and certificate validation.
+     * @param waiter   blocks until the socket is ready for the next handshake
+     *                 read/write (bounded by the connect deadline), so the
+     *                 handshake does not busy-spin on the non-blocking socket.
      * @throws TlsSessionInitFailedException if the call fails.
      */
-    void startTlsSession(@Nullable CharSequence peerName) throws TlsSessionInitFailedException;
+    void startTlsSession(@Nullable CharSequence peerName, SocketReadinessWaiter waiter) throws TlsSessionInitFailedException;
 
     /**
      * @return true if the socket support TLS encryption; false otherwise.

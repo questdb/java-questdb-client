@@ -55,10 +55,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * cause, not at an arbitrary later point.
  * <p>
  * Note: the fixture uses {@link WebSocketResponse#STATUS_PARSE_ERROR}
- * (HALT-policy). Only HALT records a terminal error;
- * {@code STATUS_SCHEMA_MISMATCH} maps to DROP_AND_CONTINUE per spec and
- * the loop keeps running, so the test's "next call throws" contract is
- * specifically the HALT contract.
+ * (TERMINAL-policy). Only TERMINAL records a terminal error; RETRIABLE
+ * statuses (e.g. {@code STATUS_WRITE_ERROR}) recycle the connection and
+ * replay, so the test's "next call throws" contract is specifically the
+ * TERMINAL contract.
  */
 public class IoThreadErrorSurfacedOnRowApiTest {
 
@@ -73,7 +73,7 @@ public class IoThreadErrorSurfacedOnRowApiTest {
             String cfg = "ws::addr=localhost:" + port + ";";
             try (Sender sender = Sender.fromConfig(cfg)) {
                 // Batch 1: produces a frame the server rejects with
-                // STATUS_SCHEMA_MISMATCH. The cursor I/O loop's response
+                // STATUS_PARSE_ERROR. The cursor I/O loop's response
                 // handler routes the rejection through recordFatal, marking
                 // the loop terminal.
                 sender.table("foo").longColumn("v", 1L).atNow();

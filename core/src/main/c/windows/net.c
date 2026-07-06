@@ -160,6 +160,66 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connectAddrInfo
     return res;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_connectAddrInfoTimeout
+        (JNIEnv *e, jclass cl, jint fd, jlong lpAddrInfo, jint timeoutMillis) {
+    struct addrinfo *addr = (struct addrinfo *) lpAddrInfo;
+    SOCKET s = (SOCKET) fd;
+
+    // Switch to non-blocking BEFORE connect so it returns immediately with
+    // WSAEWOULDBLOCK instead of blocking on the OS connect timeout.
+    u_long mode = 1;
+    if (ioctlsocket(s, FIONBIO, &mode) != 0) {
+        SaveLastError();
+        return -1;
+    }
+
+    int res = connect(s, addr->ai_addr, (int) addr->ai_addrlen);
+    if (res == 0) {
+        return 0; // connected immediately (e.g. loopback)
+    }
+    if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        SaveLastError();
+        return -1;
+    }
+
+    fd_set writefds, exceptfds;
+    FD_ZERO(&writefds);
+    FD_ZERO(&exceptfds);
+    FD_SET(s, &writefds);
+    FD_SET(s, &exceptfds);
+
+    struct timeval tv;
+    tv.tv_sec = timeoutMillis / 1000;
+    tv.tv_usec = (timeoutMillis % 1000) * 1000;
+
+    // Winsock signals a failed non-blocking connect via the exception set.
+    int sel = select(0, NULL, &writefds, &exceptfds, &tv);
+    if (sel == 0) {
+        WSASetLastError(WSAETIMEDOUT);
+        SaveLastError();
+        return com_questdb_network_Net_ECONNTIMEOUT;
+    }
+    if (sel == SOCKET_ERROR) {
+        SaveLastError();
+        return -1;
+    }
+
+    int so_error = 0;
+    int len = sizeof(so_error);
+    if (FD_ISSET(s, &exceptfds) || !FD_ISSET(s, &writefds)) {
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *) &so_error, &len);
+        WSASetLastError(so_error != 0 ? so_error : WSAECONNREFUSED);
+        SaveLastError();
+        return -1;
+    }
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *) &so_error, &len) == 0 && so_error != 0) {
+        WSASetLastError(so_error);
+        SaveLastError();
+        return -1;
+    }
+    return 0;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_configureNonBlocking
         (JNIEnv *e, jclass cl, jint fd) {
     u_long mode = 1;
