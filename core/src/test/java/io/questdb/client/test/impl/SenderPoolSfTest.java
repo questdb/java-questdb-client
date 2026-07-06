@@ -43,7 +43,6 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -109,7 +108,12 @@ public class SenderPoolSfTest {
                     PooledSender a = pool.borrow();
                     PooledSender b = pool.borrow();
                     try {
-                        Assert.assertNotSame("two borrows must be distinct wrappers", a, b);
+                        // borrow() allocates a fresh PooledSender wrapper on every
+                        // call, so comparing the wrappers is vacuously true.
+                        // Distinctness of the two borrowed senders lives in the
+                        // underlying slots (mirrors SenderPoolTest.slotOf usage).
+                        Assert.assertNotSame("two borrows must hold distinct slots",
+                                slotOf(a), slotOf(b));
                         Assert.assertTrue("slot default-0 must exist", Files.exists(slot("default-0")));
                         Assert.assertTrue("slot default-1 must exist", Files.exists(slot("default-1")));
                         Assert.assertEquals("exactly two slot dirs", 2, countSlotDirs());
@@ -207,7 +211,10 @@ public class SenderPoolSfTest {
                     first.close();
                     PooledSender second = pool.borrow();
                     try {
-                        Assert.assertSame("returned slot must be recycled", first, second);
+                        // borrow() now returns a fresh wrapper each time; the
+                        // recycled thing is the underlying slot.
+                        Assert.assertSame("returned slot must be recycled",
+                                getField(first, "slot"), getField(second, "slot"));
                         Assert.assertEquals("no new slot dir on recycle", 1, countSlotDirs());
                         Assert.assertTrue(Files.exists(slot("default-0")));
                     } finally {
@@ -405,8 +412,17 @@ public class SenderPoolSfTest {
 
     @Test
     public void testCloseReleasesAllSlots() throws Exception {
-        // After the pool closes, every slot flock must be released so the
-        // dirs can be re-acquired -- by a fresh pool or a standalone sender.
+        // After the pool closes AND every lease has come home, every slot
+        // flock must be released so the dirs can be re-acquired -- by a fresh
+        // pool or a standalone sender.
+        //
+        // Note the ordering contract (C1): pool.close() itself never tears
+        // down a BORROWED delegate -- a producer thread could be inside it,
+        // and freeing its native buffers mid-append would be a
+        // use-after-free/SEGV. A lease still outstanding when close() gives
+        // up keeps its flock until the lease is closed, at which point the
+        // returning thread tears the delegate down (retireLease) and releases
+        // the flock.
         TestUtils.assertMemoryLeak(() -> {
             CountingAckHandler handler = new CountingAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -414,12 +430,20 @@ public class SenderPoolSfTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                // Short acquire timeout: it doubles as close()'s bounded
+                // lease-wait budget, which this test intentionally exhausts.
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                SenderPool pool = new SenderPool(config, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
+                SenderPool pool = new SenderPool(config, 2, 2, 300, Long.MAX_VALUE, Long.MAX_VALUE);
                 PooledSender a = pool.borrow();
                 PooledSender b = pool.borrow();
-                // Leave them borrowed: close() must still release their flocks.
+                // Close with both leases outstanding: close() waits out its
+                // budget, then returns WITHOUT touching the borrowed
+                // delegates (their flocks stay held -- leak over SEGV).
                 pool.close();
+                // The leases come home after close: each returning thread
+                // tears down its own delegate, releasing the slot flock.
+                a.close();
+                b.close();
 
                 // A fresh pool over the same dirs must re-acquire slot 0 and 1.
                 try (SenderPool reopened = new SenderPool(config, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
@@ -1883,9 +1907,12 @@ public class SenderPoolSfTest {
     }
 
     private static Sender getDelegate(PooledSender ps) throws Exception {
-        Field f = PooledSender.class.getDeclaredField("delegate");
+        Field slotF = PooledSender.class.getDeclaredField("slot");
+        slotF.setAccessible(true);
+        Object slot = slotF.get(ps);
+        Field f = slot.getClass().getDeclaredField("delegate");
         f.setAccessible(true);
-        return (Sender) f.get(ps);
+        return (Sender) f.get(slot);
     }
 
     // Invokes one of the pool's private managed-slot delegate factories
@@ -1925,33 +1952,36 @@ public class SenderPoolSfTest {
         return f.get(target);
     }
 
+    // Reads the package-private PooledSender.slot -- the identity that the pool
+    // actually recycles. Wrapper identity is useless for aliasing checks because
+    // borrow() allocates a fresh wrapper every call (mirrors SenderPoolTest and
+    // SenderPoolErrorSafetyTest).
+    private static Object slotOf(PooledSender pooledWrapper) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("slot");
+        f.setAccessible(true);
+        return f.get(pooledWrapper);
+    }
+
     private static void invokeDiscardBroken(SenderPool pool, PooledSender ps) throws Exception {
         Method m = SenderPool.class.getDeclaredMethod("discardBroken", PooledSender.class);
         m.setAccessible(true);
         m.invoke(pool, ps);
     }
 
-    // Reaches the package-private senderFactory test seam by reflection so a
-    // test can inject a fake/forged delegate (mirrors SenderPoolErrorSafetyTest).
+    // Uses the @TestOnly senderFactory seam so a test can inject a fake/forged
+    // delegate (mirrors SenderPoolErrorSafetyTest).
     private static SenderPool newPoolWithFactory(
             String cfg, int min, int max, long acquireMs, IntFunction<Sender> senderFactory
-    ) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class, IntFunction.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
+    ) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
     }
 
-    // Reaches the package-private 8-arg constructor (deferStartupRecovery=true)
-    // by reflection so a test can build a pool whose SF startup recovery is NOT
-    // run inline -- mirroring the pooled QuestDB handle, which defers it to the
-    // housekeeper. senderFactory=null -> the real defaultSender().
-    private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                IntFunction.class, boolean.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
+    // Uses the @TestOnly 8-arg constructor (deferStartupRecovery=true) so a test
+    // can build a pool whose SF startup recovery is NOT run inline -- mirroring
+    // the pooled QuestDB handle, which defers it to the housekeeper.
+    // senderFactory=null -> the real defaultSender().
+    private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
     }
 
     // Drives a deferred pool's startup recovery to completion (the housekeeper
@@ -1982,12 +2012,8 @@ public class SenderPoolSfTest {
     // test can drive the housekeeper recovery path against fully controlled
     // (fake) recoverers.
     private static SenderPool newDeferredPoolWithFactory(
-            String cfg, int min, int max, long acquireMs, IntFunction<Sender> factory) throws Exception {
-        Constructor<SenderPool> c = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                IntFunction.class, boolean.class);
-        c.setAccessible(true);
-        return c.newInstance(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
+            String cfg, int min, int max, long acquireMs, IntFunction<Sender> factory) {
+        return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
     }
 
     // Fake Sender whose drain() (for slot 0 only) parks until released, opening a

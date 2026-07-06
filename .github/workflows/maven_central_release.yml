@@ -2,7 +2,7 @@ name: Release to Maven Central
 
 # Release model (immutable-safe, verify-before-push):
 #
-#   resolve -> build x5 -> verify -> publish (gated) -> open-bump-pr
+#   resolve -> build x4 -> verify -> publish (gated) -> open-bump-pr
 #
 #   * Nothing irreversible (git tag push, Maven Central publish) happens until
 #     the full test suite has passed against the freshly built native libraries
@@ -150,15 +150,13 @@ jobs:
   build-macos:
     needs: resolve
     strategy:
-      # Build both macOS targets to completion so a failure reports per-arch instead
-      # of cancelling the sibling; publish needs both anyway.
+      # Only darwin-aarch64 is shipped. darwin-x86-64 was dropped: no CI runs the
+      # test suite on x64 macOS, so we will not publish a binary we cannot test.
       fail-fast: false
       matrix:
         include:
           - os: macos-14
             platform: darwin-aarch64
-          - os: macos-15-intel
-            platform: darwin-x86-64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -295,6 +293,8 @@ jobs:
             echo "::error::libquestdb.so has unresolved dependencies."
             exit 1
           fi
+          # Refuse to ship if a symbol raised the glibc floor above 2.14.
+          ./.github/scripts/check-glibc-floor.sh "$lib" 2.14
           cat > LoadCheck.java <<'EOF'
           public class LoadCheck {
               public static void main(String[] args) {
@@ -360,6 +360,8 @@ jobs:
             echo "::error::libquestdb.so has unresolved dependencies."
             exit 1
           fi
+          # 2.17 is the lowest floor glibc offers on aarch64.
+          ./.github/scripts/check-glibc-floor.sh "$lib" 2.17
           cat > LoadCheck.java <<'EOF'
           public class LoadCheck {
               public static void main(String[] args) {

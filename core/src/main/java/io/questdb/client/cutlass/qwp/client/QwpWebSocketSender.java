@@ -39,6 +39,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -72,6 +73,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * QWP v1 WebSocket client sender for streaming data to QuestDB.
@@ -127,6 +129,9 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_AUTO_FLUSH_BYTES = 8 * 1024 * 1024;
     public static final long DEFAULT_AUTO_FLUSH_INTERVAL_NANOS = 100_000_000L; // 100ms
     public static final int DEFAULT_AUTO_FLUSH_ROWS = 1_000;
+    // Finite fallback (ms) for BACKGROUND (drainer) TCP connects when the
+    // user left connect_timeout unset. See effectiveConnectTimeoutMs.
+    public static final int DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS = 15_000;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -148,12 +153,29 @@ public class QwpWebSocketSender implements Sender {
     private final List<Endpoint> endpoints;
     // Global symbol dictionary for delta encoding
     private final GlobalSymbolDictionary globalSymbolDictionary;
+    // Serializes FOREGROUND connect walks only (see buildAndConnect): the
+    // shared-round state in hostTracker (pickNext/beginRound/attempted
+    // bits), roundSeq, roundConnectAttemptSeq, and the foreground lifecycle
+    // commits (currentEndpointIdx, hasEverConnected, cap-derived sizing)
+    // all have exactly one writer -- the foreground walk -- and foreground
+    // walks cannot overlap by construction (the I/O loop is single-threaded
+    // and the user-thread initial connect completes before the loop
+    // starts); the lock is cheap insurance for that invariant. Background
+    // (drainer) walks take NO lock at all: they walk a private
+    // QwpHostHealthTracker.RoundCursor and record health-only results, so
+    // no network I/O ever runs under a sender-wide lock for background
+    // work, and neither the foreground's reconnect nor close() can queue
+    // behind a drainer's endpoint walk.
+    private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
     private MicrobatchBuffer activeBuffer;
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
+    // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
+    // the OS connect timeout. Applied to every WebSocketClient before connect.
+    private int connectTimeoutMs = 0;
     // Double-buffering for async I/O
     private MicrobatchBuffer buffer0;
     // Cached column references to avoid repeated hashmap lookups
@@ -161,6 +183,12 @@ public class QwpWebSocketSender implements Sender {
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
     // WebSocket client (zero-GC native implementation)
     private WebSocketClient client;
+    // Test seam: when non-null, buildAndConnect obtains its per-attempt
+    // client here instead of WebSocketClientFactory, so JVM-error cleanup
+    // tests can observe close() on a client whose connect() throws Error.
+    // Null in production; set reflectively by tests.
+    @TestOnly
+    private volatile java.util.function.Supplier<WebSocketClient> clientFactoryOverride;
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
@@ -193,6 +221,11 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
+    // User-supplied observer for background orphan-slot drainer events.
+    // Volatile: written by setDrainerListener (any thread, before or after
+    // startOrphanDrainers) and read at pool-creation time. Null -> drainers
+    // run without a listener.
+    private volatile BackgroundDrainerListener drainerListener;
     // Orphan-slot drainer pool. Non-null only when the builder requested
     // drain_orphans=true AND we have a slot path to scan against. Closed
     // alongside the cursor send loop in close().
@@ -208,7 +241,8 @@ public class QwpWebSocketSender implements Sender {
     // advertised X-QWP-Max-Batch-Size at handshake so the wire payload stays
     // under the server's cap even with encoding overhead. Volatile because the
     // I/O thread writes this inside buildAndConnect on every successful
-    // (re)connect while the producer thread reads it from sendRow without
+    // FOREGROUND (re)connect -- background drainer connects never touch it --
+    // while the producer thread reads it from sendRow without
     // holding the sender monitor.
     private volatile int effectiveAutoFlushBytes;
     private SenderErrorDispatcher errorDispatcher;
@@ -219,18 +253,27 @@ public class QwpWebSocketSender implements Sender {
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
     private boolean hasDeferredMessages;
-    // Stickys true once any successful connect has happened. Drives the
+    // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
+    // published, or -1 when none. Frames above it are deferred and uncommitted:
+    // the server withholds their acks by design (their rows are rolled back on
+    // any error, demote, or disconnect), so close-time drains must never wait
+    // for them. Updated on every non-deferred publish; combined with the
+    // engine's recovered boundary in drainOnClose.
+    private long lastCommitBoundaryFsn = -1L;
+    // Stickys true once any successful FOREGROUND connect has happened
+    // (background drainer connects never set it). Drives the
     // CONNECTED-vs-RECONNECTED-vs-FAILED_OVER classification at the success
     // point in buildAndConnect.
     private boolean hasEverConnected;
     // OFF   → startup connect failure is immediately terminal (default).
-    // SYNC  → startup connect goes through the same retry-with-backoff
-    //         loop as in-flight reconnect; auth failures still terminal.
+    // SYNC  → startup connect retries with backoff on the user thread,
+    //         bounded by reconnect_max_duration_millis; auth failures
+    //         still terminal.
     // ASYNC → user thread does not connect at all. The I/O thread runs
-    //         the same retry loop in the background; terminal failures
-    //         (auth/upgrade reject, budget exhaustion) are delivered
-    //         to the SenderError dispatcher rather than thrown from the
-    //         constructor.
+    //         the reconnect loop in the background, indefinitely
+    //         (Invariant B); terminal failures (auth/upgrade reject)
+    //         are delivered to the SenderError dispatcher rather than
+    //         thrown from the constructor.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
@@ -245,6 +288,13 @@ public class QwpWebSocketSender implements Sender {
     // Async-delivery sink for ack-watermark advances. Default no-op; a
     // setProgressHandler call before connect() swaps in a real handler.
     private SenderProgressHandler progressHandler = DefaultSenderProgressHandler.INSTANCE;
+    // Poison-frame detector threshold forwarded to the cursor send loop and to
+    // every background drainer (connect-string key max_frame_rejections).
+    private int maxFrameRejections = CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
+    // Minimum wall-clock dwell before poison escalation, forwarded alongside
+    // maxFrameRejections (connect-string key poison_min_escalation_window_millis).
+    private long poisonMinEscalationWindowMillis =
+            CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -255,8 +305,9 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private boolean requestDurableAck;
     // Monotonic per-attempt counter snapshotted onto every connection event
-    // fired from buildAndConnect. Counts every endpoint try -- successes and
-    // failures alike -- across this sender's lifetime.
+    // fired from buildAndConnect. Counts every FOREGROUND endpoint try --
+    // successes and failures alike -- across this sender's lifetime.
+    // Background (drainer) walks fire no events and do not advance it.
     private long roundConnectAttemptSeq;
     // Monotonic per-round counter incremented inside buildAndConnect on each
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
@@ -267,7 +318,8 @@ public class QwpWebSocketSender implements Sender {
     // arbitrarily large datasets that exceed the server's recv buffer.
     private boolean transactional;
     // Server-advertised hard cap on QWP ingest payload bytes, captured from
-    // X-QWP-Max-Batch-Size on each successful handshake. 0 when the server
+    // X-QWP-Max-Batch-Size on each successful FOREGROUND handshake (a
+    // background drainer's endpoint cap is irrelevant to the producer's wire). 0 when the server
     // did not advertise the header (older builds); the sender then falls back
     // to its locally configured budget. Volatile because buildAndConnect can
     // refresh this from the cursor I/O thread on a mid-stream reconnect while
@@ -577,12 +629,13 @@ public class QwpWebSocketSender implements Sender {
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
                 durableAckKeepaliveIntervalMillis, authTimeoutMs,
-                null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
+                0, null, SenderConnectionDispatcher.DEFAULT_CAPACITY);
     }
 
     /**
      * Multi-endpoint variant that also accepts the async connection-event
-     * listener and its dispatcher inbox capacity.
+     * listener and its dispatcher inbox capacity. Uses the default
+     * poison-frame detector threshold.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -602,8 +655,50 @@ public class QwpWebSocketSender implements Sender {
             int errorInboxCapacity,
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs,
+            int connectTimeoutMs,
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
+    ) {
+        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeader, requestDurableAck,
+                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS);
+    }
+
+    /**
+     * Master connect overload — also accepts the poison-frame detector
+     * threshold ({@code max_frame_rejections}): consecutive server-active
+     * rejections of the same head-of-line frame, with no ack progress in
+     * between, before the loop escalates to a typed terminal.
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -613,11 +708,14 @@ public class QwpWebSocketSender implements Sender {
         try {
             sender.requestDurableAck = requestDurableAck;
             sender.authTimeoutMs = authTimeoutMs;
+            sender.connectTimeoutMs = connectTimeoutMs;
             sender.closeFlushTimeoutMillis = closeFlushTimeoutMillis;
             sender.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
             sender.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
             sender.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
             sender.durableAckKeepaliveIntervalMillis = durableAckKeepaliveIntervalMillis;
+            sender.maxFrameRejections = maxFrameRejections;
+            sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
@@ -918,6 +1016,31 @@ public class QwpWebSocketSender implements Sender {
         return this;
     }
 
+    /**
+     * Closes the sender: flushes user-thread state into the engine, drains
+     * acked data within {@code close_flush_timeout}, stops the I/O loop,
+     * closes the orphan-drainer pool, and frees buffers.
+     * <p>
+     * Worst-case latency budget (dominant contributors, sequential):
+     * <ul>
+     *   <li>bounded drain: up to {@code close_flush_timeout} when the server
+     *       is slow or unreachable ({@code <= 0} opts out);</li>
+     *   <li>I/O loop stop: the shutdown-latch await is untimed, but the loop
+     *       exits promptly unless the I/O thread sits inside a blocking
+     *       native connect — bounded by {@code connect_timeout}, or by the
+     *       OS SYN-retry deadline (60-130s on Linux) when the default
+     *       {@code 0} is in effect. Background drainer walks never delay
+     *       this stop: they run lock-free on private round cursors and
+     *       never hold anything the foreground waits on (see
+     *       {@link #buildAndConnect});</li>
+     *   <li>drainer pool: drainers still in their connect-retry phase are
+     *       stop-signaled immediately (exit within ~50ms); drainers actively
+     *       replaying frames get a 2.5s grace window plus a 0.5s stop window
+     *       — worst case ~3s when a drainer sits in a blocking native
+     *       connect (15s background deadline) and must be abandoned to exit
+     *       on its own.</li>
+     * </ul>
+     */
     @Override
     public void close() {
         if (!closed) {
@@ -960,6 +1083,9 @@ public class QwpWebSocketSender implements Sender {
                     }
                     if (activeBuffer != null && activeBuffer.hasData()) {
                         sealAndSwapBuffer();
+                        if (!deferCommit) {
+                            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+                        }
                     }
                     // 2) Safety-net rethrow: surface the latched terminal
                     //    error only when no other channel has already
@@ -971,9 +1097,9 @@ public class QwpWebSocketSender implements Sender {
                     //    user-installed custom handler
                     //    (hasDeliveredTerminalToCustomHandler, checked here).
                     //    The test is terminal-specific on purpose: an earlier
-                    //    routine DROP_AND_CONTINUE rejection delivered to the
-                    //    handler must NOT suppress a later genuine HALT
-                    //    terminal (the "any error ever" flag did, silently
+                    //    routine RETRIABLE rejection delivered to the
+                    //    handler must NOT suppress a later genuine TERMINAL
+                    //    error (the "any error ever" flag did, silently
                     //    losing it). It also stays false when the terminal
                     //    reached only the default handler after a
                     //    setErrorHandler(null) revert, or is still
@@ -1014,10 +1140,14 @@ public class QwpWebSocketSender implements Sender {
                     terminalError = captureCloseError(terminalError, e);
                 }
             }
-            // Drainer pool runs after the foreground I/O loop is wound
-            // down — drainers don't share state with the foreground, so
-            // ordering doesn't matter for correctness, just predictable
-            // shutdown.
+            // Drainer pool closes after the foreground I/O loop is wound
+            // down. Drainers share buildAndConnect's endpoint walk and
+            // hostTracker state with the foreground (never its observable
+            // connection state or event stream), but their
+            // connect gate is their own stop flag — NOT the foreground
+            // loop's liveness — so the pool's graceful-drain window below
+            // still lets in-flight drainers finish (including reconnects)
+            // even though cursorSendLoop is already stopped.
             if (drainerPool != null) {
                 try {
                     drainerPool.close();
@@ -1048,6 +1178,27 @@ public class QwpWebSocketSender implements Sender {
                 // The I/O thread may still be using the socket and microbatch
                 // buffers. Freeing them would risk SIGSEGV.
                 LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
+                // The engine, however, need not leak: delegate its close to
+                // the I/O thread's exit path, which runs it strictly after
+                // the thread's last engine access — the mapping and slot
+                // lock release as soon as the stuck wire call resolves
+                // (bounded by OS timeouts). slotLockReleased intentionally
+                // stays false: the lock is released only when the delegated
+                // close actually runs, so the pool must not reuse the slot
+                // meanwhile. A false return means the thread exited between
+                // the failed close() and now — then closing here is safe.
+                if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null
+                        && !cursorSendLoop.delegateEngineClose()) {
+                    try {
+                        cursorEngine.close();
+                    } catch (Throwable t) {
+                        LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                        terminalError = captureCloseError(terminalError, t);
+                    }
+                    cursorEngine = null;
+                    ownsCursorEngine = false;
+                    slotLockReleased = true;
+                }
                 rethrowTerminal(terminalError);
                 return;
             }
@@ -1382,6 +1533,13 @@ public class QwpWebSocketSender implements Sender {
         }
         if (activeBuffer != null && activeBuffer.hasData()) {
             sealAndSwapBuffer();
+            if (!deferCommit) {
+                // Same residual-seal boundary update as close(): a
+                // non-deferred residual publish is commit-bearing and must be
+                // covered by close-time drains, or drainOnClose would return
+                // before its ack and memory-mode data could be lost on exit.
+                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+            }
         }
         cursorSendLoop.checkError();
         checkConnectionError();
@@ -1404,7 +1562,7 @@ public class QwpWebSocketSender implements Sender {
      * would short-circuit immediately on an empty flush even when prior
      * publishes remain unacknowledged.
      * <p>
-     * Close-time drain ({@link #drainOnClose()}) already uses the same
+     * Close-time drain ({@code #drainOnClose()}) already uses the same
      * watermark approach directly.
      *
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns
@@ -1495,8 +1653,8 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Highest FSN that has been server-acknowledged (or skipped past on a
-     * {@link SenderError.Policy#DROP_AND_CONTINUE} rejection). {@code -1} if
+     * Highest FSN that has been server-acknowledged. Rejections never advance
+     * the watermark. {@code -1} if
      * the I/O loop has not yet started or no batch has been published.
      * <p>
      * Snapshot accessor — for a bounded wait, use
@@ -1726,7 +1884,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total errors observed by the I/O loop (DROP and HALT combined).
+     * Total errors observed by the I/O loop (retriable and terminal combined).
      */
     public long getTotalServerErrors() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -1953,6 +2111,30 @@ public class QwpWebSocketSender implements Sender {
         return new ReconnectSupplier();
     }
 
+    /**
+     * Test seam: a BACKGROUND reconnect factory identical to the ones
+     * {@link #startOrphanDrainers} hands to orphan drainers (abort gate =
+     * the supplied stop flag, {@code isBackground()=true}), so tests can
+     * exercise the background side of the connect-walk lock policy (see
+     * {@link #buildAndConnect}) without reflection.
+     */
+    @TestOnly
+    public CursorWebSocketSendLoop.ReconnectFactory newBackgroundReconnectFactory(
+            java.util.function.BooleanSupplier stopFlag
+    ) {
+        return new ReconnectSupplier(stopFlag, "drainer stop requested during connect");
+    }
+
+    /**
+     * Test seam: installs the per-attempt WebSocket client factory override
+     * consulted by {@code newWebSocketClient()} inside the connect walk.
+     * Production code never sets it.
+     */
+    @TestOnly
+    public void setClientFactoryOverride(java.util.function.Supplier<WebSocketClient> factory) {
+        this.clientFactoryOverride = factory;
+    }
+
     @Override
     public void reset() {
         checkNotClosed();
@@ -2033,6 +2215,33 @@ public class QwpWebSocketSender implements Sender {
         }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
+    }
+
+    /**
+     * Register an async observer for background orphan-slot drainer events.
+     * May be called either before or after {@link #startOrphanDrainers} —
+     * when called before, the drainer pool picks it up as its submit-time
+     * default; when called after, it propagates to the pool AND to every
+     * live drainer (per-drainer re-assignment while running is explicitly
+     * permitted by the drainer's listener contract). Pass {@code null} to
+     * clear. {@code synchronized} to coordinate with
+     * {@code startOrphanDrainers}: a concurrent submit either observes the
+     * pool listener already set or is covered by the snapshot propagation.
+     */
+    public synchronized void setDrainerListener(BackgroundDrainerListener listener) {
+        this.drainerListener = listener;
+        BackgroundDrainerPool pool = drainerPool;
+        if (pool != null) {
+            // Submit-time fallback for drainers not yet submitted...
+            pool.setListener(listener);
+            // ...and direct re-assignment for the ones already running (the
+            // pool listener is only applied at submit time, never after).
+            ObjList<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer> live =
+                    pool.snapshot();
+            for (int i = 0, n = live.size(); i < n; i++) {
+                live.getQuick(i).setListener(listener);
+            }
+        }
     }
 
     /**
@@ -2133,18 +2342,44 @@ public class QwpWebSocketSender implements Sender {
         if (drainerPool == null) {
             drainerPool = new io.questdb.client.cutlass.qwp.client.sf.cursor
                     .BackgroundDrainerPool(maxBackgroundDrainers);
+            // Install the user listener as the pool's submit-time default so
+            // the drainers submitted below observe it from their first event.
+            drainerPool.setListener(this.drainerListener);
         }
         for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
             String slot = orphanSlotPaths.get(i);
+            // The drainer's connects must NOT be gated on the foreground
+            // sender's lifecycle: close() stops the foreground I/O loop
+            // BEFORE the drainer pool's graceful-drain window, so a
+            // foreground-gated factory would reject every drainer
+            // (re)connect with "sender closed during connect" during that
+            // window, leaving the orphan slot un-drained (and Invariant B
+            // forbids quarantining it on a transport-shaped error). Gate
+            // each drainer's factory on the drainer's OWN stop flag
+            // instead. The one-element array breaks the construction cycle
+            // (the factory needs the drainer, the drainer's constructor
+            // needs the factory); the ref write happens-before the drainer
+            // runs because submit() publishes the task afterwards.
+            final io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[] ref =
+                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[1];
+            ReconnectSupplier factory = new ReconnectSupplier(
+                    () -> {
+                        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer d = ref[0];
+                        return d != null && d.isStopRequested();
+                    },
+                    "drainer stop requested during connect");
             io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
                     new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
-                            newReconnectFactory(),
+                            factory,
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,
                             reconnectMaxBackoffMillis,
                             requestDurableAck,
-                            durableAckKeepaliveIntervalMillis);
+                            durableAckKeepaliveIntervalMillis,
+                            maxFrameRejections,
+                            poisonMinEscalationWindowMillis);
+            ref[0] = drainer;
             drainerPool.submit(drainer);
         }
     }
@@ -2282,7 +2517,7 @@ public class QwpWebSocketSender implements Sender {
      * True iff this sender has at least once installed a live (connected
      * + upgraded) WebSocket. Sticky — once true, stays true even after a
      * subsequent disconnect. Lets a {@link SenderErrorHandler}
-     * disambiguate a "never reached the server" budget exhaustion (likely
+     * disambiguate a "never reached the server" terminal failure (likely
      * a config typo or firewall block) from a "lost connection after we
      * were up" failure (likely transient). Returns {@code false} if no
      * I/O loop is running.
@@ -2389,25 +2624,150 @@ public class QwpWebSocketSender implements Sender {
         sendRow();
     }
 
-    private synchronized WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+    /**
+     * Resolves the connect timeout for one {@code buildAndConnect} walk.
+     * Foreground connects honour the configured value verbatim: 0 (the
+     * default) keeps the historical untimed native connect, bounded only by
+     * the OS (SYN retries, 60-130s on Linux). Background (drainer) connects
+     * get a finite fallback instead: during an outage a drainer is routinely
+     * parked inside a blocking native connect that neither unpark nor
+     * interrupt cancels, so the drainer pool's shutdownNow path (~3s into
+     * sender.close()) reliably lands on the failed-stop protocol -- the
+     * WebSocket client and microbatch buffers are deliberately leaked and
+     * the slot lock is held until the OS deadline resolves the connect. A
+     * finite background deadline bounds that window to seconds without
+     * changing foreground semantics. Exposed for unit tests.
+     */
+    @TestOnly
+    public static int effectiveConnectTimeoutMs(boolean background, int configuredMs) {
+        return background && configuredMs <= 0 ? DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS : configuredMs;
+    }
+
+    /**
+     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
+     * Production path delegates to {@link WebSocketClientFactory}; tests may
+     * install {@link #clientFactoryOverride} to substitute a stub.
+     */
+    /**
+     * Best-effort close for a client being abandoned because a JVM Error is
+     * about to be rethrown: under OOM {@code close()} itself can throw, and a
+     * secondary failure must not mask the original Error. {@code close()} is
+     * CAS-gated, so re-closing an already-closed client is a no-op.
+     */
+    private static void closeQuietlyOnError(WebSocketClient client) {
+        try {
+            client.close();
+        } catch (Throwable ignored) {
+            // best-effort; the original Error is what must surface
+        }
+    }
+
+    private WebSocketClient newWebSocketClient() {
+        java.util.function.Supplier<WebSocketClient> override = clientFactoryOverride;
+        if (override != null) {
+            return override.get();
+        }
+        return tlsConfig != null
+                ? WebSocketClientFactory.newTlsInstance(tlsConfig)
+                : WebSocketClientFactory.newPlainTextInstance();
+    }
+
+    /**
+     * Multi-endpoint connect walk shared by the foreground sender and the
+     * background orphan drainers. One invocation sweeps the endpoint list,
+     * performing a TCP/TLS connect plus a WebSocket upgrade per endpoint;
+     * worst-case sweep duration is
+     * {@code endpoints x (connect timeout + upgrade timeout)}:
+     * <ul>
+     *   <li>foreground walk: {@code connect_timeout} verbatim -- the default
+     *       {@code 0} keeps the untimed native connect, bounded only by the
+     *       OS SYN-retry deadline (60-130s per endpoint on Linux) -- plus
+     *       {@code auth_timeout_ms} (default 15s) for the upgrade;</li>
+     *   <li>background walk: 15s connect fallback
+     *       ({@link #DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS}) plus
+     *       {@code auth_timeout_ms} -- see
+     *       {@link #effectiveConnectTimeoutMs(boolean, int)}.</li>
+     * </ul>
+     * <p>
+     * Concurrency policy -- no network I/O under a sender-wide lock for
+     * background work. FOREGROUND walks (the producer's initial connect and
+     * the I/O loop's reconnects) hold {@link #connectWalkLock} across the
+     * sweep: they own the shared round state and the lifecycle commits, and
+     * can only ever wait behind another foreground walk (which cannot
+     * happen by construction -- the lock is insurance). BACKGROUND (drainer)
+     * walks take NO lock: each sweeps a private
+     * {@link QwpHostHealthTracker.RoundCursor} -- full sweep, claim-at-pick,
+     * ordered by the live shared health state -- and records results with
+     * the health-only overloads ({@code markRoundAttempted=false}), so
+     * concurrent drainer sweeps proceed in parallel with each other and
+     * with the foreground, share health observations, and can neither
+     * consume nor poison the foreground's round. The foreground's
+     * reconnect and {@code close()} paths are therefore never queued
+     * behind a drainer's endpoint walk.
+     */
+    private WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+        if (ctx.isBackground()) {
+            // Lock-free: the walk below touches only internally-synchronized
+            // hostTracker health state and walk-local/cursor-local state on
+            // the background path.
+            return connectWalk(ctx);
+        }
+        connectWalkLock.lock();
+        try {
+            return connectWalk(ctx);
+        } finally {
+            connectWalkLock.unlock();
+        }
+    }
+
+    private WebSocketClient connectWalk(ReconnectSupplier ctx) {
+        // Background (drainer) factories share this connect walk -- endpoint
+        // list and hostTracker HEALTH state (never the shared round: a
+        // background sweep walks its own RoundCursor and records with
+        // markRoundAttempted=false, so it cannot consume the foreground's
+        // round or skew roundSeq) -- but must stay INVISIBLE
+        // in the foreground sender's observable state. SenderConnectionEvents
+        // describe the FOREGROUND connection's lifecycle, and the cap-derived
+        // sizing (serverMaxBatchSize / effectiveAutoFlushBytes) guards the
+        // FOREGROUND wire: a drainer connect that committed either would
+        // fabricate lifecycle transitions the foreground never had, steal the
+        // once-per-lifetime CONNECTED classification, and re-size the
+        // producer's batch guard for a connection the producer is not on
+        // (oversize batch -> ws-close[1009] -> poison-frame escalation caused
+        // by background activity).
+        final boolean background = ctx.isBackground();
+        // Private full-sweep cursor for background walks: claim-at-pick over
+        // cursor-local attempted bits makes the pick -> record pair safe
+        // without any walk-wide lock, and guarantees every sweep tries every
+        // endpoint exactly once regardless of concurrent walkers.
+        final QwpHostHealthTracker.RoundCursor cursor =
+                background ? hostTracker.newRoundCursor() : null;
         int previousIdx = ctx.previousIdx;
         if (previousIdx >= 0) {
             // Mid-stream wire failure -- the I/O loop just observed the active
-            // connection drop and called us via the reconnect factory. Surface
-            // a DISCONNECTED event identifying which endpoint just went away
-            // before we start the per-endpoint walk for a replacement.
-            Endpoint priorEp = endpoints.get(previousIdx);
-            dispatchConnectionEvent(
-                    SenderConnectionEvent.Kind.DISCONNECTED,
-                    priorEp.host, priorEp.port,
-                    null, SenderConnectionEvent.NO_PORT,
-                    SenderConnectionEvent.NO_ATTEMPT_NUMBER,
-                    roundSeq,
-                    null);
+            // connection drop and called us via the reconnect factory. Only a
+            // FOREGROUND drop surfaces DISCONNECTED: a drainer's wire drop is
+            // not a foreground outage, and reporting it would claim an outage
+            // against an endpoint the foreground may be healthily using. The
+            // hostTracker health penalty is recorded either way -- the drop
+            // was real, whichever loop observed it.
+            if (!background) {
+                Endpoint priorEp = endpoints.get(previousIdx);
+                dispatchConnectionEvent(
+                        SenderConnectionEvent.Kind.DISCONNECTED,
+                        priorEp.host, priorEp.port,
+                        null, SenderConnectionEvent.NO_PORT,
+                        SenderConnectionEvent.NO_ATTEMPT_NUMBER,
+                        roundSeq,
+                        null);
+            }
             hostTracker.recordMidStreamFailure(previousIdx);
             ctx.previousIdx = -1;
         }
-        if (hostTracker.isRoundExhausted()) {
+        // Shared-round lifecycle is foreground-only: a background walk must
+        // not advance the round (or roundSeq, which numbers foreground
+        // events) under the foreground's feet.
+        if (!background && hostTracker.isRoundExhausted()) {
             roundSeq++;
             hostTracker.beginRound(true);
         }
@@ -2418,42 +2778,60 @@ public class QwpWebSocketSender implements Sender {
         // non-421 WebSocketUpgradeException (4xx/5xx). The catch block walks
         // remaining endpoints in case the failure is per-endpoint, then surfaces
         // this latched typed exception when the round ends without a successful
-        // connect. Auth failures are NOT latched here -- they throw immediately
-        // because a rejected credential is uniformly rejected across the cluster.
+        // connect -- except that a plain non-421 WebSocketUpgradeException is
+        // demoted below role-reject evidence in the epilogue: when any endpoint
+        // answered 421+role in the same sweep, the window is transient and the
+        // retriable role-mismatch classification wins (the demoted error rides
+        // along as a suppressed diagnostic). Auth failures are NOT latched here
+        // -- they throw immediately because a rejected credential is uniformly
+        // rejected across the cluster.
         HttpClientException terminalUpgradeError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
         while (true) {
-            if (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning()) {
-                throw new LineSenderException("sender closed during connect");
+            if (ctx.isAborted()) {
+                throw new LineSenderException(ctx.abortMessage());
             }
-            int idx = hostTracker.pickNext();
+            int idx = background ? cursor.next() : hostTracker.pickNext();
             if (idx < 0) break;
             Endpoint ep = endpoints.get(idx);
             lastEndpoint = ep;
-            long attemptNumber = ++roundConnectAttemptSeq;
-            WebSocketClient newClient = tlsConfig != null
-                    ? WebSocketClientFactory.newTlsInstance(tlsConfig)
-                    : WebSocketClientFactory.newPlainTextInstance();
+            // Attempt numbers exist for foreground observability only. A
+            // background walk fires no events and must not skew the numbering
+            // the user sees on subsequent foreground events.
+            long attemptNumber = background
+                    ? SenderConnectionEvent.NO_ATTEMPT_NUMBER
+                    : ++roundConnectAttemptSeq;
+            WebSocketClient newClient = newWebSocketClient();
             try {
                 newClient.setQwpMaxVersion(QwpConstants.VERSION);
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
+                newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
             } catch (HttpClientException e) {
-                HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
+                // Close BEFORE classify: the sibling catch (Error) below does not
+                // guard catch-arm bodies, so an Error thrown inside classify()
+                // (it allocates on the role-reject/auth paths) would escape with
+                // the client's fd and native buffers open. Safe to reorder --
+                // classify reads only heap fields (upgradeRejectRole/Zone,
+                // upgradeStatusCode) that are set during upgrade() and survive
+                // close().
                 newClient.close();
+                HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
                 if (classified instanceof QwpIngressRoleRejectedException) {
                     QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
-                    hostTracker.recordRoleReject(idx, re.isTransient());
+                    hostTracker.recordRoleReject(idx, re.isTransient(), !background);
                     lastError = re;
                     lastRoleReject = re;
-                    dispatchConnectionEvent(
-                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                            attemptNumber, roundSeq, re);
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, re);
+                    }
                     continue;
                 }
                 if (classified instanceof QwpAuthFailedException) {
@@ -2463,10 +2841,12 @@ public class QwpWebSocketSender implements Sender {
                     // moment the I/O thread gives up, ahead of the producer
                     // thread learning via LineSenderException on the next
                     // API call.
-                    dispatchConnectionEvent(
-                            SenderConnectionEvent.Kind.AUTH_FAILED,
-                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                            attemptNumber, roundSeq, classified);
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.AUTH_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, classified);
+                    }
                     throw classified;
                 }
                 if (terminalUpgradeError == null && (
@@ -2475,74 +2855,122 @@ public class QwpWebSocketSender implements Sender {
                                 && !((WebSocketUpgradeException) classified).isRoleMismatch()))) {
                     terminalUpgradeError = classified;
                 }
-                hostTracker.recordTransportError(idx);
+                hostTracker.recordTransportError(idx, !background);
                 lastError = classified;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, classified);
+                if (!background) {
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, classified);
+                }
                 continue;
             } catch (Exception e) {
                 newClient.close();
-                hostTracker.recordTransportError(idx);
+                hostTracker.recordTransportError(idx, !background);
                 lastError = e;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, e);
-                continue;
-            }
-            if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
-                newClient.close();
-                hostTracker.recordRoleReject(idx, false);
-                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
-                        ep.host, ep.port, null);
-                if (terminalUpgradeError == null) {
-                    terminalUpgradeError = ackErr;
+                if (!background) {
+                    dispatchConnectionEvent(
+                            SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                            ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                            attemptNumber, roundSeq, e);
                 }
-                lastError = ackErr;
-                dispatchConnectionEvent(
-                        SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
-                        ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
-                        attemptNumber, roundSeq, ackErr);
                 continue;
+            } catch (Error e) {
+                // JVM failure (OOM, LinkageError, StackOverflowError) during
+                // connect/upgrade. Without this catch the half-built client
+                // escaped with its fd and native buffers open -- unreachable
+                // by GC, freed only in close(). Close it quietly: under OOM
+                // close() itself can throw, and a secondary failure must not
+                // mask the original Error. Deliberately NO hostTracker penalty
+                // and NO ENDPOINT_ATTEMPT_FAILED event -- a JVM failure is not
+                // endpoint health data, and misclassifying it would poison the
+                // walk. Rethrow: every retry loop upstream (connectWithRetry,
+                // the cursor reconnect loop, BackgroundDrainer) rethrows Error
+                // rather than retrying, so this stays a loud one-shot failure.
+                closeQuietlyOnError(newClient);
+                throw e;
             }
-            int previousLiveIdx = currentEndpointIdx;
-            hostTracker.recordSuccess(idx);
-            ctx.previousIdx = idx;
-            currentEndpointIdx = idx;
-            // Classify the success. CONNECTED only fires once per sender
-            // lifetime; subsequent successes are RECONNECTED (same endpoint
-            // as before) or FAILED_OVER (different endpoint). hasEverConnected
-            // is set after the classification so the very first success picks
-            // CONNECTED before flipping the flag.
-            SenderConnectionEvent.Kind successKind;
-            String prevHost = null;
-            int prevPort = SenderConnectionEvent.NO_PORT;
-            if (!hasEverConnected) {
-                successKind = SenderConnectionEvent.Kind.CONNECTED;
-                hasEverConnected = true;
-            } else if (previousLiveIdx == idx) {
-                successKind = SenderConnectionEvent.Kind.RECONNECTED;
-            } else {
-                successKind = SenderConnectionEvent.Kind.FAILED_OVER;
-                if (previousLiveIdx >= 0) {
-                    Endpoint prevEp = endpoints.get(previousLiveIdx);
-                    prevHost = prevEp.host;
-                    prevPort = prevEp.port;
+            // Guard the post-upgrade tail: from here until newClient is
+            // returned, an escaping JVM Error would leak the CONNECTED
+            // client's fd and native buffers -- the same class the
+            // connect/upgrade catch (Error) arm above closes over. The
+            // success-event dispatch is the realistic trigger: it allocates
+            // the SenderConnectionEvent plus a deque node, and on a clean
+            // first connect it is also the dispatcher's first offer(), which
+            // lazy-starts the dispatcher thread (Thread.start() can itself
+            // fail with OOM). Same contract as the arm above: close quietly
+            // (a secondary failure must not mask the original Error) and
+            // rethrow. close() is CAS-gated, so re-closing after the
+            // durable-ack arm's own close is a no-op.
+            try {
+                if (requestDurableAck && !newClient.isServerDurableAckEnabled()) {
+                    newClient.close();
+                    hostTracker.recordRoleReject(idx, false, !background);
+                    QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
+                            ep.host, ep.port, null);
+                    if (terminalUpgradeError == null) {
+                        terminalUpgradeError = ackErr;
+                    }
+                    lastError = ackErr;
+                    if (!background) {
+                        dispatchConnectionEvent(
+                                SenderConnectionEvent.Kind.ENDPOINT_ATTEMPT_FAILED,
+                                ep.host, ep.port, null, SenderConnectionEvent.NO_PORT,
+                                attemptNumber, roundSeq, ackErr);
+                    }
+                    continue;
                 }
+                hostTracker.recordSuccess(idx, !background);
+                ctx.previousIdx = idx;
+                if (background) {
+                    // Walk bookkeeping only: recordSuccess feeds the shared health
+                    // tracker and ctx.previousIdx arms this factory's own
+                    // mid-stream-failure handling on its next reconnect. No
+                    // lifecycle event, no CONNECTED/RECONNECTED/FAILED_OVER
+                    // classification state, no producer batch re-sizing -- the
+                    // drainer's lifecycle is observable via
+                    // BackgroundDrainerListener and the drainer counters, never
+                    // the foreground connection-event stream.
+                    return newClient;
+                }
+                int previousLiveIdx = currentEndpointIdx;
+                currentEndpointIdx = idx;
+                // Classify the success. CONNECTED only fires once per sender
+                // lifetime; subsequent successes are RECONNECTED (same endpoint
+                // as before) or FAILED_OVER (different endpoint). hasEverConnected
+                // is set after the classification so the very first success picks
+                // CONNECTED before flipping the flag.
+                SenderConnectionEvent.Kind successKind;
+                String prevHost = null;
+                int prevPort = SenderConnectionEvent.NO_PORT;
+                if (!hasEverConnected) {
+                    successKind = SenderConnectionEvent.Kind.CONNECTED;
+                    hasEverConnected = true;
+                } else if (previousLiveIdx == idx) {
+                    successKind = SenderConnectionEvent.Kind.RECONNECTED;
+                } else {
+                    successKind = SenderConnectionEvent.Kind.FAILED_OVER;
+                    if (previousLiveIdx >= 0) {
+                        Endpoint prevEp = endpoints.get(previousLiveIdx);
+                        prevHost = prevEp.host;
+                        prevPort = prevEp.port;
+                    }
+                }
+                dispatchConnectionEvent(
+                        successKind, ep.host, ep.port, prevHost, prevPort,
+                        attemptNumber, roundSeq, null);
+                // Refresh the cap-derived state before returning the new client so
+                // the producer thread observes the new endpoint's advertised
+                // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
+                // on a mid-stream failover leaves the sender sized for the prior
+                // endpoint's cap; an oversize row then escapes the producer-side
+                // guard and trips a wire-level ws-close[1009] downstream.
+                applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
+                return newClient;
+            } catch (Error e) {
+                closeQuietlyOnError(newClient);
+                throw e;
             }
-            dispatchConnectionEvent(
-                    successKind, ep.host, ep.port, prevHost, prevPort,
-                    attemptNumber, roundSeq, null);
-            // Refresh the cap-derived state before returning the new client so
-            // the producer thread observes the new endpoint's advertised
-            // X-QWP-Max-Batch-Size from the next sendRow onwards. Skipping this
-            // on a mid-stream failover leaves the sender sized for the prior
-            // endpoint's cap; an oversize row then escapes the producer-side
-            // guard and trips a wire-level ws-close[1009] downstream.
-            applyServerBatchSizeLimit(newClient.getServerMaxBatchSize());
-            return newClient;
         }
         // Round walked every endpoint without a success. Surface
         // ALL_ENDPOINTS_UNREACHABLE before any of the typed throws so a
@@ -2550,32 +2978,51 @@ public class QwpWebSocketSender implements Sender {
         // which terminal branch fires next. The connectLoop wrapper retries,
         // and each retry that re-enters this method and fails again produces
         // its own ALL_ENDPOINTS_UNREACHABLE event.
-        if (lastEndpoint != null) {
+        if (!background && lastEndpoint != null) {
             dispatchConnectionEvent(
                     SenderConnectionEvent.Kind.ALL_ENDPOINTS_UNREACHABLE,
                     lastEndpoint.host, lastEndpoint.port,
                     null, SenderConnectionEvent.NO_PORT,
                     SenderConnectionEvent.NO_ATTEMPT_NUMBER, roundSeq, lastError);
         }
-        if (terminalUpgradeError != null) {
+        // Role-reject evidence outranks a latched plain non-421 upgrade
+        // error. In a mixed sweep -- e.g. [replica(421+role),
+        // replica(421+role), node(503)] -- the co-occurring 421+role
+        // responses are positive evidence of a transient failover/promotion
+        // window; throwing the latched 5xx/4xx here would misclassify that
+        // window as terminal (dead foreground sender, or a drainer slot
+        // quarantine via BackgroundDrainer markFailed). Only plain
+        // WebSocketUpgradeException is demoted: the typed capability gaps
+        // (QwpVersionMismatchException, QwpDurableAckMismatchException)
+        // extend HttpClientException directly, so they fall through this
+        // check and stay terminal even when replicas role-rejected in the
+        // same sweep -- the contract the durable-ack paragraph below
+        // documents and relies on.
+        if (terminalUpgradeError != null
+                && !(lastRoleReject != null
+                && terminalUpgradeError instanceof WebSocketUpgradeException)) {
             throw terminalUpgradeError;
         }
         if (lastRoleReject != null) {
-            // When the client opted into durable ack but every endpoint
-            // role-rejected the /write/v4 upgrade (typically a misconfigured
-            // address list pointing at replicas only), a primary that can
-            // serve durable ack will not appear by retrying. Throw the typed
-            // QwpDurableAckMismatchException -- the cursor send loop's terminal
-            // classifier recognises it by instanceof and suppresses retry, so
-            // the SYNC/ASYNC connect paths fail fast instead of burning the
-            // full reconnect_max_duration_millis budget walking the same
-            // replicas.
-            if (requestDurableAck) {
-                QwpDurableAckMismatchException ackErr = new QwpDurableAckMismatchException(
-                        lastRoleReject.getHost(), lastRoleReject.getPort(), lastRoleReject.getRole());
-                ackErr.initCause(lastRoleReject);
-                throw ackErr;
-            }
+            // Every endpoint either role-rejected the /write/v4 upgrade or
+            // failed with a demoted non-421 upgrade error: right now the
+            // reachable, role-classified nodes are all replicas (or
+            // primary-catchup). That is a TRANSIENT failover window, not a
+            // terminal condition -- a replica can be promoted and a primary
+            // will reappear. Surface it as a retriable
+            // QwpRoleMismatchException so the SYNC/ASYNC connect and
+            // reconnect loops keep the rows in store-and-forward and retry
+            // within reconnect_max_duration_millis (for an SF sender the only
+            // terminal condition is SF exhaustion).
+            //
+            // This holds even when durable ack was requested: a replica that
+            // gets promoted serves durable ack, so an all-replica window must
+            // NOT be reported as a durable-ack mismatch. Doing so conflated a
+            // transient role state with a permanent capability gap and hard-
+            // failed HA senders that should have recovered on promotion. A
+            // genuine capability gap -- an endpoint that upgrades but does not
+            // advertise durable ack -- is still terminal: it is raised as
+            // terminalUpgradeError above, before this block.
             QwpRoleMismatchException ex = new QwpRoleMismatchException(
                     QwpIngressRoleRejectedException.ROLE_PRIMARY,
                     null,
@@ -2585,6 +3032,11 @@ public class QwpWebSocketSender implements Sender {
                             + "; last observed role=" + lastRoleReject.getRole()
                             + " at " + lastRoleReject.getHost() + ':' + lastRoleReject.getPort());
             ex.initCause(lastRoleReject);
+            if (terminalUpgradeError != null) {
+                // Keep the demoted non-421 upgrade error observable for
+                // diagnostics without changing the surfaced classification.
+                ex.addSuppressed(terminalUpgradeError);
+            }
             throw ex;
         }
         LineSenderException ex = new LineSenderException(lastError);
@@ -2714,7 +3166,22 @@ public class QwpWebSocketSender implements Sender {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
-        long target = cursorEngine.publishedFsn();
+        long published = cursorEngine.publishedFsn();
+        // Never wait for uncommitted deferred frames: the server withholds
+        // their acks by design (FLAG_DEFER_COMMIT rows are rolled back on
+        // error/demote/disconnect and must stay replayable client-side), so a
+        // drain targeting them can only time out. The drain target is the last
+        // commit-bearing frame this session published, or -- for a ring
+        // recovered from disk with no commit published this session -- the
+        // recovered commit boundary.
+        long boundary = Math.max(lastCommitBoundaryFsn, cursorEngine.recoveredCommitBoundaryFsn());
+        long target = Math.min(published, boundary);
+        if (target < published) {
+            LOG.warn("close() abandoning {} uncommitted deferred frame(s) [commitBoundaryFsn={}, publishedFsn={}] "
+                            + "-- their transaction was never committed; the server rolls their rows back. "
+                            + "Call flush() before close() to commit, or ignore if the abort is intentional.",
+                    published - target, target, published);
+        }
         if (cursorEngine.ackedFsn() >= target) {
             return;
         }
@@ -2734,7 +3201,7 @@ public class QwpWebSocketSender implements Sender {
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",
                         closeFlushTimeoutMillis, target, acked);
                 throw new LineSenderException("close() drain timed out after ")
-                        .put(closeFlushTimeoutMillis).put(" ms [publishedFsn=")
+                        .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
                         .put(target).put(", ackedFsn=").put(acked)
                         .put("] - server did not acknowledge ")
                         .put(target - acked)
@@ -2811,8 +3278,9 @@ public class QwpWebSocketSender implements Sender {
                 // version today). Frames written before the first successful
                 // connect commit to V1 because cursor segments are immutable;
                 // a future version bump must account for that. Auth/upgrade
-                // rejects and budget exhaustion are surfaced via the error
-                // inbox by the I/O thread, not thrown here.
+                // rejects are surfaced via the error inbox by the I/O
+                // thread, not thrown here; plain connect failures retry
+                // indefinitely (Invariant B).
                 client = null;
                 break;
             case OFF:
@@ -2836,7 +3304,9 @@ public class QwpWebSocketSender implements Sender {
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
                     requestDurableAck,
-                    durableAckKeepaliveIntervalMillis);
+                    durableAckKeepaliveIntervalMillis,
+                    maxFrameRejections,
+                    poisonMinEscalationWindowMillis);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles
@@ -2854,10 +3324,11 @@ public class QwpWebSocketSender implements Sender {
             }
             cursorSendLoop.setProgressDispatcher(progressDispatcher);
             // Connection-event dispatcher: lets the cursor I/O loop fire
-            // DISCONNECTED on outage entry and RECONNECT_BUDGET_EXHAUSTED on
-            // budget exit. Sender-side fire points (buildAndConnect) write
-            // directly to connectionDispatcher; this getter just shares the
-            // same instance with the loop.
+            // DISCONNECTED on outage entry. Sender-side fire points
+            // (buildAndConnect) write directly to connectionDispatcher; this
+            // getter just shares the same instance with the loop. (Invariant B:
+            // the loop no longer fires a terminal budget-exhaustion event -- it
+            // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
@@ -2991,6 +3462,9 @@ public class QwpWebSocketSender implements Sender {
         sealAndSwapBuffer();
 
         hasDeferredMessages = deferCommit;
+        if (!deferCommit) {
+            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+        }
 
         resetTableBuffersAfterFlush(keys);
     }
@@ -3063,6 +3537,11 @@ public class QwpWebSocketSender implements Sender {
 
         encoder.setDeferCommit(false);
         hasDeferredMessages = deferCommit;
+        if (!deferCommit) {
+            // The last message of the split carried no defer flag -- it
+            // committed the whole group.
+            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+        }
         resetTableBuffersAfterFlush(keys);
     }
 
@@ -3104,6 +3583,7 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
         hasDeferredMessages = false;
+        lastCommitBoundaryFsn = cursorEngine.publishedFsn();
     }
 
     private void resetSymbolDictStateForNewConnection() {
@@ -3326,7 +3806,47 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
+        /**
+         * Optional caller-owned liveness gate. {@code null} means this factory
+         * serves the foreground sender and aborts when the foreground I/O loop
+         * stops. Non-null means the factory serves a {@code BackgroundDrainer}:
+         * the drainer must be able to (re)connect during the sender's close
+         * sequence (the drainer pool's graceful-drain window runs AFTER the
+         * foreground loop is stopped), so its gate is the drainer's own stop
+         * flag, supplied here, instead of the foreground loop's state.
+         */
+        private final java.util.function.BooleanSupplier abortCheck;
+        private final String abortMessage;
         private int previousIdx = -1;
+
+        private ReconnectSupplier() {
+            this(null, null);
+        }
+
+        private ReconnectSupplier(java.util.function.BooleanSupplier abortCheck, String abortMessage) {
+            this.abortCheck = abortCheck;
+            this.abortMessage = abortMessage;
+        }
+
+        String abortMessage() {
+            return abortCheck != null ? abortMessage : "sender closed during connect";
+        }
+
+        /**
+         * True when this factory serves a background drainer. Background
+         * connects share buildAndConnect's endpoint walk and hostTracker
+         * health state, but commit none of the foreground sender's
+         * observable connection state and fire no connection events.
+         */
+        boolean isBackground() {
+            return abortCheck != null;
+        }
+
+        boolean isAborted() {
+            return abortCheck != null
+                    ? abortCheck.getAsBoolean()
+                    : (cursorSendLoop == null ? closed : !cursorSendLoop.isRunning());
+        }
 
         @Override
         public WebSocketClient reconnect() {

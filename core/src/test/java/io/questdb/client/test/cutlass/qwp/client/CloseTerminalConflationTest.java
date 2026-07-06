@@ -49,29 +49,32 @@ import java.util.concurrent.atomic.AtomicReference;
  * keyed its terminal safety-net on a sticky "the custom handler saw ANY error,
  * ever" flag ({@code SenderErrorDispatcher.hasDeliveredToCustomHandler()})
  * rather than "the custom handler owns THIS terminal". A routine
- * {@code DROP_AND_CONTINUE} rejection set that flag permanently, after which a
- * later genuine HALT terminal was silently dropped from every synchronous
+ * {@code RETRIABLE} rejection set that flag permanently, after which a
+ * later genuine TERMINAL error was silently dropped from every synchronous
  * close() channel.
  * <p>
  * This test drives the deterministic, public-API path:
  * <ol>
- *   <li>a {@code WRITE_ERROR} (DROP_AND_CONTINUE) rejection is delivered to a
- *       custom handler — flipping the old "any error ever" flag;</li>
+ *   <li>a {@code WRITE_ERROR} (RETRIABLE) rejection is delivered to a
+ *       custom handler — flipping the old "any error ever" flag; the loop
+ *       recycles the connection and replays the batch, which then parks on
+ *       the server's halt gate;</li>
  *   <li>{@code setErrorHandler(null)} reverts to the loud-not-silent default —
  *       which does NOT reset the sticky flag;</li>
- *   <li>a {@code PARSE_ERROR} (HALT) terminal latches with an unacked tail and
- *       is dispatched only to the default handler.</li>
+ *   <li>a {@code PARSE_ERROR} (TERMINAL) rejection of the replayed frame
+ *       latches with an unacked tail and is dispatched only to the default
+ *       handler.</li>
  * </ol>
  * The old code returned from {@code close()} silently (flag still true ->
  * step-2 safety net skipped, drain took its silent branch). The fix gates on
  * {@code hasDeliveredTerminalToCustomHandler()} — true only when the latched
  * terminal itself reached a custom handler — so close() loudly rethrows the
- * HALT the user never saw.
+ * terminal the user never saw.
  */
 public class CloseTerminalConflationTest {
 
     @Test(timeout = 30_000)
-    public void testCloseSurfacesHaltAfterEarlierDropFlippedTheStickyFlag() throws Exception {
+    public void testCloseSurfacesTerminalAfterEarlierRetriableFlippedTheStickyFlag() throws Exception {
         DropThenGatedHaltHandler server = new DropThenGatedHaltHandler();
         try (TestWebSocketServer ws = new TestWebSocketServer(server)) {
             ws.start();
@@ -86,24 +89,25 @@ public class CloseTerminalConflationTest {
             Sender sender = Sender.builder(cfg).errorHandler(customInbox).build();
             QwpWebSocketSender wss = (QwpWebSocketSender) sender;
             try {
-                // Batch 1: server replies WRITE_ERROR (DROP_AND_CONTINUE). The
-                // loop drops the batch, advances the ack watermark and keeps
-                // running; the dispatch reaches the custom handler -> the old
-                // "delivered to custom handler" flag flips true.
+                // Batch 1: server replies WRITE_ERROR (RETRIABLE). The loop
+                // dispatches to the custom handler (-> the old "delivered to
+                // custom handler" flag flips true), recycles the connection,
+                // and replays batch 1; the replayed frame parks on the
+                // server's halt gate. Nothing is dropped, nothing latches.
                 sender.table("foo").longColumn("v", 1L).atNow();
                 sender.flush();
 
                 Assert.assertTrue(
-                        "precondition: DROP_AND_CONTINUE must reach the custom handler within 10s",
+                        "precondition: the RETRIABLE rejection must reach the custom handler within 10s",
                         customInbox.await(10, TimeUnit.SECONDS));
                 Assert.assertEquals(
                         "precondition: status 0x09 maps to WRITE_ERROR",
                         SenderError.Category.WRITE_ERROR, customInbox.get().getCategory());
                 Assert.assertEquals(
-                        "precondition: WRITE_ERROR defaults to DROP_AND_CONTINUE",
-                        SenderError.Policy.DROP_AND_CONTINUE, customInbox.get().getAppliedPolicy());
+                        "precondition: WRITE_ERROR defaults to RETRIABLE",
+                        SenderError.Policy.RETRIABLE, customInbox.get().getAppliedPolicy());
                 Assert.assertNull(
-                        "precondition: a DROP must NOT latch a terminal error",
+                        "precondition: a RETRIABLE rejection must NOT latch a terminal error",
                         wss.getLastTerminalError());
 
                 // Revert to the loud-not-silent default handler. Per its
@@ -111,23 +115,25 @@ public class CloseTerminalConflationTest {
                 // loud shutdown -- but it does not reset the sticky flag.
                 wss.setErrorHandler(null);
 
-                // Batch 2: published while the HALT is gated, so flush()'s own
-                // checkError() runs clean and nothing is surfaced
-                // synchronously. publishedFsn -> 2, ackedFsn stays at 1 once
-                // the HALT lands -> the unacked-tail precondition for the drain.
+                // Batch 2: published while the TERMINAL is gated, so flush()'s
+                // own checkError() runs clean and nothing is surfaced
+                // synchronously. publishedFsn -> 2, ackedFsn stays at 0 (no
+                // frame was ever acked) -> the unacked-tail precondition for
+                // the drain.
                 sender.table("foo").longColumn("v", 2L).atNow();
                 sender.flush();
 
-                // Release the HALT. It latches the terminal (recordFatal) and
-                // is dispatched ONLY to the default handler -- never to a
-                // custom handler -- so close() must surface it loudly.
+                // Release the gate. The PARSE_ERROR rejection of the replayed
+                // frame latches the terminal (recordFatal) and is dispatched
+                // ONLY to the default handler -- never to a custom handler --
+                // so close() must surface it loudly.
                 server.releaseHalt();
                 awaitLatchedTerminal(wss);
 
                 try {
                     sender.close();
-                    Assert.fail("C1: close() silently dropped a HALT terminal. The custom handler "
-                            + "only ever saw an earlier DROP_AND_CONTINUE, and the terminal went to "
+                    Assert.fail("C1: close() silently dropped a TERMINAL error. The custom handler "
+                            + "only ever saw an earlier RETRIABLE rejection, and the terminal went to "
                             + "the default handler after setErrorHandler(null); close() must rethrow it.");
                 } catch (LineSenderException expected) {
                     // Correct: the unsurfaced terminal is loud on shutdown.
@@ -162,10 +168,11 @@ public class CloseTerminalConflationTest {
     }
 
     /**
-     * First binary frame -> WRITE_ERROR (DROP_AND_CONTINUE) immediately.
-     * Second binary frame -> PARSE_ERROR (HALT), but only once the test
-     * releases the gate, so the rejection reaches the user purely through the
-     * shutdown path (not through flush()'s synchronous checkError()).
+     * First binary frame -> WRITE_ERROR (RETRIABLE) immediately; the client
+     * recycles the connection and replays it. Subsequent frames (the replay,
+     * then batch 2) -> PARSE_ERROR (TERMINAL), but only once the test releases
+     * the gate, so the rejection reaches the user purely through the shutdown
+     * path (not through flush()'s synchronous checkError()).
      */
     private static final class DropThenGatedHaltHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final CountDownLatch haltGate = new CountDownLatch(1);
@@ -177,11 +184,11 @@ public class CloseTerminalConflationTest {
                 long seq = nextSeq.getAndIncrement();
                 if (seq == 0) {
                     client.sendBinary(buildErrorAck(seq,
-                            WebSocketResponse.STATUS_WRITE_ERROR, "test: write error (DROP_AND_CONTINUE)"));
+                            WebSocketResponse.STATUS_WRITE_ERROR, "test: write error (RETRIABLE)"));
                 } else {
                     haltGate.await();
                     client.sendBinary(buildErrorAck(seq,
-                            WebSocketResponse.STATUS_PARSE_ERROR, "test: parse error (HALT)"));
+                            WebSocketResponse.STATUS_PARSE_ERROR, "test: parse error (TERMINAL)"));
                 }
             } catch (IOException | InterruptedException e) {
                 Thread.currentThread().interrupt();

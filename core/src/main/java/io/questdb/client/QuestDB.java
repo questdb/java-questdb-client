@@ -24,8 +24,6 @@
 
 package io.questdb.client;
 
-import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-
 import java.io.Closeable;
 
 /**
@@ -34,37 +32,42 @@ import java.io.Closeable;
  * share across threads.
  * <p>
  * Steady-state allocation is zero: pooled instances are pre-allocated and
- * reused, the per-thread {@link Query} handle is cached in a {@code ThreadLocal},
- * and the {@link Completion} associated with each query is a field on that
- * cached handle.
+ * reused, each borrowed {@link Query} handle is a pre-allocated front bound to
+ * its pool slot, and the {@link Completion} associated with each query is a
+ * field on that handle.
  * <p>
- * Configuration: use {@link #connect(CharSequence)} when the same address list
- * and credentials serve both ingest and egress -- the most common case.
- * Use {@link #connect(CharSequence, CharSequence)} or {@link #builder()} when
- * ingest and egress endpoints differ.
+ * Configuration: one {@code ws}/{@code wss} string describes the whole cluster
+ * (a single {@code addr} server list) and both the ingest and query pools
+ * connect across it. Use {@link #connect(CharSequence)} for the common case, or
+ * {@link #builder()} for pool sizing and the ingest callbacks. To tolerate the
+ * server being down at startup, set {@code lazy_connect=true} in the config
+ * (async ingest + lazy reads; reads stay enabled and connect once the server
+ * is up).
  * <p>
  * Thread safety: instances are safe to share. {@link #borrowSender()} and
- * {@link #query()} may be called concurrently from any thread; the pool
+ * {@link #borrowQuery()} may be called concurrently from any thread; the pool
  * guarantees mutual exclusion of pooled resources.
  */
 public interface QuestDB extends Closeable {
 
     /**
      * Builder for advanced configuration (pool sizes, acquisition timeouts,
-     * differing ingest/egress configs).
+     * ingest callbacks).
      */
     static QuestDBBuilder builder() {
         return new QuestDBBuilder();
     }
 
     /**
-     * Connects with a single configuration string used for both ingest and
-     * egress. The schema must be {@code ws} or {@code wss}: QuestDB ingests and
-     * queries over QWP (the QuestDB WebSocket protocol), so one string
-     * configures both clients.
+     * Connects with a single configuration string for the whole QuestDB cluster,
+     * used for both ingest and egress. The schema must be {@code ws} or
+     * {@code wss}: QuestDB ingests and queries over QWP (the QuestDB WebSocket
+     * protocol), so one string configures both clients. List every cluster node
+     * in a single {@code addr} server list and both pools connect across it.
      * <p>
-     * Use {@link #connect(CharSequence, CharSequence)} or {@link #builder()}
-     * when ingest and egress use different addresses or credentials.
+     * Use {@link #builder()} for pool sizing and the ingest callbacks. To
+     * tolerate the server being down at startup, set {@code lazy_connect=true}
+     * in the config (async ingest + lazy reads, reads still enabled).
      *
      * @param configurationString a {@code ws}/{@code wss} config string (see
      *                            {@link Sender#fromConfig} or
@@ -76,20 +79,29 @@ public interface QuestDB extends Closeable {
     }
 
     /**
-     * Connects with explicit ingest and egress configuration strings.
+     * Borrows a {@link Query} handle from the pool. The caller MUST call
+     * {@link Query#close()} on the returned instance to release it back to the
+     * pool (typically via try-with-resources). The handle leases one pooled
+     * query client (one WebSocket + I/O thread) for the borrow's lifetime;
+     * submit one or more queries on it, then close it.
+     * <p>
+     * Allocation: zero at steady state -- the returned instance is a
+     * pre-allocated handle bound to the leased pool slot.
+     * <p>
+     * Blocking: blocks up to the builder's
+     * {@link QuestDBBuilder#acquireTimeoutMillis(long) acquire timeout} when
+     * the pool is exhausted; throws on timeout.
+     * <p>
+     * Concurrency: a single handle is single-flight. To run queries
+     * concurrently, borrow one handle per concurrent query (up to
+     * {@code query_pool_max}).
      *
-     * @param ingestConfigurationString config for the {@link Sender} pool
-     *                                  ({@link Sender#fromConfig} format)
-     * @param queryConfigurationString  config for the query pool
-     *                                  ({@link io.questdb.client.cutlass.qwp.client.QwpQueryClient#fromConfig} format)
-     * @return a connected QuestDB handle
+     * @return a Query handle leased from the pool; release with
+     * {@link Query#close()}
+     * @throws QueryException if the pool is exhausted beyond the acquire
+     *                        timeout, or if this handle is closed
      */
-    static QuestDB connect(CharSequence ingestConfigurationString, CharSequence queryConfigurationString) {
-        return builder()
-                .ingestConfig(ingestConfigurationString)
-                .queryConfig(queryConfigurationString)
-                .build();
-    }
+    Query borrowQuery();
 
     /**
      * Borrows a {@link Sender} from the pool. The caller MUST call
@@ -122,64 +134,20 @@ public interface QuestDB extends Closeable {
      * query client. Idempotent. Threads currently blocked in
      * {@link #borrowSender()} or {@link Query#submit()} are released with an
      * error.
+     * <p>
+     * Outstanding leases: a borrowed {@link Sender} is never torn down
+     * underneath the thread using it. Instead, close() waits up to the
+     * builder's {@link QuestDBBuilder#acquireTimeoutMillis(long) acquire
+     * timeout} (hard-capped at 5 seconds, so an unbounded acquire timeout can
+     * never hang shutdown) for borrowed senders to be closed; a lease closed
+     * during (or
+     * after) that window is flushed and its connection released safely on the
+     * returning thread, while a lease that is never closed leaks its
+     * connection (logged). Avoid calling close() while holding an unclosed
+     * borrowed sender on the same thread: the lease cannot come home, so the
+     * close stalls for the full timeout and the connection is only released
+     * when that sender is eventually closed.
      */
     @Override
     void close();
-
-    /**
-     * One-shot convenience for queries with no bind parameters. Equivalent to
-     * {@code query().sql(sql).handler(handler).submit()}. Returns the same
-     * thread-local {@link Completion} instance that {@link #query()} would,
-     * so this method is also zero-allocation at steady state.
-     *
-     * @param sql     the SQL text; the buffer is not retained after submit
-     * @param handler the result-batch handler; invoked on the pooled query
-     *                client's I/O thread
-     * @return a single-flight handle for the in-flight query
-     */
-    Completion executeSql(CharSequence sql, QwpColumnBatchHandler handler);
-
-    /**
-     * Allocates a fresh {@link Query} handle. Unlike {@link #query()}, this
-     * does NOT return the per-thread cached instance; every call allocates.
-     * <p>
-     * Use this when one thread needs to hold multiple in-flight queries
-     * concurrently (each {@code submit()} acquires its own worker from the
-     * query pool, so up to {@code queryPoolSize} concurrent queries on a
-     * single thread is fine). For the common case of one query at a time,
-     * prefer {@link #query()} -- it is allocation-free.
-     */
-    Query newQuery();
-
-    /**
-     * Opens a query builder for the calling thread. Returns the same
-     * thread-local instance on every call: callers do not need to cache it
-     * themselves. The returned {@code Query} is in a reset state and is not
-     * thread-safe -- one in-flight query per thread.
-     * <p>
-     * For multiple concurrent in-flight queries from a single thread, use
-     * {@link #newQuery()} instead.
-     */
-    Query query();
-
-    /**
-     * Releases the thread-affine {@link Sender} (if any) currently attached
-     * to the calling thread back to the pool. Call this on threads borrowed
-     * from pools you do not own (for example, Netty event loops) before they
-     * are recycled, to avoid pinning a {@link Sender} for the lifetime of
-     * a thread that no longer needs it.
-     */
-    void releaseSender();
-
-    /**
-     * Returns a {@link Sender} pinned to the calling thread. First call on
-     * a thread takes one from the pool and pins it; subsequent calls on the
-     * same thread return the same instance. The pin is released by
-     * {@link #releaseSender()} or by {@link #close()} on this handle.
-     * <p>
-     * Use this for long-lived, dedicated producer threads where borrow/return
-     * overhead would dominate. For short-lived or event-loop callers, prefer
-     * {@link #borrowSender()}.
-     */
-    Sender sender();
 }

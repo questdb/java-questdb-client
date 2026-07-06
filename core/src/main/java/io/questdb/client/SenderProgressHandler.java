@@ -30,28 +30,15 @@ package io.questdb.client;
  * on {@code QwpWebSocketSender} via {@code setProgressHandler(...)} or on the
  * builder via {@code LineSenderBuilder.progressHandler(...)}.
  *
- * <h2>WARNING -- settled is not durable</h2>
- * {@code ackedFsn} is a <em>settled</em> watermark, not a <em>durable</em> one.
- * A {@code DROP_AND_CONTINUE} server rejection (the default policy for the
- * {@code SCHEMA_MISMATCH} and {@code WRITE_ERROR} categories) advances
- * {@code ackedFsn} past the dropped FSN range exactly as a successful OK
- * does -- the loop cannot leave a dropped FSN unsettled without leaking
- * storage and stalling the wire. This handler therefore CANNOT distinguish
- * a batch that the server committed to the WAL from one that the server
- * discarded.
+ * <h2>Watermark advances only on server acceptance</h2>
+ * {@code ackedFsn} advances exclusively on server OK frames. A server
+ * rejection NEVER advances the watermark: retriable rejections recycle the
+ * connection and replay the batch, terminal rejections halt the sender with
+ * the bytes preserved in the store-and-forward log. There is no drop policy.
  *
- * <p>Code that gates a downstream side effect on {@code onAcked} without
- * also tracking {@link SenderErrorHandler} drops will treat dropped batches
- * as durable. The result is silent data loss: rows discarded by the server
- * are marked "saved" by the user's outbox, locks released, source records
- * deleted, downstream confirmations emitted -- for data that no longer
- * exists on the server.
- *
- * <p>Required pattern when durability matters: register a
- * {@link SenderErrorHandler}, record the {@code [fromFsn, toFsn]} range of
- * every error whose {@code getAppliedPolicy()} is
- * {@link SenderError.Policy#DROP_AND_CONTINUE}, and exclude those FSNs from
- * the "durable" set you derive from the watermark.
+ * <p>Note that in non-durable-ack mode an OK acknowledges server-side commit,
+ * not object-store durability; opt in to durable acks when replication-grade
+ * durability gates downstream side effects.
  *
  * <h2>Watermark semantics</h2>
  * The handler fires only when the watermark <em>advances</em>:
@@ -93,10 +80,9 @@ package io.questdb.client;
 public interface SenderProgressHandler {
     /**
      * Called when the settled watermark advances. Strictly monotonic:
-     * {@code ackedFsn} on call N+1 is greater than on call N. "Settled" covers
-     * both successful OK frames and {@code DROP_AND_CONTINUE} rejections --
-     * see the class javadoc WARNING before treating this as a durability
-     * signal.
+     * {@code ackedFsn} on call N+1 is greater than on call N. The watermark
+     * advances only on server OK frames -- rejections never advance it (see
+     * the class javadoc for durable-ack considerations).
      */
     void onAcked(long ackedFsn);
 }

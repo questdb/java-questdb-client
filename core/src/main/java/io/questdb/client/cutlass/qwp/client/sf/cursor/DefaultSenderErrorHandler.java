@@ -35,10 +35,11 @@ import org.slf4j.LoggerFactory;
  * silence is never the default — connect-string-only users still see errors
  * in their logs.
  *
- * <p>{@link SenderError.Policy#HALT} fires at ERROR level; {@link
- * SenderError.Policy#DROP_AND_CONTINUE} fires at WARN level. Both carry the
+ * <p>{@link SenderError.Policy#TERMINAL} fires at ERROR level; {@link
+ * SenderError.Policy#RETRIABLE} / {@link SenderError.Policy#RETRIABLE_OTHER}
+ * fire at WARN level (the batch is replayed, not lost). All carry the
  * full structured payload (category, status byte, FSN span, table, server
- * message) so the log line is sufficient to dead-letter.
+ * message) so the log line is sufficient for diagnosis.
  */
 public final class DefaultSenderErrorHandler implements SenderErrorHandler {
 
@@ -64,7 +65,7 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
                 e.getMessageSequence(),
                 e.getServerMessage()
         };
-        if (e.getAppliedPolicy() == SenderError.Policy.HALT) {
+        if (e.getAppliedPolicy() == SenderError.Policy.TERMINAL) {
             LOG.error(fmt, args);
         } else {
             LOG.warn(fmt, args);

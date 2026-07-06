@@ -30,6 +30,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
+#include "glibc_compat.h"
 #include "../share/os.h"
 
 #ifdef __APPLE__

@@ -30,7 +30,7 @@ import org.jetbrains.annotations.NotNull;
 /**
  * Thrown from a producer-thread API call (typically {@link Sender#flush()}) when the
  * asynchronous SF send loop has latched a server-side rejection with policy
- * {@link SenderError.Policy#HALT}.
+ * {@link SenderError.Policy#TERMINAL}.
  *
  * <p>The wrapped {@link SenderError} carries the rejection details — category, status byte,
  * server message, FSN span, and (best-effort) table name. Use {@link #getServerError()} to

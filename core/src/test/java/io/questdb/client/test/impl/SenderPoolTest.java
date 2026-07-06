@@ -34,10 +34,7 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Unit tests for the {@link SenderPool} borrow/return semantics. Uses the
@@ -57,26 +54,36 @@ public class SenderPoolTest {
             "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
 
     @Test
-    public void testBorrowReturnRecyclesSameDecorator() {
+    public void testBorrowReturnRecyclesSameDecorator() throws Exception {
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender first = pool.borrow();
             first.close();
             Sender second = pool.borrow();
-            Assert.assertSame("returned decorator should be reused after close()", first, second);
+            // Each borrow is a fresh PooledSender wrapper; what the pool recycles
+            // is the underlying slot, so compare those rather than the handles.
+            Assert.assertSame("returned slot should be recycled after close()",
+                    slotOf(first), slotOf(second));
             second.close();
         }
     }
 
+    private static Object slotOf(Sender pooledWrapper) throws Exception {
+        Field f = PooledSender.class.getDeclaredField("slot");
+        f.setAccessible(true);
+        return f.get(pooledWrapper);
+    }
+
     @Test
-    public void testBrokenSenderIsNotReturnedToPool() {
+    public void testBrokenSenderIsNotReturnedToPool() throws Exception {
         // Borrowing, buffering a row, and then closing forces flush() against
-        // the unreachable address, which throws. The broken wrapper must not
-        // be returned to the pool: its delegate's buffer still holds the
-        // failed row, and on transports with terminal-failure semantics the
-        // delegate is also unusable. Either way, the next borrower must get
-        // a fresh wrapper.
+        // the unreachable address, which throws. The broken slot must not be
+        // returned to the pool: its delegate's buffer still holds the failed
+        // row, and on transports with terminal-failure semantics the delegate
+        // is also unusable. Either way, the next borrower must get a fresh
+        // slot, not the broken one.
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender first = pool.borrow();
+            Object firstSlot = slotOf(first);
             first.table("t").longColumn("v", 1).atNow();
             try {
                 first.close();
@@ -86,11 +93,23 @@ public class SenderPoolTest {
             }
             Sender second = pool.borrow();
             try {
-                Assert.assertNotSame("broken sender must not be handed back to next borrower",
-                        first, second);
+                // borrow() always hands out a FRESH PooledSender wrapper, so
+                // assertNotSame(first, second) on the wrappers is vacuously
+                // true and proves nothing -- it stays true whether or not the
+                // broken slot was discarded. What the pool recycles is the
+                // underlying slot, so a broken slot leaking back to the next
+                // borrower shows up as the SAME slot. Assert the slot differs.
+                Assert.assertNotSame("broken slot must not be handed back to next borrower",
+                        firstSlot, slotOf(second));
             } finally {
-                if (second != first) {
+                // On the failing path (broken slot recycled) second.close()
+                // re-throws, since its delegate's buffer still holds the
+                // failed row; swallow it so the assertion above is what
+                // surfaces rather than this incidental close() failure.
+                try {
                     second.close();
+                } catch (LineSenderException ignored) {
+                    // expected only when the regression is present
                 }
             }
         }
@@ -104,55 +123,46 @@ public class SenderPoolTest {
     }
 
     @Test
-    public void testDiscardBrokenAfterCloseDoesNotMutatePool() {
-        // Race: pool.close() iterates `all` outside the lock to close each
-        // delegate. Concurrently, a borrower's PooledSender.close() sees its
-        // delegate already closed (closed by pool.close()), the flush throws,
-        // broken=true routes to SenderPool.discardBroken -- which previously
-        // called all.remove(s) and delegate.close() unconditionally,
-        // racing the iteration in pool.close() on a non-thread-safe
-        // ArrayList. Possible outcomes: IndexOutOfBoundsException out of
-        // pool.close(), skipped delegate close (native handle leak), or
-        // two threads simultaneously inside delegate.close().
+    public void testLeaseReturnedAfterCloseTearsDownItsOwnDelegate() {
+        // C1: pool.close() must never tear down a borrowed delegate -- a
+        // producer thread may be inside it, and freeing its native buffers
+        // mid-append is a use-after-free / SEGV. close() instead waits
+        // boundedly for the lease and leaves the borrowed slot alive when the
+        // wait times out; the lease's own close() then tears the delegate
+        // down on the returning thread (retireLease): here the buffered row's
+        // flush fails against the dead address, routing through
+        // discardBroken, which removes the slot from `all` and closes the
+        // delegate -- now safe post-close because close()'s teardown loop
+        // only ever touches idle slots.
         //
-        // The fix gates discardBroken on `closed`: once the pool is shutting
-        // down, close()'s teardown loop owns the delegate close and
-        // discardBroken bails before touching `all`.
-        //
-        // Deterministic reproduction: serialise the race onto one thread by
-        // calling pool.close() first (which closes the delegate of every
-        // pooled wrapper), then driving sender.close() second. Without the
-        // fix, sender.close() routes to discardBroken, which removes the
-        // wrapper from `all` post-close -- visible as totalSize dropping
-        // from 1 to 0. With the fix, discardBroken sees closed=true and
-        // bails, leaving `all` untouched.
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+        // acquireTimeout is kept short: it doubles as close()'s bounded
+        // lease-wait budget, which this test intentionally exhausts.
+        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 150, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender s = pool.borrow();
             // A row in the buffer forces flush() to attempt a real HTTP
             // request on close(); against the unreachable DEAD_HTTP target
-            // (and now also against the closed delegate below) flush throws
-            // and routes the wrapper to discardBroken.
+            // flush throws and routes the wrapper to discardBroken.
             s.table("t").longColumn("v", 1L).atNow();
 
             pool.close();
             Assert.assertEquals(
-                    "pool.close() must not clear `all` -- the teardown loop closes delegates in place",
+                    "close() must leave the borrowed slot in place -- teardown belongs to the returning lease",
                     1, pool.totalSize()
             );
 
-            // sender.close() now hits a closed delegate; flush throws; the
-            // PooledSender.close() finally routes to discardBroken.
+            // The lease comes home after close: flush throws (dead address),
+            // and PooledSender.close()'s finally routes to discardBroken ->
+            // retireLease, the delegated single-owner teardown.
             try {
                 s.close();
-            } catch (LineSenderException expected) {
-                // expected: flush against a closed delegate throws.
+                Assert.fail("flush against the dead address with a buffered row must throw");
             } catch (RuntimeException expected) {
-                // some Sender implementations wrap differently; either is fine.
+                // expected: LineSenderException (or a transport-specific wrap)
             }
 
             Assert.assertEquals(
-                    "discardBroken called after pool close must NOT mutate `all`",
-                    1, pool.totalSize()
+                    "the returning lease must retire its slot (delegated teardown)",
+                    0, pool.totalSize()
             );
         }
     }
@@ -186,14 +196,25 @@ public class SenderPoolTest {
     }
 
     @Test
-    public void testPoolBuildsRequestedNumberOfSenders() {
+    public void testPoolBuildsRequestedNumberOfSenders() throws Exception {
         try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 3, 3, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
             Sender a = pool.borrow();
             Sender b = pool.borrow();
             Sender c = pool.borrow();
-            Assert.assertNotSame(a, b);
-            Assert.assertNotSame(b, c);
-            Assert.assertNotSame(a, c);
+            // borrow() allocates a fresh PooledSender wrapper on every call, so
+            // comparing the wrappers is vacuously true -- it would stay green
+            // even if the pool double-lent a single slot to all three borrowers.
+            // The property this test exists for -- three concurrent borrowers
+            // each hold their own sender -- lives in the underlying slots, so
+            // compare those (same reasoning as testBrokenSenderIsNotReturnedToPool).
+            Object slotA = slotOf(a);
+            Object slotB = slotOf(b);
+            Object slotC = slotOf(c);
+            Assert.assertNotSame("a and b must not share a slot", slotA, slotB);
+            Assert.assertNotSame("b and c must not share a slot", slotB, slotC);
+            Assert.assertNotSame("a and c must not share a slot", slotA, slotC);
+            Assert.assertEquals("pool must build exactly the requested number of senders",
+                    3, pool.totalSize());
             a.close();
             b.close();
             c.close();
@@ -319,180 +340,6 @@ public class SenderPoolTest {
         }
     }
 
-    @Test
-    public void testPinAfterCloseRejectsStaleEntry() throws Exception {
-        // Pin from a worker thread, close the pool from main. The worker's
-        // ThreadLocal still references its PooledSender, but the underlying
-        // delegate has been closed. The next pinToCurrentThread() on the
-        // worker must reject the stale entry instead of handing it back.
-        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
-        CountDownLatch pinned = new CountDownLatch(1);
-        CountDownLatch closed = new CountDownLatch(1);
-        AtomicReference<Throwable> secondCallError = new AtomicReference<>();
-        Thread worker = new Thread(() -> {
-            try {
-                pool.pinToCurrentThread();
-                pinned.countDown();
-                Assert.assertTrue(closed.await(2, TimeUnit.SECONDS));
-                try {
-                    pool.pinToCurrentThread();
-                    secondCallError.set(new AssertionError("pinToCurrentThread after close must throw"));
-                } catch (LineSenderException e) {
-                    // expected
-                }
-            } catch (Throwable t) {
-                secondCallError.set(t);
-            }
-        });
-        worker.start();
-        Assert.assertTrue(pinned.await(2, TimeUnit.SECONDS));
-        pool.close();
-        closed.countDown();
-        worker.join(2_000);
-        if (secondCallError.get() != null) {
-            throw new AssertionError(secondCallError.get());
-        }
-    }
-
-    @Test
-    public void testPinAfterUserCloseDoesNotShareWrapper() {
-        // Same-thread reproducer for the pinToCurrentThread() sharing bug.
-        // The user closes a pinned Sender (the natural try-with-resources
-        // idiom on the public Sender API), then another consumer borrows
-        // the slot. pinToCurrentThread() must not hand that wrapper back:
-        // it is now owned by the second consumer.
-        //
-        // Pool size 1 collapses the race window into a linear sequence:
-        // the second borrower deterministically receives the same slot
-        // that was just returned, so the bug is observable at the
-        // wrapper-identity level without timing.
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 100, Long.MAX_VALUE, Long.MAX_VALUE)) {
-            Sender pinned = pool.pinToCurrentThread();
-            pinned.close();                                   // pool slot returned; ThreadLocal still points at it
-            Sender stolen = pool.borrow();                    // pollFirst hands the same wrapper to a new consumer
-            try {
-                Sender repinned = pool.pinToCurrentThread();
-                Assert.fail("pinToCurrentThread() returned wrapper " + repinned
-                        + " already borrowed by another consumer " + stolen);
-            } catch (LineSenderException expected) {
-                // After fix: TL cleared (or owner-thread invalidated) on close;
-                // re-pin tries to borrow, pool is empty, acquireTimeout fires.
-            } finally {
-                stolen.close();
-            }
-        }
-    }
-
-    @Test
-    public void testPinAfterUserCloseDoesNotShareWrapperCrossThread() throws InterruptedException {
-        // Cross-thread variant of the same bug, mirroring the originally
-        // reported trigger: Thread A pins, closes, then re-pins while
-        // Thread B has borrowed the slot in between. A's ThreadLocal still
-        // references the wrapper, and pinToCurrentThread() hands it back --
-        // so A and B end up writing to the same underlying Sender.
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 100, Long.MAX_VALUE, Long.MAX_VALUE)) {
-            CountDownLatch aClosed = new CountDownLatch(1);
-            CountDownLatch bBorrowed = new CountDownLatch(1);
-            AtomicReference<Sender> bSender = new AtomicReference<>();
-            AtomicReference<Throwable> failure = new AtomicReference<>();
-
-            Thread a = new Thread(() -> {
-                try {
-                    Sender s = pool.pinToCurrentThread();
-                    s.close();
-                    aClosed.countDown();
-                    Assert.assertTrue(bBorrowed.await(2, TimeUnit.SECONDS));
-                    try {
-                        Sender repinned = pool.pinToCurrentThread();
-                        failure.compareAndSet(null, new AssertionError(
-                                "pinToCurrentThread() returned wrapper " + repinned
-                                        + " already borrowed by another thread " + bSender.get()));
-                    } catch (LineSenderException expected) {
-                        // After fix: re-pin tries to borrow, pool is empty, times out.
-                    }
-                } catch (Throwable t) {
-                    failure.compareAndSet(null, t);
-                }
-            });
-            Thread b = new Thread(() -> {
-                try {
-                    Assert.assertTrue(aClosed.await(2, TimeUnit.SECONDS));
-                    bSender.set(pool.borrow());
-                } catch (Throwable t) {
-                    failure.compareAndSet(null, t);
-                } finally {
-                    bBorrowed.countDown();
-                }
-            });
-
-            a.start();
-            b.start();
-            a.join(4_000);
-            b.join(4_000);
-
-            if (bSender.get() != null) {
-                bSender.get().close();
-            }
-            if (failure.get() != null) {
-                throw new AssertionError(failure.get());
-            }
-        }
-    }
-
-    @Test
-    public void testReleaseAfterCloseIsSafe() throws Exception {
-        // Same setup as the pin test, but exercise releaseCurrentThread()
-        // instead. With a closed delegate underneath, the release path must
-        // not invoke flush() on the dead Sender.
-        SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE);
-        CountDownLatch pinned = new CountDownLatch(1);
-        CountDownLatch closed = new CountDownLatch(1);
-        AtomicReference<Throwable> releaseError = new AtomicReference<>();
-        Thread worker = new Thread(() -> {
-            try {
-                pool.pinToCurrentThread();
-                pinned.countDown();
-                Assert.assertTrue(closed.await(2, TimeUnit.SECONDS));
-                pool.releaseCurrentThread();
-            } catch (Throwable t) {
-                releaseError.set(t);
-            }
-        });
-        worker.start();
-        Assert.assertTrue(pinned.await(2, TimeUnit.SECONDS));
-        pool.close();
-        closed.countDown();
-        worker.join(2_000);
-        if (releaseError.get() != null) {
-            throw new AssertionError(releaseError.get());
-        }
-    }
-
-    @Test
-    public void testThreadAffinityIsPerThread() throws InterruptedException {
-        try (SenderPool pool = new SenderPool(DEAD_HTTP_CONFIG, 2, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
-            Sender mainPinned = pool.pinToCurrentThread();
-            Assert.assertSame("re-pin on same thread returns same instance",
-                    mainPinned, pool.pinToCurrentThread());
-
-            AtomicReference<Sender> otherPinned = new AtomicReference<>();
-            CountDownLatch done = new CountDownLatch(1);
-            Thread t = new Thread(() -> {
-                try {
-                    otherPinned.set(pool.pinToCurrentThread());
-                } finally {
-                    done.countDown();
-                }
-            });
-            t.start();
-            Assert.assertTrue(done.await(2, TimeUnit.SECONDS));
-            Assert.assertNotSame("different threads must get different pinned Senders",
-                    mainPinned, otherPinned.get());
-
-            pool.releaseCurrentThread();
-        }
-    }
-
     // ----------------------------------------------------------------------
     // Teardown robustness: a delegate close() can throw an Error (e.g. an
     // -ea AssertionError), not just a RuntimeException. The pool's best-effort
@@ -578,9 +425,12 @@ public class SenderPoolTest {
      * while the test does not leak native memory.
      */
     private static void installFailingCloseDelegate(PooledSender ps, AtomicInteger closeAttempts) throws Exception {
-        Field f = PooledSender.class.getDeclaredField("delegate");
+        Field slotF = PooledSender.class.getDeclaredField("slot");
+        slotF.setAccessible(true);
+        Object slot = slotF.get(ps);
+        Field f = slot.getClass().getDeclaredField("delegate");
         f.setAccessible(true);
-        Sender real = (Sender) f.get(ps);
+        Sender real = (Sender) f.get(slot);
         Sender failing = (Sender) Proxy.newProxyInstance(
                 Sender.class.getClassLoader(),
                 new Class[]{Sender.class},
@@ -601,6 +451,6 @@ public class SenderPoolTest {
                     }
                     return method.invoke(real, args);
                 });
-        f.set(ps, failing);
+        f.set(slot, failing);
     }
 }

@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import org.junit.Assert;
@@ -59,16 +60,19 @@ public class CloseOwnershipRaceTest {
                 sfDir.getRoot().getAbsolutePath(), 16_384)) {
             Throwable leaked = null;
             for (int i = 0; i < ROUNDS && leaked == null; i++) {
-                // A null client, a reconnect factory that never produces one,
-                // and a zero reconnect budget: start()'s real I/O thread walks
-                // the production async-initial-connect path and latches a
-                // genuine RECONNECT_BUDGET_EXHAUSTED terminal within
-                // microseconds. One authentic null->error latch transition
-                // per round.
+                // A null client and a reconnect factory that throws a genuine
+                // terminal auth reject: start()'s real I/O thread walks the
+                // production async-initial-connect path and latches a genuine
+                // (SECURITY_ERROR) terminal within microseconds. One authentic
+                // null->error latch transition per round. (Under Invariant B a
+                // connection error / budget would retry forever and never latch;
+                // only a genuine terminal like auth does.)
                 CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                         null, engine, 0, 1_000_000L,
-                        () -> null,
-                        0,  // reconnect budget: exhausted on arrival
+                        () -> {
+                            throw new QwpAuthFailedException(401, "localhost", 1);
+                        },
+                        0,
                         1, 1);
                 loop.start();
                 // Race close()'s exact ownership snapshot against the latch

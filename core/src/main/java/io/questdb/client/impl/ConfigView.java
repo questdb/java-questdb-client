@@ -95,6 +95,25 @@ public final class ConfigView {
         return RELOCATED_HINTS.get(key);
     }
 
+    /**
+     * A boolean flag accepting {@code true}/{@code false} (and {@code on}/{@code off}
+     * for consistency with the rest of the connect-string surface). Returns
+     * {@code dflt} when the key is absent; throws on any other value.
+     */
+    public boolean getBool(String key, boolean dflt) {
+        String v = getStr(key);
+        if (v == null) {
+            return dflt;
+        }
+        if ("true".equals(v) || "on".equals(v)) {
+            return true;
+        }
+        if ("false".equals(v) || "off".equals(v)) {
+            return false;
+        }
+        throw new IllegalArgumentException("invalid " + key + ": " + v + " (expected true, false, on, off)");
+    }
+
     public boolean getBoolOnOff(String key, boolean dflt) {
         String v = getStr(key);
         if (v == null) {
@@ -159,17 +178,29 @@ public final class ConfigView {
         if (v == null) {
             return unset;
         }
-        int parsed;
+        // Parse in the long domain so a numeric-but-over-int value (e.g.
+        // 4294967297) is distinguishable from garbage: it must fail with the
+        // actual int limit, not wrap through an (int) cast or report a generic
+        // "invalid" for a perfectly numeric string.
+        long parsed;
         try {
-            parsed = Numbers.parseInt(v);
+            parsed = Numbers.parseLong(v);
         } catch (NumericException e) {
             throw new IllegalArgumentException("invalid " + key + ": " + v);
         }
         ConfigSchema.KeySpec spec = ConfigSchema.spec(key);
+        // Schema range first: it is the tighter, key-specific constraint, so
+        // "compression_level=4294967297" says "must be in [1, 22]".
         if (outOfRange(spec, parsed)) {
             throw new IllegalArgumentException(rangeMessage(spec));
         }
-        return parsed;
+        if (parsed > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(key + " must be <= " + Integer.MAX_VALUE + ": " + v);
+        }
+        if (parsed < Integer.MIN_VALUE) {
+            throw new IllegalArgumentException(key + " must be >= " + Integer.MIN_VALUE + ": " + v);
+        }
+        return (int) parsed;
     }
 
     public long getLong(String key, long unset) {

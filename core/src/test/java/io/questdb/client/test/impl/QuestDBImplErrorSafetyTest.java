@@ -27,11 +27,10 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.QuestDBImpl;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -48,9 +47,9 @@ import java.util.function.IntFunction;
 //
 // Sender is an interface, faked with a Proxy whose close() flips a flag, injected
 // via the SenderPool senderFactory seam. The connect Error is injected via the
-// QueryClientPool connectHook seam. Both are passed through the package-private
-// QuestDBImpl seam constructor (reached by reflection -- the main module is
-// declared `open`); production callers pass null for both.
+// QueryClientPool connectHook seam. Both are passed through the @TestOnly public
+// QuestDBImpl seam constructor; production uses the public overload that passes
+// null for both.
 public class QuestDBImplErrorSafetyTest {
 
     // Non-SF http config: the SenderPool factory replaces the build, but the
@@ -67,25 +66,27 @@ public class QuestDBImplErrorSafetyTest {
     //      delegate's close() runs.
     @Test(timeout = 30_000)
     public void ctorClosesBuiltSenderPoolWhenQueryPoolConstructionThrowsError() throws Exception {
-        AtomicBoolean senderClosed = new AtomicBoolean(false);
-        // senderMin = 1 -> SenderPool prewarms one observable delegate.
-        IntFunction<Sender> senderFactory = slotIndex -> fakeSender(senderClosed);
-        // queryMin = 1 -> QueryClientPool prewarm reaches connect(), which throws.
-        Consumer<QwpQueryClient> connectHook = client -> {
-            throw new AssertionError("injected native connect failure");
-        };
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicBoolean senderClosed = new AtomicBoolean(false);
+            // senderMin = 1 -> SenderPool prewarms one observable delegate.
+            IntFunction<Sender> senderFactory = slotIndex -> fakeSender(senderClosed);
+            // queryMin = 1 -> QueryClientPool prewarm reaches connect(), which throws.
+            Consumer<QwpQueryClient> connectHook = client -> {
+                throw new AssertionError("injected native connect failure");
+            };
 
-        try {
-            newQuestDB(senderFactory, connectHook);
-            Assert.fail("expected QuestDBImpl construction to propagate the injected Error");
-        } catch (Throwable expected) {
-            // expected -- construction aborts
-        }
+            try {
+                newQuestDB(senderFactory, connectHook);
+                Assert.fail("expected QuestDBImpl construction to propagate the injected Error");
+            } catch (Throwable expected) {
+                // expected -- construction aborts
+            }
 
-        Assert.assertTrue(
-                "QuestDBImpl ctor leaked the already-built SenderPool on an Error from "
-                        + "QueryClientPool construction: the prewarmed delegate's close() was never called",
-                senderClosed.get());
+            Assert.assertTrue(
+                    "QuestDBImpl ctor leaked the already-built SenderPool on an Error from "
+                            + "QueryClientPool construction: the prewarmed delegate's close() was never called",
+                    senderClosed.get());
+        });
     }
 
     private static Sender fakeSender(AtomicBoolean closedFlag) {
@@ -122,33 +123,15 @@ public class QuestDBImplErrorSafetyTest {
 
     private static QuestDBImpl newQuestDB(
             IntFunction<Sender> senderFactory, Consumer<QwpQueryClient> connectHook
-    ) throws Exception {
-        Constructor<QuestDBImpl> c = QuestDBImpl.class.getDeclaredConstructor(
-                String.class, String.class, int.class, int.class, int.class, int.class,
-                long.class, long.class, long.class, long.class,
-                IntFunction.class, Consumer.class);
-        c.setAccessible(true);
-        try {
-            return c.newInstance(
-                    SENDER_CFG, QUERY_CFG,
-                    /*senderMin*/ 1, /*senderMax*/ 1,
-                    /*queryMin*/ 1, /*queryMax*/ 1,
-                    /*acquireTimeoutMillis*/ 250L,
-                    /*idleTimeoutMillis*/ Long.MAX_VALUE,
-                    /*maxLifetimeMillis*/ Long.MAX_VALUE,
-                    /*housekeeperIntervalMillis*/ Long.MAX_VALUE,
-                    senderFactory, connectHook);
-        } catch (InvocationTargetException e) {
-            // Unwrap so the caller sees the real construction failure (Error or
-            // RuntimeException), matching a direct constructor invocation.
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException) {
-                throw (RuntimeException) cause;
-            }
-            if (cause instanceof Error) {
-                throw (Error) cause;
-            }
-            throw e;
-        }
+    ) {
+        return new QuestDBImpl(
+                SENDER_CFG, QUERY_CFG,
+                /*senderMin*/ 1, /*senderMax*/ 1,
+                /*queryMin*/ 1, /*queryMax*/ 1,
+                /*acquireTimeoutMillis*/ 250L,
+                /*idleTimeoutMillis*/ Long.MAX_VALUE,
+                /*maxLifetimeMillis*/ Long.MAX_VALUE,
+                /*housekeeperIntervalMillis*/ Long.MAX_VALUE,
+                senderFactory, connectHook);
     }
 }

@@ -56,18 +56,18 @@ public class PrReviewRedTestsE2e {
      * Finding C4 — {@code recordFatal} is called AFTER {@code dispatchError}
      * in three sites of {@code CursorWebSocketSendLoop}:
      * <ul>
-     *   <li>{@code handleServerRejection} HALT branch (lines 864-871)</li>
+     *   <li>{@code handleServerRejection} TERMINAL branch (lines 864-871)</li>
      *   <li>{@code fail()} auth-terminal branch (lines 437-438)</li>
      *   <li>{@code fail()} budget-exhausted branch (lines 484-485)</li>
      * </ul>
-     * The locked spec ({@code design/qwp-cursor-error-api.md} § "Path 2:
-     * producer-side typed throw") requires {@code signal.terminalError = err}
-     * to be written BEFORE {@code errorInbox.offer(err)}.
+     * The error-API contract ("Path 2: producer-side typed throw") requires
+     * {@code signal.terminalError = err} to be written BEFORE
+     * {@code errorInbox.offer(err)}.
      * <p>
      * Concrete consequence the spec calls out: a user-supplied error handler
      * that synchronously calls {@code sender.flush()} from inside
      * {@code onError} can observe {@code terminalError == null} and pass —
-     * landing post-HALT bytes in the engine.
+     * landing post-TERMINAL bytes in the engine.
      * <p>
      * This test asserts the spec invariant directly: by the time the
      * dispatcher delivers a {@link SenderError} to the user handler,
@@ -117,7 +117,7 @@ public class PrReviewRedTestsE2e {
                             s.table("foo").longColumn("v", 1L).atNow();
                             s.flush();
                         } catch (LineSenderException ignored) {
-                            // Expected on HALT path.
+                            // Expected on TERMINAL path.
                         }
                         // Give the dispatcher up to 2s to fire the handler.
                         long deadline = System.nanoTime() + 2_000_000_000L;
@@ -149,7 +149,7 @@ public class PrReviewRedTestsE2e {
     /**
      * Finding C11 — there is no end-to-end test pinning the central
      * user-visible contract of the new error API: a {@code flush()} after
-     * the I/O loop has latched a HALT-policy server rejection must throw a
+     * the I/O loop has latched a TERMINAL-policy server rejection must throw a
      * typed {@link LineSenderServerException} carrying the matching
      * {@link SenderError} payload (category, policy, server message,
      * fromFsn).
@@ -169,7 +169,7 @@ public class PrReviewRedTestsE2e {
 
                 String cfg = "ws::addr=localhost:" + port + ";";
                 try (Sender sender = Sender.fromConfig(cfg)) {
-                    // First batch — server returns STATUS_PARSE_ERROR (HALT).
+                    // First batch — server returns STATUS_PARSE_ERROR (TERMINAL).
                     sender.table("foo").longColumn("v", 1L).atNow();
                     try {
                         sender.flush();
@@ -188,7 +188,7 @@ public class PrReviewRedTestsE2e {
                     }
                     SenderError latched = wss.getLastTerminalError();
                     Assert.assertNotNull(
-                            "FINDING C11: server emitted STATUS_PARSE_ERROR (HALT) but "
+                            "FINDING C11: server emitted STATUS_PARSE_ERROR (TERMINAL) but "
                                     + "the I/O loop did not latch a typed terminal error within 3s",
                             latched);
 
@@ -198,7 +198,7 @@ public class PrReviewRedTestsE2e {
                     try {
                         sender.flush();
                         Assert.fail(
-                                "FINDING C11: flush() after HALT must throw "
+                                "FINDING C11: flush() after TERMINAL must throw "
                                         + "LineSenderServerException; instead returned cleanly. "
                                         + "Producer-thread typed-throw contract is broken.");
                     } catch (LineSenderException e) {
@@ -215,8 +215,8 @@ public class PrReviewRedTestsE2e {
                             "FINDING C11: category should be PARSE_ERROR for status byte 0x05",
                             SenderError.Category.PARSE_ERROR, payload.getCategory());
                     Assert.assertEquals(
-                            "FINDING C11: policy should be HALT for PARSE_ERROR",
-                            SenderError.Policy.HALT, payload.getAppliedPolicy());
+                            "FINDING C11: policy should be TERMINAL for PARSE_ERROR",
+                            SenderError.Policy.TERMINAL, payload.getAppliedPolicy());
                     Assert.assertTrue(
                             "FINDING C11: fromFsn should be >= 0; got " + payload.getFromFsn(),
                             payload.getFromFsn() >= 0L);
@@ -231,7 +231,7 @@ public class PrReviewRedTestsE2e {
 
     /**
      * Server fixture that responds to every binary frame with
-     * {@code STATUS_PARSE_ERROR} (a HALT-policy rejection per spec).
+     * {@code STATUS_PARSE_ERROR} (a TERMINAL-policy rejection per spec).
      */
     private static final class ParseErrorAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicLong nextSeq = new AtomicLong();

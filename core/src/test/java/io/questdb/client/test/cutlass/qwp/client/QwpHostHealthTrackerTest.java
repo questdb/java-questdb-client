@@ -319,4 +319,98 @@ public class QwpHostHealthTrackerTest {
         Assert.assertEquals(QwpHostHealthTracker.ZoneTier.SAME, t.getZoneTier(0));
         Assert.assertEquals(QwpHostHealthTracker.ZoneTier.OTHER, t.getZoneTier(1));
     }
+
+    @Test
+    public void testRoundCursor_FullSweepInLivePriorityOrderThenExhausted() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(3);
+        t.recordSuccess(2);          // HEALTHY -> first
+        t.recordTransportError(0);   // TRANSPORT_ERROR -> last
+        // host 1 stays UNKNOWN -> middle
+        QwpHostHealthTracker.RoundCursor c = t.newRoundCursor();
+        Assert.assertEquals(2, c.next());
+        Assert.assertEquals(1, c.next());
+        Assert.assertEquals(0, c.next());
+        Assert.assertEquals("cursor must be exhausted after a full sweep", -1, c.next());
+        Assert.assertEquals("cursor exhaustion is sticky", -1, c.next());
+    }
+
+    @Test
+    public void testRoundCursor_ReRanksRemainingHostsOnLiveStateChange() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(3);
+        QwpHostHealthTracker.RoundCursor c = t.newRoundCursor();
+        Assert.assertEquals(0, c.next()); // all UNKNOWN -> idx order
+        // Another walker observes host 2 healthy mid-sweep: it must now
+        // outrank the still-UNKNOWN host 1 for THIS cursor's next pick.
+        t.recordSuccess(2, false);
+        Assert.assertEquals(2, c.next());
+        Assert.assertEquals(1, c.next());
+        Assert.assertEquals(-1, c.next());
+    }
+
+    @Test
+    public void testRoundCursor_DoesNotConsumeOrDependOnSharedRound() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2);
+        // Exhaust the SHARED round completely...
+        t.recordTransportError(0);
+        t.recordTransportError(1);
+        Assert.assertTrue(t.isRoundExhausted());
+        Assert.assertEquals(-1, t.pickNext());
+        // ...a fresh cursor still gets a FULL sweep (its attempted set is
+        // private), ordered by the live states.
+        QwpHostHealthTracker.RoundCursor c = t.newRoundCursor();
+        Assert.assertEquals(0, c.next());
+        Assert.assertEquals(1, c.next());
+        Assert.assertEquals(-1, c.next());
+        // ...and the cursor's sweep left the shared round untouched.
+        Assert.assertTrue(t.isRoundExhausted());
+        Assert.assertEquals(-1, t.pickNext());
+    }
+
+    @Test
+    public void testRoundCursors_AreIndependentNoEndpointStealing() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2);
+        QwpHostHealthTracker.RoundCursor a = t.newRoundCursor();
+        QwpHostHealthTracker.RoundCursor b = t.newRoundCursor();
+        // Interleaved: each cursor must sweep EVERY host exactly once;
+        // a's claims must not consume b's sweep or vice versa.
+        Assert.assertEquals(0, a.next());
+        Assert.assertEquals(0, b.next());
+        Assert.assertEquals(1, a.next());
+        Assert.assertEquals(1, b.next());
+        Assert.assertEquals(-1, a.next());
+        Assert.assertEquals(-1, b.next());
+    }
+
+    @Test
+    public void testHealthOnlyRecords_UpdateStateButNeverTheSharedRoundBit() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(1);
+        // Health-only variants (markRoundAttempted=false): state flips...
+        t.recordTransportError(0, false);
+        Assert.assertEquals(QwpHostHealthTracker.HostState.TRANSPORT_ERROR, t.getState(0));
+        t.recordRoleReject(0, true, false);
+        Assert.assertEquals(QwpHostHealthTracker.HostState.TRANSIENT_REJECT, t.getState(0));
+        t.recordSuccess(0, false);
+        Assert.assertEquals(QwpHostHealthTracker.HostState.HEALTHY, t.getState(0));
+        // ...but the shared round never sees an attempt: the host is still
+        // pickable and the round is not exhausted. This is what keeps a
+        // background drainer's sweep invisible to the foreground's round.
+        Assert.assertFalse(t.isRoundExhausted());
+        Assert.assertEquals(0, t.pickNext());
+    }
+
+    @Test
+    public void testHealthOnlySuccess_StillFeedsStickyHealthyRecency() {
+        QwpHostHealthTracker t = new QwpHostHealthTracker(2);
+        // Foreground succeeded on 0 (round-marking), a background walker
+        // later succeeded on 1 (health-only): the background success is the
+        // most RECENT and must win the sticky-Healthy pin across
+        // beginRound(true).
+        t.recordSuccess(0);
+        t.recordSuccess(1, false);
+        t.beginRound(true);
+        Assert.assertEquals("most recent success (health-only or not) is sticky",
+                QwpHostHealthTracker.HostState.HEALTHY, t.getState(1));
+        Assert.assertEquals(QwpHostHealthTracker.HostState.UNKNOWN, t.getState(0));
+        Assert.assertEquals(1, t.pickNext());
+    }
 }
