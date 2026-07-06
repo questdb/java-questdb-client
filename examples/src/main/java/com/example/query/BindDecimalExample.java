@@ -1,8 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 
@@ -32,88 +34,106 @@ import io.questdb.client.std.Decimal256;
  */
 public class BindDecimalExample {
 
-    public static void main(String[] args) {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+    public static void main(String[] args) throws InterruptedException {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // --- Example 1: DECIMAL64 amount, unscaled literal.
             // Looking up invoices where the total is exactly $1999.99 --
             // unscaled = 199_999 at scale 2.
             System.out.println("lookup by DECIMAL64 amount = 1999.99");
-            client.execute(
-                    "SELECT id FROM invoices WHERE amount = $1",
-                    binds -> binds.setDecimal64(0, 2, 199_999L),
-                    printIdHandler()
-            );
+            try {
+                q.sql("SELECT id FROM invoices WHERE amount = $1")
+                        .binds(binds -> binds.setDecimal64(0, 2, 199_999L))
+                        .handler(printIdHandler())
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Example 2: DECIMAL128 tax, via explicit scale + limbs.
             // Looking up invoices where tax equals 12.345678 --
             // unscaled = 12_345_678 at scale 6. Positive value fits the low
             // limb alone; high limb is zero.
             System.out.println("lookup by DECIMAL128 tax = 12.345678");
-            client.execute(
-                    "SELECT id FROM invoices WHERE tax = $1",
-                    binds -> binds.setDecimal128(0, 6, 12_345_678L, 0L),
-                    printIdHandler()
-            );
+            try {
+                q.sql("SELECT id FROM invoices WHERE tax = $1")
+                        .binds(binds -> binds.setDecimal128(0, 6, 12_345_678L, 0L))
+                        .handler(printIdHandler())
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Example 3: DECIMAL128 via Decimal128 convenience overload.
             // If you already carry the value as a Decimal128, skip the scale
             // + limb juggling -- the client reads them off the object.
             Decimal128 tax = Decimal128.fromLong(12_345_678L, 6);
             System.out.println("lookup by DECIMAL128 via Decimal128 convenience");
-            client.execute(
-                    "SELECT id FROM invoices WHERE tax = $1",
-                    binds -> binds.setDecimal128(0, tax),
-                    printIdHandler()
-            );
+            try {
+                q.sql("SELECT id FROM invoices WHERE tax = $1")
+                        .binds(binds -> binds.setDecimal128(0, tax))
+                        .handler(printIdHandler())
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Example 4: DECIMAL256 projection (no table needed).
             // 42.0 at scale 10 -> unscaled 420_000_000_000. Positive value so
             // only the lowest of the four limbs is set.
             System.out.println("project DECIMAL256 42.0 at scale 10");
-            client.execute(
-                    "SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)",
-                    binds -> binds.setDecimal256(0, 10, 420_000_000_000L, 0L, 0L, 0L),
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            System.out.println("  dec256 scale: " + batch.getDecimalScale(0));
-                        }
+            try {
+                q.sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
+                        .binds(binds -> binds.setDecimal256(0, 10, 420_000_000_000L, 0L, 0L, 0L))
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                System.out.println("  dec256 scale: " + batch.getDecimalScale(0));
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("query failed: " + message);
-                        }
-                    }
-            );
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
+                        })
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Example 5: DECIMAL256 via Decimal256 convenience.
             Decimal256 big = new Decimal256(0L, 0L, 0L, 420_000_000_000L, 10);
             System.out.println("project DECIMAL256 via Decimal256 convenience");
-            client.execute(
-                    "SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)",
-                    binds -> binds.setDecimal256(0, big),
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            System.out.println("  dec256 scale: " + batch.getDecimalScale(0));
-                        }
+            try {
+                q.sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
+                        .binds(binds -> binds.setDecimal256(0, big))
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                System.out.println("  dec256 scale: " + batch.getDecimalScale(0));
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("query failed: " + message);
-                        }
-                    }
-            );
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
+                        })
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 
@@ -131,7 +151,6 @@ public class BindDecimalExample {
 
             @Override
             public void onError(byte status, String message) {
-                System.err.println("  query failed: " + message);
             }
         };
     }

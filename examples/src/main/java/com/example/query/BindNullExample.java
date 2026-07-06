@@ -1,8 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
 /**
@@ -34,65 +36,75 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
  */
 public class BindNullExample {
 
-    public static void main(String[] args) {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+    public static void main(String[] args) throws InterruptedException {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // --- Convenience: setVarchar(index, null).
             // Use IS NULL / IS NOT NULL predicates since SQL equality with
             // NULL always yields NULL. $1 still needs a typed NULL so the
             // server can infer the intended type; the bind drives that.
             System.out.println("rows where note IS NOT NULL and level < some-null-placeholder:");
-            client.execute(
-                    "SELECT id, note FROM logs WHERE note IS NOT NULL AND level < COALESCE($1::INT, 100) LIMIT 10",
-                    binds -> binds.setNull(0, QwpConstants.TYPE_INT),
-                    printRowsHandler()
-            );
+            try {
+                q.sql("SELECT id, note FROM logs WHERE note IS NOT NULL AND level < COALESCE($1::INT, 100) LIMIT 10")
+                        .binds(binds -> binds.setNull(0, QwpConstants.TYPE_INT))
+                        .handler(printRowsHandler())
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Convenience: setUuid(index, (UUID) null).
             System.out.println("projection: NULL VARCHAR");
-            client.execute(
-                    "SELECT $1 AS v FROM long_sequence(1)",
-                    binds -> binds.setVarchar(0, null),
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            System.out.println("  v is null? " + batch.isNull(0, 0));
-                        }
+            try {
+                q.sql("SELECT $1 AS v FROM long_sequence(1)")
+                        .binds(binds -> binds.setVarchar(0, null))
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                System.out.println("  v is null? " + batch.isNull(0, 0));
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("  query failed: " + message);
-                        }
-                    }
-            );
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
+                        })
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
 
             // --- Explicit setNull for every scalar type (useful when you
             //     don't have a value-type overload, e.g. TIMESTAMP_NANOS).
             System.out.println("projection: NULL TIMESTAMP_NANOS");
-            client.execute(
-                    "SELECT CAST($1 AS TIMESTAMP_NS) AS ts FROM long_sequence(1)",
-                    binds -> binds.setNull(0, QwpConstants.TYPE_TIMESTAMP_NANOS),
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            System.out.println("  ts is null? " + batch.isNull(0, 0));
-                        }
+            try {
+                q.sql("SELECT CAST($1 AS TIMESTAMP_NS) AS ts FROM long_sequence(1)")
+                        .binds(binds -> binds.setNull(0, QwpConstants.TYPE_TIMESTAMP_NANOS))
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                System.out.println("  ts is null? " + batch.isNull(0, 0));
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("  query failed: " + message);
-                        }
-                    }
-            );
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
+                        })
+                        .submit()
+                        .await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 
@@ -111,7 +123,6 @@ public class BindNullExample {
 
             @Override
             public void onError(byte status, String message) {
-                System.err.println("  query failed: " + message);
             }
         };
     }
