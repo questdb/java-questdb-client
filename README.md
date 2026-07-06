@@ -114,6 +114,51 @@ try (Sender sender = db.borrowSender()) {
 }
 ```
 
+### Sending Batches of Rows
+
+The sender buffers rows and sends them in batches. For high throughput, write many rows on one borrowed sender and
+flush per batch rather than per row: each flush has a fixed cost, so batching raises throughput. `close()` flushes the
+final partial batch.
+
+```java
+try (Sender sender = db.borrowSender()) {
+    for (int i = 0; i < trades.size(); i++) {
+        Trade t = trades.get(i);
+        sender.table("trades")
+                .symbol("symbol", t.symbol)
+                .doubleColumn("price", t.price)
+                .longColumn("size", t.size)
+                .atNow();
+        // Flush every 10k rows to bound buffer memory and latency.
+        if ((i + 1) % 10_000 == 0) {
+            sender.flush();
+        }
+    }
+    // Remaining rows are flushed by close().
+}
+```
+
+You can also let the client flush batches for you with the `auto_flush_rows` / `auto_flush_interval` config keys, e.g.
+`ws::addr=localhost:9000;auto_flush_rows=10000;auto_flush_interval=1000;`.
+
+**Confirm a batch is durably received.** Over QWP each flush returns a frame sequence number (FSN); `awaitAckedFsn`
+blocks until the server has acknowledged it. Rows are safe in the store-and-forward log even if the ack has not landed
+yet — they replay on reconnect.
+
+```java
+try (Sender sender = db.borrowSender()) {
+    for (Trade t : batch) {
+        sender.table("trades").symbol("symbol", t.symbol).doubleColumn("price", t.price).atNow();
+    }
+    long fsn = sender.flushAndGetSequence();          // publish the batch, get its sequence number
+    if (sender.awaitAckedFsn(fsn, 30_000)) {          // block up to 30s for the server ack
+        // batch acknowledged by the server
+    } else {
+        // not yet acked within the timeout; it stays buffered and replays on reconnect
+    }
+}
+```
+
 ### Query Data
 
 Borrow a `Query`, set the SQL and a result handler, submit, and await. The handler receives results a batch at a time;
@@ -206,6 +251,46 @@ try (QuestDB db = QuestDB.builder()
         .acquireTimeoutMillis(10_000)
         .build()) {
     // ... use db ...
+}
+```
+
+### Multiple Servers and Failover
+
+List every cluster node in one `addr` server list; the single string configures both the ingest and query pools across
+all of them. On the query side, `target` selects the node role to route to (`any`, `primary`, or `replica`) and
+`failover=on` enables failover across the list. The ingest side reconnects across the same node list on its own — a
+store-and-forward sender keeps buffering rows through a failover window and never drops them.
+
+```java
+try (QuestDB db = QuestDB.connect(
+        "ws::addr=node1:9000,node2:9000,node3:9000;target=primary;failover=on;")) {
+    try (Sender s = db.borrowSender()) {
+        s.table("trades").symbol("symbol", "BTC-USD").doubleColumn("price", 42_500.50).atNow();
+    }
+    try (Query q = db.borrowQuery()) {
+        q.sql("SELECT count() FROM trades").handler(handler).submit().await();
+    }
+}
+```
+
+### Zone-Aware Query Routing
+
+In a multi-zone deployment, `zone` tells the query pool to prefer endpoints in the same zone, cutting cross-zone read
+latency. It is a query-routing hint (opaque, case-insensitive), matched against each server's advertised zone; it
+applies only to `target=any` / `target=replica` (a `primary` is followed across zones). Cross-zone hosts remain
+fallbacks, so a same-zone outage still fails over. `client_id` is an opaque identifier surfaced server-side for
+observability.
+
+```java
+try (QuestDB db = QuestDB.connect(
+        "ws::addr=node1:9000,node2:9000,node3:9000;"
+                + "target=replica;zone=eu-west-1a;failover=on;client_id=dashboard/2.0;")) {
+    try (Query q = db.borrowQuery()) {
+        q.sql("SELECT price FROM trades WHERE symbol = 'BTC-USD' LIMIT 10")
+                .handler(handler)
+                .submit()
+                .await();
+    }
 }
 ```
 
@@ -341,6 +426,17 @@ schema::key1=value1;key2=value2;
 | `acquire_timeout_ms`     | `5000`  | How long `borrowSender()`/`borrowQuery()` waits for a free slot                |
 | `idle_timeout_ms`        | `60000` | How long a pooled connection may stay idle before it is reaped                 |
 | `max_lifetime_ms`        | `1800000` | Maximum lifetime of a pooled connection before it is recycled                |
+
+### Query routing keys
+
+Applied by the query pool to select and fail over between the nodes in the `addr` list.
+
+| Key         | Default | Description                                                                              |
+| ----------- | ------- | ---------------------------------------------------------------------------------------- |
+| `target`    | `any`   | Node role to route reads to: `any`, `primary`, or `replica`                              |
+| `failover`  | `off`   | Enable query-side failover across the `addr` list                                        |
+| `zone`      |         | Prefer same-zone endpoints for `target=any`/`replica` (opaque, case-insensitive)         |
+| `client_id` |         | Opaque client identifier surfaced server-side for observability                          |
 
 The ingest side also accepts store-and-forward and reconnection tuning keys (`auto_flush_*`, `initial_connect_retry`,
 `reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …). See the
