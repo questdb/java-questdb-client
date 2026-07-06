@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -11,15 +12,16 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
  * The query side of the pool is thread-safe the same way ingest is (see
  * {@link com.example.sender.WsConcurrentIngestExample}): create one
  * {@code QuestDB}, hand the same instance to every thread, and let each call
- * {@link QuestDB#query()}. Every call returns that thread's own cached
- * {@link io.questdb.client.Query} instance -- no external synchronization, no
- * per-query allocation, one in-flight query per thread. Each {@code submit()}
- * acquires a worker from the query pool, so {@code queryPoolSize} caps how
- * many queries run in parallel; extra submits block on the acquire timeout
- * until a worker frees up.
+ * {@link QuestDB#borrowQuery()}. Every borrow leases that thread its own
+ * {@link io.questdb.client.Query} handle (one WebSocket + I/O thread) for the
+ * lifetime of the borrow -- no external synchronization, one in-flight query
+ * per handle. Each borrow leases a client from the query pool, so
+ * {@code queryPoolSize} caps how many queries run in parallel; extra borrows
+ * block on the acquire timeout until a client frees up. Close the handle
+ * (try-with-resources) to return the client to the pool.
  * <p>
- * For several in-flight queries from a <em>single</em> thread, see
- * {@link MultiInFlightQueryExample} ({@link QuestDB#newQuery()}).
+ * For several in-flight queries from a <em>single</em> thread, borrow one
+ * handle per concurrent query -- see {@link MultiInFlightQueryExample}.
  */
 public class ConcurrentQueryExample {
 
@@ -44,9 +46,8 @@ public class ConcurrentQueryExample {
     }
 
     private static void countTrades(QuestDB db, final String symbol) {
-        try {
-            db.query()
-                    .sql("SELECT count() FROM trades WHERE symbol = $1")
+        try (Query q = db.borrowQuery()) {
+            q.sql("SELECT count() FROM trades WHERE symbol = $1")
                     .binds(binds -> binds.setVarchar(0, symbol))
                     .handler(new QwpColumnBatchHandler() {
                         @Override

@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -48,10 +49,10 @@ public class CreditFlowControlExample {
         // by the byte-size of each batch once the handler releases it.
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;initial_credit=262144;")) {
             final long[] rowsSeen = {0};
-            try {
-                db.executeSql(
-                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -30, now())",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -30, now())")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 // Process the batch. If you block here (e.g. writing to a
@@ -69,7 +70,7 @@ public class CreditFlowControlExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

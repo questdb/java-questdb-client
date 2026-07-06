@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -32,8 +33,8 @@ public class TypedResultExample {
 
     public static void main(String[] args) throws InterruptedException {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
-            try {
-                db.executeSql("SELECT * FROM demo LIMIT 5", new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT * FROM demo LIMIT 5").handler(new QwpColumnBatchHandler() {
                     // Sinks live at the handler level so they're reused across every
                     // (row, col) that needs a UUID or LONG256/DECIMAL256 decode.
                     final Long256Impl long256Sink = new Long256Impl();
@@ -65,7 +66,7 @@ public class TypedResultExample {
                     @Override
                     public void onError(byte status, String message) {
                     }
-                }).await();
+                }).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

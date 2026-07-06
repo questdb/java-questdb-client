@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -25,7 +26,8 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 public class BindParametersExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             String sql = "SELECT timestamp, symbol, price, amount FROM trades "
                     + "WHERE symbol = $1 AND price >= $2 AND timestamp >= $3 LIMIT 1000";
@@ -36,8 +38,7 @@ public class BindParametersExample {
             for (String symbol : symbols) {
                 System.out.println("fetching trades for " + symbol);
                 try {
-                    db.query()
-                            .sql(sql)
+                    q.sql(sql)
                             .binds(binds -> binds
                                     .setVarchar(0, symbol)
                                     .setDouble(1, 100.0)

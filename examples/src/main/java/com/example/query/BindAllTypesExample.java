@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -46,10 +47,10 @@ public class BindAllTypesExample {
                 + "$18::DECIMAL(76, 10) AS c_dec256 "
                 + "FROM long_sequence(1)";
 
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
             try {
-                db.query()
-                        .sql(sql)
+                q.sql(sql)
                         .binds(binds -> binds
                                 .setBoolean(0, true)
                                 .setByte(1, (byte) 42)

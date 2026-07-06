@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -34,15 +35,15 @@ import io.questdb.client.std.Decimal256;
 public class BindDecimalExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // --- Example 1: DECIMAL64 amount, unscaled literal.
             // Looking up invoices where the total is exactly $1999.99 --
             // unscaled = 199_999 at scale 2.
             System.out.println("lookup by DECIMAL64 amount = 1999.99");
             try {
-                db.query()
-                        .sql("SELECT id FROM invoices WHERE amount = $1")
+                q.sql("SELECT id FROM invoices WHERE amount = $1")
                         .binds(binds -> binds.setDecimal64(0, 2, 199_999L))
                         .handler(printIdHandler())
                         .submit()
@@ -57,8 +58,7 @@ public class BindDecimalExample {
             // limb alone; high limb is zero.
             System.out.println("lookup by DECIMAL128 tax = 12.345678");
             try {
-                db.query()
-                        .sql("SELECT id FROM invoices WHERE tax = $1")
+                q.sql("SELECT id FROM invoices WHERE tax = $1")
                         .binds(binds -> binds.setDecimal128(0, 6, 12_345_678L, 0L))
                         .handler(printIdHandler())
                         .submit()
@@ -73,8 +73,7 @@ public class BindDecimalExample {
             Decimal128 tax = Decimal128.fromLong(12_345_678L, 6);
             System.out.println("lookup by DECIMAL128 via Decimal128 convenience");
             try {
-                db.query()
-                        .sql("SELECT id FROM invoices WHERE tax = $1")
+                q.sql("SELECT id FROM invoices WHERE tax = $1")
                         .binds(binds -> binds.setDecimal128(0, tax))
                         .handler(printIdHandler())
                         .submit()
@@ -88,8 +87,7 @@ public class BindDecimalExample {
             // only the lowest of the four limbs is set.
             System.out.println("project DECIMAL256 42.0 at scale 10");
             try {
-                db.query()
-                        .sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
+                q.sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
                         .binds(binds -> binds.setDecimal256(0, 10, 420_000_000_000L, 0L, 0L, 0L))
                         .handler(new QwpColumnBatchHandler() {
                             @Override
@@ -115,8 +113,7 @@ public class BindDecimalExample {
             Decimal256 big = new Decimal256(0L, 0L, 0L, 420_000_000_000L, 10);
             System.out.println("project DECIMAL256 via Decimal256 convenience");
             try {
-                db.query()
-                        .sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
+                q.sql("SELECT $1::DECIMAL(76, 10) AS v FROM long_sequence(1)")
                         .binds(binds -> binds.setDecimal256(0, big))
                         .handler(new QwpColumnBatchHandler() {
                             @Override

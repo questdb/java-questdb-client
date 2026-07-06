@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -34,7 +35,8 @@ public class BindRepeatedLookupExample {
     public static void main(String[] args) throws InterruptedException {
         List<String> instruments = Arrays.asList("ETH-USD", "BTC-USD", "SOL-USD", "ADA-USD", "XRP-USD");
 
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // SAME SQL TEXT across every iteration. Only the bind values differ.
             String sql = "SELECT timestamp, price, amount FROM trades "
@@ -46,8 +48,7 @@ public class BindRepeatedLookupExample {
                 System.out.println("latest trades for " + symbol);
                 long[] rowCount = {0};
                 try {
-                    db.query()
-                            .sql(sql)
+                    q.sql(sql)
                             .binds(binds -> binds
                                     .setVarchar(0, symbol)
                                     .setTimestampMicros(1, since))

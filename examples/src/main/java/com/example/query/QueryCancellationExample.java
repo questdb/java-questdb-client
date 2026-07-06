@@ -1,6 +1,7 @@
 package com.example.query;
 
 import io.questdb.client.Completion;
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -22,11 +23,13 @@ import java.util.concurrent.TimeUnit;
 public class QueryCancellationExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
-            Completion c = db.executeSql(
-                    "SELECT * FROM trades ORDER BY price",
-                    new PrintingHandler());
+            Completion c = q.sql(
+                    "SELECT * FROM trades ORDER BY price")
+                    .handler(new PrintingHandler())
+                    .submit();
 
             // Give it 5 seconds; if it's still running, cancel and drain. await(...)
             // also rethrows a server error that lands before the deadline, so the

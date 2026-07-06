@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -32,10 +33,10 @@ public class LargeResultStreamingExample {
             final long[] batchCount = {0};
             final double[] priceSum = {0.0};
 
-            try {
-                db.executeSql(
-                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -7, now())",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT timestamp, price FROM trades WHERE timestamp > dateadd('d', -7, now())")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 batchCount[0]++;
@@ -63,7 +64,7 @@ public class LargeResultStreamingExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -29,10 +30,10 @@ public class ArrayResultExample {
 
     public static void main(String[] args) throws InterruptedException {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
-            try {
-                db.executeSql(
-                        "SELECT levels FROM book LIMIT 10",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT levels FROM book LIMIT 10")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 for (int row = 0; row < batch.getRowCount(); row++) {
@@ -56,7 +57,7 @@ public class ArrayResultExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

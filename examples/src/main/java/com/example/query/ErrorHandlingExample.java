@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -51,8 +52,8 @@ public class ErrorHandlingExample {
 
     private static void runAndReport(QuestDB db, final String sql) throws InterruptedException {
         System.out.println("-- executing: " + sql);
-        try {
-            db.executeSql(sql, new QwpColumnBatchHandler() {
+        try (Query q = db.borrowQuery()) {
+            q.sql(sql).handler(new QwpColumnBatchHandler() {
                 @Override
                 public void onBatch(QwpColumnBatch batch) {
                     System.out.println("(unexpected) received " + batch.getRowCount() + " rows");
@@ -72,7 +73,7 @@ public class ErrorHandlingExample {
                 public void onExecDone(short opType, long rowsAffected) {
                     System.out.printf("(unexpected) exec ok: opType=%d, rows=%d%n", opType, rowsAffected);
                 }
-            }).await();
+            }).submit().await();
         } catch (QueryException e) {
             // await() rethrows the same failure the handler already reported in
             // onError above; caught here so the loop moves on to the next query.

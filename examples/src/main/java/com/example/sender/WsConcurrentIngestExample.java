@@ -12,12 +12,10 @@ import io.questdb.client.Sender;
  * thread-safe, so no two threads may touch the same one -- the pool hands each
  * thread its own.
  * <p>
- * These dedicated producer threads use {@link QuestDB#sender()} (thread-affine):
- * the first call on a thread pins a sender to it, and the tight loop reuses that
- * same instance with zero borrow overhead. Short-lived or event-loop callers
- * would use {@link QuestDB#borrowSender()} instead (see {@link WsExample}). We
- * size the sender pool to the producer count so no thread ever waits on the
- * acquire timeout.
+ * Each producer thread takes its own sender with {@link QuestDB#borrowSender()}
+ * and reuses it for the batch (see {@link WsExample}); close() flushes and
+ * returns it to the pool. We size the sender pool to the producer count so no
+ * thread ever waits on the acquire timeout.
  */
 public class WsConcurrentIngestExample {
 
@@ -42,25 +40,23 @@ public class WsConcurrentIngestExample {
             System.out.printf("ingested %d rows across %d threads%n",
                     PRODUCERS * ROWS_PER_PRODUCER, PRODUCERS);
             // db.close() (try-with-resources) drains and disconnects every
-            // pooled sender, including the ones pinned to the producer threads.
+            // pooled sender.
         }
     }
 
     private static void ingestBatch(QuestDB db, int producerId) {
-        // First sender() call on this thread pins a sender; the loop reuses it.
-        Sender sender = db.sender();
-        String symbol = "SYM-" + producerId;
-        for (int i = 0; i < ROWS_PER_PRODUCER; i++) {
-            sender.table("trades")
-                    .symbol("symbol", symbol)
-                    .longColumn("producer", producerId)
-                    .doubleColumn("price", 100.0 + i)
-                    .atNow();
+        // Each thread borrows its own sender and reuses it for the batch;
+        // close() (try-with-resources) flushes and returns it to the pool.
+        try (Sender sender = db.borrowSender()) {
+            String symbol = "SYM-" + producerId;
+            for (int i = 0; i < ROWS_PER_PRODUCER; i++) {
+                sender.table("trades")
+                        .symbol("symbol", symbol)
+                        .longColumn("producer", producerId)
+                        .doubleColumn("price", 100.0 + i)
+                        .atNow();
+            }
+            sender.flush();
         }
-        sender.flush();
-        // These threads are dedicated and about to exit, so db.close() reaps
-        // their pinned senders. On a thread borrowed from a foreign pool (a
-        // Netty event loop, a servlet container) call db.releaseSender() here
-        // before handing the thread back.
     }
 }

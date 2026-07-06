@@ -26,7 +26,8 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 public class BindErrorHandlingExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // 1. Scale out of range. Max scale is 76 for every DECIMAL form.
             System.out.println("bad: DECIMAL scale = 200");
@@ -63,8 +64,7 @@ public class BindErrorHandlingExample {
             // 6. For comparison: a good call. The pool stays healthy after the
             //    errors above, so this still works.
             System.out.println("good: valid DECIMAL64 bind");
-            db.query()
-                    .sql("SELECT $1::DECIMAL(18, 4) AS v FROM long_sequence(1)")
+            q.sql("SELECT $1::DECIMAL(18, 4) AS v FROM long_sequence(1)")
                     .binds(binds -> binds.setDecimal64(0, 4, 123_456L))
                     .handler(new QwpColumnBatchHandler() {
                         @Override
@@ -88,8 +88,8 @@ public class BindErrorHandlingExample {
 
     private static void runExpectingBindError(QuestDB db, String sql, QwpBindSetter binds)
             throws InterruptedException {
-        try {
-            db.query().sql(sql).binds(binds).handler(printErrorHandler()).submit().await();
+        try (Query q = db.borrowQuery()) {
+            q.sql(sql).binds(binds).handler(printErrorHandler()).submit().await();
         } catch (QueryException e) {
             // await() rethrows the bind-encode failure the handler already
             // reported in onError; swallowed here so the demo continues.

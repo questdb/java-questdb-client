@@ -1,6 +1,7 @@
 package com.example;
 
 import io.questdb.client.Completion;
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
@@ -29,7 +30,8 @@ public class QuestDBExample {
     public static void main(String[] args) throws InterruptedException {
         // One handle for the whole deployment. close() (try-with-resources)
         // shuts the pools down and disconnects every underlying client.
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // Ingest: borrow a Sender, write rows, close() flushes it and
             // returns it to the pool. The WebSocket is NOT torn down here --
@@ -49,14 +51,15 @@ public class QuestDBExample {
                         .atNow();
             }
 
-            // Query: one-shot SELECT. executeSql(...) borrows a query client
-            // from the egress pool, runs the SQL, and returns a Completion.
+            // Query: one-shot SELECT. Borrow a Query handle from the egress
+            // pool, submit the SQL, and await the returned Completion.
             // (Freshly ingested rows land in the WAL asynchronously, so an
             // immediate read-back may not see them yet -- that is expected.)
-            Completion c = db.executeSql(
+            Completion c = q.sql(
                     "SELECT symbol, side, price, amount FROM trades "
-                            + "WHERE symbol = 'ETH-USD' LIMIT 10",
-                    new PrintingHandler());
+                            + "WHERE symbol = 'ETH-USD' LIMIT 10")
+                    .handler(new PrintingHandler())
+                    .submit();
             try {
                 c.await(); // blocks until onEnd / onError has run
             } catch (QueryException e) {

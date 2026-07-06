@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -36,7 +37,8 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 public class BindNullExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // --- Convenience: setVarchar(index, null).
             // Use IS NULL / IS NOT NULL predicates since SQL equality with
@@ -44,8 +46,7 @@ public class BindNullExample {
             // server can infer the intended type; the bind drives that.
             System.out.println("rows where note IS NOT NULL and level < some-null-placeholder:");
             try {
-                db.query()
-                        .sql("SELECT id, note FROM logs WHERE note IS NOT NULL AND level < COALESCE($1::INT, 100) LIMIT 10")
+                q.sql("SELECT id, note FROM logs WHERE note IS NOT NULL AND level < COALESCE($1::INT, 100) LIMIT 10")
                         .binds(binds -> binds.setNull(0, QwpConstants.TYPE_INT))
                         .handler(printRowsHandler())
                         .submit()
@@ -57,8 +58,7 @@ public class BindNullExample {
             // --- Convenience: setUuid(index, (UUID) null).
             System.out.println("projection: NULL VARCHAR");
             try {
-                db.query()
-                        .sql("SELECT $1 AS v FROM long_sequence(1)")
+                q.sql("SELECT $1 AS v FROM long_sequence(1)")
                         .binds(binds -> binds.setVarchar(0, null))
                         .handler(new QwpColumnBatchHandler() {
                             @Override
@@ -84,8 +84,7 @@ public class BindNullExample {
             //     don't have a value-type overload, e.g. TIMESTAMP_NANOS).
             System.out.println("projection: NULL TIMESTAMP_NANOS");
             try {
-                db.query()
-                        .sql("SELECT CAST($1 AS TIMESTAMP_NS) AS ts FROM long_sequence(1)")
+                q.sql("SELECT CAST($1 AS TIMESTAMP_NS) AS ts FROM long_sequence(1)")
                         .binds(binds -> binds.setNull(0, QwpConstants.TYPE_TIMESTAMP_NANOS))
                         .handler(new QwpColumnBatchHandler() {
                             @Override

@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -33,14 +34,14 @@ import java.util.UUID;
 public class BindUuidExample {
 
     public static void main(String[] args) throws InterruptedException {
-        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
             UUID id = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
 
             // Convenience overload: pass java.util.UUID directly.
             System.out.println("lookup by java.util.UUID convenience overload");
             try {
-                db.query()
-                        .sql("SELECT user_name, started_at FROM sessions WHERE session_id = $1")
+                q.sql("SELECT user_name, started_at FROM sessions WHERE session_id = $1")
                         .binds(binds -> binds.setUuid(0, id))
                         .handler(new QwpColumnBatchHandler() {
                             @Override
@@ -70,8 +71,7 @@ public class BindUuidExample {
             long hi = id.getMostSignificantBits();
             System.out.println("lookup by (lo, hi) limb overload");
             try {
-                db.query()
-                        .sql("SELECT user_name, started_at FROM sessions WHERE session_id = $1")
+                q.sql("SELECT user_name, started_at FROM sessions WHERE session_id = $1")
                         .binds(binds -> binds.setUuid(0, lo, hi))
                         .handler(new QwpColumnBatchHandler() {
                             @Override
@@ -99,8 +99,7 @@ public class BindUuidExample {
             // Projecting a UUID back via the batch's UUID accessors.
             System.out.println("project a UUID back");
             try {
-                db.query()
-                        .sql("SELECT $1::UUID AS u FROM long_sequence(1)")
+                q.sql("SELECT $1::UUID AS u FROM long_sequence(1)")
                         .binds(binds -> binds.setUuid(0, id))
                         .handler(new QwpColumnBatchHandler() {
                             @Override

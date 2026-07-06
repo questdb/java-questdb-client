@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -59,10 +60,10 @@ public class ExecStatementExample {
             // 4. SELECT the data back to confirm the UPDATE landed. Uses the
             //    standard batch-streaming path (onBatch + onEnd).
             System.out.println("-- verifying UPDATE via SELECT");
-            try {
-                db.executeSql(
-                        "SELECT ts, sym, qty FROM trades_example",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT ts, sym, qty FROM trades_example")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 for (int row = 0; row < batch.getRowCount(); row++) {
@@ -83,7 +84,7 @@ public class ExecStatementExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }
@@ -100,8 +101,8 @@ public class ExecStatementExample {
      */
     private static void runExec(QuestDB db, String sql, short expectedOpType) throws InterruptedException {
         System.out.println("-- executing: " + sql);
-        try {
-            db.executeSql(sql, new QwpColumnBatchHandler() {
+        try (Query q = db.borrowQuery()) {
+            q.sql(sql).handler(new QwpColumnBatchHandler() {
                 @Override
                 public void onBatch(QwpColumnBatch batch) {
                     System.err.println("(unexpected) batch with " + batch.getRowCount() + " rows");
@@ -126,7 +127,7 @@ public class ExecStatementExample {
                         System.err.println("  !! op type mismatch");
                     }
                 }
-            }).await();
+            }).submit().await();
         } catch (QueryException e) {
             System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
         }

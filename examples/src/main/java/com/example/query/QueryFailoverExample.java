@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -31,8 +32,8 @@ public class QueryFailoverExample {
                         + "target=replica;"      // prefer read replicas for egress
                         + "zone=us-east-1a;")) {  // prefer this availability zone
 
-            try {
-                db.executeSql("SELECT count() FROM trades", new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT count() FROM trades").handler(new QwpColumnBatchHandler() {
                     @Override
                     public void onBatch(QwpColumnBatch batch) {
                         batch.forEachRow(row -> System.out.println("count = " + row.getLongValue(0)));
@@ -53,7 +54,7 @@ public class QueryFailoverExample {
                         System.out.println("failed over to node=" + newNode.getNodeId()
                                 + " zone=" + newNode.getZoneId());
                     }
-                }).await();
+                }).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

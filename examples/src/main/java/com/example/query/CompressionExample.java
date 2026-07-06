@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -61,11 +62,11 @@ public final class CompressionExample {
 
             long[] rows = {0};
 
-            try {
-                db.executeSql(
+            try (Query q = db.borrowQuery()) {
+                q.sql(
                         "SELECT symbol, price, timestamp "
-                                + "FROM trades WHERE timestamp IN yesterday()",
-                        new QwpColumnBatchHandler() {
+                                + "FROM trades WHERE timestamp IN yesterday()")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 // The decoder hands us a view over the decompressed
@@ -83,7 +84,7 @@ public final class CompressionExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

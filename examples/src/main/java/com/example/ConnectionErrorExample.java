@@ -1,5 +1,6 @@
 package com.example;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
@@ -47,8 +48,8 @@ public class ConnectionErrorExample {
         // 2. target=replica but no listed endpoint is a replica -> role mismatch.
         try (QuestDB db = QuestDB.connect(
                 "wss::addr=db-primary:9000;token=YOUR_TOKEN;target=replica;")) {
-            try {
-                db.executeSql("SELECT 1", new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT 1").handler(new QwpColumnBatchHandler() {
                     @Override
                     public void onBatch(QwpColumnBatch batch) {
                     }
@@ -60,7 +61,7 @@ public class ConnectionErrorExample {
                     @Override
                     public void onError(byte status, String message) {
                     }
-                }).await();
+                }).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

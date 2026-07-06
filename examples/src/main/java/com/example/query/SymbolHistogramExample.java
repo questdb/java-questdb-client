@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.ColumnView;
@@ -38,10 +39,10 @@ public class SymbolHistogramExample {
 
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
 
-            try {
-                db.executeSql(
-                        "SELECT symbol FROM trades",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT symbol FROM trades")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 ColumnView syms = batch.column(0);
@@ -92,7 +93,7 @@ public class SymbolHistogramExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }

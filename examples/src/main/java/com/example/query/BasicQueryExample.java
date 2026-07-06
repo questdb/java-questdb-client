@@ -1,5 +1,6 @@
 package com.example.query;
 
+import io.questdb.client.Query;
 import io.questdb.client.QueryException;
 import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -8,8 +9,8 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 /**
  * Minimal QWP egress query example.
  * <p>
- * Opens a pooled {@link QuestDB} handle over QWP (WebSocket), runs a SELECT
- * through {@code db.executeSql(...)}, and prints each row as the batches
+ * Opens a pooled {@link QuestDB} handle over QWP (WebSocket), borrows a
+ * {@link Query} to run a SELECT, and prints each row as the batches
  * arrive. {@code Completion.await()} blocks until the query finishes and
  * rethrows any server error as a {@link QueryException}.
  * <p>
@@ -31,10 +32,10 @@ public class BasicQueryExample {
 
     public static void main(String[] args) throws InterruptedException {
         try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
-            try {
-                db.executeSql(
-                        "SELECT timestamp, symbol, side, price, amount FROM trades WHERE symbol = 'ETH-USD' LIMIT 1000",
-                        new QwpColumnBatchHandler() {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT timestamp, symbol, side, price, amount FROM trades WHERE symbol = 'ETH-USD' LIMIT 1000")
+                        .handler(new QwpColumnBatchHandler() {
                             @Override
                             public void onBatch(QwpColumnBatch batch) {
                                 // The RowView handed to the lambda is reusable and pinned to the
@@ -63,7 +64,7 @@ public class BasicQueryExample {
                             public void onError(byte status, String message) {
                             }
                         }
-                ).await();
+                ).submit().await();
             } catch (QueryException e) {
                 System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
             }
