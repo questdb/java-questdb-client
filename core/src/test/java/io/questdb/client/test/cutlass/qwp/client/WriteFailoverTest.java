@@ -307,6 +307,84 @@ public class WriteFailoverTest {
     }
 
     @Test
+    public void testMixedSweepRoleRejectOutranksLatchedTerminalUpgradeError() throws Exception {
+        // Mixed connect sweep: [replica(421+role), replica(421+role),
+        // node(503)]. The co-occurring 421 role rejects are positive
+        // evidence of a transient failover/promotion window -- a replica
+        // can be promoted and a primary will reappear -- so the round
+        // epilogue must surface the retriable QwpRoleMismatchException,
+        // NOT the latched non-421 terminal upgrade error. Preferring the
+        // 503 turns a transient window into a dead sender (or a drainer
+        // slot quarantine on the background path).
+        AckHandler ack = new AckHandler();
+        TestWebSocketServer r1 = new TestWebSocketServer(ack);
+        int port1 = r1.getPort();
+        r1.setRejectWithRole("REPLICA");
+        TestWebSocketServer r2 = new TestWebSocketServer(ack);
+        int port2 = r2.getPort();
+        r2.setRejectWithRole("REPLICA");
+        TestWebSocketServer sick = new TestWebSocketServer(ack);
+        int port3 = sick.getPort();
+        sick.setRejectWithStatus(503, "Service Unavailable");
+        try {
+            r1.start();
+            r2.start();
+            sick.start();
+            Assert.assertTrue(r1.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(r2.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(sick.awaitStart(5, TimeUnit.SECONDS));
+
+            QwpRoleMismatchException observed = null;
+            // Off-mode walk sweeps every endpoint once and classifies the
+            // exhausted round at build(). Endpoint pick order does not
+            // matter: 421 role rejects and the 503 both `continue` the walk,
+            // so all three endpoints are always visited before the epilogue.
+            try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET)
+                    .address("localhost:" + port1)
+                    .address("localhost:" + port2)
+                    .address("localhost:" + port3)
+                    .build()) {
+                Assert.fail("expected the mixed-sweep connect to fail");
+            } catch (QwpRoleMismatchException e) {
+                observed = e;
+            } catch (WebSocketUpgradeException e) {
+                throw new AssertionError(
+                        "mixed sweep misclassified as terminal: latched non-421 upgrade error "
+                                + "(status=" + e.getStatusCode()
+                                + ") outranked role-reject evidence: " + e.getMessage(), e);
+            } catch (LineSenderException e) {
+                throw new AssertionError(
+                        "expected QwpRoleMismatchException but got LineSenderException: "
+                                + e.getMessage(), e);
+            }
+            Assert.assertNotNull("expected a role-mismatch surface", observed);
+            Assert.assertEquals("PRIMARY", observed.getTargetRole());
+            String msg = observed.getMessage();
+            Assert.assertNotNull(msg);
+            Assert.assertTrue("error must mention the observed replica role: " + msg,
+                    msg.contains("REPLICA"));
+            // The demoted non-421 upgrade error must stay observable for
+            // diagnostics: it rides along as a suppressed exception on the
+            // surfaced role-mismatch classification.
+            WebSocketUpgradeException demoted = null;
+            for (Throwable s : observed.getSuppressed()) {
+                if (s instanceof WebSocketUpgradeException) {
+                    demoted = (WebSocketUpgradeException) s;
+                    break;
+                }
+            }
+            Assert.assertNotNull(
+                    "expected the demoted 503 upgrade error as a suppressed diagnostic",
+                    demoted);
+            Assert.assertEquals(503, demoted.getStatusCode());
+        } finally {
+            r1.close();
+            r2.close();
+            sick.close();
+        }
+    }
+
+    @Test
     public void testStandaloneIsTreatedAsWritable() throws Exception {
         // OSS / single-node deployments advertise STANDALONE. The client
         // must accept that handshake without rotation since standalone

@@ -1,8 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 import java.util.Arrays;
 import java.util.List;
@@ -21,60 +23,60 @@ import java.util.List;
  * sets" workload. The cache stays warm for the lifetime of the query-
  * execution plan cache on the server side.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
  *   CREATE TABLE trades (
- *       ts    TIMESTAMP,
- *       sym   SYMBOL,
- *       price DOUBLE,
- *       qty   LONG
- *   ) TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class BindRepeatedLookupExample {
 
-    public static void main(String[] args) {
-        List<String> instruments = Arrays.asList("AAPL", "MSFT", "GOOG", "AMZN", "META");
+    public static void main(String[] args) throws InterruptedException {
+        List<String> instruments = Arrays.asList("ETH-USD", "BTC-USD", "SOL-USD", "ADA-USD", "XRP-USD");
 
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;");
+             Query q = db.borrowQuery()) {
 
             // SAME SQL TEXT across every iteration. Only the bind values differ.
-            String sql = "SELECT ts, price, qty FROM trades "
-                    + "WHERE sym = $1 AND ts >= $2 ORDER BY ts DESC LIMIT 10";
+            String sql = "SELECT timestamp, price, amount FROM trades "
+                    + "WHERE symbol = $1 AND timestamp >= $2 ORDER BY timestamp DESC LIMIT 10";
 
             long since = 1_700_000_000_000_000L; // micros since epoch
 
             for (String symbol : instruments) {
                 System.out.println("latest trades for " + symbol);
                 long[] rowCount = {0};
-                client.execute(
-                        sql,
-                        binds -> binds
-                                .setVarchar(0, symbol)
-                                .setTimestampMicros(1, since),
-                        new QwpColumnBatchHandler() {
-                            @Override
-                            public void onBatch(QwpColumnBatch batch) {
-                                rowCount[0] += batch.getRowCount();
-                                batch.forEachRow(row -> System.out.printf(
-                                        "  ts=%d price=%.4f qty=%d%n",
-                                        row.getLongValue(0),
-                                        row.getDoubleValue(1),
-                                        row.getLongValue(2)
-                                ));
-                            }
+                try {
+                    q.sql(sql)
+                            .binds(binds -> binds
+                                    .setVarchar(0, symbol)
+                                    .setTimestampMicros(1, since))
+                            .handler(new QwpColumnBatchHandler() {
+                                @Override
+                                public void onBatch(QwpColumnBatch batch) {
+                                    rowCount[0] += batch.getRowCount();
+                                    batch.forEachRow(row -> System.out.printf(
+                                            "  timestamp=%d price=%.4f amount=%.5f%n",
+                                            row.getLongValue(0),
+                                            row.getDoubleValue(1),
+                                            row.getDoubleValue(2)
+                                    ));
+                                }
 
-                            @Override
-                            public void onEnd(long totalRows) {
-                            }
+                                @Override
+                                public void onEnd(long totalRows) {
+                                }
 
-                            @Override
-                            public void onError(byte status, String message) {
-                                System.err.println("  query failed: " + message);
-                            }
-                        }
-                );
+                                @Override
+                                public void onError(byte status, String message) {
+                                }
+                            })
+                            .submit()
+                            .await();
+                } catch (QueryException e) {
+                    System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+                }
                 System.out.println("  (" + rowCount[0] + " rows)");
             }
         }

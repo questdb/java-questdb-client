@@ -54,10 +54,6 @@ stages:
               imageName: "macos-15-arm64"
               poolName: "Azure Pipelines"
               jdkArch: "arm64"
-            mac-x64:
-              imageName: "macos-15"
-              poolName: "Azure Pipelines"
-              jdkArch: "x64"
             windows-msvc-2022-x64:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
@@ -82,6 +78,13 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
+          # Compile the native libquestdb shared library on the runner; no
+          # platform's binary is committed anymore. Must run before the client
+          # jar is installed so the freshly built lib is packaged into it. The
+          # template builds the right artifact for the current native agent --
+          # Linux (.so), Windows (.dll), and macOS (.dylib) alike (see
+          # build_native.yaml).
+          - template: build_native.yaml
           - bash: |
               BRANCH="${SYSTEM_PULLREQUEST_SOURCEBRANCH:-$BUILD_SOURCEBRANCHNAME}"
               BRANCH="${BRANCH#refs/heads/}"
@@ -149,6 +152,9 @@ stages:
                 maven | "$(Agent.OS)"
               path: $(HOME)/.m2/repository
             displayName: "Cache Maven repository"
+          # Native binaries are no longer committed; compile libquestdb.so on the
+          # runner so the coverage test run can load it (same as BuildAndTest).
+          - template: build_native.yaml
           - task: Maven@3
             displayName: "Run tests with coverage"
             inputs:

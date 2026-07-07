@@ -1,8 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 
 /**
  * Opting into zstd compression of {@code RESULT_BATCH} frames.
@@ -53,36 +55,39 @@ public final class CompressionExample {
     private CompressionExample() {
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         // compression=zstd at a mid-tier level for a typical WAN consumer.
-        try (QwpQueryClient client = QwpQueryClient.fromConfig(
+        try (QuestDB db = QuestDB.connect(
                 "ws::addr=127.0.0.1:9000;compression=zstd;compression_level=3;")) {
-            client.connect();
 
             long[] rows = {0};
 
-            client.execute(
-                    "SELECT symbol, price, timestamp "
-                            + "FROM trades WHERE timestamp IN yesterday()",
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            // The decoder hands us a view over the decompressed
-                            // bytes; the rest of the row-consuming code is
-                            // identical whether or not compression is on.
-                            rows[0] += batch.getRowCount();
-                        }
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT symbol, price, timestamp "
+                                + "FROM trades WHERE timestamp IN yesterday()")
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                // The decoder hands us a view over the decompressed
+                                // bytes; the rest of the row-consuming code is
+                                // identical whether or not compression is on.
+                                rows[0] += batch.getRowCount();
+                            }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                            System.out.printf("done: %d rows%n", totalRows);
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                                System.out.printf("done: %d rows%n", totalRows);
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.printf("query failed [status=%d]: %s%n", status, message);
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
                         }
-                    });
+                ).submit().await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 }

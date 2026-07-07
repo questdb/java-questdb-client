@@ -925,6 +925,40 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_reconnectMaxDurationZero_fails() {
+        // A zero budget must be rejected up front: connectWithRetry's deadline
+        // (startNanos + 0) makes the SYNC initial connect throw "after 0ms /
+        // 0 attempts" without ever dialing a healthy server, and the drainer's
+        // capabilityGapBudgetNanos=0 exhausts the durable-ack settle budget
+        // (0 >= 0) on the first gap sweep, quarantining the slot instantly
+        // instead of after the documented 16-sweep budget.
+        assertBadConfig("ws::addr=localhost:9000;reconnect_max_duration_millis=0;",
+                "reconnect_max_duration_millis must be > 0");
+    }
+
+    @Test
+    public void testWsConfigString_reconnectMaxDurationNegative_fails() {
+        assertBadConfig("ws::addr=localhost:9000;reconnect_max_duration_millis=-1;",
+                "reconnect_max_duration_millis must be > 0");
+    }
+
+    @Test
+    public void testReconnectMaxDurationBuilder_zeroRejected() {
+        assertThrows("reconnect_max_duration_millis must be > 0",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .reconnectMaxDurationMillis(0));
+    }
+
+    @Test
+    public void testReconnectMaxDurationBuilder_negativeRejected() {
+        assertThrows("reconnect_max_duration_millis must be > 0",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .reconnectMaxDurationMillis(-1));
+    }
+
+    @Test
     public void testWsConfigString_usernameWithoutPassword_fails() {
         // The ingress ws path rejects a username with no password up front in
         // validateWsConfig, with the same message the egress QwpQueryClient uses,

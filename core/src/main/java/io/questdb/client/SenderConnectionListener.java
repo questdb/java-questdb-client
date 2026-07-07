@@ -51,8 +51,8 @@ import org.jetbrains.annotations.NotNull;
  * {@link SenderConnectionEvent.Kind#RECONNECTED}) are guaranteed to fire on
  * each transition. Failure events ({@code ENDPOINT_ATTEMPT_FAILED},
  * {@code ALL_ENDPOINTS_UNREACHABLE}) may be coalesced under inbox pressure.
- * Terminal events ({@code AUTH_FAILED}, {@code RECONNECT_BUDGET_EXHAUSTED})
- * fire before the producer-thread {@code LineSenderException} is observable on
+ * The terminal event {@code AUTH_FAILED}
+ * fires before the producer-thread {@code LineSenderException} is observable on
  * the next API call -- so a listener can react sooner than the producer learns
  * via exception, but should not assume the listener fires first under heavy
  * notification load.

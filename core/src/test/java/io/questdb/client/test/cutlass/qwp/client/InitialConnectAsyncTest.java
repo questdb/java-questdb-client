@@ -49,10 +49,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
  * {@code Sender.fromConfig} must return immediately even when no server
- * is reachable; the I/O thread retries connect in the background, and
- * terminal failures (auth/upgrade reject, budget exhaustion) are
- * delivered through the async error inbox rather than thrown at the
- * call site.
+ * is reachable; the I/O thread retries connect in the background. Plain
+ * connect failures are retried indefinitely (Invariant B: no wall-clock
+ * budget give-up); only genuine terminals (auth/upgrade reject,
+ * durable-ack capability gap) are delivered through the async error
+ * inbox rather than thrown at the call site.
  */
 public class InitialConnectAsyncTest {
 
@@ -92,8 +93,8 @@ public class InitialConnectAsyncTest {
                         "category must be SECURITY_ERROR for ws-upgrade-failed",
                         SenderError.Category.SECURITY_ERROR, err.getCategory());
                 Assert.assertEquals(
-                        "auth failure is HALT",
-                        SenderError.Policy.HALT, err.getAppliedPolicy());
+                        "auth failure is TERMINAL",
+                        SenderError.Policy.TERMINAL, err.getAppliedPolicy());
                 String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
                 Assert.assertTrue(
                         "error message must mention ws-upgrade-failed: " + msg,
@@ -106,17 +107,19 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testAsyncBudgetExhaustionDeliversToErrorInbox() throws Exception {
-        // No server. With async mode and a tight cap, the I/O thread
-        // exhausts its connect budget and surfaces a SenderError to the
-        // user-supplied handler. fromConfig itself does not throw; only
-        // close() rethrows the latched terminal so a user who never
-        // installed a handler still sees the failure on shutdown.
+    public void testAsyncNoServerRetriesForeverNoTerminal() throws Exception {
+        // INVARIANT B: an SF sender in async mode pointed at a dead port must
+        // NEVER surface a connection-error terminal -- a down server is transient
+        // (it may appear; the data is safe in SF), so the I/O thread retries
+        // forever. reconnect_max_duration_millis is IGNORED as a give-up deadline:
+        // no SenderError lands, the sender stays usable, and wasEverConnected()
+        // stays false. Only a GENUINE terminal (auth/upgrade) or SF exhaustion may
+        // surface -- see testAsyncAuthFailureDeliversToErrorInbox.
         int port = TestPorts.findUnusedPort();
         ErrorInbox inbox = new ErrorInbox();
         String cfg = "ws::addr=localhost:" + port
                 + sfDirOpt() + ";initial_connect_retry=async"
-                + ";reconnect_max_duration_millis=400"
+                + ";reconnect_max_duration_millis=200"
                 + ";reconnect_initial_backoff_millis=10"
                 + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
@@ -124,38 +127,33 @@ public class InitialConnectAsyncTest {
                 .errorHandler(inbox)
                 .build();
         try {
-            // Wait up to 5s for the I/O thread to exhaust its budget.
-            Assert.assertTrue(
-                    "async budget exhaustion must surface a SenderError within 5s",
-                    inbox.await(5, TimeUnit.SECONDS));
-            SenderError err = inbox.get();
-            Assert.assertNotNull(
-                    "async budget exhaustion must surface a SenderError to the inbox",
-                    err);
-            Assert.assertEquals(
-                    "budget exhaustion is a HALT-policy terminal",
-                    SenderError.Policy.HALT, err.getAppliedPolicy());
-            Assert.assertEquals(
-                    "category must be PROTOCOL_VIOLATION for budget exhaustion",
-                    SenderError.Category.PROTOCOL_VIOLATION, err.getCategory());
-            String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
-            Assert.assertTrue(
-                    "error message must use never-connected tag (no successful connect): " + msg,
-                    msg.contains("never-connected-budget-exhausted"));
-            Assert.assertTrue(
-                    "error message must hint at config-likely cause: " + msg,
-                    msg.contains("never reached the server"));
+            // Observe well past the (ignored) 200ms budget: no terminal lands.
             Assert.assertFalse(
-                    "wasEverConnected() must be false when no connect ever succeeded",
+                    "async SF sender must NOT surface a connection-error terminal "
+                            + "(Invariant B: retries forever past the budget)",
+                    inbox.await(1500, TimeUnit.MILLISECONDS));
+            Assert.assertNull("no SenderError may be delivered for a down server", inbox.get());
+            // Sender stays usable -- producer keeps appending to SF.
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+            Assert.assertFalse(
+                    "wasEverConnected() stays false while no server is reachable",
                     ((QwpWebSocketSender) sender).wasEverConnected());
+            // LIVENESS: no-terminal-in-window alone cannot distinguish
+            // "retries forever" from "gave up silently" -- an I/O thread
+            // that exits without latching a terminal also delivers nothing,
+            // and the flush above lands in SF regardless of wire liveness.
+            // The retry loop bumps getTotalReconnectAttempts() on every
+            // iteration, so the counter advancing NOW -- long past the
+            // (ignored) 200ms budget -- proves the loop is still running.
+            awaitReconnectAttemptsAdvance((QwpWebSocketSender) sender);
         } finally {
-            assertCloseRethrowsTerminal(sender,
-                    "never-connected-budget-exhausted");
+            sender.close();
         }
     }
 
     @Test
-    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() {
+    public void testAsyncDeliversBufferedRowsWhenServerArrivesLate() throws Exception {
         // Sender opens before the server is listening. Frames are
         // appended to the cursor SF engine on the producer thread. The
         // I/O thread retries connect in the background; once the server
@@ -169,7 +167,10 @@ public class InitialConnectAsyncTest {
                     + ";reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=200"
                     + ";close_flush_timeout_millis=2000;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            // fromConfig/flush/setup failures must fail the test -- only
+            // close() teardown noise is tolerated (see closeQuietly).
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 // wasEverConnected starts false in async mode — the I/O
                 // thread has not yet completed an upgrade.
@@ -198,9 +199,9 @@ public class InitialConnectAsyncTest {
                 Assert.assertTrue(
                         "wasEverConnected() must flip to true after the I/O thread connects",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+            } finally {
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
@@ -233,13 +234,12 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
-    public void testConnectionLostBudgetExhaustionTagsDifferently() {
-        // Server is up at first (initial connect succeeds + ACKs one
-        // batch), then we tear it down. The I/O loop tries to reconnect,
-        // every attempt hits TCP refused, and the budget exhausts.
-        // Because the loop did connect at least once before the outage,
-        // the SenderError must use the connection-lost tag and the sender
-        // must report wasEverConnected()==true.
+    public void testConnectionLostRetriesForeverNoTerminal() throws Exception {
+        // INVARIANT B: after a successful connect, if the server drops, the
+        // mid-stream reconnect must retry FOREVER -- it must NEVER surface a
+        // connection-lost terminal on a wall-clock budget. The rows are safe in
+        // SF and the server may return, so reconnect_max_duration_millis is
+        // ignored as a give-up deadline. wasEverConnected() stays true.
         AckHandler handler = new AckHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             int port = server.getPort();
@@ -248,7 +248,7 @@ public class InitialConnectAsyncTest {
 
             ErrorInbox inbox = new ErrorInbox();
             String cfg = "ws::addr=localhost:" + port
-                    + ";reconnect_max_duration_millis=400"
+                    + ";reconnect_max_duration_millis=200"
                     + ";reconnect_initial_backoff_millis=10"
                     + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
@@ -265,54 +265,53 @@ public class InitialConnectAsyncTest {
                         "wasEverConnected() must be true after a successful connect",
                         ((QwpWebSocketSender) sender).wasEverConnected());
 
-                // Tear the server down. The cursor I/O loop's tryReceiveAcks
-                // polls every 50us and discovers the peer disconnect on its
-                // own, then enters the reconnect loop and exhausts the
-                // 400ms budget — no producer activity required.
+                // Tear the server down. The I/O loop discovers the disconnect and
+                // enters reconnect -- which must retry forever, NOT surface a
+                // terminal on the (ignored) 200ms budget.
                 server.close();
-                Assert.assertTrue("budget exhaustion must surface a SenderError within 5s",
-                        inbox.await(5, TimeUnit.SECONDS));
-                SenderError err = inbox.get();
-                Assert.assertNotNull("budget exhaustion must surface a SenderError", err);
-                String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
-                Assert.assertTrue(
-                        "error message must use connection-lost tag: " + msg,
-                        msg.contains("connection-lost-budget-exhausted"));
-                Assert.assertTrue(
-                        "error message must hint at transient cause: " + msg,
-                        msg.contains("server unreachable since last connect"));
+                Assert.assertFalse(
+                        "mid-stream reconnect must NOT surface a connection-lost terminal "
+                                + "(Invariant B: retries forever past the budget)",
+                        inbox.await(1500, TimeUnit.MILLISECONDS));
+                Assert.assertNull("no terminal may be delivered on a transient outage", inbox.get());
                 Assert.assertTrue(
                         "wasEverConnected() must remain true after the outage",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+                // LIVENESS: same discriminator as the async-init test above.
+                // The mid-stream reconnect loop must still be making connect
+                // attempts long past the (ignored) 200ms budget -- not merely
+                // failing to report that it stopped.
+                awaitReconnectAttemptsAdvance((QwpWebSocketSender) sender);
             } finally {
-                assertCloseRethrowsTerminal(sender, "connection-lost-budget-exhausted");
+                // closeQuietly (not a bare close()) so a close-path exception
+                // cannot replace a pending AssertionError from the contract
+                // assertions above and mask a genuine failure.
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
     @Test
-    public void testWasEverConnectedTrueImmediatelyInSyncMode() {
+    public void testWasEverConnectedTrueImmediatelyInSyncMode() throws Exception {
         // Default (OFF) and SYNC modes both connect on the user thread
         // before fromConfig returns. wasEverConnected() must therefore
         // already be true the instant the sender becomes visible to the
         // caller — there is no observable "never connected" window in
-        // those modes, so misclassifying a budget exhaustion as
-        // never-connected is impossible.
+        // those modes.
         try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
             int port = server.getPort();
             server.start();
             Assert.assertTrue(server.awaitStart(5, java.util.concurrent.TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
                     + ";close_flush_timeout_millis=0;";
-            try (Sender sender = Sender.fromConfig(cfg)) {
+            Sender sender = Sender.fromConfig(cfg);
+            try {
                 Assert.assertTrue(
                         "wasEverConnected() must be true immediately in OFF/SYNC mode",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+            } finally {
+                closeQuietly(sender);
             }
-        } catch (Exception ignored) {
-            // already closed
         }
     }
 
@@ -332,6 +331,45 @@ public class InitialConnectAsyncTest {
                         "I/O thread did not log a connect attempt within 5s");
             }
             io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
+    /**
+     * Proves the I/O thread's retry loop is still ALIVE rather than merely
+     * quiet: snapshots {@link QwpWebSocketSender#getTotalReconnectAttempts()}
+     * and spins until it advances past the snapshot. Callers invoke this
+     * after the (ignored) reconnect budget has already elapsed, so a stuck
+     * counter means the loop gave up silently -- exactly the Invariant B
+     * regression a no-terminal-in-window assertion cannot see. A plain
+     * {@code attempts >= 1} check would NOT discriminate: attempts made
+     * before the budget expired would satisfy it even if the loop then
+     * exited.
+     */
+    private static void awaitReconnectAttemptsAdvance(QwpWebSocketSender wss) {
+        long snapshot = wss.getTotalReconnectAttempts();
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (wss.getTotalReconnectAttempts() <= snapshot) {
+            if (System.nanoTime() > deadlineNanos) {
+                throw new AssertionError(
+                        "Invariant B violation: reconnect attempts stuck at "
+                                + snapshot + " for 5s past the budget -- the I/O "
+                                + "thread stopped retrying without surfacing a terminal");
+            }
+            io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
+    /**
+     * Closes the sender, tolerating close-path teardown noise only. Used
+     * instead of a broad {@code catch (Exception ignored)} around a whole
+     * test body, which would swallow fromConfig/flush/setup failures and
+     * let the contract assertions pass vacuously.
+     */
+    private static void closeQuietly(Sender sender) {
+        try {
+            sender.close();
+        } catch (Exception ignored) {
+            // close() teardown noise only
         }
     }
 
@@ -362,8 +400,11 @@ public class InitialConnectAsyncTest {
 
     /**
      * Returns a unique temp sf_dir snippet for embedding in a config
-     * string. initial_connect_retry on/sync/async requires sf_dir per
-     * spec §3.5; without it the builder rejects construction.
+     * string. The builder does NOT require sf_dir for any
+     * initial_connect_retry mode — without it the sender builds in
+     * memory mode and buffers rows in the in-RAM cursor ring. These
+     * tests set an sf_dir so the rows accumulated before the first
+     * successful connect are disk-backed (the durable SF path).
      */
     private static String sfDirOpt() {
         String dir = java.nio.file.Paths.get(

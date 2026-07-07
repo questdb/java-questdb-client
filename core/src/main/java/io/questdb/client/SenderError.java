@@ -34,7 +34,7 @@ import org.jetbrains.annotations.Nullable;
  * <ul>
  *   <li>Asynchronously via {@link SenderErrorHandler} registered on the builder.</li>
  *   <li>Synchronously as the payload of a {@link LineSenderServerException} thrown
- *       from the next producer-thread API call after a {@link Policy#HALT} error has
+ *       from the next producer-thread API call after a {@link Policy#TERMINAL} error has
  *       been latched.</li>
  * </ul>
  *
@@ -87,9 +87,10 @@ public final class SenderError {
     }
 
     /**
-     * @return the policy the I/O loop actually applied — DROP_AND_CONTINUE means the data
-     * was dropped; HALT means a {@link LineSenderServerException} will be thrown on the next
-     * producer-thread API call.
+     * @return the policy the I/O loop actually applied — RETRIABLE / RETRIABLE_OTHER means
+     * the batch stays in the store-and-forward log and is replayed after a reconnect (no data
+     * loss, informational delivery); TERMINAL means a {@link LineSenderServerException} will be
+     * thrown on the next producer-thread API call.
      */
     public @NotNull Policy getAppliedPolicy() {
         return appliedPolicy;
@@ -195,7 +196,17 @@ public final class SenderError {
          */
         WRITE_ERROR,
         /**
-         * WebSocket-layer close frame with a terminal code (PROTOCOL_ERROR, UNSUPPORTED_DATA, MESSAGE_TOO_BIG).
+         * Node cannot serve writes at all right now (read-only replica, primary demoting).
+         * Wire {@code 0x0C} — reserved: current servers signal this state with a
+         * reconnect-eligible close instead of a mid-stream NACK, so this category is
+         * mapped for forward compatibility with servers that NACK it explicitly.
+         */
+        NOT_WRITABLE,
+        /**
+         * A frame the server (or an intermediary) deterministically rejects: the
+         * poison-frame detector observed the same head-of-line frame fail
+         * {@link io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_MAX_HEAD_FRAME_REJECTIONS}
+         * consecutive times with no ack progress — replaying it cannot succeed.
          */
         PROTOCOL_VIOLATION,
         /**
@@ -210,21 +221,37 @@ public final class SenderError {
      * connect-string per-category {@code on_*_error} → connect-string global {@code on_server_error}
      * → spec defaults.
      *
-     * <p>{@link Category#PROTOCOL_VIOLATION} and {@link Category#UNKNOWN} are forced {@link #HALT};
-     * user overrides for those categories are ignored.
+     * <p>There is no drop policy by design: the client never silently discards data. A rejected
+     * batch is either replayed ({@link #RETRIABLE} / {@link #RETRIABLE_OTHER}) or halts the
+     * sender loudly with the bytes preserved on disk ({@link #TERMINAL}).
+     *
+     * <p>{@link Category#PROTOCOL_VIOLATION} is forced {@link #TERMINAL} and
+     * {@link Category#UNKNOWN} is forced {@link #RETRIABLE} (fail open: a status byte from a
+     * newer server must degrade to retry, not to a dead sender); user overrides for those
+     * categories are ignored.
      */
     public enum Policy {
         /**
-         * Drop the rejected batch from the SF disk store (advance ackedFsn past it) and continue
-         * draining subsequent batches. The data is lost from the sender's perspective; the user
-         * must dead-letter via {@link SenderErrorHandler} if a record is needed.
+         * Recycle the connection and replay from the store-and-forward log: reconnect with
+         * capped exponential backoff and reposition at {@code ackedFsn + 1}. No data is
+         * dropped and the producer keeps writing; delivery through {@link SenderErrorHandler}
+         * is informational. A frame that keeps being rejected with no ack progress escalates
+         * to {@link #TERMINAL} via the poison-frame detector.
          */
-        DROP_AND_CONTINUE,
+        RETRIABLE,
+        /**
+         * Same replay semantics as {@link #RETRIABLE}, but the rejection says this node cannot
+         * serve writes at all (read-only replica / demoting primary), so the reconnect rotates
+         * to the next configured endpoint rather than waiting out a backoff against the same
+         * node.
+         */
+        RETRIABLE_OTHER,
         /**
          * Latch the error as terminal. The next producer-thread API call (e.g. {@link Sender#flush()})
          * throws {@link LineSenderServerException}. The sender does not drain further until the
-         * caller closes and rebuilds it.
+         * caller closes and rebuilds it. The rejected bytes remain in the store-and-forward log
+         * on disk — nothing is silently discarded.
          */
-        HALT
+        TERMINAL
     }
 }

@@ -76,6 +76,29 @@ public class QwpColumnBatchViewsTest {
 
     @After
     public void tearDown() {
+        // Safety net for exits that bypass the assertMemoryLeak wrapper;
+        // normally a no-op because the wrapper's finally already freed them.
+        freeAllocations();
+    }
+
+    /**
+     * Wraps a test body in {@link TestUtils#assertMemoryLeak} and frees the
+     * tracked allocations BEFORE the leak check fires -- LeakCheck closes at
+     * the end of the wrapped lambda, so freeing only in @After would run too
+     * late and fail every test now that the check asserts strict per-tag
+     * equality.
+     */
+    private void assertMemoryLeak(TestUtils.LeakProneCode code) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try {
+                code.run();
+            } finally {
+                freeAllocations();
+            }
+        });
+    }
+
+    private void freeAllocations() {
         for (long[] alloc : allocations) {
             Unsafe.free(alloc[0], alloc[1], MemoryTag.NATIVE_DEFAULT);
         }
@@ -84,7 +107,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewArrayRowAddr() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             Object l = setupArrayColumnLayout(batch,
                     new boolean[]{false, true, false},
@@ -102,7 +125,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewBatchAccessorReturnsParent() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 1);
             setupLongColumnLayout(batch, 0, "x", new long[]{42L}, new boolean[]{false});
             Assert.assertSame(batch, batch.column(0).batch());
@@ -111,7 +134,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewBinaryAccessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupBinaryColumnLayout(batch,
                     new byte[][]{{0x00, 0x7F, (byte) 0xFF}, null, {0x01}},
@@ -137,7 +160,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewBoolValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupBooleanColumnLayout(batch, 0,
                     new boolean[]{true, false, true, true, false},
@@ -154,7 +177,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewByteValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupByteColumnLayout(batch, 0,
                     new byte[]{Byte.MIN_VALUE, -1, 0, Byte.MAX_VALUE},
@@ -169,7 +192,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewBytesPerValuePerType() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(8, 1);
             setupLongColumnLayout(batch, 0, "l", new long[]{0}, new boolean[]{false});
             setupIntColumnLayout(batch, 1, new int[]{0}, new boolean[]{false});
@@ -193,7 +216,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewCachedPerColumnIndex() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(2, 1);
             setupLongColumnLayout(batch, 0, "a", new long[]{1L}, new boolean[]{false});
             setupLongColumnLayout(batch, 1, "b", new long[]{2L}, new boolean[]{false});
@@ -215,7 +238,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewCharValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupCharColumnLayout(batch, 0,
                     new char[]{'A', 'z', '0'},
@@ -229,7 +252,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewDecimal128Accessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             long[] lo = {0xFFEE_DDCC_BBAA_9988L, 0L, 0x1L};
             long[] hi = {0x1122_3344_5566_7788L, 0L, 0x2L};
@@ -246,7 +269,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewDelegatesAgreeWithBatchPrimitives() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(5, 4);
             setupLongColumnLayout(batch, 0, "l", new long[]{1L, 2L, 0L, 4L}, new boolean[]{false, false, true, false});
             setupIntColumnLayout(batch, 1, new int[]{10, 20, 0, 40}, new boolean[]{false, false, true, false});
@@ -279,7 +302,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewDoubleArrayElements() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupArrayColumnLayout(batch,
                     new boolean[]{false, true, false},
@@ -293,7 +316,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewDoubleValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupDoubleColumnLayout(batch, 0,
                     new double[]{1.5, -1.5, 0.0, Double.MAX_VALUE},
@@ -308,7 +331,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewFloatValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupFloatColumnLayout(batch, 0,
                     new float[]{1.5f, -1.5f, 0.0f},
@@ -322,7 +345,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewGeohashValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(3, 2);
             setupGeohashColumnLayout(batch, 0, "g20", new long[]{0xABCDEL, 0L}, new boolean[]{false, true}, 20);
             setupGeohashColumnLayout(batch, 1, "g40", new long[]{0x12345_6789AL, 0L}, new boolean[]{false, true}, 40);
@@ -344,7 +367,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewGetColumnIndex() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(3, 1);
             setupLongColumnLayout(batch, 0, "a", new long[]{0}, new boolean[]{false});
             setupLongColumnLayout(batch, 1, "b", new long[]{0}, new boolean[]{false});
@@ -357,7 +380,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewGetColumnWireType() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(2, 1);
             setupLongColumnLayout(batch, 0, "l", new long[]{0}, new boolean[]{false});
             setupVarcharColumnLayout(batch, 1, "s", new String[]{""}, new boolean[]{false});
@@ -368,7 +391,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewIntValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupIntColumnLayout(batch, 0,
                     new int[]{Integer.MIN_VALUE + 1, -1, 0, Integer.MAX_VALUE},
@@ -383,7 +406,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewLong256AndLong256Word() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[][] words = {{0xAAAAL, 0xBBBBL, 0xCCCCL, 0xDDDDL}, {0L, 0L, 0L, 0L}};
             setupLong256ColumnLayout(batch, words, new boolean[]{false, true});
@@ -409,7 +432,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewLongValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{Long.MIN_VALUE + 1, -1L, 0L, Long.MAX_VALUE},
@@ -424,7 +447,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewNonNullCount() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 2L, 0L, 4L, 0L},
@@ -435,7 +458,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewNonNullIndex() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             // Rows 1 and 3 are NULL; dense indices for non-null rows are 0, 1, 2.
             setupLongColumnLayout(batch, 0, "l",
@@ -452,7 +475,7 @@ public class QwpColumnBatchViewsTest {
     public void testColumnViewNonNullIndexNoNulls() throws Exception {
         // When there are no nulls, dense index equals row index (layout skips the
         // nonNullIdx fill; the method just returns the row back).
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 2L, 3L},
@@ -466,7 +489,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewNullBitmapAddrNoNulls() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 2L, 3L},
@@ -477,7 +500,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewNullBitmapAddrWithNulls() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 0L, 3L, 0L, 5L},
@@ -496,7 +519,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewNullValuesReturnTypeSentinels() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(6, 1);
             setupLongColumnLayout(batch, 0, "l", new long[]{0L}, new boolean[]{true});
             setupIntColumnLayout(batch, 1, new int[]{0}, new boolean[]{true});
@@ -519,7 +542,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewOfReturnsThis() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(2, 1);
             setupLongColumnLayout(batch, 0, "a", new long[]{1L}, new boolean[]{false});
             setupLongColumnLayout(batch, 1, "b", new long[]{2L}, new boolean[]{false});
@@ -532,7 +555,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewRebindingPicksUpFreshLayout() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupLongColumnLayout(batch, 0, "l", new long[]{1L, 2L}, new boolean[]{false, false});
             ColumnView col = batch.column(0);
@@ -560,7 +583,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewShortValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupShortColumnLayout(batch, 0,
                     new short[]{Short.MIN_VALUE + 1, -1, 0, Short.MAX_VALUE},
@@ -577,7 +600,7 @@ public class QwpColumnBatchViewsTest {
     public void testColumnViewStrBDualHold() throws Exception {
         // strA and strB are independent slots; a call to strB must not invalidate
         // an already-obtained strA view, and vice-versa.
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupVarcharColumnLayout(batch, 0, "s",
                     new String[]{"alpha", "beta", null},
@@ -596,7 +619,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewStringHeapAllocated() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupVarcharColumnLayout(batch, 0, "s",
                     new String[]{"alpha", null, "gamma"},
@@ -610,7 +633,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewStringSink() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupVarcharColumnLayout(batch, 0, "s",
                     new String[]{"alpha", null, "gamma"},
@@ -632,7 +655,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewSymbolAccessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             String[] dict = {"AAPL", "MSFT", "GOOG"};
             int[] rowIds = {0, 1, 0, 2, -1};
@@ -662,7 +685,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewUuidLoHi() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[] lo = {0xCAFE_BABEL, 0L};
             long[] hi = {0xDEAD_BEEFL, 0L};
@@ -677,7 +700,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewUuidWithSink() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[] lo = {0x1111_1111_1111_1111L, 0L};
             long[] hi = {0x2222_2222_2222_2222L, 0L};
@@ -693,7 +716,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewValuesAddrMatchesLayout() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(2, 1);
             Object lLayout = setupLongColumnLayout(batch, 0, "l", new long[]{1L}, new boolean[]{false});
             Object dLayout = setupDoubleColumnLayout(batch, 1, new double[]{2.0}, new boolean[]{false});
@@ -704,7 +727,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testColumnViewVarcharAndStringBytesAddr() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupVarcharColumnLayout(batch, 0, "v",
                     new String[]{"hello", "world", null},
@@ -722,7 +745,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testForEachRowEmptyBatch() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 0);
             // Register a minimal layout so column() doesn't trip on null, though
             // forEachRow never reaches into it.
@@ -741,7 +764,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testForEachRowExceptionPropagates() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 2L, 3L, 4L, 5L},
@@ -762,7 +785,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testForEachRowReusesSameInstance() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{1L, 2L, 3L, 4L},
@@ -775,7 +798,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testForEachRowVisitsRowsInOrder() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{10L, 20L, 30L, 40L, 50L},
@@ -796,7 +819,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewArrayAccessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupArrayColumnLayout(batch,
                     new boolean[]{false, true, false},
@@ -811,7 +834,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewBatchAccessor() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 1);
             setupLongColumnLayout(batch, 0, "x", new long[]{42L}, new boolean[]{false});
             Assert.assertSame(batch, batch.row(0).batch());
@@ -820,7 +843,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewBinaryAccessor() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupBinaryColumnLayout(batch,
                     new byte[][]{{0x00, 0x7F, (byte) 0xFF}, null},
@@ -841,7 +864,7 @@ public class QwpColumnBatchViewsTest {
     @Test
     public void testRowViewBinaryBDualHold() throws Exception {
         // binaryA and binaryB are independent slots, parallel to strA/strB.
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupBinaryColumnLayout(batch,
                     new byte[][]{{0x01, 0x02}, {(byte) 0xFE, (byte) 0xFF}},
@@ -860,7 +883,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewByteAndShortAndCharAndFloat() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(4, 2);
             setupByteColumnLayout(batch, 0, new byte[]{(byte) 127, 0}, new boolean[]{false, true});
             setupShortColumnLayout(batch, 1, new short[]{(short) -32000, 0}, new boolean[]{false, true});
@@ -884,7 +907,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewDecimal128() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[] lo = {0x1122_3344_5566_7788L, 0L};
             long[] hi = {0x99AA_BBCC_DDEE_FF00L, 0L};
@@ -898,7 +921,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewDelegatesAgreeWithBatchPrimitives() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(5, 4);
             setupLongColumnLayout(batch, 0, "l", new long[]{1L, 2L, 0L, 4L}, new boolean[]{false, false, true, false});
             setupIntColumnLayout(batch, 1, new int[]{10, 20, 0, 40}, new boolean[]{false, false, true, false});
@@ -921,7 +944,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewGeohashValue() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupGeohashColumnLayout(batch, 0, "g", new long[]{0xDEAD_BEEFL, 0L}, new boolean[]{false, true}, 32);
             Assert.assertEquals(0xDEAD_BEEFL, batch.row(0).getGeohashValue(0));
@@ -931,7 +954,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewGetRowIndex() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 5);
             setupLongColumnLayout(batch, 0, "l",
                     new long[]{0L, 0L, 0L, 0L, 0L},
@@ -947,7 +970,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewLong256WithSink() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[][] words = {{0x1L, 0x2L, 0x3L, 0x4L}, {0L, 0L, 0L, 0L}};
             setupLong256ColumnLayout(batch, words, new boolean[]{false, true});
@@ -965,7 +988,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewLong256Word() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[][] words = {{0x11L, 0x22L, 0x33L, 0x44L}, {0L, 0L, 0L, 0L}};
             setupLong256ColumnLayout(batch, words, new boolean[]{false, true});
@@ -980,7 +1003,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewOfReturnsThis() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupLongColumnLayout(batch, 0, "l", new long[]{7L, 8L}, new boolean[]{false, false});
             RowView v = batch.row(0);
@@ -991,7 +1014,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewSingleSharedInstance() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupLongColumnLayout(batch, 0, "l", new long[]{1L, 2L, 3L}, new boolean[]{false, false, false});
             RowView a = batch.row(0);
@@ -1006,7 +1029,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewStrAStrBDualHold() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             setupVarcharColumnLayout(batch, 0, "s",
                     new String[]{"alpha", "beta"},
@@ -1023,7 +1046,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewStringAccessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 3);
             setupVarcharColumnLayout(batch, 0, "s",
                     new String[]{"alpha", null, "gamma"},
@@ -1046,7 +1069,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewSymbolAccessors() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 4);
             String[] dict = {"AAPL", "MSFT"};
             int[] rowIds = {0, 1, 0, -1};
@@ -1066,7 +1089,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewUuidLoHi() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[] lo = {0xCAFE_BABEL, 0L};
             long[] hi = {0xDEAD_BEEFL, 0L};
@@ -1080,7 +1103,7 @@ public class QwpColumnBatchViewsTest {
 
     @Test
     public void testRowViewUuidWithSink() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
+        assertMemoryLeak(() -> {
             QwpColumnBatch batch = newBatch(1, 2);
             long[] lo = {0xAAAAL, 0L};
             long[] hi = {0xBBBBL, 0L};

@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.ConfigSchema;
 import io.questdb.client.impl.ConfigView;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -40,71 +41,101 @@ import org.junit.Test;
 public class QwpConfigKeysTest {
 
     @Test
-    public void testEverySchemaKeyIsRecognizedByBothClients() {
-        for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
-            String cfg = "ws::addr=h:9000;" + spec.name() + "=" + sampleValue(spec) + ";";
-            // A key may still fail a cross-key or range check; it must NOT fail
-            // as an unknown key -- that would mean it is missing from the
-            // registry (or that a consumer rejects a key it should ignore).
-            assertNotUnknown(spec.name(), () -> Sender.builder(cfg));
-            assertNotUnknown(spec.name(), () -> QwpQueryClient.fromConfig(cfg).close());
-        }
+    public void testEverySchemaKeyIsRecognizedByBothClients() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
+                String cfg = "ws::addr=h:9000;" + spec.name() + "=" + sampleValue(spec) + ";";
+                // A key may still fail a cross-key or range check; it must NOT fail
+                // as an unknown key -- that would mean it is missing from the
+                // registry (or that a consumer rejects a key it should ignore).
+                assertNotUnknown(spec.name(), () -> Sender.builder(cfg));
+                assertNotUnknown(spec.name(), () -> QwpQueryClient.fromConfig(cfg).close());
+            }
+        });
     }
 
     @Test
-    public void testJunkKeyRejectedOnBoth() {
-        assertRejected("ws::addr=h:9000;not_a_real_key=foo;",
-                "unknown configuration key: not_a_real_key");
+    public void testConnectTimeoutOverIntRejectedOnBoth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // connect_timeout flows into an int API on both clients. A bare
+            // (int) cast would silently wrap 2^32+1 to a 1 ms timeout and turn
+            // 2^31 into a misleading "must be > 0: -2147483648" error. Both
+            // must reject up front, naming the actual limit.
+            assertRejected("ws::addr=h:9000;connect_timeout=4294967297;",
+                    "connect_timeout must be <= 2147483647: 4294967297");
+            assertRejected("ws::addr=h:9000;connect_timeout=2147483648;",
+                    "connect_timeout must be <= 2147483647: 2147483648");
+            // The schema lower bound is intact end-to-end...
+            assertRejected("ws::addr=h:9000;connect_timeout=0;",
+                    "connect_timeout must be > 0");
+            // ...and a valid value still builds on both clients.
+            Sender.builder("ws::addr=h:9000;connect_timeout=7000;");
+            QwpQueryClient.fromConfig("ws::addr=h:9000;connect_timeout=7000;").close();
+        });
     }
 
     @Test
-    public void testLegacyKeysRejectedWithHintOnBoth() {
-        String legacyHint = "(applies to legacy http/tcp/udp transports only)";
-        assertRejected("ws::addr=h:9000;init_buf_size=1024;",
-                "unknown configuration key: init_buf_size", legacyHint);
-        assertRejected("ws::addr=h:9000;max_buf_size=1024;",
-                "unknown configuration key: max_buf_size", legacyHint);
-        assertRejected("ws::addr=h:9000;request_timeout=1000;",
-                "unknown configuration key: request_timeout", legacyHint);
-        assertRejected("ws::addr=h:9000;request_min_throughput=1000;",
-                "unknown configuration key: request_min_throughput", legacyHint);
-        assertRejected("ws::addr=h:9000;max_datagram_size=1400;",
-                "unknown configuration key: max_datagram_size", legacyHint);
-        assertRejected("ws::addr=h:9000;multicast_ttl=4;",
-                "unknown configuration key: multicast_ttl", legacyHint);
-        assertRejected("ws::addr=h:9000;retry_timeout=1000;",
-                "unknown configuration key: retry_timeout", "(use reconnect_max_duration_millis on ws/wss)");
-        assertRejected("ws::addr=h:9000;protocol_version=2;",
-                "unknown configuration key: protocol_version", "(QWP negotiates the protocol version during the WebSocket upgrade)");
+    public void testJunkKeyRejectedOnBoth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            assertRejected("ws::addr=h:9000;not_a_real_key=foo;",
+                    "unknown configuration key: not_a_real_key");
+        });
     }
 
     @Test
-    public void testRelocatedHintTableIsExactlyTheLegacyKeys() {
-        String legacyHint = "(applies to legacy http/tcp/udp transports only)";
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("init_buf_size"));
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("max_buf_size"));
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("request_timeout"));
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("request_min_throughput"));
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("max_datagram_size"));
-        Assert.assertEquals(legacyHint, ConfigView.relocatedHint("multicast_ttl"));
-        Assert.assertEquals("(use reconnect_max_duration_millis on ws/wss)", ConfigView.relocatedHint("retry_timeout"));
-        Assert.assertEquals("(QWP negotiates the protocol version during the WebSocket upgrade)", ConfigView.relocatedHint("protocol_version"));
-
-        // No registry key (including POOL keys) carries a relocated hint.
-        for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
-            Assert.assertNull("registry key '" + spec.name() + "' must not be in the hint table",
-                    ConfigView.relocatedHint(spec.name()));
-        }
-        // ECDSA keys are plain unknowns (only the C client handles them).
-        Assert.assertNull(ConfigView.relocatedHint("token_x"));
-        Assert.assertNull(ConfigView.relocatedHint("token_y"));
-        Assert.assertNull(ConfigView.relocatedHint("not_a_real_key"));
+    public void testLegacyKeysRejectedWithHintOnBoth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String legacyHint = "(applies to legacy http/tcp/udp transports only)";
+            assertRejected("ws::addr=h:9000;init_buf_size=1024;",
+                    "unknown configuration key: init_buf_size", legacyHint);
+            assertRejected("ws::addr=h:9000;max_buf_size=1024;",
+                    "unknown configuration key: max_buf_size", legacyHint);
+            assertRejected("ws::addr=h:9000;request_timeout=1000;",
+                    "unknown configuration key: request_timeout", legacyHint);
+            assertRejected("ws::addr=h:9000;request_min_throughput=1000;",
+                    "unknown configuration key: request_min_throughput", legacyHint);
+            assertRejected("ws::addr=h:9000;max_datagram_size=1400;",
+                    "unknown configuration key: max_datagram_size", legacyHint);
+            assertRejected("ws::addr=h:9000;multicast_ttl=4;",
+                    "unknown configuration key: multicast_ttl", legacyHint);
+            assertRejected("ws::addr=h:9000;retry_timeout=1000;",
+                    "unknown configuration key: retry_timeout", "(use reconnect_max_duration_millis on ws/wss)");
+            assertRejected("ws::addr=h:9000;protocol_version=2;",
+                    "unknown configuration key: protocol_version", "(QWP negotiates the protocol version during the WebSocket upgrade)");
+        });
     }
 
     @Test
-    public void testTokenXYRejectedWithoutHintOnBoth() {
-        assertRejectedNoHint("ws::addr=h:9000;token_x=abc;", "token_x");
-        assertRejectedNoHint("ws::addr=h:9000;token_y=def;", "token_y");
+    public void testRelocatedHintTableIsExactlyTheLegacyKeys() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String legacyHint = "(applies to legacy http/tcp/udp transports only)";
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("init_buf_size"));
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("max_buf_size"));
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("request_timeout"));
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("request_min_throughput"));
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("max_datagram_size"));
+            Assert.assertEquals(legacyHint, ConfigView.relocatedHint("multicast_ttl"));
+            Assert.assertEquals("(use reconnect_max_duration_millis on ws/wss)", ConfigView.relocatedHint("retry_timeout"));
+            Assert.assertEquals("(QWP negotiates the protocol version during the WebSocket upgrade)", ConfigView.relocatedHint("protocol_version"));
+
+            // No registry key (including POOL keys) carries a relocated hint.
+            for (ConfigSchema.KeySpec spec : ConfigSchema.all()) {
+                Assert.assertNull("registry key '" + spec.name() + "' must not be in the hint table",
+                        ConfigView.relocatedHint(spec.name()));
+            }
+            // ECDSA keys are plain unknowns (only the C client handles them).
+            Assert.assertNull(ConfigView.relocatedHint("token_x"));
+            Assert.assertNull(ConfigView.relocatedHint("token_y"));
+            Assert.assertNull(ConfigView.relocatedHint("not_a_real_key"));
+        });
+    }
+
+    @Test
+    public void testTokenXYRejectedWithoutHintOnBoth() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            assertRejectedNoHint("ws::addr=h:9000;token_x=abc;", "token_x");
+            assertRejectedNoHint("ws::addr=h:9000;token_y=def;", "token_y");
+        });
     }
 
     private static void assertNotUnknown(String key, Runnable action) {

@@ -40,4 +40,44 @@ public final class TestPorts {
             throw new RuntimeException("failed to allocate an ephemeral port", e);
         }
     }
+
+    /**
+     * Allocates {@code n} DISTINCT ephemeral ports. All {@code n} probe
+     * sockets are held open simultaneously, so the kernel is forced to hand
+     * out {@code n} different ports; they are closed together only after
+     * every port has been collected.
+     * <p>
+     * Do NOT emulate this with repeated {@link #findUnusedPort()} calls:
+     * that helper is bind-close-return, and once its probe socket closes the
+     * port returns to the kernel's ephemeral pool — Linux readily hands the
+     * just-released port straight back to the next {@code bind(0)}, so two
+     * back-to-back calls can return the SAME port. That exact race made a
+     * multi-addr config fail validation with "duplicate addr entry" in CI.
+     */
+    public static int[] findUnusedPorts(int n) {
+        if (n <= 0) {
+            throw new IllegalArgumentException("n must be > 0: " + n);
+        }
+        ServerSocket[] sockets = new ServerSocket[n];
+        int[] ports = new int[n];
+        try {
+            for (int i = 0; i < n; i++) {
+                sockets[i] = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+                ports[i] = sockets[i].getLocalPort();
+            }
+            return ports;
+        } catch (IOException e) {
+            throw new RuntimeException("failed to allocate " + n + " ephemeral ports", e);
+        } finally {
+            for (ServerSocket s : sockets) {
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (IOException ignored) {
+                        // best-effort; the probe socket carries no state
+                    }
+                }
+            }
+        }
+    }
 }

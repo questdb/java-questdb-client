@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Review a GitHub pull request against QuestDB coding standards. Use when asked to review a PR (by number or URL), optionally with a depth level 0..3. Performs an adversarial, blocking, mission-critical code review covering correctness, concurrency, performance, resource management, tests, and QuestDB conventions, then verifies every finding against source before reporting.
+description: Review a GitHub pull request against QuestDB coding standards. Use when asked to review a PR (by number or URL), optionally with a depth level 0..3. Performs an adversarial, blocking, mission-critical code review covering correctness, concurrency, performance, resource management, test coverage, test efficacy, test-code quality, and QuestDB conventions, then verifies every finding against source before reporting.
 allowed-tools: bash read subagent
 ---
 
@@ -45,10 +45,10 @@ The level controls how much of the review below actually runs. Lower levels keep
 
 | Level | What runs |
 |-------|-----------|
-| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no subagent spawn; review the diff inline in the main loop, using `read`/`bash` searches on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, NULL handling, tests, and QuestDB standards on the diff itself. |
-| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d). In Step 3, launch only reviewer 1 (correctness), reviewer 5 (tests), and reviewer 6 (code quality) in parallel. Skip all other reviewers. Skip Step 3b — verify findings inline as you draft the report. |
-| **2** | Full Step 2.5, but in 2.5b restrict the callsite inventory to `public`/`protected` symbols (skip package-private and `pub(crate)`). In Step 3, launch reviewers 1-7, plus reviewer 8 if `.rs` files are present. Skip reviewer 9 (cross-context) and reviewer 10 (adversarial fresh-context). Step 3b uses a single batched verification reviewer for all findings instead of one per finding. |
-| **3** | Every step below as written, all 10 reviewers, per-finding verification. The full mission-critical pass. |
+| **0 (default)** | Steps 1, 2, 4. Skip Step 2.5. Skip Step 3 — no subagent spawn; review the diff inline in the main loop, using `read`/`bash` searches on demand to resolve ambiguities. Skip Step 3b — verify each finding inline as you write it. Single-pass review covering correctness, NULL handling, test coverage, and QuestDB standards on the diff itself. When the diff touches test code, also apply the test-efficacy and test-code-quality anti-pattern checks inline (vacuous assertions, reflection overuse, reinvented helpers, javadoc bloat). |
+| **1** | Adds Step 2.5a (semantic delta only — skip 2.5b/2.5c/2.5d) plus Step 2.5e when test code is present. In Step 3, launch reviewer 1 (correctness), reviewer 5 (test coverage), reviewer 6 (code quality), and — when the diff touches test code — reviewer 11 (test efficacy) and reviewer 12 (test-code quality) in parallel. Skip all other reviewers. Skip Step 3b — verify findings inline as you draft the report. |
+| **2** | Full Step 2.5 (including 2.5e when test code is present), but in 2.5b restrict the callsite inventory to `public`/`protected` symbols (skip package-private and `pub(crate)`). In Step 3, launch reviewers 1-7, plus reviewer 8 if `.rs` files are present, plus reviewers 11 and 12 when the diff touches test code. Skip reviewer 9 (cross-context), reviewer 10 (adversarial fresh-context), and reviewer 13 (regression-test efficacy verification). Step 3b uses a single batched verification reviewer for all findings instead of one per finding. |
+| **3** | Every step below as written, all 13 reviewers, per-finding verification. The full mission-critical pass. |
 
 State the chosen level in one line at the start of the review so the user knows what they're getting (e.g., "Reviewing PR #1234 at level 2"). If the level was defaulted, mention that level 3 exists for full review.
 
@@ -60,8 +60,17 @@ Capture the PR identifier in `$PR` (the part of `$ARGUMENTS` left after strippin
 PR='<PR number or URL from $ARGUMENTS, with any --level=N / -lN / bare-digit level token removed>'
 gh pr view "$PR" --json number,title,body,labels,state
 gh pr diff "$PR"
+gh pr diff "$PR" --numstat   # binary files show as `-<TAB>-<TAB><path>`
 gh pr view "$PR" --comments
 ```
+
+**Committed-binary gate (runs at every level).** Scan the `--numstat` output for
+any added/modified file git reports as binary (`-`/`-` in the added/deleted
+columns). This repo builds its native/C libraries from source in CI and does not
+commit build outputs, so any such file is a **Critical** finding regardless of
+review level — report it even at level 0. See the "Committed build artifacts"
+checklist for the rationale and the acceptable-exception (genuine test-input
+fixtures only).
 
 ## Step 2: PR title and description
 
@@ -128,6 +137,14 @@ End this step with an explicit list of "places this change is visible from but t
 
 The list groups the callsites from 2.5b by execution context: hot data paths, SQL compilation, async runtime, JNI boundary, replication, materialized views, parallel execution workers, etc. Every entry on this list must be reviewed in Step 3.
 
+### 2.5e Test surface & helper inventory
+
+Run this only when the PR adds or changes test code. It is the test-code counterpart to 2.5b and feeds Reviewers 11-13. Use real `rg`/`find` searches via `bash` — do not reason about helpers from memory.
+
+- **Existing-infrastructure inventory:** search the changed test files' package and module for base test classes, shared `@Before`/`@After`, helper methods, fixtures, and assertion utilities the new tests could reuse (`rg` for `extends Abstract.*Test`, `class .*TestUtils`, `assertMemoryLeak`, `assertQuery`, `assertSql`, shared `protected` helpers in the base class). This list is the baseline Reviewer 12 uses to flag reinvented boilerplate — a "you stamped boilerplate instead of reusing helper X" finding requires X to appear in this inventory.
+- **Changed shared helpers as symbols:** if the PR changes a shared test base class, helper, or fixture, run the 2.5b callsite inventory for it too — a changed test base class can silently break every subclassing test.
+- **Exercised-symbol map:** for each new or changed test, list which production symbols from 2.5a it actually exercises, so Reviewers 11 and 13 can check efficacy and regression value.
+
 ## Step 3: Parallel review
 
 Launch the reviewers below with the `subagent` tool in `context: "fresh"` mode, in parallel (`subagent({ tasks: [...], context: "fresh", concurrency: N })`). Every reviewer task must include:
@@ -147,7 +164,7 @@ Launch the reviewers below with the `subagent` tool in `context: "fresh"` mode, 
 
 Launch the following reviewers in parallel.
 
-**Reviewer 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite.
+**Reviewer 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the store-and-forward sender, the async drainer / send loop, primary reconnect/failover, or pool startup (`lazy_connect` / `initial_connect_retry` / `SenderPool` / `QueryClientPool`), also verify the "Store-and-forward & pool startup invariants" checklist — a running drainer that propagates a transport error to the caller, imposes a reconnect time budget, or hard-fails on a transient outage is a Critical (data-loss) finding.
 
 **Reviewer 2 — Concurrency:** Race conditions, shared mutable state, missing volatile, lock ordering, thread-safety of data structures. Use the implicit contract list (lock order, thread-affinity) and check every callsite from 2.5b for violations of the new contract.
 
@@ -155,9 +172,9 @@ Launch the following reviewers in parallel.
 
 **Reviewer 4 — Resource management:** Leaks on all code paths (especially errors), try-with-resources, native memory, pool management. Walk every callsite from 2.5b that constructs, owns, or transfers ownership of changed types and verify cleanup on all paths.
 
-**Reviewer 5 — Test review & coverage:** Coverage gaps, error path tests, NULL tests, boundary conditions, regression tests, test quality, `assertMemoryLeak()` usage. Cross-reference 2.5d: every cross-context exposure should have a test that exercises the changed symbol from that context. Missing tests for cross-context callsites is a high-priority finding.
+**Reviewer 5 — Test coverage:** Coverage gaps, error path tests, NULL tests, boundary conditions, regression tests exist, `assertMemoryLeak()` usage. Cross-reference 2.5d: every cross-context exposure should have a test that exercises the changed symbol from that context. Missing tests for cross-context callsites is a high-priority finding. Test *efficacy* (whether those tests actually exercise the change and could fail) and test-*code* quality are handled by Reviewers 11-13 — here focus only on whether coverage exists for every new or changed path.
 
-**Reviewer 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies.
+**Reviewer 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies. Also scan the diff for any committed compiled binary / build artifact (run `git diff --numstat`/`--stat` and flag files git reports as binary) — the native/C libraries are built from source in CI, so a committed binary is a **Critical** finding (see the "Committed build artifacts" checklist).
 
 **Reviewer 7 — PR metadata & conventions:** Title format, description quality, commit messages, labels, SQL style in tests.
 
@@ -192,6 +209,25 @@ The point of this reviewer is to surface bugs the structured reviewers cannot se
 
 Run this reviewer in parallel with reviewers 1-9. It is mandatory regardless of diff size.
 
+**Test-code reviewers (Reviewers 11-13) — run only when the diff adds or changes test code.** Launch them in the same parallel batch as reviewers 1-10. Each receives the diff, the change surface map, and the test surface inventory from 2.5e. They are the test-code counterparts to the production reviewers: Reviewer 11 mirrors Reviewer 1 (correctness), Reviewer 12 mirrors Reviewer 6 (code quality), and Reviewer 13 verifies regression-test efficacy. Tests are not second-class code — apply the same adversarial rigor here as to production.
+
+**Reviewer 11 — Test efficacy & correctness (adversarial):** Prove each test actually exercises the production change and could fail if that change regressed.
+- **Vacuous assertions:** flag every assertion that cannot fail — `assertTrue(true)`, `assertFalse(false)`, `assertEquals(x, x)`, asserting a literal against the same literal, asserting on a value the test itself just hard-coded, or a `@Test` body with no assertion and no `expected=`/`assertThrows`.
+- **Tests that don't reach the changed code:** the assertion passes whether or not the production change is present. Trace the data flow from the changed symbol to the assertion.
+- **Happy-path-only:** no assertion on the error/exception/NULL path the production change added.
+- **Concurrency-test correctness:** races in the test harness itself, missing latches/barriers, an `AssertionError` thrown on a spawned thread where it is swallowed instead of failing the test, `Thread.sleep`-based synchronization that is timing-dependent and flaky.
+- **Test setup/teardown resource handling:** native memory allocated in setup/`@Before` that leaks on a failing path, missing `assertMemoryLeak()` wrapping.
+- Each finding states the exact assertion and why it cannot fail or what it fails to cover.
+
+**Reviewer 12 — Test-code quality & maintainability:** Review the test as code.
+- **Reflection overuse:** flag `setAccessible(true)`, `getDeclaredField`/`getDeclaredMethod`, `Field.set`, `Class.forName`, and similar when a public API, an existing test helper, or a constructor reaches the same state. Reflection in tests is a last resort; if a neater non-reflective path exists, the reflection is a finding — name the alternative.
+- **No code reuse / boilerplate stamping:** before accepting repeated setup or assertion blocks, run `rg`/`find` for existing helpers, base test classes, and fixtures (e.g., `extends Abstract.*Test`, `TestUtils`, `*TestUtils`, shared `assert*`, shared `@Before`) using the 2.5e inventory. If a helper already exists that the new test reimplements inline, flag it and name the helper. Duplicated blocks across new test methods that should be a single helper or a parameterized test are findings.
+- **Javadoc bloat:** flag multi-paragraph javadoc on `@Test` methods, javadoc that merely restates the test name, and stacked/duplicated javadoc ("javadoc piled on javadoc"). Test intent belongs in a precise test name plus, at most, a one-line comment.
+- **Residue and smells:** dead code, commented-out code, copy-paste leftovers (a `testFoo` that actually tests bar), `System.out.println` debugging, `@Ignore` without a referenced ticket, magic numbers >= 5 digits without `_` separators.
+- **Which standards apply:** zero-GC and `io.questdb.std`-over-`java.util` do NOT apply to test code — do not flag `java.util` collections or allocations in tests. Member ordering, `is/has` boolean naming, and SQL style DO apply.
+
+**Reviewer 13 — Regression-test efficacy verification:** For any PR that claims to fix a bug, verify the regression test would actually fail without the production change. Reason about reverting the production hunk and confirm the new or changed test's assertions would then fail. If the test still passes with the fix reverted, it is not a regression test — flag it. State, per test, which production line the test depends on and what its assertion would do if that line were reverted. Run only when the PR is a fix; skip for pure features or refactors.
+
 Combine all reviewer findings into a single deduplicated **draft** report. Do NOT present this draft to the user yet — it goes straight into verification.
 
 ## Step 3b: Verify every finding against source code
@@ -217,7 +253,9 @@ For each finding in the draft report:
    saving is negligible relative to the surrounding work. Exception: GC allocations on a hot path are always worth
    flagging, even a single one.
 9. **For cross-context findings (Reviewer 9)**: re-read the callsite in full, including its callers up two levels, and confirm the broken behavior is reachable from production code paths. Cross-context findings are high-value but also the easiest to overstate — verify carefully.
-10. **Classify each finding** as:
+10. **For test-efficacy findings (Reviewers 11, 13)**: re-read the cited assertion in full context and confirm it truly cannot fail — a "vacuous assertion" claim is a false positive if production code actually recomputes the asserted value. For "would pass without the fix" claims, trace what the assertion observes against the reverted production hunk before reporting.
+11. **For test-code-quality findings (Reviewer 12)**: confirm a flagged reflective access really has a non-reflective alternative (some QuestDB internals genuinely require reflection in tests) before reporting it. Confirm a "reinvented helper" finding by actually locating the helper with `rg` and checking its signature fits the test's need.
+12. **Classify each finding** as:
     - **CONFIRMED in-diff** — the bug is real and inside the diff
     - **CONFIRMED at out-of-diff callsite** — the bug is in an unchanged file because the changed symbol is used there in a way that's now broken (cite the file and the contract from 2.5c that was violated)
     - **FALSE POSITIVE** — the code is actually correct (explain why)
@@ -260,6 +298,26 @@ Review the diff for:
 - Code smell: overly complex methods, deep nesting, unclear intent, dead code
 - No third-party Java dependencies on data paths
 
+### Committed build artifacts
+- **A newly committed compiled binary is always Critical.** This repo builds its
+  native/C libraries from source in CI (`rebuild_native_libs.yml`,
+  `build_native.yaml`, guarded by `check-glibc-floor.sh`) and does not commit
+  build outputs. A binary added or modified in the diff cannot be reviewed,
+  audited, or reproduced from source, can smuggle in unaudited or malicious
+  code, and bloats the repo history irreversibly — so it blocks the merge.
+- Detect it structurally, not by extension alone: run `git diff --stat` /
+  `git diff --numstat` on the PR and flag every added/modified file git reports
+  as binary (`numstat` shows `-`/`-` for added/deleted lines; `--stat` shows a
+  `Bin … -> … bytes` marker). Typical offenders: `.so`, `.dylib`, `.dll`, `.a`,
+  `.o`, `.lib`, `.exe`, `.class`, `.jar`, `.war`, `.wasm`, `.node`, `.bin`.
+- The finding stands even when the binary "looks" legitimate (e.g. a rebuilt
+  `libquestdb.*`): the correct source of these artifacts is the CI native-build
+  pipeline plus release packaging, never a PR diff. The only acceptable binaries
+  are genuine test-input fixtures/resources (data a test reads), not build
+  outputs — and even those must be justified.
+- Suggested fix: drop the binary from the PR, confirm a `.gitignore` entry
+  covers it, and let CI native-build + release packaging produce it.
+
 ### QuestDB coding standards
 - Class members grouped by kind (static vs instance) and visibility, sorted alphabetically
 - Boolean names use `is...` / `has...` prefix
@@ -269,6 +327,82 @@ Review the diff for:
 - Resources properly closed in all code paths (especially error paths)
 - try-with-resources used where applicable
 - Native memory freed correctly
+
+### Store-and-forward & pool startup invariants (QWP facade)
+Apply this whenever the diff touches the SF sender, the async drainer / send
+loop, primary reconnect/failover, `SenderPool` / `QueryClientPool` startup,
+`lazy_connect`, or `initial_connect_retry`. A violation here is a **Critical**
+finding: the whole point of store-and-forward is that a running producer never
+loses data and never hard-fails on a transient outage.
+
+**Drainer (steady state — once the pool is running).**
+- Once the pool is running, an async drainer thread ships buffered SF data to
+  the server. It MUST NOT propagate server / transport errors back to the
+  client (`Sender` producer calls, `flush()`, the pooled handle). The ONLY
+  error a running drainer may surface to the caller is **SF out of space** (the
+  on-disk / backing buffer is full and can accept no more rows). Flag any other
+  failure class (connect-refused, DNS, unreachable/black-hole, TLS/cert, auth,
+  role-reject, upgrade/protocol timeout, reset) that can escape the drainer
+  onto a producer or borrow call.
+- Primary reconnect MUST be fully contained inside the drainer thread and MUST
+  have **no time limit** — no `reconnect_max_duration_millis`-style budget, no
+  deadline, no "give up and latch terminal after N ms". A budget that latches
+  the sender terminal on a long outage is a Critical violation: it drops a
+  producer that store-and-forward promised to keep alive. Flag any bounded
+  reconnect loop, `deadlineNanos` / `while (now < deadline)`, or terminal
+  `SenderError` reachable from the running drainer's reconnect path.
+- The drainer must retry with **exponential backoff** and handle every connect
+  failure class gracefully, without a hard fail — it keeps buffering and keeps
+  retrying until the wire is back. The per-attempt backoff may be capped (a max
+  delay between attempts), but the RETRY LOOP ITSELF must be unbounded. Flag a
+  capped total retry duration or an attempt-count cap on the steady-state
+  drainer.
+- **Sanctioned terminals (orphan-slot drainer only).** The orphan drainer
+  (`BackgroundDrainer`) MAY quarantine its slot (`.failed` sentinel,
+  human-in-the-loop) on conditions that are terminal by design: auth failure,
+  a non-421 upgrade reject, and a genuine cluster-wide durable-ack capability
+  gap that exhausted its documented settle budget (16 consecutive
+  capability-gap sweeps, or a wall-clock budget anchored at the FIRST
+  capability-gap error of the episode — whichever is hit first). These are
+  NOT violations of the no-budget rule above. The settle budget applies ONLY
+  to consecutive capability-gap attempts: transient classes (role reject,
+  transport error) must never increment it or burn its wall clock — a
+  transient state consuming the terminal budget (shared attempt counter,
+  entry-anchored deadline) IS a Critical violation of this checklist.
+- **Mid-stream server NACKs (no drop policy).** The NACK policy must mirror
+  the connect-time tiering. A rejection category that a transient cluster
+  state can produce (`WRITE_ERROR`, `INTERNAL_ERROR`, `UNKNOWN` — and any
+  future status byte) is RETRIABLE: recycle the wire and replay from
+  `ackedFsn+1`. It must NEVER drop the batch and NEVER latch a terminal /
+  quarantine a slot on first sight. Only rejections deterministic under
+  byte-identical replay (`SCHEMA_MISMATCH`, `PARSE_ERROR`, `SECURITY_ERROR`
+  on a writable node) may go TERMINAL. A client that advances the ack
+  watermark past a NACKed frame is silently losing data — Critical. A frame
+  repeatedly rejected with no ack progress must escalate through the
+  poison-frame detector (bounded consecutive strikes at the same head FSN),
+  not through a WS close-code list — close codes carry no policy semantics.
+  `UNKNOWN` must fail OPEN (retry), never closed (terminal): a status byte
+  from a newer server must degrade to retry, not to a dead sender.
+
+**Pool startup — two modes; the mode decides who sees connectivity errors.**
+- `lazy_connect=true`: `build()` MUST succeed with **no server present**. The
+  producing `Sender` must work immediately (writes buffer via SF), and once the
+  server comes up the read side must also connect and read (reads are deferred,
+  not disabled). Verify `build()` does not fail-fast, the sender does not throw
+  on the first write while the server is down, and a later `borrowQuery()`
+  succeeds once the server is up.
+- `lazy_connect=false` (default): `build()` / the initial connect MUST expose
+  connectivity problems to the caller — DNS errors, connect-refused /
+  unreachable, TLS/cert, authentication/authorization, and connect/upgrade
+  timeouts must all surface as a thrown exception at startup, not be swallowed.
+  Verify each of those failure classes reaches the user during initialization.
+- **In BOTH modes the boundary is the same:** connectivity errors are only
+  ever the caller's problem DURING initialization. Once the client has
+  connected and is past initialization, the running drainer reverts to the
+  steady-state contract above — it must NEVER expose transport problems, NEVER
+  impose a reconnect time budget, and NEVER hard-fail on a transient outage.
+  Anything that undermines the store-and-forward guarantee past init is
+  Critical.
 
 ### SQL conventions (if tests or SQL involved)
 - Keywords in UPPERCASE
@@ -298,6 +432,14 @@ Review the diff for:
 - **Regression tests:** If this PR fixes a bug, is there a test that reproduces the original bug and would fail without the fix?
 - Use `read`/`bash` (rg/find) to find existing test files for the changed classes and verify they cover the new behavior.
 
+### Test code quality
+- **No vacuous assertions.** Every assertion must be able to fail. Flag `assertTrue(true)`, `assertFalse(false)`, `assertEquals(x, x)`, asserting a literal against the same literal, or a `@Test` body with no assertion and no `expected=`/`assertThrows`.
+- **Reflection is a last resort.** Flag `setAccessible(true)`, `getDeclaredField`/`getDeclaredMethod`, `Field.set`, `Class.forName` when a public API, existing helper, or constructor would reach the same state. Name the non-reflective path.
+- **Reuse before reinventing.** Search for existing helpers, base classes, and fixtures before accepting inline setup. Duplicated setup/assert blocks an existing helper or a parameterized test would cover are findings; name the helper.
+- **No javadoc bloat.** No multi-paragraph javadoc on `@Test` methods, no javadoc that restates the test name, no stacked/duplicated javadoc. Prefer a precise test name and at most a one-line comment.
+- **Test-appropriate standards.** zero-GC and `io.questdb.std`-over-`java.util` rules do NOT apply to tests — do not flag them there. Member ordering, `is/has` naming, and SQL style DO apply.
+- **No debugging residue.** No `System.out.println`, no commented-out code, no `@Ignore` without a referenced ticket.
+
 ### Unresolved TODOs and FIXMEs
 - Scan the diff for `TODO`, `FIXME`, `HACK`, `XXX`, and `WORKAROUND` comments. For each one found:
   - Is it a pre-existing comment that was just moved/reformatted, or newly introduced in this PR?
@@ -314,7 +456,10 @@ Review the diff for:
 Present ONLY verified findings (false positives are excluded). Structure as:
 
 ### Critical
-Issues that must be fixed before merge. Each must include:
+Issues that must be fixed before merge. **A newly committed compiled binary or
+other build artifact (see the "Committed build artifacts" checklist) is always
+Critical, no matter how legitimate it looks — native/C libraries are built from
+source in CI, so a binary in the diff is never acceptable.** Each must include:
 - Exact file path and line numbers (including out-of-diff files)
 - Whether the finding is **in-diff** or **out-of-diff**
 - Code path trace showing why the bug is real

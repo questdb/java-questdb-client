@@ -233,7 +233,7 @@ public class SenderBuilderErrorApiTest {
         // Cross-check that the enum surface is fully reachable from
         // user-side code via the builder import path.
         SenderError.Category c = SenderError.Category.SCHEMA_MISMATCH;
-        SenderError.Policy p = SenderError.Policy.DROP_AND_CONTINUE;
+        SenderError.Policy p = SenderError.Policy.RETRIABLE;
         Assert.assertNotNull(c);
         Assert.assertNotNull(p);
     }

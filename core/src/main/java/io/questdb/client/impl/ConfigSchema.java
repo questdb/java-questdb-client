@@ -56,6 +56,7 @@ public final class ConfigSchema {
         str("tls_roots", Side.COMMON);
         str("tls_roots_password", Side.COMMON);
         longRange("auth_timeout_ms", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
+        longRange("connect_timeout", Side.COMMON, 0, OPEN_MAX, true, false); // > 0
 
         // INGRESS -- the WebSocket Sender applies. STRING in the registry; the
         // Sender parses suffix/mode values (off/on, 64k, durability) with its
@@ -71,6 +72,11 @@ public final class ConfigSchema {
         str("error_inbox_capacity", Side.INGRESS);
         str("initial_connect_retry", Side.INGRESS);
         str("max_background_drainers", Side.INGRESS);
+        // Poison-frame detector threshold (see CursorWebSocketSendLoop): the
+        // Sender applies it; the QwpQueryClient accepts it as a syntactic no-op
+        // (one vocabulary, side-owned application).
+        str("max_frame_rejections", Side.INGRESS);
+        str("poison_min_escalation_window_millis", Side.INGRESS);
         str("max_name_len", Side.INGRESS);
         str("reconnect_initial_backoff_millis", Side.INGRESS);
         str("reconnect_max_backoff_millis", Side.INGRESS);
@@ -108,9 +114,11 @@ public final class ConfigSchema {
         intRange("query_pool_min", Side.POOL, OPEN, OPEN_MAX, false, false);
         intRange("query_pool_max", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("acquire_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
+        longRange("query_close_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("idle_timeout_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("max_lifetime_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
         longRange("housekeeper_interval_ms", Side.POOL, OPEN, OPEN_MAX, false, false);
+        boolOnOff("lazy_connect", Side.POOL); // facade flag: tolerant non-blocking startup (async ingest + lazy reads)
 
         // RESERVED -- accepted no-op (error-policy keys reserved by the spec).
         str("on_internal_error", Side.RESERVED);

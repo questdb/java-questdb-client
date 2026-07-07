@@ -81,7 +81,8 @@ public class JavaTlsClientSocketHandshakeOverflowTest {
                 CountDownLatch done = new CountDownLatch(1);
                 t = new Thread(() -> {
                     try {
-                        socket.startTlsSession("test.host");
+                        socket.startTlsSession("test.host", op -> {
+                        });
                     } catch (Throwable ignored) {
                         // Expected: a healthy handshake loop should fail loudly here,
                         // not spin forever. Any exception (AssertionError, SSLException,

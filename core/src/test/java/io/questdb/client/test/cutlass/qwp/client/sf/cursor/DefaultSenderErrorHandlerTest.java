@@ -37,7 +37,7 @@ public class DefaultSenderErrorHandlerTest {
         // documented nullable on SenderError.
         SenderError e = new SenderError(
                 SenderError.Category.PROTOCOL_VIOLATION,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 SenderError.NO_STATUS_BYTE,
                 null, // null serverMessage
                 SenderError.NO_MESSAGE_SEQUENCE,

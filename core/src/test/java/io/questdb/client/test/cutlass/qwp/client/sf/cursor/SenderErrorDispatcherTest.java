@@ -272,7 +272,7 @@ public class SenderErrorDispatcherTest {
         // FSN reused as the test's identity field — easiest to assert on.
         return new SenderError(
                 SenderError.Category.SCHEMA_MISMATCH,
-                SenderError.Policy.DROP_AND_CONTINUE,
+                SenderError.Policy.RETRIABLE,
                 0x03,
                 "msg-" + seq,
                 seq,

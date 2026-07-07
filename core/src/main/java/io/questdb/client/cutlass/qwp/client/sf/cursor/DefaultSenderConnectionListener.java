@@ -36,9 +36,8 @@ import org.slf4j.LoggerFactory;
  * transition so silence is never the default -- connect-string-only users
  * still see failover and outage signals in their logs.
  *
- * <p>Terminal kinds ({@code AUTH_FAILED}, {@code RECONNECT_BUDGET_EXHAUSTED})
- * and {@code ALL_ENDPOINTS_UNREACHABLE} fire at WARN level; everything else
- * fires at INFO.
+ * <p>Terminal kind {@code AUTH_FAILED} and {@code ALL_ENDPOINTS_UNREACHABLE}
+ * fire at WARN level; everything else fires at INFO.
  */
 public final class DefaultSenderConnectionListener implements SenderConnectionListener {
 
@@ -52,7 +51,6 @@ public final class DefaultSenderConnectionListener implements SenderConnectionLi
     public void onEvent(@NotNull SenderConnectionEvent e) {
         switch (e.getKind()) {
             case AUTH_FAILED:
-            case RECONNECT_BUDGET_EXHAUSTED:
             case ALL_ENDPOINTS_UNREACHABLE:
                 LOG.warn("connection event {}", e);
                 break;

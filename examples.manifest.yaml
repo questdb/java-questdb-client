@@ -1,3 +1,21 @@
+- name: qwp-pool
+  lang: java
+  path: examples/src/main/java/com/example/QuestDBExample.java
+  header: |-
+    QuestDB Java client [docs](https://questdb.io/docs/connect/clients/java/)
+    and [Maven artifact](https://central.sonatype.com/artifact/org.questdb/questdb-client).
+- name: qwp-ingest
+  lang: java
+  path: examples/src/main/java/com/example/sender/WsExample.java
+  header: |-
+    QuestDB Java client [docs](https://questdb.io/docs/connect/clients/java/)
+    and [Maven artifact](https://central.sonatype.com/artifact/org.questdb/questdb-client).
+- name: qwp-query
+  lang: java
+  path: examples/src/main/java/com/example/query/BasicQueryExample.java
+  header: |-
+    QuestDB Java client [docs](https://questdb.io/docs/connect/clients/java/)
+    and [Maven artifact](https://central.sonatype.com/artifact/org.questdb/questdb-client).
 - name: ilp-http
   lang: java
   path: examples/src/main/java/com/example/sender/HttpExample.java
@@ -40,7 +58,7 @@
     ```
 - name: ilp
   lang: java
-  path: examples/src/main/java/com/example/sender/BasicExample.java
+  path: examples/src/main/java/com/example/sender/TcpExample.java
   header: |-
     Java client library [docs](https://questdb.io/docs/reference/clients/java_ilp)
     and [Maven artifact](https://search.maven.org/artifact/org.questdb/questdb).
@@ -112,7 +130,7 @@
     port: 9009
 - name: ilp-from-conf
   lang: java
-  path: examples/src/main/java/com/example/sender/BasicExample.java
+  path: examples/src/main/java/com/example/sender/TcpExample.java
   header: |-
     Java client library [docs](https://questdb.io/docs/reference/clients/java_ilp)
     and [Maven artifact](https://search.maven.org/artifact/org.questdb/questdb).

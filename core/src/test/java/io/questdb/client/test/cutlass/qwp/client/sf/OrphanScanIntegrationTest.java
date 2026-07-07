@@ -39,16 +39,17 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Integration check: with {@code drain_orphans=true} the foreground sender
- * sees sibling slots holding unacked data and a follow-up call to
- * {@link OrphanScanner#scan} from outside the sender returns the same.
- * <p>
- * The drainer runtime that actually empties orphan slots is a follow-up;
- * this test pins down the visibility/scan piece.
+ * sees sibling slots holding unacked data, adopts them via the background
+ * drainer pool, and replays their unacked frames — after which
+ * {@link OrphanScanner#scan} reports no candidates, both while the adopting
+ * sender is still open and after it closes.
  */
 public class OrphanScanIntegrationTest {
 
@@ -75,7 +76,8 @@ public class OrphanScanIntegrationTest {
             // with sender_id=primary and drain_orphans=true.
 
             // Phase 1: ghost writes + closes; never acked.
-            try (TestWebSocketServer ghostServer = new TestWebSocketServer(new SilentHandler())) {
+            SilentHandler silent = new SilentHandler();
+            try (TestWebSocketServer ghostServer = new TestWebSocketServer(silent)) {
                 ghostServer.start();
                 Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
 
@@ -85,21 +87,29 @@ public class OrphanScanIntegrationTest {
                 try (Sender ghost = Sender.fromConfig(ghostCfg)) {
                     ghost.table("foo").longColumn("v", 7L).atNow();
                     ghost.flush();
+                    // The frame must reach the wire before we close: on-the-wire
+                    // implies the I/O loop read it back from the slot's .sfa, so
+                    // the recovered slot holds publishedFsn >= 1 and the drain in
+                    // phase 2 proves something. Without this await,
+                    // close_flush_timeout=0 can close before the async publish
+                    // lands and the "drain" would trivially succeed on an empty
+                    // slot (observed as "fully drained (target=0)").
+                    Assert.assertTrue("ghost frame must reach the wire before close",
+                            silent.awaitFrame(5, TimeUnit.SECONDS));
                     // No wait for ACK — close right away; close_flush_timeout=0
                     // means we don't drain.
                 }
-            } catch (Exception ignored) {
-                // best-effort
             }
             // Independent verification: the scanner sees the ghost slot.
             ObjList<String> seen = OrphanScanner.scan(sfDir, "primary");
             Assert.assertEquals("ghost slot must be a candidate orphan", 1, seen.size());
             Assert.assertEquals(sfDir + "/ghost", seen.get(0));
 
-            // Phase 2: open the primary sender with drain_orphans=true. We
-            // can't directly assert the log output in this test, but the
-            // call must not throw, and the primary's own slot must NOT
-            // appear in a fresh scan (sender_id-filtered).
+            // Phase 2: open the primary sender with drain_orphans=true. The
+            // background drainer pool adopts the ghost slot, replays its
+            // unacked frames against the ACKing primaryServer, and the
+            // drained slot's .sfa files are removed when the drainer's
+            // engine closes fully drained.
             try (TestWebSocketServer primaryServer = new TestWebSocketServer(new AckHandler())) {
                 primaryServer.start();
                 Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
@@ -112,19 +122,28 @@ public class OrphanScanIntegrationTest {
                 try (Sender primary = Sender.fromConfig(primaryCfg)) {
                     primary.table("foo").longColumn("v", 8L).atNow();
                     primary.flush();
+                    // Await the drain while the primary is still open so this
+                    // assertion exercises the drainer runtime itself and does
+                    // not depend on close()'s bounded graceful-drain window.
+                    long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (OrphanScanner.scan(sfDir, "primary").size() > 0
+                            && System.nanoTime() < deadlineNanos) {
+                        Thread.sleep(10);
+                    }
+                    Assert.assertEquals(
+                            "drainer should have adopted + drained the ghost slot "
+                                    + "while the primary sender is open",
+                            0, OrphanScanner.scan(sfDir, "primary").size());
                 }
-                // With drain_orphans=true, the background drainer pool adopts
-                // the ghost slot, replays its unacked frames against the now-
-                // ACKing primaryServer, and removes the drained slot dir.
                 // Primary's own slot drains cleanly on close() and is filtered
-                // out by sender_id. Net: scanner sees neither.
+                // out by sender_id; the drained ghost slot must not resurface
+                // (e.g. as a spurious .failed quarantine). Net: scanner sees
+                // neither.
                 ObjList<String> postRun = OrphanScanner.scan(sfDir, "primary");
                 Assert.assertEquals(
                         "drain_orphans=true should have drained + removed the "
                                 + "ghost slot; primary's own slot is sender_id-filtered",
                         0, postRun.size());
-            } catch (Exception ignored) {
-                // best-effort
             }
         });
     }
@@ -154,20 +173,38 @@ public class OrphanScanIntegrationTest {
     /** Receives binary frames but never acks. Causes the sender to
      *  leave unacked data on disk on close. */
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch frameReceived = new CountDownLatch(1);
+
+        boolean awaitFrame(long timeout, TimeUnit unit) throws InterruptedException {
+            return frameReceived.await(timeout, unit);
+        }
+
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            // Drop on the floor — no ACK.
+            // Drop on the floor — no ACK. Record receipt so the test can
+            // prove the frame reached the wire (hence the slot's .sfa)
+            // before the ghost sender closes.
+            frameReceived.countDown();
         }
     }
 
-    /** Acks every binary frame. */
+    /**
+     * Acks every binary frame. Sequence numbers are per-connection: the
+     * primary sender and the orphan drainer each open their own WebSocket,
+     * and each connection numbers its frames from 0. A single shared
+     * counter would hand the second connection an ack seq it never sent
+     * ("ACK wire seq N exceeds highest sent 0"), making the drain succeed
+     * only via the client's clamping fallback.
+     */
     private static class AckHandler implements TestWebSocketServer.WebSocketServerHandler {
-        private final AtomicLong nextSeq = new AtomicLong(0);
+        private final ConcurrentHashMap<TestWebSocketServer.ClientHandler, AtomicLong> seqByClient =
+                new ConcurrentHashMap<>();
 
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq = seqByClient.computeIfAbsent(client, k -> new AtomicLong()).getAndIncrement();
             try {
-                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+                client.sendBinary(buildAck(seq));
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

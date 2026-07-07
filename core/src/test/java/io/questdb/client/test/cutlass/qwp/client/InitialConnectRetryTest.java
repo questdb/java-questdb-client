@@ -42,9 +42,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public class InitialConnectRetryTest {
 
     /**
-     * Temp sf_dir for retry-mode tests. Per spec §3.5,
-     * initial_connect_retry on/sync/async requires sf_dir — memory-mode
-     * senders cannot durably retry across reconnects.
+     * Temp sf_dir for retry-mode tests. The builder does NOT require
+     * sf_dir for any initial_connect_retry mode — memory-mode senders
+     * share the same retry machinery, buffering rows in the in-RAM
+     * cursor ring instead of on disk. These tests use an sf_dir so the
+     * retried rows are disk-backed and the tests exercise the durable
+     * SF path.
      */
     private static String makeSfDir() {
         return java.nio.file.Paths.get(

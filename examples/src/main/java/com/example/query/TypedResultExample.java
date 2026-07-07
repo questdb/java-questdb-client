@@ -1,8 +1,10 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Long256Impl;
 import io.questdb.client.std.Uuid;
@@ -29,43 +31,45 @@ import io.questdb.client.std.Uuid;
  */
 public class TypedResultExample {
 
-    public static void main(String[] args) {
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
-            client.execute("SELECT * FROM demo LIMIT 5", new QwpColumnBatchHandler() {
-                // Sinks live at the handler level so they're reused across every
-                // (row, col) that needs a UUID or LONG256/DECIMAL256 decode.
-                final Long256Impl long256Sink = new Long256Impl();
-                final Uuid uuidSink = new Uuid();
+    public static void main(String[] args) throws InterruptedException {
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+            try (Query q = db.borrowQuery()) {
+                q.sql("SELECT * FROM demo LIMIT 5").handler(new QwpColumnBatchHandler() {
+                    // Sinks live at the handler level so they're reused across every
+                    // (row, col) that needs a UUID or LONG256/DECIMAL256 decode.
+                    final Long256Impl long256Sink = new Long256Impl();
+                    final Uuid uuidSink = new Uuid();
 
-                @Override
-                public void onBatch(QwpColumnBatch batch) {
-                    int cols = batch.getColumnCount();
-                    int rows = batch.getRowCount();
-                    for (int row = 0; row < rows; row++) {
-                        StringBuilder line = new StringBuilder();
-                        for (int col = 0; col < cols; col++) {
-                            if (col > 0) line.append(" | ");
-                            line.append(batch.getColumnName(col)).append('=');
-                            if (batch.isNull(col, row)) {
-                                line.append("NULL");
-                            } else {
-                                appendCell(line, batch, col, row, uuidSink, long256Sink);
+                    @Override
+                    public void onBatch(QwpColumnBatch batch) {
+                        int cols = batch.getColumnCount();
+                        int rows = batch.getRowCount();
+                        for (int row = 0; row < rows; row++) {
+                            StringBuilder line = new StringBuilder();
+                            for (int col = 0; col < cols; col++) {
+                                if (col > 0) line.append(" | ");
+                                line.append(batch.getColumnName(col)).append('=');
+                                if (batch.isNull(col, row)) {
+                                    line.append("NULL");
+                                } else {
+                                    appendCell(line, batch, col, row, uuidSink, long256Sink);
+                                }
                             }
+                            System.out.println(line);
                         }
-                        System.out.println(line);
                     }
-                }
 
-                @Override
-                public void onEnd(long totalRows) {
-                }
+                    @Override
+                    public void onEnd(long totalRows) {
+                    }
 
-                @Override
-                public void onError(byte status, String message) {
-                    System.err.println("query error: " + message);
-                }
-            });
+                    @Override
+                    public void onError(byte status, String message) {
+                    }
+                }).submit().await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 

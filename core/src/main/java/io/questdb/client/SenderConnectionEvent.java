@@ -96,8 +96,8 @@ public final class SenderConnectionEvent {
     /**
      * The classified cause of the event, or {@code null} for success/info
      * events ({@link Kind#CONNECTED}, {@link Kind#FAILED_OVER},
-     * {@link Kind#RECONNECTED}). For terminal kinds
-     * ({@link Kind#AUTH_FAILED}, {@link Kind#RECONNECT_BUDGET_EXHAUSTED}) this
+     * {@link Kind#RECONNECTED}). For the terminal kind
+     * ({@link Kind#AUTH_FAILED}) this
      * carries the typed exception that caused the sender to halt.
      */
     @Nullable
@@ -223,8 +223,10 @@ public final class SenderConnectionEvent {
         /**
          * Every endpoint in the configured address list was attempted and none
          * accepted the connection in this sweep. The client will back off and
-         * retry the sweep until the reconnect budget is exhausted. Fired once
-         * per failed sweep.
+         * retry the sweep — bounded by {@code reconnect_max_duration_millis}
+         * during a blocking (sync) initial connect, indefinitely otherwise
+         * (Invariant B: the background loop never gives up on a wall-clock
+         * budget). Fired once per failed sweep.
          */
         ALL_ENDPOINTS_UNREACHABLE,
 
@@ -234,14 +236,6 @@ public final class SenderConnectionEvent {
          * producer-thread API call surfaces a {@code LineSenderException}.
          * {@link #getCause()} carries the {@code QwpAuthFailedException}.
          */
-        AUTH_FAILED,
-
-        /**
-         * Terminal: the configured reconnect time budget was exhausted without
-         * a successful reconnect. The sender will halt; the next producer-thread
-         * API call surfaces a {@code LineSenderException}. {@link #getCause()}
-         * carries the last observed reconnect error.
-         */
-        RECONNECT_BUDGET_EXHAUSTED
+        AUTH_FAILED
     }
 }
