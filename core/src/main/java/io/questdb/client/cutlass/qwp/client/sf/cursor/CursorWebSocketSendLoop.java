@@ -178,6 +178,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
+    private final SwapDrainHandler swapDrainHandler = new SwapDrainHandler();
     private final AtomicLong totalAcks = new AtomicLong();
     // Counters for observability of the durable-ack path. Both are zero
     // when durableAckMode is false.
@@ -1831,6 +1832,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
+        // A demoting / handing-off primary flushes its final covering
+        // STATUS_DURABLE_ACK just before it closes, but by then the failover has
+        // already been triggered (by the read-only rejection) and the I/O thread
+        // is parked in connectLoop, so that ack sits unread in the old socket's
+        // recv buffer. Apply it now -- before we drop the connection and anchor
+        // the replay cursor at ackedFsn+1 -- otherwise we replay frames the
+        // server already confirmed durable, duplicating them on the promoted
+        // node (which already holds them) on a table without dedup keys.
+        // swapDrainHandler applies durable acks ONLY and no-ops CLOSE/OK, so a
+        // CLOSE trailing the ack in the buffer cannot re-enter fail()/connectLoop.
+        if (old != null) {
+            try {
+                while (old.tryReceiveFrame(swapDrainHandler)) {
+                    // apply any durable acks buffered on the wire we are leaving
+                }
+            } catch (Throwable ignored) {
+                // best-effort; the connection is going away regardless
+            }
+        }
         this.client = newClient;
         // Sticky: once the wire is up, we've reached the server at least
         // once for this sender's lifetime. Used downstream to classify a
@@ -2377,6 +2397,33 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // RTT rate for the whole window.
                 failExemptPaced(recycleCause);
             }
+        }
+    }
+
+    /**
+     * Frame handler used only while {@link #swapClient} is draining the
+     * connection it is about to drop. It applies buffered durable acks -- so the
+     * replay cursor can be anchored past work the server already confirmed
+     * durable -- and ignores everything else: OK / NACK frames (the new
+     * connection re-OKs every replayed batch and the server re-emits cumulative
+     * durable-ack watermarks from scratch), and a trailing CLOSE, which must not
+     * re-enter the failover path already in progress.
+     */
+    private final class SwapDrainHandler implements WebSocketFrameHandler {
+        @Override
+        public void onBinaryMessage(long payloadPtr, int payloadLen) {
+            if (!durableAckMode || !response.readFrom(payloadPtr, payloadLen)) {
+                return;
+            }
+            if (response.isDurableAck()) {
+                totalDurableAcks.incrementAndGet();
+                applyDurableAck();
+            }
+        }
+
+        @Override
+        public void onClose(int code, String reason) {
+            // no-op: this connection is already being swapped out
         }
     }
 }
