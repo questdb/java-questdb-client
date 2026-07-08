@@ -310,6 +310,23 @@ public final class MmapSegment implements QuietCloseable {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
             }
             Files.close(fd);
+            // The header reads above (magic/version/baseSeq) run before
+            // scanFrames and are otherwise unguarded. An unbacked page 0 --
+            // an unflushed header on a truncate-based-allocate filesystem
+            // after a crash (create() does not msync), or a file truncated
+            // under the mapping -- faults at the Unsafe intrinsic site as a
+            // catchable InternalError. Convert it to a MmapSegmentException so
+            // SegmentRing's per-file catch skips just this .sfa, instead of
+            // letting the raw InternalError escape to SegmentRing's outer catch
+            // and abort recovery of every sibling segment. scanFrames and
+            // detectTornTail already handle their own in-mapping faults; this
+            // covers the header block and any future reader placed ahead of the
+            // scan.
+            if (isMmapAccessFault(t)) {
+                throw new MmapSegmentException(
+                        "unreadable mapped header page in " + path
+                                + " (unbacked/sparse page 0): " + t.getMessage(), t);
+            }
             throw t;
         }
     }
@@ -502,6 +519,13 @@ public final class MmapSegment implements QuietCloseable {
      * fresh segments, memory-backed segments, and cleanly partially-filled
      * recovered segments. Operators / tests can read this to tell silent
      * truncation (corruption) from a normal partial fill (no incident).
+     * <p>
+     * One case this does NOT count: when the scan stops because the bail-out
+     * region is itself an unbacked mapped page (an in-mapping fault, not a
+     * backed torn header), that region cannot be probed, so this returns
+     * {@code 0} even though frames may have been discarded. That outcome is
+     * surfaced by the {@code WARN} in {@link #scanFrames} instead -- see it for
+     * the benign-tail-vs-media-error caveat.
      */
     public long tornTailBytes() {
         return tornTailBytes;
@@ -595,8 +619,12 @@ public final class MmapSegment implements QuietCloseable {
                 throw e;
             }
             LOG.warn("SF segment recovery: unreadable mapped page at offset {} (file size {}); "
-                            + "treating it as the end of recoverable data. Expected when a prior "
-                            + "session left a sparse segment tail; investigate disk health if it recurs.",
+                            + "treating it as the end of recoverable data -- any frames beyond this "
+                            + "offset are discarded. The usual cause is a benign sparse pre-allocation "
+                            + "tail (e.g. a truncate-based allocate on ZFS) left by a prior session, "
+                            + "but a mid-file media error (bad sector) is indistinguishable here; "
+                            + "check disk health if this segment was expected to be fully written or "
+                            + "if this recurs.",
                     pos, fileSize);
         }
         return pos;

@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
@@ -37,6 +38,7 @@ import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Regression guard for the recovery-time SIGBUS hazard in {@link MmapSegment}.
@@ -172,6 +174,37 @@ public class MmapSegmentRecoveryFaultTest {
                 // Frame 2's header bytes are real (non-zero) and survive the
                 // truncate, so the bail-out region is flagged as a torn tail.
                 assertTrue("a torn write into the unbacked region must be flagged", seg.tornTailBytes() > 0);
+            }
+        });
+    }
+
+    /**
+     * M1 regression: the header block (magic/version/baseSeq) is read before
+     * {@code scanFrames}, so an unbacked page 0 faults ahead of the guarded
+     * scan. {@link MmapSegment#openExisting} must surface that as a
+     * {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
+     * catches to skip just this {@code .sfa} -- and never let the raw
+     * {@code InternalError} escape and abort recovery of every sibling segment.
+     * <p>
+     * Portable across filesystems: on a hole-faulting FS (ZFS) the fault is
+     * converted to a {@code MmapSegmentException} in {@code openExisting}'s
+     * catch; on a hole-zero-filling FS (ext4) page 0 reads back as zeroes, so
+     * the magic check fails and throws {@code MmapSegmentException} directly.
+     * Either way the file is skippable, not fatal.
+     */
+    @Test
+    public void testUnbackedHeaderPageIsSkippableNotFatal() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-unbacked-header.sfa";
+            writeSegment(path, 3L, new int[]{64});
+            // Punch the whole file into a hole -- page 0 (the header) included.
+            punchSparseTail(path, 0L);
+            try {
+                MmapSegment.openExisting(path).close();
+                fail("expected MmapSegmentException for an unbacked header page");
+            } catch (MmapSegmentException expected) {
+                // ok -- SegmentRing's per-file catch skips just this file
+                // instead of aborting recovery of the whole slot.
             }
         });
     }
