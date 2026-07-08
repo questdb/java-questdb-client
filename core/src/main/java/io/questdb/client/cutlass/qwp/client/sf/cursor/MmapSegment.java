@@ -64,6 +64,7 @@ public final class MmapSegment implements QuietCloseable {
     public static final int FRAME_HEADER_SIZE = 8;   // u32 crc + u32 payloadLen
     public static final int HEADER_SIZE = 24;
     public static final byte VERSION = 1;
+    private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
     private final String path;
@@ -509,22 +510,30 @@ public final class MmapSegment implements QuietCloseable {
     /**
      * True when {@code t} is the JVM's recoverable signal for a fault while
      * accessing a memory-mapped region -- a SIGBUS/SIGSEGV that HotSpot
-     * translates into {@code InternalError("a fault occurred in an unsafe
-     * memory access operation")} instead of aborting the process. It surfaces
-     * when a mapped page is not backed by real file blocks: a sparse
-     * {@code .sfa} tail on a filesystem whose pre-allocation leaves holes
-     * (e.g. ZFS, where a truncate-based {@code allocate} does not materialize
-     * blocks), or a file truncated under the mapping. Recovery treats this as
-     * an I/O boundary -- the same way MappedByteBuffer readers do -- not a
-     * fatal VM error. Matches on the JVM's stable message so a genuine
-     * VirtualMachineError (real OOM, StackOverflow) is never swallowed.
+     * translates into an {@code InternalError} at an {@code Unsafe} intrinsic
+     * site instead of aborting the process. It surfaces when a mapped page is
+     * not backed by real file blocks: a sparse {@code .sfa} tail on a
+     * filesystem whose pre-allocation leaves holes (e.g. ZFS, where a
+     * truncate-based {@code allocate} does not materialize blocks), or a file
+     * truncated under the mapping. Recovery treats this as an I/O boundary --
+     * the same way MappedByteBuffer readers do -- not a fatal VM error.
+     * <p>
+     * The message is matched on the fragment {@code "unsafe memory access
+     * operation"}, which is common to both HotSpot wordings and NOT
+     * version-stable as a whole: pre-21 JDKs (including the shipping/CI JDK 8)
+     * emit {@code "a fault occurred in a recent unsafe memory access operation
+     * in compiled Java code"}, while JDK 21+ shortened it to {@code "a fault
+     * occurred in an unsafe memory access operation"}. Matching the shared
+     * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
+     * still being specific enough that a genuine VirtualMachineError (real OOM,
+     * StackOverflow) is never swallowed.
      */
     private static boolean isMmapAccessFault(Throwable t) {
         if (!(t instanceof InternalError)) {
             return false;
         }
         String msg = t.getMessage();
-        return msg != null && msg.contains("a fault occurred in an unsafe memory access");
+        return msg != null && msg.contains("unsafe memory access operation");
     }
 
     /**
@@ -545,10 +554,26 @@ public final class MmapSegment implements QuietCloseable {
                 if (payloadLen < 0 || pos + FRAME_HEADER_SIZE + payloadLen > fileSize) {
                     return pos;
                 }
-                int crcCalc = Crc32c.update(Crc32c.INIT, addr + pos + 4, 4);
-                if (payloadLen > 0) {
-                    crcCalc = Crc32c.update(crcCalc, addr + pos + FRAME_HEADER_SIZE, payloadLen);
-                }
+                // CRC over the contiguous (payloadLen, payload) pair, folded
+                // via Unsafe reads rather than the native Crc32c.update.
+                // Recovery maps to the file's stat length, but a page inside
+                // that range can be unbacked: a sparse pre-allocation tail (a
+                // truncate-based allocate that never materialized blocks, as on
+                // ZFS), or -- via a torn write, since tryAppend writes the
+                // length field before copying the payload -- a real positive
+                // payloadLen whose payload spans into an unwritten hole. A raw
+                // read of an unbacked page raises SIGBUS; HotSpot translates
+                // that into a catchable InternalError ONLY at an Unsafe
+                // intrinsic site, NEVER inside JNI native code, so a native
+                // Crc32c.update over such a page aborts the whole JVM (and,
+                // empirically on pre-21 JDKs, a preceding Unsafe pre-touch does
+                // not reliably fault first once an earlier native CRC ran in
+                // the same scan). Folding over Unsafe keeps every fault
+                // catchable -- handled below as the boundary of recoverable
+                // data; a page that instead reads back as zeroes just fails the
+                // CRC check and ends the scan. Recovery is cold, so the slower
+                // table CRC here is immaterial.
+                int crcCalc = crc32cRecovery(addr + pos + 4, 4L + payloadLen);
                 if (crcCalc != crcRead) {
                     return pos;
                 }
@@ -575,6 +600,39 @@ public final class MmapSegment implements QuietCloseable {
                     pos, fileSize);
         }
         return pos;
+    }
+
+    /**
+     * CRC-32C (Castagnoli) of {@code [addr, addr + len)} read through
+     * {@link Unsafe}, seeded like {@code Crc32c.update(Crc32c.INIT, addr, len)}
+     * and bit-identical to it (verified) -- but every byte load is an Unsafe
+     * intrinsic, so a fault on an unbacked mapped page is a catchable
+     * {@link InternalError} instead of the uncatchable JNI SIGBUS the native
+     * {@link Crc32c} would raise. Byte-at-a-time via a precomputed table
+     * ({@code ~0.5 GiB/s}); used only on the cold recovery scan, never on the
+     * append hot path (which stays on the native, hardware-friendly path).
+     */
+    private static int crc32cRecovery(long addr, long len) {
+        int crc = ~Crc32c.INIT;
+        for (long i = 0; i < len; i++) {
+            crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ Unsafe.getUnsafe().getByte(addr + i)) & 0xFF];
+        }
+        return ~crc;
+    }
+
+    // Standard reflected CRC-32C byte table (polynomial 0x82F63B78), matching
+    // crc32c_table[0] in the native crc32c.c. Computed at class init to avoid
+    // 256 hand-transcribed literals; drives crc32cRecovery.
+    private static int[] buildCrc32cTable() {
+        int[] table = new int[256];
+        for (int n = 0; n < 256; n++) {
+            int c = n;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) != 0 ? (0x82F63B78 ^ (c >>> 1)) : (c >>> 1);
+            }
+            table[n] = c;
+        }
+        return table;
     }
 
     /**
