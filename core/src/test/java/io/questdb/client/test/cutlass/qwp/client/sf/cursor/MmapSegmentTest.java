@@ -35,8 +35,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.nio.file.Paths;
-
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -49,32 +47,12 @@ public class MmapSegmentTest {
 
     @Before
     public void setUp() {
-        tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-mmap-seg-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
+        tmpDir = TestUtils.createTmpDir("qdb-mmap-seg-");
     }
 
     @After
     public void tearDown() {
-        if (tmpDir == null) {
-            return;
-        }
-        long find = Files.findFirst(tmpDir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(tmpDir + "/" + name);
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(tmpDir);
+        TestUtils.removeTmpDir(tmpDir);
     }
 
     @Test
