@@ -258,11 +258,31 @@ public final class MmapSegment implements QuietCloseable {
      * last valid frame) do not log and report {@code 0}.
      */
     public static MmapSegment openExisting(String path) {
-        long fileSize = Files.length(path);
+        return openExisting(FilesFacade.INSTANCE, path);
+    }
+
+    /**
+     * Facade-aware variant of {@link #openExisting(String)} that takes the file
+     * length (and open/close) through a {@link FilesFacade} instead of straight
+     * off {@link Files}. Production uses {@link FilesFacade#INSTANCE}; the seam
+     * exists so recovery's mmap-fault guard can be regression-tested on any
+     * filesystem.
+     * <p>
+     * The mapping is sized to {@code ff.length(path)} and every recovery read
+     * runs straight out of it, so a facade that reports a length <em>larger</em>
+     * than the real file makes the mapping extend past end-of-file. A read of a
+     * page beyond real EOF raises SIGBUS on <em>every</em> filesystem — the same
+     * fault an unbacked/sparse page raises on ZFS, but reproduced
+     * deterministically on ext4/xfs, where a within-EOF hole would instead
+     * zero-fill and never exercise the guard. See
+     * {@link FilesFacade#length(String)}.
+     */
+    public static MmapSegment openExisting(FilesFacade ff, String path) {
+        long fileSize = ff.length(path);
         if (fileSize < HEADER_SIZE) {
             throw new MmapSegmentException("file shorter than header: " + path + " size=" + fileSize);
         }
-        int fd = Files.openRW(path);
+        int fd = ff.openRW(path);
         if (fd < 0) {
             throw new MmapSegmentException("openRW failed for " + path);
         }
@@ -309,7 +329,7 @@ public final class MmapSegment implements QuietCloseable {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
             }
-            Files.close(fd);
+            ff.close(fd);
             // The header reads above (magic/version/baseSeq) run before
             // scanFrames and are otherwise unguarded. An unbacked page 0 --
             // an unflushed header on a truncate-based-allocate filesystem

@@ -564,6 +564,11 @@ public class MmapSegmentTest {
         }
 
         @Override
+        public long length(String path) {
+            return INSTANCE.length(path);
+        }
+
+        @Override
         public int lock(int fd) {
             return INSTANCE.lock(fd);
         }

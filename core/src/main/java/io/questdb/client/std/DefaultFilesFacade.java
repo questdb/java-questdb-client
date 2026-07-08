@@ -92,6 +92,11 @@ final class DefaultFilesFacade implements FilesFacade {
     }
 
     @Override
+    public long length(String path) {
+        return Files.length(path);
+    }
+
+    @Override
     public int lock(int fd) {
         return Files.lock(fd);
     }
