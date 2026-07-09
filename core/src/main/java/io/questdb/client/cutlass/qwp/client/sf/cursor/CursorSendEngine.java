@@ -84,9 +84,9 @@ public final class CursorSendEngine implements QuietCloseable {
     private final SlotLock slotLock;
     // True when the constructor recovered an existing on-disk slot rather
     // than starting fresh. Diagnostic accessor for tests and observability;
-    // cursor frames are self-sufficient (every frame carries full schema +
-    // full symbol-dict delta), so producer-side schema reset on recovery
-    // is not required.
+    // every frame carries its full inline schema, so producer-side schema reset
+    // on recovery is not required (the symbol dictionary, which delta frames do
+    // NOT carry in full, is re-registered by an I/O-thread catch-up instead).
     private final boolean wasRecoveredFromDisk;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame found in a
     // ring recovered from disk, or -1 for fresh/memory rings and recovered

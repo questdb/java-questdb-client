@@ -224,11 +224,14 @@ public class QwpWebSocketSender implements Sender {
     private boolean deferCommit;
     // True when the sender emits incremental (delta) symbol dictionaries: each
     // message carries only symbol ids not yet sent on the wire, rather than the
-    // full dictionary from id 0. Enabled only in memory-mode, where a reconnect
-    // replays from the in-process ring and the I/O thread re-registers the whole
-    // dictionary via a catch-up frame before replaying. File-mode store-and-forward
-    // keeps full self-sufficient frames (recovery/orphan-drain can replay mid-stream
-    // to a fresh server, where a partial delta would leave gaps). Set in setCursorEngine.
+    // full dictionary from id 0. Enabled in memory-mode (a reconnect replays from
+    // the in-process ring) and in file-mode store-and-forward when the per-slot
+    // persisted dictionary opened. In both, the I/O thread re-registers the whole
+    // dictionary via a catch-up frame before replaying, so a non-self-sufficient
+    // delta frame never dangles an id on a fresh server. Falls back to full
+    // self-sufficient frames only when the persisted dictionary is unavailable in
+    // file-mode (recovery/orphan-drain would then have nothing to rebuild the
+    // deltas from). Set in setCursorEngine.
     private boolean deltaDictEnabled;
     // User-supplied observer for background orphan-slot drainer events.
     // Volatile: written by setDrainerListener (any thread, before or after
@@ -3386,18 +3389,18 @@ public class QwpWebSocketSender implements Sender {
                     host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
         } else {
             // Async mode: I/O thread will drive the connect. Encoder uses
-            // its default version (V1). The symbol-dict watermark still gets
-            // reset for consistency with the sync path; the post-connect replay
-            // path does not need a producer-side reset signal because every
-            // cursor frame is self-sufficient.
+            // its default version (V1). The per-batch symbol-dict watermark still
+            // gets reset for consistency with the sync path; the post-connect
+            // replay path needs no producer-side reset signal (see below).
             Endpoint ep = endpoints.get(0);
             LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
                     ep.host, ep.port, endpoints.size());
         }
-        // Server starts fresh on each connection, so reset the symbol-dict
-        // watermark. Cursor frames are self-sufficient (every frame carries its
-        // full inline schema + a symbol-dict delta from id 0), so post-reconnect
-        // replay needs no producer-side reset signal.
+        // Server starts fresh on each connection, so reset the per-batch
+        // symbol-dict watermark. Every frame still carries its full inline schema,
+        // and the fresh server's dictionary is re-established either by a full-dict
+        // frame (full-dict mode) or by an I/O-thread catch-up frame before replay
+        // (delta mode), so post-reconnect replay needs no producer-side reset signal.
         resetSymbolDictStateForNewConnection();
         connectionError.set(null);
 
@@ -3784,7 +3787,7 @@ public class QwpWebSocketSender implements Sender {
             // back to it; flushPendingRows aborts its post-enqueue state
             // updates after this throw, so the source rows stay intact and the
             // next batch re-emits the same rows along with the full inline
-            // schema and symbol-dict delta from id 0.
+            // schema and the symbol-dict delta the batch requires.
             if (toSend.isSending()) {
                 toSend.markRecycled();
             } else if (toSend.isSealed()) {
