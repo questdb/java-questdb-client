@@ -788,6 +788,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // after — the latch await is only skipped when the loop never ran.
         running = false;
         Thread t = ioThread;
+        // The symbol-dict mirror (sentDictBytesAddr) is I/O-thread-owned and gets
+        // freed on ioLoop's exit path. When t == null the loop never ran (start()
+        // was never called, or t.start() failed before committing ioThread), so
+        // that free never happens and a seeded (recovery / orphan-drain) mirror
+        // would leak. Capture that here; free it below, after client teardown.
+        boolean loopNeverRan = t == null;
         if (t != null) {
             LockSupport.unpark(t);
             // Only await the shutdown latch if the I/O thread actually ran.
@@ -845,6 +851,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // best-effort
             }
             client = null;
+        }
+        // Free the I/O-thread-owned symbol-dict mirror ONLY when the loop never
+        // ran (see loopNeverRan). If it ran, ioLoop's exit already freed it -- and
+        // on the failed-stop path (interrupted latch await, ioThread left set) the
+        // thread may still be mid-send, so touching the mirror here would race.
+        // A duplicate close observes sentDictBytesAddr == 0 and skips.
+        if (loopNeverRan && sentDictBytesAddr != 0) {
+            Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
+            sentDictBytesAddr = 0;
+            sentDictBytesCapacity = 0;
+            sentDictBytesLen = 0;
         }
     }
 
