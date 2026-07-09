@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.tools;
 
+import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
@@ -139,6 +140,18 @@ public final class TestUtils {
         return Long.parseLong(reverseBeHex(hex), 16);
     }
 
+    /**
+     * Creates a unique temp directory under {@code java.io.tmpdir}, named
+     * {@code prefix + <nanoTime>}, and returns its path. Pair with
+     * {@link #removeTmpDir(String)} in {@code tearDown}.
+     */
+    public static String createTmpDir(String prefix) {
+        String dir = Paths.get(System.getProperty("java.io.tmpdir"),
+                prefix + System.nanoTime()).toString();
+        Assert.assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+        return dir;
+    }
+
     @NotNull
     public static Rnd generateRandom(Logger log) {
         return generateRandom(log, System.nanoTime(), System.currentTimeMillis());
@@ -170,6 +183,36 @@ public final class TestUtils {
 
     public static String ipv4ToString(int ip) {
         return ((ip >> 24) & 0xff) + "." + ((ip >> 16) & 0xff) + "." + ((ip >> 8) & 0xff) + "." + (ip & 0xff);
+    }
+
+    /**
+     * Flat (non-recursive) cleanup for a directory created by
+     * {@link #createTmpDir(String)}: removes every entry in {@code tmpDir}
+     * (the SF cursor tests only write flat {@code .sfa}/{@code .corrupt}
+     * files) and then the directory itself. A {@code null} argument is a
+     * no-op, so it is safe to call from {@code tearDown} before {@code setUp}
+     * ran.
+     */
+    public static void removeTmpDir(String tmpDir) {
+        if (tmpDir == null) {
+            return;
+        }
+        long find = Files.findFirst(tmpDir);
+        if (find > 0) {
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && !".".equals(name) && !"..".equals(name)) {
+                        Files.remove(tmpDir + "/" + name);
+                    }
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+        }
+        Files.remove(tmpDir);
     }
 
     /**

@@ -170,10 +170,7 @@ public class SegmentManagerCloseRaceTest {
                 Assert.assertTrue("precondition: path scratch should be allocated",
                         readPathScratchImpl(manager) != 0L);
 
-                // Exercise the same branch as a timed-out join without making
-                // the test sleep for 5 seconds: join() returns while the worker
-                // is still alive. close() must leave worker-owned native memory
-                // alone so the worker can resume safely.
+                manager.setWorkerJoinTimeoutMillis(50L);
                 Thread.currentThread().interrupt();
                 manager.close();
                 Assert.assertTrue("close should preserve interrupted status",
@@ -185,12 +182,92 @@ public class SegmentManagerCloseRaceTest {
                         readPathScratchImpl(manager) != 0L);
 
                 releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                 manager.close();
                 managerClosed = true;
                 Assert.assertNull("successful close should clear workerThread",
                         readWorkerThread(manager));
                 Assert.assertEquals("successful close should free path scratch",
                         0L, readPathScratchImpl(manager));
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    Thread.interrupted();
+                    manager.close();
+                }
+                ring.close();
+            }
+        });
+    }
+
+    @Test(timeout = 15_000L)
+    public void testInterruptedCallerDoesNotAbandonReapableWorker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/interrupt-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            CountDownLatch closeReturned = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicBoolean interruptPreserved = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            AtomicReference<Throwable> closeErr = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                Thread closer = new Thread(() -> {
+                    Thread.currentThread().interrupt();
+                    try {
+                        manager.close();
+                    } catch (Throwable t) {
+                        closeErr.compareAndSet(null, t);
+                    } finally {
+                        interruptPreserved.set(Thread.currentThread().isInterrupted());
+                        closeReturned.countDown();
+                    }
+                }, "interrupted-closer");
+                closer.start();
+
+                Assert.assertFalse("interrupted close() abandoned a live worker instead of waiting",
+                        closeReturned.await(300, TimeUnit.MILLISECONDS));
+
+                releaseWorker.countDown();
+                Assert.assertTrue("close() never returned after the worker was released",
+                        closeReturned.await(10, TimeUnit.SECONDS));
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                managerClosed = readWorkerThread(manager) == null;
+
+                if (closeErr.get() != null) {
+                    throw new AssertionError("close() threw", closeErr.get());
+                }
+                Assert.assertNull("close() must reap the worker despite the pending interrupt",
+                        readWorkerThread(manager));
+                Assert.assertTrue("close() must restore the caller's interrupt status",
+                        interruptPreserved.get());
                 if (hookErr.get() != null) {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
