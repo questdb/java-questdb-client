@@ -193,6 +193,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // on reconnect it can re-register the whole dictionary on the fresh server
     // (which discards its dictionary on every disconnect) before replaying frames
     // whose deltas start above id 0. All of this is touched only by the I/O thread.
+    // Footprint note: this mirror is a SECOND copy of the dictionary -- the same
+    // symbols the producer's GlobalSymbolDictionary already holds as Java Strings --
+    // kept as native UTF-8 bytes for the reconnect-catch-up capability. So a
+    // memory-mode connection's steady-state dictionary footprint is ~2x the symbol
+    // set. It is bounded by distinct-symbol count (not per-row) and never trimmed
+    // for the connection's lifetime (a reconnect may need the whole dictionary at
+    // any moment), so it cannot be dropped; it is an intentional cost of the feature.
     private final boolean deltaDictEnabled;
     private long sentDictBytesAddr;
     private int sentDictBytesCapacity;
@@ -2025,15 +2032,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long p = payloadAddr + QwpConstants.HEADER_SIZE + NativeBufferWriter.varintSize(deltaStart);
         long deltaCount = readVarintAt(p, limit);
         p = varintEnd;
-        // Only a delta that extends exactly from our current tip introduces new
-        // symbols. deltaStart < sentDictCount is a replay/overlap we already hold;
-        // deltaStart > sentDictCount is rejected before send by the torn-dictionary
-        // guard in trySendOne, so it never reaches here.
-        if (deltaCount <= 0 || deltaStart != sentDictCount) {
+        // The mirror holds ids [0, sentDictCount). Accumulate ONLY the part of this
+        // frame's delta [deltaStart, deltaStart+deltaCount) that extends past the
+        // tip -- ids [sentDictCount, deltaStart+deltaCount). Cases:
+        //   - deltaStart > sentDictCount: a gap. trySendOne's torn-dictionary guard
+        //     rejects it before send, so it never reaches here; bail defensively
+        //     rather than accumulate past a hole.
+        //   - deltaEnd <= sentDictCount: a pure replay/overlap we already hold --
+        //     nothing new.
+        //   - deltaStart <= sentDictCount < deltaEnd: extend the mirror by the tail.
+        //     deltaStart == sentDictCount is the steady-state case (skip == 0).
+        // Handling the partial overlap explicitly -- rather than dropping the whole
+        // frame whenever deltaStart != sentDictCount -- keeps the mirror complete
+        // even if a future producer ever emits a delta that overlaps the tip;
+        // silently dropping the new tail would leave the reconnect catch-up
+        // incomplete and shift server-side ids.
+        long deltaEnd = deltaStart + deltaCount;
+        if (deltaCount <= 0 || deltaStart > sentDictCount || deltaEnd <= sentDictCount) {
             return;
         }
+        // Walk past the already-held prefix [deltaStart, sentDictCount), then copy
+        // the new tail [sentDictCount, deltaEnd).
+        int skip = sentDictCount - deltaStart;
+        for (int i = 0; i < skip; i++) {
+            long len = readVarintAt(p, limit);
+            p = varintEnd + len;
+            if (p > limit) {
+                return; // malformed -- bail rather than corrupt the mirror
+            }
+        }
         long regionStart = p;
-        for (long i = 0; i < deltaCount; i++) {
+        long newCount = deltaEnd - sentDictCount;
+        for (long i = 0; i < newCount; i++) {
             long len = readVarintAt(p, limit);
             p = varintEnd + len;
             if (p > limit) {
@@ -2050,7 +2080,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         ensureSentDictCapacity((long) sentDictBytesLen + regionBytes);
         Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
         sentDictBytesLen += regionBytes;
-        sentDictCount += (int) deltaCount;
+        sentDictCount += (int) newCount;
     }
 
     private void ensureSentDictCapacity(long required) {
