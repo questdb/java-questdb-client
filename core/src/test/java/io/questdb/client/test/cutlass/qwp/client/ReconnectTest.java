@@ -52,9 +52,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * disconnect = sender broken, every subsequent batch threw. Reconnect
  * machinery now handles transient drops: detect, build a fresh client
  * via the registered factory, reset wire state, and reposition the replay
- * cursor at {@code engine.ackedFsn() + 1}. Cursor frames are self-sufficient
- * (every frame carries full schema + full symbol-dict delta), so post-reconnect
- * replay needs no producer-side schema-reset signal.
+ * cursor at {@code engine.ackedFsn() + 1}. Every frame carries its full schema
+ * inline; the symbol dictionary is either shipped in full per frame (file-mode
+ * store-and-forward) or re-registered by an I/O-thread catch-up frame before
+ * replay (memory-mode), so post-reconnect replay needs no producer-side reset.
  * <p>
  * This commit covers the mechanics with a single-attempt retry; backoff,
  * per-outage time cap, and auth-failure detection follow.

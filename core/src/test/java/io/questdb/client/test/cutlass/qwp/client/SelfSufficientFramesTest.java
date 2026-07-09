@@ -32,23 +32,26 @@ import org.junit.Test;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Pins down the "every frame on disk is self-sufficient" rule for the symbol
- * dictionary.
+ * Pins down how the symbol dictionary is framed on the wire.
  * <p>
- * The cursor SF path used to elide previously-sent symbols on subsequent
- * batches over the same connection, emitting a delta-dict that carried only
- * the new entries. That's wrong for SF: the bytes survive process restarts and
- * replay against fresh server connections (post-reconnect, or via a background
- * drainer adopting an orphan slot). A delta that references symbol ids the new
- * server has never seen is unrecoverable.
+ * Both engine modes ship <b>monotonic</b> deltas -- each symbol id travels once,
+ * not the whole dictionary per message -- which is the bandwidth win this feature
+ * adds. The I/O thread re-registers the dictionary with a catch-up frame whenever
+ * it (re)connects, so a fresh server can resolve the non-self-sufficient delta
+ * frames that follow.
  * <p>
- * Today every frame must carry a complete symbol-dict delta starting at id 0
- * (column schemas travel inline on the first batch too). This test asserts the
- * symbol-dict invariant on the wire.
+ * The modes differ only in where the catch-up's dictionary comes from: memory
+ * mode keeps it in an in-process mirror; file-backed store-and-forward keeps it in
+ * a per-slot {@code .symbol-dict} file so a recovered or orphan-drained slot (a
+ * fresh process with no in-memory mirror) can rebuild it. This test asserts the
+ * monotonic wire framing in both modes and the presence of that dictionary file.
  */
 public class SelfSufficientFramesTest {
 
@@ -56,12 +59,72 @@ public class SelfSufficientFramesTest {
     private static final int DELTA_START_OFFSET = 12;
 
     @Test
-    public void testEverySymbolBatchIncludesFullDeltaFromZero() throws Exception {
-        // Send two batches against the same connection, each with a
-        // distinct symbol value. With the old schema-ref/delta encoding,
-        // batch 2 would emit deltaStart=1, deltaCount=1 — only the new
-        // symbol. With self-sufficient frames, batch 2 must emit
-        // deltaStart=0 covering BOTH symbols.
+    public void testFileModeShipsMonotonicDeltaAndPersistsDict() throws Exception {
+        // File-backed SF also ships monotonic deltas now: batch 2 carries only
+        // "beta" (deltaStart=1). The dictionary is durably kept in .symbol-dict
+        // so a recovered/orphan-drained slot can rebuild it.
+        Path sfDir = Files.createTempDirectory("qwp-sf-selfsufficient");
+        CapturingHandler handler = new CapturingHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+            // The engine places slot files under sf_dir/<sender_id> (default "default").
+            Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
+            try (Sender sender = Sender.fromConfig(config)) {
+                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                sender.flush();
+                waitFor(() -> handler.batches.size() >= 1, 5_000);
+
+                sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                sender.flush();
+                waitFor(() -> handler.batches.size() >= 2, 5_000);
+
+                // Check the persisted dictionary while the sender is live: a
+                // fully-drained close intentionally unlinks it (slot cleanup).
+                Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
+                byte[] dict = Files.readAllBytes(dictFile);
+                Assert.assertTrue("dictionary retains alpha", containsUtf8(dict, "alpha"));
+                Assert.assertTrue("dictionary retains beta", containsUtf8(dict, "beta"));
+            }
+
+            Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+            byte[] b1 = handler.batches.get(0);
+            byte[] b2 = handler.batches.get(1);
+
+            Assert.assertEquals("batch 1 deltaStart must be 0",
+                    0, readVarint(b1, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 1 deltaCount must be 1", 1, readVarint(b1, DELTA_START_OFFSET + 1));
+            // batch 2 ships ONLY beta as a delta from id 1.
+            Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
+                    1, readVarint(b2, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
+                    1, readVarint(b2, DELTA_START_OFFSET + 1));
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
+    private static boolean containsUtf8(byte[] haystack, String needle) {
+        byte[] n = needle.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        outer:
+        for (int i = 0; i + n.length <= haystack.length; i++) {
+            for (int j = 0; j < n.length; j++) {
+                if (haystack[i + j] != n[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    @Test
+    public void testMemoryModeShipsMonotonicDelta() throws Exception {
+        // Memory-mode (no sf_dir): each symbol id ships once. Batch 2 carries
+        // only "beta" as a delta starting at id 1, not the whole dictionary.
         CapturingHandler handler = new CapturingHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             int port = server.getPort();
@@ -82,29 +145,17 @@ public class SelfSufficientFramesTest {
             byte[] b1 = handler.batches.get(0);
             byte[] b2 = handler.batches.get(1);
 
-            // The deltaStart varint sits right after the 12-byte header.
-            // For self-sufficient frames it must be 0 (single byte 0x00)
-            // in BOTH batches — regardless of how many symbols the prior
-            // batch already shipped.
-            int deltaStart1 = readVarint(b1, DELTA_START_OFFSET);
-            int deltaStart2 = readVarint(b2, DELTA_START_OFFSET);
-            Assert.assertEquals("batch 1 deltaStart must be 0", 0, deltaStart1);
-            Assert.assertEquals("batch 2 deltaStart must be 0 (self-sufficient)",
-                    0, deltaStart2);
+            // Batch 1 introduces alpha at id 0.
+            Assert.assertEquals("batch 1 deltaStart must be 0",
+                    0, readVarint(b1, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 1 deltaCount must be 1",
+                    1, readVarint(b1, DELTA_START_OFFSET + 1));
 
-            // batch 2 must include >= 2 symbols in its delta dict (alpha
-            // from the prior batch + beta from this one). The varint at
-            // DELTA_START_OFFSET+1 is deltaCount.
-            int deltaCount2 = readVarint(b2, DELTA_START_OFFSET + 1);
-            Assert.assertTrue("batch 2 must redefine at least 2 symbols, got " + deltaCount2,
-                    deltaCount2 >= 2);
-
-            // Sanity: batch 2 should NOT be much smaller than batch 1 —
-            // with schema-ref/delta encoding it would have been; with
-            // self-sufficient frames the size is in the same ballpark.
-            Assert.assertTrue("batch 2 (" + b2.length + " bytes) must not be drastically smaller than batch 1 ("
-                            + b1.length + ")",
-                    b2.length >= b1.length / 2);
+            // Batch 2 ships ONLY beta as a delta from id 1.
+            Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
+                    1, readVarint(b2, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
+                    1, readVarint(b2, DELTA_START_OFFSET + 1));
         }
     }
 
@@ -120,6 +171,25 @@ public class SelfSufficientFramesTest {
             if (shift > 28) throw new IllegalStateException("varint too long");
         }
         throw new IllegalStateException("varint truncated");
+    }
+
+    private static void rmDir(Path dir) {
+        try {
+            if (dir == null || !Files.exists(dir)) {
+                return;
+            }
+            Files.walk(dir)
+                    .sorted(Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException ignored) {
+                            // best-effort
+                        }
+                    });
+        } catch (IOException ignored) {
+            // best-effort
+        }
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {
@@ -157,6 +227,7 @@ public class SelfSufficientFramesTest {
             }
         }
 
+        // Mirrors WebSocketResponse STATUS_OK layout: status u8 | sequence u64 | table_count u16
         static byte[] buildAck(long seq) {
             byte[] buf = new byte[1 + 8 + 2];
             ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);

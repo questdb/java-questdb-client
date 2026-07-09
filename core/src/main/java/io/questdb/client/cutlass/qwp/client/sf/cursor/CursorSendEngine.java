@@ -110,6 +110,13 @@ public final class CursorSendEngine implements QuietCloseable {
     // in the constructor, closed by {@link #close()}. The segment manager
     // writes through this on every tick where ackedFsn has advanced.
     private final AckWatermark watermark;
+    // Engine-owned per-slot symbol dictionary file (disk mode only; {@code null}
+    // in memory mode and if open() failed). Enables delta-encoded SF frames:
+    // recovery / orphan-drain load it to re-register the dictionary on the fresh
+    // server before replaying non-self-sufficient frames. Opened in the
+    // constructor, closed by {@link #close()}. When null in disk mode the engine
+    // reports delta encoding as unavailable and the sender keeps full-dict frames.
+    private final PersistedSymbolDict persistedSymbolDict;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
@@ -199,6 +206,7 @@ public final class CursorSendEngine implements QuietCloseable {
         // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
+        PersistedSymbolDict persistedDictInProgress = null;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -257,6 +265,10 @@ public final class CursorSendEngine implements QuietCloseable {
                 // mmap doesn't take down the engine -- we just fall
                 // back to the bare lowestBase - 1 seed.
                 watermarkInProgress = AckWatermark.open(sfDir);
+                // Load the persisted symbol dictionary so delta-encoded frames
+                // in this recovered slot can be re-registered on the fresh
+                // server before replay. Null on open failure -> delta disabled.
+                persistedDictInProgress = PersistedSymbolDict.open(sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress != null
                         ? watermarkInProgress.read()
@@ -309,6 +321,10 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (!memoryMode) {
                     AckWatermark.removeOrphan(sfDir);
                     watermarkInProgress = AckWatermark.open(sfDir);
+                    // Same stale-side-file hygiene for the symbol dictionary: a
+                    // fresh slot starts with an empty dictionary.
+                    PersistedSymbolDict.removeOrphan(sfDir);
+                    persistedDictInProgress = PersistedSymbolDict.open(sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;
@@ -333,10 +349,11 @@ public final class CursorSendEngine implements QuietCloseable {
                 manager.start();
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress);
-            // All construction succeeded — commit the ring and
-            // watermark references.
+            // All construction succeeded — commit the ring, watermark and
+            // symbol-dictionary references.
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
+            this.persistedSymbolDict = persistedDictInProgress;
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
@@ -359,6 +376,12 @@ public final class CursorSendEngine implements QuietCloseable {
             if (watermarkInProgress != null) {
                 try {
                     watermarkInProgress.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (persistedDictInProgress != null) {
+                try {
+                    persistedDictInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }
@@ -541,6 +564,12 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
+            if (persistedSymbolDict != null) {
+                try {
+                    persistedSymbolDict.close();
+                } catch (Throwable ignored) {
+                }
+            }
             if (fullyDrained) {
                 try {
                     unlinkAllSegmentFiles(sfDir);
@@ -548,6 +577,11 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 try {
                     AckWatermark.removeOrphan(sfDir);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    // Slot fully drained: the dictionary has no frames behind it.
+                    PersistedSymbolDict.removeOrphan(sfDir);
                 } catch (Throwable ignored) {
                 }
             }
@@ -584,6 +618,38 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long getTotalBackpressureStalls() {
         return backpressureStallCount.get();
+    }
+
+    /**
+     * True when this engine has no store-and-forward directory: the ring lives
+     * only in malloc'd memory, so it cannot be recovered after a crash and no
+     * orphan drainer ever replays it. Only in-process reconnect/failover replays
+     * its frames, which is what makes send-time symbol-dict catch-up (rather than
+     * fully self-sufficient frames) safe.
+     */
+    public boolean isMemoryMode() {
+        return sfDir == null;
+    }
+
+    /**
+     * Whether the sender may delta-encode symbol dictionaries on this engine.
+     * Always true in memory mode (the send loop keeps an in-process catch-up
+     * mirror). In disk mode it requires the persisted dictionary to have opened,
+     * since delta frames are not self-sufficient and recovery / orphan-drain must
+     * be able to rebuild the dictionary from disk. When false in disk mode the
+     * sender falls back to full self-sufficient frames.
+     */
+    public boolean isDeltaDictEnabled() {
+        return sfDir == null || persistedSymbolDict != null;
+    }
+
+    /**
+     * The engine's persisted symbol dictionary, or {@code null} in memory mode
+     * (and in disk mode if it failed to open). The producer appends new symbols
+     * to it; recovery / orphan-drain read its loaded entries to seed catch-up.
+     */
+    public PersistedSymbolDict getPersistedSymbolDict() {
+        return persistedSymbolDict;
     }
 
     /**

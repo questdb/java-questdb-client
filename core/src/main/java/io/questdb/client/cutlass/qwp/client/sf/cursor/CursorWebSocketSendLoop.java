@@ -36,9 +36,12 @@ import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
@@ -177,6 +180,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
+    // Delta symbol dictionary catch-up state (memory-mode only; see swapClient).
+    // deltaDictEnabled gates all of it. The loop mirrors, in sentDict*, every
+    // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
+    // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that
+    // on reconnect it can re-register the whole dictionary on the fresh server
+    // (which discards its dictionary on every disconnect) before replaying frames
+    // whose deltas start above id 0. All of this is touched only by the I/O thread.
+    private final boolean deltaDictEnabled;
+    private long sentDictBytesAddr;
+    private int sentDictBytesCapacity;
+    private int sentDictBytesLen;
+    private int sentDictCount;
+    // End position (native address) written by the last readVarintAt() call.
+    private long varintEnd;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
     // Counters for observability of the durable-ack path. Both are zero
@@ -489,6 +506,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         this.client = client;
         this.engine = engine;
+        this.deltaDictEnabled = engine.isDeltaDictEnabled();
+        // Recovery / orphan-drain: the loop starts with a fresh in-memory mirror,
+        // so seed it from the slot's persisted dictionary. That way the very first
+        // connection re-registers the whole dictionary (via a catch-up frame)
+        // before replaying the recovered delta frames.
+        if (deltaDictEnabled) {
+            PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+            if (pd != null && pd.size() > 0) {
+                int len = pd.loadedEntriesLen();
+                if (len > 0) {
+                    ensureSentDictCapacity(len);
+                    Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
+                    sentDictBytesLen = len;
+                }
+                sentDictCount = pd.size();
+            }
+        }
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
@@ -1669,6 +1703,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // best-effort
                 }
             }
+            // The symbol-dict mirror is I/O-thread-owned; free it here, on the
+            // owning thread's exit path, after the last send that could touch it.
+            if (sentDictBytesAddr != 0) {
+                Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
+                sentDictBytesAddr = 0;
+                sentDictBytesCapacity = 0;
+                sentDictBytesLen = 0;
+            }
             shutdownLatch.countDown();
             // Failed-stop hand-off (see delegateEngineClose): the owner could
             // not free the engine safely while this thread was alive, so the
@@ -1849,8 +1891,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // past the tail instead of replaying into it.
         tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
-        this.fsnAtZero = replayStart;
-        this.nextWireSeq = 0L;
         // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
         // were already on the wire before the drop and will be replayed.
         // trySendOne resets replayTargetFsn to -1 once we cross the boundary.
@@ -1862,7 +1902,238 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // carrying stale state across the wire boundary would either
         // double-trim or starve the queue.
         clearDurableAckTracking();
+        setWireBaselineWithCatchUp(replayStart);
         positionCursorAt(replayStart);
+    }
+
+    /**
+     * Sets the wire-sequence baseline for a fresh connection and, when the symbol
+     * dictionary mirror is non-empty, emits a full-dictionary catch-up frame first
+     * so the fresh server (whose dictionary starts empty) can resolve the
+     * non-self-sufficient delta frames that replay next.
+     * <p>
+     * The catch-up occupies wire seq 0, which maps to the already-acked FSN just
+     * below {@code replayStart} (a harmless re-ack); real replay frames then follow
+     * from wire seq 1. With nothing to catch up (fresh sender, or full-dict mode),
+     * or before a client exists (async initial connect), keep the plain 1:1
+     * {@code fsnAtZero == replayStart} mapping; the catch-up then happens on the
+     * first real connection via swapClient.
+     */
+    private void setWireBaselineWithCatchUp(long replayStart) {
+        if (client != null && deltaDictEnabled && sentDictCount > 0) {
+            this.nextWireSeq = 0L;
+            // The catch-up may span several frames when the dictionary exceeds the
+            // server's batch cap; each consumes a wire sequence (0 .. n-1) that maps
+            // to an already-acked FSN, so the first real frame still lands on
+            // replayStart.
+            int catchUpFrames = sendDictCatchUp();
+            this.fsnAtZero = replayStart - catchUpFrames;
+        } else {
+            this.fsnAtZero = replayStart;
+            this.nextWireSeq = 0L;
+        }
+    }
+
+    /**
+     * Copies the symbol-dictionary delta a just-sent frame carries into the
+     * loop-local mirror ({@link #sentDictBytesAddr}) so a future reconnect can
+     * re-register it. Frames are sent in FSN order carrying monotonically
+     * extending deltas, so a frame whose delta starts exactly at
+     * {@link #sentDictCount} extends the mirror; a replayed or empty-delta frame
+     * (nothing new) is skipped. Only ever called in delta mode.
+     *
+     * @param payloadAddr address of the QWP message (12-byte header first)
+     * @param payloadLen  message length in bytes
+     */
+    /**
+     * Returns the symbol-dictionary delta start id of a frame, or -1 when the
+     * frame carries no delta section. Used by the pre-send torn-dictionary guard.
+     */
+    private int frameDeltaStart(long payloadAddr, int payloadLen) {
+        if (!isDeltaFrame(payloadAddr, payloadLen)) {
+            return -1;
+        }
+        return (int) readVarintAt(payloadAddr + QwpConstants.HEADER_SIZE, payloadAddr + payloadLen);
+    }
+
+    // True only for a well-formed QWP frame this encoder produced that carries a
+    // delta symbol-dict section. The magic check keeps the dict logic from
+    // misreading non-QWP payloads (e.g. synthetic frames injected by tests) whose
+    // bytes happen to set the delta flag.
+    private static boolean isDeltaFrame(long payloadAddr, int payloadLen) {
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(payloadAddr) != QwpConstants.MAGIC_MESSAGE) {
+            return false;
+        }
+        byte flags = Unsafe.getUnsafe().getByte(payloadAddr + QwpConstants.HEADER_OFFSET_FLAGS);
+        return (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
+    }
+
+    private void accumulateSentDict(long payloadAddr, int payloadLen) {
+        long limit = payloadAddr + payloadLen;
+        if (!isDeltaFrame(payloadAddr, payloadLen)) {
+            return;
+        }
+        long p = payloadAddr + QwpConstants.HEADER_SIZE;
+        long deltaStart = readVarintAt(p, limit);
+        p = varintEnd;
+        long deltaCount = readVarintAt(p, limit);
+        p = varintEnd;
+        // Only a delta that extends exactly from our current tip introduces new
+        // symbols. deltaStart < sentDictCount is a replay/overlap we already hold;
+        // deltaStart > sentDictCount is rejected before send by the torn-dictionary
+        // guard in trySendOne, so it never reaches here.
+        if (deltaCount <= 0 || deltaStart != sentDictCount) {
+            return;
+        }
+        long regionStart = p;
+        for (long i = 0; i < deltaCount; i++) {
+            long len = readVarintAt(p, limit);
+            p = varintEnd + len;
+            if (p > limit) {
+                // Malformed -- never happens for frames we encoded; bail rather
+                // than corrupt the mirror.
+                return;
+            }
+        }
+        int regionBytes = (int) (p - regionStart);
+        ensureSentDictCapacity(sentDictBytesLen + regionBytes);
+        Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
+        sentDictBytesLen += regionBytes;
+        sentDictCount += (int) deltaCount;
+    }
+
+    private void ensureSentDictCapacity(int required) {
+        if (sentDictBytesCapacity >= required) {
+            return;
+        }
+        int newCap = Math.max(sentDictBytesCapacity * 2, Math.max(4096, required));
+        sentDictBytesAddr = Unsafe.realloc(sentDictBytesAddr, sentDictBytesCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
+        sentDictBytesCapacity = newCap;
+    }
+
+    private long readVarintAt(long p, long limit) {
+        long value = 0;
+        int shift = 0;
+        long cur = p;
+        while (cur < limit) {
+            byte b = Unsafe.getUnsafe().getByte(cur++);
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                break;
+            }
+            shift += 7;
+        }
+        varintEnd = cur;
+        return value;
+    }
+
+    /**
+     * Builds a table-less catch-up frame carrying the full symbol dictionary
+     * ({@code deltaStart=0, deltaCount=sentDictCount}) and sends it to the freshly
+     * connected server, then consumes wire seq 0 for it. {@code sendBinary} copies
+     * the bytes synchronously, so the temporary frame buffer is freed immediately.
+     * On send failure it fails the loop, which recycles and retries on the next
+     * connection.
+     */
+    /**
+     * Re-registers the whole symbol dictionary on a fresh connection, split into
+     * as many table-less frames as the server's advertised batch cap requires so
+     * no single frame exceeds it (a large dictionary would otherwise be rejected).
+     * Each chunk carries a contiguous id range {@code [start .. start+count)}, in
+     * order, so the server accumulates them exactly as it would the original
+     * per-frame deltas. Returns the number of frames sent (each consumed a wire
+     * sequence), so the caller can align {@code fsnAtZero}. Stops early and fails
+     * the loop on a send error or an entry too large for the cap.
+     */
+    private int sendDictCatchUp() {
+        int cap = client.getServerMaxBatchSize();
+        // Symbol-bytes budget per frame, leaving room for the 12-byte header and
+        // the two delta-section varints. cap <= 0 means the server advertised no
+        // limit -> send the whole dictionary in one frame.
+        int budget = cap > 0 ? Math.max(1, cap - QwpConstants.HEADER_SIZE - 16) : Integer.MAX_VALUE;
+        int framesSent = 0;
+        int chunkStartId = 0;
+        long chunkStartAddr = sentDictBytesAddr;
+        int chunkSymbols = 0;
+        long chunkBytes = 0;
+        long p = sentDictBytesAddr;
+        long limit = sentDictBytesAddr + sentDictBytesLen;
+        while (p < limit) {
+            long entryStart = p;
+            long len = readVarintAt(p, limit); // entry length prefix; varintEnd -> just past prefix
+            long entryEnd = varintEnd + len;   // just past [len varint][utf8 bytes]
+            long entryBytes = entryEnd - entryStart;
+            if (entryBytes > budget) {
+                fail(new LineSenderException(
+                        "symbol dictionary entry too large for the server batch cap during catch-up ["
+                                + "entryBytes=" + entryBytes + ", budget=" + budget + ']'));
+                return framesSent;
+            }
+            if (chunkSymbols > 0 && chunkBytes + entryBytes > budget) {
+                if (!sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes)) {
+                    return framesSent;
+                }
+                framesSent++;
+                chunkStartId += chunkSymbols;
+                chunkStartAddr = entryStart;
+                chunkSymbols = 0;
+                chunkBytes = 0;
+            }
+            chunkSymbols++;
+            chunkBytes += entryBytes;
+            p = entryEnd;
+        }
+        if (chunkSymbols > 0 && sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes)) {
+            framesSent++;
+        }
+        return framesSent;
+    }
+
+    /**
+     * Sends one table-less catch-up frame carrying dictionary ids
+     * {@code [deltaStart .. deltaStart+deltaCount)}. Returns false and fails the
+     * loop on a send error.
+     */
+    private boolean sendCatchUpChunk(int deltaStart, int deltaCount, long symbolsAddr, int symbolsLen) {
+        int payloadLen = NativeBufferWriter.varintSize(deltaStart)
+                + NativeBufferWriter.varintSize(deltaCount)
+                + symbolsLen;
+        int frameLen = QwpConstants.HEADER_SIZE + payloadLen;
+        long frame = Unsafe.malloc(frameLen, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putByte(frame, (byte) 'Q');
+            Unsafe.getUnsafe().putByte(frame + 1, (byte) 'W');
+            Unsafe.getUnsafe().putByte(frame + 2, (byte) 'P');
+            Unsafe.getUnsafe().putByte(frame + 3, (byte) '1');
+            Unsafe.getUnsafe().putByte(frame + 4, (byte) client.getServerQwpVersion());
+            Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS,
+                    (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT));
+            Unsafe.getUnsafe().putShort(frame + 6, (short) 0); // tableCount
+            Unsafe.getUnsafe().putInt(frame + 8, payloadLen);
+            long q = writeVarintAt(frame + QwpConstants.HEADER_SIZE, deltaStart);
+            q = writeVarintAt(q, deltaCount);
+            Unsafe.getUnsafe().copyMemory(symbolsAddr, q, symbolsLen);
+            client.sendBinary(frame, frameLen);
+        } catch (Throwable t) {
+            fail(t);
+            return false;
+        } finally {
+            Unsafe.free(frame, frameLen, MemoryTag.NATIVE_DEFAULT);
+        }
+        nextWireSeq++; // this catch-up chunk consumed a wire sequence
+        lastFrameOrPingNanos = System.nanoTime();
+        totalFramesSent.incrementAndGet();
+        return true;
+    }
+
+    private static long writeVarintAt(long addr, long value) {
+        while (value > 0x7F) {
+            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        Unsafe.getUnsafe().putByte(addr++, (byte) value);
+        return addr;
     }
 
     private boolean tryReceiveAcks() {
@@ -1949,11 +2220,37 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (frameEnd > pub) {
             return false; // payload not fully published yet
         }
+        if (deltaDictEnabled) {
+            // Torn-dictionary guard. In normal operation a delta frame's start id
+            // never exceeds the dictionary coverage established so far (replayed
+            // frames overlap the catch-up dict; fresh frames extend it
+            // contiguously). A gap here means the persisted dictionary was torn --
+            // almost always by a host/power crash, which leaves segment frames on
+            // disk but loses recently-written dictionary entries (SF, like the rest
+            // of the store, is process-crash durable but not host-crash durable).
+            // Sending the frame would corrupt the table (the server would null-pad
+            // the missing ids), so fail terminally instead; the unreplayable data
+            // must be resent.
+            int deltaStart = frameDeltaStart(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
+            if (deltaStart > sentDictCount) {
+                recordFatal(new LineSenderException(
+                        "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
+                                + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
+                                + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+                return false;
+            }
+        }
         try {
             client.sendBinary(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
         } catch (Throwable t) {
             fail(t);
             return false;
+        }
+        if (deltaDictEnabled) {
+            // Mirror the symbols this frame introduced so a later reconnect can
+            // rebuild the whole dictionary. Idempotent on replay: a frame whose
+            // delta we already hold advances nothing.
+            accumulateSentDict(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
         }
         lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
@@ -1984,8 +2281,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // starts past it. Zero wire cost, no recycle.
         tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
-        this.fsnAtZero = replayStart;
-        this.nextWireSeq = 0L;
+        // Recovery / orphan-drain seed the dictionary mirror, so the initial
+        // connection may also need a catch-up (client is non-null in the
+        // sync-start and drainer paths; null in async-initial, where swapClient
+        // handles it on the first connect).
+        setWireBaselineWithCatchUp(replayStart);
         positionCursorAt(replayStart);
     }
 

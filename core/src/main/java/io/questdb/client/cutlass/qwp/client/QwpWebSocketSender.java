@@ -46,6 +46,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
@@ -221,6 +222,14 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
+    // True when the sender emits incremental (delta) symbol dictionaries: each
+    // message carries only symbol ids not yet sent on the wire, rather than the
+    // full dictionary from id 0. Enabled only in memory-mode, where a reconnect
+    // replays from the in-process ring and the I/O thread re-registers the whole
+    // dictionary via a catch-up frame before replaying. File-mode store-and-forward
+    // keeps full self-sufficient frames (recovery/orphan-drain can replay mid-stream
+    // to a fresh server, where a partial delta would leave gaps). Set in setCursorEngine.
+    private boolean deltaDictEnabled;
     // User-supplied observer for background orphan-slot drainer events.
     // Volatile: written by setDrainerListener (any thread, before or after
     // startOrphanDrainers) and read at pool-creation time. Null -> drainers
@@ -313,6 +322,12 @@ public class QwpWebSocketSender implements Sender {
     // beginRound(true) call. roundSeq=1 is the first round; CONNECTED in the
     // first round indicates the initial connect.
     private long roundSeq;
+    // Highest global symbol id the producer has baked into a frame so far, or -1.
+    // Lifetime-monotonic in delta mode -- it is NOT reset on reconnect, because
+    // the I/O thread re-registers the full dictionary via a catch-up frame before
+    // replaying, so the producer's delta baseline stays valid across the wire
+    // boundary. Used only when deltaDictEnabled; ignored in full-dict mode.
+    private int sentMaxSymbolId = -1;
     // When true, auto-flush sends messages with FLAG_DEFER_COMMIT and only
     // explicit flush() triggers the server-side commit. Enables accumulating
     // arbitrarily large datasets that exceed the server's recv buffer.
@@ -2215,6 +2230,18 @@ public class QwpWebSocketSender implements Sender {
         }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
+        // Delta encoding is available in memory-mode (in-process catch-up) and in
+        // file-mode when the persisted dictionary opened (recovery / orphan-drain
+        // rebuild the dictionary from it). Otherwise fall back to full self-
+        // sufficient frames. See CursorSendEngine.isDeltaDictEnabled.
+        this.deltaDictEnabled = engine != null && engine.isDeltaDictEnabled();
+        // Recovery: repopulate the producer's global dictionary from the slot's
+        // persisted dictionary so newly ingested symbols continue from the
+        // recovered ids (rather than colliding with them at 0), and the delta
+        // baseline resumes where the crashed session left off.
+        if (deltaDictEnabled && engine.wasRecoveredFromDisk()) {
+            seedGlobalDictionaryFromPersisted(engine.getPersistedSymbolDict());
+        }
     }
 
     /**
@@ -3423,14 +3450,15 @@ public class QwpWebSocketSender implements Sender {
         }
 
         ensureActiveBufferReady();
-        // Cursor SF requires every on-disk frame to be self-sufficient:
-        // recorded frames replay to fresh server connections (orphan-slot
-        // drainers and post-reconnect replay), so always emit the full
-        // symbol-dict delta from id=0 and the full column schema inline,
-        // never a back-reference the target server may not have seen.
+        // In full-dict mode every frame is self-sufficient: it carries the whole
+        // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
+        // server never dangles a symbol id. In delta mode (memory-mode only) each
+        // frame carries only ids above sentMaxSymbolId; a reconnect re-registers
+        // the dictionary via an I/O-thread catch-up frame before replay, so the
+        // producer's monotonic baseline stays valid across the wire boundary.
         encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
-                /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+                symbolDeltaBaseline(), currentBatchMaxSymbolId);
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3456,10 +3484,18 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
 
+        // Write-ahead: durably persist this frame's new symbols BEFORE it is
+        // published, so a recovered/orphan-drained slot can always rebuild the
+        // dictionary the (non-self-sufficient) delta frame references. No-op in
+        // memory mode and when the frame introduces no new symbols.
+        persistNewSymbolsBeforePublish();
         activeBuffer.ensureCapacity(messageSize);
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
+        // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
+        // advance the delta baseline so the next frame ships only newer ids.
+        advanceSentMaxSymbolId();
 
         hasDeferredMessages = deferCommit;
         if (!deferCommit) {
@@ -3514,8 +3550,12 @@ public class QwpWebSocketSender implements Sender {
             boolean deferThis = deferCommit || !isLast;
 
             encoder.setDeferCommit(deferThis);
+            // Each split frame emits the delta above sentMaxSymbolId; the first
+            // frame ships the whole batch's new ids and advances the baseline, so
+            // the remaining frames carry an empty delta and just reference ids the
+            // first frame already registered.
             encoder.beginMessage(1, globalSymbolDictionary,
-                    /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+                    symbolDeltaBaseline(), currentBatchMaxSymbolId);
             encoder.addTable(tableBuffer);
             int messageSize = encoder.finishMessage();
             QwpBufferWriter buffer = encoder.getBuffer();
@@ -3528,11 +3568,18 @@ public class QwpWebSocketSender implements Sender {
                         .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
             }
 
+            // Write-ahead persist before publish (see flushPendingRows). The
+            // first split frame carries the batch's new symbols; the rest are
+            // no-ops once the baseline has advanced past them.
+            persistNewSymbolsBeforePublish();
             ensureActiveBufferReady();
             activeBuffer.ensureCapacity(messageSize);
             activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
             sealAndSwapBuffer();
+            // Frame queued: advance so the next split frame's delta starts above
+            // the ids this one just registered.
+            advanceSentMaxSymbolId();
         }
 
         encoder.setDeferCommit(false);
@@ -3573,8 +3620,10 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Sending commit message for deferred batch");
         }
         encoder.setDeferCommit(false);
+        // A commit carries no rows and no new symbols; in delta mode its empty
+        // delta simply starts at the server's current dictionary size.
         encoder.beginMessage(0, globalSymbolDictionary,
-                /*confirmedMaxId=*/ -1, currentBatchMaxSymbolId);
+                symbolDeltaBaseline(), currentBatchMaxSymbolId);
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
         ensureActiveBufferReady();
@@ -3586,13 +3635,82 @@ public class QwpWebSocketSender implements Sender {
         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
     }
 
+    /**
+     * Advances the delta baseline once a frame carrying the current batch's
+     * symbols has been queued onto the ring. No-op in full-dict mode. Only ever
+     * moves the baseline forward, so a batch that used no new symbols leaves it
+     * unchanged.
+     */
+    private void advanceSentMaxSymbolId() {
+        if (deltaDictEnabled && currentBatchMaxSymbolId > sentMaxSymbolId) {
+            sentMaxSymbolId = currentBatchMaxSymbolId;
+        }
+    }
+
+    /**
+     * Appends the symbols this frame introduces ({@code [sentMaxSymbolId+1 ..
+     * currentBatchMaxSymbolId]}) to the slot's persisted dictionary BEFORE the
+     * frame is published to the ring. This write-ahead ordering keeps the
+     * persisted dictionary a superset of every process-crash-recoverable frame's
+     * references, so recovery and orphan-drain can re-register it on a fresh
+     * server. Not fsync'd (see PersistedSymbolDict) -- a host crash that tears it
+     * is caught by the send loop's replay guard. No-op in memory mode (no
+     * persisted dictionary) and when the frame introduces no new symbols.
+     */
+    private void persistNewSymbolsBeforePublish() {
+        if (!deltaDictEnabled || cursorEngine == null) {
+            return;
+        }
+        PersistedSymbolDict pd = cursorEngine.getPersistedSymbolDict();
+        if (pd == null) {
+            return;
+        }
+        int from = sentMaxSymbolId + 1;
+        int to = currentBatchMaxSymbolId;
+        if (to < from) {
+            return;
+        }
+        for (int id = from; id <= to; id++) {
+            pd.appendSymbol(globalSymbolDictionary.getSymbol(id));
+        }
+    }
+
     private void resetSymbolDictStateForNewConnection() {
-        // The new server has an empty symbol dictionary, so the next batch
-        // must ship a delta starting at id 0. beginMessage() always passes
-        // confirmedMaxId = -1; resetting the batch watermark here keeps a
-        // stale value from suppressing re-emission of symbol ids the new
-        // server has never seen.
+        // Runs on the foreground (initial) connect only -- NOT on the I/O thread's
+        // reconnect/failover path. The per-batch watermark is drained state, so
+        // clearing it here is harmless. sentMaxSymbolId is deliberately left
+        // untouched: in delta mode the I/O thread re-registers the whole
+        // dictionary with a catch-up frame on reconnect, so the producer's
+        // monotonic baseline must survive the wire boundary; resetting it would
+        // desync the producer from the I/O thread's sent-dictionary count.
         currentBatchMaxSymbolId = -1;
+    }
+
+    /**
+     * On recovery, repopulates the producer's {@link GlobalSymbolDictionary} from
+     * the slot's persisted dictionary (ids assigned in the same ascending order,
+     * so they match the recovered frames) and resumes the delta baseline at the
+     * recovered tip, so newly ingested symbols continue above the recovered ids.
+     */
+    private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {
+        if (pd == null || pd.size() == 0) {
+            return;
+        }
+        ObjList<String> symbols = pd.readLoadedSymbols();
+        for (int i = 0, n = symbols.size(); i < n; i++) {
+            globalSymbolDictionary.getOrAddSymbol(symbols.getQuick(i));
+        }
+        sentMaxSymbolId = globalSymbolDictionary.size() - 1;
+    }
+
+    /**
+     * The symbol id below which the server already holds every dictionary entry,
+     * used as {@code confirmedMaxId} when encoding a frame. In delta mode this is
+     * the producer's monotonic sent watermark; in full-dict mode it is -1 so every
+     * frame re-ships the dictionary from id 0.
+     */
+    private int symbolDeltaBaseline() {
+        return deltaDictEnabled ? sentMaxSymbolId : -1;
     }
 
     private void rollbackRow() {
