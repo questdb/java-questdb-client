@@ -1979,17 +1979,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Copies the symbol-dictionary delta a just-sent frame carries into the
-     * loop-local mirror ({@link #sentDictBytesAddr}) so a future reconnect can
-     * re-register it. Frames are sent in FSN order carrying monotonically
-     * extending deltas, so a frame whose delta starts exactly at
-     * {@link #sentDictCount} extends the mirror; a replayed or empty-delta frame
-     * (nothing new) is skipped. Only ever called in delta mode.
-     *
-     * @param payloadAddr address of the QWP message (12-byte header first)
-     * @param payloadLen  message length in bytes
-     */
-    /**
      * Returns the symbol-dictionary delta start id of a frame, or -1 when the
      * frame carries no delta section. Used by the pre-send torn-dictionary guard.
      */
@@ -2013,14 +2002,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0;
     }
 
-    private void accumulateSentDict(long payloadAddr, int payloadLen) {
+    /**
+     * Copies the symbol-dictionary delta a just-sent frame carries into the
+     * loop-local mirror ({@link #sentDictBytesAddr}) so a future reconnect can
+     * re-register it. Frames are sent in FSN order carrying monotonically
+     * extending deltas, so a frame whose delta starts exactly at
+     * {@link #sentDictCount} extends the mirror; a replayed or empty-delta frame
+     * (nothing new) is skipped. Only ever called in delta mode, for a frame the
+     * pre-send guard already classified as a delta frame.
+     *
+     * @param payloadAddr address of the QWP message (12-byte header first)
+     * @param payloadLen  message length in bytes
+     * @param deltaStart  the frame's delta start id, already decoded by the
+     *                    pre-send guard ({@link #frameDeltaStart}) -- passed in so
+     *                    the magic/flags and start-id varint are not re-parsed
+     */
+    private void accumulateSentDict(long payloadAddr, int payloadLen, int deltaStart) {
         long limit = payloadAddr + payloadLen;
-        if (!isDeltaFrame(payloadAddr, payloadLen)) {
-            return;
-        }
-        long p = payloadAddr + QwpConstants.HEADER_SIZE;
-        long deltaStart = readVarintAt(p, limit);
-        p = varintEnd;
+        // deltaStart is known (the guard decoded it); locate deltaCount just past
+        // its canonical LEB128 encoding rather than re-reading the header and the
+        // start-id varint.
+        long p = payloadAddr + QwpConstants.HEADER_SIZE + NativeBufferWriter.varintSize(deltaStart);
         long deltaCount = readVarintAt(p, limit);
         p = varintEnd;
         // Only a delta that extends exactly from our current tip introduces new
@@ -2291,6 +2293,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (frameEnd > pub) {
             return false; // payload not fully published yet
         }
+        long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
+        // -1 unless this is a delta frame; the guard decodes it once here and
+        // accumulateSentDict reuses it post-send, so the delta header is parsed
+        // once per frame rather than twice.
+        int deltaStart = -1;
         if (deltaDictEnabled) {
             // Torn-dictionary guard. In normal operation a delta frame's start id
             // never exceeds the dictionary coverage established so far (replayed
@@ -2302,7 +2309,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // Sending the frame would corrupt the table (the server would null-pad
             // the missing ids), so fail terminally instead; the unreplayable data
             // must be resent.
-            int deltaStart = frameDeltaStart(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
+            deltaStart = frameDeltaStart(frameAddr, payloadLen);
             if (deltaStart > sentDictCount) {
                 recordFatal(new LineSenderException(
                         "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
@@ -2312,16 +2319,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         try {
-            client.sendBinary(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
+            client.sendBinary(frameAddr, payloadLen);
         } catch (Throwable t) {
             fail(t);
             return false;
         }
-        if (deltaDictEnabled) {
+        if (deltaStart >= 0) {
             // Mirror the symbols this frame introduced so a later reconnect can
             // rebuild the whole dictionary. Idempotent on replay: a frame whose
             // delta we already hold advances nothing.
-            accumulateSentDict(base + sendOffset + MmapSegment.FRAME_HEADER_SIZE, payloadLen);
+            accumulateSentDict(frameAddr, payloadLen, deltaStart);
         }
         lastFrameOrPingNanos = System.nanoTime();
         sendOffset = frameEnd;
