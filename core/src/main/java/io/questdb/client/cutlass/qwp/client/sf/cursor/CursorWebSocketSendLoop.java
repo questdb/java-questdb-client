@@ -1030,7 +1030,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // walks back to the lowest unacked frame so sealed-segment data
         // actually reaches the wire — without it, start() would skip
         // straight to the active and orphan everything in sealed.
-        positionCursorForStart();
+        try {
+            positionCursorForStart();
+        } catch (CatchUpSendException e) {
+            // A recovered sender re-registers its dictionary with a catch-up on
+            // the very first connect. Here that runs on the CALLER thread (sync
+            // start), so we must NOT let it drive connectLoop -- that would block
+            // Sender construction forever on a transient outage. Drop the dead
+            // client instead: the I/O thread then reconnects via
+            // attemptInitialConnect -> swapClient and re-sends the catch-up off
+            // this thread. If the failure was already terminal (recordFatal set
+            // running=false, e.g. an entry too large for the batch cap), the I/O
+            // thread simply winds down and checkError() surfaces it.
+            WebSocketClient dead = client;
+            client = null;
+            if (dead != null) {
+                try {
+                    dead.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
+        }
         Thread t = new Thread(this::ioLoop, "qdb-cursor-ws-io");
         t.setDaemon(true);
         try {
@@ -2029,22 +2050,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Builds a table-less catch-up frame carrying the full symbol dictionary
-     * ({@code deltaStart=0, deltaCount=sentDictCount}) and sends it to the freshly
-     * connected server, then consumes wire seq 0 for it. {@code sendBinary} copies
-     * the bytes synchronously, so the temporary frame buffer is freed immediately.
-     * On send failure it fails the loop, which recycles and retries on the next
-     * connection.
-     */
-    /**
      * Re-registers the whole symbol dictionary on a fresh connection, split into
      * as many table-less frames as the server's advertised batch cap requires so
      * no single frame exceeds it (a large dictionary would otherwise be rejected).
      * Each chunk carries a contiguous id range {@code [start .. start+count)}, in
      * order, so the server accumulates them exactly as it would the original
      * per-frame deltas. Returns the number of frames sent (each consumed a wire
-     * sequence), so the caller can align {@code fsnAtZero}. Stops early and fails
-     * the loop on a send error or an entry too large for the cap.
+     * sequence), so the caller can align {@code fsnAtZero}. Throws {@link
+     * CatchUpSendException} on a send error (retriable -- the caller reconnects);
+     * a single entry too large for the cap is non-retriable, so it latches a
+     * terminal before throwing.
      */
     private int sendDictCatchUp() {
         int cap = client.getServerMaxBatchSize();
@@ -2065,15 +2080,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             long entryEnd = varintEnd + len;   // just past [len varint][utf8 bytes]
             long entryBytes = entryEnd - entryStart;
             if (entryBytes > budget) {
-                fail(new LineSenderException(
+                // Non-retriable: the entry will not shrink and the same cluster
+                // re-advertises the same cap, so reconnecting would livelock.
+                // Latch a terminal (the data must be resent after the cap is
+                // raised) rather than calling fail() -- which, from inside the
+                // catch-up, would re-enter connectLoop (see CatchUpSendException).
+                LineSenderException err = new LineSenderException(
                         "symbol dictionary entry too large for the server batch cap during catch-up ["
-                                + "entryBytes=" + entryBytes + ", budget=" + budget + ']'));
-                return framesSent;
+                                + "entryBytes=" + entryBytes + ", budget=" + budget + ']');
+                recordFatal(err);
+                throw new CatchUpSendException(err);
             }
             if (chunkSymbols > 0 && chunkBytes + entryBytes > budget) {
-                if (!sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes)) {
-                    return framesSent;
-                }
+                sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes);
                 framesSent++;
                 chunkStartId += chunkSymbols;
                 chunkStartAddr = entryStart;
@@ -2084,7 +2103,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             chunkBytes += entryBytes;
             p = entryEnd;
         }
-        if (chunkSymbols > 0 && sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes)) {
+        if (chunkSymbols > 0) {
+            sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes);
             framesSent++;
         }
         return framesSent;
@@ -2092,10 +2112,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Sends one table-less catch-up frame carrying dictionary ids
-     * {@code [deltaStart .. deltaStart+deltaCount)}. Returns false and fails the
-     * loop on a send error.
+     * {@code [deltaStart .. deltaStart+deltaCount)}. Throws {@link
+     * CatchUpSendException} on a send error instead of calling {@link #fail}
+     * (see that type for why the catch-up must not re-enter the reconnect loop);
+     * the caller turns it into a single, non-re-entrant reconnect.
      */
-    private boolean sendCatchUpChunk(int deltaStart, int deltaCount, long symbolsAddr, int symbolsLen) {
+    private void sendCatchUpChunk(int deltaStart, int deltaCount, long symbolsAddr, int symbolsLen) {
         int payloadLen = NativeBufferWriter.varintSize(deltaStart)
                 + NativeBufferWriter.varintSize(deltaCount)
                 + symbolsLen;
@@ -2116,15 +2138,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             Unsafe.getUnsafe().copyMemory(symbolsAddr, q, symbolsLen);
             client.sendBinary(frame, frameLen);
         } catch (Throwable t) {
-            fail(t);
-            return false;
+            // Do NOT fail() here -- see CatchUpSendException. Signal the failure
+            // up so exactly one non-re-entrant reconnect follows. A JVM Error is
+            // never a transient reconnect case; let it propagate as-is so the
+            // I/O loop latches it terminal rather than looping on it.
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            throw new CatchUpSendException(t);
         } finally {
             Unsafe.free(frame, frameLen, MemoryTag.NATIVE_DEFAULT);
         }
         nextWireSeq++; // this catch-up chunk consumed a wire sequence
         lastFrameOrPingNanos = System.nanoTime();
         totalFramesSent.incrementAndGet();
-        return true;
     }
 
     private static long writeVarintAt(long addr, long value) {
@@ -2169,7 +2196,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // Nothing sent on this connection yet: re-anchor in place past
                 // the retired tail. The wireSeq<->FSN mapping is untouched
                 // because no wire sequence has been consumed.
-                positionCursorForStart();
+                try {
+                    positionCursorForStart();
+                } catch (CatchUpSendException e) {
+                    // Re-anchor's catch-up send failed. fail() here is a fresh,
+                    // non-re-entrant connectLoop entry from the I/O loop body --
+                    // the same recovery a normal trySendOne send failure takes.
+                    fail(e.getCause());
+                    return false;
+                }
                 return true;
             }
             // Frames were already sent on this connection: the linear
@@ -2334,6 +2369,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @FunctionalInterface
     public interface ReconnectFactory {
         WebSocketClient reconnect() throws Exception;
+    }
+
+    /**
+     * Signals that a symbol-dictionary catch-up frame could not be sent on the
+     * current connection. Thrown by {@link #sendDictCatchUp}/{@link
+     * #sendCatchUpChunk} instead of calling {@link #fail}: the catch-up runs
+     * inside {@link #connectLoop} (via {@link #swapClient}) and, on the initial
+     * connect, inside {@link #start()} / {@link #trySendOne} on the caller
+     * thread. Calling {@code fail()} from there would re-enter {@code
+     * connectLoop} -- corrupting the {@code fsnAtZero}/{@code nextWireSeq} wire
+     * mapping (a subsequent ACK then trims un-acked frames) and growing the
+     * stack until it overflows into a terminal, breaking the "retry a transient
+     * outage forever" invariant -- or run {@code connectLoop} on the caller
+     * thread and block {@code Sender} construction indefinitely. Each catch
+     * site instead turns it into ONE non-re-entrant reconnect: {@code
+     * connectLoop}'s own retry catch (swapClient path), a fresh {@code fail()}
+     * from the I/O loop body (trySendOne path), or dropping the dead client so
+     * the I/O thread reconnects (start path). A JVM {@code Error} is never
+     * wrapped -- it must stay terminal.
+     */
+    private static final class CatchUpSendException extends RuntimeException {
+        CatchUpSendException(Throwable cause) {
+            super(cause);
+        }
     }
 
     /**
