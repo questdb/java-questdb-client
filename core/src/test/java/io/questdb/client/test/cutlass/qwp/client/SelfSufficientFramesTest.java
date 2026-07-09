@@ -38,6 +38,8 @@ import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * Pins down how the symbol dictionary is framed on the wire.
  * <p>
@@ -64,44 +66,48 @@ public class SelfSufficientFramesTest {
         // "beta" (deltaStart=1). The dictionary is durably kept in .symbol-dict
         // so a recovered/orphan-drained slot can rebuild it.
         Path sfDir = Files.createTempDirectory("qwp-sf-selfsufficient");
-        CapturingHandler handler = new CapturingHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        try {
+            assertMemoryLeak(() -> {
+                CapturingHandler handler = new CapturingHandler();
+                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                    int port = server.getPort();
+                    server.start();
+                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-            // The engine places slot files under sf_dir/<sender_id> (default "default").
-            Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
-            try (Sender sender = Sender.fromConfig(config)) {
-                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 1, 5_000);
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    // The engine places slot files under sf_dir/<sender_id> (default "default").
+                    Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
+                    try (Sender sender = Sender.fromConfig(config)) {
+                        sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.batches.size() >= 1, 5_000);
 
-                sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 2, 5_000);
+                        sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.batches.size() >= 2, 5_000);
 
-                // Check the persisted dictionary while the sender is live: a
-                // fully-drained close intentionally unlinks it (slot cleanup).
-                Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
-                byte[] dict = Files.readAllBytes(dictFile);
-                Assert.assertTrue("dictionary retains alpha", containsUtf8(dict, "alpha"));
-                Assert.assertTrue("dictionary retains beta", containsUtf8(dict, "beta"));
-            }
+                        // Check the persisted dictionary while the sender is live: a
+                        // fully-drained close intentionally unlinks it (slot cleanup).
+                        Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
+                        byte[] dict = Files.readAllBytes(dictFile);
+                        Assert.assertTrue("dictionary retains alpha", containsUtf8(dict, "alpha"));
+                        Assert.assertTrue("dictionary retains beta", containsUtf8(dict, "beta"));
+                    }
 
-            Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
-            byte[] b1 = handler.batches.get(0);
-            byte[] b2 = handler.batches.get(1);
+                    Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+                    byte[] b1 = handler.batches.get(0);
+                    byte[] b2 = handler.batches.get(1);
 
-            Assert.assertEquals("batch 1 deltaStart must be 0",
-                    0, readVarint(b1, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 1 deltaCount must be 1", 1, readVarint(b1, DELTA_START_OFFSET + 1));
-            // batch 2 ships ONLY beta as a delta from id 1.
-            Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
-                    1, readVarint(b2, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
-                    1, readVarint(b2, DELTA_START_OFFSET + 1));
+                    Assert.assertEquals("batch 1 deltaStart must be 0",
+                            0, readVarint(b1, DELTA_START_OFFSET));
+                    Assert.assertEquals("batch 1 deltaCount must be 1", 1, readVarint(b1, DELTA_START_OFFSET + 1));
+                    // batch 2 ships ONLY beta as a delta from id 1.
+                    Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
+                            1, readVarint(b2, DELTA_START_OFFSET));
+                    Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
+                            1, readVarint(b2, DELTA_START_OFFSET + 1));
+                }
+            });
         } finally {
             rmDir(sfDir);
         }
@@ -121,43 +127,47 @@ public class SelfSufficientFramesTest {
         Path dictPath = sfDir.resolve("default").resolve(".symbol-dict");
         Files.createDirectories(dictPath);             // a directory, not a file
         Files.createFile(dictPath.resolve("blocker")); // non-empty: cannot be unlinked/rmdir'd
-        CapturingHandler handler = new CapturingHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        try {
+            assertMemoryLeak(() -> {
+                CapturingHandler handler = new CapturingHandler();
+                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                    int port = server.getPort();
+                    server.start();
+                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-            try (Sender sender = Sender.fromConfig(config)) {
-                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 1, 5_000);
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    try (Sender sender = Sender.fromConfig(config)) {
+                        sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.batches.size() >= 1, 5_000);
 
-                sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 2, 5_000);
-            }
+                        sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.batches.size() >= 2, 5_000);
+                    }
 
-            // The planted directory is untouched -- the dictionary never opened,
-            // so delta encoding stayed disabled.
-            Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
-                    Files.isDirectory(dictPath));
+                    // The planted directory is untouched -- the dictionary never
+                    // opened, so delta encoding stayed disabled.
+                    Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
+                            Files.isDirectory(dictPath));
 
-            Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
-            byte[] b1 = handler.batches.get(0);
-            byte[] b2 = handler.batches.get(1);
+                    Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+                    byte[] b1 = handler.batches.get(0);
+                    byte[] b2 = handler.batches.get(1);
 
-            // Full-dict fallback: BOTH batches start at id 0, and batch 2 re-ships
-            // the WHOLE dictionary (alpha + beta), NOT a monotonic delta (which
-            // would be deltaStart=1, deltaCount=1 as in the test above).
-            Assert.assertEquals("batch 1 deltaStart must be 0",
-                    0, readVarint(b1, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 1 deltaCount must be 1",
-                    1, readVarint(b1, DELTA_START_OFFSET + 1));
-            Assert.assertEquals("batch 2 deltaStart must be 0 (full-dict fallback, not monotonic)",
-                    0, readVarint(b2, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 2 deltaCount must be 2 (whole dictionary re-shipped)",
-                    2, readVarint(b2, DELTA_START_OFFSET + 1));
+                    // Full-dict fallback: BOTH batches start at id 0, and batch 2
+                    // re-ships the WHOLE dictionary (alpha + beta), NOT a monotonic
+                    // delta (which would be deltaStart=1, deltaCount=1 as above).
+                    Assert.assertEquals("batch 1 deltaStart must be 0",
+                            0, readVarint(b1, DELTA_START_OFFSET));
+                    Assert.assertEquals("batch 1 deltaCount must be 1",
+                            1, readVarint(b1, DELTA_START_OFFSET + 1));
+                    Assert.assertEquals("batch 2 deltaStart must be 0 (full-dict fallback, not monotonic)",
+                            0, readVarint(b2, DELTA_START_OFFSET));
+                    Assert.assertEquals("batch 2 deltaCount must be 2 (whole dictionary re-shipped)",
+                            2, readVarint(b2, DELTA_START_OFFSET + 1));
+                }
+            });
         } finally {
             rmDir(sfDir);
         }
@@ -181,38 +191,40 @@ public class SelfSufficientFramesTest {
     public void testMemoryModeShipsMonotonicDelta() throws Exception {
         // Memory-mode (no sf_dir): each symbol id ships once. Batch 2 carries
         // only "beta" as a delta starting at id 1, not the whole dictionary.
-        CapturingHandler handler = new CapturingHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
-                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 1, 5_000);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 5_000);
 
-                sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> handler.batches.size() >= 2, 5_000);
+                    sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
+                }
+
+                Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+                byte[] b1 = handler.batches.get(0);
+                byte[] b2 = handler.batches.get(1);
+
+                // Batch 1 introduces alpha at id 0.
+                Assert.assertEquals("batch 1 deltaStart must be 0",
+                        0, readVarint(b1, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 1 deltaCount must be 1",
+                        1, readVarint(b1, DELTA_START_OFFSET + 1));
+
+                // Batch 2 ships ONLY beta as a delta from id 1.
+                Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
+                        1, readVarint(b2, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
+                        1, readVarint(b2, DELTA_START_OFFSET + 1));
             }
-
-            Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
-            byte[] b1 = handler.batches.get(0);
-            byte[] b2 = handler.batches.get(1);
-
-            // Batch 1 introduces alpha at id 0.
-            Assert.assertEquals("batch 1 deltaStart must be 0",
-                    0, readVarint(b1, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 1 deltaCount must be 1",
-                    1, readVarint(b1, DELTA_START_OFFSET + 1));
-
-            // Batch 2 ships ONLY beta as a delta from id 1.
-            Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
-                    1, readVarint(b2, DELTA_START_OFFSET));
-            Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
-                    1, readVarint(b2, DELTA_START_OFFSET + 1));
-        }
+        });
     }
 
     private static int readVarint(byte[] buf, int offset) {

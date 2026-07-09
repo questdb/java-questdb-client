@@ -42,6 +42,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * Verifies the delta symbol-dictionary catch-up on reconnect (memory-mode).
  * <p>
@@ -61,37 +63,40 @@ public class DeltaDictCatchUpTest {
         // sender reconnects. Connection 2 (fresh, empty dict): send "beta" (id 1).
         // Without catch-up, connection 2's first data frame would carry
         // deltaStart=1 and the fresh server would never learn id 0.
-        CatchUpHandler handler = new CatchUpHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            CatchUpHandler handler = new CatchUpHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
-                sender.table("t").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                sender.flush();
-                waitFor(() -> handler.dictFor(1).size() >= 1, 5_000);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    sender.table("t").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.dictFor(1).size() >= 1, 5_000);
 
-                // Let the I/O loop observe the server-side close before the next
-                // batch, so batch 2 is what drives the reconnect + catch-up.
-                Thread.sleep(200);
+                    // Wait until the server has actually closed connection 1 before
+                    // sending batch 2, so batch 2 cannot race into connection 1 and
+                    // must drive the reconnect + catch-up.
+                    waitFor(() -> handler.conn1Closed, 5_000);
 
-                sender.table("t").symbol("s", "beta").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> handler.connectionsAccepted.get() >= 2
-                        && handler.dictFor(2).size() >= 2, 5_000);
+                    sender.table("t").symbol("s", "beta").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.connectionsAccepted.get() >= 2
+                            && handler.dictFor(2).size() >= 2, 5_000);
+                }
+
+                // The fresh (2nd) connection's dictionary, rebuilt purely from the
+                // frames it received, must hold both symbols contiguously with no
+                // null gap -- exactly what the catch-up frame guarantees.
+                List<String> conn2 = handler.dictFor(2);
+                Assert.assertTrue("2nd connection saw a catch-up frame with 0 tables",
+                        handler.sawZeroTableFrameOnConn2);
+                Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
+                Assert.assertEquals("alpha", conn2.get(0));
+                Assert.assertEquals("beta", conn2.get(1));
             }
-
-            // The fresh (2nd) connection's dictionary, rebuilt purely from the
-            // frames it received, must hold both symbols contiguously with no
-            // null gap -- exactly what the catch-up frame guarantees.
-            List<String> conn2 = handler.dictFor(2);
-            Assert.assertTrue("2nd connection saw a catch-up frame with 0 tables",
-                    handler.sawZeroTableFrameOnConn2);
-            Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
-            Assert.assertEquals("alpha", conn2.get(0));
-            Assert.assertEquals("beta", conn2.get(1));
-        }
+        });
     }
 
     @Test
@@ -109,48 +114,50 @@ public class DeltaDictCatchUpTest {
         // reconnect's catch-up cannot re-ship the symbol. (One fixed cap can't do
         // this: the client refuses to SEND a single-table frame over the cap, and
         // that data frame is always larger than the bare catch-up entry.)
-        CapShrinkHandler handler = new CapShrinkHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            handler.setServer(server);
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            CapShrinkHandler handler = new CapShrinkHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                handler.setServer(server);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
-            LineSenderException terminal = null;
-            Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";");
-            try {
-                sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
-                sender.flush();
-                // The terminal latches on the I/O thread once the reconnect's
-                // catch-up hits the oversized entry; it surfaces to the producer
-                // on a subsequent flush. Poll a bounded time for it. The polling
-                // rows use a small symbol that fits the shrunk cap, so the
-                // producer-side cap check never fires and flush() surfaces the
-                // I/O thread's catch-up terminal via checkError.
-                long deadline = System.currentTimeMillis() + 10_000;
-                while (System.currentTimeMillis() < deadline && terminal == null) {
-                    try {
-                        sender.table("t").symbol("s", "y").longColumn("v", 2L).atNow();
-                        sender.flush();
-                        Thread.sleep(20);
-                    } catch (LineSenderException e) {
-                        terminal = e;
-                    }
-                }
-            } finally {
+                String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
+                LineSenderException terminal = null;
+                Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";");
                 try {
-                    sender.close();
-                } catch (LineSenderException e) {
-                    if (terminal == null) {
-                        terminal = e;
+                    sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
+                    sender.flush();
+                    // The terminal latches on the I/O thread once the reconnect's
+                    // catch-up hits the oversized entry; it surfaces to the producer
+                    // on a subsequent flush. Poll a bounded time for it. The polling
+                    // rows use a small symbol that fits the shrunk cap, so the
+                    // producer-side cap check never fires and flush() surfaces the
+                    // I/O thread's catch-up terminal via checkError.
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && terminal == null) {
+                        try {
+                            sender.table("t").symbol("s", "y").longColumn("v", 2L).atNow();
+                            sender.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
                     }
                 }
+                Assert.assertNotNull("an oversized catch-up entry must surface a terminal", terminal);
+                Assert.assertTrue("terminal must come from the catch-up path, got: " + terminal.getMessage(),
+                        terminal.getMessage().contains("during catch-up"));
             }
-            Assert.assertNotNull("an oversized catch-up entry must surface a terminal", terminal);
-            Assert.assertTrue("terminal must come from the catch-up path, got: " + terminal.getMessage(),
-                    terminal.getMessage().contains("during catch-up"));
-        }
+        });
     }
 
     @Test
@@ -163,48 +170,50 @@ public class DeltaDictCatchUpTest {
         // into several contiguous zero-table frames that the fresh server stitches
         // back into a complete, gap-free dictionary.
         final int symbolCount = 40;
-        SplitCatchUpHandler handler = new SplitCatchUpHandler(symbolCount);
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            server.setAdvertisedMaxBatchSize(160); // small cap forces the catch-up to split
-            int port = server.getPort();
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            SplitCatchUpHandler handler = new SplitCatchUpHandler(symbolCount);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(160); // small cap forces the catch-up to split
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
-                // One row per flush so each frame stays under the 160-byte cap; the
-                // sent dictionary still accumulates all 40 symbols on connection 1.
-                for (int i = 0; i < symbolCount; i++) {
-                    sender.table("t").symbol("s", symbolName(i)).longColumn("v", i).atNow();
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    // One row per flush so each frame stays under the 160-byte cap; the
+                    // sent dictionary still accumulates all 40 symbols on connection 1.
+                    for (int i = 0; i < symbolCount; i++) {
+                        sender.table("t").symbol("s", symbolName(i)).longColumn("v", i).atNow();
+                        sender.flush();
+                    }
+                    // Wait until connection 1 has learned every symbol, so the sender's
+                    // sent-dictionary mirror (the catch-up source) holds all of them.
+                    waitFor(() -> handler.dictFor(1).size() >= symbolCount, 10_000);
+
+                    // Wait until the server has actually closed connection 1 before
+                    // sending batch 2, so batch 2 drives the reconnect + split catch-up.
+                    waitFor(() -> handler.conn1Closed, 5_000);
+
+                    sender.table("t").symbol("s", symbolName(symbolCount)).longColumn("v", symbolCount).atNow();
                     sender.flush();
+                    waitFor(() -> handler.connectionsAccepted.get() >= 2
+                            && handler.dictFor(2).size() >= symbolCount + 1, 10_000);
                 }
-                // Wait until connection 1 has learned every symbol, so the sender's
-                // sent-dictionary mirror (the catch-up source) holds all of them.
-                waitFor(() -> handler.dictFor(1).size() >= symbolCount, 10_000);
 
-                // Let the I/O loop observe the server-side close before the next
-                // batch, so batch 2 drives the reconnect + split catch-up.
-                Thread.sleep(200);
-
-                sender.table("t").symbol("s", symbolName(symbolCount)).longColumn("v", symbolCount).atNow();
-                sender.flush();
-                waitFor(() -> handler.connectionsAccepted.get() >= 2
-                        && handler.dictFor(2).size() >= symbolCount + 1, 10_000);
+                // Connection 2's dictionary, rebuilt purely from the frames it received,
+                // must hold every symbol contiguously with no null gap -- the split
+                // catch-up frames reassemble exactly.
+                List<String> conn2 = handler.dictFor(2);
+                Assert.assertEquals("2nd connection dictionary size", symbolCount + 1, conn2.size());
+                for (int i = 0; i <= symbolCount; i++) {
+                    Assert.assertEquals("symbol at id " + i, symbolName(i), conn2.get(i));
+                }
+                // The catch-up had to span more than one zero-table frame to stay under
+                // the advertised cap -- that split is the behaviour under test.
+                Assert.assertTrue("catch-up split into multiple frames (saw "
+                                + handler.zeroTableFramesOnConn2 + ")",
+                        handler.zeroTableFramesOnConn2 >= 2);
             }
-
-            // Connection 2's dictionary, rebuilt purely from the frames it received,
-            // must hold every symbol contiguously with no null gap -- the split
-            // catch-up frames reassemble exactly.
-            List<String> conn2 = handler.dictFor(2);
-            Assert.assertEquals("2nd connection dictionary size", symbolCount + 1, conn2.size());
-            for (int i = 0; i <= symbolCount; i++) {
-                Assert.assertEquals("symbol at id " + i, symbolName(i), conn2.get(i));
-            }
-            // The catch-up had to span more than one zero-table frame to stay under
-            // the advertised cap -- that split is the behaviour under test.
-            Assert.assertTrue("catch-up split into multiple frames (saw "
-                            + handler.zeroTableFramesOnConn2 + ")",
-                    handler.zeroTableFramesOnConn2 >= 2);
-        }
+        });
     }
 
     private static String symbolName(int i) {
@@ -252,6 +261,10 @@ public class DeltaDictCatchUpTest {
      */
     private static class CatchUpHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger connectionsAccepted = new AtomicInteger();
+        // Set once the server has closed connection 1. A test waits on this
+        // (rather than a fixed sleep) before sending batch 2, so batch 2 cannot
+        // race into connection 1's pre-close window and must land on the reconnect.
+        volatile boolean conn1Closed;
         volatile boolean sawZeroTableFrameOnConn2;
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
@@ -284,6 +297,7 @@ public class DeltaDictCatchUpTest {
                 if (connNumber == 1) {
                     Thread.sleep(50);
                     client.close();
+                    conn1Closed = true;
                 }
             } catch (IOException | InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -377,6 +391,8 @@ public class DeltaDictCatchUpTest {
      */
     private static class SplitCatchUpHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger connectionsAccepted = new AtomicInteger();
+        // Set once the server has closed connection 1 (see CatchUpHandler.conn1Closed).
+        volatile boolean conn1Closed;
         volatile int zeroTableFramesOnConn2;
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private final int dropConn1AtDictSize;
@@ -417,6 +433,7 @@ public class DeltaDictCatchUpTest {
                     conn1Dropped = true;
                     Thread.sleep(50);
                     client.close();
+                    conn1Closed = true;
                 }
             } catch (IOException | InterruptedException e) {
                 Thread.currentThread().interrupt();

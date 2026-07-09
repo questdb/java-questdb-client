@@ -46,6 +46,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * End-to-end recovery for the delta symbol dictionary in store-and-forward mode.
  * <p>
@@ -79,131 +81,149 @@ public class DeltaDictRecoveryTest {
 
     @Test
     public void testRecoveredSlotReplaysDeltaFramesAgainstFreshServer() throws Exception {
-        // Phase 1: silent server (no acks). Sender 1 writes symbol rows and
-        // close-fast (no drain), leaving unacked delta frames + a persisted
-        // dictionary in the slot.
-        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-            int port = silent.getPort();
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // Phase 1: silent server (no acks). Sender 1 writes symbol rows and
+            // close-fast (no drain), leaving unacked delta frames + a persisted
+            // dictionary in the slot.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
 
-            String pad = TestUtils.repeat("x", 64);
-            String cfg = "ws::addr=localhost:" + port
-                    + ";sf_dir=" + sfDir
-                    + ";sf_max_bytes=4096"
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender s1 = Sender.fromConfig(cfg)) {
-                for (int i = 0; i < ROWS; i++) {
-                    s1.table("m")
-                            .symbol("s", "sym-" + (i % DISTINCT_SYMBOLS))
-                            .stringColumn("p", pad)
-                            .longColumn("v", i)
-                            .atNow();
-                    s1.flush();
-                }
-            }
-        }
-
-        // Ack a prefix so recovery does NOT replay from the self-sufficient head.
-        // Rows 0..DISTINCT_SYMBOLS-1 register all the symbols, so stamping the
-        // watermark at FSN DISTINCT_SYMBOLS-1 makes recovery replay from FSN
-        // DISTINCT_SYMBOLS onward -- frames whose delta starts at
-        // DISTINCT_SYMBOLS and carries NO new symbols (rows past the first cycle
-        // reuse existing ids). The early ids those frames reference then exist
-        // ONLY in the persisted dictionary, so the reconstructed dictionary below
-        // is complete solely because the catch-up frame re-registered them. That
-        // pins the content assertions to the catch-up: without it (or with a
-        // broken one) the fresh server would null-pad ids 0..DISTINCT_SYMBOLS-1
-        // and the per-id checks would fail.
-        java.nio.file.Path slot = Paths.get(sfDir, "default");
-        writeAckWatermark(slot.resolve(".ack-watermark"), DISTINCT_SYMBOLS - 1);
-
-        // Phase 2: fresh server that reconstructs its per-connection dictionary
-        // from the delta sections. Sender 2 recovers the slot and replays.
-        DictReconstructingHandler handler = new DictReconstructingHandler();
-        try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
-            int port = good.getPort();
-            good.start();
-            Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
-
-            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-            try (Sender ignored = Sender.fromConfig(cfg)) {
-                long deadline = System.currentTimeMillis() + 5_000;
-                while (System.currentTimeMillis() < deadline
-                        && handler.maxDictSize() < DISTINCT_SYMBOLS) {
-                    Thread.sleep(20);
+                String pad = TestUtils.repeat("x", 64);
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_bytes=4096"
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < ROWS; i++) {
+                        s1.table("m")
+                                .symbol("s", "sym-" + (i % DISTINCT_SYMBOLS))
+                                .stringColumn("p", pad)
+                                .longColumn("v", i)
+                                .atNow();
+                        s1.flush();
+                    }
                 }
             }
 
-            // The recovering sender must have re-registered the dictionary via a
-            // catch-up (0-table) frame before replaying delta frames.
-            Assert.assertTrue("recovery sent a full-dictionary catch-up frame",
-                    handler.sawCatchUpFrame);
-            // The reconstructed dictionary must be complete and gap-free: exactly
-            // the DISTINCT_SYMBOLS symbols, no null padding left by a missing id.
-            List<String> dict = handler.dictSnapshot();
-            Assert.assertEquals("reconstructed dictionary size", DISTINCT_SYMBOLS, dict.size());
-            for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
-                Assert.assertEquals("dictionary id " + i, "sym-" + i, dict.get(i));
+            // Ack a prefix so recovery does NOT replay from the self-sufficient head.
+            // Rows 0..DISTINCT_SYMBOLS-1 register all the symbols, so stamping the
+            // watermark at FSN DISTINCT_SYMBOLS-1 makes recovery replay from FSN
+            // DISTINCT_SYMBOLS onward -- frames whose delta starts at
+            // DISTINCT_SYMBOLS and carries NO new symbols (rows past the first cycle
+            // reuse existing ids). The early ids those frames reference then exist
+            // ONLY in the persisted dictionary, so the reconstructed dictionary below
+            // is complete solely because the catch-up frame re-registered them. That
+            // pins the content assertions to the catch-up: without it (or with a
+            // broken one) the fresh server would null-pad ids 0..DISTINCT_SYMBOLS-1
+            // and the per-id checks would fail.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            writeAckWatermark(slot.resolve(".ack-watermark"), DISTINCT_SYMBOLS - 1);
+
+            // Phase 2: fresh server that reconstructs its per-connection dictionary
+            // from the delta sections. Sender 2 recovers the slot and replays.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+
+                // The recovering sender must have re-registered the dictionary via a
+                // catch-up (0-table) frame before replaying delta frames.
+                Assert.assertTrue("recovery sent a full-dictionary catch-up frame",
+                        handler.sawCatchUpFrame);
+                // The reconstructed dictionary must be complete and gap-free: exactly
+                // the DISTINCT_SYMBOLS symbols, no null padding left by a missing id.
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size", DISTINCT_SYMBOLS, dict.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, dict.get(i));
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testTornDictionaryFailsCleanlyInsteadOfCorrupting() throws Exception {
-        // Phase 1: each row introduces a new symbol, so frame i carries deltaStart=i.
-        // Silent server + close-fast leaves all frames unacked in the slot.
-        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-            int port = silent.getPort();
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender s1 = Sender.fromConfig(cfg)) {
-                for (int i = 0; i < 6; i++) {
-                    s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
-                    s1.flush();
+        assertMemoryLeak(() -> {
+            // Phase 1: each row introduces a new symbol, so frame i carries deltaStart=i.
+            // Silent server + close-fast leaves all frames unacked in the slot.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
                 }
             }
-        }
 
-        // Simulate a host/power crash: the segment frames survive but the persisted
-        // dictionary is lost, and the ack watermark was left mid-stream. Truncate
-        // .symbol-dict to its 8-byte header (0 symbols) and stamp the watermark at
-        // FSN 2, so recovery replays from FSN 3 -- a frame with deltaStart=3.
-        java.nio.file.Path slot = Paths.get(sfDir, "default");
-        java.nio.file.Path dict = slot.resolve(".symbol-dict");
-        byte[] header = Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8);
-        java.nio.file.Files.write(dict, header);
-        writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+            // Simulate a host/power crash: the segment frames survive but the persisted
+            // dictionary is lost, and the ack watermark was left mid-stream. Truncate
+            // .symbol-dict to its 8-byte header (0 symbols) and stamp the watermark at
+            // FSN 2, so recovery replays from FSN 3 -- a frame with deltaStart=3.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            byte[] header = Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8);
+            java.nio.file.Files.write(dict, header);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
 
-        // Phase 2: recover against a fresh counting server. The replay guard must
-        // fire (frame deltaStart 3 > recovered dictionary size 0) and fail terminally
-        // rather than send a gapped frame that would corrupt the table.
-        CountingHandler handler = new CountingHandler();
-        try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
-            int port = good.getPort();
-            good.start();
-            Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+            // Phase 2: recover against a fresh counting server. The replay guard must
+            // fire (frame deltaStart 3 > recovered dictionary size 0) and fail terminally
+            // rather than send a gapped frame that would corrupt the table.
+            CountingHandler handler = new CountingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 
-            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-            LineSenderException terminal = null;
-            Sender s2 = Sender.fromConfig(cfg);
-            try {
-                Thread.sleep(1_000); // let the I/O loop attempt replay and hit the guard
-            } finally {
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                LineSenderException terminal = null;
+                Sender s2 = Sender.fromConfig(cfg);
                 try {
-                    s2.close();
-                } catch (LineSenderException e) {
-                    terminal = e;
+                    // Poll for the replay guard to fire (it recordFatal's on the I/O
+                    // thread); flush() surfaces the latched terminal to the producer.
+                    // A bounded poll replaces a fixed sleep and captures it as soon as
+                    // it fires; close() below is the fallback if it surfaces only there.
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && terminal == null) {
+                        try {
+                            s2.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        s2.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
+                    }
                 }
+                Assert.assertEquals("no frame may be replayed to a fresh server with a torn dictionary",
+                        0, handler.frames.get());
+                Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
+                Assert.assertTrue(terminal.getMessage(),
+                        terminal.getMessage().contains("symbol dictionary is incomplete"));
             }
-            Assert.assertEquals("no frame may be replayed to a fresh server with a torn dictionary",
-                    0, handler.frames.get());
-            Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
-            Assert.assertTrue(terminal.getMessage(),
-                    terminal.getMessage().contains("symbol dictionary is incomplete"));
-        }
+        });
     }
 
     private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {
