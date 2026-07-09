@@ -1,0 +1,324 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
+
+import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.std.Files;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
+
+import static org.junit.Assert.assertEquals;
+
+/**
+ * Guards the reconnect/failover symbol-dictionary catch-up ACK alignment in
+ * {@link CursorWebSocketSendLoop#setWireBaselineWithCatchUp}.
+ * <p>
+ * On a fresh connection the loop re-registers the whole dictionary with a
+ * catch-up frame BEFORE replaying data frames. Each catch-up frame consumes a
+ * wire sequence, so the loop anchors {@code fsnAtZero = replayStart - catchUpFrames}
+ * to keep every catch-up frame mapped to an already-acked FSN. Dropping the
+ * {@code - catchUpFrames} term is silent data loss: a server ACK for a catch-up
+ * frame then translates through {@code engine.acknowledge(fsnAtZero + wireSeq)}
+ * to an FSN at or above {@code replayStart}, trimming a not-yet-delivered data
+ * frame from the store-and-forward log.
+ * <p>
+ * The loop is constructed but never {@link CursorWebSocketSendLoop#start started};
+ * the catch-up runs against a stub {@link WebSocketClient} that counts frames, and
+ * the OK is delivered straight into the inner {@code ResponseHandler} -- the same
+ * white-box idiom {@code CursorWebSocketSendLoopDurableAckTest} uses, because
+ * {@code setWireBaselineWithCatchUp} and the wire ports have no public entry point.
+ * {@link CursorSendEngine#ackedFsn()} is the authoritative trim watermark asserted
+ * against.
+ */
+public class CursorWebSocketSendLoopCatchUpAlignmentTest {
+
+    private String tmpDir;
+
+    @Before
+    public void setUp() {
+        tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                "qdb-cursor-catchup-" + System.nanoTime()).toString();
+        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
+    }
+
+    @After
+    public void tearDown() {
+        if (tmpDir == null) return;
+        long find = Files.findFirst(tmpDir);
+        if (find > 0) {
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && !".".equals(name) && !"..".equals(name)) {
+                        Files.remove(tmpDir + "/" + name);
+                    }
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+        }
+        Files.remove(tmpDir);
+    }
+
+    @Test
+    public void testCatchUpFrameAckDoesNotAdvanceTrimWatermark() throws Exception {
+        // Single catch-up frame (server advertises no cap). Two frames were
+        // acked before the reconnect (ackedFsn=1), FSN 2 is unacked. The catch-up
+        // frame's OK must NOT advance the watermark past 1 -- it carries no data,
+        // only the dictionary the fresh server needs before replay.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0); // 0 => no cap => one frame
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 3);            // FSN 0,1,2 published
+                engine.acknowledge(1);              // ackedFsn=1 => replayStart=2, FSN 2 still unacked
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, "s0", "s1");   // sentDictCount=2 => catch-up fires
+                    long replayStart = engine.ackedFsn() + 1L; // = 2
+
+                    invokeSetWireBaselineWithCatchUp(loop, replayStart);
+
+                    assertEquals("whole dictionary fits one frame under no cap",
+                            1, client.framesSent);
+
+                    // Behavioural (the harm): the catch-up frame (wire seq 0) is
+                    // OK'd by the fresh server. It carries no data, so it must
+                    // resolve to an already-acked FSN and leave the trim watermark
+                    // untouched -- advancing it would trim the undelivered FSN 2.
+                    deliverOk(loop, 0);
+                    assertEquals("catch-up frame ACK must not advance the trim watermark "
+                                    + "(would trim an undelivered data frame -> silent data loss)",
+                            1L, engine.ackedFsn());
+                    // Mechanism: the catch-up frames are anchored below replayStart.
+                    assertEquals("fsnAtZero must be anchored catchUpFrames below replayStart",
+                            replayStart - client.framesSent, readLong(loop, "fsnAtZero"));
+                } finally {
+                    loop.close(); // frees the seeded mirror + the stub client's buffers
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSplitCatchUpFramesAcksDoNotAdvanceTrimWatermark() throws Exception {
+        // A small advertised cap splits the dictionary across several catch-up
+        // frames, so the fsnAtZero offset must subtract the full frame count. Ack
+        // the LAST catch-up wire sequence: it still maps below replayStart. With
+        // the offset dropped it would translate to replayStart+1 and over-trim.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(40); // budget 12 => one 11-byte symbol per frame
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 5);            // FSN 0..4 published
+                engine.acknowledge(2);              // ackedFsn=2 => replayStart=3, FSN 3,4 unacked
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, "symbol0000", "symbol0001"); // 11 bytes each -> two frames
+                    long replayStart = engine.ackedFsn() + 1L; // = 3
+
+                    invokeSetWireBaselineWithCatchUp(loop, replayStart);
+
+                    assertEquals("cap must split the two symbols across two frames",
+                            2, client.framesSent);
+
+                    // ACK the highest catch-up wire sequence (the last catch-up
+                    // frame). It too must map below replayStart -- with the offset
+                    // dropped it translates to replayStart+1 and over-trims.
+                    deliverOk(loop, client.framesSent - 1);
+                    assertEquals("no catch-up frame ACK may advance the trim watermark",
+                            2L, engine.ackedFsn());
+                    assertEquals("fsnAtZero must subtract the full split frame count",
+                            replayStart - client.framesSent, readLong(loop, "fsnAtZero"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    private static void appendFrames(CursorSendEngine engine, int count) {
+        long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+        try {
+            byte[] payload = "frame-bytes-padd".getBytes(StandardCharsets.US_ASCII);
+            for (int i = 0; i < payload.length; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, payload[i]);
+            }
+            for (int i = 0; i < count; i++) {
+                engine.appendBlocking(buf, 16);
+            }
+        } finally {
+            Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // Delivers a 0-table STATUS_OK for {@code wireSeq} into the loop's response
+    // handler, mimicking the server acking a catch-up frame (which carries no tables).
+    private static void deliverOk(CursorWebSocketSendLoop loop, long wireSeq) throws Exception {
+        int size = 11; // status(1) + sequence(8) + tableCount(2)
+        long ptr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_OK);
+            Unsafe.getUnsafe().putLong(ptr + 1, wireSeq);
+            Unsafe.getUnsafe().putShort(ptr + 9, (short) 0);
+            Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
+            f.setAccessible(true);
+            Object handler = f.get(loop);
+            Method m = handler.getClass().getDeclaredMethod("onBinaryMessage", long.class, int.class);
+            m.setAccessible(true);
+            m.invoke(handler, ptr, size);
+        } finally {
+            Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void invokeSetWireBaselineWithCatchUp(CursorWebSocketSendLoop loop, long replayStart) throws Exception {
+        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("setWireBaselineWithCatchUp", long.class);
+        m.setAccessible(true);
+        m.invoke(loop, replayStart);
+    }
+
+    private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
+        return new CursorWebSocketSendLoop(
+                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                () -> {
+                    throw new UnsupportedOperationException("test loop is never started");
+                },
+                5_000L, 100L, 5_000L, false);
+    }
+
+    private CursorSendEngine newEngine() {
+        return new CursorSendEngine(tmpDir, 16384);
+    }
+
+    private static long readLong(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getLong(loop);
+    }
+
+    // Populates the loop's native sent-dictionary mirror with {@code symbols} in
+    // the on-wire [len varint][utf8] layout, so setWireBaselineWithCatchUp sees a
+    // non-empty dictionary to re-register. loop.close() frees it.
+    private static void seedMirror(CursorWebSocketSendLoop loop, String... symbols) throws Exception {
+        int total = 0;
+        for (String s : symbols) {
+            int len = s.getBytes(StandardCharsets.UTF_8).length;
+            total += varintSize(len) + len;
+        }
+        long addr = Unsafe.malloc(total, MemoryTag.NATIVE_DEFAULT);
+        long p = addr;
+        for (String s : symbols) {
+            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            p = writeVarint(p, bytes.length);
+            for (byte b : bytes) {
+                Unsafe.getUnsafe().putByte(p++, b);
+            }
+        }
+        setField(loop, "sentDictBytesAddr", addr);
+        setIntField(loop, "sentDictBytesCapacity", total);
+        setIntField(loop, "sentDictBytesLen", total);
+        setIntField(loop, "sentDictCount", symbols.length);
+    }
+
+    private static void setField(Object target, String name, long value) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        f.setLong(target, value);
+    }
+
+    private static void setIntField(Object target, String name, int value) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        f.setInt(target, value);
+    }
+
+    private static int varintSize(long value) {
+        int n = 1;
+        while (value > 0x7F) {
+            value >>>= 7;
+            n++;
+        }
+        return n;
+    }
+
+    private static long writeVarint(long addr, long value) {
+        while (value > 0x7F) {
+            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
+        }
+        Unsafe.getUnsafe().putByte(addr++, (byte) value);
+        return addr;
+    }
+
+    // Stub transport: completes no real I/O. getServerMaxBatchSize drives the
+    // catch-up split; sendBinary counts the frames the catch-up emitted.
+    private static final class CatchUpCapturingClient extends WebSocketClient {
+        private final int cap;
+        private int framesSent;
+
+        CatchUpCapturingClient(int cap) {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+            this.cap = cap;
+        }
+
+        @Override
+        public int getServerMaxBatchSize() {
+            return cap;
+        }
+
+        @Override
+        public int getServerQwpVersion() {
+            return 1;
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+            framesSent++;
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
+        }
+    }
+}
