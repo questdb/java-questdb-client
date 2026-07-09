@@ -39,11 +39,13 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
 
 /**
  * Guards the reconnect/failover symbol-dictionary catch-up ACK alignment in
@@ -173,6 +175,42 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         });
     }
 
+    @Test
+    public void testTransientCatchUpSendFailureIsRetriableNotTerminal() throws Exception {
+        // A transient wire failure WHILE shipping the catch-up (the fresh
+        // connection drops mid-handshake) must surface as a retriable
+        // CatchUpSendException for the reconnect loop to handle -- it must NOT
+        // call fail(). From inside the catch-up fail() re-enters connectLoop
+        // (corrupting the fsnAtZero/nextWireSeq mapping, or overflowing the stack
+        // on a flapping connection) or, with no reconnect attempt reachable,
+        // latches a terminal -- turning a transient outage into a hard failure and
+        // breaking store-and-forward. Only the oversized-entry (non-retriable)
+        // terminal was covered; this pins the retriable path.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0, true); // sendBinary throws
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                engine.acknowledge(0); // ackedFsn=0 => a real unacked frame exists behind the catch-up
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, "s0", "s1"); // non-empty dict => catch-up fires and hits the failing send
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                        fail("a transient catch-up send failure must raise a retriable "
+                                + "CatchUpSendException, not be swallowed into fail()/a terminal");
+                    } catch (InvocationTargetException e) {
+                        assertEquals("transient catch-up send failure must surface as CatchUpSendException",
+                                "CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    }
+                    // Retriable, not terminal: the producer-facing error latch stays clear.
+                    loop.checkError();
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private static void appendFrames(CursorSendEngine engine, int count) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -288,14 +326,22 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     // Stub transport: completes no real I/O. getServerMaxBatchSize drives the
-    // catch-up split; sendBinary counts the frames the catch-up emitted.
+    // catch-up split; sendBinary counts the frames the catch-up emitted, or --
+    // when throwOnSend is set -- raises a transient wire error to model the fresh
+    // connection dropping mid-catch-up.
     private static final class CatchUpCapturingClient extends WebSocketClient {
         private final int cap;
+        private final boolean throwOnSend;
         private int framesSent;
 
         CatchUpCapturingClient(int cap) {
+            this(cap, false);
+        }
+
+        CatchUpCapturingClient(int cap, boolean throwOnSend) {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
             this.cap = cap;
+            this.throwOnSend = throwOnSend;
         }
 
         @Override
@@ -310,6 +356,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
 
         @Override
         public void sendBinary(long dataPtr, int length) {
+            if (throwOnSend) {
+                throw new RuntimeException("transient wire failure during catch-up");
+            }
             framesSent++;
         }
 
