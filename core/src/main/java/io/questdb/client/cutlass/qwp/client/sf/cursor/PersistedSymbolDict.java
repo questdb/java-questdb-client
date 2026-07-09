@@ -328,8 +328,18 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
             Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
             buf = 0L;
-            // appendOffset lands just past the last complete entry, so the next
-            // append overwrites any torn trailing bytes.
+            // Physically drop any torn/stale trailing bytes (a crash mid-append)
+            // so a LATER, shorter append cannot leave residue past its own end
+            // that a future recovery mis-parses as a ghost symbol -- which would
+            // shift every subsequent dense id. Without this, appendOffset already
+            // lands just past the last complete entry, so the next append
+            // overwrites FROM there, but only truncation guarantees nothing
+            // survives BEYOND it. Best-effort: a failed truncate just forgoes the
+            // hardening and falls back to the overwrite-from-appendOffset behaviour.
+            long validLen = HEADER_SIZE + entriesLen;
+            if (validLen < len) {
+                Files.truncate(fd, validLen);
+            }
             return new PersistedSymbolDict(fd, HEADER_SIZE + entriesLen, count, entriesAddr, entriesLen);
         } catch (Throwable t) {
             if (buf != 0L) {

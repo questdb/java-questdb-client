@@ -229,17 +229,24 @@ public class PersistedSymbolDictTest {
                 d.close();
 
                 Path f = dir.resolve(".symbol-dict");
+                long cleanLen = Files.size(f); // header + "one" + "two", no tail
                 Files.write(f, new byte[]{(byte) 5, (byte) 'x', (byte) 'y'},
                         StandardOpenOption.APPEND);
+                Assert.assertEquals("torn tail present before reopen", cleanLen + 3, Files.size(f));
 
                 // Reopen: the torn tail is ignored; only the two complete entries load.
                 PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
                 try {
+                    // open() physically truncates the torn tail: the file returns
+                    // to its clean length, so a later SHORTER append can never
+                    // leave residue past its end that a future recovery mis-parses
+                    // as a ghost symbol.
+                    Assert.assertEquals("torn tail physically dropped by open", cleanLen, Files.size(f));
                     Assert.assertEquals(2, re.size());
                     ObjList<String> s = re.readLoadedSymbols();
                     Assert.assertEquals("one", s.getQuick(0));
                     Assert.assertEquals("two", s.getQuick(1));
-                    // The next append overwrites the torn tail, keeping the file consistent.
+                    // The next append continues from the truncated tail cleanly.
                     re.appendSymbol("three");
                     Assert.assertEquals(3, re.size());
                 } finally {
