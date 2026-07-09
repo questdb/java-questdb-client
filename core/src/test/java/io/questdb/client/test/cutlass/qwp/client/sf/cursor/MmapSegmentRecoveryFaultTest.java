@@ -63,6 +63,14 @@ import static org.junit.Assert.fail;
  *       so a reflection-based test spuriously fails on the shipping JDK 8/11/17
  *       even though the direct-call production path catches it fine.</li>
  * </ul>
+ * The fault-delivery mechanism the fix rests on was verified directly on the
+ * shipping/CI Java floor -- JDK 8 (Temurin 1.8.0_492) -- not merely inferred
+ * from the adjacent pre-21 LTS releases: the whole class passes there in both
+ * interpreter ({@code -Xint}) and JIT modes, HotSpot emits the exact pre-21
+ * message above, and a <i>direct</i> {@code try/catch} catches the fault in
+ * interpreter, C1, and C2 modes. {@code isMmapAccessFault}'s shared
+ * {@code "unsafe memory access operation"} fragment matches that message while
+ * the JDK 21+-only needle it replaced does not -- the guard is live on JDK 8.
  * The unbacked tail is produced portably by truncating the file down (dropping
  * the tail blocks) and back up to the mapping size (leaving a sparse hole). A
  * hole-faulting filesystem (ZFS) then faults on the read exactly as in
