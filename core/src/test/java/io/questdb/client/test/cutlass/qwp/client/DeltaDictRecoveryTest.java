@@ -104,6 +104,20 @@ public class DeltaDictRecoveryTest {
             }
         }
 
+        // Ack a prefix so recovery does NOT replay from the self-sufficient head.
+        // Rows 0..DISTINCT_SYMBOLS-1 register all the symbols, so stamping the
+        // watermark at FSN DISTINCT_SYMBOLS-1 makes recovery replay from FSN
+        // DISTINCT_SYMBOLS onward -- frames whose delta starts at
+        // DISTINCT_SYMBOLS and carries NO new symbols (rows past the first cycle
+        // reuse existing ids). The early ids those frames reference then exist
+        // ONLY in the persisted dictionary, so the reconstructed dictionary below
+        // is complete solely because the catch-up frame re-registered them. That
+        // pins the content assertions to the catch-up: without it (or with a
+        // broken one) the fresh server would null-pad ids 0..DISTINCT_SYMBOLS-1
+        // and the per-id checks would fail.
+        java.nio.file.Path slot = Paths.get(sfDir, "default");
+        writeAckWatermark(slot.resolve(".ack-watermark"), DISTINCT_SYMBOLS - 1);
+
         // Phase 2: fresh server that reconstructs its per-connection dictionary
         // from the delta sections. Sender 2 recovers the slot and replays.
         DictReconstructingHandler handler = new DictReconstructingHandler();
