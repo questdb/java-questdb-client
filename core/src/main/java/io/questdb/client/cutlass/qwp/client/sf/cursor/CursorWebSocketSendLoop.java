@@ -133,6 +133,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
+    // Hard ceiling for the lifetime-monotonic sent-dictionary mirror. The mirror
+    // fields are int, so it cannot exceed Integer.MAX_VALUE bytes; reaching even
+    // this needs ~200M+ distinct symbols on a single connection, far past any real
+    // workload. The guard exists so that pathological growth fails loudly instead
+    // of overflowing the int capacity math into a heap-corrupting copyMemory.
+    private static final int MAX_SENT_DICT_BYTES = Integer.MAX_VALUE - 8;
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
@@ -2035,19 +2041,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         int regionBytes = (int) (p - regionStart);
-        ensureSentDictCapacity(sentDictBytesLen + regionBytes);
+        // long sum: sentDictBytesLen + regionBytes can exceed Integer.MAX_VALUE on
+        // a very-high-cardinality lifetime connection; ensureSentDictCapacity then
+        // fails loudly rather than overflowing to a negative int (which would make
+        // the capacity check pass and copyMemory scribble past the buffer).
+        ensureSentDictCapacity((long) sentDictBytesLen + regionBytes);
         Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
         sentDictBytesLen += regionBytes;
         sentDictCount += (int) deltaCount;
     }
 
-    private void ensureSentDictCapacity(int required) {
+    private void ensureSentDictCapacity(long required) {
         if (sentDictBytesCapacity >= required) {
             return;
         }
-        int newCap = Math.max(sentDictBytesCapacity * 2, Math.max(4096, required));
-        sentDictBytesAddr = Unsafe.realloc(sentDictBytesAddr, sentDictBytesCapacity, newCap, MemoryTag.NATIVE_DEFAULT);
-        sentDictBytesCapacity = newCap;
+        if (required > MAX_SENT_DICT_BYTES) {
+            throw new LineSenderException("symbol dictionary mirror exceeds the maximum size ["
+                    + "required=" + required + ", max=" + MAX_SENT_DICT_BYTES + ']');
+        }
+        // Grow in long to avoid the capacity*2 int overflow (negative) that would
+        // otherwise degrade the doubling near 1 GB; clamp to the int ceiling.
+        long newCap = Math.max((long) sentDictBytesCapacity * 2, Math.max(4096L, required));
+        if (newCap > MAX_SENT_DICT_BYTES) {
+            newCap = MAX_SENT_DICT_BYTES;
+        }
+        sentDictBytesAddr = Unsafe.realloc(sentDictBytesAddr, sentDictBytesCapacity, (int) newCap, MemoryTag.NATIVE_DEFAULT);
+        sentDictBytesCapacity = (int) newCap;
     }
 
     private long readVarintAt(long p, long limit) {
