@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -222,6 +223,70 @@ public class DeltaDictRecoveryTest {
                 Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
                 Assert.assertTrue(terminal.getMessage(),
                         terminal.getMessage().contains("symbol dictionary is incomplete"));
+            }
+        });
+    }
+
+    @Test
+    public void testFailedPublishDoesNotDuplicatePersistedSymbols() throws Exception {
+        // Regression: persistNewSymbolsBeforePublish is a write-ahead -- it runs
+        // BEFORE the frame is published (sealAndSwapBuffer -> appendBlocking). If
+        // publish fails (here PAYLOAD_TOO_LARGE, a frame bigger than the SF
+        // segment; a backpressure deadline in production), the frame's symbols are
+        // already on disk but sentMaxSymbolId is NOT advanced and the rows stay
+        // buffered -- so a retry re-runs the persist. Keying the persist range off
+        // pd.size() (not sentMaxSymbolId+1) makes it idempotent. Before that fix,
+        // the retry appended the symbol a SECOND time, breaking the dense
+        // id->position invariant; on recovery every later global id shifts by one
+        // and symbol column values are silently misattributed.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Small segment; a heavily padded row's frame cannot fit, so
+                // appendBlocking throws PAYLOAD_TOO_LARGE deterministically -- no
+                // backpressure timing needed. The server never acks (SilentHandler).
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_bytes=1024;";
+                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
+                Sender sender = Sender.fromConfig(cfg);
+                try {
+                    // Buffer ONE new-symbol row, then flush it TWICE. Each flush
+                    // runs the write-ahead persist and then fails to publish; the
+                    // failed flush leaves the row buffered, so the second flush is
+                    // the retry that (pre-fix) duplicated the persisted symbol.
+                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.flush();
+                            Assert.fail("oversized frame must fail to publish");
+                        } catch (LineSenderException expected) {
+                            // frame too large -- expected on every attempt
+                        }
+                    }
+
+                    // The persisted dictionary must hold "s0" EXACTLY ONCE.
+                    // Pre-fix, the retry duplicated it (size == 2).
+                    PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
+                    Assert.assertNotNull(pd);
+                    try {
+                        Assert.assertEquals("failed-publish retry must not duplicate the persisted symbol",
+                                1, pd.size());
+                        Assert.assertEquals("s0", pd.readLoadedSymbols().getQuick(0));
+                    } finally {
+                        pd.close();
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered oversized row and
+                        // fails again (PAYLOAD_TOO_LARGE); expected here and not
+                        // what we assert. close() still runs its resource cleanup,
+                        // so no native memory leaks.
+                    }
+                }
             }
         });
     }
