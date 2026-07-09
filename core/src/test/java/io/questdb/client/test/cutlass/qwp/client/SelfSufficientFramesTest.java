@@ -107,6 +107,62 @@ public class SelfSufficientFramesTest {
         }
     }
 
+    @Test
+    public void testDiskModeFallsBackToFullDictWhenPersistedDictUnopenable() throws Exception {
+        // When the per-slot .symbol-dict cannot be opened in disk mode,
+        // isDeltaDictEnabled() is false and the sender must fall back to
+        // self-sufficient frames: every batch re-ships the WHOLE dictionary from
+        // id 0. A recovered / orphan-drained slot then has no dictionary to
+        // rebuild deltas from, so a monotonic delta would dangle ids on the fresh
+        // server -- the full-dict frame is the safe degradation. Force the open
+        // failure by planting a DIRECTORY where the dictionary file belongs:
+        // openRW / openCleanRW on a directory fails, so open() returns null.
+        Path sfDir = Files.createTempDirectory("qwp-sf-fallback");
+        Path dictPath = sfDir.resolve("default").resolve(".symbol-dict");
+        Files.createDirectories(dictPath);             // a directory, not a file
+        Files.createFile(dictPath.resolve("blocker")); // non-empty: cannot be unlinked/rmdir'd
+        CapturingHandler handler = new CapturingHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+            try (Sender sender = Sender.fromConfig(config)) {
+                sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                sender.flush();
+                waitFor(() -> handler.batches.size() >= 1, 5_000);
+
+                sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                sender.flush();
+                waitFor(() -> handler.batches.size() >= 2, 5_000);
+            }
+
+            // The planted directory is untouched -- the dictionary never opened,
+            // so delta encoding stayed disabled.
+            Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
+                    Files.isDirectory(dictPath));
+
+            Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+            byte[] b1 = handler.batches.get(0);
+            byte[] b2 = handler.batches.get(1);
+
+            // Full-dict fallback: BOTH batches start at id 0, and batch 2 re-ships
+            // the WHOLE dictionary (alpha + beta), NOT a monotonic delta (which
+            // would be deltaStart=1, deltaCount=1 as in the test above).
+            Assert.assertEquals("batch 1 deltaStart must be 0",
+                    0, readVarint(b1, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 1 deltaCount must be 1",
+                    1, readVarint(b1, DELTA_START_OFFSET + 1));
+            Assert.assertEquals("batch 2 deltaStart must be 0 (full-dict fallback, not monotonic)",
+                    0, readVarint(b2, DELTA_START_OFFSET));
+            Assert.assertEquals("batch 2 deltaCount must be 2 (whole dictionary re-shipped)",
+                    2, readVarint(b2, DELTA_START_OFFSET + 1));
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
     private static boolean containsUtf8(byte[] haystack, String needle) {
         byte[] n = needle.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         outer:
