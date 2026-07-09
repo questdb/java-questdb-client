@@ -162,7 +162,7 @@ public class MmapSegmentRecoveryFaultTest {
             final int payloadLen1 = (int) (frame2Offset - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
 
             long used = writeSegment(path, 11L, new int[]{payloadLen1, payloadLen2});
-            assertEquals("frame 2's header must end on the page boundary", boundary - 8, frame2Offset + MmapSegment.FRAME_HEADER_SIZE);
+            assertEquals("frame 2's header must end 8 bytes below the page boundary", boundary - 8, frame2Offset + MmapSegment.FRAME_HEADER_SIZE);
             assertTrue("frame 2 payload must reach past the boundary", used > boundary);
             punchSparseTail(path, boundary);
 

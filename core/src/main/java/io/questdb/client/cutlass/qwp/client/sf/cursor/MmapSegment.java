@@ -668,9 +668,12 @@ public final class MmapSegment implements QuietCloseable {
         return ~crc;
     }
 
-    // Standard reflected CRC-32C byte table (polynomial 0x82F63B78), matching
-    // crc32c_table[0] in the native crc32c.c. Computed at class init to avoid
-    // 256 hand-transcribed literals; drives crc32cRecovery.
+    /**
+     * Standard reflected CRC-32C byte table (polynomial {@code 0x82F63B78}),
+     * matching {@code crc32c_table[0]} in the native {@code crc32c.c}. Computed
+     * at class init to avoid 256 hand-transcribed literals; drives
+     * {@link #crc32cRecovery}.
+     */
     private static int[] buildCrc32cTable() {
         int[] table = new int[256];
         for (int n = 0; n < 256; n++) {
