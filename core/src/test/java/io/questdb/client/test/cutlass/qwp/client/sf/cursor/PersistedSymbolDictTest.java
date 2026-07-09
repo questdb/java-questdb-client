@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.ObjList;
 import org.junit.Assert;
@@ -80,6 +81,64 @@ public class PersistedSymbolDictTest {
                 try {
                     Assert.assertEquals(4, third.size());
                     Assert.assertEquals("TSLA", third.readLoadedSymbols().getQuick(3));
+                } finally {
+                    third.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testAppendSymbolsBatchWritesDenseRange() throws Exception {
+        // appendSymbols persists a whole id range in one write (the hot-path
+        // syscall reduction). It must produce the same dense, id-ordered file a
+        // per-symbol loop would, including an empty symbol mid-range, and a second
+        // batched call keyed off size() must continue densely (the resume-from-
+        // durable-size contract the producer relies on).
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                dict.getOrAddSymbol("AAPL"); // id 0
+                dict.getOrAddSymbol("");     // id 1 -- empty symbol mid-range
+                dict.getOrAddSymbol("MSFT"); // id 2
+                dict.getOrAddSymbol("TSLA"); // id 3
+
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                try {
+                    d.appendSymbols(dict, 0, 3); // one write for all four ids
+                    Assert.assertEquals(4, d.size());
+                    d.appendSymbols(dict, 4, 3); // empty range (to < from) is a no-op
+                    Assert.assertEquals(4, d.size());
+                } finally {
+                    d.close();
+                }
+
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(dir.toString());
+                try {
+                    Assert.assertEquals(4, reopened.size());
+                    ObjList<String> symbols = reopened.readLoadedSymbols();
+                    Assert.assertEquals(4, symbols.size());
+                    Assert.assertEquals("AAPL", symbols.getQuick(0));
+                    Assert.assertEquals("", symbols.getQuick(1));
+                    Assert.assertEquals("MSFT", symbols.getQuick(2));
+                    Assert.assertEquals("TSLA", symbols.getQuick(3));
+
+                    // A follow-on batch keyed off the recovered size continues
+                    // the dense sequence without a gap or duplicate.
+                    dict.getOrAddSymbol("NVDA"); // id 4
+                    reopened.appendSymbols(dict, reopened.size(), 4);
+                    Assert.assertEquals(5, reopened.size());
+                } finally {
+                    reopened.close();
+                }
+
+                PersistedSymbolDict third = PersistedSymbolDict.open(dir.toString());
+                try {
+                    Assert.assertEquals(5, third.size());
+                    Assert.assertEquals("NVDA", third.readLoadedSymbols().getQuick(4));
                 } finally {
                     third.close();
                 }

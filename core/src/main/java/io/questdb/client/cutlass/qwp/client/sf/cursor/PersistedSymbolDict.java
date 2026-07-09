@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -171,6 +172,46 @@ public final class PersistedSymbolDict implements QuietCloseable {
         }
         appendOffset += recLen;
         size++;
+    }
+
+    /**
+     * Appends the dense id range {@code [from .. to]} in a SINGLE write. Encodes
+     * the whole {@code [len varint][utf8]...} region into scratch first, then
+     * issues one positioned write -- versus one {@code pwrite(2)} per symbol via
+     * {@link #appendSymbol}. That per-symbol syscall count is the hot-path cost
+     * on a high-cardinality batch (one new symbol per row), which is exactly the
+     * store-and-forward workload delta encoding targets. Callers pass the
+     * dictionary and the range so the ids resolve to their symbol strings.
+     * <p>
+     * Same durability and idempotency contract as {@link #appendSymbol}: no
+     * fsync, and a short write throws WITHOUT advancing {@code size}/{@code
+     * appendOffset}, so a retry keyed off {@link #size()} re-encodes the same
+     * range and overwrites at the same offset. No-op when the range is empty or
+     * the dictionary is closed.
+     */
+    public void appendSymbols(GlobalSymbolDictionary dict, int from, int to) {
+        if (closed || to < from) {
+            return;
+        }
+        int len = 0;
+        for (int id = from; id <= to; id++) {
+            CharSequence symbol = dict.getSymbol(id);
+            int utf8Len = Utf8s.utf8Bytes(symbol);
+            int recLen = varintSize(utf8Len) + utf8Len;
+            ensureScratch(len + recLen);
+            long p = writeVarint(scratchAddr + len, utf8Len);
+            if (utf8Len > 0) {
+                Utf8s.strCpyUtf8(symbol, p, utf8Len);
+            }
+            len += recLen;
+        }
+        long written = Files.write(fd, scratchAddr, len, appendOffset);
+        if (written != len) {
+            throw new IllegalStateException("short write to " + FILE_NAME
+                    + " [expected=" + len + ", actual=" + written + ']');
+        }
+        appendOffset += len;
+        size += to - from + 1;
     }
 
     @Override
