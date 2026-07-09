@@ -227,6 +227,52 @@ public class SelfSufficientFramesTest {
         });
     }
 
+    @Test
+    public void testSplitBatchShipsDeltaOnFirstFrameOnly() throws Exception {
+        // A single flush whose encoded size exceeds the server's batch cap is
+        // split into one frame per table (flushPendingRowsSplit). The FIRST split
+        // frame carries the whole batch's symbol-dict delta and advances the
+        // baseline; the remaining frames carry an EMPTY delta and only reference
+        // ids the first frame already registered. A regression that shipped each
+        // table's own symbols (wrong deltaStart) would dangle ids on the server.
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Padding inflates each table past half the cap, so the combined
+                // two-table message exceeds it while each single-table frame fits.
+                String pad = new String(new char[60]).replace('\0', 'x');
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    // Buffer TWO tables (symbols "a" id 0, "b" id 1), then ONE flush.
+                    sender.table("t1").symbol("s", "a").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    sender.table("t2").symbol("s", "b").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
+                }
+
+                Assert.assertEquals("the oversized two-table batch must split into 2 frames",
+                        2, handler.batches.size());
+                byte[] f1 = handler.batches.get(0);
+                byte[] f2 = handler.batches.get(1);
+
+                // First split frame ships the whole batch's dictionary (a + b).
+                Assert.assertEquals("first split frame deltaStart must be 0",
+                        0, readVarint(f1, DELTA_START_OFFSET));
+                Assert.assertEquals("first split frame ships both new symbols",
+                        2, readVarint(f1, DELTA_START_OFFSET + 1));
+                // Second split frame carries an empty delta above the advanced baseline.
+                Assert.assertEquals("second split frame deltaStart must be 2 (baseline advanced)",
+                        2, readVarint(f2, DELTA_START_OFFSET));
+                Assert.assertEquals("second split frame carries no new symbols",
+                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
     private static int readVarint(byte[] buf, int offset) {
         // Simple unsigned varint decode — sufficient for small values.
         int result = 0;
