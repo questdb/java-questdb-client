@@ -186,7 +186,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
-    // Delta symbol dictionary catch-up state (memory-mode only; see swapClient).
+    // Delta symbol dictionary catch-up state (see swapClient). Active in memory
+    // mode, and in disk mode on a recovered / orphan-drained slot (the constructor
+    // seeds sentDict* from the persisted dictionary there).
     // deltaDictEnabled gates all of it. The loop mirrors, in sentDict*, every
     // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
     // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that
@@ -532,8 +534,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     ensureSentDictCapacity(len);
                     Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
                     sentDictBytesLen = len;
+                    // Set the count only alongside the bytes so sentDictCount can
+                    // never claim symbols the mirror does not hold. A recovered slot
+                    // always has loadedEntriesLen > 0 when size > 0, so this is the
+                    // same result -- it just makes the coupling explicit.
+                    sentDictCount = pd.size();
                 }
-                sentDictCount = pd.size();
             }
         }
         this.fsnAtZero = fsnAtZero;
@@ -1784,8 +1790,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Walk the engine's segments to find the one containing {@code targetFsn},
      * and set {@code sendOffset} to the byte offset of that frame within it.
-     * This is called at startup and after every reconnect, after fsnAtZero has
-     * already been reset to {@code targetFsn} and nextWireSeq to 0.
+     * This is called at startup and after every reconnect, once
+     * {@link #setWireBaselineWithCatchUp} has anchored the wire baseline
+     * ({@code fsnAtZero} / {@code nextWireSeq}) -- which may leave {@code nextWireSeq}
+     * past the catch-up frames it emitted. This method only positions the byte
+     * cursor at {@code targetFsn}; it does not touch the wire mapping.
      * <p>
      * If {@code targetFsn} is already published, the method positions the byte
      * cursor exactly at that frame. If {@code targetFsn} is not published yet,
@@ -2133,8 +2142,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         int cap = client.getServerMaxBatchSize();
         // Symbol-bytes budget per frame, leaving room for the 12-byte header and
         // the two delta-section varints. cap <= 0 means the server advertised no
-        // limit -> send the whole dictionary in one frame.
-        int budget = cap > 0 ? Math.max(1, cap - QwpConstants.HEADER_SIZE - 16) : Integer.MAX_VALUE;
+        // limit -- send the whole dictionary in one frame, but still bound the
+        // budget by MAX_SENT_DICT_BYTES so sendCatchUpChunk's int frameLen
+        // (HEADER_SIZE + varints + symbolsLen) cannot overflow on a pathological
+        // multi-GB dictionary (unreachable at real cardinality; defensive).
+        int budget = cap > 0
+                ? Math.max(1, cap - QwpConstants.HEADER_SIZE - 16)
+                : MAX_SENT_DICT_BYTES - QwpConstants.HEADER_SIZE - 16;
         int framesSent = 0;
         int chunkStartId = 0;
         long chunkStartAddr = sentDictBytesAddr;
