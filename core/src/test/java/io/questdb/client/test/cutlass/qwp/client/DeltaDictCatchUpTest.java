@@ -25,7 +25,9 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -89,6 +91,65 @@ public class DeltaDictCatchUpTest {
             Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
             Assert.assertEquals("alpha", conn2.get(0));
             Assert.assertEquals("beta", conn2.get(1));
+        }
+    }
+
+    @Test
+    public void testCatchUpEntryTooLargeForCapFailsTerminally() throws Exception {
+        // A dictionary entry that exceeds the reconnect server's per-chunk budget
+        // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk.
+        // sendDictCatchUp must latch a clean terminal ("... during catch-up")
+        // rather than call fail(): pre-fix the oversized entry drove an endless
+        // reconnect loop (the entry never shrinks and the same cluster
+        // re-advertises the same cap) and re-entered connectLoop from the catch-up.
+        //
+        // Connection 1 advertises no cap, so the ~202-byte symbol registers and
+        // enters the sent-dictionary mirror. The handler then shrinks the
+        // advertised cap to 160 (catch-up budget 132) and drops the socket, so the
+        // reconnect's catch-up cannot re-ship the symbol. (One fixed cap can't do
+        // this: the client refuses to SEND a single-table frame over the cap, and
+        // that data frame is always larger than the bare catch-up entry.)
+        CapShrinkHandler handler = new CapShrinkHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            handler.setServer(server);
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
+            LineSenderException terminal = null;
+            Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";");
+            try {
+                sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
+                sender.flush();
+                // The terminal latches on the I/O thread once the reconnect's
+                // catch-up hits the oversized entry; it surfaces to the producer
+                // on a subsequent flush. Poll a bounded time for it. The polling
+                // rows use a small symbol that fits the shrunk cap, so the
+                // producer-side cap check never fires and flush() surfaces the
+                // I/O thread's catch-up terminal via checkError.
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (System.currentTimeMillis() < deadline && terminal == null) {
+                    try {
+                        sender.table("t").symbol("s", "y").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        Thread.sleep(20);
+                    } catch (LineSenderException e) {
+                        terminal = e;
+                    }
+                }
+            } finally {
+                try {
+                    sender.close();
+                } catch (LineSenderException e) {
+                    if (terminal == null) {
+                        terminal = e;
+                    }
+                }
+            }
+            Assert.assertNotNull("an oversized catch-up entry must surface a terminal", terminal);
+            Assert.assertTrue("terminal must come from the catch-up path, got: " + terminal.getMessage(),
+                    terminal.getMessage().contains("during catch-up"));
         }
     }
 
@@ -264,6 +325,47 @@ public class DeltaDictCatchUpTest {
 
         private static int tableCount(byte[] frame) {
             return (frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8);
+        }
+    }
+
+    /**
+     * ACKs connection 1's frames with no advertised cap (so an oversized symbol
+     * registers), then -- once connection 1 has sent something -- shrinks the
+     * advertised batch cap and drops the socket. The reconnect (connection 2)
+     * therefore advertises a cap whose catch-up budget is too small for the
+     * symbol, exercising the oversized-entry terminal in sendDictCatchUp.
+     */
+    private static class CapShrinkHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final AtomicInteger connectionsAccepted = new AtomicInteger();
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private TestWebSocketServer.ClientHandler currentClient;
+        private volatile TestWebSocketServer server;
+
+        void setServer(TestWebSocketServer server) {
+            this.server = server;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                currentClient = client;
+                connectionsAccepted.incrementAndGet();
+            }
+            try {
+                client.sendBinary(CatchUpHandler.buildAck(nextSeq.getAndIncrement()));
+                if (connectionsAccepted.get() == 1) {
+                    // Connection 1 registered the big symbol. Shrink the cap so the
+                    // reconnect's catch-up budget can't fit it, then drop to force
+                    // the reconnect. Setting the cap before the close (not from the
+                    // test thread after it) removes the set-vs-reconnect race.
+                    server.setAdvertisedMaxBatchSize(160); // catch-up budget = 132
+                    Thread.sleep(50);
+                    client.close();
+                }
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
         }
     }
 
