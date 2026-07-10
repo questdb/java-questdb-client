@@ -33,6 +33,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -96,6 +97,69 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         }
     }
 
+    @Test
+    public void testRecycledLoopReSeedsMirrorFromPersistedDict() throws Exception {
+        // C1 regression: the orphan drainer (BackgroundDrainer) builds a NEW
+        // CursorWebSocketSendLoop per wire session against the SAME, persistent
+        // engine when a durable-ack capability gap forces a mid-drain recycle. The
+        // recovery mirror seed must survive that recycle. If the first loop CONSUMED
+        // the persisted dictionary's loaded entries (a one-shot ownership transfer),
+        // the second loop seeds an EMPTY mirror (sentDictCount = 0), sends no
+        // reconnect catch-up, and the first replayed delta frame (deltaStart > 0)
+        // trips the torn-dict guard -- falsely quarantining a healthy slot with a
+        // bogus "resend required" terminal. Copying the entries (leaving the
+        // dictionary intact for the engine's lifetime) lets every recycled loop
+        // re-seed. Pre-fix, loop2's sentDictCount is 0 and this assertion fails.
+        Path sfDir = Files.createTempDirectory("qwp-mirror-reseed");
+        try {
+            populateRecoverableSlot(sfDir);
+            Path slot = sfDir.resolve("default");
+            assertMemoryLeak(() -> {
+                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                    PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                    Assert.assertNotNull(pd);
+                    int dictSize = pd.size();
+                    Assert.assertTrue("recovery must load a non-empty dictionary", dictSize > 0);
+
+                    // Session 1 seeds its mirror from the persisted dictionary.
+                    CursorWebSocketSendLoop loop1 = newRecoveryLoop(engine);
+                    try {
+                        Assert.assertEquals("session-1 mirror must seed from the persisted dict",
+                                dictSize, readInt(loop1, "sentDictCount"));
+                    } finally {
+                        loop1.close();
+                    }
+
+                    // Session 2 against the SAME engine (the drainer recycle): the
+                    // seed must NOT have been consumed -- the mirror must re-seed to
+                    // the full dictionary so the reconnect catch-up is complete.
+                    CursorWebSocketSendLoop loop2 = newRecoveryLoop(engine);
+                    try {
+                        Assert.assertEquals("recycled session-2 mirror must re-seed from the "
+                                        + "persisted dict (pre-fix it was 0)",
+                                dictSize, readInt(loop2, "sentDictCount"));
+                    } finally {
+                        loop2.close();
+                    }
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
+    // Constructs a recovery send loop but does NOT start it: the ctor seeds the
+    // catch-up mirror synchronously, which is all these tests observe. The
+    // reconnect factory is never invoked.
+    private static CursorWebSocketSendLoop newRecoveryLoop(CursorSendEngine engine) {
+        return new CursorWebSocketSendLoop(
+                null, engine, 0, 1_000_000L,
+                () -> {
+                    throw new IOException("no reconnect in this test");
+                },
+                0, 0, 1);
+    }
+
     private static void populateRecoverableSlot(Path sfDir) throws Exception {
         try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
             int port = silent.getPort();
@@ -115,6 +179,12 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 }
             }
         }
+    }
+
+    private static int readInt(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getInt(loop);
     }
 
     private static void rmDir(Path dir) throws IOException {

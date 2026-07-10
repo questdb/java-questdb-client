@@ -543,15 +543,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (pd != null && pd.size() > 0) {
                 int len = pd.loadedEntriesLen();
                 if (len > 0) {
-                    // Adopt the persisted dictionary's loaded-entries buffer as the
-                    // mirror's initial backing instead of copying it and leaving the
-                    // dictionary to retain a second copy for the engine's lifetime.
-                    // The producer's readLoadedSymbols() -- the only other consumer --
-                    // runs earlier in setCursorEngine; the drainer path has no
-                    // producer consumer. takeLoadedEntries() transfers ownership, so
-                    // this loop's mirror lifecycle frees it (not pd.close()). The
-                    // buffer's allocated size equals loadedEntriesLen.
-                    sentDictBytesAddr = pd.takeLoadedEntries();
+                    // COPY the persisted dictionary's loaded-entries buffer into this
+                    // loop's own mirror rather than taking ownership of it. The engine
+                    // (and its PersistedSymbolDict) OUTLIVES this loop on the orphan
+                    // drainer path: BackgroundDrainer builds a fresh send loop per wire
+                    // session against the same engine on a durable-ack capability-gap
+                    // recycle. A one-shot ownership transfer would leave every loop
+                    // after the first with an EMPTY mirror -- it would then send no
+                    // reconnect catch-up, and the first replayed delta frame
+                    // (deltaStart > 0) would trip the torn-dict guard, falsely
+                    // quarantining a healthy slot. Copying keeps the dictionary's
+                    // loaded entries intact for the engine's lifetime so every
+                    // recycled loop re-seeds; pd.close() (at engine close) frees the
+                    // dictionary's copy, this loop frees its own copy on exit.
+                    sentDictBytesAddr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
                     sentDictBytesCapacity = len;
                     sentDictBytesLen = len;
                     // Set the count only alongside the bytes so sentDictCount can
