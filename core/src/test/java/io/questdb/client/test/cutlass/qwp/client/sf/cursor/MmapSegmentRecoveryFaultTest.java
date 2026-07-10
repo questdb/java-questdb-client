@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
@@ -87,6 +88,84 @@ public class MmapSegmentRecoveryFaultTest {
                 assertEquals("the frame below the unbacked tail must be recovered", 1L, seg.frameCount());
                 assertEquals("scan must stop at the unbacked-page boundary", page, seg.publishedOffset());
                 assertEquals("an unwritten hole is not a torn write", 0L, seg.tornTailBytes());
+            }
+        });
+    }
+
+    /**
+     * Regression for the recovered-sparse-tail SIGBUS: recovery used to mmap
+     * the file's complete logical size RW and leave the sparse tail as
+     * writable capacity, so the next append stored straight into the unbacked
+     * hole — which under ENOSPC raises SIGBUS and aborts the JVM.
+     * {@link FilesFacade#allocate} cannot retroactively fill holes below EOF,
+     * so no recovery-time reservation can make that tail safe; instead the
+     * fix maps only the validated prefix. The recovered segment must be born
+     * full and refuse appends, forcing rotation onto a freshly created,
+     * genuinely block-reserved segment.
+     */
+    @Test
+    public void testRecoveredSparseSegmentIsBornFullAndRefusesAppends() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-sparse-no-append.sfa";
+            final long page = Files.PAGE_SIZE;
+            final int payloadLen = (int) (page - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
+            long boundary = writeSegment(path, 5L, new int[]{payloadLen});
+            assertEquals("frame must fill exactly one page", page, boundary);
+            punchSparseTail(path, page);
+
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                assertEquals("recovered data must remain readable", 1L, seg.frameCount());
+                assertEquals("scan must stop at the unbacked-page boundary", page, seg.publishedOffset());
+                assertEquals("mapping must cover only the validated prefix", page, seg.sizeBytes());
+                assertTrue("recovered segment must be born full", seg.isFull());
+                assertEquals("no payload capacity may remain over the sparse tail",
+                        0L, seg.capacityRemaining());
+                assertEquals("append into the unbacked tail must be refused",
+                        -1L, seg.tryAppend(buf, 16));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Recovery-to-producer path for the same regression: a ring recovered
+     * around a sparse-tail active must backpressure the first append (never
+     * touching the hole) and resume cleanly — with a contiguous FSN sequence
+     * — once a genuinely allocated hot spare is installed and rotated in.
+     */
+    @Test
+    public void testRecoveredRingRotatesBeforeAppendingPastSparseTail() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/sf-0.sfa";
+            final long page = Files.PAGE_SIZE;
+            final int payloadLen = (int) (page - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
+            long boundary = writeSegment(path, 0L, new int[]{payloadLen});
+            assertEquals("frame must fill exactly one page", page, boundary);
+            punchSparseTail(path, page);
+
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, SEGMENT_BYTES)) {
+                    assertTrue("ring must recover from the on-disk segment", recovered != null);
+                    assertEquals(1L, recovered.getActive().frameCount());
+                    assertEquals(1L, recovered.nextSeqHint());
+                    // First append must NOT write into the sparse tail — the
+                    // born-full active backpressures until a spare arrives.
+                    assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
+                            recovered.appendOrFsn(buf, 16));
+                    // create() pre-allocates real blocks, so the rotated-in
+                    // spare is safe to store into.
+                    recovered.installHotSpare(
+                            MmapSegment.create(tmpDir + "/sf-1.sfa", 1L, SEGMENT_BYTES));
+                    assertEquals("append must resume with a contiguous FSN",
+                            1L, recovered.appendOrFsn(buf, 16));
+                    assertEquals("append must land in the rotated-in spare",
+                            1L, recovered.getActive().baseSeq());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

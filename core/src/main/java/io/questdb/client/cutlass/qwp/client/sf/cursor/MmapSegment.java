@@ -70,6 +70,11 @@ public final class MmapSegment implements QuietCloseable {
     private final FilesFacade filesFacade;
     private final String path;
     private final long sizeBytes;
+    // fileBytes: logical size of the backing file — the segment's on-disk
+    // footprint for sf_max_total_bytes accounting. Equals sizeBytes for
+    // created and memory-backed segments; for recovered segments it can
+    // exceed sizeBytes because recovery maps only the validated prefix.
+    private final long fileBytes;
     // memoryBacked: true when the segment buffer lives in malloc'd native
     // memory rather than an mmap'd file. The "non-SF async" path uses
     // memory-backed segments — same cursor architecture, no disk involvement.
@@ -104,13 +109,14 @@ public final class MmapSegment implements QuietCloseable {
     private final long tornTailBytes;
 
     private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
-                        long baseSeq, long initialCursor, long frameCount,
+                        long fileBytes, long baseSeq, long initialCursor, long frameCount,
                         boolean memoryBacked, long tornTailBytes, FilesFacade filesFacade) {
         this.path = path;
         this.filesFacade = filesFacade;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
         this.sizeBytes = sizeBytes;
+        this.fileBytes = fileBytes;
         this.baseSeq = baseSeq;
         this.appendCursor = initialCursor;
         this.publishedCursor = initialCursor;
@@ -200,7 +206,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
             return new MmapSegment(
-                    displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L, ff);
+                    displayPath, fd, addr, sizeBytes, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L, ff);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -238,7 +244,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
             return new MmapSegment(
-                    null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L, null);
+                    null, -1, addr, sizeBytes, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L, null);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
@@ -246,12 +252,21 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Opens an existing segment file for recovery. mmaps it RW, validates the
-     * header magic / version, then scans frames forward verifying each CRC.
-     * The first bad CRC (or a frame whose declared length runs past the file
-     * end) is treated as a torn tail; both cursors are positioned at the
-     * start of that frame. Returns the segment ready for further appends.
+     * Opens an existing segment file for recovery. Validates the header magic
+     * / version, then scans frames forward verifying each CRC. The first bad
+     * CRC (or a frame whose declared length runs past the file end) is treated
+     * as a torn tail; both cursors are positioned at the start of that frame.
      * Throws {@link MmapSegmentException} on header validation failure.
+     * <p>
+     * The returned segment maps ONLY the validated prefix
+     * {@code [0, lastGoodOffset)} and is therefore born full:
+     * {@link #tryAppend} returns -1 and the caller rotates onto a freshly
+     * created segment before the next append. The tail past the last good
+     * frame is never mapped — it may be sparse/unbacked ({@code create()}'s
+     * block reservation does not survive external sparsification, and
+     * {@link FilesFacade#allocate} cannot retroactively fill holes below EOF),
+     * and a store into an unbacked page under ENOSPC raises SIGBUS, aborting
+     * the JVM.
      * <p>
      * If recovery observes a torn tail (the bytes at the bail-out position
      * are non-zero, indicating an attempted-but-failed frame write rather
@@ -303,11 +318,23 @@ public final class MmapSegment implements QuietCloseable {
                         "short read before stable file EOF during recovery: " + path
                                 + " size=" + fileSize);
             }
-            mapSize = Math.min(fileSize, finalFileSize);
-            if (mapSize < HEADER_SIZE) {
+            long logicalSize = Math.min(fileSize, finalFileSize);
+            if (logicalSize < HEADER_SIZE) {
                 throw new MmapSegmentException("file shorter than header after recovery scan: "
-                        + path + " size=" + mapSize);
+                        + path + " size=" + logicalSize);
             }
+            // Map ONLY the validated prefix [0, lastGoodOffset). The tail past
+            // the last good frame may be sparse/unbacked, and a store into an
+            // unbacked page under ENOSPC raises SIGBUS and aborts the JVM.
+            // FilesFacade.allocate cannot make that tail safe at recovery time
+            // (it reserves [currentSize, target) only — pre-existing holes
+            // below EOF are not retroactively filled). Mapping through
+            // lastGoodOffset makes the recovered segment born full
+            // (capacityRemaining() == 0), so the producer rotates onto a
+            // freshly created — and genuinely block-reserved — segment before
+            // the next append. Consumers are unaffected: they only read below
+            // publishedOffset(), which equals lastGoodOffset.
+            mapSize = recovered.lastGoodOffset;
             addr = Files.mmap(fd, mapSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
                 throw new MmapSegmentException("mmap failed for " + path);
@@ -317,23 +344,24 @@ public final class MmapSegment implements QuietCloseable {
                     fd,
                     addr,
                     mapSize,
+                    logicalSize,
                     recovered.baseSeq,
                     recovered.lastGoodOffset,
                     recovered.frameCount,
                     false,
-                    Math.min(recovered.tornTailBytes, mapSize - recovered.lastGoodOffset),
+                    Math.min(recovered.tornTailBytes, logicalSize - recovered.lastGoodOffset),
                     ff
             );
             if (segment.tornTailBytes() > 0) {
                 LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
                                 + "(file size {}, frames recovered {}). "
-                                + "Recovery will overwrite this region on next append; "
+                                + "The torn region is excluded from the recovered mapping and "
                                 + "frames past the tear (if any) are discarded. "
                                 + "Investigate disk health or unexpected writer crash.",
                         path,
                         segment.tornTailBytes(),
                         segment.publishedOffset(),
-                        mapSize,
+                        logicalSize,
                         segment.frameCount());
             }
             // Ownership of fd and addr transfers to the returned segment.
@@ -441,6 +469,19 @@ public final class MmapSegment implements QuietCloseable {
 
     public long sizeBytes() {
         return sizeBytes;
+    }
+
+    /**
+     * Logical size of the backing file in bytes — the segment's on-disk
+     * footprint for {@code sf_max_total_bytes} cap accounting. Equals
+     * {@link #sizeBytes()} for created and memory-backed segments; for
+     * recovered segments it can exceed {@link #sizeBytes()} because recovery
+     * maps only the validated prefix (SIGBUS hardening in
+     * {@link #openExisting}) while the file keeps its full logical length
+     * until trim unlinks it.
+     */
+    public long fileBytes() {
+        return fileBytes;
     }
 
     /**

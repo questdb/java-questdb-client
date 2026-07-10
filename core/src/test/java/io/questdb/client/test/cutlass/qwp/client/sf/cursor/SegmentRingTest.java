@@ -294,7 +294,8 @@ public class SegmentRingTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Write three segments with FSN ranges 0..3, 4..7, 8..9 (last
-                // partially full so the recovered ring has appendable room).
+                // partially full; recovery still maps it born-full — see the
+                // SIGBUS hardening in MmapSegment.openExisting).
                 MmapSegment s0 = MmapSegment.create(tmpDir + "/r0.sfa", 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
@@ -319,8 +320,17 @@ public class SegmentRingTest {
                     assertEquals(4, recovered.getSealedSegments().get(1).baseSeq());
                     // nextSeq must continue past the recovered frames.
                     assertEquals(10, recovered.nextSeqHint());
-                    // Further appends land into the active and assign FSN 10.
+                    // Recovered segments are mapped only through their validated
+                    // prefix and are born full: the first append backpressures
+                    // (never writing into the potentially unbacked tail) until a
+                    // spare is installed, then rotates and assigns FSN 10.
+                    assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE,
+                            recovered.appendOrFsn(buf, 16));
+                    recovered.installHotSpare(
+                            MmapSegment.create(tmpDir + "/r3.sfa", 10, segSize));
                     assertEquals(10, recovered.appendOrFsn(buf, 16));
+                    assertEquals("append must land in the rotated-in spare",
+                            10, recovered.getActive().baseSeq());
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);

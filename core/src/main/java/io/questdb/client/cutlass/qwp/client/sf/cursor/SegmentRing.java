@@ -139,8 +139,11 @@ public final class SegmentRing implements QuietCloseable {
      * directory, opens each via {@link MmapSegment#openExisting}, and
      * arranges them by baseSeq:
      * <ul>
-     *   <li>Highest-baseSeq segment becomes the active (further appends land
-     *       there until it fills, at which point normal rotation kicks in).</li>
+     *   <li>Highest-baseSeq segment becomes the active. Recovered segments
+     *       are mapped only through their validated prefix (SIGBUS hardening
+     *       in {@link MmapSegment#openExisting}) and are therefore born full:
+     *       the first append backpressures until the manager installs a hot
+     *       spare, then rotates onto it.</li>
      *   <li>All others become sealed segments awaiting ACK and trim.</li>
      * </ul>
      * Returns {@code null} if the directory is empty or contains no
@@ -291,10 +294,12 @@ public final class SegmentRing implements QuietCloseable {
                                     + " check disk health");
                 }
             }
-            // The newest segment becomes the active. Even if it's full, that's OK:
-            // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
-            // installs a hot spare, the producer rotates. Same fast path as a
-            // mid-life ring.
+            // The newest segment becomes the active. Recovered segments are
+            // born full (mapped only through the validated prefix -- see the
+            // SIGBUS hardening in MmapSegment.openExisting), so the next
+            // appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager installs
+            // a hot spare, the producer rotates. Same fast path as a mid-life
+            // ring whose active just filled.
             int last = opened.size() - 1;
             MmapSegment active = opened.get(last);
             opened.remove(last);
@@ -682,21 +687,25 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Total mmap'd bytes the ring currently owns: active + hot spare (if
+     * Total on-disk bytes the ring currently owns: active + hot spare (if
      * installed) + every sealed segment. Used by {@code SegmentManager}
      * to seed its {@code totalBytes} accounting at register time and to
-     * reverse the contribution at deregister time. Synchronized against
-     * rotation so we never read a half-resized sealed list.
+     * reverse the contribution at deregister time. Uses
+     * {@link MmapSegment#fileBytes()} — the file's logical length — rather
+     * than the mapped size, because recovered segments map only their
+     * validated prefix while the file keeps its full length until trim
+     * unlinks it. Synchronized against rotation so we never read a
+     * half-resized sealed list.
      */
     public synchronized long totalSegmentBytes() {
         long total = 0L;
         MmapSegment a = active;
-        if (a != null) total += a.sizeBytes();
+        if (a != null) total += a.fileBytes();
         MmapSegment hs = hotSpare;
-        if (hs != null) total += hs.sizeBytes();
+        if (hs != null) total += hs.fileBytes();
         for (int i = 0, n = sealedSegments.size(); i < n; i++) {
             MmapSegment s = sealedSegments.get(i);
-            if (s != null) total += s.sizeBytes();
+            if (s != null) total += s.fileBytes();
         }
         return total;
     }

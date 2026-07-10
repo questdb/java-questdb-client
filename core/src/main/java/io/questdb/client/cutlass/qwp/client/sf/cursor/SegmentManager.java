@@ -744,7 +744,11 @@ public final class SegmentManager implements QuietCloseable {
             trim = e.ring.drainTrimmable();
             if (registered && trim != null) {
                 for (int i = 0, n = trim.size(); i < n; i++) {
-                    totalBytes -= trim.get(i).sizeBytes();
+                    // fileBytes(), not sizeBytes(): must mirror the register-time
+                    // seed (SegmentRing.totalSegmentBytes), which accounts the
+                    // on-disk footprint — recovered segments map only their
+                    // validated prefix but occupy the full file length on disk.
+                    totalBytes -= trim.get(i).fileBytes();
                 }
             }
         }
