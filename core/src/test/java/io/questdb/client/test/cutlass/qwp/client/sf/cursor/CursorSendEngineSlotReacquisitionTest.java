@@ -410,6 +410,120 @@ public class CursorSendEngineSlotReacquisitionTest {
     }
 
     /**
+     * Registration-failure twin of
+     * {@link #testOwnedEngineCloseHandsCleanupToWorkerExit}: when
+     * {@code deferUntilWorkerExit} itself throws (allocation failure while
+     * building the handoff), close() must NOT mistake the swallowed throw
+     * for "worker already exited" and run the terminal cleanup inline — the
+     * worker is provably still mid service pass, so releasing the ring,
+     * watermark or slot flock here is the original stale-worker UAF/data-loss
+     * hazard. Every worker-reachable resource must be retained and the close
+     * must stay incomplete; a retried close() after the worker exits
+     * converges and releases the slot.
+     */
+    @Test(timeout = 30_000L)
+    public void testOwnedEngineCloseRetainsSlotWhenHandoffRegistrationFails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + payloadLen);
+            String slot = tmpDir + "/owned-regfail-slot";
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Production shape: private, owned manager (ownsManager=true).
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            SegmentManager manager = readManager(engine);
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Phase 1: wait out the initial spare install so the park hook
+                // can only fire on the rotation-triggered pass (see
+                // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
+                SegmentRing ring = readRing(engine);
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (ring.needsHotSpare()) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("manager worker never installed the initial hot spare");
+                    }
+                    Thread.sleep(1);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+
+                // Phase 2: fill the active segment and rotate onto the spare;
+                // the worker's next tick re-enters the install pass and parks.
+                Unsafe.getUnsafe().putLong(buf, 0L);
+                Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertTrue("worker never re-entered a spare-install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Phase 3: make the handoff registration throw — simulating
+                // an OutOfMemoryError allocating the cleanup lambda/list —
+                // with the worker provably still mid service pass. close()
+                // must retain everything: no inline finishClose, no flock
+                // release, closeCompleted stays false.
+                manager.setBeforeExitCleanupRegistrationHook(() -> {
+                    throw new OutOfMemoryError("simulated allocation failure registering exit cleanup");
+                });
+                manager.setWorkerJoinTimeoutMillis(50L);
+                engine.close();
+                Assert.assertFalse("close must stay incomplete when handoff registration fails",
+                        engine.isCloseCompleted());
+                try {
+                    SlotLock probe = SlotLock.acquire(slot);
+                    probe.close();
+                    Assert.fail("engine.close() released the slot lock after a failed handoff "
+                            + "registration while the manager worker was still mid service "
+                            + "pass — the swallowed throw was mistaken for proof the worker "
+                            + "exited (stale-worker UAF/data-loss hazard)");
+                } catch (Exception expected) {
+                    // good — slot retained while the worker can still touch it.
+                }
+
+                // Phase 4: clear the fault, release the worker (its loop was
+                // already stopped by the close attempt, so it exits), and
+                // retry close(). The retry must converge via isWorkerReaped()
+                // and release the slot.
+                manager.setBeforeExitCleanupRegistrationHook(null);
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                engine.close();
+                Assert.assertTrue("retried close must report complete cleanup",
+                        engine.isCloseCompleted());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after the retried close", probe);
+                } catch (Exception e) {
+                    throw new AssertionError("retried close() did not release the slot lock", e);
+                }
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeExitCleanupRegistrationHook(null);
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
      * An engine that owns its manager must use the whole-manager stop/join as
      * its only quiescence barrier. Calling the per-ring barrier first would
      * give a stuck worker two independent timeout budgets.

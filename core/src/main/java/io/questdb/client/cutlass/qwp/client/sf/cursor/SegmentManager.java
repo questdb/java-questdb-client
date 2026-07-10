@@ -97,6 +97,13 @@ public final class SegmentManager implements QuietCloseable {
     // production; owned-engine close tests use it to prove they take only the
     // stronger whole-manager join path, not two sequential timeout budgets.
     private volatile Runnable beforeRingQuiescenceAwaitHook;
+    // Test seam: runs at the top of deferUntilWorkerExit, before the
+    // worker-liveness check. Null in production; registration-failure tests
+    // throw from it to simulate an allocation failure (OOM building the
+    // cleanup lambda or growing exitCleanups) while the worker is still
+    // live. Callers must treat such a throw as "worker state unknown",
+    // never as the exact false return meaning the worker loop has exited.
+    private volatile Runnable beforeExitCleanupRegistrationHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
@@ -283,8 +290,18 @@ public final class SegmentManager implements QuietCloseable {
      * flip share {@link #lock}, so the cleanup runs exactly once: either it
      * is registered before the flip and the worker runs it, or the flip won
      * and this method rejects the handoff.
+     * <p>
+     * May throw on allocation failure (the lambda at the call site, the
+     * {@code ObjList}, or its growth). A throw carries NO liveness
+     * information: the worker was never observed, so the caller must treat
+     * it as "worker possibly still live" and retain resources — never as
+     * the exact {@code false} return above.
      */
     public boolean deferUntilWorkerExit(Runnable cleanup) {
+        Runnable hook = beforeExitCleanupRegistrationHook;
+        if (hook != null) {
+            hook.run();
+        }
         synchronized (lock) {
             if (workerLoopExited || workerThread == null) {
                 return false;
@@ -463,6 +480,11 @@ public final class SegmentManager implements QuietCloseable {
         // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
         // when the worker has not been started yet.
         wakeWorker();
+    }
+
+    @TestOnly
+    public void setBeforeExitCleanupRegistrationHook(Runnable hook) {
+        this.beforeExitCleanupRegistrationHook = hook;
     }
 
     @TestOnly
