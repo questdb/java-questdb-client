@@ -2811,6 +2811,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         wireSeq, highestSent);
             }
             long fsn = fsnAtZero + cappedSeq;
+            if (fsn <= engine.ackedFsn()) {
+                // The clamped wire seq maps at or below the replay head, so this
+                // NACK is for a dictionary catch-up frame -- which occupies the
+                // already-acked wire sequences below replayStart -- not a data frame
+                // this connection sent. (dataFrameSentThisConnection can be true here
+                // because trySendOne ships the head data frame before tryReceiveAcks
+                // reads the catch-up's NACK in the same loop iteration.) Attributing
+                // it a data FSN would key recordHeadRejectionStrike() off a
+                // below-baseline FSN -- negative when replayStart < catchUpFrames --
+                // colliding with the poisonFsn == -1 "no suspect" sentinel and
+                // laundering a genuine poison run, and would report a bogus FSN.
+                // Treat it exactly like a pre-send rejection: surface + recycle, no
+                // poison strike, no watermark advance. Symmetric with the success
+                // path, where engine.acknowledge() no-ops at or below ackedFsn. A
+                // real replayed data frame is at fsn > ackedFsn, so it is never
+                // caught here.
+                handlePreSendRejection(wireSeq, status, category, policy);
+                return;
+            }
             // Best-effort table attribution: the parser populates
             // response.tableNames on error frames the same way it does on
             // STATUS_OK. If exactly one table was named, surface it; if

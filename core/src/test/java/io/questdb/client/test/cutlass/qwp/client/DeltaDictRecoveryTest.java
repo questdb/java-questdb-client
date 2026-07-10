@@ -481,6 +481,70 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testFailedPublishThenNewSymbolPersistsSuffixWithoutDuplicating() throws Exception {
+        // Regression for the re-encode (else) branch of persistNewSymbolsBeforePublish.
+        // After a failed publish leaves the durable dictionary size ahead of the wire
+        // baseline (pd.size() > sentMaxSymbolId+1), a later flush that introduces a NEW
+        // symbol cannot reuse the frame's already-encoded fast-path bytes -- it
+        // re-encodes just the [pd.size() .. currentBatchMaxSymbolId] suffix via
+        // appendSymbols. Keying that off pd.size() (not sentMaxSymbolId+1) keeps it
+        // idempotent: the already-persisted prefix is NOT re-appended.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                // Small segment: any frame carrying the padded row fails to publish with
+                // PAYLOAD_TOO_LARGE deterministically (no backpressure timing).
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_bytes=1024;";
+                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
+                Sender sender = Sender.fromConfig(cfg);
+                try {
+                    // Flush 1: s0 is persisted (write-ahead) before the oversized frame
+                    // fails to publish. pd.size()=1, sentMaxSymbolId stays -1.
+                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                    }
+
+                    // Add a NEW symbol s1 (id 1). The failed s0 row is still buffered, so
+                    // the batch is {s0, s1} and the durable size (1) has run ahead of the
+                    // wire baseline (-1) -- the state that selects the appendSymbols branch.
+                    sender.table("m").symbol("s", "s1").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                    }
+
+                    // The else branch persisted ONLY s1 (the suffix). The dictionary holds
+                    // s0, s1 exactly once each. Pre-fix (appendSymbols from
+                    // sentMaxSymbolId+1) re-appended s0, giving size 3.
+                    PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
+                    Assert.assertNotNull(pd);
+                    try {
+                        Assert.assertEquals("re-encode suffix must not duplicate the persisted prefix",
+                                2, pd.size());
+                        Assert.assertEquals("s0", pd.readLoadedSymbols().getQuick(0));
+                        Assert.assertEquals("s1", pd.readLoadedSymbols().getQuick(1));
+                    } finally {
+                        pd.close();
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered oversized rows and fails
+                        // again (PAYLOAD_TOO_LARGE); expected, resources still released.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testRecoveryAfterFailedPublishReplaysGapFree() throws Exception {
         // M3 end-to-end: chains a failed publish -> fresh-process recovery -> replay.
         // A failed publish persists the frame's symbol (write-ahead) but does NOT

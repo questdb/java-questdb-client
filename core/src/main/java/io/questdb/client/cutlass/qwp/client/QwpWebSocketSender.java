@@ -3707,14 +3707,30 @@ public class QwpWebSocketSender implements Sender {
         // failed publish the durable size has run ahead of the wire baseline, so
         // the frame's delta covers MORE than remains to persist; then re-encode
         // just the [from .. currentBatchMaxSymbolId] suffix.
-        if (from == sentMaxSymbolId + 1) {
-            QwpBufferWriter buffer = encoder.getBuffer();
-            pd.appendRawEntries(
-                    buffer.getBufferPtr() + encoder.getDeltaEntriesStart(),
-                    encoder.getDeltaEntriesLen(),
-                    currentBatchMaxSymbolId - from + 1);
-        } else {
-            pd.appendSymbols(globalSymbolDictionary, from, currentBatchMaxSymbolId);
+        try {
+            if (from == sentMaxSymbolId + 1) {
+                QwpBufferWriter buffer = encoder.getBuffer();
+                pd.appendRawEntries(
+                        buffer.getBufferPtr() + encoder.getDeltaEntriesStart(),
+                        encoder.getDeltaEntriesLen(),
+                        currentBatchMaxSymbolId - from + 1);
+            } else {
+                pd.appendSymbols(globalSymbolDictionary, from, currentBatchMaxSymbolId);
+            }
+        } catch (Throwable t) {
+            // A short write (disk full / quota) to the persisted dictionary throws
+            // a low-level IllegalStateException. Surface it as a LineSenderException
+            // -- like every other flush-path failure, e.g. the cursor append in
+            // sealAndSwapBuffer -- so a caller catching LineSenderException around
+            // flush() also catches a disk-full during the write-ahead persist. The
+            // persist ran before publish and pd.size() did not advance on the short
+            // write, so the still-buffered rows re-persist the same range
+            // idempotently on retry. A JVM Error is never a persist failure; let it
+            // propagate.
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            throw new LineSenderException("failed to persist symbol dictionary before publish", t);
         }
     }
 

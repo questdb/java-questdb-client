@@ -83,9 +83,14 @@ import org.slf4j.LoggerFactory;
  * A torn trailing entry from a crash mid-append is self-healing: {@link #open}
  * stops parsing at the first incomplete entry and the next append overwrites it.
  * <p>
- * <b>Lifecycle:</b> single-writer (the producer / user thread). Read once at
- * {@link #open} to seed in-memory state on recovery or orphan-drain. Owner
- * (the engine) closes it. Not thread-safe for concurrent writers.
+ * <b>Lifecycle:</b> single-writer (the producer / user thread) for appends. Read
+ * once at {@link #open} to seed in-memory state on recovery or orphan-drain. The
+ * owner (the engine) closes it, and {@code close()} is callable from any thread
+ * (a shutdown hook, test cleanup). {@code close()} and the append methods are
+ * therefore {@code synchronized}: without that, a close racing an in-flight append
+ * could free the scratch buffer or close the fd mid-write and let the write land
+ * on a descriptor the OS has reused for another file (silent cross-file
+ * corruption). Not thread-safe for concurrent writers.
  */
 public final class PersistedSymbolDict implements QuietCloseable {
 
@@ -188,7 +193,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * appendOffset}, so a retry keyed off {@link #size()} re-persists the same range
      * at the same offset. No-op when the range is empty or the dictionary is closed.
      */
-    public void appendRawEntries(long addr, int len, int count) {
+    public synchronized void appendRawEntries(long addr, int len, int count) {
         if (closed || count <= 0 || len <= 0) {
             return;
         }
@@ -208,7 +213,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * (see the class-level durability note). Assigns the next dense id implicitly
      * (the entry's position).
      */
-    public void appendSymbol(CharSequence symbol) {
+    public synchronized void appendSymbol(CharSequence symbol) {
         if (closed) {
             return;
         }
@@ -244,7 +249,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * range and overwrites at the same offset. No-op when the range is empty or
      * the dictionary is closed.
      */
-    public void appendSymbols(GlobalSymbolDictionary dict, int from, int to) {
+    public synchronized void appendSymbols(GlobalSymbolDictionary dict, int from, int to) {
         if (closed || to < from) {
             return;
         }
@@ -270,7 +275,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (closed) {
             return;
         }

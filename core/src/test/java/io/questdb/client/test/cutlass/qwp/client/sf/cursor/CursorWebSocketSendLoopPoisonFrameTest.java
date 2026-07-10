@@ -657,6 +657,46 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     @Test
+    public void testPostSendCatchUpNackDoesNotStrikeOrLaunderPoisonState() throws Exception {
+        // Regression: after a reconnect the loop ships the head DATA frame
+        // (dataFrameSentThisConnection=true) BEFORE tryReceiveAcks reads the server's
+        // NACK of a dictionary CATCH-UP frame in the same loop iteration. That NACK
+        // names a wire seq below the replay head, so its fsn = fsnAtZero+cappedSeq is
+        // at or below ackedFsn -- negative when replayStart < catchUpFrames. It must
+        // NOT charge a poison strike: recordHeadRejectionStrike(fsn) would set
+        // poisonFsn to that value (the common shape yields -1, the "no suspect"
+        // sentinel), laundering any genuine in-progress poison run and reporting a
+        // bogus fsn. The fix routes an fsn <= ackedFsn rejection to the pre-send path
+        // (surface + recycle, no strike), symmetric with the success path's
+        // engine.acknowledge() no-op below ackedFsn.
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                // Model: 2 catch-up frames (wire seq 0,1) + 1 data frame (wire seq 2)
+                // sent, nothing acked (ackedFsn = -1), so fsnAtZero = replayStart(0) -
+                // catchUpFrames(2) = -2. A NACK of catch-up wire seq 0 maps to fsn -2,
+                // strictly below the -1 sentinel so the assertion discriminates.
+                setPostCatchUpDataFrameBaseline(loop, -2L, 3L);
+                assertEquals("precondition: no poison suspect yet",
+                        -1L, getLongField(loop, "poisonFsn"));
+
+                deliverRetriableNack(loop, 0, "disk full");
+
+                // The catch-up NACK was surfaced + recycled but charged NO strike, so
+                // the sentinel is intact. Pre-fix it was set to -2, laundering the
+                // poison detector's state.
+                assertEquals("catch-up NACK must not set/launder the poison sentinel",
+                        -1L, getLongField(loop, "poisonFsn"));
+                loop.checkError();
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
     public void testPostSendNotWritableNackNeverEscalatesToPoisonTerminal() throws Exception {
         // RETRIABLE_OTHER (NOT_WRITABLE) is a node-state verdict, not a frame
         // verdict: an all-replica window answers it on every rotated endpoint
@@ -1056,6 +1096,28 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
         f.setAccessible(true);
         f.setLong(loop, count);
+    }
+
+    // Models a fresh connection that has shipped the dictionary catch-up (advancing
+    // fsnAtZero below the replay head) AND the head data frame: sets fsnAtZero,
+    // nextWireSeq, and dataFrameSentThisConnection=true together.
+    private static void setPostCatchUpDataFrameBaseline(CursorWebSocketSendLoop loop,
+                                                        long fsnAtZero, long nextWireSeq) throws Exception {
+        Field z = CursorWebSocketSendLoop.class.getDeclaredField("fsnAtZero");
+        z.setAccessible(true);
+        z.setLong(loop, fsnAtZero);
+        Field w = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
+        w.setAccessible(true);
+        w.setLong(loop, nextWireSeq);
+        Field d = CursorWebSocketSendLoop.class.getDeclaredField("dataFrameSentThisConnection");
+        d.setAccessible(true);
+        d.setBoolean(loop, true);
+    }
+
+    private static long getLongField(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getLong(loop);
     }
 
     private static long[] txns(long... v) {
