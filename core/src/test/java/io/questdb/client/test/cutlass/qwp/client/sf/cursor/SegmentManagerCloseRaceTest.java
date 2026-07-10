@@ -204,6 +204,81 @@ public class SegmentManagerCloseRaceTest {
         });
     }
 
+    /**
+     * Pins the {@link SegmentManager#awaitRingQuiescence} contract that
+     * {@code CursorSendEngine.close()} depends on:
+     * <ul>
+     *   <li>returns {@code false} (never {@code true}) while a service pass
+     *       for the ring is provably in flight and the timeout elapses;</li>
+     *   <li>preserves a pending caller interrupt without aborting;</li>
+     *   <li>returns {@code true} once the in-flight pass has finished.</li>
+     * </ul>
+     */
+    @Test(timeout = 15_000L)
+    public void testAwaitRingQuiescenceBlocksWhileServicePassInFlight() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/quiesce-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                manager.deregister(ring);
+                manager.setWorkerJoinTimeoutMillis(50L);
+                Thread.currentThread().interrupt();
+                Assert.assertFalse(
+                        "awaitRingQuiescence returned true while the worker was parked "
+                                + "inside the service pass for this ring",
+                        manager.awaitRingQuiescence(ring));
+                Assert.assertTrue("awaitRingQuiescence must preserve the caller's interrupt",
+                        Thread.interrupted());
+
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                Assert.assertTrue(
+                        "awaitRingQuiescence must return true once the in-flight pass finished",
+                        manager.awaitRingQuiescence(ring));
+
+                manager.close();
+                managerClosed = true;
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    Thread.interrupted();
+                    manager.close();
+                }
+                ring.close();
+            }
+        });
+    }
+
     @Test(timeout = 15_000L)
     public void testInterruptedCallerDoesNotAbandonReapableWorker() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

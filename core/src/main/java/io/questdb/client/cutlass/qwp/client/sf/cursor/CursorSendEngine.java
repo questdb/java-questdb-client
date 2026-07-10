@@ -114,6 +114,12 @@ public final class CursorSendEngine implements QuietCloseable {
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
     private volatile boolean closed;
+    // True once close() has run its full cleanup sequence. Stays false when
+    // a close attempt could not confirm manager-worker quiescence and had to
+    // leak the ring/watermark/slot lock — in that case a later close() call
+    // retries the cleanup (the worker may have exited by then). Guarded by
+    // the synchronized close() method; never read elsewhere.
+    private boolean closeCompleted;
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
@@ -480,7 +486,7 @@ public final class CursorSendEngine implements QuietCloseable {
 
     @Override
     public synchronized void close() {
-        if (closed) return;
+        if (closed && closeCompleted) return;
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
         // closed, its accessors aren't safe to read. The active segment is
@@ -492,10 +498,14 @@ public final class CursorSendEngine implements QuietCloseable {
         // the server has no dedup state for those messageSequences.
         // Memory mode has no files to unlink.
         // The whole close sequence runs under try/finally so the slot lock
-        // is ALWAYS released, even if manager/ring close or unlink throws —
-        // otherwise a kernel-held flock outlives the engine and the next
-        // sender for the same slot collides on a lock the dead engine
-        // never released.
+        // is released whenever it is safe to do so, even if manager/ring
+        // close or unlink throws — otherwise a kernel-held flock outlives
+        // the engine and the next sender for the same slot collides on a
+        // lock the dead engine never released. The one deliberate exception
+        // is a manager worker that failed to quiesce: releasing the lock
+        // then would let a replacement engine acquire the slot while the
+        // stale worker can still create/unlink segment paths inside it.
+        boolean workerQuiescent = false;
         try {
             // "Fully drained" includes BOTH the obvious case (every published
             // FSN has been acked) AND the never-published case (publishedFsn
@@ -504,9 +514,15 @@ public final class CursorSendEngine implements QuietCloseable {
             // recreates a fresh sf-initial.sfa — would otherwise leave that
             // fresh empty file behind, the next scanner finds it, adopts the
             // slot again, and the cycle repeats forever (M6).
-            boolean fullyDrained = sfDir != null
-                    && (ring.publishedFsn() < 0
-                    || ring.ackedFsn() >= ring.publishedFsn());
+            // Own try/catch so sabotaged/broken ring state cannot skip the
+            // quiescence barrier below or the slot-lock release in finally.
+            boolean fullyDrained = false;
+            try {
+                fullyDrained = sfDir != null
+                        && (ring.publishedFsn() < 0
+                        || ring.ackedFsn() >= ring.publishedFsn());
+            } catch (Throwable ignored) {
+            }
             // Each cleanup step in its own try/catch so a single failure
             // doesn't strand later cleanups — mirrors the constructor's
             // catch block. Without this, a throw from manager.deregister
@@ -517,11 +533,41 @@ public final class CursorSendEngine implements QuietCloseable {
                 manager.deregister(ring);
             } catch (Throwable ignored) {
             }
+            // Quiescence barrier. deregister alone only removes the entry
+            // from the registry — the worker may still be mid service pass
+            // for this ring (creating a spare file, trimming, unlinking).
+            // Releasing the ring, watermark, segment files, or the slot lock
+            // while that pass is in flight lets the stale worker unlink a
+            // path that a replacement engine — which can acquire the slot
+            // the moment the lock is released — is actively writing through:
+            // store-and-forward data loss after restart. Wait for confirmed
+            // quiescence before touching anything the worker can reach.
+            try {
+                workerQuiescent = manager.awaitRingQuiescence(ring);
+            } catch (Throwable ignored) {
+            }
             if (ownsManager) {
                 try {
                     manager.close();
                 } catch (Throwable ignored) {
                 }
+                if (!workerQuiescent) {
+                    // manager.close() joins the worker; a reaped (or
+                    // never-started) worker is an even stronger barrier
+                    // than per-ring quiescence.
+                    try {
+                        workerQuiescent = manager.isWorkerReaped();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            if (!workerQuiescent) {
+                LOG.error("SF manager worker did not quiesce during engine close; leaking the "
+                        + "ring, watermark and slot lock so a stale worker cannot corrupt a "
+                        + "future engine on slot {}. The kernel releases the slot flock on "
+                        + "process exit; close() may be invoked again to retry cleanup once "
+                        + "the worker has exited.", sfDir == null ? "<memory>" : sfDir);
+                return;
             }
             try {
                 ring.close();
@@ -551,8 +597,13 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
+            closeCompleted = true;
         } finally {
-            if (slotLock != null) {
+            // Gate on quiescence: releasing the flock while a stale worker
+            // can still touch this slot directory hands the slot to a new
+            // engine that the worker may then corrupt. Leaking the fd is
+            // the safe failure mode — the kernel drops it on process exit.
+            if (workerQuiescent && slotLock != null) {
                 try {
                     slotLock.close();
                 } catch (Throwable ignored) {

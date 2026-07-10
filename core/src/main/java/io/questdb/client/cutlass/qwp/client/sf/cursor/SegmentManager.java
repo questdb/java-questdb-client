@@ -100,15 +100,34 @@ public final class SegmentManager implements QuietCloseable {
     // registered flag check inside the trim block closes for watermark writes
     // and totalBytes accounting.
     private volatile Runnable beforeTrimSyncHook;
+    // Entry currently being serviced by the worker thread, or null when the
+    // worker is between service passes (or not running). Guarded by
+    // {@link #lock}; cleared with lock.notifyAll() so awaitRingQuiescence can
+    // block until an in-flight pass for a just-deregistered ring finishes.
+    private RingEntry inService;
     private long lastDiskFullLogNs;
     private volatile boolean running;
+    // pathScratch free-exactly-once coordination between a timed-out close()
+    // and the worker's exit path. All three are guarded by {@link #lock}.
+    // When close() gives up on the join while the worker loop has not yet
+    // exited, it hands scratch ownership to the worker
+    // (scratchHandedToWorker=true) and the worker frees the buffer in its
+    // exit block; in every other case close() frees it. Without the handoff,
+    // a worker that outlives the bounded join leaks the native scratch
+    // buffer forever, because nobody retries manager cleanup after close()
+    // returns.
+    private boolean scratchFreed;
+    private boolean scratchHandedToWorker;
+    private boolean workerLoopExited;
     // Total bytes currently allocated across every segment owned by every
     // registered ring (active + sealed + hot-spare). Mutated by the manager
     // thread on provision/trim and by register/deregister callers under
     // {@link #lock}; the lock covers both paths so the counter stays
     // consistent across registration boundaries.
     private long totalBytes;
-    private long workerJoinTimeoutMillis = WORKER_JOIN_TIMEOUT_MILLIS;
+    // volatile: read by awaitRingQuiescence() from arbitrary caller threads
+    // while the @TestOnly setter may run on another.
+    private volatile long workerJoinTimeoutMillis = WORKER_JOIN_TIMEOUT_MILLIS;
     // volatile because wakeWorker() reads workerThread without holding the
     // monitor; the synchronized start()/close() pair handles the
     // start-vs-close ordering.
@@ -194,18 +213,100 @@ public final class SegmentManager implements QuietCloseable {
                 }
             }
             if (t.isAlive()) {
-                LOG.warn("SegmentManager worker did not stop before close wait completed; "
-                        + "leaving worker-owned resources allocated");
-                return;
+                synchronized (lock) {
+                    if (!workerLoopExited) {
+                        // Hand pathScratch ownership to the worker: its exit
+                        // block frees the buffer under the same lock, so the
+                        // native allocation is reclaimed even though this
+                        // close() could not confirm termination. workerThread
+                        // stays set so isWorkerReaped() reports the incomplete
+                        // shutdown and a later close() can retry the join.
+                        scratchHandedToWorker = true;
+                        LOG.warn("SegmentManager worker did not stop before close wait completed; "
+                                + "worker frees its native scratch buffer on exit");
+                        return;
+                    }
+                }
+                // The worker loop has already run its exit block; the thread
+                // is at most a few instructions from terminating and can no
+                // longer touch manager state. Fall through and reap it.
             }
             workerThread = null;
         }
         // Free the rotation-path native scratch buffer only after worker
-        // termination has been observed. The worker is the only thread that
-        // touches the buffer, but close() uses a bounded join; if the worker is
-        // still alive, leaking this one scratch allocation is safer than freeing
-        // native memory it may still read or write.
-        pathScratch.close();
+        // termination (or worker-loop exit) has been observed. The worker is
+        // the only thread that touches the buffer; the scratchFreed flag
+        // (shared with the worker's exit block) makes the free exactly-once
+        // no matter which side runs last.
+        synchronized (lock) {
+            if (!scratchFreed) {
+                scratchFreed = true;
+                pathScratch.close();
+            }
+        }
+    }
+
+    /**
+     * Quiescence barrier for {@link #deregister(SegmentRing)}. Blocks until
+     * the worker thread is provably no longer executing a service pass for
+     * {@code ring}, or the worker-join timeout elapses. After this returns
+     * {@code true}, the worker will never again touch the ring, its
+     * watermark, or path names under its slot directory: deregister has
+     * removed the entry from the registry, a stale snapshot entry that has
+     * not started its pass is skipped by the registration check at the top
+     * of {@link #serviceRing(RingEntry)}, and this method has observed the
+     * end of any in-flight pass. Only then may the caller release dependent
+     * resources (ring, watermark, segment files, slot lock).
+     * <p>
+     * Returns {@code true} immediately when no worker is running or when
+     * called from the worker thread itself (test hooks inject deregister
+     * calls there; waiting would self-deadlock). Returns {@code false} when
+     * the in-flight pass did not finish within the timeout — the caller must
+     * treat the worker as still live and leak rather than release.
+     * <p>
+     * A pending caller interrupt is preserved but does not abort the wait,
+     * mirroring {@link #close()}.
+     */
+    public boolean awaitRingQuiescence(SegmentRing ring) {
+        Thread t = workerThread;
+        if (t == null || t == Thread.currentThread()) {
+            return true;
+        }
+        long deadlineNanos = System.nanoTime() + workerJoinTimeoutMillis * 1_000_000L;
+        boolean interrupted = Thread.interrupted();
+        try {
+            synchronized (lock) {
+                while (inService != null && inService.ring == ring) {
+                    long remainingNanos = deadlineNanos - System.nanoTime();
+                    if (remainingNanos <= 0) {
+                        return false;
+                    }
+                    try {
+                        // Round up so a sub-millisecond remainder still waits
+                        // instead of spinning through wait(0) == wait-forever.
+                        lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+            }
+            return true;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * True when no manager worker thread can be running: either
+     * {@link #start()} was never called, or a {@link #close()} confirmed
+     * worker termination and reaped the thread. Owners use this as a
+     * stronger fallback barrier when {@link #awaitRingQuiescence(SegmentRing)}
+     * times out but a subsequent {@code close()} join succeeded.
+     */
+    public synchronized boolean isWorkerReaped() {
+        return workerThread == null;
     }
 
     /**
@@ -213,6 +314,13 @@ public final class SegmentManager implements QuietCloseable {
      * created after this returns, but already-installed spares stay with
      * the ring (the ring closes them on its own {@link SegmentRing#close}).
      * Idempotent; safe to call from any thread.
+     * <p>
+     * Non-blocking: a worker service pass already in flight for this ring
+     * may still be running when this returns. Callers about to release
+     * resources the worker can reach (the ring itself, its watermark, its
+     * segment files, or the slot lock guarding its directory) MUST follow
+     * up with {@link #awaitRingQuiescence(SegmentRing)} and only release on
+     * a {@code true} result.
      */
     public void deregister(SegmentRing ring) {
         synchronized (lock) {
@@ -412,6 +520,32 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     private void serviceRing(RingEntry e) {
+        // Claim the entry as in-service so deregister-side quiescence
+        // barriers (awaitRingQuiescence) can wait for this pass to finish.
+        // A stale snapshot entry deregistered before the pass starts is
+        // skipped entirely: the deregistering thread may already be
+        // releasing the ring / watermark / slot resources, so the worker
+        // must not touch them at all. The registered check and the
+        // in-service claim are atomic under `lock` — deregister flips
+        // `registered` under the same lock, so it either prevents this
+        // pass or the barrier observes it via `inService`.
+        synchronized (lock) {
+            if (!e.registered) {
+                return;
+            }
+            inService = e;
+        }
+        try {
+            serviceRing0(e);
+        } finally {
+            synchronized (lock) {
+                inService = null;
+                lock.notifyAll();
+            }
+        }
+    }
+
+    private void serviceRing0(RingEntry e) {
         // 1. Provision a hot spare if the ring needs one AND we have headroom
         //    under the disk-total cap. Cap check is per-tick; if we're capped
         //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
@@ -571,26 +705,40 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     private void workerLoop() {
-        while (running) {
-            // Snapshot the rings under the lock so we don't hold it through the
-            // (potentially slow) syscalls during creation/unlink. ringSnapshot
-            // is a thread-confined field — no per-tick allocation.
-            ringSnapshot.clear();
+        try {
+            while (running) {
+                // Snapshot the rings under the lock so we don't hold it through the
+                // (potentially slow) syscalls during creation/unlink. ringSnapshot
+                // is a thread-confined field — no per-tick allocation.
+                ringSnapshot.clear();
+                synchronized (lock) {
+                    for (int i = 0, n = rings.size(); i < n; i++) {
+                        ringSnapshot.add(rings.getQuick(i));
+                    }
+                }
+                for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
+                    if (!running) break;
+                    serviceRing(ringSnapshot.getQuick(i));
+                }
+                // Drop strong refs so a deregistered ring becomes collectable
+                // before the next tick (otherwise the snapshot pins it for up
+                // to pollNanos after deregister).
+                ringSnapshot.clear();
+                if (!running) break;
+                LockSupport.parkNanos(pollNanos);
+            }
+        } finally {
+            // If a timed-out close() abandoned the reap, it handed
+            // pathScratch ownership to this thread (see close()). Freeing it
+            // here reclaims the native buffer even when the worker outlives
+            // every close() attempt — nobody else retries manager cleanup.
             synchronized (lock) {
-                for (int i = 0, n = rings.size(); i < n; i++) {
-                    ringSnapshot.add(rings.getQuick(i));
+                workerLoopExited = true;
+                if (scratchHandedToWorker && !scratchFreed) {
+                    scratchFreed = true;
+                    pathScratch.close();
                 }
             }
-            for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
-                if (!running) break;
-                serviceRing(ringSnapshot.getQuick(i));
-            }
-            // Drop strong refs so a deregistered ring becomes collectable
-            // before the next tick (otherwise the snapshot pins it for up
-            // to pollNanos after deregister).
-            ringSnapshot.clear();
-            if (!running) break;
-            LockSupport.parkNanos(pollNanos);
         }
     }
 
