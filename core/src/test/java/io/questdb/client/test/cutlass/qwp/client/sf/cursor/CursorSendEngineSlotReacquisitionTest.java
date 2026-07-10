@@ -387,6 +387,191 @@ public class CursorSendEngineSlotReacquisitionTest {
     }
 
     /**
+     * Regression for the unbounded deferred-close thread pool: E engines
+     * stuck behind stalled manager workers must share ONE deferred-close
+     * daemon thread (the old newCachedThreadPool + in-thread retry loop
+     * pinned one thread per engine), and every engine must still complete
+     * once its worker quiesces.
+     */
+    @Test(timeout = 60_000L)
+    public void testManyStuckEnginesShareOneDeferredCloseThread() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int engineCount = 4;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            SegmentManager[] managers = new SegmentManager[engineCount];
+            CursorSendEngine[] engines = new CursorSendEngine[engineCount];
+            CountDownLatch releaseWorkers = new CountDownLatch(1);
+            // Fast retries so completion after release is prompt; attempt
+            // budget large enough that nothing is abandoned mid-test.
+            CursorSendEngine.setDeferredCloseTuning(1_000_000L, 50_000_000L, 1_000_000);
+            try {
+                for (int i = 0; i < engineCount; i++) {
+                    SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+                    managers[i] = manager;
+                    CountDownLatch workerBlocked = new CountDownLatch(1);
+                    AtomicBoolean fired = new AtomicBoolean();
+                    manager.setBeforeInstallSyncHook(() -> {
+                        if (!fired.compareAndSet(false, true)) return;
+                        workerBlocked.countDown();
+                        try {
+                            releaseWorkers.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+                    manager.start();
+                    engines[i] = new CursorSendEngine(tmpDir + "/many-slot-" + i, segSize, manager);
+                    Assert.assertTrue("worker " + i + " never reached the install hook",
+                            workerBlocked.await(5, TimeUnit.SECONDS));
+                    manager.setWorkerJoinTimeoutMillis(20L);
+                    engines[i].close();
+                    Assert.assertFalse("close " + i + " must remain incomplete",
+                            engines[i].isCloseCompleted());
+                    engines[i].closeEventually();
+                }
+
+                // Let the daemon cycle through several retries for every engine.
+                Thread.sleep(300L);
+                for (int i = 0; i < engineCount; i++) {
+                    Assert.assertFalse("engine " + i + " cannot complete while its worker is stalled",
+                            engines[i].isCloseCompleted());
+                }
+                Assert.assertTrue(
+                        "deferred close must be bounded to a single shared daemon thread",
+                        countDeferredCloseThreads() <= 1
+                );
+
+                releaseWorkers.countDown();
+                for (SegmentManager manager : managers) {
+                    manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                }
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+                for (int i = 0; i < engineCount; i++) {
+                    while (!engines[i].isCloseCompleted() && System.nanoTime() < deadline) {
+                        Thread.sleep(1L);
+                    }
+                    Assert.assertTrue("deferred close " + i + " did not complete after quiescence",
+                            engines[i].isCloseCompleted());
+                }
+            } finally {
+                CursorSendEngine.setDeferredCloseTuning(
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS,
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS,
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS
+                );
+                releaseWorkers.countDown();
+                for (int i = 0; i < engineCount; i++) {
+                    if (managers[i] != null) {
+                        managers[i].setBeforeInstallSyncHook(null);
+                    }
+                    if (engines[i] != null) {
+                        try {
+                            engines[i].close();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    if (managers[i] != null) {
+                        try {
+                            managers[i].close();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Permanently-stuck-manager path: the deferred-close daemon must not
+     * retry forever. After the retry budget is exhausted the engine is
+     * abandoned (observable via getAbandonedDeferredCloseCount), its slot
+     * stays locked (leaked, not released to a replacement the stale worker
+     * could corrupt), and a later direct close() — once the worker finally
+     * quiesces — still completes the cleanup.
+     */
+    @Test(timeout = 60_000L)
+    public void testPermanentlyStuckManagerAbandonsDeferredCloseAfterRetryBudget() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/abandon-slot";
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            CursorSendEngine engine = null;
+            boolean managerClosed = false;
+            CursorSendEngine.setDeferredCloseTuning(1_000_000L, 2_000_000L, 3);
+            try {
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        releaseWorker.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+                manager.start();
+                engine = new CursorSendEngine(slot, segSize, manager);
+                Assert.assertTrue("worker never reached the install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                manager.setWorkerJoinTimeoutMillis(20L);
+                engine.close();
+                Assert.assertFalse("first close must remain incomplete", engine.isCloseCompleted());
+
+                long abandonedBefore = CursorSendEngine.getAbandonedDeferredCloseCount();
+                engine.closeEventually();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (CursorSendEngine.getAbandonedDeferredCloseCount() == abandonedBefore
+                        && System.nanoTime() < deadline) {
+                    Thread.sleep(1L);
+                }
+                Assert.assertEquals("deferred close must give up after its retry budget",
+                        abandonedBefore + 1, CursorSendEngine.getAbandonedDeferredCloseCount());
+                Assert.assertFalse("an abandoned engine stays incomplete", engine.isCloseCompleted());
+                // Abandonment leaks — it must NOT hand the slot to a
+                // replacement while the stale worker can still touch it.
+                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                    Assert.fail("abandoned deferred close must retain the slot lock");
+                } catch (IllegalStateException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("sf slot already in use"));
+                }
+
+                // Recovery path promised by the abandonment log: a direct
+                // close() once the worker quiesces.
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                engine.close();
+                Assert.assertTrue("direct close after abandonment must complete",
+                        engine.isCloseCompleted());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after recovery close", probe);
+                }
+                manager.close();
+                managerClosed = true;
+            } finally {
+                CursorSendEngine.setDeferredCloseTuning(
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS,
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS,
+                        CursorSendEngine.DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS
+                );
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                if (engine != null) {
+                    try {
+                        engine.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (!managerClosed) {
+                    manager.close();
+                }
+            }
+        });
+    }
+
+    /**
      * Plain-positive path: after a normal close (worker quiesces promptly),
      * a second engine must be able to acquire and use the same slot.
      */
@@ -404,6 +589,16 @@ public class CursorSendEngineSlotReacquisitionTest {
                 second.close();
             }
         });
+    }
+
+    private static int countDeferredCloseThreads() {
+        int count = 0;
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.isAlive() && t.getName().startsWith("qdb-cursor-engine-close")) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static void rmDirRecursive(String dir) {

@@ -28,6 +28,7 @@ import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.concurrent.locks.LockSupport;
 
@@ -61,14 +62,41 @@ public final class CursorSendEngine implements QuietCloseable {
      * Default deadline for {@link #appendBlocking}: 30 seconds.
      */
     public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
-    private static final java.util.concurrent.ExecutorService DEFERRED_CLOSE_EXECUTOR =
-            java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+    /**
+     * Default retry budget for {@link #closeEventually()}: initial backoff,
+     * attempt cap and backoff cap. With these defaults a stuck engine is
+     * retried for roughly five minutes of scheduled delay (plus whatever
+     * time each {@link #close()} attempt spends blocked on the quiescence
+     * barrier) before it is abandoned.
+     */
+    public static final long DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS = 10_000_000L; // 10 ms
+    public static final int DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS = 40;
+    public static final long DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS = 10_000_000_000L; // 10 s
+    // Number of engines (process-wide) whose deferred close exhausted its
+    // retry budget and was abandoned: their ring, watermark and slot lock
+    // leak until process exit. Observability + test hook; never reset.
+    private static final java.util.concurrent.atomic.AtomicLong DEFERRED_CLOSE_ABANDONED_COUNT =
+            new java.util.concurrent.atomic.AtomicLong();
+    // Single shared daemon that owns every deferred close retry. One thread
+    // bounds the process footprint no matter how many engines are stuck:
+    // each task performs ONE close() attempt and reschedules itself with
+    // exponential backoff — it never loops or parks in-thread — so E stuck
+    // engines cost E queued tasks, not E threads. Attempts serialize, which
+    // is acceptable for a degraded-mode path whose per-attempt blocking is
+    // bounded by the manager's worker-join timeout.
+    private static final java.util.concurrent.ScheduledExecutorService DEFERRED_CLOSE_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread thread = new Thread(runnable, "qdb-cursor-engine-close");
                 thread.setDaemon(true);
                 return thread;
             });
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
+    // Deferred-close retry tuning. volatile: the @TestOnly setter may run on
+    // a different thread than the scheduler that reads them.
+    private static volatile long deferredCloseInitialBackoffNanos = DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS;
+    private static volatile int deferredCloseMaxAttempts = DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS;
+    private static volatile long deferredCloseMaxBackoffNanos = DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS;
     private final long appendDeadlineNanos;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
@@ -126,8 +154,16 @@ public final class CursorSendEngine implements QuietCloseable {
     // retries the cleanup (the worker may have exited by then). Guarded by
     // the synchronized close() method and isCloseCompleted() accessor.
     private boolean closeCompleted;
-    // True once a dedicated daemon has accepted ownership of incomplete close
-    // retries. Guarded by synchronized closeEventually().
+    // Deferred-close retry state. Initialized under closeEventually()'s
+    // monitor before the first task is submitted (task submission
+    // happens-before publishes them to the scheduler thread); thereafter
+    // touched only by the single deferred-close scheduler thread.
+    private int deferredCloseAttempts;
+    private long deferredCloseBackoffNanos;
+    // True once the shared daemon has accepted ownership of incomplete close
+    // retries. Guarded by synchronized closeEventually(). Stays true after
+    // the retry budget is exhausted — abandonment is terminal for the daemon,
+    // though close() may still be invoked directly.
     private boolean deferredCloseScheduled;
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
@@ -638,18 +674,27 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Transfers an incomplete close to a dedicated daemon owner. This lets
-     * I/O and drainer executors terminate even when a manager service pass is
-     * permanently stalled. The deferred owner retains this engine, and thus
-     * its flock and native mappings, until a retry completes.
+     * Transfers an incomplete close to a shared single-thread daemon owner.
+     * This lets I/O and drainer executors terminate even when a manager
+     * service pass is permanently stalled. The deferred owner retains this
+     * engine, and thus its flock and native mappings, until a retry
+     * completes — or until the retry budget
+     * ({@link #DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS} attempts with
+     * exponential backoff) is exhausted, at which point the engine is
+     * abandoned: its resources stay leaked until process exit (the kernel
+     * releases the flock), {@link #getAbandonedDeferredCloseCount()} is
+     * incremented, and one ERROR is logged. {@link #close()} may still be
+     * invoked directly after abandonment.
      */
     public synchronized void closeEventually() {
         if (closeCompleted || deferredCloseScheduled) {
             return;
         }
         deferredCloseScheduled = true;
+        deferredCloseAttempts = 0;
+        deferredCloseBackoffNanos = deferredCloseInitialBackoffNanos;
         try {
-            DEFERRED_CLOSE_EXECUTOR.execute(this::runDeferredClose);
+            DEFERRED_CLOSE_EXECUTOR.execute(this::deferredCloseAttempt);
         } catch (Throwable t) {
             deferredCloseScheduled = false;
             throw t;
@@ -668,6 +713,27 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public MmapSegment firstSealed() {
         return ring.firstSealed();
+    }
+
+    /**
+     * Number of engines (process-wide) whose deferred close exhausted its
+     * retry budget and was abandoned, leaking their ring, watermark and
+     * slot lock until process exit. Cumulative; never reset.
+     */
+    public static long getAbandonedDeferredCloseCount() {
+        return DEFERRED_CLOSE_ABANDONED_COUNT.get();
+    }
+
+    /**
+     * Tunes the deferred-close retry budget. Affects engines armed by
+     * {@link #closeEventually()} after this call. Tests must restore the
+     * {@code DEFERRED_CLOSE_DEFAULT_*} values when done.
+     */
+    @TestOnly
+    public static void setDeferredCloseTuning(long initialBackoffNanos, long maxBackoffNanos, int maxAttempts) {
+        deferredCloseInitialBackoffNanos = initialBackoffNanos;
+        deferredCloseMaxBackoffNanos = maxBackoffNanos;
+        deferredCloseMaxAttempts = maxAttempts;
     }
 
     /**
@@ -764,6 +830,48 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * One deferred-close retry. Performs a single {@link #close()} attempt;
+     * on failure reschedules itself with exponential backoff until the
+     * retry budget is exhausted, then abandons the engine (terminal for the
+     * daemon: resources leak until process exit). Runs on the shared
+     * single-thread deferred-close daemon and never loops or parks, so one
+     * stuck engine cannot pin a thread and E stuck engines cannot pin E
+     * threads.
+     */
+    private void deferredCloseAttempt() {
+        try {
+            close();
+        } catch (Throwable ignored) {
+            // Retain ownership; the retry budget below decides what's next.
+        }
+        // The daemon owns cleanup independently of caller cancellation. Clear
+        // a stray interrupt so it cannot poison the joins/waits of the next
+        // attempt on this shared thread.
+        Thread.interrupted();
+        if (isCloseCompleted()) {
+            return;
+        }
+        if (++deferredCloseAttempts >= deferredCloseMaxAttempts) {
+            DEFERRED_CLOSE_ABANDONED_COUNT.incrementAndGet();
+            LOG.error("abandoning deferred close after {} attempts: the SF manager worker never "
+                    + "quiesced; ring, watermark and slot lock for {} stay leaked until process "
+                    + "exit (the kernel releases the flock). close() may still be invoked "
+                    + "directly to retry cleanup.", deferredCloseAttempts, sfDir == null ? "<memory>" : sfDir);
+            return;
+        }
+        long delayNanos = deferredCloseBackoffNanos;
+        deferredCloseBackoffNanos = Math.min(delayNanos * 2, deferredCloseMaxBackoffNanos);
+        try {
+            DEFERRED_CLOSE_EXECUTOR.schedule(
+                    this::deferredCloseAttempt, delayNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
+        } catch (Throwable t) {
+            DEFERRED_CLOSE_ABANDONED_COUNT.incrementAndGet();
+            LOG.error("could not reschedule deferred close for {}; ring, watermark and slot lock "
+                    + "stay leaked until process exit", sfDir == null ? "<memory>" : sfDir, t);
+        }
+    }
+
+    /**
      * Unlinks every {@code .sfa} file under {@code dir}. Called only on
      * clean shutdown when the ring confirms every published FSN has been
      * acked — at that moment the slot has no recoverable work and the
@@ -771,23 +879,6 @@ public final class CursorSendEngine implements QuietCloseable {
      * Best-effort: logs and continues on failures, since we're already on
      * the close path.
      */
-    private void runDeferredClose() {
-        while (!isCloseCompleted()) {
-            try {
-                close();
-            } catch (Throwable ignored) {
-                // Retain ownership and retry after a bounded pause.
-            }
-            if (!isCloseCompleted()) {
-                LockSupport.parkNanos(10_000_000L);
-                // The internal daemon owns cleanup independently of caller
-                // cancellation. Clear interrupts so they cannot create a hot
-                // retry loop if an executor implementation interrupts it.
-                Thread.interrupted();
-            }
-        }
-    }
-
     private static void unlinkAllSegmentFiles(String dir) {
         if (!io.questdb.client.std.Files.exists(dir)) return;
         long find = io.questdb.client.std.Files.findFirst(dir);
