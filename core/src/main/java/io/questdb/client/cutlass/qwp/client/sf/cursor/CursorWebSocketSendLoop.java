@@ -2234,10 +2234,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * the caller turns it into a single, non-re-entrant reconnect.
      */
     private void sendCatchUpChunk(int deltaStart, int deltaCount, long symbolsAddr, int symbolsLen) {
-        int payloadLen = NativeBufferWriter.varintSize(deltaStart)
+        // Compute the frame size in long and fail loud if it would overflow the int
+        // size math into a negative Unsafe.malloc. sendDictCatchUp already caps each
+        // chunk's symbol bytes under the budget, so this is unreachable at real
+        // cardinality -- but the mirror-side ensureSentDictCapacity guards the same
+        // math, and a future caller must not be able to overflow this one silently.
+        long payloadLenL = (long) NativeBufferWriter.varintSize(deltaStart)
                 + NativeBufferWriter.varintSize(deltaCount)
                 + symbolsLen;
-        int frameLen = QwpConstants.HEADER_SIZE + payloadLen;
+        long frameLenL = QwpConstants.HEADER_SIZE + payloadLenL;
+        if (frameLenL > MAX_SENT_DICT_BYTES) {
+            LineSenderException err = new LineSenderException(
+                    "symbol dictionary catch-up frame exceeds the maximum size ["
+                            + "frameLen=" + frameLenL + ", max=" + MAX_SENT_DICT_BYTES + ']');
+            recordFatal(err);
+            throw new CatchUpSendException(err);
+        }
+        int payloadLen = (int) payloadLenL;
+        int frameLen = (int) frameLenL;
         long frame = Unsafe.malloc(frameLen, MemoryTag.NATIVE_DEFAULT);
         try {
             Unsafe.getUnsafe().putByte(frame, (byte) 'Q');

@@ -43,8 +43,12 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -211,6 +215,76 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         });
     }
 
+    @Test
+    public void testAccumulateSentDictPartialOverlapExtendsMirror() throws Exception {
+        // M3: accumulateSentDict must handle a delta that STRADDLES the mirror tip
+        // (deltaStart < sentDictCount < deltaStart+deltaCount) by copying only the
+        // new tail, not dropping the whole frame. The monotonic producer never emits
+        // a straddling delta in steady state (so the pre-fix drop-whole-frame guard
+        // passed every test), but a torn-dict replay can seed the mirror smaller than
+        // a frame's coverage. Seed the mirror with 1 symbol, feed a [0..2] delta, and
+        // assert the mirror extends to all 3 -- pre-fix it stayed at 1, leaving the
+        // reconnect catch-up incomplete and shifting server-side ids.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, "aa"); // sentDictCount = 1, mirror holds "aa"
+                    int[] frameLen = new int[1];
+                    long frame = buildDeltaFrame(0, new String[]{"aa", "bb", "cc"}, frameLen);
+                    try {
+                        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
+                                "accumulateSentDict", long.class, int.class, int.class);
+                        m.setAccessible(true);
+                        m.invoke(loop, frame, frameLen[0], 0);
+                    } finally {
+                        Unsafe.free(frame, frameLen[0], MemoryTag.NATIVE_DEFAULT);
+                    }
+                    assertEquals("straddling delta must extend the mirror to all 3 ids",
+                            3, readInt(loop, "sentDictCount"));
+                    assertEquals("mirror must hold the two new tail symbols after the "
+                                    + "already-held prefix, gap-free",
+                            Arrays.asList("aa", "bb", "cc"), readMirrorSymbols(loop));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCatchUpChunkFrameSizeOverflowFailsLoud() throws Exception {
+        // M3: sendDictCatchUp caps each chunk under the budget, so the single-frame
+        // catch-up path cannot overflow its int frameLen at any real cardinality. The
+        // guard must still be LOCAL -- a future caller must not be able to feed a
+        // wrapped-negative frameLen to Unsafe.malloc. An oversized symbolsLen must
+        // fail loud (CatchUpSendException) BEFORE the malloc; the guard fires before
+        // symbolsAddr is read, so a dummy address is fine.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
+                            "sendCatchUpChunk", int.class, int.class, long.class, int.class);
+                    m.setAccessible(true);
+                    // symbolsLen past the mirror ceiling: HEADER + varints + symbolsLen
+                    // overflows an int, so the guard must reject it before malloc.
+                    m.invoke(loop, 0, 1, 0L, Integer.MAX_VALUE - 4);
+                    fail("an overflowing catch-up frame size must fail loud, not malloc negative");
+                } catch (InvocationTargetException e) {
+                    assertEquals("overflow must surface as CatchUpSendException",
+                            "CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    assertTrue("message must name the frame-size guard: " + e.getCause().getMessage(),
+                            e.getCause().getMessage().contains("catch-up frame exceeds the maximum size"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private static void appendFrames(CursorSendEngine engine, int count) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {
@@ -224,6 +298,64 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         } finally {
             Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
         }
+    }
+
+    // Builds a QWP delta frame [12-byte header][deltaStart varint][deltaCount
+    // varint][ [len varint][utf8] ... ] for the given symbols. accumulateSentDict
+    // skips the header, so its content is irrelevant; the caller frees the frame.
+    private static long buildDeltaFrame(int deltaStart, String[] symbols, int[] outLen) {
+        int deltaCount = symbols.length;
+        int size = 12 + varintSize(deltaStart) + varintSize(deltaCount);
+        for (String s : symbols) {
+            size += varintSize(s.getBytes(StandardCharsets.UTF_8).length)
+                    + s.getBytes(StandardCharsets.UTF_8).length;
+        }
+        long addr = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        long p = writeVarint(addr + 12, deltaStart);
+        p = writeVarint(p, deltaCount);
+        for (String s : symbols) {
+            byte[] b = s.getBytes(StandardCharsets.UTF_8);
+            p = writeVarint(p, b.length);
+            for (byte x : b) {
+                Unsafe.getUnsafe().putByte(p++, x);
+            }
+        }
+        outLen[0] = size;
+        return addr;
+    }
+
+    private static int readInt(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getInt(loop);
+    }
+
+    // Parses the loop's native sent-dictionary mirror ([len varint][utf8]...) back
+    // into the symbol strings a reconnect catch-up would re-register.
+    private static List<String> readMirrorSymbols(CursorWebSocketSendLoop loop) throws Exception {
+        long addr = readLong(loop, "sentDictBytesAddr");
+        int len = readInt(loop, "sentDictBytesLen");
+        List<String> out = new ArrayList<>();
+        long p = addr;
+        long limit = addr + len;
+        while (p < limit) {
+            long l = 0;
+            int shift = 0;
+            while (p < limit) {
+                byte b = Unsafe.getUnsafe().getByte(p++);
+                l |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    break;
+                }
+                shift += 7;
+            }
+            byte[] bytes = new byte[(int) l];
+            for (int i = 0; i < l; i++) {
+                bytes[i] = Unsafe.getUnsafe().getByte(p++);
+            }
+            out.add(new String(bytes, StandardCharsets.UTF_8));
+        }
+        return out;
     }
 
     // Delivers a 0-table STATUS_OK for {@code wireSeq} into the loop's response
