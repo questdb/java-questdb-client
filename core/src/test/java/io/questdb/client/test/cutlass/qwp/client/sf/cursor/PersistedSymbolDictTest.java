@@ -92,6 +92,62 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testAppendRawEntriesMatchesAppendSymbols() throws Exception {
+        // M1: the producer persists the frame's already-encoded delta bytes via
+        // appendRawEntries instead of re-encoding the symbols. Those bytes are the
+        // same [len][utf8]... layout appendSymbols writes, so both must produce an
+        // identical, recoverable dictionary. Encode a range with appendSymbols,
+        // reopen to grab its on-disk entry bytes, replay them through
+        // appendRawEntries into a fresh dict, and assert the recovered symbols
+        // match -- including an empty entry mid-range.
+        assertMemoryLeak(() -> {
+            Path src = Files.createTempDirectory("qwp-symdict-src");
+            Path dst = Files.createTempDirectory("qwp-symdict-dst");
+            try {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                dict.getOrAddSymbol("AAPL"); // id 0
+                dict.getOrAddSymbol("");     // id 1 -- empty entry mid-range
+                dict.getOrAddSymbol("MSFT"); // id 2
+
+                PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString());
+                encoded.appendSymbols(dict, 0, 2);
+                encoded.close();
+
+                // Reopen to obtain the on-disk entry region [len][utf8]... verbatim,
+                // then replay it byte-for-byte into a fresh dict via appendRawEntries.
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(src.toString());
+                try {
+                    PersistedSymbolDict raw = PersistedSymbolDict.open(dst.toString());
+                    try {
+                        raw.appendRawEntries(reopened.loadedEntriesAddr(),
+                                reopened.loadedEntriesLen(), reopened.size());
+                        Assert.assertEquals(3, raw.size());
+                    } finally {
+                        raw.close();
+                    }
+                } finally {
+                    reopened.close();
+                }
+
+                // The raw-appended dict must recover the same dense symbols.
+                PersistedSymbolDict recovered = PersistedSymbolDict.open(dst.toString());
+                try {
+                    Assert.assertEquals(3, recovered.size());
+                    ObjList<String> symbols = recovered.readLoadedSymbols();
+                    Assert.assertEquals("AAPL", symbols.getQuick(0));
+                    Assert.assertEquals("", symbols.getQuick(1));
+                    Assert.assertEquals("MSFT", symbols.getQuick(2));
+                } finally {
+                    recovered.close();
+                }
+            } finally {
+                rmDir(src);
+                rmDir(dst);
+            }
+        });
+    }
+
+    @Test
     public void testAppendSymbolsBatchWritesDenseRange() throws Exception {
         // appendSymbols persists a whole id range in one write (the hot-path
         // syscall reduction). It must produce the same dense, id-ordered file a

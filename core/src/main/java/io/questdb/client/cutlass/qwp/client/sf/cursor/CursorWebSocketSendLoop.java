@@ -2192,6 +2192,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // Latch a terminal (the data must be resent after the cap is
                 // raised) rather than calling fail() -- which, from inside the
                 // catch-up, would re-enter connectLoop (see CatchUpSendException).
+                //
+                // Tradeoff (heterogeneous / rolling-cap clusters): a symbol
+                // accepted under a larger/absent cap can hit this on failover to a
+                // smaller-cap node, and the hard terminal does NOT self-recover if
+                // a later node advertises a larger cap -- the producer must be
+                // resumed after the data is resent (or the cap raised). Bounding
+                // symbol size at ingest, or a settle budget across reconnects
+                // before latching, would relax this, but both are larger changes;
+                // the terminal keeps the homogeneous common case livelock-free.
                 LineSenderException err = new LineSenderException(
                         "symbol dictionary entry too large for the server batch cap during catch-up ["
                                 + "entryBytes=" + entryBytes + ", budget=" + budget + ']');

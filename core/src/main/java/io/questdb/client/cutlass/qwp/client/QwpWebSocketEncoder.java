@@ -39,6 +39,14 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
     private NativeBufferWriter buffer;
+    // Byte offsets, within the buffer, of the symbol-dict delta ENTRY region
+    // ([len][utf8]... only, without the two section varints) that beginMessage
+    // last wrote. Let the producer persist those bytes straight to the slot's
+    // .symbol-dict instead of re-encoding the same symbols (see
+    // QwpWebSocketSender.persistNewSymbolsBeforePublish). Valid until the next
+    // beginMessage; stored as offsets so they survive a buffer realloc.
+    private int deltaEntriesEnd;
+    private int deltaEntriesStart;
     // QWP ingress always advertises Gorilla timestamp encoding. The column
     // writer still emits a per-column encoding byte and falls back to raw
     // values when delta-of-delta overflows int32.
@@ -75,10 +83,12 @@ public class QwpWebSocketEncoder implements QuietCloseable {
         payloadStart = buffer.getPosition();
         buffer.putVarint(deltaStart);
         buffer.putVarint(deltaCount);
+        deltaEntriesStart = buffer.getPosition();
         for (int id = deltaStart; id < deltaStart + deltaCount; id++) {
             String symbol = globalDict.getSymbol(id);
             buffer.putString(symbol);
         }
+        deltaEntriesEnd = buffer.getPosition();
         columnWriter.setBuffer(buffer);
     }
 
@@ -120,6 +130,22 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     public QwpBufferWriter getBuffer() {
         return buffer;
+    }
+
+    /**
+     * Byte length of the symbol-dict delta ENTRY region ({@code [len][utf8]...},
+     * excluding the two section varints) that {@link #beginMessage} last wrote.
+     */
+    public int getDeltaEntriesLen() {
+        return deltaEntriesEnd - deltaEntriesStart;
+    }
+
+    /**
+     * Byte offset, within {@link #getBuffer()}, of the symbol-dict delta ENTRY
+     * region {@link #beginMessage} last wrote.
+     */
+    public int getDeltaEntriesStart() {
+        return deltaEntriesStart;
     }
 
     public void setDeferCommit(boolean defer) {

@@ -3681,24 +3681,41 @@ public class QwpWebSocketSender implements Sender {
         if (pd == null) {
             return;
         }
-        // Persist [pd.size() .. currentBatchMaxSymbolId] as ONE write.
+        // Persist [pd.size() .. currentBatchMaxSymbolId] as ONE write, BEFORE the
+        // frame is published.
         //
         // Resume from the dictionary's own durable size, NOT sentMaxSymbolId+1:
-        // appendSymbols advances pd.size() only after a full write, whereas
+        // the persist advances pd.size() only after a full write, whereas
         // sentMaxSymbolId only advances after the WHOLE frame is published (via
         // advanceSentMaxSymbolId, after activeBuffer.write). If a prior persist
-        // threw (a short write -- disk full/quota), the frame was not published
-        // and sentMaxSymbolId stayed put, while the symbols before the failing
-        // one are already on disk. Keying the resume point off sentMaxSymbolId+1
-        // would then re-append that persisted prefix on the retry, duplicating
-        // entries and corrupting the dense id->symbol mapping recovery relies on
-        // (position i must be symbol id i). pd.size() resumes exactly past what is
-        // already durable (the write overwrites any torn trailing bytes at
-        // appendOffset), so the write-ahead is idempotent under retry. In the
-        // happy path pd.size() equals sentMaxSymbolId+1, so the range -- and the
-        // behaviour -- are unchanged; the single positioned write just replaces
-        // the previous one-syscall-per-new-symbol loop.
-        pd.appendSymbols(globalSymbolDictionary, pd.size(), currentBatchMaxSymbolId);
+        // threw (short write -- disk full/quota) or the publish threw, the frame
+        // was not published and sentMaxSymbolId stayed put, while the symbols
+        // before the failure are already on disk. Keying the resume point off
+        // sentMaxSymbolId+1 would re-append that persisted prefix on the retry,
+        // duplicating entries and corrupting the dense id->symbol mapping recovery
+        // relies on (position i must be symbol id i). pd.size() resumes exactly
+        // past what is already durable, so the write-ahead is idempotent.
+        int from = pd.size();
+        if (currentBatchMaxSymbolId < from) {
+            return; // nothing new to persist (warm batch, or an idempotent retry)
+        }
+        // Fast path: the frame the encoder just built already holds these symbols
+        // in its delta section as [len][utf8]... -- byte-identical to what
+        // PersistedSymbolDict stores. In the common case pd.size() equals the
+        // frame's delta start id (sentMaxSymbolId+1), so persist those bytes
+        // straight from the frame instead of re-encoding the symbols. After a
+        // failed publish the durable size has run ahead of the wire baseline, so
+        // the frame's delta covers MORE than remains to persist; then re-encode
+        // just the [from .. currentBatchMaxSymbolId] suffix.
+        if (from == sentMaxSymbolId + 1) {
+            QwpBufferWriter buffer = encoder.getBuffer();
+            pd.appendRawEntries(
+                    buffer.getBufferPtr() + encoder.getDeltaEntriesStart(),
+                    encoder.getDeltaEntriesLen(),
+                    currentBatchMaxSymbolId - from + 1);
+        } else {
+            pd.appendSymbols(globalSymbolDictionary, from, currentBatchMaxSymbolId);
+        }
     }
 
     private void resetSymbolDictStateForNewConnection() {

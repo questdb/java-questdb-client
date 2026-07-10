@@ -149,6 +149,30 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
+     * Appends {@code count} already-encoded entries -- {@code [len varint][utf8]...},
+     * the exact layout {@link #appendSymbols} produces -- verbatim from {@code addr}
+     * in a single write. The producer uses this when it already holds those bytes
+     * (the symbol-dict delta section the frame encoder just wrote), so it does not
+     * re-encode the same symbols. Writes {@code len} bytes and advances {@code size}
+     * by {@code count}. Same durability/idempotency contract as {@link #appendSymbols}:
+     * no fsync, and a short write throws WITHOUT advancing {@code size}/{@code
+     * appendOffset}, so a retry keyed off {@link #size()} re-persists the same range
+     * at the same offset. No-op when the range is empty or the dictionary is closed.
+     */
+    public void appendRawEntries(long addr, int len, int count) {
+        if (closed || count <= 0 || len <= 0) {
+            return;
+        }
+        long written = Files.write(fd, addr, len, appendOffset);
+        if (written != len) {
+            throw new IllegalStateException("short write to " + FILE_NAME
+                    + " [expected=" + len + ", actual=" + written + ']');
+        }
+        appendOffset += len;
+        size += count;
+    }
+
+    /**
      * Appends one symbol, extending the on-disk dictionary. The caller appends a
      * frame's new symbols BEFORE publishing that frame, so the write ordering
      * (dictionary entry before referencing frame) holds; no fsync is performed
