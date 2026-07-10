@@ -89,7 +89,15 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                             0, 0, 1);
                     // Close without start(): the ctor-seeded mirror is this
                     // thread's to free, since the I/O loop never ran.
+                    Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
+                            readInt(loop, "sentDictCount") > 0);
                     loop.close();
+                    // close() must reset sentDictCount alongside freeing the buffer,
+                    // so the mirror stays all-or-nothing: a hypothetical post-close
+                    // start() (no closed guard) cannot read a stale count against a
+                    // freed buffer and drive a null-mirror catch-up.
+                    Assert.assertEquals("close() must reset sentDictCount to 0",
+                            0, readInt(loop, "sentDictCount"));
                 }
             });
         } finally {

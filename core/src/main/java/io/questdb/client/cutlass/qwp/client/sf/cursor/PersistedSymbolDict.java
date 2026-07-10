@@ -282,6 +282,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
         closed = true;
         if (loadedEntriesAddr != 0L) {
             Unsafe.free(loadedEntriesAddr, loadedEntriesLen, MemoryTag.NATIVE_DEFAULT);
+            // Null after freeing (like scratchAddr below) so a future accessor that
+            // reads loadedEntriesAddr()/loadedEntriesLen() post-close cannot
+            // dereference freed native memory; the getters are not closed-guarded.
+            loadedEntriesAddr = 0L;
+            loadedEntriesLen = 0;
         }
         if (scratchAddr != 0L) {
             Unsafe.free(scratchAddr, scratchCap, MemoryTag.NATIVE_DEFAULT);
@@ -437,8 +442,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             LOG.warn("symbol dict {} could not be created (rc={}); proceeding without it", filePath, fd);
             return null;
         }
-        long hdr = Unsafe.malloc(HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+        long hdr = 0L;
         try {
+            hdr = Unsafe.malloc(HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             Unsafe.getUnsafe().putInt(hdr, FILE_MAGIC);
             Unsafe.getUnsafe().putByte(hdr + 4, VERSION);
             Unsafe.getUnsafe().putByte(hdr + 5, (byte) 0);
@@ -451,8 +457,18 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 LOG.warn("symbol dict {} header write failed; proceeding without it", filePath);
                 return null;
             }
+        } catch (Throwable t) {
+            // Unreachable today (Files.write is native and returns -1 rather than
+            // throwing; the Unsafe puts target a valid 8-byte buffer and an 8-byte
+            // malloc cannot realistically OOM), but close the fd against a future
+            // edit so it cannot leak -- mirroring openExisting's error handling.
+            Files.close(fd);
+            LOG.warn("symbol dict {} creation failed ({}); proceeding without it", filePath, String.valueOf(t));
+            return null;
         } finally {
-            Unsafe.free(hdr, HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+            if (hdr != 0L) {
+                Unsafe.free(hdr, HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+            }
         }
         return new PersistedSymbolDict(fd, HEADER_SIZE, 0, 0L, 0);
     }

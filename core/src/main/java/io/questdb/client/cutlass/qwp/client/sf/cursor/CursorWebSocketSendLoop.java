@@ -907,6 +907,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             sentDictBytesAddr = 0;
             sentDictBytesCapacity = 0;
             sentDictBytesLen = 0;
+            // Reset the count alongside the buffer so the mirror stays all-or-
+            // nothing: a hypothetical close()-then-start() (start() has no closed
+            // guard) must not observe a non-zero sentDictCount against a freed
+            // buffer and drive setWireBaselineWithCatchUp into a null-mirror catch-up.
+            sentDictCount = 0;
         }
     }
 
@@ -1793,6 +1798,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesAddr = 0;
                 sentDictBytesCapacity = 0;
                 sentDictBytesLen = 0;
+                sentDictCount = 0; // keep the mirror all-or-nothing (see close())
             }
             shutdownLatch.countDown();
             // Failed-stop hand-off (see delegateEngineClose): the owner could

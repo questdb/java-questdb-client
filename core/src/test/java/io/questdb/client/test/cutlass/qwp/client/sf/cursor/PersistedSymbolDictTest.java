@@ -229,6 +229,32 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testCloseNullsLoadedEntries() throws Exception {
+        // close() must null loadedEntriesAddr/Len after freeing them (like
+        // scratchAddr), so an accidental post-close read of the getters cannot
+        // dereference freed native memory. Pre-fix the pointer survived close()
+        // non-zero.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                d.appendSymbol("AAPL");
+                d.close();
+
+                // Reopen so recovery loads the entries into native memory.
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                Assert.assertTrue("recovery must load entries into native memory",
+                        re.loadedEntriesAddr() != 0L && re.loadedEntriesLen() > 0);
+                re.close();
+                Assert.assertEquals("close() must null loadedEntriesAddr", 0L, re.loadedEntriesAddr());
+                Assert.assertEquals("close() must null loadedEntriesLen", 0, re.loadedEntriesLen());
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testEmptySymbolRoundTrips() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
