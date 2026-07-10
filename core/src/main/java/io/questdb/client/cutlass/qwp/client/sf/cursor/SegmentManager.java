@@ -109,6 +109,14 @@ public final class SegmentManager implements QuietCloseable {
     // {@link #lock}; cleared with lock.notifyAll() so awaitRingQuiescence can
     // block until an in-flight pass for a just-deregistered ring finishes.
     private RingEntry inService;
+    // Number of threads currently parked in awaitRingQuiescence()'s wait
+    // loop. Guarded by {@link #lock}. The worker's per-pass finally block
+    // only calls lock.notifyAll() when this is > 0, so the steady-state
+    // production path (no quiescence barrier in flight) never notifies.
+    // Both sides mutate/check under the same lock, so there is no lost
+    // wakeup: a waiter that increments after the worker's check re-reads
+    // inService before waiting and sees the pass already finished.
+    private int quiescenceWaiters;
     private long lastDiskFullLogNs;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
@@ -284,18 +292,23 @@ public final class SegmentManager implements QuietCloseable {
         boolean interrupted = Thread.interrupted();
         try {
             synchronized (lock) {
-                while (inService != null && inService.ring == ring) {
-                    long remainingNanos = deadlineNanos - System.nanoTime();
-                    if (remainingNanos <= 0) {
-                        return false;
+                quiescenceWaiters++;
+                try {
+                    while (inService != null && inService.ring == ring) {
+                        long remainingNanos = deadlineNanos - System.nanoTime();
+                        if (remainingNanos <= 0) {
+                            return false;
+                        }
+                        try {
+                            // Round up so a sub-millisecond remainder still waits
+                            // instead of spinning through wait(0) == wait-forever.
+                            lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
+                        } catch (InterruptedException ignored) {
+                            interrupted = true;
+                        }
                     }
-                    try {
-                        // Round up so a sub-millisecond remainder still waits
-                        // instead of spinning through wait(0) == wait-forever.
-                        lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
-                    } catch (InterruptedException ignored) {
-                        interrupted = true;
-                    }
+                } finally {
+                    quiescenceWaiters--;
                 }
             }
             return true;
@@ -553,7 +566,14 @@ public final class SegmentManager implements QuietCloseable {
         } finally {
             synchronized (lock) {
                 inService = null;
-                lock.notifyAll();
+                // Wake quiescence barriers only when one is actually parked.
+                // In production no engine ever waits here (owned-manager
+                // close joins the worker thread instead), so the per-tick
+                // pass must not pay an unconditional notifyAll. notifyAll,
+                // not notify: distinct waiters may await different rings.
+                if (quiescenceWaiters > 0) {
+                    lock.notifyAll();
+                }
             }
         }
     }
