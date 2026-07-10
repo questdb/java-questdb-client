@@ -35,6 +35,7 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -123,6 +124,8 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // service pass for this engine's ring.
                 manager.setWorkerJoinTimeoutMillis(50L);
                 engine.close();
+                Assert.assertFalse("incomplete close must remain observable to the owner",
+                        engine.isCloseCompleted());
 
                 // The slot must still be locked: a replacement engine (or raw
                 // SlotLock) acquiring it now would race the stale worker.
@@ -145,6 +148,8 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // Retry close(): the barrier now succeeds and the full cleanup
                 // (ring, watermark, unlink, slot lock) must complete.
                 engine.close();
+                Assert.assertTrue("retried close must report complete cleanup",
+                        engine.isCloseCompleted());
                 engine = null;
 
                 try (SlotLock probe = SlotLock.acquire(slot)) {
@@ -175,6 +180,31 @@ public class CursorSendEngineSlotReacquisitionTest {
     }
 
     /**
+     * An engine that owns its manager must use the whole-manager stop/join as
+     * its only quiescence barrier. Calling the per-ring barrier first would
+     * give a stuck worker two independent timeout budgets.
+     */
+    @Test(timeout = 30_000L)
+    public void testOwnedManagerCloseSkipsPerRingQuiescenceWait() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = tmpDir + "/owned-slot";
+            CursorSendEngine engine = new CursorSendEngine(slot, 4L * 1024 * 1024);
+            SegmentManager manager = readManager(engine);
+            AtomicBoolean perRingAwaited = new AtomicBoolean();
+            try {
+                manager.setBeforeRingQuiescenceAwaitHook(() -> perRingAwaited.set(true));
+                engine.close();
+                Assert.assertTrue("owned engine close did not complete", engine.isCloseCompleted());
+                Assert.assertFalse("owned engine close spent a separate per-ring wait budget",
+                        perRingAwaited.get());
+            } finally {
+                manager.setBeforeRingQuiescenceAwaitHook(null);
+                engine.close();
+            }
+        });
+    }
+
+    /**
      * Plain-positive path: after a normal close (worker quiesces promptly),
      * a second engine must be able to acquire and use the same slot.
      */
@@ -192,6 +222,12 @@ public class CursorSendEngineSlotReacquisitionTest {
                 second.close();
             }
         });
+    }
+
+    private static SegmentManager readManager(CursorSendEngine engine) throws Exception {
+        Field field = CursorSendEngine.class.getDeclaredField("manager");
+        field.setAccessible(true);
+        return (SegmentManager) field.get(engine);
     }
 
     private static void rmDirRecursive(String dir) {

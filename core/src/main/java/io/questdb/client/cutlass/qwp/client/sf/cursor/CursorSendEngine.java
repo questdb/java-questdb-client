@@ -540,25 +540,26 @@ public final class CursorSendEngine implements QuietCloseable {
             // while that pass is in flight lets the stale worker unlink a
             // path that a replacement engine — which can acquire the slot
             // the moment the lock is released — is actively writing through:
-            // store-and-forward data loss after restart. Wait for confirmed
-            // quiescence before touching anything the worker can reach.
-            try {
-                workerQuiescent = manager.awaitRingQuiescence(ring);
-            } catch (Throwable ignored) {
-            }
+            // store-and-forward data loss after restart.
             if (ownsManager) {
+                // Stopping and reaping a private manager is a stronger barrier
+                // than waiting for this ring alone. Do it directly so a stuck
+                // worker consumes at most one workerJoinTimeoutMillis budget,
+                // rather than one here and a second one in manager.close().
                 try {
                     manager.close();
                 } catch (Throwable ignored) {
                 }
-                if (!workerQuiescent) {
-                    // manager.close() joins the worker; a reaped (or
-                    // never-started) worker is an even stronger barrier
-                    // than per-ring quiescence.
-                    try {
-                        workerQuiescent = manager.isWorkerReaped();
-                    } catch (Throwable ignored) {
-                    }
+                try {
+                    workerQuiescent = manager.isWorkerReaped();
+                } catch (Throwable ignored) {
+                }
+            } else {
+                // A shared manager must keep serving its other rings, so wait
+                // only for the deregistered ring's current pass to finish.
+                try {
+                    workerQuiescent = manager.awaitRingQuiescence(ring);
+                } catch (Throwable ignored) {
                 }
             }
             if (!workerQuiescent) {
@@ -611,6 +612,16 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
         }
+    }
+
+    /**
+     * Whether {@link #close()} completed all cleanup, including releasing the
+     * SF slot lock. A false value after close means manager-worker quiescence
+     * could not be confirmed and the worker-reachable resources were retained
+     * deliberately. Owners must not report or reuse the slot in that case.
+     */
+    public synchronized boolean isCloseCompleted() {
+        return closeCompleted;
     }
 
     /**

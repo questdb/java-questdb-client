@@ -278,10 +278,10 @@ public class QwpWebSocketSender implements Sender {
     private boolean ownsCursorEngine;
     private long pendingBytes;
     // Set true by close() once the SF slot flock has been released (the normal
-    // teardown path). Stays false if close() bailed early with the I/O thread
-    // still running -- then cursorEngine.close() never ran and the flock is
-    // still held, so the owning pool MUST keep the slot reserved rather than
-    // hand the still-locked dir to the next borrow ("sf slot already in use").
+    // teardown path). Stays false if an I/O or manager worker did not stop and
+    // cursorEngine retained the flock, so the owning pool MUST keep the slot
+    // reserved rather than hand the still-locked dir to the next borrow
+    // ("sf slot already in use").
     private boolean slotLockReleased;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
@@ -1038,7 +1038,10 @@ public class QwpWebSocketSender implements Sender {
      *       replaying frames get a 2.5s grace window plus a 0.5s stop window
      *       — worst case ~3s when a drainer sits in a blocking native
      *       connect (15s background deadline) and must be abandoned to exit
-     *       on its own.</li>
+     *       on its own;</li>
+     *   <li>SF manager stop: normally immediate, bounded by 5s when its worker
+     *       is stuck in a filesystem operation. On timeout the slot remains
+     *       locked rather than being exposed to a stale worker.</li>
      * </ul>
      */
     @Override
@@ -1189,15 +1192,23 @@ public class QwpWebSocketSender implements Sender {
                 // the failed close() and now — then closing here is safe.
                 if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null
                         && !cursorSendLoop.delegateEngineClose()) {
+                    CursorSendEngine engine = cursorEngine;
                     try {
-                        cursorEngine.close();
+                        engine.close();
                     } catch (Throwable t) {
                         LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
                         terminalError = captureCloseError(terminalError, t);
                     }
-                    cursorEngine = null;
-                    ownsCursorEngine = false;
-                    slotLockReleased = true;
+                    if (engine.isCloseCompleted()) {
+                        cursorEngine = null;
+                        ownsCursorEngine = false;
+                        slotLockReleased = true;
+                    } else {
+                        // Preserve the engine and report the retained flock.
+                        // Sender.close() is idempotent, so this is a deliberate
+                        // safe leak until process exit rather than a retry path.
+                        slotLockReleased = false;
+                    }
                 }
                 rethrowTerminal(terminalError);
                 return;
@@ -1231,19 +1242,27 @@ public class QwpWebSocketSender implements Sender {
             }
 
             if (ownsCursorEngine && cursorEngine != null) {
+                CursorSendEngine engine = cursorEngine;
                 try {
-                    cursorEngine.close();
+                    engine.close();
                 } catch (Throwable t) {
                     LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
                     terminalError = captureCloseError(terminalError, t);
                 }
-                cursorEngine = null;
-                ownsCursorEngine = false;
+                if (engine.isCloseCompleted()) {
+                    cursorEngine = null;
+                    ownsCursorEngine = false;
+                    slotLockReleased = true;
+                } else {
+                    // The manager worker did not quiesce. Preserve ownership
+                    // and report the retained flock so pools retire this slot.
+                    // Repeated Sender.close() calls remain no-ops by contract.
+                    slotLockReleased = false;
+                }
+            } else {
+                // This sender owns no cursor engine holding an SF flock.
+                slotLockReleased = true;
             }
-            // Past the ioThreadStopped guard => cursorEngine.close() ran and
-            // released the SF flock in its finally (or this sender owned no
-            // engine holding one). Signal the pool it may reuse the slot.
-            slotLockReleased = true;
 
             // Shutdown order: dispatcher last, after the I/O loop has stopped
             // producing into it. close() drains pending entries with a short
@@ -1288,9 +1307,9 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * True once {@link #close()} has released the store-and-forward slot
-     * flock. False means close() leaked the still-running I/O thread (and its
-     * resources), so the flock is still held; the owning pool must keep the
-     * slot index reserved instead of reusing the still-locked slot dir.
+     * flock. False means an I/O or manager worker did not stop and close()
+     * retained the lock and worker-reachable resources; the owning pool must
+     * keep the slot index reserved instead of reusing the still-locked dir.
      */
     public boolean isSlotLockReleased() {
         return slotLockReleased;

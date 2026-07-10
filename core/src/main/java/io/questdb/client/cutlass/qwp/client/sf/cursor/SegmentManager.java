@@ -93,6 +93,10 @@ public final class SegmentManager implements QuietCloseable {
     // but before ownership/accounting commit. Callers may inject a deregister
     // or hold this stale worker snapshot while caller-side cleanup runs.
     private volatile Runnable beforeInstallSyncHook;
+    // Test seam: records entry into the per-ring quiescence wait. Null in
+    // production; owned-engine close tests use it to prove they take only the
+    // stronger whole-manager join path, not two sequential timeout budgets.
+    private volatile Runnable beforeRingQuiescenceAwaitHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
@@ -268,6 +272,10 @@ public final class SegmentManager implements QuietCloseable {
      * mirroring {@link #close()}.
      */
     public boolean awaitRingQuiescence(SegmentRing ring) {
+        Runnable hook = beforeRingQuiescenceAwaitHook;
+        if (hook != null) {
+            hook.run();
+        }
         Thread t = workerThread;
         if (t == null || t == Thread.currentThread()) {
             return true;
@@ -408,6 +416,11 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public void setBeforeInstallSyncHook(Runnable hook) {
         this.beforeInstallSyncHook = hook;
+    }
+
+    @TestOnly
+    public void setBeforeRingQuiescenceAwaitHook(Runnable hook) {
+        this.beforeRingQuiescenceAwaitHook = hook;
     }
 
     @TestOnly
