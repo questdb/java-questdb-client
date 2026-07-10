@@ -27,8 +27,11 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -180,6 +183,120 @@ public class CursorSendEngineSlotReacquisitionTest {
     }
 
     /**
+     * Owned-manager twin of {@link #testCloseRetainsSlotWhileWorkerIsMidServicePass}:
+     * the ONLY construction shape production uses (Sender.build, BackgroundDrainer,
+     * QwpWebSocketSender.connect all own their manager). The owned close path does
+     * not run the per-ring barrier at all — it relies on {@code manager.close()}'s
+     * bounded join and the {@code isWorkerReaped()} check. If that check regressed
+     * to report quiescence unconditionally (or {@code isWorkerReaped()} itself
+     * returned true while the worker is alive), close() would release the slot
+     * lock mid service pass and the shared-manager tests would stay green — this
+     * test is the red gate for the production path.
+     * <p>
+     * Determinism: the owned manager starts inside the engine ctor (1 ms poll),
+     * so its first spare-install pass races test setup. We first wait until the
+     * initial hot spare is installed — after that the worker cannot enter another
+     * install pass until a rotation consumes the spare, so the park hook installed
+     * afterwards can neither be missed nor fire early. Two appends then fill the
+     * active segment and rotate onto the spare; the worker's next poll tick
+     * re-enters the install pass and parks in the hook.
+     */
+    @Test(timeout = 30_000L)
+    public void testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + payloadLen);
+            String slot = tmpDir + "/owned-parked-slot";
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Production shape: private, owned manager (ownsManager=true).
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            SegmentManager manager = readManager(engine);
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Phase 1: let the worker finish the initial spare install so
+                // the hook below can only fire on the rotation-triggered pass.
+                SegmentRing ring = readRing(engine);
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (ring.needsHotSpare()) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("manager worker never installed the initial hot spare");
+                    }
+                    Thread.sleep(1);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+
+                // Phase 2: one frame fills the active segment exactly; the
+                // second forces rotation onto the spare. needsHotSpare() is
+                // true again, so the worker's next tick parks in the hook.
+                Unsafe.getUnsafe().putLong(buf, 0L);
+                Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertTrue("worker never re-entered a spare-install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Phase 3: owned close with the worker provably mid service
+                // pass. manager.close()'s 50 ms join times out, the worker is
+                // not reaped, and close() must retain every worker-reachable
+                // resource — above all the slot flock.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                engine.close();
+                Assert.assertFalse("incomplete owned close must remain observable to the owner",
+                        engine.isCloseCompleted());
+                try {
+                    SlotLock probe = SlotLock.acquire(slot);
+                    probe.close();
+                    Assert.fail("owned engine.close() released the slot lock while its manager "
+                            + "worker was still mid service pass — a replacement engine could "
+                            + "acquire the slot and have its segment files unlinked by the "
+                            + "stale worker (the production SF-data-loss hazard)");
+                } catch (Exception expected) {
+                    // good — slot retained.
+                }
+
+                // Phase 4: release the worker (it abandons the spare: the ring
+                // was deregistered by the close attempt) and retry. The join
+                // now reaps the worker and the full cleanup must complete.
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                engine.close();
+                Assert.assertTrue("retried owned close must report complete cleanup",
+                        engine.isCloseCompleted());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after a completed close", probe);
+                } catch (Exception e) {
+                    throw new AssertionError("retried owned close() did not release the slot lock", e);
+                }
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
      * An engine that owns its manager must use the whole-manager stop/join as
      * its only quiescence barrier. Calling the per-ring barrier first would
      * give a stuck worker two independent timeout budgets.
@@ -228,6 +345,12 @@ public class CursorSendEngineSlotReacquisitionTest {
         Field field = CursorSendEngine.class.getDeclaredField("manager");
         field.setAccessible(true);
         return (SegmentManager) field.get(engine);
+    }
+
+    private static SegmentRing readRing(CursorSendEngine engine) throws Exception {
+        Field field = CursorSendEngine.class.getDeclaredField("ring");
+        field.setAccessible(true);
+        return (SegmentRing) field.get(engine);
     }
 
     private static void rmDirRecursive(String dir) {
