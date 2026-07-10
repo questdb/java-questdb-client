@@ -43,6 +43,7 @@ import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -513,6 +514,255 @@ public class CursorSendEngineSlotReacquisitionTest {
                 Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
                 manager.setBeforeInstallSyncHook(null);
                 manager.setBeforeExitCleanupRegistrationHook(null);
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
+     * Exactly-once contention on the terminal-cleanup claim
+     * ({@code terminalCleanupClaimed} CAS): after a timed-out owned close
+     * handed cleanup to the worker's exit path, a retried {@code close()}
+     * that races the worker MID-{@code finishClose} must neither re-run the
+     * terminal cleanup (double munmap / double flock release) nor block on
+     * the worker, nor publish completion on the worker's behalf. The race
+     * window is made deterministic by parking the worker inside
+     * {@code finishClose} (via {@code beforeFlockReleaseHook}) while the
+     * retried close() converges through {@code isWorkerReaped()} and loses
+     * the CAS.
+     */
+    @Test(timeout = 30_000L)
+    public void testTerminalCleanupRunsExactlyOnceWhenRetriedCloseRacesWorkerHandoff() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + payloadLen);
+            String slot = tmpDir + "/cas-contention-slot";
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            CountDownLatch inFinishClose = new CountDownLatch(1);
+            CountDownLatch releaseFinishClose = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicInteger finishCloseRuns = new AtomicInteger();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Production shape: private, owned manager (ownsManager=true).
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            SegmentManager manager = readManager(engine);
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Phase 1: wait out the initial spare install so the park hook
+                // can only fire on the rotation-triggered pass.
+                SegmentRing ring = readRing(engine);
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (ring.needsHotSpare()) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("manager worker never installed the initial hot spare");
+                    }
+                    Thread.sleep(1);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                // Counts terminal-cleanup executions and parks the FIRST one
+                // (the worker's deferred cleanup) mid-finishClose, before the
+                // flock release — the exact window a retried close() races.
+                engine.setBeforeFlockReleaseHook(() -> {
+                    if (finishCloseRuns.incrementAndGet() == 1) {
+                        inFinishClose.countDown();
+                        try {
+                            if (!releaseFinishClose.await(20, TimeUnit.SECONDS)) {
+                                hookErr.compareAndSet(null, new AssertionError(
+                                        "timed out waiting for test to release finishClose"));
+                            }
+                        } catch (Throwable t) {
+                            hookErr.compareAndSet(null, t);
+                        }
+                    }
+                });
+
+                // Phase 2: rotate onto the spare so the worker parks in the
+                // next install pass.
+                Unsafe.getUnsafe().putLong(buf, 0L);
+                Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertTrue("worker never re-entered a spare-install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Phase 3: timed-out close — cleanup ownership transfers to
+                // the worker's exit path.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                engine.close();
+                Assert.assertFalse("close must stay incomplete while the worker holds the handoff",
+                        engine.isCloseCompleted());
+
+                // Phase 4: release the pass. The worker exits its loop, wins
+                // the cleanup CAS, enters finishClose and parks in the hook —
+                // mid-cleanup, flock still held, completion unpublished.
+                releaseWorker.countDown();
+                Assert.assertTrue("worker never entered the deferred finishClose",
+                        inFinishClose.await(10, TimeUnit.SECONDS));
+                Assert.assertEquals(1, finishCloseRuns.get());
+                Assert.assertFalse("completion must not be observable mid-finishClose",
+                        engine.isCloseCompleted());
+
+                // Phase 5 — the contention under test: a retried close() while
+                // the worker is parked INSIDE finishClose. The worker loop has
+                // already exited (workerLoopExited=true precedes the deferred
+                // cleanups), so the short bounded join reaps the manager state
+                // and close() converges to the CAS — which it must LOSE,
+                // returning promptly without touching ring/watermark/flock.
+                engine.close();
+                Assert.assertEquals(
+                        "retried close() re-ran the terminal cleanup while the worker's "
+                                + "deferred cleanup was mid-flight — ring/watermark/flock would "
+                                + "be double-released",
+                        1, finishCloseRuns.get());
+                Assert.assertFalse("retried close() must not publish completion on the worker's behalf",
+                        engine.isCloseCompleted());
+                try {
+                    SlotLock probe = SlotLock.acquire(slot);
+                    probe.close();
+                    Assert.fail("slot lock observable as released while the worker was still "
+                            + "parked before its flock release");
+                } catch (Exception expected) {
+                    // good — flock still held by the parked cleanup.
+                }
+
+                // Phase 6: let the worker finish. Completion publishes, the
+                // slot becomes acquirable, and the cleanup count stays at 1.
+                releaseFinishClose.countDown();
+                long cleanupDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!engine.isCloseCompleted()) {
+                    if (System.nanoTime() > cleanupDeadlineNs) {
+                        throw new AssertionError("deferred cleanup never completed after release");
+                    }
+                    Thread.sleep(1);
+                }
+                Assert.assertEquals(1, finishCloseRuns.get());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after the worker-exit cleanup", probe);
+                }
+                // A final close() takes the fast no-op path.
+                engine.close();
+                Assert.assertEquals("post-completion close() must be a no-op",
+                        1, finishCloseRuns.get());
+                if (hookErr.get() != null) {
+                    throw new AssertionError("hook failed", hookErr.get());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                manager.setBeforeInstallSyncHook(null);
+                engine.setBeforeFlockReleaseHook(null);
+                releaseWorker.countDown();
+                releaseFinishClose.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
+     * Memory-mode twin of {@link #testOwnedEngineCloseHandsCleanupToWorkerExit}:
+     * {@code sfDir == null}, so there is no slot lock, no watermark and no
+     * segment files — but the ring's malloc'd native segments are still
+     * worker-reachable, so the timed-out close must take the same handoff
+     * path with every SF-only resource null. Pins that (a) the handoff
+     * branch tolerates null slotLock/watermark/sfDir without NPE, (b) the
+     * close stays incomplete while the worker can still touch the ring, and
+     * (c) the worker-exit cleanup completes the close and frees the ring's
+     * native memory (assertMemoryLeak is the leak oracle here).
+     */
+    @Test(timeout = 30_000L)
+    public void testMemoryModeOwnedCloseHandsCleanupToWorkerExit() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + payloadLen);
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Memory mode: null sfDir, private owned manager — the exact
+            // shape non-SF async ingest uses.
+            CursorSendEngine engine = new CursorSendEngine(null, segSize);
+            SegmentManager manager = readManager(engine);
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Phase 1: wait out the initial spare install so the park hook
+                // can only fire on the rotation-triggered pass.
+                SegmentRing ring = readRing(engine);
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (ring.needsHotSpare()) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("manager worker never installed the initial hot spare");
+                    }
+                    Thread.sleep(1);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+
+                // Phase 2: rotate onto the spare; the worker's next tick
+                // re-enters the (in-memory) install pass and parks.
+                Unsafe.getUnsafe().putLong(buf, 0L);
+                Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertTrue("worker never re-entered a spare-install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Phase 3: timed-out memory-mode close. The worker can still
+                // touch the ring's native memory, so the close must hand off
+                // and stay incomplete — releasing the ring here would be a
+                // use-after-free on the worker's install path.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                engine.close();
+                Assert.assertFalse(
+                        "memory-mode close must stay incomplete while the worker is mid service pass",
+                        engine.isCloseCompleted());
+
+                // Phase 4: release the worker; its exit path must run the
+                // deferred cleanup (null slotLock/watermark/sfDir) and flip
+                // completion with no further caller action.
+                releaseWorker.countDown();
+                long cleanupDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!engine.isCloseCompleted()) {
+                    if (System.nanoTime() > cleanupDeadlineNs) {
+                        throw new AssertionError(
+                                "deferred memory-mode cleanup never ran on manager-worker exit — "
+                                        + "the ring's native segments would leak for the process lifetime");
+                    }
+                    Thread.sleep(1);
+                }
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                manager.setBeforeInstallSyncHook(null);
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                 try {

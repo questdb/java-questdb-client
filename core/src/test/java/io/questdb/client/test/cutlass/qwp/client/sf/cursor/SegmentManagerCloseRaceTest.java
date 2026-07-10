@@ -205,6 +205,224 @@ public class SegmentManagerCloseRaceTest {
     }
 
     /**
+     * Pins the claim-time registration gate at the top of
+     * {@code SegmentManager.serviceRing}: a snapshot entry whose ring was
+     * deregistered BEFORE the worker claims it must be skipped entirely —
+     * never claimed as {@code inService}, never handed to
+     * {@code serviceRing0}. This is the exact guarantee
+     * {@code CursorSendEngine.close()} relies on when it releases the ring,
+     * watermark and slot flock right after
+     * {@code awaitRingQuiescence(ring) == true}: the deregistering thread may
+     * already be freeing those resources, so a stale snapshot entry must not
+     * be touched at all (spare install, watermark write, drainTrimmable, or
+     * path building under the slot dir).
+     * <p>
+     * Deterministic shape: three rings A, B, C registered before start, so
+     * the worker's first snapshot is exactly [A, B, C]. The worker parks in
+     * A's spare-install pass; while it is parked, B is deregistered (and a
+     * quiescence barrier for B must pass immediately — no pass for B is in
+     * flight). After release the worker walks the rest of its stale
+     * snapshot: it must skip B and service C. Every serviced ring is
+     * recorded from inside the worker's own pass (via the trim-sync hook
+     * reading {@code inService}), so the assertion is exact — no timing
+     * grace, no sleeps.
+     */
+    @Test(timeout = 15_000L)
+    public void testStaleSnapshotEntrySkippedAfterDeregisterBeforeServiceClaim() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentRing[] rings = new SegmentRing[3];
+            String[] slots = new String[3];
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Rings the worker actually claimed and serviced, recorded from
+            // the worker thread itself at the trim-sync point every service
+            // pass reaches (spare needed or not).
+            java.util.Set<Object> serviced =
+                    java.util.Collections.synchronizedSet(
+                            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+            boolean managerClosed = false;
+            try {
+                for (int i = 0; i < 3; i++) {
+                    slots[i] = tmpDir + "/claim-skip-slot-" + i;
+                    Assert.assertEquals(0, Files.mkdir(slots[i], Files.DIR_MODE_DEFAULT));
+                    MmapSegment initial = MmapSegment.create(
+                            slots[i] + "/sf-initial.sfa", 0L, segSize);
+                    rings[i] = new SegmentRing(initial, segSize);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.setBeforeTrimSyncHook(() -> {
+                    try {
+                        Object ring = readInServiceRing(manager);
+                        if (ring != null) {
+                            serviced.add(ring);
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                // Register all three BEFORE start: the worker's first snapshot
+                // is [A, B, C] and every fresh ring wants a hot spare, so the
+                // install hook parks the worker inside A's pass.
+                manager.register(rings[0], slots[0]);
+                manager.register(rings[1], slots[1]);
+                manager.register(rings[2], slots[2]);
+                manager.start();
+                Assert.assertTrue("worker did not reach A's install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // B is deregistered while its snapshot entry is still ahead of
+                // the worker's cursor. The quiescence barrier must pass at
+                // once: the in-flight pass is A's, not B's — this is the state
+                // in which an engine owner frees B's resources.
+                manager.deregister(rings[1]);
+                Assert.assertTrue("no pass for B is in flight — the barrier must pass immediately",
+                        manager.awaitRingQuiescence(rings[1]));
+
+                releaseWorker.countDown();
+
+                // Positive marker that the worker walked PAST B's snapshot
+                // slot: C sits after B in the same snapshot, so once C has
+                // been serviced, B's claim-or-skip decision has been made.
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!serviced.contains(rings[2])) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("worker never serviced ring C after release");
+                    }
+                    Thread.sleep(1);
+                }
+
+                Assert.assertTrue("ring A must have been serviced", serviced.contains(rings[0]));
+                Assert.assertFalse(
+                        "worker claimed and serviced a snapshot entry that was deregistered "
+                                + "before its pass started — the deregistering thread may already "
+                                + "be releasing the ring/watermark/slot lock, so a stale snapshot "
+                                + "entry must be skipped at claim time",
+                        serviced.contains(rings[1]));
+                // Defense in depth: nothing may have been installed into the
+                // deregistered ring either.
+                Assert.assertNull("no hot spare may be installed into a deregistered ring",
+                        readHotSpare(rings[1]));
+
+                manager.close();
+                managerClosed = true;
+                if (hookErr.get() != null) {
+                    throw new AssertionError("worker-side hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeTrimSyncHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    manager.close();
+                }
+                for (SegmentRing ring : rings) {
+                    if (ring != null) {
+                        ring.close();
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Pins the scratch-handoff half of the timed-out-close contract in
+     * isolation: after {@code close()} gives up on the bounded join and hands
+     * {@code pathScratch} ownership to the worker, the WORKER's exit block
+     * alone must free the native buffer — with no retried {@code close()}
+     * ever running. The sibling test
+     * ({@link #testCloseDoesNotFreePathScratchWhenWorkerStillAlive}) retries
+     * {@code close()} before asserting the free, so a regression that dropped
+     * the worker-side free (leaving reclaim to a retry nobody is required to
+     * make) would stay green there: production owners do NOT retry — a
+     * timed-out close returns to the pool and the worker is the only thread
+     * left that can reclaim the allocation.
+     */
+    @Test(timeout = 15_000L)
+    public void testWorkerAloneFreesPathScratchAfterTimedOutClose() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/worker-frees-scratch-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            try {
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Timed-out close: hands scratch ownership to the worker and
+                // returns. This is the last close() call this test makes.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                manager.close();
+                Thread worker = readWorkerThread(manager);
+                Assert.assertTrue("worker must still be live after the timed-out close",
+                        worker != null && worker.isAlive());
+                Assert.assertTrue("scratch must still be allocated while the worker may use it",
+                        readPathScratchImpl(manager) != 0L);
+
+                // Release the pass. running=false already, so the worker
+                // finishes the pass and exits — its exit block must free the
+                // handed-over scratch buffer without ANY further caller action.
+                releaseWorker.countDown();
+                worker.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("worker never exited after release", worker.isAlive());
+                Assert.assertEquals(
+                        "worker exit block must free the handed-over path scratch — no retried "
+                                + "close() runs in production after a timed-out close, so leaving "
+                                + "the free to a retry leaks the native buffer for the process "
+                                + "lifetime",
+                        0L, readPathScratchImpl(manager));
+
+                // Reap the dead thread for tidiness; must not double-free.
+                manager.close();
+                Assert.assertNull("retried close must reap the exited worker",
+                        readWorkerThread(manager));
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                manager.close();
+                ring.close();
+            }
+        });
+    }
+
+    /**
      * Pins the {@link SegmentManager#deferUntilWorkerExit} handoff contract
      * that {@code CursorSendEngine.close()}'s slot-ownership transfer depends
      * on:
@@ -471,6 +689,24 @@ public class SegmentManagerCloseRaceTest {
         } finally {
             Files.findClose(find);
         }
+    }
+
+    private static Object readHotSpare(SegmentRing ring) throws Exception {
+        Field f = SegmentRing.class.getDeclaredField("hotSpare");
+        f.setAccessible(true);
+        return f.get(ring);
+    }
+
+    private static Object readInServiceRing(SegmentManager manager) throws Exception {
+        Field inServiceF = SegmentManager.class.getDeclaredField("inService");
+        inServiceF.setAccessible(true);
+        Object entry = inServiceF.get(manager);
+        if (entry == null) {
+            return null;
+        }
+        Field ringF = entry.getClass().getDeclaredField("ring");
+        ringF.setAccessible(true);
+        return ringF.get(entry);
     }
 
     private static long readPathScratchImpl(SegmentManager manager) throws Exception {

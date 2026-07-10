@@ -32,12 +32,14 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -170,6 +172,70 @@ public class EngineClosePublishAfterFlockReleaseTest {
             } catch (IllegalStateException stillHeld) {
                 fail("closeCompleted reported true but the slot flock is still held: "
                         + stillHeld.getMessage());
+            }
+        });
+    }
+
+    /**
+     * The error half of the publish-after-release contract: when
+     * {@code SlotLock.release()} reports failure (the OS refused the fd
+     * close, so the flock may still be held), {@code closeCompleted} must
+     * NEVER be published — not by the failing close(), and not by a retried
+     * close() either (the terminal-cleanup claim is already consumed; the
+     * design deliberately leaves an unconfirmed release to the kernel's
+     * process-exit cleanup rather than risking a double release). A pool
+     * observing {@code isCloseCompleted() == false} keeps the slot retired,
+     * which is exactly right: the flock genuinely is still held.
+     * <p>
+     * {@code Files.close} cannot be made to fail through the public API, so
+     * the lock's fd is swapped to a known-bad descriptor for the close and
+     * restored (and released for real) afterwards.
+     */
+    @Test(timeout = 30_000L)
+    public void testUnconfirmedFlockReleaseKeepsCloseIncomplete() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine engine = new CursorSendEngine(sfDir, 4L * 1024 * 1024);
+            Field slotLockField = CursorSendEngine.class.getDeclaredField("slotLock");
+            slotLockField.setAccessible(true);
+            SlotLock slotLock = (SlotLock) slotLockField.get(engine);
+            assertNotNull("disk-mode engine must hold a slot lock", slotLock);
+            Field fdField = SlotLock.class.getDeclaredField("fd");
+            fdField.setAccessible(true);
+            int realFd = fdField.getInt(slotLock);
+            assertTrue("precondition: live flock fd", realFd >= 0);
+            try {
+                // A non-negative fd no process has open: close(2) fails EBADF,
+                // so finishClose's release() confirmation fails.
+                fdField.setInt(slotLock, 1_000_000_000);
+                engine.close();
+                assertFalse(
+                        "closeCompleted was published despite an unconfirmed flock release; "
+                                + "a pool observing this would free the slot index while the "
+                                + "flock fd is still open",
+                        engine.isCloseCompleted());
+                // The REAL flock is still held — the incomplete report is true.
+                try {
+                    SlotLock probe = SlotLock.acquire(sfDir);
+                    probe.close();
+                    fail("slot must not be acquirable while the original flock fd is still open");
+                } catch (IllegalStateException expected) {
+                    // good — incomplete close really means "still locked".
+                }
+                // A retried close() must neither throw nor re-run the terminal
+                // cleanup (the claim is consumed) nor suddenly report success.
+                engine.close();
+                assertFalse("retried close() must not fabricate completion after a failed "
+                                + "flock release — the claim is consumed and the kernel owns "
+                                + "the eventual cleanup",
+                        engine.isCloseCompleted());
+            } finally {
+                // Undo the fault and drop the real flock so the test leaves no
+                // open fd behind (in production the kernel does this at exit).
+                fdField.setInt(slotLock, realFd);
+                assertTrue("restored fd must release cleanly", slotLock.release());
+            }
+            try (SlotLock ignored = SlotLock.acquire(sfDir)) {
+                // good — with the flock genuinely dropped, the slot is reusable.
             }
         });
     }

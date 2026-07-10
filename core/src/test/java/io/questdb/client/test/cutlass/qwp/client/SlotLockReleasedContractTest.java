@@ -24,10 +24,13 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
@@ -305,6 +308,162 @@ public class SlotLockReleasedContractTest {
         });
     }
 
+    /**
+     * Delegated-I/O-close recovery path: when {@code close()} bails early
+     * because the I/O thread refuses to stop, the engine close is delegated
+     * to that thread's exit path ({@code delegateEngineClose()} returned
+     * true) and the sender must retain the engine for re-probing —
+     * {@code isSlotLockReleased()} stays false while the thread lives, then
+     * flips true the moment the thread's exit path completes the engine
+     * close and releases the flock. Pre-fix, this branch discarded the
+     * engine reference, so the late release was permanently invisible to a
+     * pool that had retired the slot. The existing forged I/O-refusal test
+     * can never reach this branch: its sabotaged loop throws from
+     * {@code delegateEngineClose()} itself (nulled latch), before the
+     * retained-engine assignment.
+     * <p>
+     * The wedge is the same deterministic one CursorWebSocketSendLoop's C5
+     * test uses: the I/O thread sits in a blocking "connect" (a
+     * ReconnectFactory immune to unpark, never interrupted by loop.close()),
+     * and the closer thread's pre-set interrupt flag makes
+     * {@code shutdownLatch.await()} throw immediately — the real production
+     * path to {@code ioThreadStopped = false}.
+     */
+    @Test(timeout = 30_000L)
+    public void testDelegatedIoThreadEngineCloseFlipsSlotLockReleased() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                    "qdb-slot-lock-delegated-" + System.nanoTime()).toString();
+            Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
+            String slot = tmpDir + "/slot";
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+            final CountDownLatch enteredConnect = new CountDownLatch(1);
+            final CountDownLatch releaseConnect = new CountDownLatch(1);
+            final AtomicReference<Thread> ioThreadRef = new AtomicReference<>();
+            final StubWebSocketClient stubClient = new StubWebSocketClient();
+            // Healthy owned manager: once the wedged I/O thread is released,
+            // its exit-path engine.close() completes normally and releases
+            // the flock — the flip this test pins.
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            CursorWebSocketSendLoop loop = null;
+            QwpWebSocketSender wss = null;
+            try {
+                // Stand-in for a blocking native connect(2): entered by the
+                // loop's I/O thread, immune to unpark, never interrupted by
+                // loop.close().
+                CursorWebSocketSendLoop.ReconnectFactory stuckConnect = () -> {
+                    ioThreadRef.set(Thread.currentThread());
+                    enteredConnect.countDown();
+                    releaseConnect.await();
+                    return stubClient;
+                };
+                loop = new CursorWebSocketSendLoop(
+                        null /* async-initial-connect: the I/O thread drives the connect */,
+                        engine, 0L, 1_000L,
+                        stuckConnect,
+                        5_000L, 100L, 5_000L, false);
+                loop.start();
+                Assert.assertTrue("I/O thread never reached the connect factory",
+                        enteredConnect.await(5, TimeUnit.SECONDS));
+
+                wss = QwpWebSocketSender.createForTesting("localhost", 1);
+                wss.setCursorEngine(engine, true);
+                setField(wss, "cursorSendLoop", loop);
+
+                // Drive the real early-bail close() on a thread whose pending
+                // interrupt lands in loop.close()'s shutdownLatch.await().
+                AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+                QwpWebSocketSender wssRef = wss;
+                Thread closer = new Thread(() -> {
+                    Thread.currentThread().interrupt();
+                    try {
+                        wssRef.close();
+                    } catch (Throwable t) {
+                        closeFailure.set(t);
+                    }
+                }, "delegated-close-closer");
+                closer.setDaemon(true);
+                closer.start();
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("closer thread did not finish", closer.isAlive());
+                Assert.assertNotNull("close() must surface the failed I/O-thread stop",
+                        closeFailure.get());
+
+                // The I/O thread is still wedged: the flock is retained and
+                // must be reported retained.
+                Assert.assertFalse(
+                        "isSlotLockReleased() must be false while the delegated engine "
+                                + "close is pending on the wedged I/O thread",
+                        wss.isSlotLockReleased());
+                Assert.assertFalse("engine close must not have run yet",
+                        engine.isCloseCompleted());
+                try {
+                    SlotLock probe = SlotLock.acquire(slot);
+                    probe.close();
+                    Assert.fail("slot became acquirable while the delegated engine close "
+                            + "was still pending");
+                } catch (Exception expected) {
+                    // good — the flock is genuinely held.
+                }
+
+                // Un-wedge the connect. The I/O thread exits; its exit path
+                // runs the delegated engine.close(), which releases the flock.
+                releaseConnect.countDown();
+                Thread ioThread = ioThreadRef.get();
+                Assert.assertNotNull(ioThread);
+                ioThread.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("I/O thread did not exit after the connect returned",
+                        ioThread.isAlive());
+
+                // The recovery contract under test: the getter re-probes the
+                // retained engine, so the late release MUST become visible —
+                // this is what lets SenderPool recover the retired slot.
+                Assert.assertTrue("delegated engine close must have completed on the "
+                                + "I/O thread's exit path",
+                        engine.isCloseCompleted());
+                Assert.assertTrue(
+                        "isSlotLockReleased() must flip true once the delegated engine "
+                                + "close released the flock — otherwise the pool retires the "
+                                + "slot's capacity until process exit",
+                        wss.isSlotLockReleased());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after the delegated close", probe);
+                }
+            } finally {
+                releaseConnect.countDown();
+                // Reap the loop's bookkeeping now that the I/O thread is gone
+                // (close() threw mid-teardown, so ioThread was left set).
+                Thread.interrupted();
+                if (loop != null) {
+                    try {
+                        loop.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (engine != null && !engine.isCloseCompleted()) {
+                    try {
+                        engine.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                // The early-return close() deliberately leaked the resources
+                // the (then-running) I/O thread might touch; free the same set
+                // the post-guard tail would have freed.
+                if (wss != null) {
+                    freeFieldQuietly(wss, "buffer0");
+                    freeFieldQuietly(wss, "buffer1");
+                    freeFieldQuietly(wss, "client");
+                    freeFieldQuietly(wss, "errorDispatcher");
+                    freeFieldQuietly(wss, "progressDispatcher");
+                    freeFieldQuietly(wss, "connectionDispatcher");
+                }
+                stubClient.close();
+                rmDirRecursive(tmpDir);
+                Files.remove(tmpDir);
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ utils
 
     private static void freeFieldQuietly(Object target, String name) {
@@ -368,6 +527,28 @@ public class SlotLockReleasedContractTest {
             }
         }
         throw new NoSuchFieldException(name);
+    }
+
+    /**
+     * Minimal concrete {@link WebSocketClient} — never performs I/O. Handed
+     * to the loop by the stuck-connect factory; the loop's exit path closes
+     * it (close is idempotent via the superclass).
+     */
+    private static final class StubWebSocketClient extends WebSocketClient {
+
+        StubWebSocketClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+            throw new UnsupportedOperationException("stub: no socket");
+        }
+
+        @Override
+        protected void setupIoWait() {
+            // no-op
+        }
     }
 
     /** ACKs every binary frame with a running sequence so flush/close drain cleanly. */

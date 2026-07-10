@@ -34,6 +34,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -116,6 +117,54 @@ public class SlotLockTest {
             // close() after release() is a safe no-op (QuietCloseable path).
             lock.close();
             // Confirmed release means the slot is genuinely acquirable.
+            try (SlotLock again = SlotLock.acquire(slot)) {
+                assertEquals(slot, again.slotDir());
+            }
+        });
+    }
+
+    /**
+     * The {@code release() == false} branch: when the OS reports a close
+     * failure, release must (a) return {@code false} so owners gating a
+     * "slot reusable" signal never see a lie, (b) RETAIN the fd — forgetting
+     * it would misreport the lock state and forfeit any later retry — and
+     * (c) keep returning {@code false} on repeat attempts while the failure
+     * persists. Once the close succeeds, release confirms and stays
+     * confirmed. {@code Files.close} cannot be made to fail through the
+     * public API, so the fd is swapped to a known-bad descriptor and
+     * restored afterwards.
+     */
+    @Test
+    public void testFailedCloseRetainsFdAndReportsFalse() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-release";
+            SlotLock lock = SlotLock.acquire(slot);
+            java.lang.reflect.Field fdField = SlotLock.class.getDeclaredField("fd");
+            fdField.setAccessible(true);
+            int realFd = fdField.getInt(lock);
+            assertTrue("precondition: acquire must hold a live fd", realFd >= 0);
+            try {
+                // A non-negative fd no process has open: close(2) fails EBADF.
+                fdField.setInt(lock, 1_000_000_000);
+                assertFalse("release must report false when the OS close fails",
+                        lock.release());
+                assertEquals("failed release must retain the fd for a retry — "
+                                + "dropping it would misreport the flock as released",
+                        1_000_000_000, fdField.getInt(lock));
+                assertFalse("repeat release must keep reporting false while the failure persists",
+                        lock.release());
+                // While the release is unconfirmed the REAL flock is still
+                // held — a second acquire on the slot must fail.
+                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                    fail("slot must not be acquirable while the original flock fd is still open");
+                } catch (IllegalStateException expected) {
+                    // good — unconfirmed release really means "still locked".
+                }
+            } finally {
+                fdField.setInt(lock, realFd);
+            }
+            assertTrue("release must confirm once the close succeeds", lock.release());
+            assertTrue("confirmed release must stay confirmed", lock.release());
             try (SlotLock again = SlotLock.acquire(slot)) {
                 assertEquals(slot, again.slotDir());
             }
