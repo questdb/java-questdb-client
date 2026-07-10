@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -238,6 +239,43 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                                     + "watermark + 1 (fsn 0 -- accepted at the OK level)",
                             1L, e.getServerError().getFromFsn());
                 }
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
+    public void testRoleChangeCloseIsOrderlyNeverCountsStrikes() throws Exception {
+        // The server's role-change close (ROLE_CHANGE, 4001) is the demote
+        // handoff: "go elsewhere", not a verdict on the bytes. Like
+        // NORMAL_CLOSURE and GOING_AWAY it must never count a poison strike.
+        // Dropping ROLE_CHANGE from the orderly set would pass the rest of
+        // this suite while latching a PROTOCOL_VIOLATION terminal after
+        // maxHeadFrameRejections demote closes at an unadvanced head FSN --
+        // turning a routine failover into a false data-poison verdict.
+        // Mirrors testNonOrderlyClosePoisonKeysOnOkLevelHeadOfLine with the
+        // opposite expectation.
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                setSentCount(loop, 2);
+
+                deliverOk(loop, 0, names("trades"), txns(7L));
+                for (int i = 0; i < MAX_REJECTIONS + 1; i++) {
+                    // Role-change close after at least one send on this
+                    // connection: strike-exempt, so no number of repeats may
+                    // escalate. Restore the sent count after each recycle,
+                    // exactly like the non-orderly variant.
+                    setSentCount(loop, 2);
+                    deliverRoleChangeClose(loop);
+                }
+
+                // Must NOT throw: orderly closes never escalate to a typed
+                // terminal, however many accumulate at the same head FSN.
+                loop.checkError();
             } finally {
                 closeAll(clients);
             }
@@ -905,6 +943,16 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
         m.setAccessible(true);
         m.invoke(handler, 1001, "server draining"); // GOING_AWAY: orderly, strike-exempt
+    }
+
+    private static void deliverRoleChangeClose(CursorWebSocketSendLoop loop) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
+        f.setAccessible(true);
+        Object handler = f.get(loop);
+        Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
+        m.setAccessible(true);
+        // ROLE_CHANGE (4001): the demote handoff, orderly, strike-exempt
+        m.invoke(handler, WebSocketCloseCode.ROLE_CHANGE, "role change: primary demoted");
     }
 
     private static void deliverNonOrderlyClose(CursorWebSocketSendLoop loop) throws Exception {

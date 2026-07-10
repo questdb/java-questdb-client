@@ -66,8 +66,9 @@ is caught *behaviorally*:
 > in durable-ack mode the trim watermark advances only on durable coverage,
 > so every post-NACK recycle replays from the durable watermark and re-OKs
 > frames *behind* the suspect — those re-OKs say nothing about the poisoned
-> bytes and must not launder the count. Orderly closes (`NORMAL_CLOSURE`
-> role-change handoff, `GOING_AWAY` restart drain) never count strikes.
+> bytes and must not launder the count. Orderly closes (`ROLE_CHANGE` (4001)
+> role-change handoff, `NORMAL_CLOSURE`, `GOING_AWAY` restart drain) never
+> count strikes.
 
 Below the escalation threshold, a RETRIABLE NACK's recycle is **paced**: the
 server is reachable (it just answered), so the reconnect succeeds immediately
@@ -99,8 +100,11 @@ diagnostics only.
 
 The server already handles it at the right layer (Invariant B work): the
 read-only gate and the commit-path authorization refusal both set
-`roleChangeClosePending` and close with a reconnect-eligible `NORMAL_CLOSURE`
-instead of NACKing `SECURITY_ERROR` (`QwpIngressProcessorState`). The client
+`roleChangeClosePending` and close with a reconnect-eligible `ROLE_CHANGE`
+(4001, private-use range; distinct from `NORMAL_CLOSURE` so the client's
+verbatim CLOSE echo is distinguishable from a voluntary client CLOSE that
+crossed the server's CLOSE on the wire) instead of NACKing `SECURITY_ERROR`
+(`QwpIngressProcessorState`). The client
 reconnects, hits the 421 role reject on the now-replica, and retries from SF
 until a primary is reachable. Consequently:
 

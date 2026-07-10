@@ -321,7 +321,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long highestOkFsn = -1L;
     // Zero-progress recycle pacer (I/O thread only; survives reconnects).
     // Counts consecutive strike-EXEMPT recycles -- orderly closes
-    // (NORMAL_CLOSURE/GOING_AWAY), non-orderly closes before any send on the
+    // (NORMAL_CLOSURE/GOING_AWAY/ROLE_CHANGE), non-orderly closes before any send on the
     // connection, and pre-send RETRIABLE_OTHER rejections -- with no
     // acceptance progress in between. These paths deliberately carry no
     // poison strike (they are not a verdict on the bytes), which also exempts
@@ -1527,7 +1527,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Recycle path for strike-exempt wire events: orderly closes
-     * (NORMAL_CLOSURE / GOING_AWAY), non-orderly closes before any send on
+     * (NORMAL_CLOSURE / GOING_AWAY / ROLE_CHANGE), non-orderly closes before any send on
      * the connection, and RETRIABLE_OTHER rejections (pre- and post-send:
      * NOT_WRITABLE is a node-state verdict, not a frame verdict). None of
      * these implicate the head frame, so they carry no poison strike -- but that
@@ -2172,11 +2172,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // after this connection already sent the head frame counts a poison
             // strike; maxHeadFrameRejections consecutive strikes at the same
             // head FSN with no ack progress escalate to a typed terminal. Orderly
-            // closes (NORMAL_CLOSURE role-change handoff, GOING_AWAY restart
-            // drain) never count strikes — they are the server asking us to go
-            // elsewhere, not a verdict on the bytes.
+            // closes (ROLE_CHANGE role-change handoff, NORMAL_CLOSURE, GOING_AWAY
+            // restart drain) never count strikes — they are the server asking us
+            // to go elsewhere, not a verdict on the bytes.
             boolean orderly = code == WebSocketCloseCode.NORMAL_CLOSURE
-                    || code == WebSocketCloseCode.GOING_AWAY;
+                    || code == WebSocketCloseCode.GOING_AWAY
+                    || code == WebSocketCloseCode.ROLE_CHANGE;
             LineSenderException cause = new LineSenderException(
                     "WebSocket closed by server: code=" + code + " reason=" + reason);
             if (!orderly && nextWireSeq > 0) {
