@@ -100,6 +100,67 @@ public class DeltaDictCatchUpTest {
     }
 
     @Test
+    public void testFixedCapNearBoundarySymbolCatchesUpWithoutTerminal() throws Exception {
+        // Regression (homogeneous single cap): a symbol whose length sits just below
+        // the advertised cap is ACCEPTED into a data frame (messageSize <= cap) and
+        // enters the sent-dictionary mirror. On reconnect the catch-up must
+        // re-register it under the SAME cap -- the bare catch-up frame (header + two
+        // varints + the entry) is smaller than the data frame that already shipped
+        // it (which also carried the table schema + a row), so it fits.
+        //
+        // Pre-fix, the single-entry terminal used the conservative PACKING budget
+        // (cap - HEADER_SIZE - 16), which is stricter than the producer's publish
+        // gate (messageSize <= cap) by more than the minimal data-frame overhead. So
+        // a symbol accepted onto the wire under cap C could exceed that budget and
+        // trip a spurious "during catch-up" terminal, permanently hard-failing a
+        // running producer on its first transient reconnect. Concretely at cap=200:
+        // table("t").symbol("s", <173 chars>).atNow() encodes to 198 bytes (<=200,
+        // accepted), its dict entry is 2+173=175 bytes (> old budget 172 -> old
+        // terminal), while the real solo catch-up frame is 12+1+1+175=189 (<=200 ->
+        // fits). Unlike testCatchUpEntryTooLargeForCapFailsTerminally (a genuinely
+        // oversized entry on a shrunk cap, which MUST still terminate), this entry
+        // is legally shippable and must NOT terminate.
+        final int cap = 200;
+        final String nearCapSymbol = TestUtils.repeat("x", 173);
+        assertMemoryLeak(() -> {
+            CatchUpHandler handler = new CatchUpHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap); // same cap on every handshake (homogeneous)
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    // Symbol-only row so the near-cap symbol drives the frame size.
+                    sender.table("t").symbol("s", nearCapSymbol).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.dictFor(1).size() >= 1, 5_000);
+                    waitFor(() -> handler.conn1Closed, 5_000);
+
+                    // The reconnect runs the catch-up under the SAME cap. Pre-fix
+                    // this latched a terminal (surfacing on this flush); post-fix the
+                    // catch-up ships the near-cap symbol and the flush goes through.
+                    sender.table("t").symbol("s", "beta").atNow();
+                    sender.flush();
+                    waitFor(() -> handler.connectionsAccepted.get() >= 2
+                            && handler.dictFor(2).size() >= 2, 5_000);
+                }
+
+                // Connection 2's dictionary, rebuilt purely from the frames it
+                // received, must hold the near-cap symbol (re-registered by the
+                // catch-up) and beta, gap-free -- proving the catch-up SHIPPED rather
+                // than terminated.
+                List<String> conn2 = handler.dictFor(2);
+                Assert.assertTrue("2nd connection saw a catch-up frame with 0 tables",
+                        handler.sawZeroTableFrameOnConn2);
+                Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
+                Assert.assertEquals(nearCapSymbol, conn2.get(0));
+                Assert.assertEquals("beta", conn2.get(1));
+            }
+        });
+    }
+
+    @Test
     public void testCatchUpEntryTooLargeForCapFailsTerminally() throws Exception {
         // A dictionary entry that exceeds the reconnect server's per-chunk budget
         // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk.

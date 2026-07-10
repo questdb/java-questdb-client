@@ -2171,12 +2171,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private int sendDictCatchUp() {
         int cap = client.getServerMaxBatchSize();
-        // Symbol-bytes budget per frame, leaving room for the 12-byte header and
-        // the two delta-section varints. cap <= 0 means the server advertised no
-        // limit -- send the whole dictionary in one frame, but still bound the
-        // budget by MAX_SENT_DICT_BYTES so sendCatchUpChunk's int frameLen
-        // (HEADER_SIZE + varints + symbolsLen) cannot overflow on a pathological
-        // multi-GB dictionary (unreachable at real cardinality; defensive).
+        // The frame ceiling a catch-up chunk must not exceed: the server's
+        // advertised cap, or -- when the server advertises none (cap <= 0) --
+        // MAX_SENT_DICT_BYTES so sendCatchUpChunk's int frameLen (HEADER_SIZE +
+        // varints + symbolsLen) cannot overflow on a pathological multi-GB
+        // dictionary (unreachable at real cardinality; defensive). Used by the
+        // single-entry terminal below, which measures the real solo frame.
+        int frameLimit = cap > 0 ? cap : MAX_SENT_DICT_BYTES;
+        // Symbol-bytes budget for PACKING several entries into one chunk, leaving
+        // room for the 12-byte header and the two delta-section varints. Kept
+        // deliberately conservative (reserving 16 for the varints): it only makes a
+        // multi-entry chunk split marginally earlier, never over the cap. It must
+        // NOT gate the single-entry terminal -- that reserve is larger than the
+        // minimal data-frame overhead, so an entry the producer already shipped
+        // under this cap could exceed the reserve yet still fit its own catch-up
+        // frame; the terminal tests the real solo frame against frameLimit instead.
         int budget = cap > 0
                 ? Math.max(1, cap - QwpConstants.HEADER_SIZE - 16)
                 : MAX_SENT_DICT_BYTES - QwpConstants.HEADER_SIZE - 16;
@@ -2192,7 +2201,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             long len = readVarintAt(p, limit); // entry length prefix; varintEnd -> just past prefix
             long entryEnd = varintEnd + len;   // just past [len varint][utf8 bytes]
             long entryBytes = entryEnd - entryStart;
-            if (entryBytes > budget) {
+            // The exact table-less frame sendCatchUpChunk would build for THIS entry
+            // alone: header + deltaStart varint (the entry's own global id) +
+            // deltaCount varint (1) + the entry bytes. Terminal only when even that
+            // solo frame exceeds the cap -- i.e. the entry genuinely cannot be
+            // re-registered. Testing the real solo frame (not the conservative
+            // packing budget above) is what keeps a HOMOGENEOUS cluster
+            // livelock-free: an entry the producer already shipped in a data frame
+            // under this cap (header + delta varints + entry + schema + >=1 row) is
+            // strictly larger than its bare catch-up frame, so it always fits here.
+            long soloFrameLen = QwpConstants.HEADER_SIZE
+                    + NativeBufferWriter.varintSize(chunkStartId + chunkSymbols)
+                    + NativeBufferWriter.varintSize(1)
+                    + entryBytes;
+            if (soloFrameLen > frameLimit) {
                 // Non-retriable: the entry will not shrink and the same cluster
                 // re-advertises the same cap, so reconnecting would livelock.
                 // Latch a terminal (the data must be resent after the cap is
@@ -2209,7 +2231,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // the terminal keeps the homogeneous common case livelock-free.
                 LineSenderException err = new LineSenderException(
                         "symbol dictionary entry too large for the server batch cap during catch-up ["
-                                + "entryBytes=" + entryBytes + ", budget=" + budget + ']');
+                                + "frameLen=" + soloFrameLen + ", cap=" + cap + ']');
                 recordFatal(err);
                 throw new CatchUpSendException(err);
             }
