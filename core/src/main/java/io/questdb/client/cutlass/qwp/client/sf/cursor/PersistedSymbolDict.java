@@ -67,9 +67,18 @@ import org.slf4j.LoggerFactory;
  * dictionary is a superset of every recoverable frame's references. It is NOT
  * sufficient for a <b>host/power crash</b>, where unflushed pages can be lost out
  * of order and the dictionary may end up torn relative to the frames it serves --
- * exactly as the segment frames themselves may be lost on a host crash. A torn
- * dictionary is caught at replay by the send loop's guard, which fails loudly
- * (the unreplayable data must be resent) rather than corrupting the target table.
+ * exactly as the segment frames themselves may be lost on a host crash. The send
+ * loop's replay guard catches the COMMON host-crash outcome -- a truncated tail,
+ * where a frame's delta start id exceeds the recovered dictionary size -- and
+ * fails loudly (the unreplayable data must be resent) rather than sending a
+ * gapped frame. It does NOT catch every host-crash tear: an interior page lost
+ * out of order reads back as zeroes that parse as empty-string entries, and a
+ * failed best-effort truncate (see {@link #open}) can leave a stale trailing
+ * entry -- either SHIFTS the dense id->symbol mapping without changing the entry
+ * count the guard checks, so a replay silently misattributes symbols. That
+ * residual exposure sits within the "not host-crash durable" boundary above; a
+ * per-entry or running CRC would be needed to close it (the 3 reserved header
+ * bytes leave room for a future integrity field).
  * <p>
  * A torn trailing entry from a crash mid-append is self-healing: {@link #open}
  * stops parsing at the first incomplete entry and the next append overwrites it.
@@ -367,8 +376,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // shift every subsequent dense id. Without this, appendOffset already
             // lands just past the last complete entry, so the next append
             // overwrites FROM there, but only truncation guarantees nothing
-            // survives BEYOND it. Best-effort: a failed truncate just forgoes the
-            // hardening and falls back to the overwrite-from-appendOffset behaviour.
+            // survives BEYOND it. Best-effort: a failed truncate (rare -- an I/O
+            // error) leaves a latent silent-corruption path, not merely a lost
+            // optimization: if a later, shorter append then leaves stale bytes past
+            // its end, a subsequent recovery mis-parses them as a ghost symbol and
+            // shifts the dense ids, and the count-based replay guard does not catch
+            // it (see the class-level durability note).
             long validLen = HEADER_SIZE + entriesLen;
             if (validLen < len) {
                 Files.truncate(fd, validLen);

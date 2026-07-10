@@ -480,6 +480,100 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testRecoveryAfterFailedPublishReplaysGapFree() throws Exception {
+        // M3 end-to-end: chains a failed publish -> fresh-process recovery -> replay.
+        // A failed publish persists the frame's symbol (write-ahead) but does NOT
+        // record the frame, so the persisted dictionary becomes a strict SUPERSET of
+        // the recorded frames' references. A recovering sender must still replay
+        // gap-free: it re-registers the whole (superset) dictionary via the catch-up
+        // -- including the symbol whose frame never reached disk -- so the fresh
+        // server reconstructs a complete, gap-free dictionary. The sibling
+        // testFailedPublishDoesNotDuplicatePersistedSymbols proves the dict has no
+        // duplicate after the failed publish; this proves the resulting slot then
+        // recovers and replays end-to-end against a real server.
+        assertMemoryLeak(() -> {
+            // Phase 1: a silent server (no acks) + a small SF segment. Four small
+            // rows register sym-0..sym-3 and their frames are recorded; a fifth,
+            // oversized row registers (persists) sym-4 but its frame is too large for
+            // the segment, so appendBlocking throws and the frame is NOT recorded.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_bytes=4096"
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    for (int i = 0; i < 4; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                    // Oversized frame: sym-4 is persisted (write-ahead) before the
+                    // publish fails, so the dictionary runs one ahead of the frames.
+                    s1.table("m").symbol("s", "sym-4")
+                            .stringColumn("p", TestUtils.repeat("x", 8000))
+                            .longColumn("v", 4).atNow();
+                    try {
+                        s1.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                        // PAYLOAD_TOO_LARGE -- frame not recorded, sym-4 stays persisted
+                    }
+                } finally {
+                    try {
+                        // Re-flushes the still-buffered oversized row and fails again
+                        // (expected); resources are still released, and the idempotent
+                        // write-ahead does not re-append sym-4.
+                        s1.close();
+                    } catch (LineSenderException ignored) {
+                    }
+                }
+            }
+
+            // The persisted dictionary must hold the superset: sym-0..sym-4 (5 ids),
+            // one more than the four recorded frames reference, with no duplicate.
+            PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
+            Assert.assertNotNull(pd);
+            try {
+                Assert.assertEquals("failed publish must leave the dict a superset (sym-0..sym-4)",
+                        5, pd.size());
+            } finally {
+                pd.close();
+            }
+
+            // Phase 2: recover against a fresh server that reconstructs its
+            // dictionary from the wire. The recovering sender must re-register all 5
+            // symbols via a catch-up (sym-4 exists ONLY in the dictionary -- no frame
+            // carries it) and replay the 4 recorded frames, leaving a complete,
+            // gap-free server dictionary.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 5) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertTrue("recovery must send a full-dictionary catch-up frame",
+                        handler.sawCatchUpFrame);
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("recovered dictionary must include the failed-publish symbol",
+                        5, dict.size());
+                for (int i = 0; i < 5; i++) {
+                    Assert.assertEquals("dictionary id " + i + " must be gap-free",
+                            "sym-" + i, dict.get(i));
+                }
+            }
+        });
+    }
+
     private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {
         byte[] buf = new byte[16];
         ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
