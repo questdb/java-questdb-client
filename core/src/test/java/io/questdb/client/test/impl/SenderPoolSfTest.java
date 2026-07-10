@@ -875,7 +875,7 @@ public class SenderPoolSfTest {
         // C1 regression: the startup recovery loop MUST mirror discardBroken /
         // reapIdle. When a recoverer's delegate close() returns with the SF
         // flock still held (the I/O thread refused to stop), the recovered slot
-        // index must be retired permanently (leakedSlots++, slotInUse stays
+        // index must be retired (leakedSlots++, slotInUse stays
         // set) -- NOT freed. Freeing it would let a later borrow re-pick the
         // still-locked dir and resurrect "sf slot already in use", the exact
         // failure class this PR exists to kill. Pre-fix the recovery finally
@@ -951,7 +951,7 @@ public class SenderPoolSfTest {
                     try {
                         Assert.assertTrue("borrow must use a fresh slot dir",
                                 Files.exists(slot("default-1")));
-                        // Capacity is permanently reduced by the leaked slot:
+                        // Capacity stays reduced while the flock is held:
                         // max=2, one leaked + one live => the next borrow times
                         // out rather than colliding on the locked dir.
                         try {
@@ -973,6 +973,108 @@ public class SenderPoolSfTest {
                     if (leaked != null) {
                         setBooleanField(leaked, "closed", false);
                         leaked.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStartupRetiredSlotRecoveredAfterLateFlockRelease() throws Exception {
+        // Recovery twin of
+        // testStartupRecoveryRetiresSlotWhenRecovererCloseLeavesFlockHeld: a
+        // slot retired by STARTUP recovery (recoverer close() returned with
+        // the flock still held) must not stay lost until process exit.
+        // isSlotLockReleased() is no longer a one-shot snapshot -- deferred
+        // engine cleanup on a worker exit path can release the flock later --
+        // so the pool must keep the recoverer in retiredSlots and re-probe it.
+        // Pre-fix, startup recovery only ticked leakedSlots and dropped the
+        // recoverer: at maxSize=1 every later borrow timed out forever even
+        // after the flock dropped. This test is RED until the recoverer is
+        // retained.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: strand unacked data under default-0 so startup recovery
+            // treats it as a candidate orphan and builds a recoverer.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool pool = new SenderPool(cfg1, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    for (int i = 0; i < 3; i++) {
+                        s.table("recover").longColumn("v", i).atNow();
+                        s.flush();
+                    }
+                    s.close();
+                }
+            }
+            Assert.assertTrue("unacked data must persist under default-0",
+                    hasSegmentFile(slot("default-0")));
+
+            // Phase 2: maxSize=1 -- the worst case, where the single slot's
+            // retirement starves the whole pool. Forge the retention exactly
+            // like the retire test (closed=true makes the recovery drain and
+            // close a no-op, so the real flock stays held and slotLockReleased
+            // stays false), but only for the FIRST build of slot 0: the
+            // post-recovery borrow below must get a working delegate on the
+            // recovered index.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+
+                AtomicReference<Sender> forged = new AtomicReference<>();
+                IntFunction<Sender> factory = idx -> {
+                    Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
+                    if (idx == 0 && forged.compareAndSet(null, real)) {
+                        try {
+                            setBooleanField(real, "closed", true);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    return real;
+                };
+
+                try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 500, factory)) {
+                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertEquals("precondition: startup recovery must retire the slot",
+                            1, pool.leakedSlotCount());
+
+                    // While the flock is genuinely held, borrows time out: the
+                    // cap-check re-probe finds the flock still reported held.
+                    try {
+                        pool.borrow();
+                        Assert.fail("borrow must time out while the slot is retired");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
+                    }
+
+                    // The late release: the "wedged worker" finishes and the
+                    // flock genuinely drops (un-forge and close the recoverer
+                    // for real; in production this flip comes from
+                    // isSlotLockReleased() re-probing the retained engine after
+                    // the worker exited).
+                    Sender recoverer = forged.get();
+                    setBooleanField(recoverer, "closed", false);
+                    recoverer.close();
+
+                    // The capacity-starved borrow must re-probe the startup-
+                    // retired slot, recover its capacity, and create on the
+                    // freed index -- no housekeeper tick required.
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertEquals("borrow must recover the startup-retired slot's capacity",
+                                0, pool.leakedSlotCount());
+                        boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                        Assert.assertTrue("recovered index 0 must carry the new borrow", slotInUse[0]);
+                        Assert.assertEquals(1, countSlotDirs());
+                    } finally {
+                        b.close();
                     }
                 }
             }

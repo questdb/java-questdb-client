@@ -179,12 +179,15 @@ public final class SenderPool implements AutoCloseable {
     // retiredSlots and returns any index whose flock has since dropped.
     // Guarded by lock; only ever ticks for SF slots.
     private int leakedSlots;
-    // The retired slots behind the leakedSlots count (runtime reclaim paths
-    // only; startup-recovery retirements stay permanent — their transient
-    // recoverer sender is out of scope by retire time). Re-probed by
-    // reprobeRetiredSlots() so a late flock release (deferred engine cleanup
-    // on a worker exit path) restores the pool's capacity instead of
-    // ratcheting it down until process exit. Guarded by lock.
+    // The retired slots behind the leakedSlots count: runtime reclaim paths
+    // (discardBroken/reapIdle via reclaimSlot) and the in-range startup-
+    // recovery pass (recoverOneSlotStep, which retains the recoverer slot for
+    // exactly this purpose). Re-probed by reprobeRetiredSlots() so a late
+    // flock release (deferred engine cleanup on a worker exit path) restores
+    // the pool's capacity instead of ratcheting it down until process exit.
+    // Out-of-range startup recoverers are NEVER added: they carry no
+    // leakedSlots tick and their index has no slotInUse entry to free.
+    // Guarded by lock.
     private final ArrayList<SenderSlot> retiredSlots = new ArrayList<>();
     // SF slots currently held by the in-range startup-recovery pass
     // (recoverOneSlotStep): each is reserved under `lock` for the
@@ -480,7 +483,7 @@ public final class SenderPool implements AutoCloseable {
             recoveryComplete = true;
             return false;
         }
-        final boolean[] flockHeld = new boolean[1];
+        final SenderSlot[] retained = new SenderSlot[1];
 
         // Pass 1: in-range managed slots [0, maxSize). Skip live and empty slots
         // cheaply; spend the step on the first slot that actually holds data.
@@ -526,23 +529,29 @@ public final class SenderPool implements AutoCloseable {
             // A real candidate -> spend the step on it. Advance the cursor first
             // so a resume never reprocesses this index.
             recoveryInRangeNext++;
-            boolean stopScan = drainCandidateSlotForRecovery(i, slotPath, stepBudgetMillis, flockHeld);
+            boolean stopScan = drainCandidateSlotForRecovery(i, slotPath, stepBudgetMillis, retained);
             lock.lock();
             try {
                 // Release the recovery reservation accounting; from here either
                 // leakedSlots (retire) or the freed index carries the cap math.
                 recoveringSlots--;
-                if (flockHeld[0]) {
+                if (retained[0] != null) {
                     // close() retained the flock because an I/O or manager
-                    // worker did not stop. Retire the slot permanently (mirror
+                    // worker did not stop. Retire the slot (mirror
                     // discardBroken/reapIdle): keep slotInUse[i] set and count it
                     // in leakedSlots so the borrow() cap math accounts for the
                     // lost capacity and no later borrow ever reuses the
-                    // still-locked dir.
+                    // still-locked dir. Keep the recoverer in retiredSlots so
+                    // reprobeRetiredSlots() restores the capacity once the
+                    // deferred engine cleanup releases the flock — without it
+                    // the retirement would be permanent even after the release
+                    // (fatal at maxSize=1: every later borrow would time out).
                     leakedSlots++;
-                    LOG.warn("startup SF recovery: slot {} retired permanently: delegate close() returned with "
+                    retiredSlots.add(retained[0]);
+                    LOG.warn("startup SF recovery: slot {} retired: delegate close() returned with "
                                     + "the flock still held (I/O or manager worker did not stop); pool capacity reduced by 1, "
-                                    + "now {} of {} usable [leakedSlots={}]",
+                                    + "now {} of {} usable [leakedSlots={}]; the slot is re-probed and recovered "
+                                    + "if the worker releases the flock later",
                             i, maxSize - leakedSlots, maxSize, leakedSlots);
                 } else {
                     slotInUse[i] = false;
@@ -586,15 +595,17 @@ public final class SenderPool implements AutoCloseable {
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
                 continue;
             }
-            boolean stopScan = drainCandidateSlotForRecovery(idx, slotPath, stepBudgetMillis, flockHeld);
-            if (flockHeld[0]) {
+            boolean stopScan = drainCandidateSlotForRecovery(idx, slotPath, stepBudgetMillis, retained);
+            if (retained[0] != null) {
                 // Out of the pool's [0, maxSize) capacity range: there is no
                 // slotInUse entry to retire and no future borrow targets this
                 // dir, so a still-held flock only leaks this recoverer's
                 // worker-reachable resources (a best-effort teardown loss,
                 // logged). Crucially we do
                 // NOT touch leakedSlots -- that would wrongly shrink the
-                // in-range pool capacity.
+                // in-range pool capacity -- and we do NOT add to retiredSlots:
+                // there is no capacity to recover, and freeSlotIndex(idx)
+                // would index past the slotInUse array (sized maxSize).
                 LOG.warn("startup SF recovery: out-of-range slot {} closed with the flock still held "
                                 + "(I/O or manager worker did not stop); its data is durable on disk for a later attempt",
                         slotPath);
@@ -616,17 +627,20 @@ public final class SenderPool implements AutoCloseable {
      * (whose {@link #defaultSender} derives the dir {@code <base>-slotIndex}),
      * drains its unacked data, and closes the delegate. Shared by both recovery
      * passes -- the in-range pass and the out-of-range pass -- which differ only
-     * in their slot bookkeeping, handled by the caller via {@code flockHeld}.
+     * in their slot bookkeeping, handled by the caller via {@code retainedOut}.
      *
-     * @param flockHeld single-element out-param set to {@code true} iff a
-     *                  recoverer was built and its {@code close()} returned with
-     *                  the flock still held because a worker did not stop
+     * @param retainedOut single-element out-param set to the recoverer iff one
+     *                    was built and its {@code close()} returned with the
+     *                    flock still held because a worker did not stop; the
+     *                    in-range caller keeps it in {@link #retiredSlots} so a
+     *                    late flock release can be re-probed. {@code null} when
+     *                    the flock was released (or no recoverer was built).
      * @return {@code true} if a build/drain failure occurred that will very
      * likely repeat for every remaining slot, so the caller should stop scanning
      */
     private boolean drainCandidateSlotForRecovery(int slotIndex, String slotPath,
-                                                  long remainingMillis, boolean[] flockHeld) {
-        flockHeld[0] = false;
+                                                  long remainingMillis, SenderSlot[] retainedOut) {
+        retainedOut[0] = null;
         // Hoisted so the flock check after the try can consult it:
         // createRecoverer() takes the slot flock on <base>-slotIndex, and
         // delegate().close() can retain it when an I/O or manager worker does
@@ -678,8 +692,8 @@ public final class SenderPool implements AutoCloseable {
             LOG.warn("startup SF recovery: scan failed for slot {} ({})",
                     slotPath, scanErr.toString());
         }
-        if (recoverer != null) {
-            flockHeld[0] = !flockReleased(recoverer);
+        if (recoverer != null && !flockReleased(recoverer)) {
+            retainedOut[0] = recoverer;
         }
         return stopScan;
     }
