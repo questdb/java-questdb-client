@@ -30,7 +30,9 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
@@ -53,6 +55,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -771,6 +774,116 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testPoolRetiresAndRecoversSlotThroughRealManagerWorkerWedge() throws Exception {
+        // Full-stack twin of the two forged-flag recovery tests above: no
+        // reflection-forged slotLockReleased anywhere. The REAL mechanism is
+        // driven end to end — the delegate's owned SegmentManager worker is
+        // wedged mid service pass (test hook), the delegate's close() takes
+        // the real timed-out-join → worker-exit handoff path, the pool
+        // retires the slot off the delegate's genuine isSlotLockReleased()
+        // report, the worker's deferred cleanup releases the real flock, and
+        // the housekeeper re-probe restores capacity — proving the recovered
+        // index is genuinely reusable by borrowing on it again (a forged flag
+        // would pass the accounting asserts but collide on the flock here).
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 2, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-0")));
+
+                    Sender delegate = getDelegate(a);
+                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
+                    Assert.assertNotNull("SF delegate must own a cursor engine", engine);
+                    SegmentManager manager = (SegmentManager) getField(engine, "manager");
+
+                    CountDownLatch workerBlocked = new CountDownLatch(1);
+                    CountDownLatch releaseWorker = new CountDownLatch(1);
+                    AtomicBoolean fired = new AtomicBoolean();
+                    AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                    try {
+                        // Park the manager worker inside a service pass for
+                        // the delegate's ring. The trim-sync point is reached
+                        // on every ~1ms tick, so this wedges deterministically.
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!fired.compareAndSet(false, true)) return;
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                                    hookErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for test to release worker"));
+                                }
+                            } catch (Throwable t) {
+                                hookErr.compareAndSet(null, t);
+                            }
+                        });
+                        Assert.assertTrue("manager worker never entered a service pass",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+
+                        // Real teardown against the wedged worker: the
+                        // delegate's engine close times out its bounded join,
+                        // hands cleanup to the worker's exit path, and reports
+                        // the retained flock; the pool must retire the slot.
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        invokeDiscardBroken(pool, a);
+                        Assert.assertEquals(
+                                "pool must retire the slot while the delegate's manager "
+                                        + "worker holds the deferred cleanup",
+                                1, pool.leakedSlotCount());
+                        Assert.assertFalse("engine cleanup must still be pending",
+                                engine.isCloseCompleted());
+
+                        // Un-wedge: the worker finishes its pass, exits (its
+                        // loop was stopped by the close), and runs the
+                        // deferred cleanup that releases the real flock.
+                        releaseWorker.countDown();
+                        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!engine.isCloseCompleted()) {
+                            if (System.nanoTime() > deadlineNs) {
+                                throw new AssertionError(
+                                        "deferred engine cleanup never ran on manager-worker exit");
+                            }
+                            Thread.sleep(1);
+                        }
+
+                        // The housekeeper tick is the recovery driver.
+                        pool.reapIdle();
+                        Assert.assertEquals("recovered slot must leave the leaked count",
+                                0, pool.leakedSlotCount());
+                        boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                        Assert.assertFalse("recovered slot index 0 must return to the free set",
+                                slotInUse[0]);
+
+                        // The proof a forged flag cannot fake: both indices —
+                        // including the recovered one, whose flock was really
+                        // dropped by the worker-exit cleanup — admit live
+                        // senders again.
+                        PooledSender b = pool.borrow();
+                        PooledSender c = pool.borrow();
+                        try {
+                            Assert.assertEquals(2, countSlotDirs());
+                        } finally {
+                            c.close();
+                            b.close();
+                        }
+                        if (hookErr.get() != null) {
+                            throw new AssertionError("trim hook failed", hookErr.get());
+                        }
+                    } finally {
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Recovery: stable slot ids let a re-created pool re-adopt unacked data.
     // ----------------------------------------------------------------------
@@ -1073,6 +1186,201 @@ public class SenderPoolSfTest {
                         boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
                         Assert.assertTrue("recovered index 0 must carry the new borrow", slotInUse[0]);
                         Assert.assertEquals(1, countSlotDirs());
+                    } finally {
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testZeroTimeoutBorrowProbesRetiredSlotBeforeThrowing() throws Exception {
+        // Boundary twin of testStartupRetiredSlotRecoveredAfterLateFlockRelease:
+        // acquireTimeoutMillis=0 is a valid try-once borrow (builder rejects only
+        // < 0). Pre-fix, borrow() ran the terminal timeout check BEFORE
+        // reprobeRetiredSlots(), so a zero-budget borrow threw "timed out"
+        // without its one probe -- even when the retired slot's flock had
+        // already dropped and a probe would have restored capacity and admitted
+        // a creation. Deterministic: no housekeeper runs in this test, so
+        // borrow() is the only reprobe driver. Recovery is driven manually via
+        // the deferred-pool step helper because the inline path reuses
+        // acquireTimeoutMillis as its recovery budget -- 0 would skip recovery
+        // outright. This test is RED until the probe is hoisted above the
+        // timeout check.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: strand unacked data under default-0 so startup recovery
+            // treats it as a candidate orphan and builds a recoverer.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool pool = new SenderPool(cfg1, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    for (int i = 0; i < 3; i++) {
+                        s.table("recover").longColumn("v", i).atNow();
+                        s.flush();
+                    }
+                    s.close();
+                }
+            }
+            Assert.assertTrue("unacked data must persist under default-0",
+                    hasSegmentFile(slot("default-0")));
+
+            // Phase 2: maxSize=1, zero acquire budget, deferred recovery driven
+            // step-by-step (the housekeeper's per-tick unit, budgeted by
+            // RECOVERY_DRAIN_BUDGET_MILLIS, not the zero acquire budget). Forge
+            // the retirement (closed=true makes the recovery drain and close a
+            // no-op, so the real flock stays held), then release the flock for
+            // real BEFORE borrowing: the recovery is discoverable, but only via
+            // a probe.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+
+                AtomicReference<Sender> forged = new AtomicReference<>();
+                IntFunction<Sender> factory = idx -> {
+                    Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
+                    if (idx == 0 && forged.compareAndSet(null, real)) {
+                        try {
+                            setBooleanField(real, "closed", true);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    return real;
+                };
+
+                try (SenderPool pool = newDeferredPoolWithFactory(cfg2, 0, 1, 0, factory)) {
+                    //noinspection StatementWithEmptyBody
+                    while (invokeRunStartupRecoveryStep(pool)) {
+                        // drive the whole backlog, one housekeeper-tick unit at a time
+                    }
+                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertEquals("precondition: startup recovery must retire the slot",
+                            1, pool.leakedSlotCount());
+
+                    // The late release: un-forge and close the recoverer for
+                    // real. The flock genuinely drops, but nothing signals the
+                    // pool -- the release happens in the delegate, volatile
+                    // writes only.
+                    Sender recoverer = forged.get();
+                    setBooleanField(recoverer, "closed", false);
+                    recoverer.close();
+
+                    // Try-once borrow: its single pass must probe, recover the
+                    // capacity, and create on the freed index. Pre-fix this
+                    // threw "timed out" without ever probing.
+                    PooledSender b = pool.borrow();
+                    try {
+                        Assert.assertEquals("zero-timeout borrow must recover the retired slot's capacity",
+                                0, pool.leakedSlotCount());
+                    } finally {
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testParkedBorrowerGetsFinalProbeAfterBudgetExpiry() throws Exception {
+        // Release-during-wait twin of the zero-timeout test. A borrower parks
+        // in awaitNanos while the retired slot's flock is genuinely held; the
+        // deferred cleanup then releases the flock mid-wait. Nothing signals
+        // slotReleased (the release is delegate-side, volatile writes only), so
+        // the borrower sleeps out its full budget. Pre-fix its wake-up pass hit
+        // the terminal timeout check before reprobeRetiredSlots() and threw --
+        // missing capacity that had already come back. Post-fix the wake-up
+        // pass probes first, recovers the index, and the creation is admitted.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: strand unacked data under default-0.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool pool = new SenderPool(cfg1, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    for (int i = 0; i < 3; i++) {
+                        s.table("recover").longColumn("v", i).atNow();
+                        s.flush();
+                    }
+                    s.close();
+                }
+            }
+            Assert.assertTrue("unacked data must persist under default-0",
+                    hasSegmentFile(slot("default-0")));
+
+            // Phase 2: maxSize=1, generous budget so the mid-wait release lands
+            // comfortably inside it.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+
+                AtomicReference<Sender> forged = new AtomicReference<>();
+                IntFunction<Sender> factory = idx -> {
+                    Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
+                    if (idx == 0 && forged.compareAndSet(null, real)) {
+                        try {
+                            setBooleanField(real, "closed", true);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    return real;
+                };
+
+                try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 2_000, factory)) {
+                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertEquals("precondition: startup recovery must retire the slot",
+                            1, pool.leakedSlotCount());
+
+                    // Borrower parks: its pre-park probe correctly fails while
+                    // the flock is genuinely held.
+                    AtomicReference<Throwable> failure = new AtomicReference<>();
+                    AtomicReference<PooledSender> borrowed = new AtomicReference<>();
+                    Thread borrower = new Thread(() -> {
+                        try {
+                            borrowed.set(pool.borrow());
+                        } catch (Throwable e) {
+                            failure.set(e);
+                        }
+                    });
+                    borrower.start();
+
+                    // Let the borrower enter borrow() and park. If a CI stall
+                    // delays it past the release below, the pre-park probe
+                    // recovers instead and the test degrades to a pass -- never
+                    // a flaky failure.
+                    Thread.sleep(300);
+
+                    // Mid-wait release: flock drops, no signal reaches the pool.
+                    Sender recoverer = forged.get();
+                    setBooleanField(recoverer, "closed", false);
+                    recoverer.close();
+
+                    borrower.join(10_000);
+                    Assert.assertFalse("borrower must have finished", borrower.isAlive());
+                    if (failure.get() != null) {
+                        throw new AssertionError(
+                                "borrower must recover the retired slot on its wake-up pass, not time out",
+                                failure.get());
+                    }
+                    PooledSender b = borrowed.get();
+                    Assert.assertNotNull("borrower must have obtained a sender", b);
+                    try {
+                        Assert.assertEquals("wake-up probe must recover the retired slot's capacity",
+                                0, pool.leakedSlotCount());
                     } finally {
                         b.close();
                     }

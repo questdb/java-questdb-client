@@ -187,8 +187,12 @@ public final class SenderPool implements AutoCloseable {
     // the pool's capacity instead of ratcheting it down until process exit.
     // Out-of-range startup recoverers are NEVER added: they carry no
     // leakedSlots tick and their index has no slotInUse entry to free.
-    // Guarded by lock.
-    private final ArrayList<SenderSlot> retiredSlots = new ArrayList<>();
+    // Pre-sized to maxSize (every entry keeps a distinct in-range slot index
+    // reserved, so size can never exceed maxSize): add() never grows the
+    // backing array, so a retire (leakedSlots++ then add, under lock) cannot
+    // fail on allocation and strand a counted-but-untracked slot that
+    // reprobeRetiredSlots() could never recover. Guarded by lock.
+    private final ArrayList<SenderSlot> retiredSlots;
     // SF slots currently held by the in-range startup-recovery pass
     // (recoverOneSlotStep): each is reserved under `lock` for the
     // duration of its drain and counted in the borrow() cap check so a
@@ -306,6 +310,7 @@ public final class SenderPool implements AutoCloseable {
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
+        this.retiredSlots = new ArrayList<>(maxSize);
         this.slotReleased = lock.newCondition();
         // Probe the config once, up front: this validates it eagerly (so a
         // bad config fails at construction even when minSize == 0) and tells
@@ -793,15 +798,23 @@ public final class SenderPool implements AutoCloseable {
                     created.bumpGeneration();
                     return new PooledSender(created, created.generation());
                 }
+                // Capacity-starved: re-probe retired slots BEFORE the terminal
+                // timeout check — a deferred engine cleanup may have released a
+                // flock since the retire, and the freed index can admit a
+                // creation right now. The release itself never signals
+                // slotReleased (it happens in the delegate on a worker/I/O-thread
+                // exit path, volatile writes only), so this poll is the only way
+                // a borrower learns of it. Ordering matters twice over: a
+                // zero-timeout (try-once) borrow must get its one probe before
+                // throwing, and a borrower whose awaitNanos budget just expired
+                // must get a final probe on its wake-up pass instead of timing
+                // out on capacity that has already come back.
+                if (reprobeRetiredSlots()) {
+                    continue;
+                }
                 if (remainingNanos <= 0) {
                     throw new LineSenderException(
                             "timed out waiting for a Sender from the pool after " + acquireTimeoutMillis + "ms");
-                }
-                // Capacity-starved: before parking, re-probe retired slots — a
-                // deferred engine cleanup may have released a flock since the
-                // retire, and the freed index can admit a creation right now.
-                if (reprobeRetiredSlots()) {
-                    continue;
                 }
                 try {
                     remainingNanos = slotReleased.awaitNanos(remainingNanos);
