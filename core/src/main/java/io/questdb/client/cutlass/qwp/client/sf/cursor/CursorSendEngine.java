@@ -620,6 +620,15 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * The engine's persisted symbol dictionary, or {@code null} in memory mode
+     * (and in disk mode if it failed to open). The producer appends new symbols
+     * to it; recovery / orphan-drain read its loaded entries to seed catch-up.
+     */
+    public PersistedSymbolDict getPersistedSymbolDict() {
+        return persistedSymbolDict;
+    }
+
+    /**
      * Number of times {@link #appendBlocking} hit
      * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
      * had to wait for the segment manager (or for ACKs) to free space.
@@ -639,15 +648,6 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public boolean isDeltaDictEnabled() {
         return sfDir == null || persistedSymbolDict != null;
-    }
-
-    /**
-     * The engine's persisted symbol dictionary, or {@code null} in memory mode
-     * (and in disk mode if it failed to open). The producer appends new symbols
-     * to it; recovery / orphan-drain read its loaded entries to seed catch-up.
-     */
-    public PersistedSymbolDict getPersistedSymbolDict() {
-        return persistedSymbolDict;
     }
 
     /**

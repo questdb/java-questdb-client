@@ -3362,6 +3362,17 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
             cursorSendLoop.start();
         } catch (Throwable t) {
+            // start() (or dispatcher construction) failed after cursorSendLoop was
+            // assigned. Close it so a caller that retries -- re-entering
+            // ensureConnected and reassigning cursorSendLoop above -- cannot orphan
+            // a recovered slot's ctor-seeded native mirror (freed only by close()
+            // or the I/O loop, neither of which has run). close() is idempotent and
+            // frees the mirror via its loopNeverRan path; it also closes the shared
+            // client, so the client.close() below is a safe idempotent no-op.
+            if (cursorSendLoop != null) {
+                cursorSendLoop.close();
+                cursorSendLoop = null;
+            }
             if (client != null) {
                 client.close();
                 client = null;

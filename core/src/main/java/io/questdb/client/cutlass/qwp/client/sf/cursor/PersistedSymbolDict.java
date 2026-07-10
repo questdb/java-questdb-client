@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -218,10 +219,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return;
         }
         int utf8Len = Utf8s.utf8Bytes(symbol);
-        int varLen = varintSize(utf8Len);
+        int varLen = NativeBufferWriter.varintSize(utf8Len);
         int recLen = varLen + utf8Len;
         ensureScratch(recLen);
-        long p = writeVarint(scratchAddr, utf8Len);
+        long p = NativeBufferWriter.writeVarint(scratchAddr, utf8Len);
         if (utf8Len > 0) {
             Utf8s.strCpyUtf8(symbol, p, utf8Len);
         }
@@ -257,9 +258,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
         for (int id = from; id <= to; id++) {
             CharSequence symbol = dict.getSymbol(id);
             int utf8Len = Utf8s.utf8Bytes(symbol);
-            int recLen = varintSize(utf8Len) + utf8Len;
+            int recLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len;
             ensureScratch(len + recLen);
-            long p = writeVarint(scratchAddr + len, utf8Len);
+            long p = NativeBufferWriter.writeVarint(scratchAddr + len, utf8Len);
             if (utf8Len > 0) {
                 Utf8s.strCpyUtf8(symbol, p, utf8Len);
             }
@@ -349,6 +350,30 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public int size() {
         return size;
+    }
+
+    /**
+     * Decodes an unsigned LEB128 varint from {@code buf[pos..limit)}. Returns
+     * {@code [value, newPos]} or {@code null} if the varint is truncated
+     * (torn tail).
+     */
+    private static long[] decodeVarint(long buf, int pos, int limit) {
+        long value = 0;
+        int shift = 0;
+        int cur = pos;
+        while (cur < limit) {
+            byte b = Unsafe.getUnsafe().getByte(buf + cur);
+            cur++;
+            value |= (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return new long[]{value, cur};
+            }
+            shift += 7;
+            if (shift > 35) {
+                return null; // implausible for an entry length; treat as torn
+            }
+        }
+        return null;
     }
 
     private static PersistedSymbolDict openExisting(String filePath, long fileLen) {
@@ -471,48 +496,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
         }
         return new PersistedSymbolDict(fd, HEADER_SIZE, 0, 0L, 0);
-    }
-
-    /**
-     * Decodes an unsigned LEB128 varint from {@code buf[pos..limit)}. Returns
-     * {@code [value, newPos]} or {@code null} if the varint is truncated
-     * (torn tail).
-     */
-    private static long[] decodeVarint(long buf, int pos, int limit) {
-        long value = 0;
-        int shift = 0;
-        int cur = pos;
-        while (cur < limit) {
-            byte b = Unsafe.getUnsafe().getByte(buf + cur);
-            cur++;
-            value |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                return new long[]{value, cur};
-            }
-            shift += 7;
-            if (shift > 35) {
-                return null; // implausible for an entry length; treat as torn
-            }
-        }
-        return null;
-    }
-
-    private static int varintSize(long value) {
-        int n = 1;
-        while (value > 0x7F) {
-            value >>>= 7;
-            n++;
-        }
-        return n;
-    }
-
-    private static long writeVarint(long addr, long value) {
-        while (value > 0x7F) {
-            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
-            value >>>= 7;
-        }
-        Unsafe.getUnsafe().putByte(addr++, (byte) value);
-        return addr;
     }
 
     private void ensureScratch(int required) {

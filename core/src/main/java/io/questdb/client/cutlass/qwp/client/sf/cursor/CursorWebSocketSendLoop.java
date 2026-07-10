@@ -2161,6 +2161,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 break;
             }
             shift += 7;
+            if (shift > 35) {
+                // Defensive bound, matching PersistedSymbolDict.decodeVarint: a
+                // canonical entry-length / delta varint is <= 5 bytes. Every caller
+                // reads freshly-encoded, CRC- or openExisting-validated bytes, so
+                // this is unreachable, but it stops a corrupt continuation run from
+                // over-shifting into a garbage length.
+                break;
+            }
         }
         varintEnd = cur;
         return value;
@@ -2310,8 +2318,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             | QwpConstants.FLAG_DEFER_COMMIT));
             Unsafe.getUnsafe().putShort(frame + 6, (short) 0); // tableCount
             Unsafe.getUnsafe().putInt(frame + 8, payloadLen);
-            long q = writeVarintAt(frame + QwpConstants.HEADER_SIZE, deltaStart);
-            q = writeVarintAt(q, deltaCount);
+            long q = NativeBufferWriter.writeVarint(frame + QwpConstants.HEADER_SIZE, deltaStart);
+            q = NativeBufferWriter.writeVarint(q, deltaCount);
             Unsafe.getUnsafe().copyMemory(symbolsAddr, q, symbolsLen);
             client.sendBinary(frame, frameLen);
         } catch (Throwable t) {
@@ -2329,15 +2337,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         nextWireSeq++; // this catch-up chunk consumed a wire sequence
         lastFrameOrPingNanos = System.nanoTime();
         totalFramesSent.incrementAndGet();
-    }
-
-    private static long writeVarintAt(long addr, long value) {
-        while (value > 0x7F) {
-            Unsafe.getUnsafe().putByte(addr++, (byte) ((value & 0x7F) | 0x80));
-            value >>>= 7;
-        }
-        Unsafe.getUnsafe().putByte(addr++, (byte) value);
-        return addr;
     }
 
     private boolean tryReceiveAcks() {

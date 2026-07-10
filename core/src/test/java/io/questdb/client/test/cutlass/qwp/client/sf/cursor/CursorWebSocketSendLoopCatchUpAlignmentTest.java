@@ -30,7 +30,6 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
-import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -42,7 +41,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -78,30 +76,12 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
 
     @Before
     public void setUp() {
-        tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-cursor-catchup-" + System.nanoTime()).toString();
-        assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
+        tmpDir = TestUtils.createTmpDir("qdb-cursor-catchup-");
     }
 
     @After
     public void tearDown() {
-        if (tmpDir == null) return;
-        long find = Files.findFirst(tmpDir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(tmpDir + "/" + name);
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(tmpDir);
+        TestUtils.removeTmpDir(tmpDir);
     }
 
     @Test
