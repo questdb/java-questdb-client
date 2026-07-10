@@ -86,6 +86,10 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
+    // Test seam: runs after each snapshotted entry's service attempt, including
+    // a stale entry skipped before claim. Null in production; tests use it to
+    // observe completion of the exact snapshot entry without timing.
+    private volatile Runnable afterServiceHook;
     // Test seam: runs on the closer thread inside close(), after the pending
     // caller interrupt has been cleared and immediately before EACH join
     // attempt on the worker thread. Null in production.
@@ -95,6 +99,10 @@ public final class SegmentManager implements QuietCloseable {
     // into another join attempt instead of abandoning the reap — without any
     // wall-clock coordination.
     private volatile Runnable beforeJoinAttemptHook;
+    // Test seam: runs after workerLoop selects a snapshotted entry but before
+    // serviceRing atomically checks registered and claims inService. Null in
+    // production; tests pause precisely in the stale-snapshot-before-claim gap.
+    private volatile Runnable beforeServiceClaimHook;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
     // totalBytes += segmentSize commit). Null in production; tests use it to
@@ -115,6 +123,10 @@ public final class SegmentManager implements QuietCloseable {
     // block until an in-flight pass for a just-deregistered ring finishes.
     private RingEntry inService;
     private long lastDiskFullLogNs;
+    // Number of callers currently waiting for inService to clear. Guarded by
+    // lock; serviceRing uses it to avoid a monitor-wide notifyAll on every
+    // polling pass when no quiescence barrier exists.
+    private int quiescenceWaiterCount;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
     // and the worker's exit path. All three are guarded by {@link #lock}.
@@ -289,17 +301,24 @@ public final class SegmentManager implements QuietCloseable {
         boolean interrupted = Thread.interrupted();
         try {
             synchronized (lock) {
-                while (inService != null && inService.ring == ring) {
-                    long remainingNanos = deadlineNanos - System.nanoTime();
-                    if (remainingNanos <= 0) {
-                        return false;
-                    }
+                if (inService != null && inService.ring == ring) {
+                    quiescenceWaiterCount++;
                     try {
-                        // Round up so a sub-millisecond remainder still waits
-                        // instead of spinning through wait(0) == wait-forever.
-                        lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
-                    } catch (InterruptedException ignored) {
-                        interrupted = true;
+                        while (inService != null && inService.ring == ring) {
+                            long remainingNanos = deadlineNanos - System.nanoTime();
+                            if (remainingNanos <= 0) {
+                                return false;
+                            }
+                            try {
+                                // Round up so a sub-millisecond remainder still waits
+                                // instead of spinning through wait(0) == wait-forever.
+                                lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
+                            } catch (InterruptedException ignored) {
+                                interrupted = true;
+                            }
+                        }
+                    } finally {
+                        quiescenceWaiterCount--;
                     }
                 }
             }
@@ -308,6 +327,13 @@ public final class SegmentManager implements QuietCloseable {
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
+        }
+    }
+
+    @TestOnly
+    public boolean hasWorkerLoopExited() {
+        synchronized (lock) {
+            return workerLoopExited;
         }
     }
 
@@ -419,6 +445,11 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
+    public void setAfterServiceHook(Runnable hook) {
+        this.afterServiceHook = hook;
+    }
+
+    @TestOnly
     public void setBeforeJoinAttemptHook(Runnable hook) {
         this.beforeJoinAttemptHook = hook;
     }
@@ -426,6 +457,11 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public void setBeforeInstallSyncHook(Runnable hook) {
         this.beforeInstallSyncHook = hook;
+    }
+
+    @TestOnly
+    public void setBeforeServiceClaimHook(Runnable hook) {
+        this.beforeServiceClaimHook = hook;
     }
 
     @TestOnly
@@ -538,6 +574,10 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     private void serviceRing(RingEntry e) {
+        Runnable serviceClaimHook = beforeServiceClaimHook;
+        if (serviceClaimHook != null) {
+            serviceClaimHook.run();
+        }
         // Claim the entry as in-service so deregister-side quiescence
         // barriers (awaitRingQuiescence) can wait for this pass to finish.
         // A stale snapshot entry deregistered before the pass starts is
@@ -558,7 +598,9 @@ public final class SegmentManager implements QuietCloseable {
         } finally {
             synchronized (lock) {
                 inService = null;
-                lock.notifyAll();
+                if (quiescenceWaiterCount > 0) {
+                    lock.notifyAll();
+                }
             }
         }
     }
@@ -737,6 +779,10 @@ public final class SegmentManager implements QuietCloseable {
                 for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
                     if (!running) break;
                     serviceRing(ringSnapshot.getQuick(i));
+                    Runnable serviceHook = afterServiceHook;
+                    if (serviceHook != null) {
+                        serviceHook.run();
+                    }
                 }
                 // Drop strong refs so a deregistered ring becomes collectable
                 // before the next tick (otherwise the snapshot pins it for up

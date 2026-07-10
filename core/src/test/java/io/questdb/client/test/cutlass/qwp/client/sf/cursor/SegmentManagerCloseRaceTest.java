@@ -181,13 +181,18 @@ public class SegmentManagerCloseRaceTest {
                 Assert.assertTrue("path scratch was freed while worker was still alive",
                         readPathScratchImpl(manager) != 0L);
 
+                // Do not call close() again: the worker-exit branch is the sole
+                // owner of scratch after the timed-out close handed it off.
                 releaseWorker.countDown();
-                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
-                manager.close();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (!manager.hasWorkerLoopExited() && System.nanoTime() < deadline) {
+                    Thread.sleep(1L);
+                }
+                Assert.assertTrue("worker did not exit after release", manager.hasWorkerLoopExited());
                 managerClosed = true;
-                Assert.assertNull("successful close should clear workerThread",
+                Assert.assertNotNull("no retry close should be needed to clear native scratch",
                         readWorkerThread(manager));
-                Assert.assertEquals("successful close should free path scratch",
+                Assert.assertEquals("worker exit should free path scratch without another close",
                         0L, readPathScratchImpl(manager));
                 if (hookErr.get() != null) {
                     throw new AssertionError("install hook failed", hookErr.get());

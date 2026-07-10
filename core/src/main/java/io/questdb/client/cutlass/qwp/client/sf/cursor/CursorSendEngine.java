@@ -61,6 +61,12 @@ public final class CursorSendEngine implements QuietCloseable {
      * Default deadline for {@link #appendBlocking}: 30 seconds.
      */
     public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
+    private static final java.util.concurrent.ExecutorService DEFERRED_CLOSE_EXECUTOR =
+            java.util.concurrent.Executors.newCachedThreadPool(runnable -> {
+                Thread thread = new Thread(runnable, "qdb-cursor-engine-close");
+                thread.setDaemon(true);
+                return thread;
+            });
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
     private final long appendDeadlineNanos;
@@ -118,8 +124,11 @@ public final class CursorSendEngine implements QuietCloseable {
     // a close attempt could not confirm manager-worker quiescence and had to
     // leak the ring/watermark/slot lock — in that case a later close() call
     // retries the cleanup (the worker may have exited by then). Guarded by
-    // the synchronized close() method; never read elsewhere.
+    // the synchronized close() method and isCloseCompleted() accessor.
     private boolean closeCompleted;
+    // True once a dedicated daemon has accepted ownership of incomplete close
+    // retries. Guarded by synchronized closeEventually().
+    private boolean deferredCloseScheduled;
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
@@ -614,6 +623,25 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Transfers an incomplete close to a dedicated daemon owner. This lets
+     * I/O and drainer executors terminate even when a manager service pass is
+     * permanently stalled. The deferred owner retains this engine, and thus
+     * its flock and native mappings, until a retry completes.
+     */
+    public synchronized void closeEventually() {
+        if (closeCompleted || deferredCloseScheduled) {
+            return;
+        }
+        deferredCloseScheduled = true;
+        try {
+            DEFERRED_CLOSE_EXECUTOR.execute(this::runDeferredClose);
+        } catch (Throwable t) {
+            deferredCloseScheduled = false;
+            throw t;
+        }
+    }
+
+    /**
      * Pass-through to {@link SegmentRing#findSegmentContaining(long)}.
      */
     public MmapSegment findSegmentContaining(long fsn) {
@@ -635,6 +663,16 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long getTotalBackpressureStalls() {
         return backpressureStallCount.get();
+    }
+
+    /**
+     * True only after close released every engine-owned resource, including
+     * the SF slot flock. A false result means close deliberately retained the
+     * ring/watermark/lock because the manager worker did not quiesce; owners
+     * must preserve this engine and retry later.
+     */
+    public synchronized boolean isCloseCompleted() {
+        return closeCompleted;
     }
 
     /**
@@ -718,6 +756,23 @@ public final class CursorSendEngine implements QuietCloseable {
      * Best-effort: logs and continues on failures, since we're already on
      * the close path.
      */
+    private void runDeferredClose() {
+        while (!isCloseCompleted()) {
+            try {
+                close();
+            } catch (Throwable ignored) {
+                // Retain ownership and retry after a bounded pause.
+            }
+            if (!isCloseCompleted()) {
+                LockSupport.parkNanos(10_000_000L);
+                // The internal daemon owns cleanup independently of caller
+                // cancellation. Clear interrupts so they cannot create a hot
+                // retry loop if an executor implementation interrupts it.
+                Thread.interrupted();
+            }
+        }
+    }
+
     private static void unlinkAllSegmentFiles(String dir) {
         if (!io.questdb.client.std.Files.exists(dir)) return;
         long find = io.questdb.client.std.Files.findFirst(dir);

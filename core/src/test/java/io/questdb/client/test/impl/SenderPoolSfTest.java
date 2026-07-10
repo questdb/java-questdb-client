@@ -792,10 +792,11 @@ public class SenderPoolSfTest {
             // Phase 2: ack-ing server + a new pool whose injected factory forges
             // the exact leak symptom for the recovery build of slot 0. The
             // factory returns a real, flock-holding QwpWebSocketSender but
-            // pre-sets closed=true, so the recovery close() is a complete no-op
-            // (checkNotClosed short-circuits drain too): the flock stays held
-            // and slotLockReleased never flips -- precisely a refused I/O-thread
-            // stop. flockReleased(recoverer) must therefore report false.
+            // pre-sets closed=true and cursorEngineCloseDelegated=true, modeling
+            // a close handed to an I/O thread that is still live. Repeated owner
+            // close calls must not race that delegated owner: the flock stays
+            // held and slotLockReleased remains false. flockReleased(recoverer)
+            // must therefore report false.
             CountingAckHandler handler = new CountingAckHandler();
             try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
                 int ackPort = ack.getPort();
@@ -809,6 +810,7 @@ public class SenderPoolSfTest {
                     if (idx == 0) {
                         try {
                             setBooleanField(real, "closed", true);
+                            setBooleanField(real, "cursorEngineCloseDelegated", true);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -858,6 +860,7 @@ public class SenderPoolSfTest {
                     // close it for real, otherwise assertMemoryLeak trips.
                     Sender leaked = forged.get();
                     if (leaked != null) {
+                        setBooleanField(leaked, "cursorEngineCloseDelegated", false);
                         setBooleanField(leaked, "closed", false);
                         leaked.close();
                     }

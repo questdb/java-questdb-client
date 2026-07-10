@@ -704,10 +704,15 @@ public final class BackgroundDrainer implements Runnable {
                 // between the failed close() and now: then it is safe (and
                 // necessary) to close the engine here.
                 if (ioThreadStopped || !loop.delegateEngineClose()) {
+                    // Make one bounded attempt. If manager quiescence times
+                    // out, transfer ownership so this pool task can terminate.
                     try {
-                        // engine.close() releases the slot lock too.
                         engine.close();
                     } catch (Throwable ignored) {
+                        // The deferred owner retries below when needed.
+                    }
+                    if (!engine.isCloseCompleted()) {
+                        engine.closeEventually();
                     }
                 } else {
                     LOG.warn("drainer slot {}: engine close delegated to the I/O thread; "

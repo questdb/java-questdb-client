@@ -1679,10 +1679,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // either this branch or the owner's fallback runs (or both —
             // engine.close() is idempotent).
             if (engineCloseDelegated) {
+                // Make one bounded attempt on this exit path. If manager
+                // quiescence times out, transfer ownership to the dedicated
+                // deferred closer so this I/O daemon can terminate.
                 try {
                     engine.close();
                 } catch (Throwable ignored) {
-                    // best-effort
+                    // The deferred owner retries below when needed.
+                }
+                if (!engine.isCloseCompleted()) {
+                    engine.closeEventually();
                 }
             }
         }

@@ -206,13 +206,34 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testCreateSuccessClosesThroughFacadeExactlyOnce() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-facade-close.sfa";
+            FaultyFilesFacade ff = new FaultyFilesFacade();
+            MmapSegment segment = MmapSegment.create(ff, path, 0L, 4096L);
+            assertEquals("successful create must not close before segment ownership ends", 0, ff.closeCalls);
+            segment.close();
+            segment.close();
+            assertEquals("successful create must close through its facade exactly once", 1, ff.closeCalls);
+        });
+    }
+
+    @Test
+    public void testFilesFacadePathLengthMethodIsDefault() throws Exception {
+        assertTrue(
+                "FilesFacade.length(String) must remain binary-compatible for existing implementations",
+                FilesFacade.class.getMethod("length", String.class).isDefault()
+        );
+    }
+
+    @Test
     public void testFirstFrameCrcCorruptionFlagsTornTailAndPreservesFile() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Existing torn-tail tests cover the case where N >= 1 valid
             // frames are followed by garbage. None cover frame[0] itself
             // being corrupt — yet a single bit-flip on the CRC of frame[0]
             // at rest (bit-rot, partial-page-write at crash) is the
-            // worst-case data-loss trigger: scanFrames bails at HEADER_SIZE
+            // worst-case data-loss trigger: recovery stops at HEADER_SIZE
             // and frameCount drops to 0, even though valid frames still
             // sit on disk past the corrupt header.
             //
@@ -255,7 +276,7 @@ public class MmapSegmentTest {
                         Files.exists(path));
 
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    assertEquals("scanFrames must bail at the corrupt frame[0]",
+                    assertEquals("recovery must stop at the corrupt frame[0]",
                             0L, seg.frameCount());
                     assertEquals("publishedOffset must rewind to the header end",
                             MmapSegment.HEADER_SIZE, seg.publishedOffset());
@@ -324,6 +345,34 @@ public class MmapSegmentTest {
                 fail("openExisting should reject bad magic");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(), expected.getMessage().contains("bad magic"));
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryCrcMatchesNativeAcrossAlignmentsAndTails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-crc-alignments.sfa";
+            int[] payloadLengths = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+                    63, 64, 65, 127, 128, 129, 255, 256, 257, 1023};
+            long buf = Unsafe.malloc(1023, MemoryTag.NATIVE_DEFAULT);
+            long expectedEnd = MmapSegment.HEADER_SIZE;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 7L, 16 * 1024)) {
+                    for (int i = 0; i < payloadLengths.length; i++) {
+                        int payloadLength = payloadLengths[i];
+                        fillPattern(buf, payloadLength, i * 31 + 17);
+                        assertEquals(expectedEnd, seg.tryAppend(buf, payloadLength));
+                        expectedEnd += MmapSegment.FRAME_HEADER_SIZE + payloadLength;
+                    }
+                }
+
+                try (MmapSegment recovered = MmapSegment.openExisting(path)) {
+                    assertEquals(expectedEnd, recovered.publishedOffset());
+                    assertEquals(payloadLengths.length, recovered.frameCount());
+                }
+            } finally {
+                Unsafe.free(buf, 1023, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

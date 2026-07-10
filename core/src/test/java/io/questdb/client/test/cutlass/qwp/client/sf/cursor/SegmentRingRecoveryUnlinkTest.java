@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
@@ -73,6 +74,47 @@ public class SegmentRingRecoveryUnlinkTest {
             }
         }
         Files.remove(tmpDir);
+    }
+
+    @Test
+    public void testRecoveryGapDiagnosticExplainsDeletionAndStorageFailures() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String firstPath = tmpDir + "/sf-first.sfa";
+            String secondPath = tmpDir + "/sf-after-gap.sfa";
+            long buf = io.questdb.client.std.Unsafe.malloc(
+                    32,
+                    io.questdb.client.std.MemoryTag.NATIVE_DEFAULT
+            );
+            try {
+                io.questdb.client.std.Unsafe.getUnsafe().setMemory(buf, 32, (byte) 1);
+                try (MmapSegment first = MmapSegment.create(firstPath, 0L, SEGMENT_SIZE)) {
+                    Assert.assertTrue(first.tryAppend(buf, 32) >= 0);
+                }
+                // One frame at base 0 means the next segment must start at 1.
+                // Starting at 2 creates a deterministic one-FSN gap.
+                try (MmapSegment second = MmapSegment.create(secondPath, 2L, SEGMENT_SIZE)) {
+                    Assert.assertTrue(second.tryAppend(buf, 32) >= 0);
+                }
+            } finally {
+                io.questdb.client.std.Unsafe.free(
+                        buf,
+                        32,
+                        io.questdb.client.std.MemoryTag.NATIVE_DEFAULT
+                );
+            }
+
+            try {
+                SegmentRing.openExisting(tmpDir, SEGMENT_SIZE).close();
+                Assert.fail("expected recovered FSN gap");
+            } catch (MmapSegmentException expected) {
+                String message = expected.getMessage();
+                Assert.assertTrue(message, message.contains("FSN gap in recovered segments"));
+                Assert.assertTrue(message, message.contains("a segment was deleted"));
+                Assert.assertTrue(message, message.contains("sealed segment's tail was truncated"));
+                Assert.assertTrue(message, message.contains("sparse/unbacked page or disk media error"));
+                Assert.assertTrue(message, message.contains("check disk health"));
+            }
+        });
     }
 
     @Test

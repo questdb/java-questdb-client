@@ -79,8 +79,8 @@ public class PrReviewRedTests {
     /**
      * Finding C1 / C10 — first-frame CRC corruption silently deletes the segment.
      * <p>
-     * If frame[0] of a recovered .sfa fails CRC validation, scanFrames returns
-     * lastGood=HEADER_SIZE, countFrames returns 0, and SegmentRing.openExisting
+     * If frame[0] of a recovered .sfa fails CRC validation, recovery returns
+     * lastGood=HEADER_SIZE and frameCount=0, and SegmentRing.openExisting
      * unlinks the file as an "empty hot-spare leftover" — destroying every frame
      * that physically followed the corrupt header. The torn-tail WARN inside
      * MmapSegment.openExisting is dropped on the floor.
@@ -99,7 +99,11 @@ public class PrReviewRedTests {
                 for (int i = 0; i < 32; i++) {
                     Unsafe.getUnsafe().putByte(buf + i, (byte) i);
                 }
-                Assert.assertTrue("setup: first append must succeed", seg.tryAppend(buf, 32) >= 0);
+                // A valid zero-length first frame has a non-zero CRC and a
+                // zero payload length. Corrupting that CRC to zero makes its
+                // entire 8-byte header zero, identical to unwritten space if
+                // recovery inspects only the failed header.
+                Assert.assertTrue("setup: zero-length first append must succeed", seg.tryAppend(buf, 0) >= 0);
                 Assert.assertTrue("setup: second append must succeed", seg.tryAppend(buf, 32) >= 0);
                 Assert.assertTrue("setup: third append must succeed", seg.tryAppend(buf, 32) >= 0);
                 Assert.assertEquals("setup: three frames written", 3L, seg.frameCount());
@@ -110,13 +114,13 @@ public class PrReviewRedTests {
             Assert.assertTrue("setup: file must exist on disk", Files.exists(segPath));
 
             // Corrupt the CRC field of frame[0] (offset HEADER_SIZE..HEADER_SIZE+4).
-            // A single bit flip is enough; we overwrite the whole 4-byte field with
-            // a value statistically guaranteed to mismatch any real CRC.
+            // Zero mismatches the valid zero-length frame's CRC and leaves the
+            // failed frame's complete 8-byte header all-zero.
             int fd = Files.openRW(segPath);
             Assert.assertTrue("setup: openRW failed", fd >= 0);
             long badCrcBuf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
             try {
-                Unsafe.getUnsafe().putInt(badCrcBuf, 0xDEADBEEF);
+                Unsafe.getUnsafe().putInt(badCrcBuf, 0);
                 Files.write(fd, badCrcBuf, 4, MmapSegment.HEADER_SIZE);
             } finally {
                 Unsafe.free(badCrcBuf, 4, MemoryTag.NATIVE_DEFAULT);
@@ -128,7 +132,7 @@ public class PrReviewRedTests {
             // Run recovery.
             SegmentRing recovered = SegmentRing.openExisting(tmpDir, 64 * 1024);
             try {
-                // The bug: openExisting sees frameCount=0 (because scanFrames
+                // The bug: openExisting sees frameCount=0 (because recovery
                 // bailed at the corrupt frame[0]) and treats the segment as
                 // an "empty hot-spare leftover" — closing AND UNLINKING the
                 // file. The user's frames 1, 2, 3 are gone forever; the only

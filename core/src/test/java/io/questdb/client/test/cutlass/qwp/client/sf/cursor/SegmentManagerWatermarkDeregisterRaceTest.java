@@ -41,6 +41,7 @@ import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
@@ -75,6 +76,78 @@ public class SegmentManagerWatermarkDeregisterRaceTest {
     public void tearDown() {
         if (tmpDir == null) return;
         rmDirRecursive(tmpDir);
+    }
+
+    @Test(timeout = 15_000L)
+    public void testStaleSnapshotBeforeClaimSkipsDeregisteredSecondRing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            SegmentManager mgr = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            SegmentRing firstRing = new SegmentRing(MmapSegment.createInMemory(0L, segSize), segSize);
+            SegmentRing secondRing = new SegmentRing(MmapSegment.createInMemory(0L, segSize), segSize);
+            CountDownLatch beforeSecondClaim = new CountDownLatch(1);
+            CountDownLatch releaseSecondClaim = new CountDownLatch(1);
+            CountDownLatch secondAttemptFinished = new CountDownLatch(1);
+            AtomicInteger claimAttempts = new AtomicInteger();
+            AtomicInteger installAttempts = new AtomicInteger();
+            AtomicInteger serviceAttempts = new AtomicInteger();
+            AtomicReference<Throwable> hookError = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                mgr.register(firstRing, null, null);
+                mgr.register(secondRing, null, null);
+                mgr.setBeforeInstallSyncHook(installAttempts::incrementAndGet);
+                mgr.setBeforeServiceClaimHook(() -> {
+                    if (claimAttempts.incrementAndGet() != 2) {
+                        return;
+                    }
+                    beforeSecondClaim.countDown();
+                    try {
+                        if (!releaseSecondClaim.await(10, TimeUnit.SECONDS)) {
+                            hookError.compareAndSet(null,
+                                    new AssertionError("timed out waiting to release second stale claim"));
+                        }
+                    } catch (Throwable t) {
+                        hookError.compareAndSet(null, t);
+                    }
+                });
+                mgr.setAfterServiceHook(() -> {
+                    if (serviceAttempts.incrementAndGet() == 2) {
+                        secondAttemptFinished.countDown();
+                    }
+                });
+                mgr.start();
+
+                assertTrue("worker never reached the second snapshotted ring before claim",
+                        beforeSecondClaim.await(5, TimeUnit.SECONDS));
+                assertEquals("first snapshotted ring must enter provisioning", 1, installAttempts.get());
+                mgr.deregister(secondRing);
+                releaseSecondClaim.countDown();
+                assertTrue("worker never completed the stale second-ring service attempt",
+                        secondAttemptFinished.await(5, TimeUnit.SECONDS));
+                if (hookError.get() != null) {
+                    throw new AssertionError("service hook failed", hookError.get());
+                }
+                assertEquals(
+                        "a ring deregistered after snapshot but before claim must not enter serviceRing0",
+                        1, installAttempts.get()
+                );
+
+                mgr.close();
+                managerClosed = true;
+            } finally {
+                mgr.setAfterServiceHook(null);
+                mgr.setBeforeInstallSyncHook(null);
+                mgr.setBeforeServiceClaimHook(null);
+                releaseSecondClaim.countDown();
+                if (!managerClosed) {
+                    mgr.close();
+                }
+                firstRing.close();
+                secondRing.close();
+            }
+        });
     }
 
     @Test(timeout = 15_000L)
