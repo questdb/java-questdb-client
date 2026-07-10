@@ -36,6 +36,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -711,6 +712,76 @@ public class DeltaDictRecoveryTest {
                 }
             }
         });
+    }
+
+    @Test
+    public void testRecoverySeedKeepsUtf8CollidingSymbolsInLockstep() throws Exception {
+        // M2 regression: two DISTINCT source symbols that collapse to the SAME UTF-8
+        // bytes -- lone UTF-16 surrogates, which the encoder maps to '?' -- get
+        // distinct producer ids and persist as separate entries. On recovery the
+        // producer must rebuild its id space to match the persisted entry count
+        // exactly. Pre-fix, seedGlobalDictionaryFromPersisted used getOrAddSymbol,
+        // which de-duped the two decoded "?" strings, leaving the producer
+        // dictionary (and sentMaxSymbolId) one short of pd.size() -- desyncing from
+        // the send-loop catch-up mirror (which uses pd.size()) and silently
+        // misattributing later symbols after a reconnect. addRecoveredSymbol appends
+        // without de-duping, keeping producer and mirror in lockstep.
+        assertMemoryLeak(() -> {
+            // Phase 1: ingest two lone-surrogate symbols in file mode, close-fast.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    s1.table("m").symbol("s", "\uD800").longColumn("v", 1L).atNow(); // lone surrogate -> '?'
+                    s1.flush();
+                    s1.table("m").symbol("s", "\uD801").longColumn("v", 2L).atNow(); // a DIFFERENT one -> '?'
+                    s1.flush();
+                }
+            }
+
+            // The persisted dictionary holds TWO entries (both encode to '?').
+            int persistedSize;
+            PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
+            Assert.assertNotNull(pd);
+            try {
+                persistedSize = pd.size();
+            } finally {
+                pd.close();
+            }
+            Assert.assertEquals("two colliding symbols must persist as two entries", 2, persistedSize);
+
+            // Phase 2: recover. The seeded producer id space must match pd.size().
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    Assert.assertEquals("recovered producer dictionary must match the persisted "
+                                    + "entry count (not de-duped), else the delta baseline desyncs from the mirror",
+                            persistedSize, globalDictSize(s2));
+                    Assert.assertEquals("delta baseline must resume at the persisted tip",
+                            persistedSize - 1, intField(s2, "sentMaxSymbolId"));
+                }
+            }
+        });
+    }
+
+    private static int globalDictSize(Sender sender) throws Exception {
+        Field f = sender.getClass().getDeclaredField("globalSymbolDictionary");
+        f.setAccessible(true);
+        Object dict = f.get(sender);
+        return (int) dict.getClass().getMethod("size").invoke(dict);
+    }
+
+    private static int intField(Sender sender, String name) throws Exception {
+        Field f = sender.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getInt(sender);
     }
 
     private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {

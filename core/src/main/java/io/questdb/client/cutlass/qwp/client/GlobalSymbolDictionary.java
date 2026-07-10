@@ -51,6 +51,37 @@ public class GlobalSymbolDictionary {
     }
 
     /**
+     * Appends {@code symbol} at the next sequential id, matching a recovered /
+     * persisted dictionary's dense id order, WITHOUT de-duplicating.
+     * <p>
+     * Recovery ({@code QwpWebSocketSender.seedGlobalDictionaryFromPersisted})
+     * replays the persisted entries in id order to rebuild this dictionary. It must
+     * NOT collapse two source strings that decode to the same characters, because
+     * the persisted {@code .symbol-dict}, the on-wire delta and the I/O-thread
+     * catch-up mirror all key on the entry POSITION (id), not on the string. The
+     * only strings that collide this way are malformed lone UTF-16 surrogates,
+     * which the UTF-8 encoder maps to {@code '?'}: {@link #getOrAddSymbol} would
+     * de-dup them and leave this dictionary SHORTER than the persisted entry count,
+     * desyncing the producer's delta baseline from the catch-up mirror (which uses
+     * {@code pd.size()}) and silently misattributing later symbols. Appending
+     * unconditionally keeps {@link #size()} equal to that count. The reverse lookup
+     * keeps the highest id for a colliding string, which is harmless: both ids
+     * encode to the same bytes, so resolving either is equivalent.
+     *
+     * @param symbol the recovered symbol string (must not be null)
+     * @return the id assigned (the previous {@link #size()})
+     */
+    public int addRecoveredSymbol(String symbol) {
+        if (symbol == null) {
+            throw new IllegalArgumentException("symbol cannot be null");
+        }
+        int newId = idToSymbol.size();
+        symbolToId.put(symbol, newId);
+        idToSymbol.add(symbol);
+        return newId;
+    }
+
+    /**
      * Clears all symbols from the dictionary.
      * <p>
      * After clearing, the next symbol added will get ID 0.

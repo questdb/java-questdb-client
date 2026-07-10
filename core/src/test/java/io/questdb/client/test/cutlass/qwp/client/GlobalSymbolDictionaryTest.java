@@ -32,6 +32,36 @@ import static org.junit.Assert.*;
 public class GlobalSymbolDictionaryTest {
 
     @Test
+    public void testAddRecoveredSymbol_appendsWithoutDeduplicating() {
+        // Recovery replays persisted entries in id order. Distinct source strings
+        // that decode to the same characters -- lone UTF-16 surrogates both
+        // UTF-8-encode to '?', so they read back as the string "?" -- must keep
+        // DISTINCT ids, so the producer id space matches the persisted entry count.
+        // getOrAddSymbol de-dups them; addRecoveredSymbol must not.
+        GlobalSymbolDictionary dedup = new GlobalSymbolDictionary();
+        dedup.getOrAddSymbol("?");
+        dedup.getOrAddSymbol("?");
+        assertEquals("getOrAddSymbol de-dups colliding strings", 1, dedup.size());
+
+        GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+        assertEquals(0, recovered.addRecoveredSymbol("?"));
+        assertEquals(1, recovered.addRecoveredSymbol("?"));
+        assertEquals(2, recovered.addRecoveredSymbol("nvda"));
+        assertEquals("addRecoveredSymbol keeps colliding entries distinct", 3, recovered.size());
+
+        // Dense id -> symbol mapping is preserved position-for-position.
+        assertEquals("?", recovered.getSymbol(0));
+        assertEquals("?", recovered.getSymbol(1));
+        assertEquals("nvda", recovered.getSymbol(2));
+
+        // A later ingest of a colliding string reuses the highest recovered id
+        // (harmless -- both encode to identical bytes), and a genuinely new symbol
+        // continues past the recovered tip.
+        assertEquals(1, recovered.getOrAddSymbol("?"));
+        assertEquals(3, recovered.getOrAddSymbol("brand-new"));
+    }
+
+    @Test
     public void testAddSymbol_assignsSequentialIds() {
         GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
 

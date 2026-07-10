@@ -3750,6 +3750,16 @@ public class QwpWebSocketSender implements Sender {
      * the slot's persisted dictionary (ids assigned in the same ascending order,
      * so they match the recovered frames) and resumes the delta baseline at the
      * recovered tip, so newly ingested symbols continue above the recovered ids.
+     * <p>
+     * Uses {@link GlobalSymbolDictionary#addRecoveredSymbol} (append, NOT de-dup):
+     * the persisted dictionary, the on-wire delta and the send-loop catch-up mirror
+     * all key on the entry POSITION (id), so the producer id space must match the
+     * persisted entry count exactly. {@code getOrAddSymbol} would collapse two
+     * source strings that decode to the same characters -- only malformed lone
+     * UTF-16 surrogates, which UTF-8-encode to {@code '?'} -- leaving this
+     * dictionary shorter than {@code pd.size()} and desyncing
+     * {@code sentMaxSymbolId} from the mirror's {@code sentDictCount = pd.size()},
+     * which silently misattributes later symbols after a reconnect.
      */
     private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {
         if (pd == null || pd.size() == 0) {
@@ -3757,7 +3767,7 @@ public class QwpWebSocketSender implements Sender {
         }
         ObjList<String> symbols = pd.readLoadedSymbols();
         for (int i = 0, n = symbols.size(); i < n; i++) {
-            globalSymbolDictionary.getOrAddSymbol(symbols.getQuick(i));
+            globalSymbolDictionary.addRecoveredSymbol(symbols.getQuick(i));
         }
         sentMaxSymbolId = globalSymbolDictionary.size() - 1;
     }
