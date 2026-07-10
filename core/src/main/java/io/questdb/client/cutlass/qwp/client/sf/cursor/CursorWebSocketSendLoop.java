@@ -187,8 +187,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     // Delta symbol dictionary catch-up state (see swapClient). Active in memory
-    // mode, and in disk mode on a recovered / orphan-drained slot (the constructor
-    // seeds sentDict* from the persisted dictionary there).
+    // mode, and in disk mode whenever the per-slot persisted dictionary opened --
+    // fresh slots included, not just recovered / orphan-drained ones. On a
+    // recovered / orphan-drained slot the constructor additionally SEEDS sentDict*
+    // from that persisted dictionary; a fresh slot starts with an empty mirror and
+    // grows it as frames are sent.
     // deltaDictEnabled gates all of it. The loop mirrors, in sentDict*, every
     // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
     // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that
@@ -2293,8 +2296,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             Unsafe.getUnsafe().putByte(frame + 2, (byte) 'P');
             Unsafe.getUnsafe().putByte(frame + 3, (byte) '1');
             Unsafe.getUnsafe().putByte(frame + 4, (byte) client.getServerQwpVersion());
+            // FLAG_DEFER_COMMIT: the catch-up carries dictionary entries but NO
+            // rows, so it must never trigger a server-side commit. Today it is
+            // always the first frame on a fresh (empty-transaction) connection, so
+            // committing nothing is a no-op -- but that invariant is load-bearing
+            // and unasserted. Deferring the (empty) commit removes the dependency:
+            // a future mid-stream catch-up cannot prematurely commit an in-flight
+            // deferred transaction. The dictionary delta still registers (as any
+            // deferred data frame's does); only the row commit is deferred, and the
+            // next real frame commits it.
             Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS,
-                    (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT));
+                    (byte) (QwpConstants.FLAG_GORILLA | QwpConstants.FLAG_DELTA_SYMBOL_DICT
+                            | QwpConstants.FLAG_DEFER_COMMIT));
             Unsafe.getUnsafe().putShort(frame + 6, (short) 0); // tableCount
             Unsafe.getUnsafe().putInt(frame + 8, payloadLen);
             long q = writeVarintAt(frame + QwpConstants.HEADER_SIZE, deltaStart);

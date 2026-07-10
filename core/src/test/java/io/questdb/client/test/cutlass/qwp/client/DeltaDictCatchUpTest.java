@@ -92,6 +92,9 @@ public class DeltaDictCatchUpTest {
                 List<String> conn2 = handler.dictFor(2);
                 Assert.assertTrue("2nd connection saw a catch-up frame with 0 tables",
                         handler.sawZeroTableFrameOnConn2);
+                Assert.assertTrue("the catch-up frame carries no rows, so it must defer its "
+                                + "(empty) commit -- FLAG_DEFER_COMMIT set",
+                        handler.catchUpDeferredOnConn2);
                 Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
                 Assert.assertEquals("alpha", conn2.get(0));
                 Assert.assertEquals("beta", conn2.get(1));
@@ -326,6 +329,9 @@ public class DeltaDictCatchUpTest {
         // (rather than a fixed sleep) before sending batch 2, so batch 2 cannot
         // race into connection 1's pre-close window and must land on the reconnect.
         volatile boolean conn1Closed;
+        // Set from the flags byte of the zero-table catch-up frame on connection 2:
+        // the catch-up carries no rows and must defer its (empty) commit.
+        volatile boolean catchUpDeferredOnConn2;
         volatile boolean sawZeroTableFrameOnConn2;
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
@@ -352,6 +358,8 @@ public class DeltaDictCatchUpTest {
             accumulate(data, dict);
             if (connNumber == 2 && tableCount(data) == 0) {
                 sawZeroTableFrameOnConn2 = true;
+                // FLAG_DEFER_COMMIT is bit 0x01 of the flags byte (offset 5).
+                catchUpDeferredOnConn2 = (data[5] & 0x01) != 0;
             }
             try {
                 client.sendBinary(buildAck(nextSeq.getAndIncrement()));

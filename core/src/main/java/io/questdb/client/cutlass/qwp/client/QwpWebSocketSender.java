@@ -3455,7 +3455,8 @@ public class QwpWebSocketSender implements Sender {
         ensureActiveBufferReady();
         // In full-dict mode every frame is self-sufficient: it carries the whole
         // symbol dictionary from id 0 so orphan-drain / recovery replay to a fresh
-        // server never dangles a symbol id. In delta mode (memory-mode only) each
+        // server never dangles a symbol id. In delta mode (memory-mode, and
+        // file-mode store-and-forward once the persisted dictionary opened) each
         // frame carries only ids above sentMaxSymbolId; a reconnect re-registers
         // the dictionary via an I/O-thread catch-up frame before replay, so the
         // producer's monotonic baseline stays valid across the wire boundary.
