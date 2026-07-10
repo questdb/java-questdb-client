@@ -146,16 +146,24 @@ public final class SegmentRing implements QuietCloseable {
      *       spare, then rotates onto it.</li>
      *   <li>All others become sealed segments awaiting ACK and trim.</li>
      * </ul>
-     * Returns {@code null} if the directory is empty or contains no
-     * recognizable {@code .sfa} files -- the caller should then construct a
-     * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
-     * created initial segment.
+     * Returns {@code null} only when there is genuinely no data to recover:
+     * the directory does not exist, is empty, or contains only empty
+     * hot-spare leftovers (which are unlinked). The caller may then safely
+     * construct a fresh ring with {@link #SegmentRing(MmapSegment, long)} and
+     * a freshly created initial segment.
      * <p>
-     * Recovery is best-effort: a single bad-magic file is silently skipped
-     * (logged-then-ignored is the right call here; a stray unrelated file in
-     * the SF dir shouldn't take the whole sender down). A failure to open
-     * an otherwise-valid segment IS fatal -- the caller's data integrity
-     * depends on every segment being readable.
+     * Recovery fails closed: any {@code .sfa} file that cannot be opened --
+     * bad magic, bad header, unsupported version, short file, mmap rejection
+     * -- aborts recovery with {@link MmapSegmentException}, as does a failure
+     * to enumerate the directory. Skipping an unreadable file is never safe
+     * here: the interior FSN-contiguity check below cannot expose a skipped
+     * segment at the lowest, highest, or sole position (the survivors stay
+     * mutually contiguous), so recovery would silently retire the skipped
+     * segment's unacked frames, mint duplicate FSNs past a skipped tail, or
+     * -- for a sole skipped file -- route the caller onto the truncating
+     * fresh-start path that destroys the only surviving segment. An operator
+     * who wants to accept the loss moves the file out of the SF directory
+     * explicitly.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
         if (!Files.exists(sfDir)) {
@@ -164,9 +172,16 @@ public final class SegmentRing implements QuietCloseable {
         ObjList<MmapSegment> opened = new ObjList<>();
         long find = Files.findFirst(sfDir);
         if (find < 0) {
-            LOG.warn("openExisting could not enumerate {} - treating as empty, "
-                    + "but this may indicate a permission or transient error", sfDir);
-            return null;
+            // Fail closed: an enumeration failure (permissions, transient
+            // I/O error) is NOT an empty store. Returning null here would
+            // route the caller onto the fresh-start path, whose truncating
+            // openCleanRW of sf-initial.sfa destroys any surviving data the
+            // JVM merely could not list.
+            throw new MmapSegmentException(
+                    "could not enumerate SF directory " + sfDir
+                            + " -- refusing to treat an unreadable directory as an empty"
+                            + " store (a fresh start would truncate sf-initial.sfa over"
+                            + " any surviving data); check directory permissions");
         }
         if (find == 0) {
             return null;
@@ -185,7 +200,30 @@ public final class SegmentRing implements QuietCloseable {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
                         try {
-                            seg = MmapSegment.openExisting(path);
+                            try {
+                                seg = MmapSegment.openExisting(path);
+                            } catch (MmapSegmentException t) {
+                                // Fail closed: an unreadable .sfa in the slot is a
+                                // recovery failure, not a skippable curiosity. The
+                                // interior contiguity check below cannot expose a
+                                // skipped segment at the lowest, highest, or sole
+                                // position -- the survivors stay mutually
+                                // contiguous -- so skipping would silently retire
+                                // the segment's unacked frames (lowest/sole: the
+                                // engine seeds ackedFsn past them), mint duplicate
+                                // FSNs (highest: nextSeq resumes inside the skipped
+                                // range), or -- sole -- route the caller onto the
+                                // truncating fresh-start path that destroys the
+                                // only surviving file. The outer catch closes every
+                                // already-recovered segment before this propagates.
+                                throw new MmapSegmentException(
+                                        "recovery failed: unreadable segment file " + path
+                                                + " -- refusing to start with partial data (a skipped"
+                                                + " segment silently loses or duplicates frames). Restore"
+                                                + " the file from a copy, or move it out of the SF"
+                                                + " directory to explicitly accept the data loss",
+                                        t);
+                            }
                             // Filter out empty leftovers -- typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
@@ -213,30 +251,39 @@ public final class SegmentRing implements QuietCloseable {
                                 if (torn > 0) {
                                     int renameResult = Files.rename(path, path + ".corrupt");
                                     if (renameResult != 0) {
-                                        LOG.warn("openExisting: could not quarantine corrupt segment {}; "
-                                                + "the original file remains in place [rc={}]",
-                                                path, renameResult);
+                                        // Fail closed: with the quarantine rename
+                                        // failed, the corrupt file is still at its
+                                        // original path -- if it is the sole
+                                        // segment, the caller's fresh start would
+                                        // truncate it (sf-initial.sfa) or restart
+                                        // FSNs alongside it. Surface the error
+                                        // instead of proceeding over live data.
+                                        throw new MmapSegmentException(
+                                                "could not quarantine corrupt segment " + path
+                                                        + " to " + path + ".corrupt [rc=" + renameResult
+                                                        + "] -- refusing to continue recovery while the"
+                                                        + " corrupt file occupies its original path");
                                     }
                                 } else {
-                                    Files.remove(path);
+                                    if (!Files.remove(path)) {
+                                        // Same fail-closed reasoning: an empty
+                                        // leftover that cannot be unlinked would
+                                        // be truncated by the caller's fresh
+                                        // start (harmless for an empty file) --
+                                        // but unlink failing in a directory we
+                                        // just created files in means something
+                                        // is wrong (permissions changed, dir
+                                        // vanished); don't build on that ground.
+                                        throw new MmapSegmentException(
+                                                "could not unlink empty leftover segment " + path
+                                                        + " -- refusing to continue recovery; check"
+                                                        + " directory permissions");
+                                    }
                                 }
                             } else {
                                 opened.add(seg);
                                 seg = null;
                             }
-                        } catch (MmapSegmentException t) {
-                            // Per-file data error (bad magic, bad header,
-                            // unsupported version, mmap rejection on this one
-                            // file). Don't take down recovery for one corrupt
-                            // .sfa -- log and skip so siblings still recover.
-                            // Resource exhaustion (OOM) and programmer errors
-                            // (IOOBE) deliberately propagate to the outer
-                            // catch, which closes every already-recovered
-                            // segment and rethrows: continuing the loop after
-                            // an OOM would just fail again on the next file
-                            // while silently leaking the segments we managed
-                            // to recover before it.
-                            LOG.warn("openExisting: skipping {} -- {}", path, t.toString());
                         } finally {
                             // Close any seg whose ownership wasn't transferred
                             // (either to opened, or via the empty-branch close

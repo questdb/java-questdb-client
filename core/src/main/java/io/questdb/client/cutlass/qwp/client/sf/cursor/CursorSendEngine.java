@@ -316,21 +316,36 @@ public final class CursorSendEngine implements QuietCloseable {
                             recoveredCommitBoundaryFsn, publishedFsn);
                 }
             } else {
-                // Fresh start with no recovered segments. Any stale
-                // watermark from a prior fully-drained session refers
-                // to a lifecycle now gone -- unlink it before opening
-                // so the new session's first read() correctly reports
-                // INVALID (magic=0 on a freshly zero-filled file).
-                if (!memoryMode) {
-                    AckWatermark.removeOrphan(sfDir);
-                    watermarkInProgress = AckWatermark.open(sfDir);
-                }
+                // Fresh start with no recovered segments.
                 MmapSegment initial;
                 String initialPath = null;
                 if (memoryMode) {
                     initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
                 } else {
                     initialPath = sfDir + "/sf-initial.sfa";
+                    // Defense in depth: recovery returning null now guarantees
+                    // no recognizable segment data remained (unreadable files
+                    // and enumeration failures fail closed; empty leftovers
+                    // were unlinked; corrupt-tailed ones quarantined). If a
+                    // file still exists at this path, some invariant broke --
+                    // and MmapSegment.create's openCleanRW uses truncating
+                    // semantics (O_CREAT|O_TRUNC / CREATE_ALWAYS), so creating
+                    // over it would silently destroy whatever it holds.
+                    // Checked BEFORE the watermark unlink below so a guard
+                    // trip preserves maximal forensic state for postmortem.
+                    if (Files.exists(initialPath)) {
+                        throw new MmapSegmentException(
+                                "refusing to overwrite existing " + initialPath
+                                        + " on fresh start -- recovery reported no data, yet the"
+                                        + " file exists; creating over it would truncate its"
+                                        + " contents");
+                    }
+                    // Any stale watermark from a prior fully-drained session
+                    // refers to a lifecycle now gone -- unlink it before
+                    // opening so the new session's first read() correctly
+                    // reports INVALID (magic=0 on a freshly zero-filled file).
+                    AckWatermark.removeOrphan(sfDir);
+                    watermarkInProgress = AckWatermark.open(sfDir);
                     initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
                 }
                 try {

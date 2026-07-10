@@ -369,7 +369,7 @@ public class SegmentRingTest {
     }
 
     @Test
-    public void testOpenExistingSkipsBadMagicFile() throws Exception {
+    public void testOpenExistingFailsClosedOnBadMagicFile() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
@@ -379,7 +379,12 @@ public class SegmentRingTest {
                 MmapSegment s0 = MmapSegment.create(tmpDir + "/good.sfa", 0, segSize);
                 s0.tryAppend(buf, 16);
                 s0.close();
-                // One stray .sfa with no proper header — must be ignored.
+                // One .sfa with no proper header. A torn header write at
+                // crash produces exactly this on a REAL segment, so recovery
+                // must fail closed rather than skip: skipped at the lowest/
+                // highest/sole position it silently loses or duplicates FSNs
+                // (see SegmentRingEdgeRecoveryTest), and "stray foreign
+                // file" is indistinguishable from "torn real segment".
                 int fd = Files.openCleanRW(tmpDir + "/stray.sfa");
                 long hdr = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
                 try {
@@ -391,11 +396,19 @@ public class SegmentRingTest {
                     Unsafe.free(hdr, 8, MemoryTag.NATIVE_DEFAULT);
                 }
 
-                try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
-                    assertNotNull(recovered);
-                    assertEquals(0, recovered.getActive().baseSeq());
-                    assertEquals(0, recovered.getSealedSegments().size());
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("expected fail-closed recovery on unreadable .sfa");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("unreadable segment file"));
+                    assertTrue("message must name the offending file: " + expected.getMessage(),
+                            expected.getMessage().contains("stray.sfa"));
                 }
+                // Fail closed must also preserve the good segment untouched
+                // for the next (post-remediation) recovery attempt.
+                assertTrue("good segment must survive a failed recovery",
+                        Files.exists(tmpDir + "/good.sfa"));
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }

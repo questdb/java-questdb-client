@@ -208,12 +208,15 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * An unbacked page-zero header must produce the per-file
-     * {@link MmapSegmentException} that SegmentRing skips, not poison recovery
-     * of valid sibling files.
+     * An unbacked page-zero header must produce a synchronous
+     * {@link MmapSegmentException}, not a SIGBUS/undefined mapping.
+     * SegmentRing.openExisting fails recovery closed on this exception --
+     * a segment with an unreadable header may hold recoverable frames, and
+     * silently skipping it at the lowest/highest/sole position loses or
+     * duplicates FSNs (see SegmentRingEdgeRecoveryTest).
      */
     @Test
-    public void testUnbackedHeaderPageIsSkippableNotFatal() throws Exception {
+    public void testUnbackedHeaderPageFailsSynchronously() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String path = tmpDir + "/seg-unbacked-header.sfa";
             writeSegment(path, 3L, new int[]{64});
@@ -223,8 +226,9 @@ public class MmapSegmentRecoveryFaultTest {
                 MmapSegment.openExisting(path).close();
                 fail("expected MmapSegmentException for an unbacked header page");
             } catch (MmapSegmentException expected) {
-                // ok -- SegmentRing's per-file catch skips just this file
-                // instead of aborting recovery of the whole slot.
+                // ok -- surfaces synchronously; SegmentRing.openExisting
+                // fails recovery closed on it rather than silently skipping
+                // a file that may hold recoverable frames.
             }
         });
     }
@@ -331,11 +335,12 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * A header short-read produces the per-file exception that SegmentRing
-     * skips; recovery never maps the stale reported length.
+     * A header short-read produces a synchronous per-file exception on which
+     * SegmentRing.openExisting fails recovery closed; recovery never maps
+     * the stale reported length.
      */
     @Test
-    public void testHeaderShortReadIsSkippable() throws Exception {
+    public void testHeaderShortReadFailsSynchronously() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String path = tmpDir + "/seg-mappasteof-header.sfa";
             final long page = Files.PAGE_SIZE;
