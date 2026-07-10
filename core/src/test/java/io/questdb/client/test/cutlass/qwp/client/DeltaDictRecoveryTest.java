@@ -228,6 +228,62 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testRecoveredSenderContinuesIngestingNewSymbols() throws Exception {
+        // M2 regression: seedGlobalDictionaryFromPersisted resumes the producer's
+        // dictionary and delta baseline from the persisted .symbol-dict, so a
+        // recovered sender that continues ingesting assigns the NEXT id, not a
+        // colliding low one. Without it the new symbol reuses a recovered id and the
+        // fresh server sees a redefinition -> silent misattribution. No prior test
+        // ingests on the recovered sender. Replay is from FSN 0 (no acks), so the
+        // recovered frames legitimately overlap the seeded dictionary -- this also
+        // pins that the redefinition guard does not false-positive on normal
+        // recovery.
+        assertMemoryLeak(() -> {
+            // Phase 1: ingest DISTINCT_SYMBOLS symbols, silent server, close-fast ->
+            // unacked frames + a full persisted dictionary.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_bytes=4096;close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Phase 2: recover against a fresh server, then ingest a genuinely NEW
+            // symbol. The producer must continue at id DISTINCT_SYMBOLS.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "brand-new").longColumn("v", 99L).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS + 1) {
+                        Thread.sleep(20);
+                    }
+                }
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("recovered sender must continue the dictionary, not collide: " + dict,
+                        DISTINCT_SYMBOLS + 1, dict.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("sym-" + i, dict.get(i));
+                }
+                Assert.assertEquals("brand-new", dict.get(DISTINCT_SYMBOLS));
+            }
+        });
+    }
+
+    @Test
     public void testUnopenablePersistedDictStillGuardsAgainstReplayingDeltaFrames() throws Exception {
         // C1 regression: when a recovered disk slot's persisted dictionary cannot be
         // OPENED (fd exhaustion, a read-only remount, ENOSPC -- simulated here by a

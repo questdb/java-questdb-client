@@ -94,14 +94,19 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private static final int MAX_ENTRY_LEN = 1 << 20;
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
-    // In-memory copy of the entry region [len][utf8]... exactly as on disk,
-    // populated only when open() recovered existing entries (recovery /
-    // orphan-drain). Zero/empty for a freshly created file. Consumed once to
-    // seed the send loop's catch-up mirror and the producer's id map.
-    private final long loadedEntriesAddr;
-    private final int loadedEntriesLen;
     private long appendOffset;
     private boolean closed;
+    // In-memory copy of the entry region [len][utf8]... exactly as on disk,
+    // populated only when open() recovered existing entries (recovery /
+    // orphan-drain). Zero/empty for a freshly created file. Consumed once to seed
+    // the producer's id map (readLoadedSymbols) and then ADOPTED by the send loop's
+    // catch-up mirror (takeLoadedEntries), which takes ownership so this file no
+    // longer retains a second copy of the dictionary for the engine's lifetime.
+    private long loadedEntriesAddr;
+    private int loadedEntriesLen;
+    // True once takeLoadedEntries() handed loadedEntriesAddr to the send-loop
+    // mirror; guards a stale readLoadedSymbols() call (which must run first).
+    private boolean loadedEntriesTaken;
     private long scratchAddr;
     private int scratchCap;
     private int size;
@@ -256,6 +261,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * recovered.
      */
     public ObjList<String> readLoadedSymbols() {
+        assert !loadedEntriesTaken : "readLoadedSymbols() must run before takeLoadedEntries()";
         ObjList<String> out = new ObjList<>(Math.max(size, 1));
         long p = loadedEntriesAddr;
         long limit = p + loadedEntriesLen;
@@ -284,6 +290,25 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public int size() {
         return size;
+    }
+
+    /**
+     * Transfers ownership of the loaded-entries buffer to the caller and returns
+     * its base address (0 when nothing was recovered). The send loop adopts it as
+     * the initial backing of its catch-up mirror rather than copying it, so this
+     * file stops retaining a second copy of the dictionary for the engine's
+     * lifetime. After this call {@link #close()} no longer frees the buffer -- the
+     * caller owns it. The producer's {@link #readLoadedSymbols()} is the only other
+     * consumer and MUST run first: {@code setCursorEngine} seeds the producer
+     * before the send loop is constructed, and the drainer path has no producer
+     * consumer. The buffer was allocated with {@link MemoryTag#NATIVE_DEFAULT}.
+     */
+    public long takeLoadedEntries() {
+        long addr = loadedEntriesAddr;
+        loadedEntriesAddr = 0L;
+        loadedEntriesLen = 0;
+        loadedEntriesTaken = true;
+        return addr;
     }
 
     private static PersistedSymbolDict openExisting(String filePath, long fileLen) {

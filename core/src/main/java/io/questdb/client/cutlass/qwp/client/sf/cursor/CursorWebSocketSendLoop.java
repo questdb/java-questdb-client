@@ -543,8 +543,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (pd != null && pd.size() > 0) {
                 int len = pd.loadedEntriesLen();
                 if (len > 0) {
-                    ensureSentDictCapacity(len);
-                    Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
+                    // Adopt the persisted dictionary's loaded-entries buffer as the
+                    // mirror's initial backing instead of copying it and leaving the
+                    // dictionary to retain a second copy for the engine's lifetime.
+                    // The producer's readLoadedSymbols() -- the only other consumer --
+                    // runs earlier in setCursorEngine; the drainer path has no
+                    // producer consumer. takeLoadedEntries() transfers ownership, so
+                    // this loop's mirror lifecycle frees it (not pd.close()). The
+                    // buffer's allocated size equals loadedEntriesLen.
+                    sentDictBytesAddr = pd.takeLoadedEntries();
+                    sentDictBytesCapacity = len;
                     sentDictBytesLen = len;
                     // Set the count only alongside the bytes so sentDictCount can
                     // never claim symbols the mirror does not hold. A recovered slot
