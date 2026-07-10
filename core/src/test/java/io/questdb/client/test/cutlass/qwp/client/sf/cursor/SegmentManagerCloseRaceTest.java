@@ -279,6 +279,17 @@ public class SegmentManagerCloseRaceTest {
         });
     }
 
+    /**
+     * A closer arriving with a pending interrupt must clear it, reach the
+     * join path, and reap the worker — not throw out of join() immediately
+     * and abandon a live worker that still owns segment files.
+     * <p>
+     * Deterministic: the before-join-attempt hook is the positive signal
+     * that the closer reached the join with (a) the interrupt cleared and
+     * (b) the worker still live. No wall-clock "close didn't return within
+     * N ms" inversion — that formulation passes with the fix reverted
+     * whenever the closer is descheduled before the join.
+     */
     @Test(timeout = 15_000L)
     public void testInterruptedCallerDoesNotAbandonReapableWorker() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -291,7 +302,10 @@ public class SegmentManagerCloseRaceTest {
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             CountDownLatch closeReturned = new CountDownLatch(1);
+            CountDownLatch closerAtJoin = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
+            AtomicBoolean interruptClearAtJoin = new AtomicBoolean();
+            AtomicBoolean workerAliveAtJoin = new AtomicBoolean();
             AtomicBoolean interruptPreserved = new AtomicBoolean();
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             AtomicReference<Throwable> closeErr = new AtomicReference<>();
@@ -310,6 +324,17 @@ public class SegmentManagerCloseRaceTest {
                         hookErr.compareAndSet(null, t);
                     }
                 });
+                manager.setBeforeJoinAttemptHook(() -> {
+                    if (closerAtJoin.getCount() == 0) return;
+                    interruptClearAtJoin.set(!Thread.currentThread().isInterrupted());
+                    try {
+                        Thread w = readWorkerThread(manager);
+                        workerAliveAtJoin.set(w != null && w.isAlive());
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                    closerAtJoin.countDown();
+                });
                 manager.start();
                 Assert.assertTrue("worker did not reach install hook",
                         workerBlocked.await(5, TimeUnit.SECONDS));
@@ -327,8 +352,17 @@ public class SegmentManagerCloseRaceTest {
                 }, "interrupted-closer");
                 closer.start();
 
-                Assert.assertFalse("interrupted close() abandoned a live worker instead of waiting",
-                        closeReturned.await(300, TimeUnit.MILLISECONDS));
+                // Positive proof the closer reached the join path: the hook
+                // fired. With the fix reverted (immediate InterruptedException
+                // abandon, or no interrupt-clearing), either the hook records
+                // a still-set interrupt or the final reap assertions fail.
+                Assert.assertTrue("closer never reached the join path",
+                        closerAtJoin.await(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the pending caller interrupt must be cleared before the join "
+                                + "(otherwise join() throws immediately and the worker is abandoned)",
+                        interruptClearAtJoin.get());
+                Assert.assertTrue("worker must still be live when the closer starts joining",
+                        workerAliveAtJoin.get());
 
                 releaseWorker.countDown();
                 Assert.assertTrue("close() never returned after the worker was released",
@@ -348,6 +382,110 @@ public class SegmentManagerCloseRaceTest {
                 }
             } finally {
                 manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeJoinAttemptHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    Thread.interrupted();
+                    manager.close();
+                }
+                ring.close();
+            }
+        });
+    }
+
+    /**
+     * The "interrupt arrives DURING the join" branch of the close() loop: an
+     * InterruptedException thrown out of {@code t.join()} must mark the
+     * interrupt for restoration and loop back into another join attempt —
+     * not abandon the reap.
+     * <p>
+     * Deterministic: the second before-join-attempt hook invocation is the
+     * positive proof that the loop retried after the mid-join interrupt.
+     * With the retry loop reverted (single join, abandon on interrupt) the
+     * second invocation never happens and the await fails.
+     */
+    @Test(timeout = 15_000L)
+    public void testInterruptDuringJoinRetriesUntilWorkerReaped() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/mid-join-interrupt-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            CountDownLatch closeReturned = new CountDownLatch(1);
+            CountDownLatch firstJoinAttempt = new CountDownLatch(1);
+            CountDownLatch secondJoinAttempt = new CountDownLatch(2);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicBoolean interruptPreserved = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            AtomicReference<Throwable> closeErr = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.setBeforeJoinAttemptHook(() -> {
+                    firstJoinAttempt.countDown();
+                    secondJoinAttempt.countDown();
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                Thread closer = new Thread(() -> {
+                    try {
+                        manager.close();
+                    } catch (Throwable t) {
+                        closeErr.compareAndSet(null, t);
+                    } finally {
+                        interruptPreserved.set(Thread.currentThread().isInterrupted());
+                        closeReturned.countDown();
+                    }
+                }, "mid-join-interrupted-closer");
+                closer.start();
+
+                Assert.assertTrue("closer never reached the first join attempt",
+                        firstJoinAttempt.await(5, TimeUnit.SECONDS));
+                // The worker is still parked in the install hook, so the
+                // join cannot return normally: this interrupt must surface
+                // as an InterruptedException inside (or on entry to) join.
+                closer.interrupt();
+                Assert.assertTrue("close() abandoned the reap after a mid-join interrupt "
+                                + "instead of looping back into another join attempt",
+                        secondJoinAttempt.await(5, TimeUnit.SECONDS));
+
+                releaseWorker.countDown();
+                Assert.assertTrue("close() never returned after the worker was released",
+                        closeReturned.await(10, TimeUnit.SECONDS));
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                managerClosed = readWorkerThread(manager) == null;
+
+                if (closeErr.get() != null) {
+                    throw new AssertionError("close() threw", closeErr.get());
+                }
+                Assert.assertNull("close() must reap the worker despite the mid-join interrupt",
+                        readWorkerThread(manager));
+                Assert.assertTrue("close() must restore the interrupt that arrived during the join",
+                        interruptPreserved.get());
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                manager.setBeforeJoinAttemptHook(null);
                 releaseWorker.countDown();
                 if (!managerClosed) {
                     Thread.interrupted();

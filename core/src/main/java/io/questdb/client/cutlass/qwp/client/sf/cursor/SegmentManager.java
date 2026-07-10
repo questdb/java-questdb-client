@@ -86,6 +86,15 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
+    // Test seam: runs on the closer thread inside close(), after the pending
+    // caller interrupt has been cleared and immediately before EACH join
+    // attempt on the worker thread. Null in production.
+    // SegmentManagerCloseRaceTest uses it to positively observe (a) that the
+    // closer reached the join path with a cleared interrupt while the worker
+    // was still live, and (b) that an interrupt delivered mid-join loops back
+    // into another join attempt instead of abandoning the reap — without any
+    // wall-clock coordination.
+    private volatile Runnable beforeJoinAttemptHook;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
     // totalBytes += segmentSize commit). Null in production; tests use it to
@@ -200,6 +209,10 @@ public final class SegmentManager implements QuietCloseable {
                     long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
                     if (remainingMillis <= 0) {
                         break;
+                    }
+                    Runnable joinHook = beforeJoinAttemptHook;
+                    if (joinHook != null) {
+                        joinHook.run();
                     }
                     try {
                         t.join(remainingMillis);
@@ -403,6 +416,11 @@ public final class SegmentManager implements QuietCloseable {
         // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
         // when the worker has not been started yet.
         wakeWorker();
+    }
+
+    @TestOnly
+    public void setBeforeJoinAttemptHook(Runnable hook) {
+        this.beforeJoinAttemptHook = hook;
     }
 
     @TestOnly
