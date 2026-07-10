@@ -228,6 +228,139 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testUnopenablePersistedDictStillGuardsAgainstReplayingDeltaFrames() throws Exception {
+        // C1 regression: when a recovered disk slot's persisted dictionary cannot be
+        // OPENED (fd exhaustion, a read-only remount, ENOSPC -- simulated here by a
+        // .symbol-dict that is a DIRECTORY, so both openRW and openCleanRW fail),
+        // CursorSendEngine.isDeltaDictEnabled() returns false. The recorded frames
+        // are still DELTA frames, and replaying them against a fresh
+        // empty-dictionary server would null-pad the missing ids and SILENTLY
+        // corrupt the table. The torn-dictionary guard must fire regardless of
+        // deltaDictEnabled -- pre-fix it was gated on that very flag, so the
+        // corrupting frame sailed through unguarded. Unlike
+        // testTornDictionaryFailsCleanlyInsteadOfCorrupting (dict present but empty,
+        // deltaDictEnabled=true), here the dict is UNOPENABLE (deltaDictEnabled=false).
+        assertMemoryLeak(() -> {
+            // Phase 1: each row introduces a new symbol => frame i carries deltaStart=i.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Make the persisted dictionary UNOPENABLE: replace the .symbol-dict file
+            // with a directory of the same name so PersistedSymbolDict.open() returns
+            // null (both openRW and openCleanRW fail) and the engine reports
+            // deltaDictEnabled=false. Stamp the watermark at FSN 2 so replay starts
+            // at FSN 3 -- a frame whose delta starts at id 3, with ids 0..2 living
+            // only in the now-unreadable dictionary.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            java.nio.file.Files.createDirectory(dict);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+
+            // Phase 2: recover against a fresh counting server. The guard must fire
+            // (frame deltaStart 3 > recovered dictionary size 0) and fail terminally
+            // rather than send a gapped frame that would corrupt the table.
+            CountingHandler handler = new CountingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                LineSenderException terminal = null;
+                Sender s2 = Sender.fromConfig(cfg);
+                try {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && terminal == null) {
+                        try {
+                            s2.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        s2.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
+                    }
+                }
+                Assert.assertEquals("no delta frame may be replayed when the persisted dictionary is unopenable",
+                        0, handler.frames.get());
+                Assert.assertNotNull("an unopenable dictionary must surface a terminal error", terminal);
+                Assert.assertTrue(terminal.getMessage(),
+                        terminal.getMessage().contains("symbol dictionary is incomplete"));
+            }
+        });
+    }
+
+    @Test
+    public void testCommitMessageDoesNotShipUnpersistedLeakedSymbol() throws Exception {
+        // C3 regression: sendCommitMessage does NOT write-ahead-persist the
+        // dictionary, so its frame must carry NO new symbol. A symbol left in the
+        // batch by a cancelled row -- cancelRow rolls back neither
+        // currentBatchMaxSymbolId nor the global-dictionary registration -- must not
+        // ride out on the commit frame: doing so puts an id on the wire that a
+        // recovered slot cannot rebuild from .symbol-dict, diverging the producer
+        // dictionary from the surviving frames and silently misattributing reused
+        // ids after a crash. The commit's delta must be bounded by sentMaxSymbolId
+        // (empty here), not currentBatchMaxSymbolId. Memory mode suffices to observe
+        // the wire behaviour; close() drains every frame to the server first.
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Transactional + autoFlushRows=1: every completed row auto-flushes
+                // as a DEFERRED batch (setting hasDeferredMessages); an explicit
+                // flush() then emits the commit message.
+                Sender sender = Sender.builder("ws::addr=localhost:" + port + ";")
+                        .transactional(true)
+                        .autoFlushRows(1)
+                        .build();
+                try {
+                    // Row 1 registers "a"@0 and auto-flushes it deferred.
+                    sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
+                    // Register "b"@1 on a row that is then cancelled: "b" stays in
+                    // the global dictionary and currentBatchMaxSymbolId advances to
+                    // 1, but nothing persists or sends it.
+                    sender.table("m").symbol("s", "b");
+                    sender.cancelRow();
+                    // Commit the deferred batch. The commit frame must carry an
+                    // EMPTY delta -- NOT "b"@1.
+                    sender.flush();
+                } finally {
+                    sender.close(); // drains every frame (incl. the commit) to the server
+                }
+
+                // The server's reconstructed dictionary must hold ONLY "a". Pre-fix
+                // the commit shipped "b"@1, so the server saw a second symbol.
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("commit frame must not ship the cancelled row's leaked symbol "
+                                + "(recovery would then diverge from the persisted dictionary): " + dict,
+                        1, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+            }
+        });
+    }
+
+    @Test
     public void testFailedPublishDoesNotDuplicatePersistedSymbols() throws Exception {
         // Regression: persistNewSymbolsBeforePublish is a write-ahead -- it runs
         // BEFORE the frame is published (sealAndSwapBuffer -> appendBlocking). If

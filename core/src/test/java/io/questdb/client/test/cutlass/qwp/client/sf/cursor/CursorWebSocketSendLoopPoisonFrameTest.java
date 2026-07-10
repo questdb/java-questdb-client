@@ -245,6 +245,41 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     @Test
+    public void testNonOrderlyCloseAfterOnlyCatchUpDoesNotStrike() throws Exception {
+        // C2 regression: the dictionary catch-up advances nextWireSeq WITHOUT
+        // sending a data frame. A non-orderly close in that window -- a flapping
+        // LB/middlebox that completes the upgrade, accepts the catch-up, then drops
+        // before the first replay frame -- must be strike-EXEMPT. Keying the
+        // poison-strike gate off nextWireSeq > 0 (rather than
+        // dataFrameSentThisConnection) charges a strike on a frame that was never
+        // sent; MAX_REJECTIONS such closes then escalate a TRANSIENT outage to a
+        // PROTOCOL_VIOLATION terminal, hard-failing the producer and quarantining an
+        // orphan drainer -- exactly what store-and-forward's retry-forever contract
+        // forbids. Mirror image of testNonOrderlyClosePoisonKeysOnOkLevelHeadOfLine,
+        // which sends a real data frame (setSentCount) and DOES escalate.
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                for (int i = 0; i < MAX_REJECTIONS + 2; i++) {
+                    // Model the catch-up: nextWireSeq advanced, but NO data frame
+                    // sent. swapClient resets both on every recycle, so re-apply
+                    // before each close. Pre-fix, each of these lands a strike on the
+                    // never-sent head frame and the loop terminals by now.
+                    setCatchUpWireSeqOnly(loop, 2);
+                    deliverNonOrderlyClose(loop);
+                }
+                // No strike was ever charged, so nothing escalated: the loop stays
+                // retriable and the producer-facing error latch is clear.
+                loop.checkError();
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
     public void testNackRecycleIsPacedAgainstHealthyServer() throws Exception {
         // A reachable, healthy server that NACKs the head frame (RETRIABLE)
         // must not drive the recycle loop at server NACK rate: connectLoop's
@@ -966,6 +1001,22 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     private static void setSentCount(CursorWebSocketSendLoop loop, long count) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
+        f.setAccessible(true);
+        f.setLong(loop, count);
+        // A non-zero sent count models DATA frames sent on this connection. The
+        // poison-strike / pre-send gates key off dataFrameSentThisConnection, not
+        // nextWireSeq (the dictionary catch-up advances nextWireSeq without sending
+        // a data frame), so keep the two in sync for these white-box scenarios.
+        Field d = CursorWebSocketSendLoop.class.getDeclaredField("dataFrameSentThisConnection");
+        d.setAccessible(true);
+        d.setBoolean(loop, count > 0);
+    }
+
+    // Sets ONLY nextWireSeq -- deliberately NOT dataFrameSentThisConnection -- to
+    // model the dictionary catch-up having advanced the wire sequence with no data
+    // frame sent yet. Contrast setSentCount, which sets both.
+    private static void setCatchUpWireSeqOnly(CursorWebSocketSendLoop loop, long count) throws Exception {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
         f.setAccessible(true);
         f.setLong(loop, count);

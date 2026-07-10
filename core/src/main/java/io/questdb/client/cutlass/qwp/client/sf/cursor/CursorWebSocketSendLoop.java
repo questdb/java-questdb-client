@@ -203,6 +203,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // for the connection's lifetime (a reconnect may need the whole dictionary at
     // any moment), so it cannot be dropped; it is an intentional cost of the feature.
     private final boolean deltaDictEnabled;
+    // True once a real ring frame (data or commit) has been sent on the CURRENT
+    // connection, as opposed to only the dictionary catch-up. The catch-up
+    // consumes wire sequences (nextWireSeq), so nextWireSeq > 0 no longer implies
+    // "the head frame was sent": onClose's poison-strike gate and
+    // handleServerRejection's pre-send gate key off THIS instead. Without it, a
+    // transient outage AFTER the catch-up but BEFORE the first data frame (a
+    // flapping LB/middlebox that accepts the upgrade + catch-up then closes) would
+    // be mistaken for a deterministic head-frame rejection and escalate to a
+    // PROTOCOL_VIOLATION terminal -- breaking the store-and-forward "retry a
+    // transient outage forever" contract. Reset per connection in
+    // setWireBaselineWithCatchUp; set in trySendOne after a successful send.
+    private boolean dataFrameSentThisConnection;
     private long sentDictBytesAddr;
     private int sentDictBytesCapacity;
     private int sentDictBytesLen;
@@ -1980,6 +1992,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * first real connection via swapClient.
      */
     private void setWireBaselineWithCatchUp(long replayStart) {
+        // Fresh connection: no data frame has been sent on it yet. Reset before the
+        // catch-up (which sends only dictionary frames) so onClose /
+        // handleServerRejection can tell "only the catch-up went out" from "the
+        // head data frame went out".
+        dataFrameSentThisConnection = false;
         if (client != null && deltaDictEnabled && sentDictCount > 0) {
             this.nextWireSeq = 0L;
             // The catch-up may span several frames when the dictionary exceeds the
@@ -2338,29 +2355,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // -1 unless this is a delta frame; the guard decodes it once here and
-        // accumulateSentDict reuses it post-send, so the delta header is parsed
-        // once per frame rather than twice.
-        int deltaStart = -1;
-        if (deltaDictEnabled) {
-            // Torn-dictionary guard. In normal operation a delta frame's start id
-            // never exceeds the dictionary coverage established so far (replayed
-            // frames overlap the catch-up dict; fresh frames extend it
-            // contiguously). A gap here means the persisted dictionary was torn --
-            // almost always by a host/power crash, which leaves segment frames on
-            // disk but loses recently-written dictionary entries (SF, like the rest
-            // of the store, is process-crash durable but not host-crash durable).
-            // Sending the frame would corrupt the table (the server would null-pad
-            // the missing ids), so fail terminally instead; the unreplayable data
-            // must be resent.
-            deltaStart = frameDeltaStart(frameAddr, payloadLen);
-            if (deltaStart > sentDictCount) {
-                recordFatal(new LineSenderException(
-                        "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
-                                + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
-                                + sentDictCount + "; cannot replay without corrupting data -- resend required"));
-                return false;
-            }
+        // Torn-dictionary guard. Decode the delta start unconditionally (-1 for a
+        // non-delta frame); the guard MUST run even when deltaDictEnabled is false.
+        // A disk slot recovered with its persisted dictionary unavailable
+        // (PersistedSymbolDict.open() returned null -- fd exhaustion, a read-only
+        // remount, ENOSPC) reports deltaDictEnabled=false, yet its recorded frames
+        // are still DELTA frames (deltaStart > 0). Replaying those against a fresh
+        // empty-dictionary server would null-pad the missing ids and SILENTLY
+        // corrupt the table -- precisely what this guard exists to prevent -- so it
+        // cannot be gated on the very flag that goes false in that failure mode. In
+        // normal operation a delta frame's start id never exceeds the dictionary
+        // coverage established so far (replayed frames overlap the catch-up dict;
+        // fresh frames extend it contiguously), so a gap here means the recovered
+        // dictionary is incomplete (a host/power crash that lost recently-written
+        // entries, SF being process-crash but not host-crash durable). Fail
+        // terminally; the unreplayable data must be resent. Full-dict / fallback
+        // frames carry deltaStart=0 with sentDictCount=0, so 0 > 0 never
+        // false-positives; only the sent-dictionary mirror below stays gated on
+        // deltaDictEnabled.
+        int deltaStart = frameDeltaStart(frameAddr, payloadLen);
+        if (deltaStart > sentDictCount) {
+            recordFatal(new LineSenderException(
+                    "recovered store-and-forward symbol dictionary is incomplete (likely a host crash): "
+                            + "frame delta start " + deltaStart + " exceeds recovered dictionary size "
+                            + sentDictCount + "; cannot replay without corrupting data -- resend required"));
+            return false;
         }
         try {
             client.sendBinary(frameAddr, payloadLen);
@@ -2368,7 +2387,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             fail(t);
             return false;
         }
-        if (deltaStart >= 0) {
+        // A real ring frame (data or commit) has now gone out on this connection,
+        // as opposed to only the dictionary catch-up. onClose / handleServerRejection
+        // key their poison-strike vs pre-send decision off this, not off nextWireSeq
+        // (which the catch-up advances).
+        dataFrameSentThisConnection = true;
+        if (deltaDictEnabled && deltaStart >= 0) {
             // Mirror the symbols this frame introduced so a later reconnect can
             // rebuild the whole dictionary. Idempotent on replay: a frame whose
             // delta we already hold advances nothing.
@@ -2619,7 +2643,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     || code == WebSocketCloseCode.GOING_AWAY;
             LineSenderException cause = new LineSenderException(
                     "WebSocket closed by server: code=" + code + " reason=" + reason);
-            if (!orderly && nextWireSeq > 0) {
+            if (!orderly && dataFrameSentThisConnection) {
                 if (recordHeadRejectionStrike(Math.max(engine.ackedFsn(), highestOkFsn) + 1L)) {
                     haltOnPoisonedFrame("ws-close[" + code + ' '
                                     + WebSocketCloseCode.describe(code) + "]: " + reason,
@@ -2726,17 +2750,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // value is only used to attribute an FSN to the error report --
             // a rejection never advances the watermark.
             long highestSent = nextWireSeq - 1L;
-            if (highestSent < 0L) {
-                // Pre-send rejection: server emitted an error frame before
-                // we sent anything on this connection (typical after a
-                // fresh swapClient — auth failure, server-initiated halt,
-                // etc.). The server-named wireSeq does not correspond to
-                // any frame we sent, so clamping it to 0 and acknowledging
-                // fsnAtZero would silently advance ackedFsn past a real
-                // unsent batch (fsnAtZero == ackedFsn + 1 right after a
-                // swap). Skip the watermark advance entirely; still surface
-                // the error so the user's handler sees it and HALT errors
-                // remain producer-observable.
+            if (!dataFrameSentThisConnection) {
+                // Pre-send rejection: the server emitted an error frame before we
+                // sent any DATA frame on this connection (typical after a fresh
+                // swapClient -- auth failure, server-initiated halt, or a rejection
+                // of the dictionary catch-up itself). nextWireSeq may be > 0 here
+                // because the catch-up consumed wire sequences, so this keys off
+                // dataFrameSentThisConnection, not highestSent >= 0 -- otherwise a
+                // transient NACK of a catch-up frame would take the post-send
+                // poison-strike path and could escalate a transient outage to a
+                // terminal. The server-named wireSeq does not correspond to any
+                // data frame we sent, so clamping it to 0 and acknowledging
+                // fsnAtZero would silently advance ackedFsn past a real unsent
+                // batch. Skip the watermark advance entirely; still surface the
+                // error so the user's handler sees it and HALT errors remain
+                // producer-observable.
                 handlePreSendRejection(wireSeq, status, category, policy);
                 return;
             }

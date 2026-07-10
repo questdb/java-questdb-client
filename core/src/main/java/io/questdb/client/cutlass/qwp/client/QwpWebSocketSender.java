@@ -3623,10 +3623,23 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Sending commit message for deferred batch");
         }
         encoder.setDeferCommit(false);
-        // A commit carries no rows and no new symbols; in delta mode its empty
-        // delta simply starts at the server's current dictionary size.
+        // A commit carries no rows, and it must also carry NO new symbols. Unlike
+        // the flush paths, sendCommitMessage does NOT write-ahead-persist the
+        // dictionary, so shipping a symbol here would put an id on the wire that a
+        // recovered slot cannot rebuild from the persisted .symbol-dict, diverging
+        // the producer dictionary from the surviving frames and silently
+        // misattributing reused ids after a crash. currentBatchMaxSymbolId can sit
+        // ABOVE sentMaxSymbolId (e.g. a cancelled row: cancelRow does not roll back
+        // currentBatchMaxSymbolId or unregister the symbol), so bound the delta at
+        // what has already been sent -- and therefore already persisted. In delta
+        // mode pass sentMaxSymbolId, yielding an empty delta
+        // [sentMaxSymbolId+1 .. sentMaxSymbolId]; in full-dict mode keep
+        // currentBatchMaxSymbolId so the frame stays self-sufficient. Any symbol a
+        // cancelled row leaked is picked up (and persisted) by the next real flush,
+        // whose persistNewSymbolsBeforePublish resumes from pd.size().
+        int commitBatchMaxId = deltaDictEnabled ? sentMaxSymbolId : currentBatchMaxSymbolId;
         encoder.beginMessage(0, globalSymbolDictionary,
-                symbolDeltaBaseline(), currentBatchMaxSymbolId);
+                symbolDeltaBaseline(), commitBatchMaxId);
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
         ensureActiveBufferReady();
