@@ -28,6 +28,7 @@ import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
@@ -115,15 +116,28 @@ public final class CursorSendEngine implements QuietCloseable {
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
     private volatile boolean closed;
-    // True once close() has run its full cleanup sequence. Stays false when
-    // a close attempt could not confirm manager-worker quiescence and had to
-    // leak the ring/watermark/slot lock — in that case a later close() call
-    // retries the cleanup (the worker may have exited by then). Guarded by
-    // the synchronized close() method; never read elsewhere.
+    // True once close() has run its full cleanup sequence INCLUDING a
+    // CONFIRMED slot-flock release — finishClose() publishes this strictly
+    // after SlotLock.release() reports success, never before. Pool threads
+    // treat the flip as "the slot dir is reusable" and free the slot index
+    // the moment they observe it (QwpWebSocketSender.isSlotLockReleased ->
+    // SenderPool.reprobeRetiredSlots), so publishing before the release
+    // would let a replacement engine's SlotLock.acquire collide with the
+    // still-open fd. Stays false when a close attempt could not confirm
+    // manager-worker quiescence (or the flock release itself failed) and had
+    // to leak the ring/watermark/slot lock — in that case a later close()
+    // call retries the cleanup (the worker may have exited by then).
     // volatile: latched by finishClose(), but read lock-free by
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Test-only hook run by finishClose() between the terminal cleanup and
+    // the flock release. Lets a test park the releasing thread inside the
+    // cleanup/release window and assert that closeCompleted stays false —
+    // i.e. that completion is never observable while the flock is still
+    // held. volatile: finishClose may run on the manager worker's exit
+    // thread while the hook is installed from a test thread.
+    private volatile Runnable beforeFlockReleaseHook;
     // Exactly-once claim on the terminal cleanup (finishClose). Contended by
     // close() and a worker-exit handoff (completeDeferredClose); whoever wins
     // the CAS runs the cleanup, the loser never touches ring/watermark/flock.
@@ -586,9 +600,17 @@ public final class CursorSendEngine implements QuietCloseable {
             // cleanup runs exactly once and the worker never blocks on the
             // engine monitor a retried close() holds while joining it.
             boolean handedOff = false;
+            boolean registrationFailed = false;
             try {
                 handedOff = manager.deferUntilWorkerExit(() -> completeDeferredClose(fullyDrained));
             } catch (Throwable ignored) {
+                // Allocation failure (OOM building the cleanup lambda or
+                // growing the manager's exitCleanups list). Unlike the exact
+                // false return below, a throw carries NO worker-liveness
+                // information — the two must never be conflated, or the
+                // inline cleanup below would release worker-reachable
+                // resources under a possibly-live worker.
+                registrationFailed = true;
             }
             if (handedOff) {
                 LOG.error("SF manager worker did not quiesce during engine close; ring, watermark "
@@ -596,6 +618,23 @@ public final class CursorSendEngine implements QuietCloseable {
                         + "moment its in-flight service pass finishes. The slot stays locked (and "
                         + "isCloseCompleted() false) until then, so no replacement engine can race "
                         + "the stale worker on slot {}", sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            if (registrationFailed) {
+                // The handoff never registered and the worker was never
+                // observed — it must be presumed live and mid service pass.
+                // Retain every worker-reachable resource (ring, watermark,
+                // segment files, slot flock) and leave terminalCleanupClaimed
+                // unclaimed and closeCompleted false, exactly like the
+                // shared-manager leak branch: manager.close() above already
+                // stopped the worker loop, so a retried close() converges via
+                // isWorkerReaped() once the in-flight pass ends. The kernel
+                // releases the slot flock on process exit regardless.
+                LOG.error("SF worker-exit handoff registration failed during engine close; "
+                        + "leaking the ring, watermark and slot lock so a possibly-live "
+                        + "worker cannot corrupt a future engine on slot {}. close() may be "
+                        + "invoked again to retry cleanup once the worker has exited.",
+                        sfDir == null ? "<memory>" : sfDir);
                 return;
             }
             // Handoff rejected: the worker loop exited between the failed
@@ -629,8 +668,13 @@ public final class CursorSendEngine implements QuietCloseable {
 
     /**
      * Terminal cleanup: closes the ring and watermark, unlinks drained
-     * segment files, releases the slot flock, and latches
-     * {@link #closeCompleted}. The caller must hold the engine monitor and
+     * segment files, releases the slot flock, and — only once the release
+     * is <b>confirmed</b> — latches {@link #closeCompleted}. Publish order
+     * is load-bearing: pools free the slot index the instant they observe
+     * {@code closeCompleted} (via {@code isSlotLockReleased()}), so it must
+     * never be visible while the flock fd is still open, or a replacement
+     * engine races the release and fails acquisition on a live slot.
+     * The caller must hold the engine monitor and
      * must have established that the manager worker can no longer touch the
      * slot directory (reaped, provably exited, or running this on its own
      * exit path) AND have won the {@link #terminalCleanupClaimed} CAS — the
@@ -669,19 +713,62 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
-            closeCompleted = true;
         } finally {
             // Reaching finishClose at all requires established quiescence, so
             // releasing the flock is safe even if a step above threw. Leaking
             // it would strand the slot until process exit for no reason.
-            if (slotLock != null) {
+            //
+            // ORDER MATTERS: release the flock FIRST, verify it, and only
+            // then publish closeCompleted. Pools read isCloseCompleted() as
+            // "the slot dir is reusable" and free the slot index the moment
+            // it flips; publishing before Files.close(fd) completes would
+            // open a window where a replacement engine's SlotLock.acquire
+            // collides with the still-open fd and fails with a spurious
+            // "slot already in use".
+            Runnable hook = beforeFlockReleaseHook;
+            if (hook != null) {
                 try {
-                    slotLock.close();
+                    hook.run();
                 } catch (Throwable ignored) {
-                    // best-effort; flock is also released by kernel on process exit
+                    // test-only; must never block the release
                 }
             }
+            boolean released;
+            if (slotLock != null) {
+                try {
+                    released = slotLock.release();
+                } catch (Throwable ignored) {
+                    released = false;
+                }
+            } else {
+                released = true;
+            }
+            if (released) {
+                closeCompleted = true;
+            } else {
+                // Unconfirmed release: the flock may still be held, so keep
+                // closeCompleted false — the owning pool keeps the slot
+                // retired (leakedSlots accounting) instead of reusing a
+                // possibly-locked dir. The kernel releases the flock on
+                // process exit regardless.
+                LOG.error("SF slot flock release failed during engine close; keeping "
+                        + "closeCompleted=false so the pool cannot reuse a possibly "
+                        + "still-locked slot dir; the kernel releases the flock on "
+                        + "process exit [slot={}]", sfDir == null ? "<memory>" : sfDir);
+            }
         }
+    }
+
+    /**
+     * Installs a hook that {@link #finishClose} runs between the terminal
+     * cleanup and the slot-flock release. Test-only: makes the otherwise
+     * microsecond-wide cleanup/release window deterministic so tests can
+     * assert {@link #isCloseCompleted()} stays false until the release is
+     * confirmed.
+     */
+    @TestOnly
+    public void setBeforeFlockReleaseHook(Runnable hook) {
+        this.beforeFlockReleaseHook = hook;
     }
 
     /**
@@ -705,10 +792,13 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Whether {@link #close()} completed all cleanup, including releasing the
-     * SF slot lock. A false value after close means manager-worker quiescence
-     * could not be confirmed and the worker-reachable resources were retained
-     * deliberately — either handed to the worker's exit path (owned manager),
+     * Whether {@link #close()} completed all cleanup, including a
+     * <b>confirmed</b> release of the SF slot lock — the flip is published
+     * strictly after the flock fd is closed, so observing {@code true}
+     * guarantees the slot dir is acquirable by a replacement engine. A false
+     * value after close means manager-worker quiescence could not be
+     * confirmed (or the flock release itself failed) and the
+     * worker-reachable resources were retained deliberately — either handed to the worker's exit path (owned manager),
      * which flips this to true the moment the worker's in-flight pass
      * finishes, or leaked until a retried close() (shared manager). Owners
      * must not reuse the slot while this is false; pools may re-probe it to

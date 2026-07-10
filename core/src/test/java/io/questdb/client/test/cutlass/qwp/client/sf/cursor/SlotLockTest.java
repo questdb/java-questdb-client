@@ -104,6 +104,25 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testReleaseConfirmsAndIsIdempotent() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/verified-release";
+            SlotLock lock = SlotLock.acquire(slot);
+            assertTrue("first release must confirm success", lock.release());
+            // Idempotent: an already-released lock keeps reporting true —
+            // callers gating a "slot reusable" signal on it must never see
+            // a spurious false after a confirmed release.
+            assertTrue("repeat release must stay true", lock.release());
+            // close() after release() is a safe no-op (QuietCloseable path).
+            lock.close();
+            // Confirmed release means the slot is genuinely acquirable.
+            try (SlotLock again = SlotLock.acquire(slot)) {
+                assertEquals(slot, again.slotDir());
+            }
+        });
+    }
+
+    @Test
     public void testTwoDifferentSlotsCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slotA = parentDir + "/a";

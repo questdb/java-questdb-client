@@ -116,15 +116,43 @@ public final class SlotLock implements QuietCloseable {
         return slotDir;
     }
 
+    /**
+     * Releases the flock by closing the lock fd and reports whether the
+     * release was <b>confirmed</b>. Closing the fd releases the lock. We do
+     * NOT remove the {@code .lock} file or the {@code .lock.pid} sidecar —
+     * a stale PID is harmless (next acquirer overwrites {@code .lock.pid}
+     * on success).
+     * <p>
+     * On close failure the fd is <b>retained</b>: the flock may still be
+     * held by this process, so forgetting the fd would misreport the lock
+     * state and forfeit any chance of a later retry. Idempotent — once
+     * released, subsequent calls return {@code true}.
+     * <p>
+     * Owners that gate a "slot dir is reusable" signal on the release
+     * (e.g. {@code CursorSendEngine.finishClose} publishing
+     * {@code closeCompleted}) must call this and check the result rather
+     * than {@link #close()}, which is best-effort by contract.
+     *
+     * @return {@code true} if the fd was closed (or was already released),
+     *         {@code false} if the OS reported a close failure and the
+     *         flock may still be held
+     */
+    public boolean release() {
+        if (fd < 0) {
+            return true;
+        }
+        if (Files.close(fd) == 0) {
+            fd = -1;
+            return true;
+        }
+        return false;
+    }
+
     @Override
     public void close() {
-        // Closing the fd releases the lock. We do NOT remove the .lock
-        // file or the .lock.pid sidecar — a stale PID is harmless (next
-        // acquirer overwrites .lock.pid on success).
-        if (fd >= 0) {
-            Files.close(fd);
-            fd = -1;
-        }
+        // QuietCloseable contract: best-effort, no signal. Callers that
+        // must confirm the release use release() and check the result.
+        release();
     }
 
     private static String readHolder(String pidPath) {
