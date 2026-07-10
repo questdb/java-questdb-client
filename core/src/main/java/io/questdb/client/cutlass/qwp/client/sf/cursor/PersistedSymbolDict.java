@@ -354,13 +354,22 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * Base address of the loaded entry region -- the concatenated
      * {@code [len][utf8]} bytes of every recovered symbol in id order, exactly
      * as a delta section carries them. Zero when nothing was recovered.
+     * <p>
+     * <b>Construction-phase only.</b> This hands out a raw pointer into native
+     * memory that {@link #close()} frees and nulls, with no closed-guard and no
+     * synchronization. It is safe to read only BEFORE the slot's I/O thread and
+     * any producer append start -- i.e. while the send loop is being constructed
+     * or an orphan-drain is seeding its mirror, both of which happen-before those
+     * threads. A caller that reads it from a running thread races {@code close()}
+     * and can dereference freed memory (use-after-free).
      */
     public long loadedEntriesAddr() {
         return loadedEntriesAddr;
     }
 
     /**
-     * Byte length of {@link #loadedEntriesAddr()}.
+     * Byte length of {@link #loadedEntriesAddr()}. Construction-phase only, for
+     * the same reason -- see {@link #loadedEntriesAddr()}.
      */
     public int loadedEntriesLen() {
         return loadedEntriesLen;
@@ -371,6 +380,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * (entry {@code i} is symbol id {@code i}). Used once on recovery to
      * repopulate the producer's global dictionary. Empty when nothing was
      * recovered.
+     * <p>
+     * <b>Construction-phase only</b> -- like {@link #loadedEntriesAddr()}, this
+     * walks the native entry region {@link #close()} frees, with no closed-guard,
+     * so it must run before the I/O thread and any producer append start.
      */
     public ObjList<String> readLoadedSymbols() {
         ObjList<String> out = new ObjList<>(Math.max(size, 1));

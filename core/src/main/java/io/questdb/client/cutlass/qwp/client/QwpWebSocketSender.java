@@ -3526,6 +3526,22 @@ public class QwpWebSocketSender implements Sender {
      * own message. All messages except the last carry FLAG_DEFER_COMMIT
      * so the server appends rows without committing until the final
      * message arrives.
+     * <p>
+     * <b>Not atomic across frames.</b> The frames publish one at a time, so a
+     * publish failure partway through -- {@link #sealAndSwapBuffer()} throwing on
+     * frame k&gt;1, e.g. a backpressure deadline or the buffer-recycle timeout --
+     * leaves frames 1..k-1 already on the ring as deferred (appended, not yet
+     * committed). The throw propagates past the {@code resetTableBuffersAfterFlush}
+     * at the end of the loop, so the source rows survive in their table buffers
+     * and the NEXT flush re-emits the whole batch; the eventual commit then
+     * commits the already-published prefix alongside the re-sent copies,
+     * delivering those rows at-least-once (duplicated), not exactly-once. This is
+     * within store-and-forward's at-least-once contract -- a DEDUP table or a
+     * durable-ack await absorbs the duplicate, and the symbol-dict state stays
+     * consistent on the retry (the re-sent frames carry empty deltas and the
+     * write-ahead persist is a {@code pd.size()} no-op). Making the split atomic
+     * (rolling back the published prefix, or skipping it on retry) would be a
+     * larger change.
      *
      * @param deferCommit when true, ALL messages (including the last)
      *                    carry FLAG_DEFER_COMMIT. When false, only the
