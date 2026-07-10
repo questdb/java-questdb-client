@@ -300,6 +300,55 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testOpenCleanDiscardsSurvivingDictionary() throws Exception {
+        // A fresh start must NOT inherit a dictionary left by a prior lifecycle:
+        // openClean() truncates any survivor to empty, where open() would recover
+        // (and TRUST) it. Trusting a survivor whose segments are gone -- the
+        // fresh-start producer is not seeded from it -- shifts the dense id->symbol
+        // mapping and misattributes symbols on the next reconnect.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict-clean");
+            try {
+                PersistedSymbolDict stale = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(stale);
+                try {
+                    stale.appendSymbol("staleX");
+                    stale.appendSymbol("staleY");
+                    Assert.assertEquals(2, stale.size());
+                } finally {
+                    stale.close();
+                }
+
+                // Fresh start: openClean yields an EMPTY dictionary regardless of
+                // the survivor, and appends from id 0 again.
+                PersistedSymbolDict fresh = PersistedSymbolDict.openClean(dir.toString());
+                Assert.assertNotNull(fresh);
+                try {
+                    Assert.assertEquals(0, fresh.size());
+                    Assert.assertEquals(0, fresh.readLoadedSymbols().size());
+                    fresh.appendSymbol("freshA");
+                    Assert.assertEquals(1, fresh.size());
+                } finally {
+                    fresh.close();
+                }
+
+                // The survivor's bytes are physically gone, not just hidden: a
+                // subsequent recovery open() sees only the post-clean content.
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(reopened);
+                try {
+                    Assert.assertEquals(1, reopened.size());
+                    Assert.assertEquals("freshA", reopened.readLoadedSymbols().getQuick(0));
+                } finally {
+                    reopened.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testRemoveOrphanDeletesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");

@@ -321,10 +321,19 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (!memoryMode) {
                     AckWatermark.removeOrphan(sfDir);
                     watermarkInProgress = AckWatermark.open(sfDir);
-                    // Same stale-side-file hygiene for the symbol dictionary: a
-                    // fresh slot starts with an empty dictionary.
-                    PersistedSymbolDict.removeOrphan(sfDir);
-                    persistedDictInProgress = PersistedSymbolDict.open(sfDir);
+                    // A fresh slot MUST start with an EMPTY symbol dictionary.
+                    // Unlike the ack watermark above -- a discardable optimization a
+                    // max() clamp protects -- the dictionary is load-bearing: a
+                    // delta frame referencing an id missing from it is unrecoverable,
+                    // and a STALE dictionary inherited here (the segments are gone, so
+                    // the producer is NOT seeded from it) shifts the dense id->symbol
+                    // mapping and silently misattributes symbols on the next
+                    // reconnect. openClean() truncates any survivor to empty rather
+                    // than trusting a best-effort delete that may have failed (e.g. a
+                    // Windows share lock); if the clean open itself fails,
+                    // persistedSymbolDict stays null and the sender falls back to full
+                    // self-sufficient frames, which is also safe.
+                    persistedDictInProgress = PersistedSymbolDict.openClean(sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;

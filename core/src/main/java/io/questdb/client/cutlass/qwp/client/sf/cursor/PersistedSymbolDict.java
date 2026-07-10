@@ -147,10 +147,31 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Best-effort removal of a stale dictionary file. Used at fresh-start (a
-     * stale dict with no segments behind it is meaningless) and at fully-drained
-     * close (the slot is empty, nothing references the dictionary any more),
-     * mirroring {@link AckWatermark#removeOrphan}.
+     * Opens the dictionary in {@code slotDir} as a FRESH, EMPTY file, discarding
+     * any surviving content. This is the fresh-start counterpart to {@link #open}:
+     * a slot with no recovered segments must start with an empty dictionary, so a
+     * dictionary left by a prior lifecycle -- a fully-drained slot whose
+     * best-effort delete failed, or a crash in the close window -- must NOT be
+     * inherited. Unlike {@link #open}, which parses and TRUSTS an existing file for
+     * recovery/orphan-drain replay, this truncates it: the fresh-start producer is
+     * not seeded from the dictionary, so trusting a survivor would leave the
+     * producer's ids diverged from the dictionary the send loop replays and
+     * silently misattribute symbols on the next reconnect. Truncating (rather than
+     * relying on an unlink succeeding first) closes the gap even when the delete is
+     * refused -- e.g. a Windows share lock. Returns {@code null} on I/O failure, so
+     * the caller falls back to full self-sufficient frames exactly as {@link #open}
+     * does.
+     */
+    public static PersistedSymbolDict openClean(String slotDir) {
+        return openFresh(slotDir + "/" + FILE_NAME);
+    }
+
+    /**
+     * Best-effort removal of a stale dictionary file. Used at fully-drained close
+     * (the slot is empty, nothing references the dictionary any more), mirroring
+     * {@link AckWatermark#removeOrphan}. The fresh-start path deliberately does NOT
+     * use this -- it opens a clean dictionary via {@link #openClean} instead, so a
+     * failed delete cannot leave a stale dictionary a new session would trust.
      */
     public static void removeOrphan(String slotDir) {
         Files.remove(slotDir + "/" + FILE_NAME);
