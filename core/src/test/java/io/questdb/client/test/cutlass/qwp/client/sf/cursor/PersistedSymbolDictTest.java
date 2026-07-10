@@ -282,6 +282,62 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testInteriorCorruptionIsCaughtNotSilentlyMisattributed() throws Exception {
+        // A host-crash interior tear (a lost page reading back as zeroes) or a
+        // stale entry left past the end by a failed truncate can change the bytes
+        // of a NON-trailing entry. Without the per-entry CRC the parse would
+        // accept those bytes, shifting the dense id->symbol map and silently
+        // misattributing symbol-column values on replay. With the CRC the corrupt
+        // entry fails verification and the parse stops there, so recovery trusts
+        // only the intact prefix (fail-clean: the send loop's torn-dict guard then
+        // forces a resend of the rest).
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                try {
+                    d.appendSymbol("s0");
+                    d.appendSymbol("s1");
+                    d.appendSymbol("s2");
+                    d.appendSymbol("s3");
+                    d.appendSymbol("s4");
+                    Assert.assertEquals(5, d.size());
+                } finally {
+                    d.close();
+                }
+
+                // Corrupt one byte inside the 3rd entry's UTF-8 (id 2). On-disk
+                // entry layout is [len varint][utf8][crc32c u32]; a 2-byte ASCII
+                // symbol is 1 + 2 + 4 = 7 bytes, after the 8-byte header:
+                //   header[0,8) e0[8,15) e1[15,22) e2[22,29) ...
+                // Offset 23 is "s2"'s first UTF-8 byte; flipping it leaves e2's
+                // stored CRC stale.
+                Path f = dir.resolve(".symbol-dict");
+                byte[] bytes = Files.readAllBytes(f);
+                bytes[23] ^= 0x7F;
+                Files.write(f, bytes);
+
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(re);
+                try {
+                    // Only the intact prefix [s0, s1] is trusted; the corrupt e2
+                    // and everything after it are dropped. No recovered symbol is
+                    // the corrupted string -- the tear is DETECTED, never silently
+                    // misattributed.
+                    Assert.assertEquals("parse must stop at the corrupt interior entry", 2, re.size());
+                    ObjList<String> s = re.readLoadedSymbols();
+                    Assert.assertEquals("s0", s.getQuick(0));
+                    Assert.assertEquals("s1", s.getQuick(1));
+                } finally {
+                    re.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testLargeSymbolRoundTripsAcrossReopen() throws Exception {
         // C1 regression: the write path caps nothing, so a symbol larger than the
         // old fixed 1 MB read ceiling must still recover intact. Before the fix,
