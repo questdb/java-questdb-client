@@ -272,7 +272,9 @@ public class DeltaDictCatchUpTest {
 
         synchronized List<String> dictFor(int connNumber) {
             return connNumber <= dictsByConn.size()
-                    ? dictsByConn.get(connNumber - 1)
+                    // Copy under the lock: the caller iterates it unlocked while the
+                    // server thread may still be appending to the live inner list.
+                    ? new ArrayList<>(dictsByConn.get(connNumber - 1))
                     : new ArrayList<>();
         }
 
@@ -406,7 +408,9 @@ public class DeltaDictCatchUpTest {
 
         synchronized List<String> dictFor(int connNumber) {
             return connNumber <= dictsByConn.size()
-                    ? dictsByConn.get(connNumber - 1)
+                    // Copy under the lock: the caller iterates it unlocked while the
+                    // server thread may still be appending to the live inner list.
+                    ? new ArrayList<>(dictsByConn.get(connNumber - 1))
                     : new ArrayList<>();
         }
 

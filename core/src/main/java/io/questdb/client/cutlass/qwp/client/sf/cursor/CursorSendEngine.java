@@ -630,17 +630,6 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * True when this engine has no store-and-forward directory: the ring lives
-     * only in malloc'd memory, so it cannot be recovered after a crash and no
-     * orphan drainer ever replays it. Only in-process reconnect/failover replays
-     * its frames, which is what makes send-time symbol-dict catch-up (rather than
-     * fully self-sufficient frames) safe.
-     */
-    public boolean isMemoryMode() {
-        return sfDir == null;
-    }
-
-    /**
      * Whether the sender may delta-encode symbol dictionaries on this engine.
      * Always true in memory mode (the send loop keeps an in-process catch-up
      * mirror). In disk mode it requires the persisted dictionary to have opened,

@@ -228,6 +228,81 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testTornDictionaryOneIdGapFailsCleanly() throws Exception {
+        // Boundary variant of testTornDictionaryFailsCleanlyInsteadOfCorrupting: the
+        // recovered dictionary is short by EXACTLY ONE id -- the tightest gap the
+        // guard must still reject (deltaStart == recoveredSize + 1). A one-entry-short
+        // tail is the common host-crash outcome, so this pins the guard's
+        // false-negative edge: a "deltaStart > size + 1" mutation would let this
+        // single-id gap through and null-pad the missing symbol on the server.
+        assertMemoryLeak(() -> {
+            // Phase 1: each row introduces a new symbol (frame i carries deltaStart=i).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Lose the whole dictionary (truncate to the 8-byte header, size 0) but
+            // stamp the watermark at FSN 0, so recovery replays from FSN 1 -- a frame
+            // with deltaStart=1. The dictionary covers no ids, so id 0 is the single
+            // missing entry: deltaStart(1) == recoveredSize(0) + 1. Because size is 0
+            // no catch-up is sent, so any counted frame would be the gapped data frame.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            byte[] header = Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8);
+            java.nio.file.Files.write(dict, header);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 0);
+
+            // Phase 2: recover against a fresh counting server. The guard must fire on
+            // the very first replay frame (deltaStart 1 > recovered size 0) and fail
+            // terminally rather than send a frame that null-pads id 0.
+            CountingHandler handler = new CountingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                LineSenderException terminal = null;
+                Sender s2 = Sender.fromConfig(cfg);
+                try {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && terminal == null) {
+                        try {
+                            s2.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        s2.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
+                    }
+                }
+                Assert.assertEquals("a one-id gap must still block replay to a fresh server",
+                        0, handler.frames.get());
+                Assert.assertNotNull("a one-id-short dictionary must surface a terminal error", terminal);
+                Assert.assertTrue(terminal.getMessage(),
+                        terminal.getMessage().contains("delta start 1 exceeds recovered dictionary size 0"));
+            }
+        });
+    }
+
+    @Test
     public void testRecoveredSenderContinuesIngestingNewSymbols() throws Exception {
         // M2 regression: seedGlobalDictionaryFromPersisted resumes the producer's
         // dictionary and delta baseline from the persisted .symbol-dict, so a

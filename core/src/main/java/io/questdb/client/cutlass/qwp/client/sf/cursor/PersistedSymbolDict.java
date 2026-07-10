@@ -353,6 +353,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return null;
         }
         long buf = 0L;
+        long entriesAddr = 0L;
+        int entriesLen = 0;
         try {
             int len = (int) fileLen;
             buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
@@ -388,8 +390,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 pos = next + (int) entryLen;
                 count++;
             }
-            int entriesLen = pos - HEADER_SIZE;
-            long entriesAddr = 0L;
+            entriesLen = pos - HEADER_SIZE;
             if (entriesLen > 0) {
                 entriesAddr = Unsafe.malloc(entriesLen, MemoryTag.NATIVE_DEFAULT);
                 Unsafe.getUnsafe().copyMemory(buf + HEADER_SIZE, entriesAddr, entriesLen);
@@ -416,6 +417,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
         } catch (Throwable t) {
             if (buf != 0L) {
                 Unsafe.free(buf, (int) fileLen, MemoryTag.NATIVE_DEFAULT);
+            }
+            // entriesAddr is transferred to the returned dict on the success path,
+            // and the catch only runs before that return, so freeing it here cannot
+            // double-free. Unreachable today (nothing between its malloc and the
+            // return throws), but keeps the error path leak-free against a future edit.
+            if (entriesAddr != 0L) {
+                Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
             }
             Files.close(fd);
             LOG.warn("symbol dict {} recovery failed ({}); recreating", filePath, String.valueOf(t));
