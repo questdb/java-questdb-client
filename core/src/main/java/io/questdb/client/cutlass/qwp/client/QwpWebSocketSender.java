@@ -3552,16 +3552,48 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", serverMaxBatchSize, deferCommit);
         }
 
-        // Collect non-empty table indices so we know which is last.
+        // Collect non-empty table indices so we know which is last, AND pre-flight
+        // every split frame's size BEFORE publishing any of them. The split hands
+        // frames to the ring one at a time (all but the last deferred -- appended but
+        // uncommitted); if a later table's frame were only found oversized
+        // mid-publish, the already-published prefix would strand on the ring, a
+        // subsequent commit would deliver it as a partial batch, and
+        // resetTableBuffersAfterFlush would discard every source row -- a partial
+        // commit the caller was told (by the throw) had failed. Checking all sizes up
+        // front makes the split all-or-nothing: either every frame fits and all
+        // publish, or none publish and we throw with nothing stranded. The cost is a
+        // second encode pass over the split batch, which is already the exceptional
+        // large-batch path. encode is read-only on the table buffer, and simBaseline
+        // mirrors the publish loop's baseline advance (advanceSentMaxSymbolId), so
+        // each measured size equals the frame the publish loop will build; this pass
+        // mutates no delta/persist state (the defer-commit flag is a header bit that
+        // does not change frame size).
         int nonEmptyCount = 0;
+        int simBaseline = symbolDeltaBaseline();
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
                 continue;
             }
             QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                nonEmptyCount++;
+            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
+                continue;
+            }
+            nonEmptyCount++;
+            encoder.beginMessage(1, globalSymbolDictionary, simBaseline, currentBatchMaxSymbolId);
+            encoder.addTable(tableBuffer);
+            int messageSize = encoder.finishMessage();
+            if (messageSize > serverMaxBatchSize) {
+                resetTableBuffersAfterFlush(keys);
+                throw new LineSenderException("single table batch too large for server batch cap")
+                        .put(" [table=").put(tableName)
+                        .put(", messageSize=").put(messageSize)
+                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+            }
+            // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
+            // new ids, the remaining frames carry an empty delta above the baseline.
+            if (deltaDictEnabled && currentBatchMaxSymbolId > simBaseline) {
+                simBaseline = currentBatchMaxSymbolId;
             }
         }
 
@@ -3590,14 +3622,15 @@ public class QwpWebSocketSender implements Sender {
             encoder.addTable(tableBuffer);
             int messageSize = encoder.finishMessage();
             QwpBufferWriter buffer = encoder.getBuffer();
-
-            if (messageSize > serverMaxBatchSize) {
-                resetTableBuffersAfterFlush(keys);
-                throw new LineSenderException("single table batch too large for server batch cap")
-                        .put(" [table=").put(tableName)
-                        .put(", messageSize=").put(messageSize)
-                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
-            }
+            // The pre-flight pass above already verified every split frame fits the
+            // cap, so none can be found oversized here -- which is what keeps this
+            // loop from publishing (and stranding) a deferred prefix before an
+            // oversized table. The assert guards a future divergence between the two
+            // passes; it deliberately does NOT reset+throw here, because by this
+            // point a prefix may already be on the ring.
+            assert messageSize <= serverMaxBatchSize
+                    : "split frame exceeded serverMaxBatchSize after pre-flight [table=" + tableName
+                    + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + serverMaxBatchSize + ']';
 
             // Write-ahead persist before publish (see flushPendingRows). The
             // first split frame carries the batch's new symbols; the rest are

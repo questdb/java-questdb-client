@@ -103,6 +103,52 @@ public class DeltaDictCatchUpTest {
     }
 
     @Test
+    public void testReconnectPreservesMonotonicDeltaBaseline() throws Exception {
+        // Regression: the producer's sent-symbol watermark (sentMaxSymbolId) must
+        // SURVIVE a reconnect. resetSymbolDictStateForNewConnection deliberately
+        // leaves it untouched -- the I/O thread re-registers the whole dictionary via
+        // a catch-up frame before replay, so the producer keeps shipping deltas ABOVE
+        // the baseline across the wire boundary. If a regression reset it on
+        // reconnect, the first post-reconnect data frame would re-ship the whole
+        // dictionary inline (deltaStart=0), pure wasted bandwidth. The sibling
+        // testReconnectCatchUpRebuildsDictionary asserts only that the final
+        // dictionary is complete -- which a reset-then-redefine ALSO satisfies (the
+        // server tolerates the redefinition) -- so it does NOT catch that regression.
+        // This pins the baseline survival directly: connection 2's data frame must
+        // carry a delta starting at id 1 (above alpha), not 0.
+        assertMemoryLeak(() -> {
+            CatchUpHandler handler = new CatchUpHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                    // Connection 1 registers alpha (id 0); the server ACKs and drops it.
+                    sender.table("t").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.dictFor(1).size() >= 1, 5_000);
+                    waitFor(() -> handler.conn1Closed, 5_000);
+
+                    // Connection 2 (fresh) registers beta (id 1). With the baseline
+                    // preserved, beta ships as a delta ABOVE id 0 (deltaStart=1).
+                    sender.table("t").symbol("s", "beta").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.connectionsAccepted.get() >= 2
+                            && handler.dictFor(2).size() >= 2, 5_000);
+                }
+
+                Assert.assertTrue("connection 2 must re-register the dictionary via a catch-up first",
+                        handler.sawZeroTableFrameOnConn2);
+                Assert.assertTrue("post-reconnect data frame must ship a delta ABOVE the surviving "
+                                + "baseline (deltaStart >= 1); a reset baseline re-ships the whole "
+                                + "dictionary from deltaStart 0",
+                        handler.conn2SawDeltaAboveBaseline);
+            }
+        });
+    }
+
+    @Test
     public void testFixedCapNearBoundarySymbolCatchesUpWithoutTerminal() throws Exception {
         // Regression (homogeneous single cap): a symbol whose length sits just below
         // the advertised cap is ACCEPTED into a data frame (messageSize <= cap) and
@@ -332,6 +378,13 @@ public class DeltaDictCatchUpTest {
         // Set from the flags byte of the zero-table catch-up frame on connection 2:
         // the catch-up carries no rows and must defer its (empty) commit.
         volatile boolean catchUpDeferredOnConn2;
+        // Set when connection 2 receives a DATA frame (tableCount > 0) whose delta
+        // starts ABOVE id 0 (deltaStart >= 1). This can only happen if the producer's
+        // monotonic baseline SURVIVED the reconnect: a reset would re-ship the whole
+        // dictionary from deltaStart 0. Robust to replay -- a replayed pre-reconnect
+        // frame carries its original deltaStart 0, so only a genuinely-above-baseline
+        // post-reconnect frame trips it.
+        volatile boolean conn2SawDeltaAboveBaseline;
         volatile boolean sawZeroTableFrameOnConn2;
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
@@ -356,10 +409,24 @@ public class DeltaDictCatchUpTest {
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
             accumulate(data, dict);
-            if (connNumber == 2 && tableCount(data) == 0) {
-                sawZeroTableFrameOnConn2 = true;
-                // FLAG_DEFER_COMMIT is bit 0x01 of the flags byte (offset 5).
-                catchUpDeferredOnConn2 = (data[5] & 0x01) != 0;
+            if (connNumber == 2) {
+                if (tableCount(data) == 0) {
+                    sawZeroTableFrameOnConn2 = true;
+                    // FLAG_DEFER_COMMIT is bit 0x01 of the flags byte (offset 5).
+                    catchUpDeferredOnConn2 = (data[5] & 0x01) != 0;
+                } else if (data.length >= 12 && (data[5] & 0x08) != 0) {
+                    // A post-reconnect DATA frame carrying a delta section
+                    // (FLAG_DELTA_SYMBOL_DICT = 0x08). A deltaStart >= 1 means the
+                    // producer resumed the delta ABOVE the surviving baseline; a reset
+                    // baseline would re-ship from deltaStart 0. Checking any frame (not
+                    // just the first) keeps this robust to a replayed pre-reconnect
+                    // frame arriving ahead of the new one -- that replay carries its
+                    // original deltaStart 0 and does not trip the flag.
+                    int[] pos = {12};
+                    if (readVarint(data, pos) >= 1) {
+                        conn2SawDeltaAboveBaseline = true;
+                    }
+                }
             }
             try {
                 client.sendBinary(buildAck(nextSeq.getAndIncrement()));

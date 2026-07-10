@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -269,6 +270,64 @@ public class SelfSufficientFramesTest {
                         2, readVarint(f2, DELTA_START_OFFSET));
                 Assert.assertEquals("second split frame carries no new symbols",
                         0, readVarint(f2, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
+    @Test
+    public void testOversizedTableSplitStrandsNothing() throws Exception {
+        // Regression: flushPendingRowsSplit publishes each table's frame one at a
+        // time (all but the last deferred, i.e. appended but uncommitted). If a LATER
+        // table's frame exceeds the cap, the split must not have already published an
+        // earlier table's frame -- otherwise that prefix strands on the ring, a later
+        // commit delivers it as a partial batch, and resetTableBuffersAfterFlush
+        // discards every source row, all while flush() reported failure to the
+        // caller. The pre-flight size pass makes the split all-or-nothing: an
+        // oversized table throws BEFORE any frame is published. Pre-fix, the "small"
+        // table's frame was published and committed on close, so the server saw it.
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(200);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // auto_flush_bytes=off lets "big" accumulate PAST the cap (byte-based
+                // auto-flush is otherwise clamped to 90% of the cap and would flush
+                // first); the row/interval limits are set high so nothing auto-flushes
+                // during the test. Each row stays under the per-row guard (< cap), but
+                // 12 rows make "big"'s single frame exceed the cap, which no split can
+                // shrink. "small" (added first) fits; "big" (added second) does not, so
+                // the split hits it AFTER publishing "small" pre-fix.
+                String pad = new String(new char[40]).replace('\0', 'x');
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
+                    sender.table("small").symbol("s", "a").longColumn("v", 1L).atNow();
+                    for (int i = 0; i < 12; i++) {
+                        sender.table("big").stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("an oversized single-table split frame must throw");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("too large for server batch cap"));
+                    }
+                    // close() drains the ring: pre-fix, the stranded "small" frame
+                    // would be sent (and committed) here.
+                }
+
+                // No DATA frame (tableCount > 0) may have reached the server: the
+                // oversized-table split published nothing. Pre-fix, "small" arrived.
+                long dataFrames = 0;
+                for (byte[] frame : handler.batches) {
+                    if (frame.length >= 8 && (((frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8)) > 0)) {
+                        dataFrames++;
+                    }
+                }
+                Assert.assertEquals("an oversized-table split must publish NO data frame -- an "
+                                + "earlier table's frame must not strand on the ring", 0, dataFrames);
             }
         });
     }
