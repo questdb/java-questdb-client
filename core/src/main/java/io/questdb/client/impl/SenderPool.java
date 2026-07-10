@@ -171,11 +171,21 @@ public final class SenderPool implements AutoCloseable {
     // down on another thread. Guarded by lock.
     private int pendingLeaseTeardowns;
     // Slots whose delegate close() returned with the SF flock still held
-    // because an I/O or manager worker did not stop. Permanently consumed:
+    // because an I/O or manager worker did not stop. Consumed while retired:
     // never freed and never reused, so no borrow ever hands out a still-
     // locked slot dir. Counted in the cap check so the lost capacity is
-    // accounted for. Guarded by lock; only ever ticks for SF slots.
+    // accounted for. NOT necessarily permanent: engine cleanup may be pending
+    // on a worker/I/O-thread exit path, so reprobeRetiredSlots() re-checks
+    // retiredSlots and returns any index whose flock has since dropped.
+    // Guarded by lock; only ever ticks for SF slots.
     private int leakedSlots;
+    // The retired slots behind the leakedSlots count (runtime reclaim paths
+    // only; startup-recovery retirements stay permanent — their transient
+    // recoverer sender is out of scope by retire time). Re-probed by
+    // reprobeRetiredSlots() so a late flock release (deferred engine cleanup
+    // on a worker exit path) restores the pool's capacity instead of
+    // ratcheting it down until process exit. Guarded by lock.
+    private final ArrayList<SenderSlot> retiredSlots = new ArrayList<>();
     // SF slots currently held by the in-range startup-recovery pass
     // (recoverOneSlotStep): each is reserved under `lock` for the
     // duration of its drain and counted in the borrow() cap check so a
@@ -773,6 +783,12 @@ public final class SenderPool implements AutoCloseable {
                     throw new LineSenderException(
                             "timed out waiting for a Sender from the pool after " + acquireTimeoutMillis + "ms");
                 }
+                // Capacity-starved: before parking, re-probe retired slots — a
+                // deferred engine cleanup may have released a flock since the
+                // retire, and the freed index can admit a creation right now.
+                if (reprobeRetiredSlots()) {
+                    continue;
+                }
                 try {
                     remainingNanos = slotReleased.awaitNanos(remainingNanos);
                 } catch (InterruptedException e) {
@@ -1029,6 +1045,11 @@ public final class SenderPool implements AutoCloseable {
             if (closed) {
                 return;
             }
+            // Housekeeper tick doubles as the retired-slot recovery driver:
+            // a slot retired because its worker did not stop is re-probed
+            // here and returns to the free set once the deferred cleanup
+            // finally released its flock.
+            reprobeRetiredSlots();
             Iterator<SenderSlot> it = available.iterator();
             while (it.hasNext() && all.size() > minSize) {
                 SenderSlot s = it.next();
@@ -1107,12 +1128,15 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Snapshot of the number of SF slots permanently retired because a
+     * Snapshot of the number of SF slots currently retired because a
      * delegate {@code close()} returned with the slot flock still held after
-     * an I/O or manager worker did not stop. Each leaked slot permanently lowers the
-     * pool's effective capacity ({@code maxSize - leakedSlotCount()}). A
-     * non-zero, growing value explains a pool that has started timing out
-     * every {@code borrow()}. For metrics and tests.
+     * an I/O or manager worker did not stop. Each leaked slot lowers the
+     * pool's effective capacity ({@code maxSize - leakedSlotCount()}) while
+     * retired. Retired slots are re-probed (housekeeper tick and
+     * capacity-starved borrows) and recovered once the delegate's deferred
+     * cleanup releases the flock, so the count can go back down; a non-zero,
+     * persistent value means a worker is still wedged and explains a pool
+     * that has started timing out {@code borrow()}. For metrics and tests.
      */
     public int leakedSlotCount() {
         lock.lock();
@@ -1304,9 +1328,44 @@ public final class SenderPool implements AutoCloseable {
             return true;
         }
         leakedSlots++;
-        LOG.warn("SF slot {} retired permanently{}: delegate close() returned with the flock still held " +
-                        "(I/O or manager worker did not stop); pool capacity reduced by 1, now {} of {} usable [leakedSlots={}]",
+        retiredSlots.add(s);
+        LOG.warn("SF slot {} retired{}: delegate close() returned with the flock still held " +
+                        "(I/O or manager worker did not stop); pool capacity reduced by 1, now {} of {} usable " +
+                        "[leakedSlots={}]; the slot is re-probed and recovered if the worker releases the flock later",
                 s.slotIndex(), context, maxSize - leakedSlots, maxSize, leakedSlots);
         return false;
+    }
+
+    /**
+     * Re-probes every retired slot (see {@link #reclaimSlot}) and returns to
+     * the free set any whose delegate now reports the flock released — the
+     * deferred engine cleanup (manager-worker or I/O-thread exit path) has
+     * run since the retire. Restores {@code leakedSlots} capacity and signals
+     * waiters so a parked borrow can admit a creation immediately.
+     * <p>
+     * Caller must hold {@code lock}. The probe is lock-free on the delegate
+     * side ({@code isSlotLockReleased()} reads volatiles only), so holding
+     * the pool lock across it cannot stall behind delegate teardown.
+     *
+     * @return {@code true} if at least one slot's capacity was recovered
+     */
+    private boolean reprobeRetiredSlots() {
+        boolean recovered = false;
+        for (int i = retiredSlots.size() - 1; i >= 0; i--) {
+            SenderSlot s = retiredSlots.get(i);
+            if (flockReleased(s)) {
+                retiredSlots.remove(i);
+                leakedSlots--;
+                freeSlotIndex(s.slotIndex());
+                recovered = true;
+                LOG.info("SF slot {} recovered: deferred cleanup released the flock after retirement; " +
+                                "pool capacity restored, now {} of {} usable [leakedSlots={}]",
+                        s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
+            }
+        }
+        if (recovered) {
+            slotReleased.signalAll();
+        }
+        return recovered;
     }
 }

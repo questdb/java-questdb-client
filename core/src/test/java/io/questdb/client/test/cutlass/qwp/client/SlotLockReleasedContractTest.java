@@ -58,6 +58,10 @@ import java.util.concurrent.locks.LockSupport;
  *   <li><b>Leak path</b> — a {@code close()} that retains the lock because an
  *       I/O or manager worker did not stop reports
  *       {@code isSlotLockReleased() == false}.</li>
+ *   <li><b>Recovery path</b> — the getter is monotonic but not frozen: it
+ *       re-probes the retained engine, so once the deferred cleanup (worker
+ *       exit path or a retried close) releases the flock, the getter flips to
+ *       {@code true} and a pool that retired the slot can recover it.</li>
  * </ul>
  * The pool's {@code flockReleased(s)} treats {@code false} as "flock still held,
  * retire the slot permanently". Before this test that contract was driven only
@@ -191,7 +195,9 @@ public class SlotLockReleasedContractTest {
      * Manager-worker leak path: engine close retains the slot while a shared
      * manager is still inside a service pass. The sender must expose that
      * retained flock to SenderPool. Repeated sender close calls remain no-ops;
-     * the test cleans the deliberately retained engine up directly.
+     * the test cleans the deliberately retained engine up directly — and once
+     * that cleanup completes, the sender must expose the released flock so a
+     * pool that retired the slot can recover its capacity.
      */
     @Test(timeout = 30_000L)
     public void testSlotLockNotReleasedUntilManagerWorkerQuiesces() throws Exception {
@@ -254,13 +260,17 @@ public class SlotLockReleasedContractTest {
 
                 releaseWorker.countDown();
                 manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
-                // Test-only cleanup through the retained local reference. The
-                // sender conservatively keeps reporting false, as required by
-                // a pool that may already have retired this slot.
+                // Test-only cleanup through the retained local reference (the
+                // shared-manager path has no worker-exit handoff to defer to;
+                // a retried close() is its reclaim driver).
                 engine.close();
                 Assert.assertTrue("direct cleanup did not complete after worker exit",
                         engine.isCloseCompleted());
-                Assert.assertFalse("sender must not revise the result after close returned",
+                // Recovery contract: the sender re-probes its retained engine,
+                // so the completed cleanup (and released flock) MUST become
+                // visible — this is what lets SenderPool recover a slot it
+                // had already retired as leaked.
+                Assert.assertTrue("sender must expose the late flock release to the pool",
                         wss.isSlotLockReleased());
                 try (SlotLock probe = SlotLock.acquire(slot)) {
                     Assert.assertNotNull("slot must be acquirable after direct cleanup", probe);

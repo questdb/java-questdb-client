@@ -205,6 +205,98 @@ public class SegmentManagerCloseRaceTest {
     }
 
     /**
+     * Pins the {@link SegmentManager#deferUntilWorkerExit} handoff contract
+     * that {@code CursorSendEngine.close()}'s slot-ownership transfer depends
+     * on:
+     * <ul>
+     *   <li>rejects the handoff ({@code false}) when no worker ever started —
+     *       the caller must clean up inline;</li>
+     *   <li>accepts it ({@code true}) while the worker is live-but-slow
+     *       mid service pass after a timed-out close(), and runs the cleanup
+     *       exactly when the worker exits — never while the pass is still in
+     *       flight;</li>
+     *   <li>rejects it again once the worker loop has exited/been reaped.</li>
+     * </ul>
+     */
+    @Test(timeout = 15_000L)
+    public void testDeferUntilWorkerExitRunsCleanupAfterFinalPass() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/defer-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            CountDownLatch cleanupRan = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            boolean managerClosed = false;
+            try {
+                // Never-started manager: no worker will ever run the cleanup,
+                // and none can touch a slot — the caller must do it inline.
+                Assert.assertFalse("never-started manager must reject the handoff",
+                        manager.deferUntilWorkerExit(cleanupRan::countDown));
+
+                manager.register(ring, slot);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(10, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertTrue("worker did not reach install hook",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Timed-out close: running=false, worker parked mid-pass — the
+                // exact state CursorSendEngine.close() hands ownership over in.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                manager.close();
+                Assert.assertFalse("worker must not be reaped while parked mid-pass",
+                        manager.isWorkerReaped());
+
+                Assert.assertTrue("live-but-slow worker must accept the handoff",
+                        manager.deferUntilWorkerExit(cleanupRan::countDown));
+                Assert.assertEquals("cleanup must not run while the pass is still in flight",
+                        1, cleanupRan.getCount());
+
+                // Release the pass; the worker loop observes running=false,
+                // exits, and must run the deferred cleanup on its way out.
+                releaseWorker.countDown();
+                Assert.assertTrue("cleanup never ran on worker exit",
+                        cleanupRan.await(10, TimeUnit.SECONDS));
+
+                // Reap the exited worker, then: no live worker, no handoff.
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                manager.close();
+                managerClosed = true;
+                Assert.assertFalse("reaped manager must reject the handoff",
+                        manager.deferUntilWorkerExit(() -> {
+                        }));
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                if (!managerClosed) {
+                    Thread.interrupted();
+                    manager.close();
+                }
+                ring.close();
+            }
+        });
+    }
+
+    /**
      * Pins the {@link SegmentManager#awaitRingQuiescence} contract that
      * {@code CursorSendEngine.close()} depends on:
      * <ul>

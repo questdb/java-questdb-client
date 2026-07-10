@@ -59,8 +59,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * ({@link SegmentManager#awaitRingQuiescence}) after {@code deregister} and
  * refuse to release any worker-reachable resource (ring, watermark, segment
  * files, slot lock) until the barrier confirms the worker cannot touch the
- * slot again. On barrier timeout the engine deliberately leaks and a later
- * {@code close()} retries the cleanup.
+ * slot again. On barrier timeout an owned-manager engine hands cleanup
+ * ownership to the worker's exit path (see
+ * {@code SegmentManager.deferUntilWorkerExit}); a shared-manager engine
+ * deliberately leaks and a later {@code close()} retries the cleanup.
  */
 public class CursorSendEngineSlotReacquisitionTest {
 
@@ -279,6 +281,117 @@ public class CursorSendEngineSlotReacquisitionTest {
                     Assert.assertNotNull("slot must be acquirable after a completed close", probe);
                 } catch (Exception e) {
                     throw new AssertionError("retried owned close() did not release the slot lock", e);
+                }
+                if (hookErr.get() != null) {
+                    throw new AssertionError("install hook failed", hookErr.get());
+                }
+            } finally {
+                Unsafe.free(buf, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                manager.setBeforeInstallSyncHook(null);
+                releaseWorker.countDown();
+                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+    }
+
+    /**
+     * The ownership handoff (owned manager): when close() cannot confirm
+     * worker quiescence within the bounded join, the terminal cleanup (ring,
+     * watermark, flock release) transfers to the worker's exit path — the
+     * worker is provably the last thread able to touch the slot directory.
+     * Once the parked pass is released the worker must run the cleanup
+     * itself, WITHOUT any retried {@code close()}: {@code isCloseCompleted()}
+     * flips true and the slot becomes acquirable again. This is what lets a
+     * pool recover a retired slot instead of losing its capacity until
+     * process exit.
+     */
+    @Test(timeout = 30_000L)
+    public void testOwnedEngineCloseHandsCleanupToWorkerExit() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int payloadLen = 32;
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + payloadLen);
+            String slot = tmpDir + "/owned-handoff-slot";
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicBoolean fired = new AtomicBoolean();
+            AtomicReference<Throwable> hookErr = new AtomicReference<>();
+            // Production shape: private, owned manager (ownsManager=true).
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            SegmentManager manager = readManager(engine);
+            long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Phase 1: wait out the initial spare install so the park hook
+                // can only fire on the rotation-triggered pass (see
+                // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
+                SegmentRing ring = readRing(engine);
+                long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (ring.needsHotSpare()) {
+                    if (System.nanoTime() > deadlineNs) {
+                        throw new AssertionError("manager worker never installed the initial hot spare");
+                    }
+                    Thread.sleep(1);
+                }
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) return;
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+
+                // Phase 2: fill the active segment and rotate onto the spare;
+                // the worker's next tick re-enters the install pass and parks.
+                Unsafe.getUnsafe().putLong(buf, 0L);
+                Assert.assertEquals(0L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertEquals(1L, engine.appendBlocking(buf, payloadLen));
+                Assert.assertTrue("worker never re-entered a spare-install pass",
+                        workerBlocked.await(5, TimeUnit.SECONDS));
+
+                // Phase 3: owned close with the worker provably mid-pass. The
+                // bounded join times out; cleanup ownership is handed to the
+                // worker's exit path. Every worker-reachable resource — above
+                // all the slot flock — must still be retained at this point.
+                manager.setWorkerJoinTimeoutMillis(50L);
+                engine.close();
+                Assert.assertFalse("close must stay incomplete while the worker holds the handoff",
+                        engine.isCloseCompleted());
+                try {
+                    SlotLock probe = SlotLock.acquire(slot);
+                    probe.close();
+                    Assert.fail("engine.close() released the slot lock while its manager worker "
+                            + "was still mid service pass — the handoff must not weaken the "
+                            + "quiescence gate");
+                } catch (Exception expected) {
+                    // good — slot retained while the worker can still touch it.
+                }
+
+                // Phase 4 — the contract under test: release the worker and do
+                // NOT retry close(). The worker finishes its pass, exits, and
+                // runs the deferred cleanup itself, flipping isCloseCompleted
+                // and releasing the flock with no further caller action.
+                releaseWorker.countDown();
+                long cleanupDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!engine.isCloseCompleted()) {
+                    if (System.nanoTime() > cleanupDeadlineNs) {
+                        throw new AssertionError(
+                                "deferred cleanup never ran on manager-worker exit — the slot "
+                                        + "would stay retired until process exit");
+                    }
+                    Thread.sleep(1);
+                }
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull("slot must be acquirable after the worker-exit cleanup", probe);
+                } catch (Exception e) {
+                    throw new AssertionError("worker-exit cleanup did not release the slot lock", e);
                 }
                 if (hookErr.get() != null) {
                     throw new AssertionError("install hook failed", hookErr.get());

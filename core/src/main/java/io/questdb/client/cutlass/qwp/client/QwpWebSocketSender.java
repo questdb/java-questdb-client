@@ -281,8 +281,17 @@ public class QwpWebSocketSender implements Sender {
     // teardown path). Stays false if an I/O or manager worker did not stop and
     // cursorEngine retained the flock, so the owning pool MUST keep the slot
     // reserved rather than hand the still-locked dir to the next borrow
-    // ("sf slot already in use").
-    private boolean slotLockReleased;
+    // ("sf slot already in use"). May flip to true LATER via the getter's
+    // re-probe of retainedEngine, once the deferred cleanup (manager-worker
+    // exit path or delegated I/O-thread close) releases the flock — pools
+    // re-probe retired slots to recover their capacity. volatile: written on
+    // the closing thread, read by pool threads.
+    private volatile boolean slotLockReleased;
+    // Engine whose close() could not complete during sender close() — its
+    // cleanup is pending on a worker/I/O-thread exit path. isSlotLockReleased()
+    // re-probes it so a late flock release becomes visible to the owning pool.
+    // Only ever set inside close(); null for a sender that closed cleanly.
+    private volatile CursorSendEngine retainedEngine;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
     // Async-delivery sink for ack-watermark advances. Default no-op; a
@@ -1190,24 +1199,33 @@ public class QwpWebSocketSender implements Sender {
                 // close actually runs, so the pool must not reuse the slot
                 // meanwhile. A false return means the thread exited between
                 // the failed close() and now — then closing here is safe.
-                if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null
-                        && !cursorSendLoop.delegateEngineClose()) {
-                    CursorSendEngine engine = cursorEngine;
-                    try {
-                        engine.close();
-                    } catch (Throwable t) {
-                        LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
-                        terminalError = captureCloseError(terminalError, t);
-                    }
-                    if (engine.isCloseCompleted()) {
-                        cursorEngine = null;
-                        ownsCursorEngine = false;
-                        slotLockReleased = true;
+                if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null) {
+                    if (cursorSendLoop.delegateEngineClose()) {
+                        // The I/O thread adopted the engine close and runs it on
+                        // its exit path. Keep the engine visible for re-probing:
+                        // isSlotLockReleased() flips true once that close
+                        // completes, letting a pool recover the retired slot.
+                        retainedEngine = cursorEngine;
                     } else {
-                        // Preserve the engine and report the retained flock.
-                        // Sender.close() is idempotent, so this is a deliberate
-                        // safe leak until process exit rather than a retry path.
-                        slotLockReleased = false;
+                        CursorSendEngine engine = cursorEngine;
+                        try {
+                            engine.close();
+                        } catch (Throwable t) {
+                            LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                            terminalError = captureCloseError(terminalError, t);
+                        }
+                        if (engine.isCloseCompleted()) {
+                            cursorEngine = null;
+                            ownsCursorEngine = false;
+                            slotLockReleased = true;
+                        } else {
+                            // Engine cleanup is pending on its manager worker's
+                            // exit path (or leaked, for a shared manager). Report
+                            // the retained flock now; the getter re-probes the
+                            // retained engine so a late release is not lost.
+                            slotLockReleased = false;
+                            retainedEngine = engine;
+                        }
                     }
                 }
                 rethrowTerminal(terminalError);
@@ -1257,7 +1275,12 @@ public class QwpWebSocketSender implements Sender {
                     // The manager worker did not quiesce. Preserve ownership
                     // and report the retained flock so pools retire this slot.
                     // Repeated Sender.close() calls remain no-ops by contract.
+                    // Engine cleanup was handed to the worker's exit path
+                    // (owned manager); the getter re-probes the retained
+                    // engine so the pool can reclaim the slot once cleanup
+                    // actually completes.
                     slotLockReleased = false;
+                    retainedEngine = engine;
                 }
             } else {
                 // This sender owns no cursor engine holding an SF flock.
@@ -1306,13 +1329,30 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * True once {@link #close()} has released the store-and-forward slot
-     * flock. False means an I/O or manager worker did not stop and close()
-     * retained the lock and worker-reachable resources; the owning pool must
-     * keep the slot index reserved instead of reusing the still-locked dir.
+     * True once the store-and-forward slot flock has been released. False
+     * means an I/O or manager worker did not stop and close() retained the
+     * lock and worker-reachable resources; the owning pool must keep the slot
+     * index reserved instead of reusing the still-locked dir.
+     * <p>
+     * Not a one-shot snapshot: when close() left engine cleanup pending on a
+     * worker/I/O-thread exit path, this re-probes the retained engine and
+     * latches true the moment that cleanup completes — pools re-probe retired
+     * slots through this getter to recover their capacity. Monotonic:
+     * false→true only, never back. Lock-free (volatile reads) so pools may
+     * call it under their capacity lock.
      */
     public boolean isSlotLockReleased() {
-        return slotLockReleased;
+        if (slotLockReleased) {
+            return true;
+        }
+        CursorSendEngine engine = retainedEngine;
+        if (engine != null && engine.isCloseCompleted()) {
+            // Benign latch race: concurrent callers may both observe the
+            // completed cleanup and both write true.
+            slotLockReleased = true;
+            return true;
+        }
+        return false;
     }
 
     @Override

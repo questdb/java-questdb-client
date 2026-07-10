@@ -29,6 +29,7 @@ import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -119,7 +120,20 @@ public final class CursorSendEngine implements QuietCloseable {
     // leak the ring/watermark/slot lock — in that case a later close() call
     // retries the cleanup (the worker may have exited by then). Guarded by
     // the synchronized close() method; never read elsewhere.
-    private boolean closeCompleted;
+    // volatile: latched by finishClose(), but read lock-free by
+    // isCloseCompleted() from pool threads re-probing a retired slot (see the
+    // getter for why it must not synchronize).
+    private volatile boolean closeCompleted;
+    // Exactly-once claim on the terminal cleanup (finishClose). Contended by
+    // close() and a worker-exit handoff (completeDeferredClose); whoever wins
+    // the CAS runs the cleanup, the loser never touches ring/watermark/flock.
+    // Deliberately NOT the engine monitor: a retried close() holds the
+    // monitor while joining the manager worker, and the worker cannot die
+    // until its exit-path cleanup finishes — monitor-based exclusion would
+    // stall that close() for its full join budget (test-visible livelock).
+    // With the CAS the worker's cleanup never blocks, so the join returns as
+    // soon as the pass ends.
+    private final AtomicBoolean terminalCleanupClaimed = new AtomicBoolean();
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
@@ -497,79 +511,136 @@ public final class CursorSendEngine implements QuietCloseable {
         // against potentially-fresh server state — duplicate writes when
         // the server has no dedup state for those messageSequences.
         // Memory mode has no files to unlink.
-        // The whole close sequence runs under try/finally so the slot lock
-        // is released whenever it is safe to do so, even if manager/ring
-        // close or unlink throws — otherwise a kernel-held flock outlives
-        // the engine and the next sender for the same slot collides on a
-        // lock the dead engine never released. The one deliberate exception
-        // is a manager worker that failed to quiesce: releasing the lock
-        // then would let a replacement engine acquire the slot while the
-        // stale worker can still create/unlink segment paths inside it.
-        boolean workerQuiescent = false;
+        //
+        // Cleanup is gated on worker quiescence: releasing the ring,
+        // watermark, segment files or the slot lock while the manager worker
+        // is still mid service pass would let a replacement engine acquire
+        // the slot and have its files unlinked by the stale worker —
+        // store-and-forward data loss after restart. When the bounded worker
+        // join times out on an owned manager, cleanup OWNERSHIP TRANSFERS to
+        // the worker's exit path (deferUntilWorkerExit): the worker is
+        // provably the last thread able to touch the slot directory, so it
+        // releases everything the moment its in-flight pass finishes instead
+        // of leaking the slot until process exit.
+        //
+        // "Fully drained" includes BOTH the obvious case (every published
+        // FSN has been acked) AND the never-published case (publishedFsn
+        // < 0). The latter matters because a drainer adopting an empty
+        // orphan slot — segments filtered as empty by recovery, engine
+        // recreates a fresh sf-initial.sfa — would otherwise leave that
+        // fresh empty file behind, the next scanner finds it, adopts the
+        // slot again, and the cycle repeats forever (M6).
+        // Own try/catch so sabotaged/broken ring state cannot skip the
+        // quiescence barrier below or the slot-lock release in finishClose.
+        boolean drained = false;
         try {
-            // "Fully drained" includes BOTH the obvious case (every published
-            // FSN has been acked) AND the never-published case (publishedFsn
-            // < 0). The latter matters because a drainer adopting an empty
-            // orphan slot — segments filtered as empty by recovery, engine
-            // recreates a fresh sf-initial.sfa — would otherwise leave that
-            // fresh empty file behind, the next scanner finds it, adopts the
-            // slot again, and the cycle repeats forever (M6).
-            // Own try/catch so sabotaged/broken ring state cannot skip the
-            // quiescence barrier below or the slot-lock release in finally.
-            boolean fullyDrained = false;
+            drained = sfDir != null
+                    && (ring.publishedFsn() < 0
+                    || ring.ackedFsn() >= ring.publishedFsn());
+        } catch (Throwable ignored) {
+        }
+        final boolean fullyDrained = drained;
+        // Each cleanup step in its own try/catch so a single failure
+        // doesn't strand later cleanups — mirrors the constructor's
+        // catch block. Without this, a throw from manager.deregister
+        // or manager.close() would leave the ring mmap'd and any
+        // residual .sfa files on disk, where the next sender can
+        // adopt them and replay already-acked data.
+        try {
+            manager.deregister(ring);
+        } catch (Throwable ignored) {
+        }
+        // Quiescence barrier. deregister alone only removes the entry
+        // from the registry — the worker may still be mid service pass
+        // for this ring (creating a spare file, trimming, unlinking).
+        boolean workerQuiescent = false;
+        if (ownsManager) {
+            // Stopping and reaping a private manager is a stronger barrier
+            // than waiting for this ring alone. Do it directly so a stuck
+            // worker consumes at most one workerJoinTimeoutMillis budget,
+            // rather than one here and a second one in manager.close().
             try {
-                fullyDrained = sfDir != null
-                        && (ring.publishedFsn() < 0
-                        || ring.ackedFsn() >= ring.publishedFsn());
+                manager.close();
             } catch (Throwable ignored) {
             }
-            // Each cleanup step in its own try/catch so a single failure
-            // doesn't strand later cleanups — mirrors the constructor's
-            // catch block. Without this, a throw from manager.deregister
-            // or manager.close() would leave the ring mmap'd and any
-            // residual .sfa files on disk, where the next sender can
-            // adopt them and replay already-acked data.
             try {
-                manager.deregister(ring);
+                workerQuiescent = manager.isWorkerReaped();
             } catch (Throwable ignored) {
             }
-            // Quiescence barrier. deregister alone only removes the entry
-            // from the registry — the worker may still be mid service pass
-            // for this ring (creating a spare file, trimming, unlinking).
-            // Releasing the ring, watermark, segment files, or the slot lock
-            // while that pass is in flight lets the stale worker unlink a
-            // path that a replacement engine — which can acquire the slot
-            // the moment the lock is released — is actively writing through:
-            // store-and-forward data loss after restart.
-            if (ownsManager) {
-                // Stopping and reaping a private manager is a stronger barrier
-                // than waiting for this ring alone. Do it directly so a stuck
-                // worker consumes at most one workerJoinTimeoutMillis budget,
-                // rather than one here and a second one in manager.close().
-                try {
-                    manager.close();
-                } catch (Throwable ignored) {
-                }
-                try {
-                    workerQuiescent = manager.isWorkerReaped();
-                } catch (Throwable ignored) {
-                }
-            } else {
-                // A shared manager must keep serving its other rings, so wait
-                // only for the deregistered ring's current pass to finish.
-                try {
-                    workerQuiescent = manager.awaitRingQuiescence(ring);
-                } catch (Throwable ignored) {
-                }
+        } else {
+            // A shared manager must keep serving its other rings, so wait
+            // only for the deregistered ring's current pass to finish.
+            try {
+                workerQuiescent = manager.awaitRingQuiescence(ring);
+            } catch (Throwable ignored) {
             }
-            if (!workerQuiescent) {
-                LOG.error("SF manager worker did not quiesce during engine close; leaking the "
-                        + "ring, watermark and slot lock so a stale worker cannot corrupt a "
-                        + "future engine on slot {}. The kernel releases the slot flock on "
-                        + "process exit; close() may be invoked again to retry cleanup once "
-                        + "the worker has exited.", sfDir == null ? "<memory>" : sfDir);
+        }
+        if (!workerQuiescent && ownsManager) {
+            // Ownership handoff: manager.close() already stopped the worker
+            // loop (running=false), so the worker exits as soon as its
+            // in-flight pass finishes — it is merely slow, or wedged in a
+            // syscall. Either way it is the last thread able to touch the
+            // slot, so hand it the terminal cleanup instead of leaking the
+            // slot until process exit. completeDeferredClose and a retried
+            // close() race through the terminalCleanupClaimed CAS, so the
+            // cleanup runs exactly once and the worker never blocks on the
+            // engine monitor a retried close() holds while joining it.
+            boolean handedOff = false;
+            try {
+                handedOff = manager.deferUntilWorkerExit(() -> completeDeferredClose(fullyDrained));
+            } catch (Throwable ignored) {
+            }
+            if (handedOff) {
+                LOG.error("SF manager worker did not quiesce during engine close; ring, watermark "
+                        + "and slot-lock release are handed to the worker's exit path and run the "
+                        + "moment its in-flight service pass finishes. The slot stays locked (and "
+                        + "isCloseCompleted() false) until then, so no replacement engine can race "
+                        + "the stale worker on slot {}", sfDir == null ? "<memory>" : sfDir);
                 return;
             }
+            // Handoff rejected: the worker loop exited between the failed
+            // bounded join and the registration attempt (both sides share the
+            // manager's lock, so this observation is exact). A worker past
+            // its loop can never touch slot paths again — inline cleanup is
+            // as safe as a reaped worker.
+            workerQuiescent = true;
+        }
+        if (!workerQuiescent) {
+            // Shared (caller-owned) manager: its worker keeps serving other
+            // rings indefinitely, so there is no exit path to hand cleanup
+            // to — leak and let a retried close() reclaim once the pass ends.
+            LOG.error("SF manager worker did not quiesce during engine close; leaking the "
+                    + "ring, watermark and slot lock so a stale worker cannot corrupt a "
+                    + "future engine on slot {}. The kernel releases the slot flock on "
+                    + "process exit; close() may be invoked again to retry cleanup once "
+                    + "the worker has exited.", sfDir == null ? "<memory>" : sfDir);
+            return;
+        }
+        if (!terminalCleanupClaimed.compareAndSet(false, true)) {
+            // A worker-exit handoff from an earlier close() attempt owns the
+            // terminal cleanup: it has run or is finishing right now on the
+            // exiting worker. closeCompleted flips the moment it is done —
+            // owners observe it via isCloseCompleted(), never by re-running
+            // the cleanup here (that would double-release ring/flock).
+            return;
+        }
+        finishClose(fullyDrained);
+    }
+
+    /**
+     * Terminal cleanup: closes the ring and watermark, unlinks drained
+     * segment files, releases the slot flock, and latches
+     * {@link #closeCompleted}. The caller must hold the engine monitor and
+     * must have established that the manager worker can no longer touch the
+     * slot directory (reaped, provably exited, or running this on its own
+     * exit path) AND have won the {@link #terminalCleanupClaimed} CAS — the
+     * claim token, not the engine monitor, is the exclusion between a
+     * worker-exit handoff and a retried close(), so ring/watermark/flock are
+     * never double-released and the worker's cleanup can never deadlock
+     * against a close() that holds the monitor while joining the worker.
+     */
+    private void finishClose(boolean fullyDrained) {
+        try {
             try {
                 ring.close();
             } catch (Throwable ignored) {
@@ -600,11 +671,10 @@ public final class CursorSendEngine implements QuietCloseable {
             }
             closeCompleted = true;
         } finally {
-            // Gate on quiescence: releasing the flock while a stale worker
-            // can still touch this slot directory hands the slot to a new
-            // engine that the worker may then corrupt. Leaking the fd is
-            // the safe failure mode — the kernel drops it on process exit.
-            if (workerQuiescent && slotLock != null) {
+            // Reaching finishClose at all requires established quiescence, so
+            // releasing the flock is safe even if a step above threw. Leaking
+            // it would strand the slot until process exit for no reason.
+            if (slotLock != null) {
                 try {
                     slotLock.close();
                 } catch (Throwable ignored) {
@@ -615,12 +685,41 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Runs on the manager worker's exit path when {@link #close()} handed
+     * cleanup ownership to the worker (see {@code deferUntilWorkerExit}).
+     * Deliberately does NOT take the engine monitor: a retried close() can
+     * hold it while joining this very worker, and the thread cannot die until
+     * this method returns — the {@link #terminalCleanupClaimed} CAS provides
+     * the exactly-once exclusion instead, so the worker always exits promptly
+     * and the racing close() converges via {@code isWorkerReaped()}.
+     */
+    private void completeDeferredClose(boolean fullyDrained) {
+        if (!terminalCleanupClaimed.compareAndSet(false, true)) {
+            // A retried close() (or an earlier duplicate handoff) already ran
+            // the terminal cleanup.
+            return;
+        }
+        finishClose(fullyDrained);
+        LOG.info("deferred SF engine cleanup completed on manager-worker exit; slot released: {}",
+                sfDir == null ? "<memory>" : sfDir);
+    }
+
+    /**
      * Whether {@link #close()} completed all cleanup, including releasing the
      * SF slot lock. A false value after close means manager-worker quiescence
      * could not be confirmed and the worker-reachable resources were retained
-     * deliberately. Owners must not report or reuse the slot in that case.
+     * deliberately — either handed to the worker's exit path (owned manager),
+     * which flips this to true the moment the worker's in-flight pass
+     * finishes, or leaked until a retried close() (shared manager). Owners
+     * must not reuse the slot while this is false; pools may re-probe it to
+     * recover a retired slot's capacity once it flips.
+     * <p>
+     * Deliberately unsynchronized ({@code closeCompleted} is volatile): pools
+     * probe this under their own capacity lock, and the deferred cleanup can
+     * hold the engine monitor through munmap/unlink syscalls — a synchronized
+     * getter would stall the pool's hot borrow path behind them.
      */
-    public synchronized boolean isCloseCompleted() {
+    public boolean isCloseCompleted() {
         return closeCompleted;
     }
 

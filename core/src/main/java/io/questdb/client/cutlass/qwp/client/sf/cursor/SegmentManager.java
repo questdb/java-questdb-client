@@ -109,6 +109,14 @@ public final class SegmentManager implements QuietCloseable {
     // {@link #lock}; cleared with lock.notifyAll() so awaitRingQuiescence can
     // block until an in-flight pass for a just-deregistered ring finishes.
     private RingEntry inService;
+    // Cleanup actions handed to the worker's exit block by an owning engine
+    // whose close() found the worker still mid service pass after the bounded
+    // join timed out (see deferUntilWorkerExit). Guarded by {@link #lock};
+    // consumed exactly once by the worker-loop finally, which runs them
+    // OUTSIDE `lock`: they perform syscalls (munmap/unlink/flock release),
+    // and no caller-facing lock may ever be held while running third-party
+    // cleanup code.
+    private ObjList<Runnable> exitCleanups;
     // Number of threads currently parked in awaitRingQuiescence()'s wait
     // loop. Guarded by {@link #lock}. The worker's per-pass finally block
     // only calls lock.notifyAll() when this is > 0, so the steady-state
@@ -255,6 +263,37 @@ public final class SegmentManager implements QuietCloseable {
                 scratchFreed = true;
                 pathScratch.close();
             }
+        }
+    }
+
+    /**
+     * Hands a cleanup action to the worker thread's exit block, to run
+     * strictly after the worker loop has finished its final service pass --
+     * i.e. after the last point where the worker can create, write or unlink
+     * anything under a registered ring's slot directory. Returns {@code false}
+     * when the worker loop has already exited (or the worker never started):
+     * the caller must run the cleanup itself, which is equally safe for the
+     * same reason -- no further worker access to the slot is possible.
+     * <p>
+     * This is the slot-ownership transfer used by an owning engine's close()
+     * when the bounded worker join timed out: instead of retiring the slot
+     * until process exit, ring/watermark/flock release moves to the worker,
+     * which is provably the last thread able to touch the slot directory.
+     * The registration here and the exit block's {@code workerLoopExited}
+     * flip share {@link #lock}, so the cleanup runs exactly once: either it
+     * is registered before the flip and the worker runs it, or the flip won
+     * and this method rejects the handoff.
+     */
+    public boolean deferUntilWorkerExit(Runnable cleanup) {
+        synchronized (lock) {
+            if (workerLoopExited || workerThread == null) {
+                return false;
+            }
+            if (exitCleanups == null) {
+                exitCleanups = new ObjList<>();
+            }
+            exitCleanups.add(cleanup);
+            return true;
         }
     }
 
@@ -765,11 +804,32 @@ public final class SegmentManager implements QuietCloseable {
             // pathScratch ownership to this thread (see close()). Freeing it
             // here reclaims the native buffer even when the worker outlives
             // every close() attempt — nobody else retries manager cleanup.
+            ObjList<Runnable> cleanups;
             synchronized (lock) {
                 workerLoopExited = true;
                 if (scratchHandedToWorker && !scratchFreed) {
                     scratchFreed = true;
                     pathScratch.close();
+                }
+                cleanups = exitCleanups;
+                exitCleanups = null;
+            }
+            // Deferred engine cleanups (see deferUntilWorkerExit) run OUTSIDE
+            // `lock`: they perform syscalls (munmap, unlink, flock release)
+            // and must never execute under a lock that close()/register/
+            // deregister callers contend on. Running them after the loop body
+            // is what makes the handoff safe: this thread can no longer touch
+            // any slot path. They must also never block on a caller-held
+            // monitor — a retried engine.close() joins this thread while
+            // holding the engine monitor, which is why the engine side uses a
+            // lock-free claim (CAS), not synchronization, for exactly-once.
+            if (cleanups != null) {
+                for (int i = 0, n = cleanups.size(); i < n; i++) {
+                    try {
+                        cleanups.getQuick(i).run();
+                    } catch (Throwable t) {
+                        LOG.error("deferred engine cleanup failed on manager-worker exit", t);
+                    }
                 }
             }
         }

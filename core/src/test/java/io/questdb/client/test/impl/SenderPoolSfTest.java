@@ -658,6 +658,119 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test
+    public void testRetiredSlotRecoveredByHousekeeperAfterLateFlockRelease() throws Exception {
+        // Recovery twin of testSlotLeakedWhenDelegateCloseDoesNotReleaseFlock:
+        // a slot retired because close() returned with the flock still held is
+        // NOT lost until process exit. Engine cleanup may complete later on a
+        // worker/I/O-thread exit path (isSlotLockReleased() re-probes the
+        // retained engine), and the housekeeper's reapIdle() tick must then
+        // return the index to the free set: leakedSlots back down, slotInUse
+        // cleared, full capacity restored.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 2, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-0")));
+
+                    // Forge the retire: real teardown first (no native leaks),
+                    // then clear slotLockReleased so discardBroken retires the
+                    // slot as leaked.
+                    Sender delegate = getDelegate(a);
+                    delegate.close();
+                    setBooleanField(delegate, "slotLockReleased", false);
+                    invokeDiscardBroken(pool, a);
+                    Assert.assertEquals("precondition: one slot must be retired",
+                            1, pool.leakedSlotCount());
+
+                    // Forge the late release: the deferred cleanup finished and
+                    // the delegate now reports the flock dropped (in production
+                    // this flip comes from isSlotLockReleased() re-probing the
+                    // retained engine after the manager worker exited).
+                    setBooleanField(delegate, "slotLockReleased", true);
+
+                    // The housekeeper tick is the recovery driver.
+                    pool.reapIdle();
+
+                    Assert.assertEquals("recovered slot must leave the leaked count",
+                            0, pool.leakedSlotCount());
+                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                    Assert.assertFalse("recovered slot index 0 must return to the free set",
+                            slotInUse[0]);
+
+                    // Full capacity restored: with maxSize=2, two concurrent
+                    // borrows must succeed again (index 0 is reusable — its
+                    // flock is genuinely free).
+                    PooledSender b = pool.borrow();
+                    PooledSender c = pool.borrow();
+                    try {
+                        Assert.assertEquals(2, countSlotDirs());
+                    } finally {
+                        c.close();
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCapacityStarvedBorrowRecoversRetiredSlot() throws Exception {
+        // Borrow-path twin of the housekeeper recovery test: a borrow that
+        // would otherwise park on the cap check must re-probe retired slots
+        // before waiting, so a late flock release converts a guaranteed
+        // borrow timeout into an immediate creation on the recovered index —
+        // no housekeeper tick required.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 2, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-0")));
+
+                    Sender delegate = getDelegate(a);
+                    delegate.close();
+                    setBooleanField(delegate, "slotLockReleased", false);
+                    invokeDiscardBroken(pool, a);
+                    Assert.assertEquals("precondition: one slot must be retired",
+                            1, pool.leakedSlotCount());
+
+                    // One live borrow + one retired slot = cap reached.
+                    PooledSender b = pool.borrow();
+                    Assert.assertTrue(Files.exists(slot("default-1")));
+                    try {
+                        // Late release lands while the pool is capacity-starved.
+                        setBooleanField(delegate, "slotLockReleased", true);
+
+                        // The next borrow hits the cap check, re-probes, frees
+                        // index 0, and must create on it instead of timing out.
+                        PooledSender c = pool.borrow();
+                        try {
+                            Assert.assertEquals("borrow must recover the retired slot's capacity",
+                                    0, pool.leakedSlotCount());
+                            Assert.assertEquals(2, countSlotDirs());
+                        } finally {
+                            c.close();
+                        }
+                    } finally {
+                        b.close();
+                    }
+                }
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------
     // Recovery: stable slot ids let a re-created pool re-adopt unacked data.
     // ----------------------------------------------------------------------
