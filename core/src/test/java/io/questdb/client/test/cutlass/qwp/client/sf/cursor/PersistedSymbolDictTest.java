@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -189,6 +190,50 @@ public class PersistedSymbolDictTest {
                     ObjList<String> s = re.readLoadedSymbols();
                     Assert.assertEquals("", s.getQuick(0));
                     Assert.assertEquals("nonempty", s.getQuick(1));
+                } finally {
+                    re.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testLargeSymbolRoundTripsAcrossReopen() throws Exception {
+        // C1 regression: the write path caps nothing, so a symbol larger than the
+        // old fixed 1 MB read ceiling must still recover intact. Before the fix,
+        // appendSymbol wrote the oversized entry but openExisting rejected it as
+        // "oversized", truncated the dictionary at that id (dropping it and every
+        // higher id), and a normal process-crash recovery then hard-failed with a
+        // spurious "host crash / resend required" terminal -- defeating store-and-
+        // forward's process-crash durability for large symbols. The file length is
+        // now the only bound, so the write and read paths agree.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                // Just over the old 1 << 20 (1 MB) ceiling.
+                String big = TestUtils.repeat("x", (1 << 20) + 17);
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                try {
+                    d.appendSymbol("before");
+                    d.appendSymbol(big);
+                    d.appendSymbol("after");
+                    Assert.assertEquals(3, d.size());
+                } finally {
+                    d.close();
+                }
+
+                // Recovery must load ALL three; pre-fix the reopen truncated at the
+                // big entry and came back with size 1 (only "before" survived).
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                try {
+                    Assert.assertEquals("large entry must survive recovery, not be truncated",
+                            3, re.size());
+                    ObjList<String> s = re.readLoadedSymbols();
+                    Assert.assertEquals("before", s.getQuick(0));
+                    Assert.assertEquals(big, s.getQuick(1));
+                    Assert.assertEquals("after", s.getQuick(2));
                 } finally {
                     re.close();
                 }

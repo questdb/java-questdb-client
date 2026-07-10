@@ -89,9 +89,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
     static final int FILE_MAGIC = 0x31445953; // 'SYD1' little-endian
     static final int HEADER_SIZE = 8;
     static final byte VERSION = 1;
-    // Guards against a hostile/corrupt varint length driving a huge allocation
-    // or a runaway parse. Symbols are short; this is a generous ceiling.
-    private static final int MAX_ENTRY_LEN = 1 << 20;
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
     private long appendOffset;
@@ -337,12 +334,20 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 if (vr == null) {
                     break; // torn length varint
                 }
-                int entryLen = (int) vr[0];
+                long entryLen = vr[0];
                 int next = (int) vr[1];
-                if (entryLen < 0 || entryLen > MAX_ENTRY_LEN || (long) next + entryLen > len) {
-                    break; // torn/oversized entry -- self-healing tail
+                // The file length is the sole sanity bound: a length that runs past
+                // the file is a torn/incomplete trailing entry and stops the parse
+                // (self-healing tail). There is deliberately NO fixed per-entry
+                // ceiling -- the write path (appendSymbol/appendSymbols) applies none
+                // either, so a legitimately persisted large symbol must recover here,
+                // not be truncated and then trip the send loop's "resend required"
+                // guard on a normal process-crash recovery. entryLen stays a long so a
+                // corrupt multi-gigabyte length cannot wrap an int back under the check.
+                if ((long) next + entryLen > len) {
+                    break; // torn/incomplete trailing entry -- self-healing tail
                 }
-                pos = next + entryLen;
+                pos = next + (int) entryLen;
                 count++;
             }
             int entriesLen = pos - HEADER_SIZE;

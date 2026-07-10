@@ -280,6 +280,42 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     @Test
+    public void testNonOrderlyRejectionAfterOnlyCatchUpDoesNotStrike() throws Exception {
+        // C2 regression: the server-NACK twin of
+        // testNonOrderlyCloseAfterOnlyCatchUpDoesNotStrike. handleServerRejection's
+        // pre-send gate keys off dataFrameSentThisConnection, NOT nextWireSeq -- the
+        // dictionary catch-up advances nextWireSeq WITHOUT sending a data frame. A
+        // server NACK of a catch-up frame (nextWireSeq>0, no data frame sent) must
+        // take the pre-send path (surface + recycle, no strike), not the post-send
+        // poison-strike path. Pre-fix (gate on highestSent >= 0, i.e. nextWireSeq>0)
+        // each catch-up NACK strikes the never-sent head frame; MAX_REJECTIONS such
+        // strikes escalate a TRANSIENT outage to a producer-fatal PROTOCOL_VIOLATION
+        // terminal -- exactly what store-and-forward's retry-forever contract forbids.
+        // WRITE_ERROR (RETRIABLE) is the discriminating category: it DOES accrue
+        // strikes on the post-send path (see testNackRecycleIsPacedAgainstHealthyServer),
+        // so a regressed gate escalates here and checkError() throws.
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                for (int i = 0; i < MAX_REJECTIONS + 2; i++) {
+                    // Model the catch-up: nextWireSeq advanced, but NO data frame
+                    // sent. The pre-send recycle (swapClient) resets nextWireSeq, so
+                    // re-apply before each NACK (mirrors the onClose twin).
+                    setCatchUpWireSeqOnly(loop, 2);
+                    deliverRetriableNack(loop, 1, "disk full");
+                }
+                // No strike was ever charged, so nothing escalated: the loop stays
+                // retriable and the producer-facing error latch is clear.
+                loop.checkError();
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
     public void testNackRecycleIsPacedAgainstHealthyServer() throws Exception {
         // A reachable, healthy server that NACKs the head frame (RETRIABLE)
         // must not drive the recycle loop at server NACK rate: connectLoop's
