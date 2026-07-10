@@ -230,6 +230,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     break;
                 }
                 shift += 7;
+                if (shift > 35) {
+                    // A canonical entry-length varint is <= 5 bytes; a longer
+                    // continuation run is corrupt. The downstream entryEnd > srcLimit
+                    // check then rejects it. Matches decodeVarint / readVarintAt.
+                    break;
+                }
             }
             long entryEnd = src + symLen; // src is just past the len varint
             if (entryEnd > srcLimit) {
@@ -241,6 +247,16 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putInt(dst + wireSpan, Crc32c.update(Crc32c.INIT, entryStart, wireSpan));
             dst += wireSpan + CRC_SIZE;
             src = entryEnd;
+        }
+        if (src != srcLimit) {
+            // The count entries did not consume exactly len bytes -- a caller passed an
+            // inconsistent (addr, len, count) triple. Writing outLen would flush an
+            // uninitialised scratch tail and mis-advance size, so fail loudly. The sole
+            // caller derives count and len from one beginMessage, so this cannot fire
+            // today.
+            throw new IllegalStateException("raw symbol-dict entries under-filled the buffer to "
+                    + FILE_NAME + " [count=" + count + ", len=" + len
+                    + ", consumed=" + (int) (src - addr) + ']');
         }
         long written = Files.write(fd, scratchAddr, outLen, appendOffset);
         if (written != outLen) {
@@ -503,6 +519,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // open. A second no-alloc walk over the already-validated region.
             if (wireLen > 0) {
                 entriesAddr = Unsafe.malloc(wireLen, MemoryTag.NATIVE_DEFAULT);
+                // Record the length alongside the malloc so the catch below frees the
+                // right size (not 0) if this copy walk ever throws.
+                entriesLen = wireLen;
                 long dst = entriesAddr;
                 int p = HEADER_SIZE;
                 for (int i = 0; i < count; i++) {
@@ -516,6 +535,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
                             break;
                         }
                         shift += 7;
+                        if (shift > 35) {
+                            break; // corrupt run; these entries were CRC-validated above
+                        }
                     }
                     int wireSpan = (vp - p) + (int) symLen; // [len][utf8], no CRC
                     Unsafe.getUnsafe().copyMemory(buf + p, dst, wireSpan);
@@ -523,7 +545,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     p += wireSpan + CRC_SIZE; // skip the entry's CRC
                 }
             }
-            entriesLen = wireLen;
             Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
             buf = 0L;
             // Drop any torn/stale trailing bytes so a LATER, shorter append cannot
@@ -601,8 +622,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
         if (scratchCap >= required) {
             return;
         }
-        int newCap = Math.max(required, Math.max(256, scratchCap * 2));
-        scratchAddr = Unsafe.realloc(scratchAddr, scratchCap, newCap, MemoryTag.NATIVE_DEFAULT);
-        scratchCap = newCap;
+        // Double in long: scratchCap * 2 as an int overflows negative past ~1 GB and
+        // would make the realloc size negative. required is bounded by one frame's
+        // entries (the server batch cap), so this never actually caps -- it mirrors the
+        // long-math growth in CursorWebSocketSendLoop.ensureSentDictCapacity.
+        long newCap = Math.max(required, Math.max(256L, (long) scratchCap * 2));
+        if (newCap > Integer.MAX_VALUE - 8) {
+            newCap = Integer.MAX_VALUE - 8;
+        }
+        scratchAddr = Unsafe.realloc(scratchAddr, scratchCap, (int) newCap, MemoryTag.NATIVE_DEFAULT);
+        scratchCap = (int) newCap;
     }
 }

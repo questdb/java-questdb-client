@@ -38,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -199,15 +200,18 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         if (dir == null || !Files.exists(dir)) {
             return;
         }
-        Files.walk(dir)
-                .sorted(Comparator.reverseOrder())
-                .forEach(p -> {
-                    try {
-                        Files.deleteIfExists(p);
-                    } catch (IOException ignored) {
-                        // best-effort
-                    }
-                });
+        // try-with-resources: Files.walk returns a Stream backed by an open
+        // directory handle that must be closed, or each rmDir leaks a descriptor.
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException ignored) {
+                            // best-effort
+                        }
+                    });
+        }
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
