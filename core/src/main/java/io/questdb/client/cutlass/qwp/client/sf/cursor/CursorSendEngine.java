@@ -124,9 +124,16 @@ public final class CursorSendEngine implements QuietCloseable {
     // SenderPool.reprobeRetiredSlots), so publishing before the release
     // would let a replacement engine's SlotLock.acquire collide with the
     // still-open fd. Stays false when a close attempt could not confirm
-    // manager-worker quiescence (or the flock release itself failed) and had
-    // to leak the ring/watermark/slot lock — in that case a later close()
-    // call retries the cleanup (the worker may have exited by then).
+    // manager-worker quiescence and had to leak the ring/watermark/slot
+    // lock — in that case a later close() call retries the cleanup (the
+    // worker may have exited by then). Also stays false — permanently —
+    // when finishClose() ran but the flock release itself failed: the
+    // terminalCleanupClaimed CAS is consumed, so a retried close() exits at
+    // the CAS without re-running the cleanup or calling SlotLock.release()
+    // again. That non-retry is deliberate (a retry would double-close the
+    // ring/watermark and double-release the flock; pinned by
+    // testUnconfirmedFlockReleaseKeepsCloseIncomplete) — the kernel drops
+    // the flock at process exit.
     // volatile: latched by finishClose(), but read lock-free by
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
@@ -674,7 +681,10 @@ public final class CursorSendEngine implements QuietCloseable {
      * {@code closeCompleted} (via {@code isSlotLockReleased()}), so it must
      * never be visible while the flock fd is still open, or a replacement
      * engine races the release and fails acquisition on a live slot.
-     * The caller must hold the engine monitor and
+     * The caller must either hold the engine monitor (the close() path) or
+     * run on the manager worker's exit path ({@link #completeDeferredClose},
+     * which deliberately takes no monitor — adding one would recreate the
+     * join livelock the CAS exists to avoid); in all cases the caller
      * must have established that the manager worker can no longer touch the
      * slot directory (reaped, provably exited, or running this on its own
      * exit path) AND have won the {@link #terminalCleanupClaimed} CAS — the
@@ -796,11 +806,14 @@ public final class CursorSendEngine implements QuietCloseable {
      * <b>confirmed</b> release of the SF slot lock — the flip is published
      * strictly after the flock fd is closed, so observing {@code true}
      * guarantees the slot dir is acquirable by a replacement engine. A false
-     * value after close means manager-worker quiescence could not be
-     * confirmed (or the flock release itself failed) and the
-     * worker-reachable resources were retained deliberately — either handed to the worker's exit path (owned manager),
-     * which flips this to true the moment the worker's in-flight pass
-     * finishes, or leaked until a retried close() (shared manager). Owners
+     * value after close means the worker-reachable resources were retained
+     * deliberately, for one of three reasons: cleanup was handed to the
+     * worker's exit path (owned manager), which flips this to true the
+     * moment the worker's in-flight pass finishes; cleanup was leaked until
+     * a retried close() (shared manager, or a failed handoff registration);
+     * or the flock release itself failed — that last case never flips: the
+     * {@link #terminalCleanupClaimed} CAS is consumed, so no retry re-runs
+     * the release, and only process exit frees the flock. Owners
      * must not reuse the slot while this is false; pools may re-probe it to
      * recover a retired slot's capacity once it flips.
      * <p>

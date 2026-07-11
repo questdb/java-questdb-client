@@ -376,9 +376,16 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
-     * True when no manager worker thread can be running: either
-     * {@link #start()} was never called, or a {@link #close()} confirmed
-     * worker termination and reaped the thread. Owners use this as a
+     * True when the manager worker can no longer run a service pass: either
+     * {@link #start()} was never called, or a {@link #close()} reaped the
+     * thread — including the fall-through reap that observes
+     * {@code workerLoopExited} while the thread is still alive. In that case
+     * the worker may still be RUNNING its deferred engine cleanups
+     * (see {@link #deferUntilWorkerExit}: munmap/unlink/flock-release on the
+     * exit path) when this flips true, so this predicate is NOT the
+     * exclusion between a retried engine close() and the worker's deferred
+     * cleanup — the engine-side {@code terminalCleanupClaimed} CAS is.
+     * Owners use this as a
      * stronger fallback barrier when {@link #awaitRingQuiescence(SegmentRing)}
      * times out but a subsequent {@code close()} join succeeded.
      */
@@ -742,7 +749,10 @@ public final class SegmentManager implements QuietCloseable {
         //    The watermark write and totalBytes commit are registration-gated
         //    under `lock` so stale worker snapshots cannot touch the
         //    engine-owned watermark or mutate accounting after deregister()
-        //    returns. drainTrimmable still runs for stale snapshots: it
+        //    returns. drainTrimmable still runs for entries deregistered
+        //    MID-pass (entries deregistered before the pass started never
+        //    get here — the registration/in-service claim at the top of
+        //    serviceRing skips them entirely): it
         //    transfers ownership of fully-acked sealed segments to this
         //    worker, preserving the old close + unlink behavior.
         //

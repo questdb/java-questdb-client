@@ -1272,13 +1272,21 @@ public class QwpWebSocketSender implements Sender {
                     ownsCursorEngine = false;
                     slotLockReleased = true;
                 } else {
-                    // The manager worker did not quiesce. Preserve ownership
-                    // and report the retained flock so pools retire this slot.
-                    // Repeated Sender.close() calls remain no-ops by contract.
-                    // Engine cleanup was handed to the worker's exit path
-                    // (owned manager); the getter re-probes the retained
-                    // engine so the pool can reclaim the slot once cleanup
-                    // actually completes.
+                    // Engine close() could not confirm a released flock.
+                    // Preserve ownership and report the retained flock so
+                    // pools retire this slot. Repeated Sender.close() calls
+                    // remain no-ops by contract. Recovery depends on WHY the
+                    // close is incomplete: when cleanup was handed to the
+                    // worker's exit path (owned manager — the only shipping
+                    // configuration), isSlotLockReleased()'s re-probe of the
+                    // retained engine flips once that cleanup completes.
+                    // When there was no handoff, the re-probe never flips
+                    // and the slot stays retired until process exit: a
+                    // shared-manager engine or a failed handoff registration
+                    // needs a retried engine.close() that this one-shot
+                    // sender never issues, and a failed flock release has
+                    // consumed the engine's cleanup claim, so nothing can
+                    // re-run the release.
                     slotLockReleased = false;
                     retainedEngine = engine;
                 }
