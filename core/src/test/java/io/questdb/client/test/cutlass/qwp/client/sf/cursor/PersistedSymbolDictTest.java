@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -499,6 +500,53 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    @Test
+    public void testTruncateFailureRecreatesEmpty() throws Exception {
+        // A host crash can leave a torn/stale tail past the last complete entry.
+        // open() drops it with a truncate; if that truncate FAILS (a read-only
+        // remount, a Windows share lock), the file still exposes the stale bytes,
+        // whose self-consistent per-entry CRC a later shifted parse could accept as
+        // a real symbol. So a failed truncate must make the file UNTRUSTED --
+        // open() recreates it empty (fail-clean) rather than returning a dict laid
+        // over stale bytes. Drive the truncate failure with a facade and assert the
+        // reopened dictionary is empty, not the [one, two] prefix.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                d.appendSymbol("one");
+                d.appendSymbol("two");
+                d.close();
+
+                // Append a torn trailing record (length prefix 5, only 2 bytes) so
+                // the reopen parses [one, two], then finds validLen < len and tries
+                // to truncate the tail -- the branch under test.
+                Path f = dir.resolve(".symbol-dict");
+                long cleanLen = Files.size(f); // header + "one" + "two", no tail
+                Files.write(f, new byte[]{(byte) 5, (byte) 'x', (byte) 'y'}, StandardOpenOption.APPEND);
+                Assert.assertEquals("torn tail present before reopen", cleanLen + 3, Files.size(f));
+
+                // Reopen through a facade whose truncate() fails.
+                PersistedSymbolDict re = PersistedSymbolDict.open(new FailingTruncateFacade(), dir.toString());
+                Assert.assertNotNull(re);
+                try {
+                    // The failed truncate made the file untrusted, so open() recreated
+                    // it empty rather than trusting the [one, two] prefix over a stale
+                    // tail: size()==0, not 2, and no recovered symbols.
+                    Assert.assertEquals("failed truncate must recreate the dictionary empty", 0, re.size());
+                    Assert.assertEquals(0, re.readLoadedSymbols().size());
+                    // openFresh rewrote a bare 8-byte header (magic + version), so both
+                    // the two entries and the torn tail are gone.
+                    Assert.assertEquals("recreated file is a bare header", 8L, Files.size(f));
+                } finally {
+                    re.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
     private static void rmDir(Path dir) {
         try {
             if (dir == null || !Files.exists(dir)) {
@@ -516,6 +564,144 @@ public class PersistedSymbolDictTest {
                         });
             }
         } catch (IOException ignored) {
+        }
+    }
+
+    /**
+     * A {@link FilesFacade} that delegates every call to {@link FilesFacade#INSTANCE}
+     * except {@link #truncate(int, long)}, which always fails -- reproducing a
+     * host where the torn/stale-tail truncate cannot succeed (read-only remount,
+     * Windows share lock) so {@code open()}'s fail-clean recreate path runs.
+     */
+    private static final class FailingTruncateFacade implements FilesFacade {
+        @Override
+        public long allocNativePath(String path) {
+            return INSTANCE.allocNativePath(path);
+        }
+
+        @Override
+        public boolean allocate(int fd, long size) {
+            return INSTANCE.allocate(fd, size);
+        }
+
+        @Override
+        public int close(int fd) {
+            return INSTANCE.close(fd);
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return INSTANCE.exists(path);
+        }
+
+        @Override
+        public void findClose(long findPtr) {
+            INSTANCE.findClose(findPtr);
+        }
+
+        @Override
+        public long findFirst(String dir) {
+            return INSTANCE.findFirst(dir);
+        }
+
+        @Override
+        public long findName(long findPtr) {
+            return INSTANCE.findName(findPtr);
+        }
+
+        @Override
+        public int findNext(long findPtr) {
+            return INSTANCE.findNext(findPtr);
+        }
+
+        @Override
+        public int findType(long findPtr) {
+            return INSTANCE.findType(findPtr);
+        }
+
+        @Override
+        public void freeNativePath(long pathPtr) {
+            INSTANCE.freeNativePath(pathPtr);
+        }
+
+        @Override
+        public int fsync(int fd) {
+            return INSTANCE.fsync(fd);
+        }
+
+        @Override
+        public long length(int fd) {
+            return INSTANCE.length(fd);
+        }
+
+        @Override
+        public long length(String path) {
+            return INSTANCE.length(path);
+        }
+
+        @Override
+        public long length(long pathPtr) {
+            return INSTANCE.length(pathPtr);
+        }
+
+        @Override
+        public int lock(int fd) {
+            return INSTANCE.lock(fd);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int openCleanRW(String path) {
+            return INSTANCE.openCleanRW(path);
+        }
+
+        @Override
+        public int openCleanRW(long pathPtr) {
+            return INSTANCE.openCleanRW(pathPtr);
+        }
+
+        @Override
+        public int openRW(String path) {
+            return INSTANCE.openRW(path);
+        }
+
+        @Override
+        public int openRW(long pathPtr) {
+            return INSTANCE.openRW(pathPtr);
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            return INSTANCE.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public boolean remove(String path) {
+            return INSTANCE.remove(path);
+        }
+
+        @Override
+        public boolean remove(long pathPtr) {
+            return INSTANCE.remove(pathPtr);
+        }
+
+        @Override
+        public int rename(String oldPath, String newPath) {
+            return INSTANCE.rename(oldPath, newPath);
+        }
+
+        @Override
+        public boolean truncate(int fd, long size) {
+            return false; // the fault under test
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            return INSTANCE.write(fd, addr, len, offset);
         }
     }
 }

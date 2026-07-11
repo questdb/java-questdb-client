@@ -27,7 +27,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Crc32c;
-import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
@@ -120,6 +120,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
     static final byte VERSION = 2; // v2 appended the per-entry CRC-32C
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
+    // Filesystem seam. Production is FilesFacade.INSTANCE (straight to Files);
+    // tests inject a fault facade to exercise recovery I/O failures (a truncate
+    // that cannot drop a torn tail, a short write) without a real broken disk.
+    private final FilesFacade ff;
     private long appendOffset;
     private boolean closed;
     // In-memory copy of the entry region [len][utf8]... exactly as on disk,
@@ -136,7 +140,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private int scratchCap;
     private int size;
 
-    private PersistedSymbolDict(int fd, long appendOffset, int size, long loadedEntriesAddr, int loadedEntriesLen) {
+    private PersistedSymbolDict(FilesFacade ff, int fd, long appendOffset, int size, long loadedEntriesAddr, int loadedEntriesLen) {
+        this.ff = ff;
         this.fd = fd;
         this.appendOffset = appendOffset;
         this.size = size;
@@ -153,17 +158,40 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * so a broken side-file degrades gracefully rather than aborting the sender.
      */
     public static PersistedSymbolDict open(String slotDir) {
+        return open(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /**
+     * Facade-aware variant of {@link #open(String)}. Production passes
+     * {@link FilesFacade#INSTANCE}; tests inject a fault facade to drive recovery
+     * I/O failures (e.g. a truncate that cannot drop a torn tail).
+     */
+    public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        long existing = Files.exists(filePath) ? Files.length(filePath) : -1L;
+        long existing = ff.exists(filePath) ? ff.length(filePath) : -1L;
+        // A dictionary that legitimately grew past Integer.MAX_VALUE cannot be
+        // reopened: openExisting reads it into ONE int-sized native buffer, and
+        // the (int) cast of a >2GB length is either negative (malloc rejects it),
+        // exactly zero (getInt then reads 4 bytes past a zero-size allocation), or
+        // a small positive prefix (whose validLen < len branch would then
+        // DESTRUCTIVELY truncate the multi-GB file). Recreate empty instead --
+        // fail-clean, exactly like every other unreadable-file case here, so the
+        // sender falls back to full self-sufficient frames. Reaching this needs
+        // ~100M+ distinct symbols on one slot (far past realistic symbol
+        // cardinality); the guard keeps the read/write size boundary safe anyway.
+        if (existing > Integer.MAX_VALUE) {
+            LOG.warn("symbol dict {} too large ({} bytes) to reopen; recreating empty", filePath, existing);
+            return openFresh(ff, filePath);
+        }
         if (existing >= HEADER_SIZE) {
-            PersistedSymbolDict d = openExisting(filePath, existing);
+            PersistedSymbolDict d = openExisting(ff, filePath, existing);
             if (d != null) {
                 return d;
             }
             // Fall through to a clean re-create: a header/parse failure on an
             // existing file means it cannot be trusted for delta replay.
         }
-        return openFresh(filePath);
+        return openFresh(ff, filePath);
     }
 
     /**
@@ -183,7 +211,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * does.
      */
     public static PersistedSymbolDict openClean(String slotDir) {
-        return openFresh(slotDir + "/" + FILE_NAME);
+        return openClean(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /**
+     * Facade-aware variant of {@link #openClean(String)}.
+     */
+    public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir) {
+        return openFresh(ff, slotDir + "/" + FILE_NAME);
     }
 
     /**
@@ -194,7 +229,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * failed delete cannot leave a stale dictionary a new session would trust.
      */
     public static void removeOrphan(String slotDir) {
-        Files.remove(slotDir + "/" + FILE_NAME);
+        removeOrphan(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /**
+     * Facade-aware variant of {@link #removeOrphan(String)}.
+     */
+    public static void removeOrphan(FilesFacade ff, String slotDir) {
+        ff.remove(slotDir + "/" + FILE_NAME);
     }
 
     /**
@@ -258,7 +300,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     + FILE_NAME + " [count=" + count + ", len=" + len
                     + ", consumed=" + (int) (src - addr) + ']');
         }
-        long written = Files.write(fd, scratchAddr, outLen, appendOffset);
+        long written = ff.write(fd, scratchAddr, outLen, appendOffset);
         if (written != outLen) {
             throw new IllegalStateException("short write to " + FILE_NAME
                     + " [expected=" + outLen + ", actual=" + written + ']');
@@ -290,7 +332,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Utf8s.strCpyUtf8(symbol, p, utf8Len);
         }
         Unsafe.getUnsafe().putInt(scratchAddr + wireLen, Crc32c.update(Crc32c.INIT, scratchAddr, wireLen));
-        long written = Files.write(fd, scratchAddr, recLen, appendOffset);
+        long written = ff.write(fd, scratchAddr, recLen, appendOffset);
         if (written != recLen) {
             throw new IllegalStateException("short write to " + FILE_NAME
                     + " [expected=" + recLen + ", actual=" + written + ']');
@@ -333,7 +375,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putInt(entryStart + wireLen, Crc32c.update(Crc32c.INIT, entryStart, wireLen));
             len += wireLen + CRC_SIZE;
         }
-        long written = Files.write(fd, scratchAddr, len, appendOffset);
+        long written = ff.write(fd, scratchAddr, len, appendOffset);
         if (written != len) {
             throw new IllegalStateException("short write to " + FILE_NAME
                     + " [expected=" + len + ", actual=" + written + ']');
@@ -362,7 +404,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             scratchCap = 0;
         }
         if (fd >= 0) {
-            Files.close(fd);
+            ff.close(fd);
         }
     }
 
@@ -456,8 +498,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return null;
     }
 
-    private static PersistedSymbolDict openExisting(String filePath, long fileLen) {
-        int fd = Files.openRW(filePath);
+    private static PersistedSymbolDict openExisting(FilesFacade ff, String filePath, long fileLen) {
+        int fd = ff.openRW(filePath);
         if (fd < 0) {
             LOG.warn("symbol dict {} could not be opened (rc={}); recreating", filePath, fd);
             return null;
@@ -468,13 +510,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
         try {
             int len = (int) fileLen;
             buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
-            long read = Files.read(fd, buf, len, 0);
+            long read = ff.read(fd, buf, len, 0);
             if (read != len
                     || Unsafe.getUnsafe().getInt(buf) != FILE_MAGIC
                     || Unsafe.getUnsafe().getByte(buf + 4) != VERSION) {
                 LOG.warn("symbol dict {} unreadable, bad magic or unknown version; recreating", filePath);
                 Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
-                Files.close(fd);
+                ff.close(fd);
                 return null;
             }
             // Parse complete, CRC-valid entries after the header; stop at the first
@@ -555,15 +597,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // open() then recreates it empty (fail-clean) rather than risk a silent
             // misattribution.
             long validLen = HEADER_SIZE + diskConsumed;
-            if (validLen < len && !Files.truncate(fd, validLen)) {
+            if (validLen < len && !ff.truncate(fd, validLen)) {
                 LOG.warn("symbol dict {} could not drop its torn/stale tail (truncate failed); recreating", filePath);
                 if (entriesAddr != 0L) {
                     Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
                 }
-                Files.close(fd);
+                ff.close(fd);
                 return null;
             }
-            return new PersistedSymbolDict(fd, validLen, count, entriesAddr, entriesLen);
+            return new PersistedSymbolDict(ff, fd, validLen, count, entriesAddr, entriesLen);
         } catch (Throwable t) {
             if (buf != 0L) {
                 Unsafe.free(buf, (int) fileLen, MemoryTag.NATIVE_DEFAULT);
@@ -575,14 +617,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (entriesAddr != 0L) {
                 Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
             }
-            Files.close(fd);
+            ff.close(fd);
             LOG.warn("symbol dict {} recovery failed ({}); recreating", filePath, String.valueOf(t));
             return null;
         }
     }
 
-    private static PersistedSymbolDict openFresh(String filePath) {
-        int fd = Files.openCleanRW(filePath);
+    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath) {
+        int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
             LOG.warn("symbol dict {} could not be created (rc={}); proceeding without it", filePath, fd);
             return null;
@@ -595,10 +637,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putByte(hdr + 5, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 6, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 7, (byte) 0);
-            long written = Files.write(fd, hdr, HEADER_SIZE, 0);
+            long written = ff.write(fd, hdr, HEADER_SIZE, 0);
             if (written != HEADER_SIZE) {
-                Files.close(fd);
-                Files.remove(filePath);
+                ff.close(fd);
+                ff.remove(filePath);
                 LOG.warn("symbol dict {} header write failed; proceeding without it", filePath);
                 return null;
             }
@@ -607,7 +649,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // throwing; the Unsafe puts target a valid 8-byte buffer and an 8-byte
             // malloc cannot realistically OOM), but close the fd against a future
             // edit so it cannot leak -- mirroring openExisting's error handling.
-            Files.close(fd);
+            ff.close(fd);
             LOG.warn("symbol dict {} creation failed ({}); proceeding without it", filePath, String.valueOf(t));
             return null;
         } finally {
@@ -615,7 +657,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 Unsafe.free(hdr, HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             }
         }
-        return new PersistedSymbolDict(fd, HEADER_SIZE, 0, 0L, 0);
+        return new PersistedSymbolDict(ff, fd, HEADER_SIZE, 0, 0L, 0);
     }
 
     private void ensureScratch(int required) {
