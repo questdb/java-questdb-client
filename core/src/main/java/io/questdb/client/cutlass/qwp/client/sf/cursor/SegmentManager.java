@@ -418,7 +418,25 @@ public final class SegmentManager implements QuietCloseable {
         // spare at sf-0000000000000000.sfa — and openCleanRW would truncate the
         // user's existing active file out from under the I/O loop, scrambling
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
-        long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
+        //
+        // A ring produced by SegmentRing.openExisting already carries the
+        // generation maximum from the full directory scan recovery just
+        // performed -- prefer it over re-enumerating the directory here.
+        // The recovered value cannot be stale: the engine holds the slot
+        // lock, and no spare can be minted into this slot before this call
+        // wires the ring up. It also cannot be too low after a deregister/
+        // re-register cycle: advanceFileGeneration only ever ratchets the
+        // counter upwards. Rings not built by recovery (fresh start, tests)
+        // report FILE_GENERATION_UNKNOWN and keep the legacy rescan.
+        long minNextGeneration;
+        if (dir == null) {
+            minNextGeneration = -1L;
+        } else {
+            long recoveredMax = ring.maxRecoveredFileGeneration();
+            minNextGeneration = (recoveredMax != SegmentRing.FILE_GENERATION_UNKNOWN
+                    ? recoveredMax
+                    : scanMaxGeneration(dir)) + 1L;
+        }
         Runnable managerWakeup = this::wakeWorker;
         RingEntry e = new RingEntry(ring, dir, watermark);
         // ObjList.add either throws before storing e or makes the entry visible.
@@ -501,7 +519,11 @@ public final class SegmentManager implements QuietCloseable {
     /**
      * Returns the highest hex-encoded generation across {@code sf-<gen>.sfa}
      * files in {@code dir}, or {@code -1} if none exist. Skips files that
-     * don't match the pattern (e.g. the legacy {@code sf-initial.sfa}).
+     * don't match the pattern (e.g. the legacy {@code sf-initial.sfa});
+     * name matching is delegated to {@link SegmentRing#parseFileGeneration}
+     * so this fallback scan and the recovery scan can never disagree.
+     * Fallback only: {@link #register(SegmentRing, String, AckWatermark)}
+     * calls this just for rings that don't carry a recovery-scanned maximum.
      */
     private static long scanMaxGeneration(String dir) {
         long max = -1L;
@@ -518,17 +540,8 @@ public final class SegmentManager implements QuietCloseable {
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
                 rc = Files.findNext(find);
-                if (name == null || !name.startsWith("sf-") || !name.endsWith(".sfa")) {
-                    continue;
-                }
-                String hex = name.substring(3, name.length() - 4);
-                if (hex.length() != 16) continue;
-                try {
-                    long gen = Long.parseUnsignedLong(hex, 16);
-                    if (gen > max) max = gen;
-                } catch (NumberFormatException ignored) {
-                    // sf-initial.sfa or non-hex — skip
-                }
+                long gen = SegmentRing.parseFileGeneration(name);
+                if (gen > max) max = gen;
             }
         } finally {
             Files.findClose(find);

@@ -60,6 +60,14 @@ public final class SegmentRing implements QuietCloseable {
 
     /** Sentinel: append failed because no hot spare was available to rotate into. */
     public static final long BACKPRESSURE_NO_SPARE = -1L;
+    /**
+     * {@link #maxRecoveredFileGeneration()} value for rings that were not
+     * produced by a directory-scanning recovery (constructor-built rings:
+     * fresh start, memory mode, tests). {@code Long.MIN_VALUE} cannot collide
+     * with a real scan result, whose minimum is {@code -1} (scanned, but no
+     * generation-named files found).
+     */
+    public static final long FILE_GENERATION_UNKNOWN = Long.MIN_VALUE;
     /** Sentinel: append failed because the payload doesn't fit in a fresh segment. */
     public static final long PAYLOAD_TOO_LARGE = -2L;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
@@ -106,6 +114,11 @@ public final class SegmentRing implements QuietCloseable {
     // manager only notices on its next polling tick -- fine on average,
     // but the worst-case wait is the full poll interval. Producer-thread-only.
     private Runnable managerWakeup;
+    // Highest sf-<gen:016x>.sfa file generation observed by the openExisting
+    // directory scan, or FILE_GENERATION_UNKNOWN for constructor-built rings.
+    // Written once by openExisting before the ring is published to the
+    // caller; read-only afterwards (see maxRecoveredFileGeneration()).
+    private long maxRecoveredFileGeneration = FILE_GENERATION_UNKNOWN;
     private long nextSeq;
     private volatile long publishedFsn;
     // Plain (producer-thread-only) flag; set to true the first time we ask
@@ -170,6 +183,11 @@ public final class SegmentRing implements QuietCloseable {
             return null;
         }
         ObjList<MmapSegment> opened = new ObjList<>();
+        // Highest sf-<gen:016x>.sfa generation seen during the scan; -1 when
+        // none matched. Carried on the returned ring so SegmentManager's
+        // register() can seed its spare file-generation counter without
+        // re-enumerating the directory this scan just walked.
+        long maxFileGeneration = -1L;
         long find = Files.findFirst(sfDir);
         if (find < 0) {
             // Fail closed: an enumeration failure (permissions, transient
@@ -196,6 +214,16 @@ public final class SegmentRing implements QuietCloseable {
                 int rc = 1;
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
+                    // Track the highest file generation over EVERY entry the
+                    // scan visits, before the unlink/quarantine below can
+                    // remove it. Including removed files keeps the bound
+                    // conservative -- a generation is never reused, so a new
+                    // spare can never collide with a quarantined twin's
+                    // <name>.sfa.corrupt on a future quarantine rename.
+                    long gen = parseFileGeneration(name);
+                    if (gen > maxFileGeneration) {
+                        maxFileGeneration = gen;
+                    }
                     if (name != null && name.endsWith(".sfa")) {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
@@ -355,6 +383,7 @@ public final class SegmentRing implements QuietCloseable {
             for (int i = 0, n = opened.size(); i < n; i++) {
                 ring.sealedSegments.add(opened.get(i));
             }
+            ring.maxRecoveredFileGeneration = maxFileGeneration;
             return ring;
         } catch (Throwable t) {
             // Close every recovered MmapSegment that's still in `opened`.
@@ -371,6 +400,31 @@ public final class SegmentRing implements QuietCloseable {
                 }
             }
             throw t;
+        }
+    }
+
+    /**
+     * Parses the spare-file generation out of a {@code sf-<gen:016x>.sfa}
+     * file name; returns {@code -1} for anything else ({@code sf-initial.sfa},
+     * non-hex, wrong hex length, {@code null}). Single source of truth shared
+     * by the recovery scan above and the segment manager's fallback directory
+     * scan (scanMaxGeneration) so the two can never disagree on which file
+     * names carry a generation. Note: startsWith + endsWith together imply a
+     * minimum length of 7 (the prefix and suffix cannot overlap), so the
+     * substring below cannot go out of bounds.
+     */
+    static long parseFileGeneration(String name) {
+        if (name == null || !name.startsWith("sf-") || !name.endsWith(".sfa")) {
+            return -1L;
+        }
+        String hex = name.substring(3, name.length() - 4);
+        if (hex.length() != 16) {
+            return -1L;
+        }
+        try {
+            return Long.parseUnsignedLong(hex, 16);
+        } catch (NumberFormatException e) {
+            return -1L;
         }
     }
 
@@ -641,6 +695,28 @@ public final class SegmentRing implements QuietCloseable {
 
     public long maxBytesPerSegment() {
         return maxBytesPerSegment;
+    }
+
+    /**
+     * Highest {@code sf-<gen:016x>.sfa} file generation observed during the
+     * {@link #openExisting} directory scan: {@code -1} when the scan matched
+     * no generation-named files, or {@link #FILE_GENERATION_UNKNOWN} when
+     * this ring was not produced by recovery at all (constructor-built:
+     * fresh start, memory mode, tests). The maximum is taken over every
+     * entry the scan visited -- including empty leftovers it unlinked and
+     * corrupt files it quarantined -- so it is a safe upper bound for the
+     * segment manager's spare file-generation counter even though those
+     * files are gone by the time the ring is registered.
+     * <p>
+     * Valid only for seeding the ring's FIRST registration: it is a
+     * construction-time snapshot, so once any manager has minted spares
+     * into the slot it is stale. Re-registering with the SAME manager stays
+     * safe regardless -- its generation counter only ratchets upward -- but
+     * a hypothetical hand-off to a different manager instance must rescan
+     * the directory instead of trusting this value.
+     */
+    public long maxRecoveredFileGeneration() {
+        return maxRecoveredFileGeneration;
     }
 
     /** True when the segment manager should prepare and install a fresh spare. */
