@@ -1076,7 +1076,9 @@ public final class SenderPool implements AutoCloseable {
                 pendingLeaseTeardowns--;
                 if (reserved) {
                     // Free the index only when the flock was released; a slot
-                    // left locked is retired permanently.
+                    // left locked is retired into retiredSlots, recoverable
+                    // by reprobeRetiredSlots() if the deferred cleanup drops
+                    // the flock later.
                     reclaimSlot(s, context);
                 }
                 slotReleased.signalAll();
@@ -1364,10 +1366,13 @@ public final class SenderPool implements AutoCloseable {
      * Reclaims one SF slot after its delegate's {@code close()} has been
      * attempted. When the flock was released the index returns to the free
      * set; when {@code close()} returned with the flock still held because an
-     * I/O or manager worker did not stop, the slot is retired permanently --
-     * {@code leakedSlots++} and {@code slotInUse[idx]} stays set -- so the cap
-     * math accounts for the lost capacity and no later borrow ever reuses the
-     * still-locked dir. Either way {@code closingSlots} is decremented.
+     * I/O or manager worker did not stop, the slot is retired --
+     * {@code leakedSlots++}, {@code slotInUse[idx]} stays set, and the sender
+     * joins {@code retiredSlots} -- so the cap math accounts for the lost
+     * capacity and no borrow reuses the still-locked dir unless
+     * {@link #reprobeRetiredSlots} later observes the deferred cleanup's
+     * release and recovers the index. Either way {@code closingSlots} is
+     * decremented.
      * <p>
      * Caller must hold {@code lock} and is responsible for signalling waiters
      * (only the free path admits a new creation). Shared by
