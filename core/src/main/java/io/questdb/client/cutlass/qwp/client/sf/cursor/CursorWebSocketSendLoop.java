@@ -2137,8 +2137,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return;
         }
         if (required > MAX_SENT_DICT_BYTES) {
-            throw new LineSenderException("symbol dictionary mirror exceeds the maximum size ["
+            // Latch a terminal, do NOT just throw: accumulateSentDict runs AFTER
+            // the frame's sendBinary, so a bare throw unwinds to ioLoop -> fail()
+            // -> connectLoop, which (running still true) reconnects and replays the
+            // same frame, which re-overflows the never-shrinking mirror -- an
+            // unbounded reconnect livelock rather than the "fails loudly" the
+            // MAX_SENT_DICT_BYTES ceiling promises. recordFatal flips running=false
+            // so connectLoop's !running guard winds the loop down and checkError()
+            // surfaces the terminal, matching sendCatchUpChunk's guard for the same
+            // ceiling. The throw still unwinds past the pending copyMemory.
+            LineSenderException err = new LineSenderException("symbol dictionary mirror exceeds the maximum size ["
                     + "required=" + required + ", max=" + MAX_SENT_DICT_BYTES + ']');
+            recordFatal(err);
+            throw err;
         }
         // Grow in long to avoid the capacity*2 int overflow (negative) that would
         // otherwise degrade the doubling near 1 GB; clamp to the int ceiling.
