@@ -148,6 +148,11 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     // True iff the configuration enables store-and-forward (sf_dir set).
     private final boolean storeAndForward;
+    // Test seam: runs after a capacity-starved borrow's condition wait has
+    // exhausted its positive timeout, before the loop's terminal pass. Null in
+    // production; regression tests release a retired slot here to prove that
+    // the terminal pass re-probes returned capacity before throwing.
+    private volatile Runnable borrowWaitExpiredHook;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -818,6 +823,12 @@ public final class SenderPool implements AutoCloseable {
                 }
                 try {
                     remainingNanos = slotReleased.awaitNanos(remainingNanos);
+                    if (remainingNanos <= 0) {
+                        Runnable hook = borrowWaitExpiredHook;
+                        if (hook != null) {
+                            hook.run();
+                        }
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new LineSenderException("interrupted while waiting for a Sender from the pool");
@@ -828,6 +839,11 @@ public final class SenderPool implements AutoCloseable {
                 lock.unlock();
             }
         }
+    }
+
+    @TestOnly
+    public void setBorrowWaitExpiredHook(Runnable hook) {
+        this.borrowWaitExpiredHook = hook;
     }
 
     /**

@@ -1290,14 +1290,13 @@ public class SenderPoolSfTest {
 
     @Test
     public void testParkedBorrowerGetsFinalProbeAfterBudgetExpiry() throws Exception {
-        // Release-during-wait twin of the zero-timeout test. A borrower parks
-        // in awaitNanos while the retired slot's flock is genuinely held; the
-        // deferred cleanup then releases the flock mid-wait. Nothing signals
-        // slotReleased (the release is delegate-side, volatile writes only), so
-        // the borrower sleeps out its full budget. Pre-fix its wake-up pass hit
-        // the terminal timeout check before reprobeRetiredSlots() and threw --
-        // missing capacity that had already come back. Post-fix the wake-up
-        // pass probes first, recovers the index, and the creation is admitted.
+        // Positive-timeout twin of the zero-timeout test. A borrower parks in
+        // awaitNanos while the retired slot's flock is genuinely held and
+        // sleeps out its full budget. A test hook releases the flock after the
+        // wait reports expiry but before the terminal loop pass. Pre-fix that
+        // pass hit the timeout check before reprobeRetiredSlots() and threw --
+        // missing capacity that had already come back. Post-fix the terminal
+        // pass probes first, recovers the index, and admits the creation.
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: strand unacked data under default-0.
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
@@ -1318,8 +1317,9 @@ public class SenderPoolSfTest {
             Assert.assertTrue("unacked data must persist under default-0",
                     hasSegmentFile(slot("default-0")));
 
-            // Phase 2: maxSize=1, generous budget so the mid-wait release lands
-            // comfortably inside it.
+            // Phase 2: maxSize=1 and a positive acquire budget. A test hook
+            // releases the flock only after awaitNanos() has returned with that
+            // budget exhausted, so the terminal wake-up pass is deterministic.
             CountingAckHandler handler = new CountingAckHandler();
             try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
                 int ackPort = ack.getPort();
@@ -1340,49 +1340,38 @@ public class SenderPoolSfTest {
                     return real;
                 };
 
-                try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 2_000, factory)) {
+                try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 100, factory)) {
                     Assert.assertNotNull("recovery must have built slot 0", forged.get());
                     Assert.assertEquals("precondition: startup recovery must retire the slot",
                             1, pool.leakedSlotCount());
 
-                    // Borrower parks: its pre-park probe correctly fails while
-                    // the flock is genuinely held.
-                    AtomicReference<Throwable> failure = new AtomicReference<>();
-                    AtomicReference<PooledSender> borrowed = new AtomicReference<>();
-                    Thread borrower = new Thread(() -> {
+                    AtomicBoolean waitExpired = new AtomicBoolean();
+                    pool.setBorrowWaitExpiredHook(() -> {
+                        Assert.assertTrue("expired-wait hook must run exactly once",
+                                waitExpired.compareAndSet(false, true));
+                        Sender recoverer = forged.get();
                         try {
-                            borrowed.set(pool.borrow());
-                        } catch (Throwable e) {
-                            failure.set(e);
+                            setBooleanField(recoverer, "closed", false);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
                         }
+                        // The flock drops only after the positive awaitNanos()
+                        // budget is exhausted. This delegate-side release does
+                        // not signal slotReleased.
+                        recoverer.close();
                     });
-                    borrower.start();
-
-                    // Let the borrower enter borrow() and park. If a CI stall
-                    // delays it past the release below, the pre-park probe
-                    // recovers instead and the test degrades to a pass -- never
-                    // a flaky failure.
-                    Thread.sleep(300);
-
-                    // Mid-wait release: flock drops, no signal reaches the pool.
-                    Sender recoverer = forged.get();
-                    setBooleanField(recoverer, "closed", false);
-                    recoverer.close();
-
-                    borrower.join(10_000);
-                    Assert.assertFalse("borrower must have finished", borrower.isAlive());
-                    if (failure.get() != null) {
-                        throw new AssertionError(
-                                "borrower must recover the retired slot on its wake-up pass, not time out",
-                                failure.get());
-                    }
-                    PooledSender b = borrowed.get();
-                    Assert.assertNotNull("borrower must have obtained a sender", b);
                     try {
-                        Assert.assertEquals("wake-up probe must recover the retired slot's capacity",
-                                0, pool.leakedSlotCount());
+                        PooledSender b = pool.borrow();
+                        try {
+                            Assert.assertTrue("borrow must exhaust its positive wait budget",
+                                    waitExpired.get());
+                            Assert.assertEquals("wake-up probe must recover the retired slot's capacity",
+                                    0, pool.leakedSlotCount());
+                        } finally {
+                            b.close();
+                        }
                     } finally {
-                        b.close();
+                        pool.setBorrowWaitExpiredHook(null);
                     }
                 }
             }
