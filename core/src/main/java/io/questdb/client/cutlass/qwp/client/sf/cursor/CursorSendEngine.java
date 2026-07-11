@@ -31,9 +31,11 @@ import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongConsumer;
 
 /**
  * Facade that bundles a {@link SegmentRing} with a {@link SegmentManager} and
@@ -69,10 +71,13 @@ public final class CursorSendEngine implements QuietCloseable {
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
     private static final ThreadFactory DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY =
             runnable -> new Thread(runnable, "qdb-sf-flock-release-retry");
+    private static final long FLOCK_RELEASE_RETRY_BASE_PARK_NANOS = 100_000_000L; // 100 ms
     private static final Object FLOCK_RELEASE_RETRY_LOCK = new Object();
+    private static final long FLOCK_RELEASE_RETRY_MAX_PARK_NANOS = 5_000_000_000L; // 5 s
     private static final ArrayDeque<CursorSendEngine> FLOCK_RELEASE_RETRY_QUEUE = new ArrayDeque<>();
     private static volatile Runnable afterFlockReleaseRetryFailureHook;
     private static volatile Runnable beforeDeferredCloseCreationHook;
+    private static volatile LongConsumer flockReleaseRetryParkOverride;
     private static Thread flockReleaseRetryThread;
     private static volatile ThreadFactory flockReleaseRetryThreadFactory =
             DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
@@ -742,6 +747,27 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     private void finishClose(boolean fullyDrained) {
         try {
+            // On a fully-drained close, persist the final acked FSN through
+            // the still-mapped watermark BEFORE closing the ring/watermark
+            // and BEFORE unlinking any segment file. The manager persists
+            // the watermark only on its own tick, so it may lag the final
+            // ack. If the unlink below then fails (or the process dies
+            // mid-unlink), residual acknowledged .sfa files without an
+            // up-to-date watermark would seed the successor's recovery at
+            // lowestBase - 1 and replay already-acknowledged rows --
+            // duplicates on a non-DEDUP table. The write is a single mmap
+            // store, so it succeeds even when the unlink is about to fail
+            // (e.g. the slot dir turned read-only). Quiescence is already
+            // established here, so no manager tick can race this write.
+            if (fullyDrained && watermark != null) {
+                try {
+                    long finalAckedFsn = ring.ackedFsn();
+                    if (finalAckedFsn >= 0) {
+                        watermark.write(finalAckedFsn);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
             try {
                 ring.close();
             } catch (Throwable ignored) {
@@ -761,13 +787,26 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
             if (fullyDrained) {
+                boolean segmentsRemoved = false;
                 try {
-                    unlinkAllSegmentFiles(sfDir);
+                    segmentsRemoved = unlinkAllSegmentFiles(sfDir);
                 } catch (Throwable ignored) {
                 }
-                try {
-                    AckWatermark.removeOrphan(sfDir);
-                } catch (Throwable ignored) {
+                // Remove the watermark ONLY once every segment file is
+                // confirmed gone. The watermark is what keeps residual
+                // acknowledged segments inert to a successor's recovery;
+                // removing it while any .sfa file survives would republish
+                // those already-acknowledged rows.
+                if (segmentsRemoved) {
+                    try {
+                        AckWatermark.removeOrphan(sfDir);
+                    } catch (Throwable ignored) {
+                    }
+                } else {
+                    LOG.warn("close-time segment cleanup incomplete on slot {}; retaining the ack "
+                            + "watermark so residual acknowledged segments stay covered -- the next "
+                            + "engine on this slot recovers them as fully acked and retries the "
+                            + "unlink on its own close", sfDir);
                 }
             }
         } finally {
@@ -811,6 +850,17 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public static void setBeforeDeferredCloseCreationHook(Runnable hook) {
         beforeDeferredCloseCreationHook = hook;
+    }
+
+    /**
+     * Replaces the shared retry driver's inter-round park with a callback
+     * receiving the park duration the driver would have used. Test-only:
+     * makes the retry cadence inspectable and rounds coordinatable without
+     * wall-clock waits.
+     */
+    @TestOnly
+    public static void setFlockReleaseRetryParkOverride(LongConsumer override) {
+        flockReleaseRetryParkOverride = override;
     }
 
     /**
@@ -903,6 +953,11 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     private static void runFlockReleaseRetryDriver() {
+        // Capped exponential backoff: a persistent unlock failure must not
+        // burn a fixed 10 rounds of native release syscalls per second
+        // forever, but a transient failure must still recover promptly. The
+        // ramp doubles per fully-failed round from 100 ms up to 5 s.
+        long parkNanos = FLOCK_RELEASE_RETRY_BASE_PARK_NANOS;
         while (true) {
             final int roundSize;
             synchronized (FLOCK_RELEASE_RETRY_LOCK) {
@@ -913,6 +968,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
             boolean hasFailures = false;
+            boolean hasSuccesses = false;
             for (int i = 0; i < roundSize; i++) {
                 final CursorSendEngine engine;
                 synchronized (FLOCK_RELEASE_RETRY_LOCK) {
@@ -920,6 +976,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 if (engine.retryFlockReleaseIfReady()) {
                     engine.flockReleaseRetryStarted.set(false);
+                    hasSuccesses = true;
                 } else {
                     synchronized (FLOCK_RELEASE_RETRY_LOCK) {
                         FLOCK_RELEASE_RETRY_QUEUE.addLast(engine);
@@ -931,11 +988,22 @@ public final class CursorSendEngine implements QuietCloseable {
                     }
                 }
             }
+            if (hasSuccesses) {
+                // Progress: the failure condition is clearing, so retry the
+                // remaining engines on the base cadence again.
+                parkNanos = FLOCK_RELEASE_RETRY_BASE_PARK_NANOS;
+            }
             if (hasFailures) {
                 // Interruption must not abandon a retained flock, but clear
                 // the flag so subsequent parks still throttle retries.
                 Thread.interrupted();
-                LockSupport.parkNanos(100_000_000L);
+                LongConsumer parkOverride = flockReleaseRetryParkOverride;
+                if (parkOverride != null) {
+                    parkOverride.accept(parkNanos);
+                } else {
+                    LockSupport.parkNanos(parkNanos);
+                }
+                parkNanos = Math.min(parkNanos * 2, FLOCK_RELEASE_RETRY_MAX_PARK_NANOS);
             }
         }
     }
@@ -947,7 +1015,12 @@ public final class CursorSendEngine implements QuietCloseable {
         Throwable startFailure = null;
         synchronized (FLOCK_RELEASE_RETRY_LOCK) {
             FLOCK_RELEASE_RETRY_QUEUE.addLast(this);
-            if (flockReleaseRetryThread == null) {
+            if (flockReleaseRetryThread != null) {
+                // The driver may be parked on a ramped backoff; wake it so a
+                // freshly failed release gets its first driver retry promptly
+                // instead of inheriting older engines' full backoff.
+                LockSupport.unpark(flockReleaseRetryThread);
+            } else {
                 try {
                     Thread retryThread = flockReleaseRetryThreadFactory.newThread(
                             CursorSendEngine::runFlockReleaseRetryDriver);
@@ -973,11 +1046,13 @@ public final class CursorSendEngine implements QuietCloseable {
                             + "retired capacity recovers after the transient failure [slot={}]",
                     sfDir == null ? "<memory>" : sfDir);
         } else {
-            // A later explicit close() can still retry without repeating the
-            // one-time ring/watermark cleanup. The failed queue is cleared so
-            // the driver does not retain engines it cannot service.
-            LOG.error("Could not start SF flock-release retry driver; close() may be "
-                            + "invoked again to retry [slot={}, error={}]",
+            // A later explicit close() or a pool's retired-slot probe
+            // (ensureFlockReleaseRetryScheduled) can still retry without
+            // repeating the one-time ring/watermark cleanup. The failed queue
+            // is cleared so the driver does not retain engines it cannot
+            // service.
+            LOG.error("Could not start SF flock-release retry driver; a retried close() "
+                            + "or pool re-probe re-arms the retry [slot={}, error={}]",
                     sfDir == null ? "<memory>" : sfDir, String.valueOf(startFailure));
         }
     }
@@ -1013,6 +1088,25 @@ public final class CursorSendEngine implements QuietCloseable {
         if (listener != null && closeCompleted) {
             listener.run();
         }
+    }
+
+    /**
+     * Re-arms the shared flock-release retry for an engine whose terminal
+     * cleanup finished but whose confirmed flock release is still pending
+     * and no longer scheduled — the retry driver thread failed to start when
+     * the release first failed (e.g. OOM at thread creation).
+     * {@code Sender.close()} is one-shot by contract, so pool probes
+     * ({@code QwpWebSocketSender.isSlotLockReleased()}) call this to keep a
+     * retired slot's capacity recoverable instead of lost until process
+     * exit. Cheap unless the engine is in that orphan state (volatile reads,
+     * then one failed CAS when the retry is already scheduled), so probes
+     * may call it under their capacity lock.
+     */
+    public void ensureFlockReleaseRetryScheduled() {
+        if (closeCompleted || !terminalResourcesCleaned) {
+            return;
+        }
+        startFlockReleaseRetry();
     }
 
     /**
@@ -1113,36 +1207,90 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Ascending removal rank of a segment file name for
+     * {@link #unlinkAllSegmentFiles(String)}. {@code sf-initial.sfa} is
+     * always the fresh-start segment at baseSeq 0, so it ranks first.
+     * Spare files carry a monotonic generation ({@code sf-<gen:016x>.sfa})
+     * assigned in creation == rotation == baseSeq order, so the parsed
+     * generation ranks them. Anything else with the extension is not a
+     * live segment and ranks last.
+     */
+    private static long segmentCleanupRank(String name) {
+        if ("sf-initial.sfa".equals(name)) {
+            return Long.MIN_VALUE;
+        }
+        if (name.length() == 23 && name.startsWith("sf-")) {
+            try {
+                return Long.parseUnsignedLong(name.substring(3, 19), 16);
+            } catch (NumberFormatException ignored) {
+                // fall through to the unrecognized-name rank
+            }
+        }
+        return Long.MAX_VALUE;
+    }
+
+    /**
      * Unlinks every {@code .sfa} file under {@code dir}. Called only on
      * clean shutdown when the ring confirms every published FSN has been
      * acked — at that moment the slot has no recoverable work and the
      * files are pure noise that would mislead the next sender's recovery.
-     * Best-effort: logs and continues on failures, since we're already on
-     * the close path.
+     * <p>
+     * Removal runs in ascending segment order and STOPS at the first
+     * failure, so whatever survives (a failure here, or a crash mid-loop)
+     * is always a contiguous top slice of the ring: recovery's
+     * FSN-contiguity check still passes, and the retained ack watermark
+     * (== the final acked FSN == the highest frame on disk) still covers
+     * every surviving frame, so a successor replays nothing.
+     *
+     * @return {@code true} only when enumeration succeeded and every
+     * {@code .sfa} file was confirmed removed — the caller keeps the ack
+     * watermark on {@code false} so residual acknowledged segments stay
+     * covered.
      */
-    private static void unlinkAllSegmentFiles(String dir) {
-        if (!io.questdb.client.std.Files.exists(dir)) return;
+    private static boolean unlinkAllSegmentFiles(String dir) {
+        if (!io.questdb.client.std.Files.exists(dir)) return true;
         long find = io.questdb.client.std.Files.findFirst(dir);
         if (find < 0) {
             LOG.warn("close-time unlink could not enumerate {}; "
                     + "any residual sf-*.sfa files will be picked up by the next recovery", dir);
-            return;
+            return false;
         }
-        if (find == 0) return;
+        if (find == 0) return true;
+        ArrayList<String> names = new ArrayList<>();
+        int rc = 1;
         try {
-            int rc = 1;
             while (rc > 0) {
                 String name = io.questdb.client.std.Files.utf8ToString(
                         io.questdb.client.std.Files.findName(find));
                 rc = io.questdb.client.std.Files.findNext(find);
-                if (name == null || !name.endsWith(".sfa")) continue;
-                String path = dir + "/" + name;
-                if (!io.questdb.client.std.Files.remove(path)) {
-                    LOG.warn("Failed to unlink fully-acked segment {} on close", path);
+                if (name != null && name.endsWith(".sfa")) {
+                    names.add(name);
                 }
             }
         } finally {
             io.questdb.client.std.Files.findClose(find);
         }
+        if (rc < 0) {
+            // A partial listing must not drive any unlink: removing only the
+            // files we happened to see could delete the segment holding the
+            // highest frame while a lower one survives, leaving residual
+            // state the retained watermark can no longer vouch for.
+            LOG.warn("close-time unlink could not fully enumerate {}; "
+                    + "leaving all segment files for the next recovery", dir);
+            return false;
+        }
+        names.sort((a, b) -> {
+            int byRank = Long.compare(segmentCleanupRank(a), segmentCleanupRank(b));
+            return byRank != 0 ? byRank : a.compareTo(b);
+        });
+        for (int i = 0, n = names.size(); i < n; i++) {
+            String path = dir + "/" + names.get(i);
+            if (!io.questdb.client.std.Files.remove(path)) {
+                LOG.warn("Failed to unlink fully-acked segment {} on close; stopping so the "
+                        + "residual files stay a contiguous, watermark-covered range", path);
+                return false;
+            }
+        }
+        return true;
     }
 }

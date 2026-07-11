@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
@@ -36,6 +37,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -52,10 +54,96 @@ public class FlockReleaseRetryDriverTest {
     @After
     public void tearDown() {
         CursorSendEngine.setAfterFlockReleaseRetryFailureHook(null);
+        CursorSendEngine.setFlockReleaseRetryParkOverride(null);
         CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
         for (String sfDir : sfDirs) {
             removeDir(sfDir);
         }
+    }
+
+    /**
+     * Driver-start failure must not strand retired capacity until process
+     * exit. {@code Sender.close()} is a one-shot no-op by contract, so the
+     * only recovery surface a pool has is its retired-slot probe
+     * ({@code isSlotLockReleased()}, called from the housekeeper tick and
+     * capacity-starved borrows) — that probe must re-arm the shared retry
+     * driver once thread creation works again.
+     */
+    @Test(timeout = 30_000L)
+    public void testDriverStartFailureRecoversViaPoolProbe() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AtomicInteger starts = new AtomicInteger();
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(task -> new Thread(task) {
+                @Override
+                public synchronized void start() {
+                    starts.incrementAndGet();
+                    throw new IllegalStateException("injected start failure");
+                }
+            });
+
+            CursorSendEngine engine = new CursorSendEngine(
+                    newSfDir("probe-rearm"), 4L * 1024 * 1024);
+            SlotLock slotLock = slotLock(engine);
+            int realFd = fd(slotLock);
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 1);
+            sender.setCursorEngine(engine, true);
+            AtomicReference<Thread> rearmedDriver = new AtomicReference<>();
+            boolean recovered = false;
+            try {
+                setFd(slotLock, 1_000_000_000);
+                sender.close();
+                assertEquals("retry driver start must be attempted once", 1, starts.get());
+                assertFalse("failed unlock must remain unpublished", engine.isCloseCompleted());
+
+                // Sender.close() is idempotent: repeat calls never reach the
+                // engine again, so they cannot restart the failed driver.
+                sender.close();
+                assertEquals("no-op close must not retry the driver start", 1, starts.get());
+
+                // While the fault persists, each pool probe re-attempts the
+                // re-arm (and fails again) without publishing a release.
+                assertFalse("failed unlock must keep the slot reported as held",
+                        sender.isSlotLockReleased());
+                assertTrue("pool probe must re-attempt the driver start",
+                        starts.get() >= 2);
+
+                // The transient condition clears: thread creation works again
+                // (the failed start drained the queue, so the factory swap is
+                // legal) and the flock fd is back.
+                CursorSendEngine.setFlockReleaseRetryThreadFactory(task -> {
+                    Thread thread = new Thread(task, "test-rearmed-flock-release-retry");
+                    rearmedDriver.set(thread);
+                    return thread;
+                });
+                setFd(slotLock, realFd);
+                CountDownLatch released = new CountDownLatch(1);
+                engine.setSlotLockReleaseListener(released::countDown);
+
+                // Production recovery surface: the pool re-probes the retired
+                // slot through isSlotLockReleased().
+                sender.isSlotLockReleased();
+                assertTrue("pool probe must re-arm the flock-release retry after "
+                                + "a driver start failure",
+                        released.await(10, TimeUnit.SECONDS));
+                assertTrue(engine.isCloseCompleted());
+                assertTrue("probe must expose the recovered release",
+                        sender.isSlotLockReleased());
+                recovered = true;
+            } finally {
+                Thread driver = rearmedDriver.get();
+                if (driver != null) {
+                    driver.join(10_000L);
+                }
+                if (!recovered) {
+                    CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
+                    setFd(slotLock, realFd);
+                    if (!slotLock.release()) {
+                        fail("restored flock fd did not release");
+                    }
+                }
+            }
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
+        });
     }
 
     @Test(timeout = 30_000L)
@@ -145,6 +233,179 @@ public class FlockReleaseRetryDriverTest {
                 }
                 CursorSendEngine.setAfterFlockReleaseRetryFailureHook(null);
             }
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
+        });
+    }
+
+    /**
+     * Schedule inspection for the shared driver's retry cadence: the
+     * inter-round park must grow exponentially from 100 ms and cap at 5 s,
+     * so a persistent unlock failure does not burn 10 syscalls per second
+     * per engine forever. The park override replaces the real park, so the
+     * test coordinates rounds without wall-clock waits.
+     */
+    @Test(timeout = 30_000L)
+    public void testRetryBackoffDoublesToCap() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            List<Long> parks = new ArrayList<>();
+            Semaphore parked = new Semaphore(0);
+            Semaphore proceed = new Semaphore(0);
+            AtomicReference<Thread> driverRef = new AtomicReference<>();
+            CursorSendEngine.setFlockReleaseRetryParkOverride(nanos -> {
+                parks.add(nanos);
+                parked.release();
+                proceed.acquireUninterruptibly();
+            });
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(task -> {
+                Thread thread = new Thread(task, "test-backoff-flock-release-retry");
+                driverRef.set(thread);
+                return thread;
+            });
+
+            CursorSendEngine engine = new CursorSendEngine(
+                    newSfDir("backoff-cap"), 4L * 1024 * 1024);
+            SlotLock slotLock = slotLock(engine);
+            int realFd = fd(slotLock);
+            boolean fdRestored = false;
+            try {
+                setFd(slotLock, 1_000_000_000);
+                engine.close();
+                assertFalse("injected unlock failure must keep close incomplete",
+                        engine.isCloseCompleted());
+
+                // Eight failed rounds: enough to observe the full ramp and
+                // two capped parks.
+                for (int round = 1; round <= 8; round++) {
+                    assertTrue("driver did not park after failed round " + round,
+                            parked.tryAcquire(10, TimeUnit.SECONDS));
+                    if (round < 8) {
+                        proceed.release();
+                    }
+                }
+
+                setFd(slotLock, realFd);
+                fdRestored = true;
+                proceed.release();
+                Thread driver = driverRef.get();
+                driver.join(10_000L);
+                assertFalse("driver did not drain after the release succeeded",
+                        driver.isAlive());
+                assertTrue("restored flock must be released", engine.isCloseCompleted());
+
+                List<Long> expected = new ArrayList<>();
+                expected.add(100_000_000L);
+                expected.add(200_000_000L);
+                expected.add(400_000_000L);
+                expected.add(800_000_000L);
+                expected.add(1_600_000_000L);
+                expected.add(3_200_000_000L);
+                expected.add(5_000_000_000L);
+                expected.add(5_000_000_000L);
+                assertEquals("retry parks must double from 100ms and cap at 5s",
+                        expected, parks);
+            } finally {
+                if (!fdRestored) {
+                    setFd(slotLock, realFd);
+                }
+                proceed.release(1_000);
+                Thread driver = driverRef.get();
+                if (driver != null) {
+                    driver.join(10_000L);
+                }
+            }
+            CursorSendEngine.setFlockReleaseRetryParkOverride(null);
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
+        });
+    }
+
+    /**
+     * A successful release in a round is progress: the driver must reset its
+     * backoff to the base so the remaining engines are retried promptly
+     * while the failure condition is clearing.
+     */
+    @Test(timeout = 30_000L)
+    public void testRetryBackoffResetsOnProgress() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            List<Long> parks = new ArrayList<>();
+            Semaphore parked = new Semaphore(0);
+            Semaphore proceed = new Semaphore(0);
+            AtomicReference<Thread> driverRef = new AtomicReference<>();
+            CursorSendEngine.setFlockReleaseRetryParkOverride(nanos -> {
+                parks.add(nanos);
+                parked.release();
+                proceed.acquireUninterruptibly();
+            });
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(task -> {
+                Thread thread = new Thread(task, "test-reset-flock-release-retry");
+                driverRef.set(thread);
+                return thread;
+            });
+
+            CursorSendEngine engineA = new CursorSendEngine(
+                    newSfDir("backoff-reset-a"), 4L * 1024 * 1024);
+            CursorSendEngine engineB = new CursorSendEngine(
+                    newSfDir("backoff-reset-b"), 4L * 1024 * 1024);
+            SlotLock slotLockA = slotLock(engineA);
+            SlotLock slotLockB = slotLock(engineB);
+            int realFdA = fd(slotLockA);
+            int realFdB = fd(slotLockB);
+            boolean fdARestored = false;
+            boolean fdBRestored = false;
+            try {
+                setFd(slotLockA, 1_000_000_000);
+                setFd(slotLockB, 1_000_000_001);
+                engineA.close();
+                engineB.close();
+
+                // Three failed rounds ramp the backoff to 400ms.
+                for (int round = 1; round <= 3; round++) {
+                    assertTrue("driver did not park after failed round " + round,
+                            parked.tryAcquire(10, TimeUnit.SECONDS));
+                    if (round < 3) {
+                        proceed.release();
+                    }
+                }
+
+                // Engine A recovers; round 4 has one success and one failure,
+                // so its park must be back at the 100ms base.
+                setFd(slotLockA, realFdA);
+                fdARestored = true;
+                proceed.release();
+                assertTrue("driver did not park after the mixed round",
+                        parked.tryAcquire(10, TimeUnit.SECONDS));
+                assertTrue("recovered engine must publish completion",
+                        engineA.isCloseCompleted());
+
+                setFd(slotLockB, realFdB);
+                fdBRestored = true;
+                proceed.release();
+                Thread driver = driverRef.get();
+                driver.join(10_000L);
+                assertFalse("driver did not drain after both releases succeeded",
+                        driver.isAlive());
+                assertTrue(engineB.isCloseCompleted());
+
+                List<Long> expected = new ArrayList<>();
+                expected.add(100_000_000L);
+                expected.add(200_000_000L);
+                expected.add(400_000_000L);
+                expected.add(100_000_000L);
+                assertEquals("a successful release must reset the backoff to base",
+                        expected, parks);
+            } finally {
+                if (!fdARestored) {
+                    setFd(slotLockA, realFdA);
+                }
+                if (!fdBRestored) {
+                    setFd(slotLockB, realFdB);
+                }
+                proceed.release(1_000);
+                Thread driver = driverRef.get();
+                if (driver != null) {
+                    driver.join(10_000L);
+                }
+            }
+            CursorSendEngine.setFlockReleaseRetryParkOverride(null);
             CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
         });
     }

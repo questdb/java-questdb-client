@@ -1357,19 +1357,29 @@ public class QwpWebSocketSender implements Sender {
      * manager-worker quiescence or I/O-thread exit path, this re-probes the
      * retained engine and latches true the moment that cleanup completes — pools re-probe retired
      * slots through this getter to recover their capacity. Monotonic:
-     * false→true only, never back. Lock-free (volatile reads) so pools may
-     * call it under their capacity lock.
+     * false→true only, never back. Cheap (volatile reads on every common
+     * path) so pools may call it under their capacity lock; only the rare
+     * orphaned-retry state below does more.
+     * <p>
+     * The probe is also the recovery surface for a retained engine whose
+     * flock-release retry fell off the shared driver because the driver
+     * thread could not start (e.g. OOM at thread creation): close() is
+     * one-shot, so without the re-arm below that slot's capacity would stay
+     * lost until process exit.
      */
     public boolean isSlotLockReleased() {
         if (slotLockReleased) {
             return true;
         }
         CursorSendEngine engine = retainedEngine;
-        if (engine != null && engine.isCloseCompleted()) {
-            // Benign latch race: concurrent callers may both observe the
-            // completed cleanup and both write true.
-            slotLockReleased = true;
-            return true;
+        if (engine != null) {
+            if (engine.isCloseCompleted()) {
+                // Benign latch race: concurrent callers may both observe the
+                // completed cleanup and both write true.
+                slotLockReleased = true;
+                return true;
+            }
+            engine.ensureFlockReleaseRetryScheduled();
         }
         return false;
     }

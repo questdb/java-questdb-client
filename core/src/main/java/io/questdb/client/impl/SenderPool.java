@@ -1428,9 +1428,10 @@ public final class SenderPool implements AutoCloseable {
      * run since the retire. Restores {@code leakedSlots} capacity and signals
      * waiters so a parked borrow can admit a creation immediately.
      * <p>
-     * Caller must hold {@code lock}. The probe is lock-free on the delegate
-     * side ({@code isSlotLockReleased()} reads volatiles only), so holding
-     * the pool lock across it cannot stall behind delegate teardown.
+     * Caller must hold {@code lock}. The probe is cheap on the delegate side
+     * ({@code isSlotLockReleased()} reads volatiles, and only re-arms the
+     * shared flock-release retry in the rare orphaned-retry state), so
+     * holding the pool lock across it cannot stall behind delegate teardown.
      *
      * @return {@code true} if at least one slot's capacity was recovered
      */
