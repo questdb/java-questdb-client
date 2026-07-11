@@ -124,18 +124,16 @@ public class SlotLockTest {
     }
 
     /**
-     * The {@code release() == false} branch: when the OS reports a close
-     * failure, release must (a) return {@code false} so owners gating a
-     * "slot reusable" signal never see a lie, (b) RETAIN the fd — forgetting
-     * it would misreport the lock state and forfeit any later retry — and
-     * (c) keep returning {@code false} on repeat attempts while the failure
-     * persists. Once the close succeeds, release confirms and stays
-     * confirmed. {@code Files.close} cannot be made to fail through the
-     * public API, so the fd is swapped to a known-bad descriptor and
-     * restored afterwards.
+     * The {@code release() == false} branch: when the OS reports an explicit
+     * unlock failure, release must (a) return {@code false} so owners gating a
+     * "slot reusable" signal never see a lie, (b) retain the fd because the
+     * non-consuming unlock can safely be retried, and (c) keep returning
+     * {@code false} while the failure persists. Once unlock succeeds, release
+     * confirms and stays confirmed. Swapping in a known-bad descriptor gives
+     * the slot-specific native primitive a deterministic unlock failure.
      */
     @Test
-    public void testFailedCloseRetainsFdAndReportsFalse() throws Exception {
+    public void testFailedUnlockRetainsFdAndReportsFalse() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/failed-release";
             SlotLock lock = SlotLock.acquire(slot);
@@ -144,26 +142,26 @@ public class SlotLockTest {
             int realFd = fdField.getInt(lock);
             assertTrue("precondition: acquire must hold a live fd", realFd >= 0);
             try {
-                // A non-negative fd no process has open: close(2) fails EBADF.
+                // A non-negative descriptor no process has open makes the
+                // explicit flock/UnlockFileEx operation fail without consuming
+                // the real descriptor that continues to hold the slot lock.
                 fdField.setInt(lock, 1_000_000_000);
-                assertFalse("release must report false when the OS close fails",
+                assertFalse("release must report false when explicit unlock fails",
                         lock.release());
-                assertEquals("failed release must retain the fd for a retry — "
-                                + "dropping it would misreport the flock as released",
+                assertEquals("failed unlock must retain the fd for a safe retry",
                         1_000_000_000, fdField.getInt(lock));
-                assertFalse("repeat release must keep reporting false while the failure persists",
+                assertFalse("repeat release must stay false while unlock keeps failing",
                         lock.release());
-                // While the release is unconfirmed the REAL flock is still
-                // held — a second acquire on the slot must fail.
+                // While the release is unconfirmed the real flock remains held.
                 try (SlotLock ignored = SlotLock.acquire(slot)) {
                     fail("slot must not be acquirable while the original flock fd is still open");
                 } catch (IllegalStateException expected) {
-                    // good — unconfirmed release really means "still locked".
+                    // good - unconfirmed release really means "still locked".
                 }
             } finally {
                 fdField.setInt(lock, realFd);
             }
-            assertTrue("release must confirm once the close succeeds", lock.release());
+            assertTrue("release must confirm once explicit unlock succeeds", lock.release());
             assertTrue("confirmed release must stay confirmed", lock.release());
             try (SlotLock again = SlotLock.acquire(slot)) {
                 assertEquals(slot, again.slotDir());

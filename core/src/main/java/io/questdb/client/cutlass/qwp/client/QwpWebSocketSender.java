@@ -194,6 +194,9 @@ public class QwpWebSocketSender implements Sender {
     // up to this many millis for ackedFsn to catch up to publishedFsn.
     private long closeFlushTimeoutMillis = 5_000L;
     private volatile boolean closed;
+    // Test-only lifecycle witness. close() invokes and clears it strictly after
+    // publishing closed=true and before starting any drain or teardown work.
+    private volatile Runnable closeStartedHook;
     private boolean connected;
     private SenderConnectionDispatcher connectionDispatcher;
     // Async-delivery sink for SenderConnectionEvent notifications. Default
@@ -1057,6 +1060,16 @@ public class QwpWebSocketSender implements Sender {
     public void close() {
         if (!closed) {
             closed = true;
+            Runnable hook = closeStartedHook;
+            closeStartedHook = null;
+            if (hook != null) {
+                try {
+                    hook.run();
+                } catch (Throwable t) {
+                    // A test witness must never prevent production resource cleanup.
+                    LOG.error("Error in close-started test hook: {}", String.valueOf(t));
+                }
+            }
             boolean ioThreadStopped = true;
             // Captures the first error from the flush/drain path AND any
             // secondary errors from cleanup steps (added via addSuppressed).
@@ -1275,10 +1288,10 @@ public class QwpWebSocketSender implements Sender {
                     // The manager worker did not quiesce. Preserve ownership
                     // and report the retained flock so pools retire this slot.
                     // Repeated Sender.close() calls remain no-ops by contract.
-                    // Engine cleanup was handed to the worker's exit path
-                    // (owned manager); the getter re-probes the retained
-                    // engine so the pool can reclaim the slot once cleanup
-                    // actually completes.
+                    // Engine cleanup was handed to a safe manager-worker path:
+                    // owned-manager exit or shared-manager ring-pass completion.
+                    // The getter re-probes the retained engine so the pool can
+                    // reclaim the slot once cleanup actually completes.
                     slotLockReleased = false;
                     retainedEngine = engine;
                 }
@@ -1335,8 +1348,8 @@ public class QwpWebSocketSender implements Sender {
      * index reserved instead of reusing the still-locked dir.
      * <p>
      * Not a one-shot snapshot: when close() left engine cleanup pending on a
-     * worker/I/O-thread exit path, this re-probes the retained engine and
-     * latches true the moment that cleanup completes — pools re-probe retired
+     * manager-worker quiescence or I/O-thread exit path, this re-probes the
+     * retained engine and latches true the moment that cleanup completes — pools re-probe retired
      * slots through this getter to recover their capacity. Monotonic:
      * false→true only, never back. Lock-free (volatile reads) so pools may
      * call it under their capacity lock.
@@ -2194,6 +2207,16 @@ public class QwpWebSocketSender implements Sender {
         this.clientFactoryOverride = factory;
     }
 
+    /**
+     * Installs a one-shot test witness that {@link #close()} invokes after it
+     * publishes the closed-state transition and before it starts drain or
+     * teardown work. Production code never sets it.
+     */
+    @TestOnly
+    public void setCloseStartedHook(Runnable hook) {
+        this.closeStartedHook = hook;
+    }
+
     @Override
     public void reset() {
         checkNotClosed();
@@ -2262,7 +2285,9 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Attach a {@link CursorSendEngine} for store-and-forward. Must be called
-     * before the first send.
+     * before the first send. Once a non-null engine has been attached, it
+     * cannot be replaced or detached. Ownership of a rejected engine remains
+     * with the caller.
      */
     public void setCursorEngine(CursorSendEngine engine, boolean takeOwnership) {
         if (closed) {
@@ -2271,6 +2296,9 @@ public class QwpWebSocketSender implements Sender {
         if (connected) {
             throw new LineSenderException(
                     "setCursorEngine must be called before the first send");
+        }
+        if (cursorEngine != null) {
+            throw new LineSenderException("CursorSendEngine is already attached");
         }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;

@@ -30,9 +30,11 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
@@ -50,6 +52,7 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -775,6 +778,285 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testMixedRetiredSlotsRecoverWithoutLosingAccounting() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(
+                        config, 0, 8, 500, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] leases = new PooledSender[8];
+                    Sender[] delegates = new Sender[8];
+                    for (int i = 0; i < leases.length; i++) {
+                        leases[i] = pool.borrow();
+                        delegates[i] = getDelegate(leases[i]);
+                    }
+                    for (int i = 0; i < leases.length; i++) {
+                        // Release the real native resources, then forge the
+                        // delayed publication which makes the pool retire the
+                        // slot. The idempotent second close in discardBroken()
+                        // leaves the forged state unchanged.
+                        delegates[i].close();
+                        setBooleanField(delegates[i], "slotLockReleased", false);
+                        invokeDiscardBroken(pool, leases[i]);
+                    }
+                    Assert.assertEquals(8, pool.leakedSlotCount());
+
+                    // Mix completed and incomplete entries throughout the
+                    // retired list. A recovery pass must remove exactly these
+                    // four without skipping a swapped entry or corrupting the
+                    // bitmap/count relationship.
+                    int[] released = {0, 2, 5, 7};
+                    for (int i = 0; i < released.length; i++) {
+                        setBooleanField(delegates[released[i]], "slotLockReleased", true);
+                    }
+                    pool.reapIdle();
+
+                    Assert.assertEquals(4, pool.leakedSlotCount());
+                    Assert.assertEquals(4, ((List<?>) getField(pool, "retiredSlots")).size());
+                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
+                    for (int i = 0; i < slotInUse.length; i++) {
+                        boolean mustRemainRetired = i == 1 || i == 3 || i == 4 || i == 6;
+                        Assert.assertEquals("slot reservation mismatch at index " + i,
+                                mustRemainRetired, slotInUse[i]);
+                    }
+
+                    // Exactly the four restored reservations are reusable.
+                    PooledSender[] recovered = new PooledSender[4];
+                    try {
+                        for (int i = 0; i < recovered.length; i++) {
+                            recovered[i] = pool.borrow();
+                        }
+                        Assert.assertEquals(4, pool.totalSize());
+                        Assert.assertEquals(4, pool.leakedSlotCount());
+                    } finally {
+                        for (int i = 0; i < recovered.length; i++) {
+                            if (recovered[i] != null) {
+                                recovered[i].close();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testMultipleWaitingBorrowersWakeForStaggeredRetiredSlotRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(
+                        config, 0, 6, 10_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] leases = new PooledSender[6];
+                    Sender[] delegates = new Sender[6];
+                    for (int i = 0; i < leases.length; i++) {
+                        leases[i] = pool.borrow();
+                        delegates[i] = getDelegate(leases[i]);
+                    }
+                    for (int i = 0; i < leases.length; i++) {
+                        delegates[i].close();
+                        setBooleanField(delegates[i], "slotLockReleased", false);
+                        invokeDiscardBroken(pool, leases[i]);
+                    }
+                    Assert.assertEquals("all capacity must start retired",
+                            6, pool.leakedSlotCount());
+
+                    final int borrowerCount = 3;
+                    CountDownLatch allAcquired = new CountDownLatch(borrowerCount);
+                    CountDownLatch allDone = new CountDownLatch(borrowerCount);
+                    CountDownLatch firstAcquired = new CountDownLatch(1);
+                    CountDownLatch initialWaiters = new CountDownLatch(borrowerCount);
+                    CountDownLatch releaseBorrowers = new CountDownLatch(1);
+                    CountDownLatch reparkedWaiters = new CountDownLatch(borrowerCount - 1);
+                    AtomicReference<Throwable> failure = new AtomicReference<>();
+                    ConcurrentHashMap<Thread, Boolean> initialWaiterThreads = new ConcurrentHashMap<>();
+                    ConcurrentHashMap<Thread, Boolean> reparkedWaiterThreads = new ConcurrentHashMap<>();
+                    PooledSender[] recovered = new PooledSender[borrowerCount];
+                    pool.setBeforeBorrowWaitHook(() -> {
+                        if (initialWaiterThreads.putIfAbsent(Thread.currentThread(), Boolean.TRUE) == null) {
+                            initialWaiters.countDown();
+                        }
+                    });
+                    for (int i = 0; i < borrowerCount; i++) {
+                        final int borrower = i;
+                        Thread thread = new Thread(() -> {
+                            try {
+                                recovered[borrower] = pool.borrow();
+                                allAcquired.countDown();
+                                firstAcquired.countDown();
+                                if (!releaseBorrowers.await(10, TimeUnit.SECONDS)) {
+                                    throw new AssertionError("timed out waiting to release recovered borrower");
+                                }
+                            } catch (Throwable e) {
+                                failure.compareAndSet(null, e);
+                            } finally {
+                                try {
+                                    if (recovered[borrower] != null) {
+                                        recovered[borrower].close();
+                                    }
+                                } catch (Throwable e) {
+                                    failure.compareAndSet(null, e);
+                                } finally {
+                                    allDone.countDown();
+                                }
+                            }
+                        }, "sender-pool-retired-waiter-" + i);
+                        thread.start();
+                    }
+
+                    try {
+                        Assert.assertTrue("all borrowers must reach the condition wait",
+                                initialWaiters.await(5, TimeUnit.SECONDS));
+                        Assert.assertEquals("three distinct borrowers must reach the wait path",
+                                borrowerCount, initialWaiterThreads.size());
+
+                        // The hook runs while each borrower holds the pool lock,
+                        // immediately before awaitNanos atomically releases that
+                        // lock and enqueues it. Once the last latch count lands,
+                        // the first reapIdle() cannot acquire the lock until all
+                        // three borrowers are definitely condition waiters.
+                        pool.setBeforeBorrowWaitHook(() -> {
+                            if (reparkedWaiterThreads.putIfAbsent(Thread.currentThread(), Boolean.TRUE) == null) {
+                                reparkedWaiters.countDown();
+                            }
+                        });
+                        setBooleanField(delegates[2], "slotLockReleased", true);
+                        pool.reapIdle();
+
+                        // One restored index admits exactly one borrower. The
+                        // other two must consume signalAll(), lose the capacity
+                        // race, and deterministically re-enter the wait path.
+                        Assert.assertTrue("one borrower must take the first restored index",
+                                firstAcquired.await(5, TimeUnit.SECONDS));
+                        Assert.assertTrue("two distinct borrowers must re-park after the first recovery",
+                                reparkedWaiters.await(5, TimeUnit.SECONDS));
+                        Assert.assertEquals("exactly two distinct borrowers must re-enter the wait path",
+                                borrowerCount - 1, reparkedWaiterThreads.size());
+                        Assert.assertEquals("exactly one borrower should hold restored capacity",
+                                borrowerCount - 1, allAcquired.getCount());
+
+                        // Recover two non-contiguous entries in one reverse /
+                        // swap-remove pass. A single signal() here would wake
+                        // only one of the two proven waiters; signalAll() must
+                        // wake both and let them claim the two restored indices.
+                        pool.setBeforeBorrowWaitHook(null);
+                        setBooleanField(delegates[0], "slotLockReleased", true);
+                        setBooleanField(delegates[5], "slotLockReleased", true);
+                        pool.reapIdle();
+                        Assert.assertTrue("all waiting borrowers must receive restored capacity",
+                                allAcquired.await(5, TimeUnit.SECONDS));
+                        Assert.assertEquals(3, pool.totalSize());
+                        Assert.assertEquals(3, pool.leakedSlotCount());
+
+                        boolean[] seen = new boolean[6];
+                        for (int i = 0; i < recovered.length; i++) {
+                            int slotIndex = getIntField(slotOf(recovered[i]), "slotIndex");
+                            Assert.assertFalse("borrowers must receive distinct restored indices",
+                                    seen[slotIndex]);
+                            seen[slotIndex] = true;
+                        }
+                        Assert.assertTrue("slot 0 must be restored", seen[0]);
+                        Assert.assertTrue("slot 2 must be restored", seen[2]);
+                        Assert.assertTrue("slot 5 must be restored", seen[5]);
+                        if (failure.get() != null) {
+                            throw new AssertionError("waiting borrower failed", failure.get());
+                        }
+                    } finally {
+                        pool.setBeforeBorrowWaitHook(null);
+                        releaseBorrowers.countDown();
+                        Assert.assertTrue("borrower threads must finish",
+                                allDone.await(10, TimeUnit.SECONDS));
+                    }
+                    if (failure.get() != null) {
+                        throw new AssertionError("waiting borrower failed", failure.get());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPoolRetiresAndRecoversSlotThroughFailedFlockReleaseRetry() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 1, 1, 2_000,
+                        Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender a = pool.borrow();
+                    Sender delegate = getDelegate(a);
+                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
+                    SlotLock slotLock = (SlotLock) getField(engine, "slotLock");
+                    Field fdField = SlotLock.class.getDeclaredField("fd");
+                    fdField.setAccessible(true);
+                    int realFd = fdField.getInt(slotLock);
+                    Assert.assertTrue("precondition: live flock fd", realFd >= 0);
+                    try {
+                        // Inject one persistent explicit-unlock failure.
+                        // Delegate close must retire the only pool slot rather
+                        // than publish a release while the real flock remains held.
+                        synchronized (slotLock) {
+                            fdField.setInt(slotLock, 1_000_000_000);
+                        }
+                        invokeDiscardBroken(pool, a);
+                        Assert.assertEquals("failed release must retire pool capacity",
+                                1, pool.leakedSlotCount());
+                        Assert.assertFalse(engine.isCloseCompleted());
+
+                        // Remove the fault without calling close again: the
+                        // engine's error-path retry driver runs outside the
+                        // pool lock and must eventually publish completion.
+                        synchronized (slotLock) {
+                            fdField.setInt(slotLock, realFd);
+                        }
+                        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!engine.isCloseCompleted()) {
+                            if (System.nanoTime() > deadlineNs) {
+                                throw new AssertionError("flock-release retry never completed");
+                            }
+                            Thread.sleep(1L);
+                        }
+
+                        // A capacity-starved public borrow re-probes the
+                        // retained delegate, frees index 0, and proves the
+                        // recovered flock is genuinely acquirable.
+                        PooledSender recovered = pool.borrow();
+                        try {
+                            Assert.assertEquals("retry must restore pool capacity",
+                                    0, pool.leakedSlotCount());
+                            Assert.assertEquals(1, countSlotDirs());
+                        } finally {
+                            recovered.close();
+                        }
+                    } finally {
+                        if (!engine.isCloseCompleted()) {
+                            synchronized (slotLock) {
+                                fdField.setInt(slotLock, realFd);
+                                Assert.assertTrue("restored fd must release cleanly",
+                                        slotLock.release());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPoolRetiresAndRecoversSlotThroughRealManagerWorkerWedge() throws Exception {
         // Full-stack twin of the two forged-flag recovery tests above: no
         // reflection-forged slotLockReleased anywhere. The REAL mechanism is
@@ -830,6 +1112,13 @@ public class SenderPoolSfTest {
                         // delegate's engine close times out its bounded join,
                         // hands cleanup to the worker's exit path, and reports
                         // the retained flock; the pool must retire the slot.
+                        // Fault the old callback-allocation/registration path.
+                        // C3 makes the owned-engine handoff preallocated, so
+                        // this hook must no longer be reached by production
+                        // teardown.
+                        manager.setBeforeExitCleanupRegistrationHook(() -> {
+                            throw new OutOfMemoryError("simulated callback allocation failure");
+                        });
                         manager.setWorkerJoinTimeoutMillis(50L);
                         invokeDiscardBroken(pool, a);
                         Assert.assertEquals(
@@ -839,18 +1128,15 @@ public class SenderPoolSfTest {
                         Assert.assertFalse("engine cleanup must still be pending",
                                 engine.isCloseCompleted());
 
-                        // Un-wedge: the worker finishes its pass, exits (its
-                        // loop was stopped by the close), and runs the
-                        // deferred cleanup that releases the real flock.
+                        // Un-wedge and deterministically reap the manager.
+                        // No sender/engine close retry is allowed: worker exit
+                        // itself must own and finish the preallocated handoff.
                         releaseWorker.countDown();
-                        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-                        while (!engine.isCloseCompleted()) {
-                            if (System.nanoTime() > deadlineNs) {
-                                throw new AssertionError(
-                                        "deferred engine cleanup never ran on manager-worker exit");
-                            }
-                            Thread.sleep(1);
-                        }
+                        manager.close();
+                        Assert.assertTrue("manager worker must be reaped", manager.isWorkerReaped());
+                        Assert.assertTrue("worker exit must run deferred cleanup despite the "
+                                        + "old allocation fault injection",
+                                engine.isCloseCompleted());
 
                         // The housekeeper tick is the recovery driver.
                         pool.reapIdle();
@@ -876,12 +1162,23 @@ public class SenderPoolSfTest {
                             throw new AssertionError("trim hook failed", hookErr.get());
                         }
                     } finally {
+                        manager.setBeforeExitCleanupRegistrationHook(null);
                         manager.setBeforeTrimSyncHook(null);
                         releaseWorker.countDown();
                     }
                 }
             }
         });
+    }
+
+    @Test
+    public void testPreallocatedExitHandoffCleansInRangeStartupRecoverer() throws Exception {
+        assertPreallocatedExitHandoffCleansStartupRecoverer(0, 1);
+    }
+
+    @Test
+    public void testPreallocatedExitHandoffCleansOutOfRangeStartupRecoverer() throws Exception {
+        assertPreallocatedExitHandoffCleansStartupRecoverer(1, 1);
     }
 
     // ----------------------------------------------------------------------
@@ -978,6 +1275,92 @@ public class SenderPoolSfTest {
                     } finally {
                         recoverer.close();
                     }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSharedManagerPassCompletionRecoversRetiredPoolSlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                long segSize = io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.HEADER_SIZE
+                        + io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment.FRAME_HEADER_SIZE + 32L;
+                SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+                CountDownLatch cleanupFinished = new CountDownLatch(1);
+                CountDownLatch workerBlocked = new CountDownLatch(1);
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                AtomicBoolean fired = new AtomicBoolean();
+                AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                AtomicReference<CursorSendEngine> engineRef = new AtomicReference<>();
+                manager.setAfterRingCleanupHook(cleanupFinished::countDown);
+                manager.setBeforeInstallSyncHook(() -> {
+                    if (!fired.compareAndSet(false, true)) {
+                        return;
+                    }
+                    workerBlocked.countDown();
+                    try {
+                        if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                            hookErr.compareAndSet(null,
+                                    new AssertionError("timed out waiting for test to release worker"));
+                        }
+                    } catch (Throwable t) {
+                        hookErr.compareAndSet(null, t);
+                    }
+                });
+                manager.start();
+                Assert.assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                IntFunction<Sender> factory = slotIndex -> {
+                    CursorSendEngine engine = new CursorSendEngine(
+                            slot("default-" + slotIndex), segSize, manager);
+                    engineRef.set(engine);
+                    QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", port);
+                    sender.setCursorEngine(engine, true);
+                    return sender;
+                };
+                SenderPool pool = new SenderPool(
+                        config, 0, 1, 500, 0, Long.MAX_VALUE, factory);
+                try {
+                    PooledSender lease = pool.borrow();
+                    Assert.assertTrue("shared manager never entered the sender ring's service pass",
+                            workerBlocked.await(5, TimeUnit.SECONDS));
+                    lease.close();
+
+                    manager.setWorkerJoinTimeoutMillis(50L);
+                    pool.reapIdle();
+                    Assert.assertEquals("pool must retire the slot while its shared-manager pass is live",
+                            1, pool.leakedSlotCount());
+                    CursorSendEngine engine = engineRef.get();
+                    Assert.assertFalse("engine cleanup must remain pending during the live pass",
+                            engine.isCloseCompleted());
+
+                    releaseWorker.countDown();
+                    Assert.assertTrue("deferred cleanup did not finish with the ring pass",
+                            cleanupFinished.await(5, TimeUnit.SECONDS));
+                    if (hookErr.get() != null) {
+                        throw new AssertionError("install hook failed", hookErr.get());
+                    }
+
+                    pool.reapIdle();
+                    Assert.assertEquals("pass completion must drive deferred engine cleanup and restore capacity",
+                            0, pool.leakedSlotCount());
+                    Assert.assertTrue("deferred cleanup must publish the released flock",
+                            engine.isCloseCompleted());
+                    try (PooledSender recovered = pool.borrow()) {
+                        Assert.assertTrue("recovered slot must be reusable", Files.exists(slot("default-0")));
+                    }
+                } finally {
+                    releaseWorker.countDown();
+                    manager.setAfterRingCleanupHook(null);
+                    manager.setBeforeInstallSyncHook(null);
+                    pool.close();
+                    manager.close();
                 }
             }
         });
@@ -2316,6 +2699,134 @@ public class SenderPoolSfTest {
 
     private String slot(String name) {
         return sfDir + "/" + name;
+    }
+
+    private void assertPreallocatedExitHandoffCleansStartupRecoverer(
+            int strandedIndex, int maxSize) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String strandedId = "default-" + strandedIndex;
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=100;";
+                Sender sender = Sender.builder(config).senderId(strandedId).build();
+                sender.table("recover").longColumn("v", strandedIndex).atNow();
+                sender.flush();
+                try {
+                    sender.close();
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("drain timed out"));
+                }
+            }
+            Assert.assertTrue("startup-recovery fixture must contain an unacked segment",
+                    hasSegmentFile(slot(strandedId)));
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                AtomicBoolean instrumented = new AtomicBoolean();
+                AtomicReference<CursorSendEngine> engineRef = new AtomicReference<>();
+                AtomicReference<SegmentManager> managerRef = new AtomicReference<>();
+                AtomicReference<Throwable> hookErr = new AtomicReference<>();
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                IntFunction<Sender> factory = idx -> {
+                    Sender sender = Sender.builder(config).senderId("default-" + idx).build();
+                    if (idx == strandedIndex && instrumented.compareAndSet(false, true)) {
+                        try {
+                            CursorSendEngine engine = (CursorSendEngine) getField(sender, "cursorEngine");
+                            SegmentManager manager = (SegmentManager) getField(engine, "manager");
+                            CountDownLatch workerBlocked = new CountDownLatch(1);
+                            AtomicBoolean fired = new AtomicBoolean();
+                            manager.setBeforeTrimSyncHook(() -> {
+                                if (!fired.compareAndSet(false, true)) {
+                                    return;
+                                }
+                                workerBlocked.countDown();
+                                try {
+                                    if (!releaseWorker.await(20, TimeUnit.SECONDS)) {
+                                        hookErr.compareAndSet(null,
+                                                new AssertionError("timed out waiting to release recovery worker"));
+                                    }
+                                } catch (Throwable t) {
+                                    hookErr.compareAndSet(null, t);
+                                }
+                            });
+                            if (!workerBlocked.await(5, TimeUnit.SECONDS)) {
+                                throw new AssertionError("recovery manager never entered a service pass");
+                            }
+                            manager.setBeforeExitCleanupRegistrationHook(() -> {
+                                throw new OutOfMemoryError("simulated callback allocation failure");
+                            });
+                            manager.setWorkerJoinTimeoutMillis(50L);
+                            engineRef.set(engine);
+                            managerRef.set(manager);
+                        } catch (Throwable t) {
+                            try {
+                                sender.close();
+                            } catch (Throwable ignored) {
+                            }
+                            throw new RuntimeException(t);
+                        }
+                    }
+                    return sender;
+                };
+
+                SenderPool pool = null;
+                try {
+                    pool = newPoolWithFactory(config, 0, maxSize, 2_000, factory);
+                    CursorSendEngine engine = engineRef.get();
+                    SegmentManager manager = managerRef.get();
+                    Assert.assertNotNull("startup recovery must build the stranded slot", engine);
+                    if (strandedIndex < maxSize) {
+                        Assert.assertEquals("in-range recoverer must remain retired while worker is live",
+                                1, pool.leakedSlotCount());
+                    } else {
+                        Assert.assertEquals("out-of-range recovery must not consume pool capacity",
+                                0, pool.leakedSlotCount());
+                    }
+                    Assert.assertFalse("cleanup must remain pending while the worker is live",
+                            engine.isCloseCompleted());
+
+                    releaseWorker.countDown();
+                    manager.close();
+                    Assert.assertTrue("recovery manager worker must be reaped", manager.isWorkerReaped());
+                    Assert.assertTrue("worker exit must complete startup-recoverer cleanup without "
+                                    + "a sender or engine close retry [index=" + strandedIndex + "]",
+                            engine.isCloseCompleted());
+                    if (hookErr.get() != null) {
+                        throw new AssertionError("recovery worker hook failed", hookErr.get());
+                    }
+                    if (strandedIndex < maxSize) {
+                        pool.reapIdle();
+                        Assert.assertEquals("late cleanup must restore in-range pool capacity",
+                                0, pool.leakedSlotCount());
+                    }
+                    try (SlotLock ignored = SlotLock.acquire(slot(strandedId))) {
+                        // Completion must mean the real slot flock is reusable.
+                    }
+                } finally {
+                    releaseWorker.countDown();
+                    SegmentManager manager = managerRef.get();
+                    if (manager != null) {
+                        manager.setBeforeExitCleanupRegistrationHook(null);
+                        manager.setBeforeTrimSyncHook(null);
+                        manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
+                        manager.close();
+                    }
+                    CursorSendEngine engine = engineRef.get();
+                    if (engine != null && !engine.isCloseCompleted()) {
+                        engine.close();
+                    }
+                    if (pool != null) {
+                        pool.close();
+                    }
+                }
+            }
+        });
     }
 
     private int countSlotDirs() {

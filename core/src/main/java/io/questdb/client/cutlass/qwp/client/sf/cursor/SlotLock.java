@@ -36,9 +36,9 @@ import java.nio.charset.StandardCharsets;
  * Advisory exclusive lock for a single SF slot directory.
  * <p>
  * One {@code .lock} file per slot, held via {@code flock}/{@code LockFileEx}
- * for the entire lifetime of the engine that owns the slot. The lock is
- * automatically released when the fd is closed — including on hard process
- * exit, since the kernel cleans up file locks for terminated processes.
+ * for the entire lifetime of the engine that owns the slot. Normal teardown
+ * explicitly unlocks it before closing the fd; hard process exit remains a
+ * backstop because the kernel cleans up file locks for terminated processes.
  * <p>
  * The holder's PID is written to a sibling {@code .lock.pid} file at
  * acquisition time. A failed acquisition reads it back so the error message
@@ -117,31 +117,32 @@ public final class SlotLock implements QuietCloseable {
     }
 
     /**
-     * Releases the flock by closing the lock fd and reports whether the
-     * release was <b>confirmed</b>. Closing the fd releases the lock. We do
-     * NOT remove the {@code .lock} file or the {@code .lock.pid} sidecar —
-     * a stale PID is harmless (next acquirer overwrites {@code .lock.pid}
-     * on success).
+     * Explicitly releases the flock and reports whether the release was
+     * <b>confirmed</b>. After a successful unlock the native primitive closes
+     * the descriptor once, best-effort, and this object forgets its numeric
+     * value. It never retries that close: POSIX leaves descriptor state
+     * unspecified after some close failures (notably {@code EINTR}), so a
+     * retry could close an unrelated descriptor that reused the same number.
+     * We do NOT remove the {@code .lock} file or {@code .lock.pid} sidecar; a
+     * stale PID is harmless because the next acquirer overwrites it.
      * <p>
-     * On close failure the fd is <b>retained</b>: the flock may still be
-     * held by this process, so forgetting the fd would misreport the lock
-     * state and forfeit any chance of a later retry. Idempotent — once
-     * released, subsequent calls return {@code true}.
+     * When the explicit unlock itself fails, the fd is retained so a later
+     * attempt can safely retry the non-consuming unlock operation. Idempotent
+     * once the unlock has succeeded.
      * <p>
      * Owners that gate a "slot dir is reusable" signal on the release
      * (e.g. {@code CursorSendEngine.finishClose} publishing
      * {@code closeCompleted}) must call this and check the result rather
      * than {@link #close()}, which is best-effort by contract.
      *
-     * @return {@code true} if the fd was closed (or was already released),
-     *         {@code false} if the OS reported a close failure and the
-     *         flock may still be held
+     * @return {@code true} if the lock was explicitly released (or was already
+     *         released), {@code false} if the OS reported an unlock failure
      */
-    public boolean release() {
+    public synchronized boolean release() {
         if (fd < 0) {
             return true;
         }
-        if (Files.close(fd) == 0) {
+        if (release0(fd) == 0) {
             fd = -1;
             return true;
         }
@@ -179,6 +180,8 @@ public final class SlotLock implements QuietCloseable {
             Files.close(rfd);
         }
     }
+
+    private static native int release0(int fd);
 
     private static void writePid(String pidPath) {
         long pid;

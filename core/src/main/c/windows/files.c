@@ -331,6 +331,20 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_lock
     return 0;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_cutlass_qwp_client_sf_cursor_SlotLock_release0
+        (JNIEnv *e, jclass cl, jint fd) {
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    if (!UnlockFileEx(FD_TO_HANDLE(fd), 0, MAXDWORD, MAXDWORD, &ov)) {
+        SaveLastError();
+        return -1;
+    }
+    /* Unlock success confirms that the slot is reusable. Match POSIX by
+     * closing once without making handle cleanup part of that signal. */
+    (void) CloseHandle(FD_TO_HANDLE(fd));
+    return 0;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
         (JNIEnv *e, jclass cl, jlong lpszPath, jint mode) {
     (void) mode;

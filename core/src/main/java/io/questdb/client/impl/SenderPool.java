@@ -148,6 +148,11 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     // True iff the configuration enables store-and-forward (sf_dir set).
     private final boolean storeAndForward;
+    // Test seam: runs immediately before a capacity-starved borrow enters its
+    // condition wait, while it still holds the pool lock. Null in production;
+    // concurrency tests use a latch here to prove that several borrowers have
+    // all reached the wait path before recovering retired capacity.
+    private volatile Runnable beforeBorrowWaitHook;
     // Test seam: runs after a capacity-starved borrow's condition wait has
     // exhausted its positive timeout, before the loop's terminal pass. Null in
     // production; regression tests release a retired slot here to prove that
@@ -822,6 +827,10 @@ public final class SenderPool implements AutoCloseable {
                             "timed out waiting for a Sender from the pool after " + acquireTimeoutMillis + "ms");
                 }
                 try {
+                    Runnable beforeWaitHook = beforeBorrowWaitHook;
+                    if (beforeWaitHook != null) {
+                        beforeWaitHook.run();
+                    }
                     remainingNanos = slotReleased.awaitNanos(remainingNanos);
                     if (remainingNanos <= 0) {
                         Runnable hook = borrowWaitExpiredHook;
@@ -839,6 +848,11 @@ public final class SenderPool implements AutoCloseable {
                 lock.unlock();
             }
         }
+    }
+
+    @TestOnly
+    public void setBeforeBorrowWaitHook(Runnable hook) {
+        this.beforeBorrowWaitHook = hook;
     }
 
     @TestOnly
@@ -1397,7 +1411,15 @@ public final class SenderPool implements AutoCloseable {
         for (int i = retiredSlots.size() - 1; i >= 0; i--) {
             SenderSlot s = retiredSlots.get(i);
             if (flockReleased(s)) {
-                retiredSlots.remove(i);
+                // Order is irrelevant. Swap with the tail before removing so
+                // each recovery does O(1) list work instead of shifting the
+                // remaining retired entries. The tail has already been probed
+                // by this reverse scan and, if still present, is unreleased.
+                int last = retiredSlots.size() - 1;
+                if (i < last) {
+                    retiredSlots.set(i, retiredSlots.get(last));
+                }
+                retiredSlots.remove(last);
                 leakedSlots--;
                 freeSlotIndex(s.slotIndex());
                 recovered = true;

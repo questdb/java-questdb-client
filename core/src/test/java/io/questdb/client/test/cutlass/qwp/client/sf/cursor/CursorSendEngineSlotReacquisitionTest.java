@@ -88,7 +88,8 @@ public class CursorSendEngineSlotReacquisitionTest {
      * inside a service pass for the engine's ring, {@code close()} must NOT
      * hand the slot to anyone else. With the quiescence barrier reverted,
      * close() releases the slot lock immediately and the mid-test
-     * {@code SlotLock.acquire} probe succeeds — failing the test.
+     * {@code SlotLock.acquire} probe succeeds. Once the pass finishes, its
+     * deferred cleanup must release the slot without a direct close retry.
      */
     @Test(timeout = 30_000L)
     public void testCloseRetainsSlotWhileWorkerIsMidServicePass() throws Exception {
@@ -98,6 +99,7 @@ public class CursorSendEngineSlotReacquisitionTest {
             // 60 s poll: the worker only acts when explicitly woken, so the
             // single pass we park below is the only pass in flight.
             SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch cleanupFinished = new CountDownLatch(1);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
@@ -105,6 +107,7 @@ public class CursorSendEngineSlotReacquisitionTest {
             boolean managerClosed = false;
             CursorSendEngine engine = null;
             try {
+                manager.setAfterRingCleanupHook(cleanupFinished::countDown);
                 manager.setBeforeInstallSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
@@ -149,19 +152,16 @@ public class CursorSendEngineSlotReacquisitionTest {
                 // Let the worker finish its pass (it abandons the spare: the
                 // ring was deregistered by the close attempt above).
                 releaseWorker.countDown();
-                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
-
-                // Retry close(): the barrier now succeeds and the full cleanup
-                // (ring, watermark, unlink, slot lock) must complete.
-                engine.close();
-                Assert.assertTrue("retried close must report complete cleanup",
+                Assert.assertTrue("ring pass did not finish deferred cleanup",
+                        cleanupFinished.await(5, TimeUnit.SECONDS));
+                Assert.assertTrue("ring-pass cleanup must report complete cleanup",
                         engine.isCloseCompleted());
                 engine = null;
 
                 try (SlotLock probe = SlotLock.acquire(slot)) {
                     Assert.assertNotNull("slot must be acquirable after a completed close", probe);
                 } catch (Exception e) {
-                    throw new AssertionError("retried close() did not release the slot lock", e);
+                    throw new AssertionError("ring-pass cleanup did not release the slot lock", e);
                 }
 
                 manager.close();
@@ -170,14 +170,9 @@ public class CursorSendEngineSlotReacquisitionTest {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
             } finally {
+                manager.setAfterRingCleanupHook(null);
                 manager.setBeforeInstallSyncHook(null);
                 releaseWorker.countDown();
-                if (engine != null) {
-                    try {
-                        engine.close();
-                    } catch (Throwable ignored) {
-                    }
-                }
                 if (!managerClosed) {
                     manager.close();
                 }

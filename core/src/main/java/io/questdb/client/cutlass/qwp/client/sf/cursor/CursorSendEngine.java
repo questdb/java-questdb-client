@@ -65,6 +65,7 @@ public final class CursorSendEngine implements QuietCloseable {
     public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
+    private static volatile Runnable beforeDeferredCloseCreationHook;
     private final long appendDeadlineNanos;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
@@ -72,6 +73,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // writer; volatile because the user may sample it from any thread.
     private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
             new java.util.concurrent.atomic.AtomicLong();
+    // Constructed before an owned manager acquires its native path scratch, so
+    // callback allocation failure cannot orphan manager resources. A timed-out
+    // close can then hand it to either manager path without allocating.
+    private final Runnable deferredClose;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
     // case close() also stops the manager. When the manager is shared across
@@ -138,6 +143,12 @@ public final class CursorSendEngine implements QuietCloseable {
     // held. volatile: finishClose may run on the manager worker's exit
     // thread while the hook is installed from a test thread.
     private volatile Runnable beforeFlockReleaseHook;
+    // Exactly one daemon drives a failed flock release to completion. The
+    // error path only: ordinary closes never allocate or start a thread.
+    private final AtomicBoolean flockReleaseRetryStarted = new AtomicBoolean();
+    // Published before deferredClose is registered. The manager lock provides
+    // the callback handoff fence; volatile also covers a direct test/retry read.
+    private volatile boolean fullyDrainedForDeferredClose;
     // Exactly-once claim on the terminal cleanup (finishClose). Contended by
     // close() and a worker-exit handoff (completeDeferredClose); whoever wins
     // the CAS runs the cleanup, the loser never touches ring/watermark/flock.
@@ -148,6 +159,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // With the CAS the worker's cleanup never blocks, so the join returns as
     // soon as the pass ends.
     private final AtomicBoolean terminalCleanupClaimed = new AtomicBoolean();
+    // Published only after ring/watermark/unlink cleanup is finished. A close
+    // that loses terminalCleanupClaimed may retry the flock only after this
+    // becomes true, otherwise it could expose the slot while cleanup is live.
+    private volatile boolean terminalResourcesCleaned;
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
@@ -171,9 +186,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos) {
-        this(sfDir, segmentSizeBytes,
-                new SegmentManager(segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes),
-                true, appendDeadlineNanos);
+        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes, appendDeadlineNanos);
     }
 
     /**
@@ -187,6 +200,22 @@ public final class CursorSendEngine implements QuietCloseable {
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos) {
+        this(sfDir, segmentSizeBytes, manager, ownsManager,
+                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos);
+    }
+
+    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos) {
+        // Allocate the bound callback before constructing an owned manager.
+        // Field initializers have completed, but no engine-owned native/disk
+        // resource exists yet. If callback allocation throws, construction
+        // stops without a manager whose native path scratch could be orphaned.
+        this.deferredClose = createDeferredClose();
+        if (ownsManager && manager == null) {
+            manager = new SegmentManager(
+                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
+        }
+
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
         //                  cursor architecture, no disk involvement; segments
         //                  live in malloc'd native memory.
@@ -206,11 +235,9 @@ public final class CursorSendEngine implements QuietCloseable {
                 // separate mkdir step needed here.
                 acquiredLock = SlotLock.acquire(sfDir);
             } catch (Throwable t) {
-                // The delegating constructors evaluate `new SegmentManager(...)`
-                // BEFORE this body runs, so on a pre-try throw (e.g. slot lock
-                // collision) an owned manager is already alive and would leak
-                // its native path-scratch sink -- 256 bytes per failed
-                // construction attempt. Close it before propagating.
+                // Callback creation and owned-manager construction have already
+                // completed. A slot-lock failure must close the owned manager's
+                // native path scratch before propagating.
                 if (ownsManager) {
                     try {
                         manager.close();
@@ -554,6 +581,7 @@ public final class CursorSendEngine implements QuietCloseable {
         } catch (Throwable ignored) {
         }
         final boolean fullyDrained = drained;
+        fullyDrainedForDeferredClose = fullyDrained;
         // Each cleanup step in its own try/catch so a single failure
         // doesn't strand later cleanups — mirrors the constructor's
         // catch block. Without this, a throw from manager.deregister
@@ -602,14 +630,11 @@ public final class CursorSendEngine implements QuietCloseable {
             boolean handedOff = false;
             boolean registrationFailed = false;
             try {
-                handedOff = manager.deferUntilWorkerExit(() -> completeDeferredClose(fullyDrained));
+                handedOff = manager.deferOwnedEngineCloseUntilWorkerExit(deferredClose);
             } catch (Throwable ignored) {
-                // Allocation failure (OOM building the cleanup lambda or
-                // growing the manager's exitCleanups list). Unlike the exact
-                // false return below, a throw carries NO worker-liveness
-                // information — the two must never be conflated, or the
-                // inline cleanup below would release worker-reachable
-                // resources under a possibly-live worker.
+                // Unexpected monitor/VM failure carries no worker-liveness
+                // information. Ordinary handoff cannot allocate: both the
+                // callback and the manager's single slot were preallocated.
                 registrationFailed = true;
             }
             if (handedOff) {
@@ -645,22 +670,41 @@ public final class CursorSendEngine implements QuietCloseable {
             workerQuiescent = true;
         }
         if (!workerQuiescent) {
-            // Shared (caller-owned) manager: its worker keeps serving other
-            // rings indefinitely, so there is no exit path to hand cleanup
-            // to — leak and let a retried close() reclaim once the pass ends.
-            LOG.error("SF manager worker did not quiesce during engine close; leaking the "
-                    + "ring, watermark and slot lock so a stale worker cannot corrupt a "
-                    + "future engine on slot {}. The kernel releases the slot flock on "
-                    + "process exit; close() may be invoked again to retry cleanup once "
-                    + "the worker has exited.", sfDir == null ? "<memory>" : sfDir);
-            return;
+            // A shared manager keeps serving sibling rings, so it cannot use
+            // the whole-worker exit handoff above. Transfer cleanup to this
+            // ring's current pass instead. Registration and pass completion
+            // share the manager lock: true means the worker owns cleanup;
+            // false means the pass already finished and inline cleanup is safe.
+            boolean handedOff = false;
+            boolean registrationFailed = false;
+            try {
+                handedOff = manager.deferUntilRingQuiescent(ring, deferredClose);
+            } catch (Throwable ignored) {
+                registrationFailed = true;
+            }
+            if (handedOff) {
+                LOG.error("SF manager worker did not quiesce during engine close; ring, watermark "
+                        + "and slot-lock release are handed to the current ring pass and run the "
+                        + "moment that pass finishes. The slot stays locked (and "
+                        + "isCloseCompleted() false) until then, so no replacement engine can "
+                        + "race the stale worker on slot {}",
+                        sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            if (registrationFailed) {
+                LOG.error("SF ring-pass cleanup handoff registration failed during engine close; "
+                        + "leaking the ring, watermark and slot lock so a possibly-live worker "
+                        + "cannot corrupt a future engine on slot {}. The kernel releases the "
+                        + "flock on process exit.", sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            workerQuiescent = true;
         }
         if (!terminalCleanupClaimed.compareAndSet(false, true)) {
-            // A worker-exit handoff from an earlier close() attempt owns the
-            // terminal cleanup: it has run or is finishing right now on the
-            // exiting worker. closeCompleted flips the moment it is done —
-            // owners observe it via isCloseCompleted(), never by re-running
-            // the cleanup here (that would double-release ring/flock).
+            // A worker-exit handoff or earlier close owns the one-time
+            // ring/watermark cleanup. Once that work is published complete,
+            // this close may still retry an unconfirmed flock release.
+            retryFlockReleaseIfReady();
             return;
         }
         finishClose(fullyDrained);
@@ -672,7 +716,7 @@ public final class CursorSendEngine implements QuietCloseable {
      * is <b>confirmed</b> — latches {@link #closeCompleted}. Publish order
      * is load-bearing: pools free the slot index the instant they observe
      * {@code closeCompleted} (via {@code isSlotLockReleased()}), so it must
-     * never be visible while the flock fd is still open, or a replacement
+     * never be visible while the flock is still held, or a replacement
      * engine races the release and fails acquisition on a live slot.
      * The caller must hold the engine monitor and
      * must have established that the manager worker can no longer touch the
@@ -718,13 +762,12 @@ public final class CursorSendEngine implements QuietCloseable {
             // releasing the flock is safe even if a step above threw. Leaking
             // it would strand the slot until process exit for no reason.
             //
-            // ORDER MATTERS: release the flock FIRST, verify it, and only
-            // then publish closeCompleted. Pools read isCloseCompleted() as
-            // "the slot dir is reusable" and free the slot index the moment
-            // it flips; publishing before Files.close(fd) completes would
-            // open a window where a replacement engine's SlotLock.acquire
-            // collides with the still-open fd and fails with a spurious
-            // "slot already in use".
+            // ORDER MATTERS: explicitly release the flock, verify it, and
+            // only then publish closeCompleted. Pools read isCloseCompleted()
+            // as "the slot dir is reusable" and free the slot index the moment
+            // it flips. SlotLock closes the fd once after confirmed unlock,
+            // but that close result cannot safely control publication because
+            // POSIX may consume the fd even when close reports failure.
             Runnable hook = beforeFlockReleaseHook;
             if (hook != null) {
                 try {
@@ -733,30 +776,19 @@ public final class CursorSendEngine implements QuietCloseable {
                     // test-only; must never block the release
                 }
             }
-            boolean released;
-            if (slotLock != null) {
-                try {
-                    released = slotLock.release();
-                } catch (Throwable ignored) {
-                    released = false;
-                }
-            } else {
-                released = true;
-            }
-            if (released) {
-                closeCompleted = true;
-            } else {
-                // Unconfirmed release: the flock may still be held, so keep
-                // closeCompleted false — the owning pool keeps the slot
-                // retired (leakedSlots accounting) instead of reusing a
-                // possibly-locked dir. The kernel releases the flock on
-                // process exit regardless.
-                LOG.error("SF slot flock release failed during engine close; keeping "
-                        + "closeCompleted=false so the pool cannot reuse a possibly "
-                        + "still-locked slot dir; the kernel releases the flock on "
-                        + "process exit [slot={}]", sfDir == null ? "<memory>" : sfDir);
-            }
+            terminalResourcesCleaned = true;
+            retryFlockReleaseIfReady();
         }
+    }
+
+    /**
+     * Installs a constructor fault hook immediately before the bound deferred
+     * close callback is created. Test-only: proves callback allocation failure
+     * occurs before an owned manager acquires native resources.
+     */
+    @TestOnly
+    public static void setBeforeDeferredCloseCreationHook(Runnable hook) {
+        beforeDeferredCloseCreationHook = hook;
     }
 
     /**
@@ -772,29 +804,94 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Runs on the manager worker's exit path when {@link #close()} handed
-     * cleanup ownership to the worker (see {@code deferUntilWorkerExit}).
+     * Runs on a safe manager-worker handoff path when {@link #close()} moved
+     * cleanup ownership to either a shared manager's ring-pass completion or
+     * an owned manager's worker exit.
      * Deliberately does NOT take the engine monitor: a retried close() can
      * hold it while joining this very worker, and the thread cannot die until
      * this method returns — the {@link #terminalCleanupClaimed} CAS provides
      * the exactly-once exclusion instead, so the worker always exits promptly
      * and the racing close() converges via {@code isWorkerReaped()}.
      */
-    private void completeDeferredClose(boolean fullyDrained) {
+    private void completeDeferredClose() {
         if (!terminalCleanupClaimed.compareAndSet(false, true)) {
             // A retried close() (or an earlier duplicate handoff) already ran
             // the terminal cleanup.
             return;
         }
-        finishClose(fullyDrained);
-        LOG.info("deferred SF engine cleanup completed on manager-worker exit; slot released: {}",
-                sfDir == null ? "<memory>" : sfDir);
+        finishClose(fullyDrainedForDeferredClose);
+        LOG.info("deferred SF engine resource cleanup completed after manager-worker quiescence; "
+                        + "slot release confirmed: {} [slot={}]",
+                closeCompleted, sfDir == null ? "<memory>" : sfDir);
+    }
+
+    private Runnable createDeferredClose() {
+        Runnable hook = beforeDeferredCloseCreationHook;
+        if (hook != null) {
+            hook.run();
+        }
+        return this::completeDeferredClose;
+    }
+
+    private boolean retryFlockReleaseIfReady() {
+        if (closeCompleted || !terminalResourcesCleaned) {
+            return closeCompleted;
+        }
+        boolean released;
+        if (slotLock != null) {
+            try {
+                released = slotLock.release();
+            } catch (Throwable ignored) {
+                released = false;
+            }
+        } else {
+            released = true;
+        }
+        if (released) {
+            closeCompleted = true;
+            return true;
+        }
+        startFlockReleaseRetry();
+        return false;
+    }
+
+    private void startFlockReleaseRetry() {
+        if (!flockReleaseRetryStarted.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Thread retryThread = new Thread(() -> {
+                while (!retryFlockReleaseIfReady()) {
+                    try {
+                        Thread.sleep(100L);
+                    } catch (InterruptedException ignored) {
+                        // A failed flock release must remain retryable until
+                        // confirmed or process exit; interruption is not a
+                        // safe reason to abandon the slot permanently.
+                    }
+                }
+            }, "qdb-sf-flock-release-retry");
+            retryThread.setDaemon(true);
+            retryThread.start();
+            LOG.error("SF slot flock release failed during engine close; keeping "
+                            + "closeCompleted=false and retrying outside the pool lock so "
+                            + "retired capacity recovers after the transient failure [slot={}]",
+                    sfDir == null ? "<memory>" : sfDir);
+        } catch (Throwable t) {
+            // A later explicit close() can still retry without repeating the
+            // one-time ring/watermark cleanup. The kernel remains the final
+            // process-exit backstop if thread creation and all retries fail.
+            flockReleaseRetryStarted.set(false);
+            LOG.error("Could not start SF flock-release retry driver; close() may be "
+                            + "invoked again to retry [slot={}, error={}]",
+                    sfDir == null ? "<memory>" : sfDir, String.valueOf(t));
+        }
     }
 
     /**
      * Whether {@link #close()} completed all cleanup, including a
      * <b>confirmed</b> release of the SF slot lock — the flip is published
-     * strictly after the flock fd is closed, so observing {@code true}
+     * strictly after explicit unlock succeeds, so observing {@code true}
      * guarantees the slot dir is acquirable by a replacement engine. A false
      * value after close means manager-worker quiescence could not be
      * confirmed (or the flock release itself failed) and the

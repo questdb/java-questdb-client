@@ -195,12 +195,11 @@ public class SlotLockReleasedContractTest {
     }
 
     /**
-     * Manager-worker leak path: engine close retains the slot while a shared
+     * Manager-worker handoff path: engine close retains the slot while a shared
      * manager is still inside a service pass. The sender must expose that
      * retained flock to SenderPool. Repeated sender close calls remain no-ops;
-     * the test cleans the deliberately retained engine up directly — and once
-     * that cleanup completes, the sender must expose the released flock so a
-     * pool that retired the slot can recover its capacity.
+     * the manager pass owns deferred cleanup and releases the flock when it
+     * finishes, so the sender can expose recovery without a direct close retry.
      */
     @Test(timeout = 30_000L)
     public void testSlotLockNotReleasedUntilManagerWorkerQuiesces() throws Exception {
@@ -211,6 +210,7 @@ public class SlotLockReleasedContractTest {
             String slot = tmpDir + "/slot";
             long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
             SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch cleanupFinished = new CountDownLatch(1);
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
@@ -219,6 +219,7 @@ public class SlotLockReleasedContractTest {
             QwpWebSocketSender wss = null;
             boolean managerClosed = false;
             try {
+                manager.setAfterRingCleanupHook(cleanupFinished::countDown);
                 manager.setBeforeInstallSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
@@ -262,12 +263,9 @@ public class SlotLockReleasedContractTest {
                         engine.isCloseCompleted());
 
                 releaseWorker.countDown();
-                manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
-                // Test-only cleanup through the retained local reference (the
-                // shared-manager path has no worker-exit handoff to defer to;
-                // a retried close() is its reclaim driver).
-                engine.close();
-                Assert.assertTrue("direct cleanup did not complete after worker exit",
+                Assert.assertTrue("shared-manager pass did not finish deferred cleanup",
+                        cleanupFinished.await(5, TimeUnit.SECONDS));
+                Assert.assertTrue("deferred cleanup did not complete after the ring pass",
                         engine.isCloseCompleted());
                 // Recovery contract: the sender re-probes its retained engine,
                 // so the completed cleanup (and released flock) MUST become
@@ -276,7 +274,7 @@ public class SlotLockReleasedContractTest {
                 Assert.assertTrue("sender must expose the late flock release to the pool",
                         wss.isSlotLockReleased());
                 try (SlotLock probe = SlotLock.acquire(slot)) {
-                    Assert.assertNotNull("slot must be acquirable after direct cleanup", probe);
+                    Assert.assertNotNull("slot must be acquirable after deferred cleanup", probe);
                 }
 
                 manager.close();
@@ -285,17 +283,12 @@ public class SlotLockReleasedContractTest {
                     throw new AssertionError("install hook failed", hookErr.get());
                 }
             } finally {
+                manager.setAfterRingCleanupHook(null);
                 manager.setBeforeInstallSyncHook(null);
                 releaseWorker.countDown();
                 if (wss != null) {
                     try {
                         wss.close();
-                    } catch (Throwable ignored) {
-                    }
-                }
-                if (engine != null && !engine.isCloseCompleted()) {
-                    try {
-                        engine.close();
                     } catch (Throwable ignored) {
                     }
                 }

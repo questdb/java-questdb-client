@@ -178,21 +178,18 @@ public class EngineClosePublishAfterFlockReleaseTest {
 
     /**
      * The error half of the publish-after-release contract: when
-     * {@code SlotLock.release()} reports failure (the OS refused the fd
-     * close, so the flock may still be held), {@code closeCompleted} must
-     * NEVER be published — not by the failing close(), and not by a retried
-     * close() either (the terminal-cleanup claim is already consumed; the
-     * design deliberately leaves an unconfirmed release to the kernel's
-     * process-exit cleanup rather than risking a double release). A pool
-     * observing {@code isCloseCompleted() == false} keeps the slot retired,
-     * which is exactly right: the flock genuinely is still held.
+     * {@code SlotLock.release()} reports failure (the OS refused the explicit
+     * unlock, so the flock may still be held), {@code closeCompleted} must
+     * stay false until a later close confirms release. A pool observing
+     * {@code isCloseCompleted() == false} keeps the slot retired while the
+     * flock is genuinely held, then recovers it once the retry completes.
      * <p>
-     * {@code Files.close} cannot be made to fail through the public API, so
-     * the lock's fd is swapped to a known-bad descriptor for the close and
-     * restored (and released for real) afterwards.
+     * The lock's fd is swapped to a known-bad descriptor for a deterministic
+     * native unlock failure, then restored before retrying through the engine's
+     * public close API.
      */
     @Test(timeout = 30_000L)
-    public void testUnconfirmedFlockReleaseKeepsCloseIncomplete() throws Exception {
+    public void testUnconfirmedFlockReleaseKeepsCloseIncompleteUntilRetry() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CursorSendEngine engine = new CursorSendEngine(sfDir, 4L * 1024 * 1024);
             Field slotLockField = CursorSendEngine.class.getDeclaredField("slotLock");
@@ -221,21 +218,24 @@ public class EngineClosePublishAfterFlockReleaseTest {
                 } catch (IllegalStateException expected) {
                     // good — incomplete close really means "still locked".
                 }
-                // A retried close() must neither throw nor re-run the terminal
-                // cleanup (the claim is consumed) nor suddenly report success.
-                engine.close();
-                assertFalse("retried close() must not fabricate completion after a failed "
-                                + "flock release — the claim is consumed and the kernel owns "
-                                + "the eventual cleanup",
-                        engine.isCloseCompleted());
-            } finally {
-                // Undo the fault and drop the real flock so the test leaves no
-                // open fd behind (in production the kernel does this at exit).
+
+                // Remove the injected fault. The retry must only re-attempt
+                // the retained fd release: ring/watermark cleanup stays
+                // exactly-once, while completion and slot reusability recover.
                 fdField.setInt(slotLock, realFd);
-                assertTrue("restored fd must release cleanly", slotLock.release());
-            }
-            try (SlotLock ignored = SlotLock.acquire(sfDir)) {
-                // good — with the flock genuinely dropped, the slot is reusable.
+                engine.close();
+                assertTrue("retried close() must complete after the flock release succeeds",
+                        engine.isCloseCompleted());
+                try (SlotLock ignored = SlotLock.acquire(sfDir)) {
+                    // good — eventual completion implies reusable capacity.
+                }
+            } finally {
+                // If an assertion failed before the successful retry, restore
+                // and release the real fd so the test never leaks a flock.
+                if (!engine.isCloseCompleted()) {
+                    fdField.setInt(slotLock, realFd);
+                    assertTrue("restored fd must release cleanly", slotLock.release());
+                }
             }
         });
     }

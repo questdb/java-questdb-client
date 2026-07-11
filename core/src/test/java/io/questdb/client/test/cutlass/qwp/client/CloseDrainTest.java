@@ -35,8 +35,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Regression tests for the close() drain semantics.
@@ -75,6 +77,56 @@ public class CloseDrainTest {
                             + "drain timeout is broken or never enabled",
                     elapsedMs >= ackDelayMs / 2);
         }
+    }
+
+    @Test
+    public void testCloseStartedHookRunsAfterClosedStateTransition() throws Exception {
+        QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 1);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Throwable> closerFailure = new AtomicReference<>();
+        AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+        sender.setCloseStartedHook(() -> {
+            try {
+                try {
+                    sender.table("must_reject_after_close_started");
+                    Assert.fail("close-started hook ran before closed=true was published");
+                } catch (LineSenderException expected) {
+                    // Required lifecycle boundary: public operations already reject.
+                }
+                entered.countDown();
+                if (!release.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("close-started hook release timed out");
+                }
+            } catch (Throwable t) {
+                hookFailure.set(t);
+                entered.countDown();
+            }
+        });
+
+        Assert.assertEquals("installing the hook must not emit a pre-invocation witness",
+                1L, entered.getCount());
+        Thread closer = new Thread(() -> {
+            try {
+                sender.close();
+            } catch (Throwable t) {
+                closerFailure.set(t);
+            }
+        }, "close-started-hook-test");
+        try {
+            closer.start();
+            Assert.assertTrue("close() never reached its internal lifecycle witness",
+                    entered.await(10, TimeUnit.SECONDS));
+            Assert.assertTrue("close() completed while its internal witness was held",
+                    closer.isAlive());
+        } finally {
+            release.countDown();
+            closer.join(10_000L);
+            sender.close();
+        }
+        Assert.assertFalse("close thread did not finish", closer.isAlive());
+        Assert.assertNull("close-started hook failed", hookFailure.get());
+        Assert.assertNull("close() failed", closerFailure.get());
     }
 
     @Test

@@ -236,6 +236,18 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_lock
     return flock((int) fd, LOCK_EX | LOCK_NB);
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_cutlass_qwp_client_sf_cursor_SlotLock_release0
+        (JNIEnv *e, jclass cl, jint fd) {
+    if (flock((int) fd, LOCK_UN) != 0) {
+        return -1;
+    }
+    /* Unlock success confirms that the slot is reusable. close() is one-shot:
+     * POSIX leaves descriptor state unspecified on EINTR, so retrying its
+     * numeric value could close an unrelated descriptor after reuse. */
+    (void) close((int) fd);
+    return 0;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
         (JNIEnv *e, jclass cl, jlong lpszPath, jint mode) {
     return mkdir((const char *) (uintptr_t) lpszPath, (mode_t) mode);

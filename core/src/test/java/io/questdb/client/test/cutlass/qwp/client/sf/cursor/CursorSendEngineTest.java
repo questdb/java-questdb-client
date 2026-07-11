@@ -198,6 +198,25 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testCallbackCreationFailurePrecedesOwnedManagerResources() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine.setBeforeDeferredCloseCreationHook(() -> {
+                throw new OutOfMemoryError("simulated bound callback allocation failure");
+            });
+            try {
+                try {
+                    new CursorSendEngine(tmpDir, 4096);
+                    fail("expected callback allocation failure");
+                } catch (OutOfMemoryError expected) {
+                    assertEquals("simulated bound callback allocation failure", expected.getMessage());
+                }
+            } finally {
+                CursorSendEngine.setBeforeDeferredCloseCreationHook(null);
+            }
+        });
+    }
+
+    @Test
     public void testConstructorFailureAfterOwnedManagerStartCleansResources() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             SegmentManager manager = new SegmentManager(4096);

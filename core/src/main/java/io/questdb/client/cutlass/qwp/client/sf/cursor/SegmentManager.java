@@ -34,7 +34,9 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -66,6 +68,14 @@ public final class SegmentManager implements QuietCloseable {
     public static final long DEFAULT_POLL_NANOS = 1_000_000L; // 1 ms
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
+    private static final int ENTRY_DEREGISTERED = 3;
+    private static final int ENTRY_DEREGISTERED_IN_SERVICE = 2;
+    private static final int ENTRY_IN_SERVICE = 1;
+    private static final int ENTRY_REGISTERED = 0;
+    private static final AtomicReferenceFieldUpdater<RingEntry, Runnable> ENTRY_CLEANUP_UPDATER =
+            AtomicReferenceFieldUpdater.newUpdater(RingEntry.class, Runnable.class, "quiescenceCleanup");
+    private static final AtomicIntegerFieldUpdater<RingEntry> ENTRY_STATE_UPDATER =
+            AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
     private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
@@ -86,6 +96,17 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
+    // Test seam: runs after a deferred ring-pass cleanup returns. Null in
+    // production; public sender/pool lifecycle tests use it to observe exact
+    // callback completion without sleeps or polling.
+    private volatile Runnable afterRingCleanupHook;
+    // Test seam: runs at the top of deferUntilWorkerExit, before the
+    // worker-liveness check. Null in production; registration-failure tests
+    // throw from it to simulate an allocation failure (OOM building the
+    // cleanup lambda or growing exitCleanups) while the worker is still
+    // live. Callers must treat such a throw as "worker state unknown",
+    // never as the exact false return meaning the worker loop has exited.
+    private volatile Runnable beforeExitCleanupRegistrationHook;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
     // totalBytes += segmentSize commit). Null in production; tests use it to
@@ -97,25 +118,19 @@ public final class SegmentManager implements QuietCloseable {
     // production; owned-engine close tests use it to prove they take only the
     // stronger whole-manager join path, not two sequential timeout budgets.
     private volatile Runnable beforeRingQuiescenceAwaitHook;
-    // Test seam: runs at the top of deferUntilWorkerExit, before the
-    // worker-liveness check. Null in production; registration-failure tests
-    // throw from it to simulate an allocation failure (OOM building the
-    // cleanup lambda or growing exitCleanups) while the worker is still
-    // live. Callers must treat such a throw as "worker state unknown",
-    // never as the exact false return meaning the worker loop has exited.
-    private volatile Runnable beforeExitCleanupRegistrationHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
-    // registered flag check inside the trim block closes for watermark writes
-    // and totalBytes accounting.
+    // entry-state check inside the trim block closes for watermark writes and
+    // totalBytes accounting.
     private volatile Runnable beforeTrimSyncHook;
-    // Entry currently being serviced by the worker thread, or null when the
-    // worker is between service passes (or not running). Guarded by
-    // {@link #lock}; cleared with lock.notifyAll() so awaitRingQuiescence can
-    // block until an in-flight pass for a just-deregistered ring finishes.
-    private RingEntry inService;
+    // Entry the worker is claiming or servicing, or null between passes.
+    // Volatile publication lets teardown find the entry after deregister()
+    // removes it from rings. RingEntry.state is the authoritative barrier:
+    // the worker publishes this reference before its REGISTERED->IN_SERVICE
+    // CAS and only touches ring resources after that CAS succeeds.
+    private volatile RingEntry inService;
     // Cleanup actions handed to the worker's exit block by an owning engine
     // whose close() found the worker still mid service pass after the bounded
     // join timed out (see deferUntilWorkerExit). Guarded by {@link #lock};
@@ -124,14 +139,11 @@ public final class SegmentManager implements QuietCloseable {
     // and no caller-facing lock may ever be held while running third-party
     // cleanup code.
     private ObjList<Runnable> exitCleanups;
-    // Number of threads currently parked in awaitRingQuiescence()'s wait
-    // loop. Guarded by {@link #lock}. The worker's per-pass finally block
-    // only calls lock.notifyAll() when this is > 0, so the steady-state
-    // production path (no quiescence barrier in flight) never notifies.
-    // Both sides mutate/check under the same lock, so there is no lost
-    // wakeup: a waiter that increments after the worker's check re-reads
-    // inService before waiting and sees the pass already finished.
-    private int quiescenceWaiters;
+    // A private manager belongs to exactly one CursorSendEngine. Its callback
+    // is preallocated by that engine and stored directly here, so the critical
+    // timed-out-close handoff never allocates an ObjList or grows a backing
+    // array. Guarded by lock and consumed on worker-loop exit outside lock.
+    private Runnable ownedEngineExitCleanup;
     private long lastDiskFullLogNs;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
@@ -274,6 +286,62 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     /**
+     * Hands the single owning engine's preallocated close callback to the
+     * worker exit block. Registration only assigns a reference under
+     * {@link #lock}; it cannot allocate in the timed-out teardown path.
+     * Returns {@code false} only after the worker loop has exited (or when it
+     * never started), so the caller may then clean up inline safely.
+     */
+    public boolean deferOwnedEngineCloseUntilWorkerExit(Runnable cleanup) {
+        synchronized (lock) {
+            if (workerLoopExited || workerThread == null) {
+                return false;
+            }
+            if (ownedEngineExitCleanup != null && ownedEngineExitCleanup != cleanup) {
+                throw new IllegalStateException("owned manager already has an engine-exit cleanup");
+            }
+            ownedEngineExitCleanup = cleanup;
+            return true;
+        }
+    }
+
+    /**
+     * Hands a cleanup action to the current service pass for {@code ring}.
+     * The worker runs it outside the manager lock immediately after that pass
+     * finishes. Returns {@code false} when no pass for the ring remains in
+     * flight, in which case the caller already owns a quiescent ring and must
+     * run the cleanup itself.
+     * <p>
+     * Registration and pass completion coordinate through the entry's atomic
+     * state and callback fields, so there is no gap without an owner: either
+     * this method attaches the cleanup while the pass remains active, the
+     * worker claims an attached cleanup while completing, or this method
+     * observes completed state and rejects the handoff. A repeated registration
+     * for the same pass returns {@code true} without replacing its existing
+     * owner.
+     */
+    public boolean deferUntilRingQuiescent(SegmentRing ring, Runnable cleanup) {
+        RingEntry e = inService;
+        if (e == null || e.ring != ring || !e.isInService()) {
+            return false;
+        }
+        Runnable existing = ENTRY_CLEANUP_UPDATER.get(e);
+        if (existing == null && ENTRY_CLEANUP_UPDATER.compareAndSet(e, null, cleanup)) {
+            if (e.isInService()) {
+                return true;
+            }
+            // Completion changed the state before observing the callback.
+            // Remove our callback and clean inline, unless the worker already
+            // claimed it (in which case that worker remains the owner).
+            return !ENTRY_CLEANUP_UPDATER.compareAndSet(e, cleanup, null);
+        }
+        // A callback already attached to this pass is an owner. The sole
+        // production caller always supplies the engine's preallocated bound
+        // callback; duplicates intentionally do not replace it.
+        return true;
+    }
+
+    /**
      * Hands a cleanup action to the worker thread's exit block, to run
      * strictly after the worker loop has finished its final service pass --
      * i.e. after the last point where the worker can create, write or unlink
@@ -347,10 +415,14 @@ public final class SegmentManager implements QuietCloseable {
         long deadlineNanos = System.nanoTime() + workerJoinTimeoutMillis * 1_000_000L;
         boolean interrupted = Thread.interrupted();
         try {
+            RingEntry e = inService;
+            if (e == null || e.ring != ring || !e.isInService()) {
+                return true;
+            }
             synchronized (lock) {
-                quiescenceWaiters++;
+                e.quiescenceWaiters++;
                 try {
-                    while (inService != null && inService.ring == ring) {
+                    while (e.isInService()) {
                         long remainingNanos = deadlineNanos - System.nanoTime();
                         if (remainingNanos <= 0) {
                             return false;
@@ -364,7 +436,7 @@ public final class SegmentManager implements QuietCloseable {
                         }
                     }
                 } finally {
-                    quiescenceWaiters--;
+                    e.quiescenceWaiters--;
                 }
             }
             return true;
@@ -411,7 +483,7 @@ public final class SegmentManager implements QuietCloseable {
                     // single subtraction covers both the initial seed
                     // and the net manager activity (provisions minus
                     // trims) for this ring.
-                    e.registered = false;
+                    e.deregister();
                     totalBytes -= ring.totalSegmentBytes();
                     rings.remove(i);
                     return;
@@ -480,6 +552,11 @@ public final class SegmentManager implements QuietCloseable {
         // wakeWorker is cheap (a single LockSupport.unpark) and a no-op
         // when the worker has not been started yet.
         wakeWorker();
+    }
+
+    @TestOnly
+    public void setAfterRingCleanupHook(Runnable hook) {
+        this.afterRingCleanupHook = hook;
     }
 
     @TestOnly
@@ -607,33 +684,42 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     private void serviceRing(RingEntry e) {
-        // Claim the entry as in-service so deregister-side quiescence
-        // barriers (awaitRingQuiescence) can wait for this pass to finish.
-        // A stale snapshot entry deregistered before the pass starts is
-        // skipped entirely: the deregistering thread may already be
-        // releasing the ring / watermark / slot resources, so the worker
-        // must not touch them at all. The registered check and the
-        // in-service claim are atomic under `lock` — deregister flips
-        // `registered` under the same lock, so it either prevents this
-        // pass or the barrier observes it via `inService`.
-        synchronized (lock) {
-            if (!e.registered) {
-                return;
-            }
-            inService = e;
+        // Publish before the CAS so deregister + await can always find the
+        // entry. The state CAS is the ownership decision: if deregister won,
+        // this stale snapshot pass skips the ring without touching it.
+        inService = e;
+        if (!ENTRY_STATE_UPDATER.compareAndSet(e, ENTRY_REGISTERED, ENTRY_IN_SERVICE)) {
+            inService = null;
+            return;
         }
         try {
             serviceRing0(e);
         } finally {
-            synchronized (lock) {
-                inService = null;
-                // Wake quiescence barriers only when one is actually parked.
-                // In production no engine ever waits here (owned-manager
-                // close joins the worker thread instead), so the per-tick
-                // pass must not pay an unconditional notifyAll. notifyAll,
-                // not notify: distinct waiters may await different rings.
-                if (quiescenceWaiters > 0) {
-                    lock.notifyAll();
+            e.finishService();
+            Runnable cleanup = e.quiescenceCleanup == null
+                    ? null
+                    : ENTRY_CLEANUP_UPDATER.getAndSet(e, null);
+            inService = null;
+            // A normal pass performs only the two state CAS operations above.
+            // The manager monitor is entered here only for an actual close
+            // waiter; the recheck under lock prevents lost wakeups.
+            if (e.quiescenceWaiters > 0) {
+                synchronized (lock) {
+                    if (e.quiescenceWaiters > 0) {
+                        lock.notifyAll();
+                    }
+                }
+            }
+            if (cleanup != null) {
+                try {
+                    cleanup.run();
+                } catch (Throwable t) {
+                    LOG.error("deferred engine cleanup failed after manager-worker ring pass", t);
+                } finally {
+                    Runnable hook = afterRingCleanupHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
                 }
             }
         }
@@ -704,7 +790,7 @@ public final class SegmentManager implements QuietCloseable {
                     // observe the spare in the ring (and subtract it) or
                     // run before installation (so no install happens).
                     synchronized (lock) {
-                        if (e.registered) {
+                        if (e.isRegistered()) {
                             e.ring.installHotSpare(spare);
                             totalBytes += segmentSizeBytes;
                             installed = true;
@@ -754,7 +840,7 @@ public final class SegmentManager implements QuietCloseable {
             hook.run();
         }
         synchronized (lock) {
-            boolean registered = e.registered;
+            boolean registered = e.isRegistered();
             // Persist the current ackedFsn watermark BEFORE the trim runs.
             // On host crash between the persist and the unlinks below, the
             // segments survive and the watermark is correct. On crash AFTER
@@ -827,6 +913,7 @@ public final class SegmentManager implements QuietCloseable {
             // here reclaims the native buffer even when the worker outlives
             // every close() attempt — nobody else retries manager cleanup.
             ObjList<Runnable> cleanups;
+            Runnable ownedEngineCleanup;
             synchronized (lock) {
                 workerLoopExited = true;
                 if (scratchHandedToWorker && !scratchFreed) {
@@ -835,8 +922,10 @@ public final class SegmentManager implements QuietCloseable {
                 }
                 cleanups = exitCleanups;
                 exitCleanups = null;
+                ownedEngineCleanup = ownedEngineExitCleanup;
+                ownedEngineExitCleanup = null;
             }
-            // Deferred engine cleanups (see deferUntilWorkerExit) run OUTSIDE
+            // Deferred engine cleanups run OUTSIDE
             // `lock`: they perform syscalls (munmap, unlink, flock release)
             // and must never execute under a lock that close()/register/
             // deregister callers contend on. Running them after the loop body
@@ -845,6 +934,13 @@ public final class SegmentManager implements QuietCloseable {
             // monitor — a retried engine.close() joins this thread while
             // holding the engine monitor, which is why the engine side uses a
             // lock-free claim (CAS), not synchronization, for exactly-once.
+            if (ownedEngineCleanup != null) {
+                try {
+                    ownedEngineCleanup.run();
+                } catch (Throwable t) {
+                    LOG.error("deferred owned-engine cleanup failed on manager-worker exit", t);
+                }
+            }
             if (cleanups != null) {
                 for (int i = 0, n = cleanups.size(); i < n; i++) {
                     try {
@@ -870,16 +966,57 @@ public final class SegmentManager implements QuietCloseable {
         // Survives across multiple serviceRing ticks and avoids a
         // write-storm when ackedFsn is steady.
         long lastPersistedAck = -1L;
-        // Guarded by SegmentManager.lock. A worker snapshot may retain this
-        // entry after deregister() removes it from rings; registered=false is
-        // the O(1) ownership check that prevents post-deregister writes through
-        // the engine-owned watermark, hot-spare installs, and accounting.
-        boolean registered = true;
+        // Updated lock-free by deferUntilRingQuiescent and pass completion.
+        // The field updater avoids one AtomicReference allocation per ring.
+        volatile Runnable quiescenceCleanup;
+        // Waiters mutate this under SegmentManager.lock; pass completion reads
+        // it before taking the otherwise-cold notification path.
+        volatile int quiescenceWaiters;
+        // REGISTERED -> IN_SERVICE -> REGISTERED on a normal pass.
+        // Deregistration changes either registered state to its corresponding
+        // deregistered state; completion then changes DEREGISTERED_IN_SERVICE
+        // to DEREGISTERED. The field updater avoids per-entry allocation.
+        volatile int state = ENTRY_REGISTERED;
 
         RingEntry(SegmentRing ring, String dir, AckWatermark watermark) {
             this.ring = ring;
             this.dir = dir;
             this.watermark = watermark;
+        }
+
+        void deregister() {
+            while (true) {
+                int current = state;
+                int next = current == ENTRY_IN_SERVICE
+                        ? ENTRY_DEREGISTERED_IN_SERVICE
+                        : ENTRY_DEREGISTERED;
+                if (current == ENTRY_DEREGISTERED || current == ENTRY_DEREGISTERED_IN_SERVICE
+                        || ENTRY_STATE_UPDATER.compareAndSet(this, current, next)) {
+                    return;
+                }
+            }
+        }
+
+        void finishService() {
+            while (true) {
+                int current = state;
+                int next = current == ENTRY_DEREGISTERED_IN_SERVICE
+                        ? ENTRY_DEREGISTERED
+                        : ENTRY_REGISTERED;
+                if (ENTRY_STATE_UPDATER.compareAndSet(this, current, next)) {
+                    return;
+                }
+            }
+        }
+
+        boolean isInService() {
+            int current = state;
+            return current == ENTRY_IN_SERVICE || current == ENTRY_DEREGISTERED_IN_SERVICE;
+        }
+
+        boolean isRegistered() {
+            int current = state;
+            return current == ENTRY_REGISTERED || current == ENTRY_IN_SERVICE;
         }
     }
 }
