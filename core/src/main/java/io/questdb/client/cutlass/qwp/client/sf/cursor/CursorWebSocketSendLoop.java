@@ -200,7 +200,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
-    private WebSocketClient client;
+    private volatile WebSocketClient client;
     // Optional: when non-null, every server-rejection error (retriable and
     // terminal alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
@@ -763,6 +763,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // would block forever. isAlive()==false also covers the normal
             // post-exit case where the latch is already counted down.
             if (t.isAlive()) {
+                // Break a native send/receive before joining. Full client close
+                // must remain after the worker exit because it frees buffers the
+                // worker may still access.
+                WebSocketClient activeClient = client;
+                if (activeClient != null) {
+                    try {
+                        activeClient.closeTraffic();
+                    } catch (Throwable e) {
+                        // A custom transport that cannot safely cancel traffic
+                        // must not be destructively closed while the worker is
+                        // live. Fail without joining indefinitely; the worker's
+                        // exit path retains ownership of final cleanup.
+                        throw new LineSenderException(
+                                "cursor I/O thread did not stop: active transport does not support safe traffic shutdown; "
+                                        + "client/engine teardown is delegated to the I/O thread's exit path",
+                                e
+                        );
+                    }
+                }
                 try {
                     shutdownLatch.await();
                 } catch (InterruptedException e) {
@@ -1114,7 +1133,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * before the first connect attempt — see {@link #failPaced}.
      */
     private void connectLoop(Throwable initial, String phase, long paceFirstAttemptMillis) {
-        if (reconnectFactory == null || !running) {
+        if (!running) {
+            return;
+        }
+        if (reconnectFactory == null) {
             recordFatal(initial);
             return;
         }

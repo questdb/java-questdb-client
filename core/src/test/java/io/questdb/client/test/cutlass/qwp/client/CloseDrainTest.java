@@ -51,6 +51,83 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class CloseDrainTest {
 
+    @Test(timeout = 30_000L)
+    public void testCloseBlocksAcrossAllReplicaWindowUntilPromotion() throws Exception {
+        DelayingAckHandler handler = new DelayingAckHandler(0);
+        try (TestWebSocketServer server = new TestWebSocketServer(handler, false, "PRIMARY")) {
+            server.setRejectWithRole("REPLICA");
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";initial_connect_retry=async"
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=100"
+                    + ";close_flush_timeout_millis=10000;";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            CountDownLatch closeDrainWaiting = new CountDownLatch(1);
+            CountDownLatch releaseCloseDrain = new CountDownLatch(1);
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            AtomicReference<Throwable> hookFailure = new AtomicReference<>();
+            sender.setCloseDrainWaitingHook(() -> {
+                closeDrainWaiting.countDown();
+                try {
+                    if (!releaseCloseDrain.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("promotion did not release the close-drain witness");
+                    }
+                } catch (Throwable t) {
+                    hookFailure.set(t);
+                }
+            });
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            Thread closer = new Thread(() -> {
+                try {
+                    sender.close();
+                } catch (Throwable t) {
+                    closeFailure.set(t);
+                }
+            }, "all-replica-close-drain");
+            try {
+                closer.start();
+                Assert.assertTrue("server never produced the all-replica role rejection",
+                        server.awaitRoleReject(5, TimeUnit.SECONDS));
+                Assert.assertTrue("close never observed its real unacknowledged drain target",
+                        closeDrainWaiting.await(5, TimeUnit.SECONDS));
+
+                Assert.assertTrue("pre-promotion witness must include a role rejection",
+                        server.roleRejectCount() >= 1);
+                Assert.assertEquals("pre-promotion data must remain unacknowledged",
+                        -1L, sender.getAckedFsn());
+                Assert.assertTrue("close must remain pending for the whole all-replica window",
+                        closer.isAlive());
+                Assert.assertEquals("promotion must not have delivered or replayed the frame yet",
+                        0L, handler.nextSeq.get());
+
+                // The close-drain barrier has held continuously since it observed
+                // targetFsn > ackedFsn. Promote first, then release the barrier:
+                // completion therefore cannot precede the deterministic recovery event.
+                server.setAdvertisedRole("PRIMARY");
+                server.setRejectWithRole(null);
+                releaseCloseDrain.countDown();
+                closer.join(10_000L);
+
+                Assert.assertFalse("close did not complete after promotion", closer.isAlive());
+                Assert.assertNull("close-drain witness failed", hookFailure.get());
+                Assert.assertNull("close failed after promotion", closeFailure.get());
+                Assert.assertEquals("the unacknowledged frame must be delivered exactly once",
+                        1L, handler.nextSeq.get());
+            } finally {
+                server.setAdvertisedRole("PRIMARY");
+                server.setRejectWithRole(null);
+                releaseCloseDrain.countDown();
+                closer.join(10_000L);
+                sender.close();
+            }
+        }
+    }
+
     @Test
     public void testCloseBlocksUntilAckArrives() throws Exception {
         // Server delays every ACK by 800ms. With the default

@@ -230,6 +230,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_configureNonBlocking
     return res;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
+        (JNIEnv *e, jclass cl, jint fd) {
+    const int result = shutdown((SOCKET) fd, SD_BOTH);
+    if (result == SOCKET_ERROR) {
+        SaveLastError();
+    }
+    return result;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_recv
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jint len) {
     const int n = recv((SOCKET) fd, (char *) addr, len, 0);

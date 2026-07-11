@@ -516,6 +516,21 @@ public final class SegmentRing implements QuietCloseable {
         return sealedSegments.size() > 0 ? sealedSegments.get(0) : null;
     }
 
+    /**
+     * Returns the oldest fully acknowledged sealed segment without removing
+     * it. The segment manager keeps it owned by the ring until close + unlink
+     * succeeds, so a failed unlink cannot make the path disappear from live
+     * bookkeeping or allow its identifier to be reused.
+     */
+    public synchronized MmapSegment firstTrimmable() {
+        if (sealedSegments.size() == 0) {
+            return null;
+        }
+        MmapSegment segment = sealedSegments.get(0);
+        long lastSeq = segment.baseSeq() + segment.frameCount() - 1;
+        return lastSeq <= ackedFsn ? segment : null;
+    }
+
     /** Active segment -- exposed for the I/O thread's "send next batch" path. */
     /**
      * Walks every published frame in the ring (sealed segments plus the active
@@ -632,6 +647,22 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long publishedFsn() {
         return publishedFsn;
+    }
+
+    /**
+     * Commits removal of the segment returned by {@link #firstTrimmable()}.
+     * Returns false if concurrent lifecycle activity changed the head.
+     */
+    public synchronized boolean removeTrimmable(MmapSegment segment) {
+        if (sealedSegments.size() == 0 || sealedSegments.get(0) != segment) {
+            return false;
+        }
+        long lastSeq = segment.baseSeq() + segment.frameCount() - 1;
+        if (lastSeq > ackedFsn) {
+            return false;
+        }
+        sealedSegments.remove(0);
+        return true;
     }
 
     /**

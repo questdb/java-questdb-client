@@ -189,6 +189,9 @@ public class QwpWebSocketSender implements Sender {
     // Null in production; set reflectively by tests.
     @TestOnly
     private volatile java.util.function.Supplier<WebSocketClient> clientFactoryOverride;
+    // Test-only lifecycle witness. drainOnClose() invokes and clears it after
+    // confirming a real unacknowledged close target, immediately before waiting.
+    private volatile Runnable closeDrainWaitingHook;
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
@@ -290,6 +293,9 @@ public class QwpWebSocketSender implements Sender {
     // re-probe retired slots to recover their capacity. volatile: written on
     // the closing thread, read by pool threads.
     private volatile boolean slotLockReleased;
+    // Optional owning-pool notification, relayed after the engine confirms the
+    // flock release and slotLockReleased is visible to pool re-probes.
+    private volatile Runnable slotLockReleaseListener;
     // Engine whose close() could not complete during sender close() — its
     // cleanup is pending on a worker/I/O-thread exit path. isSlotLockReleased()
     // re-probes it so a late flock release becomes visible to the owning pool.
@@ -1368,6 +1374,17 @@ public class QwpWebSocketSender implements Sender {
         return false;
     }
 
+    /**
+     * Registers a callback for confirmed SF slot-lock release. Pools use this
+     * to wake borrowers without waiting for a timeout or housekeeper tick.
+     */
+    public void setSlotLockReleaseListener(Runnable listener) {
+        slotLockReleaseListener = listener;
+        if (listener != null && slotLockReleased) {
+            listener.run();
+        }
+    }
+
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
         checkNotClosed();
@@ -2208,6 +2225,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Installs a one-shot test witness that close-time drain invokes after it
+     * observes a real unacknowledged target and before it starts waiting.
+     * Production code never sets it.
+     */
+    @TestOnly
+    public void setCloseDrainWaitingHook(Runnable hook) {
+        this.closeDrainWaitingHook = hook;
+    }
+
+    /**
      * Installs a one-shot test witness that {@link #close()} invokes after it
      * publishes the closed-state transition and before it starts drain or
      * teardown work. Production code never sets it.
@@ -2302,6 +2329,9 @@ public class QwpWebSocketSender implements Sender {
         }
         this.cursorEngine = engine;
         this.ownsCursorEngine = takeOwnership && engine != null;
+        if (engine != null) {
+            engine.setSlotLockReleaseListener(this::onSlotLockReleased);
+        }
     }
 
     /**
@@ -3272,6 +3302,16 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine.ackedFsn() >= target) {
             return;
         }
+        Runnable hook = closeDrainWaitingHook;
+        closeDrainWaitingHook = null;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (Throwable t) {
+                // A test witness must never prevent production resource cleanup.
+                LOG.error("Error in close-drain-waiting test hook: {}", String.valueOf(t));
+            }
+        }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
         while (cursorEngine.ackedFsn() < target) {
             // Stop on a latched terminal (acks will never reach target);
@@ -3630,6 +3670,14 @@ public class QwpWebSocketSender implements Sender {
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
         resetTableBuffersAfterFlush(keys);
+    }
+
+    private void onSlotLockReleased() {
+        slotLockReleased = true;
+        Runnable listener = slotLockReleaseListener;
+        if (listener != null) {
+            listener.run();
+        }
     }
 
     private void resetTableBuffersAfterFlush(ObjList<CharSequence> keys) {

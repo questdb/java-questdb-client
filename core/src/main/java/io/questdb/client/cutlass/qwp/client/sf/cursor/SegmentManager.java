@@ -80,6 +80,7 @@ public final class SegmentManager implements QuietCloseable {
     private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
     private final AtomicLong fileGeneration = new AtomicLong();
+    private final FilesFacade filesFacade;
     private final Object lock = new Object();
     private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
@@ -173,11 +174,11 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE);
     }
 
     public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE);
     }
 
     /**
@@ -203,6 +204,11 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
+        this(segmentSizeBytes, pollNanos, maxTotalBytes, FilesFacade.INSTANCE);
+    }
+
+    @TestOnly
+    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
         // The pathScratch field initializer has already allocated its native
         // buffer by the time this body runs, so a validation throw must free
         // it or every failed construction leaks 256 bytes of native memory
@@ -217,6 +223,7 @@ public final class SegmentManager implements QuietCloseable {
                     "maxTotalBytes (" + maxTotalBytes + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");
         }
+        this.filesFacade = filesFacade;
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
         this.maxTotalBytes = maxTotalBytes;
@@ -613,21 +620,19 @@ public final class SegmentManager implements QuietCloseable {
      * files in {@code dir}, or {@code -1} if none exist. Skips files that
      * don't match the pattern (e.g. the legacy {@code sf-initial.sfa}).
      */
-    private static long scanMaxGeneration(String dir) {
+    private long scanMaxGeneration(String dir) {
         long max = -1L;
-        if (!Files.exists(dir)) return max;
-        long find = Files.findFirst(dir);
+        if (!filesFacade.exists(dir)) return max;
+        long find = filesFacade.findFirst(dir);
         if (find < 0) {
-            LOG.warn("scanMaxGeneration could not enumerate {}; "
-                    + "next spare may collide with an existing on-disk segment", dir);
-            return max;
+            throw new IllegalStateException("could not enumerate SF segment directory " + dir);
         }
         if (find == 0) return max;
         try {
             int rc = 1;
             while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                rc = Files.findNext(find);
+                String name = Files.utf8ToString(filesFacade.findName(find));
+                rc = filesFacade.findNext(find);
                 if (name == null || !name.startsWith("sf-") || !name.endsWith(".sfa")) {
                     continue;
                 }
@@ -640,8 +645,11 @@ public final class SegmentManager implements QuietCloseable {
                     // sf-initial.sfa or non-hex — skip
                 }
             }
+            if (rc < 0) {
+                throw new IllegalStateException("could not fully enumerate SF segment directory " + dir);
+            }
         } finally {
-            Files.findClose(find);
+            filesFacade.findClose(find);
         }
         return max;
     }
@@ -769,7 +777,7 @@ public final class SegmentManager implements QuietCloseable {
                         // via its long-ptr overload, bypassing the byte[] + native
                         // malloc that the String overload would incur on every
                         // rotation.
-                        spare = MmapSegment.create(FilesFacade.INSTANCE,
+                        spare = MmapSegment.create(filesFacade,
                                 pathScratch.ptr(), path,
                                 e.ring.nextSeqHint(), segmentSizeBytes);
                     }
@@ -815,7 +823,7 @@ public final class SegmentManager implements QuietCloseable {
                     // on disk, this is the second-line defense. Repeated
                     // unlink on an already-removed path is a harmless no-op.
                     if (path != null) {
-                        Files.remove(path);
+                        filesFacade.remove(path);
                     }
                 }
             }
@@ -828,57 +836,52 @@ public final class SegmentManager implements QuietCloseable {
         //    The watermark write and totalBytes commit are registration-gated
         //    under `lock` so stale worker snapshots cannot touch the
         //    engine-owned watermark or mutate accounting after deregister()
-        //    returns. drainTrimmable still runs for stale snapshots: it
-        //    transfers ownership of fully-acked sealed segments to this
-        //    worker, preserving the old close + unlink behavior.
+        //    returns. Trimming still runs for stale snapshots: a successful
+        //    close + unlink transfers the fully-acked segment out of the ring,
+        //    preserving cleanup without touching deregistered accounting.
         //
         //    munmap + unlink stay outside the lock — they can be slow
         //    and shouldn't block register/deregister or sibling rings.
-        ObjList<MmapSegment> trim;
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
             hook.run();
         }
+        boolean trimFailed = false;
+        while (true) {
+            MmapSegment segment = e.ring.firstTrimmable();
+            if (segment == null) {
+                break;
+            }
+            String path = segment.path();
+            try {
+                segment.close();
+                if (path != null && !filesFacade.remove(path)) {
+                    trimFailed = true;
+                    LOG.warn("Failed to unlink trimmed segment {}", path);
+                    break;
+                }
+                synchronized (lock) {
+                    if (e.ring.removeTrimmable(segment) && e.isRegistered()) {
+                        totalBytes -= segment.sizeBytes();
+                    }
+                }
+            } catch (Throwable t) {
+                trimFailed = true;
+                LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
+                break;
+            }
+        }
+        // An unlink failure leaves the acknowledged segment in the ring and
+        // on disk. Do not advance the persisted watermark past it: recovery
+        // must continue to see the failed path as live bookkeeping rather
+        // than infer that trim committed. A later successful retry persists
+        // the current cumulative ACK normally.
         synchronized (lock) {
-            boolean registered = e.isRegistered();
-            // Persist the current ackedFsn watermark BEFORE the trim runs.
-            // On host crash between the persist and the unlinks below, the
-            // segments survive and the watermark is correct. On crash AFTER
-            // the unlinks but before next tick, the segments are gone and
-            // the watermark is stale, but recovery clamps with
-            // max(lowestSurvivingBaseSeq - 1, watermark) so either ordering
-            // is safe. Memory-mode rings (and callers that didn't supply a
-            // watermark) skip the write.
-            // Persist only on advance to avoid pointless mmap stores when
-            // ackedFsn is steady. The store is a single 8-byte put against
-            // an already-mapped region -- no syscall, no allocation -- but
-            // the gate keeps the dirty-page footprint minimal under
-            // steady-state load with no new acks arriving.
-            if (registered && e.watermark != null) {
+            if (!trimFailed && e.isRegistered() && e.watermark != null) {
                 long currentAck = e.ring.ackedFsn();
                 if (currentAck > e.lastPersistedAck) {
                     e.watermark.write(currentAck);
                     e.lastPersistedAck = currentAck;
-                }
-            }
-            trim = e.ring.drainTrimmable();
-            if (registered && trim != null) {
-                for (int i = 0, n = trim.size(); i < n; i++) {
-                    totalBytes -= trim.get(i).sizeBytes();
-                }
-            }
-        }
-        if (trim != null) {
-            for (int i = 0, n = trim.size(); i < n; i++) {
-                MmapSegment s = trim.get(i);
-                String path = s.path();
-                try {
-                    s.close();
-                    if (path != null && !Files.remove(path)) {
-                        LOG.warn("Failed to unlink trimmed segment {}", path);
-                    }
-                } catch (Throwable t) {
-                    LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
                 }
             }
         }

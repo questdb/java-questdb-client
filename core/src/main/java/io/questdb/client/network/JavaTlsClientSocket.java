@@ -150,6 +150,14 @@ public final class JavaTlsClientSocket implements Socket {
     }
 
     @Override
+    public void closeTraffic() {
+        // A concurrent TLS send may still use the SSLEngine and direct buffers.
+        // Shut down only the delegate traffic path here; close() releases the
+        // retained fd and frees TLS state after the owning worker has stopped.
+        delegate.closeTraffic();
+    }
+
+    @Override
     public int getFd() {
         return delegate.getFd();
     }

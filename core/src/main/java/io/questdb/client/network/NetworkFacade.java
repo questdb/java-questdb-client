@@ -78,6 +78,15 @@ public interface NetworkFacade {
 
     int setTcpNoDelay(int fd, boolean noDelay);
 
+    /**
+     * Shuts down traffic on a descriptor owned by this facade without releasing
+     * the descriptor. Custom facades must override this method rather than let
+     * native code operate on a synthetic or remapped descriptor.
+     */
+    default int shutdown(int fd) {
+        throw new UnsupportedOperationException("traffic shutdown is not supported by this network facade");
+    }
+
     long sockaddr(int address, int port);
 
     int socketTcp(boolean blocking);

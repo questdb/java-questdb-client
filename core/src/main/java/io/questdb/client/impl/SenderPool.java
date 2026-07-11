@@ -220,8 +220,9 @@ public final class SenderPool implements AutoCloseable {
     // races it. recoveryInRangeNext is the next in-range index in [0, maxSize)
     // for pass 1; recoveryOutOfRange / recoveryOutOfRangeNext are the lazily
     // built pass-2 work list (same-base slots at index >= maxSize) and its
-    // cursor; recoveryComplete latches true when the whole scan finishes or is
-    // aborted, making runStartupRecoveryStep()/...ToCompletion() idempotent.
+    // cursor; recoveryComplete latches true only when the whole scan finishes.
+    // A transient build failure or drain timeout leaves the current candidate
+    // pending so a later tick or explicit drive can retry it on the same pool.
     private int recoveryInRangeNext;
     private IntList recoveryOutOfRange;
     private int recoveryOutOfRangeNext;
@@ -427,8 +428,9 @@ public final class SenderPool implements AutoCloseable {
      * No-op (returns {@code false}) when SF is off, the pool is shutting down, or
      * recovery has already finished.
      *
-     * @return {@code true} if recovery has more work (call again), {@code false}
-     * when recovery is complete or the pool is shutting down
+     * @return {@code true} if recovery has more work immediately; {@code false}
+     * when recovery is complete, the pool is shutting down, or a transient
+     * failure deferred the current candidate until a later tick
      */
     boolean runStartupRecoveryStep() {
         if (!storeAndForward || closed || recoveryComplete) {
@@ -469,9 +471,10 @@ public final class SenderPool implements AutoCloseable {
      * {@code slotInUse} entry and are never allocated by borrow().
      * <p>
      * Best-effort throughout: a build/close Error or a slow drain is logged and
-     * never propagates, since the data stays durable on disk for a later attempt;
-     * the first build failure or drain timeout latches {@code recoveryComplete}
-     * (the failure will very likely repeat for every remaining slot).
+     * never propagates, since the data stays durable on disk for a later attempt.
+     * A build failure or drain timeout stops the current drive but leaves its
+     * candidate pending so a later housekeeper tick can retry after a transient
+     * condition clears; it does not poison recovery for the life of the pool.
      * <p>
      * <b>Boundedness / residual window.</b> Recovery is driven on the
      * PoolHousekeeper thread, and {@code close()} relies on a step finishing
@@ -541,9 +544,8 @@ public final class SenderPool implements AutoCloseable {
                 recoveryInRangeNext++;
                 continue;
             }
-            // A real candidate -> spend the step on it. Advance the cursor first
-            // so a resume never reprocesses this index.
-            recoveryInRangeNext++;
+            // A real candidate -> spend the step on it. Advance the cursor only
+            // after success so a transient build/drain failure remains retryable.
             boolean stopScan = drainCandidateSlotForRecovery(i, slotPath, stepBudgetMillis, retained);
             lock.lock();
             try {
@@ -579,12 +581,12 @@ public final class SenderPool implements AutoCloseable {
                 lock.unlock();
             }
             if (stopScan) {
-                // A build failure or drain timeout that will very likely repeat
-                // for every remaining slot -- abort the scan; the data stays
-                // durable on disk for a later attempt. Do not start pass 2.
-                recoveryComplete = true;
+                // Stop this drive without advancing the cursor. The same live
+                // pool retries this candidate after the transient condition is
+                // removed instead of requiring pool recreation.
                 return false;
             }
+            recoveryInRangeNext++;
             return true;
         }
 
@@ -605,9 +607,10 @@ public final class SenderPool implements AutoCloseable {
             if (closed) {
                 return false;
             }
-            int idx = recoveryOutOfRange.getQuick(recoveryOutOfRangeNext++);
+            int idx = recoveryOutOfRange.getQuick(recoveryOutOfRangeNext);
             String slotPath = sfDir + "/" + slotBaseId + "-" + idx;
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
+                recoveryOutOfRangeNext++;
                 continue;
             }
             boolean stopScan = drainCandidateSlotForRecovery(idx, slotPath, stepBudgetMillis, retained);
@@ -626,9 +629,12 @@ public final class SenderPool implements AutoCloseable {
                         slotPath);
             }
             if (stopScan) {
-                recoveryComplete = true;
+                // Keep the out-of-range cursor on this candidate. In particular,
+                // a transient flock/build collision must be retried after the
+                // primary sender returns; no capacity bookkeeping is involved.
                 return false;
             }
+            recoveryOutOfRangeNext++;
             return true;
         }
 
@@ -678,7 +684,7 @@ public final class SenderPool implements AutoCloseable {
                 // likely repeat for every remaining slot, so stop here rather
                 // than pay a connect timeout per slot.
                 LOG.warn("startup SF recovery: could not open slot {} ({}); "
-                        + "skipping remaining slots", slotPath, buildErr.toString());
+                        + "deferring this and remaining slots", slotPath, buildErr.toString());
                 return true;
             }
             try {
@@ -688,7 +694,7 @@ public final class SenderPool implements AutoCloseable {
                 // same reasoning as the build-failure case above.
                 if (!recoverer.delegate().drain(remainingMillis)) {
                     LOG.warn("startup SF recovery: drain did not ack slot {} "
-                            + "within {}ms; skipping remaining slots",
+                            + "within {}ms; deferring this and remaining slots",
                             slotPath, remainingMillis);
                     stopScan = true;
                 }
@@ -811,10 +817,10 @@ public final class SenderPool implements AutoCloseable {
                 // Capacity-starved: re-probe retired slots BEFORE the terminal
                 // timeout check — a deferred engine cleanup may have released a
                 // flock since the retire, and the freed index can admit a
-                // creation right now. The release itself never signals
-                // slotReleased (it happens in the delegate on a worker/I/O-thread
-                // exit path, volatile writes only), so this poll is the only way
-                // a borrower learns of it. Ordering matters twice over: a
+                // creation right now. The delegate normally signals this pool
+                // after deferred release, while this probe also covers delegates
+                // that do not expose that notification and release/listener races.
+                // Ordering matters twice over: a
                 // zero-timeout (try-once) borrow must get its one probe before
                 // throwing, and a borrower whose awaitNanos budget just expired
                 // must get a final probe on its wake-up pass instead of timing
@@ -1207,7 +1213,11 @@ public final class SenderPool implements AutoCloseable {
     }
 
     private SenderSlot createUnlocked(int slotIndex) {
-        return new SenderSlot(senderFactory.apply(slotIndex), this, slotIndex);
+        Sender delegate = senderFactory.apply(slotIndex);
+        if (delegate instanceof QwpWebSocketSender) {
+            ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(this::recoverReleasedSlots);
+        }
+        return new SenderSlot(delegate, this, slotIndex);
     }
 
     /**
@@ -1218,7 +1228,11 @@ public final class SenderPool implements AutoCloseable {
      * {@link #drainCandidateSlotForRecovery}.
      */
     private SenderSlot createRecoverer(int slotIndex) {
-        return new SenderSlot(recoverySenderFactory.apply(slotIndex), this, slotIndex);
+        Sender delegate = recoverySenderFactory.apply(slotIndex);
+        if (delegate instanceof QwpWebSocketSender) {
+            ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(this::recoverReleasedSlots);
+        }
+        return new SenderSlot(delegate, this, slotIndex);
     }
 
     private Sender defaultSender(int slotIndex) {
@@ -1396,6 +1410,15 @@ public final class SenderPool implements AutoCloseable {
                         "[leakedSlots={}]; the slot is re-probed and recovered if the worker releases the flock later",
                 s.slotIndex(), context, maxSize - leakedSlots, maxSize, leakedSlots);
         return false;
+    }
+
+    private void recoverReleasedSlots() {
+        lock.lock();
+        try {
+            reprobeRetiredSlots();
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**

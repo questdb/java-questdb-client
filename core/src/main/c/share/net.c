@@ -128,6 +128,11 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_send
     return com_questdb_network_Net_EOTHERDISCONNECT;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
+        (JNIEnv *e, jclass cl, jint fd) {
+    return shutdown((int) fd, SHUT_RDWR);
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_recv
         (JNIEnv *e, jclass cl, jint fd, jlong ptr, jint len) {
     ssize_t n;

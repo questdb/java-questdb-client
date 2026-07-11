@@ -777,6 +777,100 @@ public class SenderPoolSfTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testDeferredFlockReleaseWakesParkedLongTimeoutBorrower() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String config = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(
+                        config, 1, 1, 60_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender lease = pool.borrow();
+                    Sender delegate = getDelegate(lease);
+                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
+                    SlotLock slotLock = (SlotLock) getField(engine, "slotLock");
+                    Field fdField = SlotLock.class.getDeclaredField("fd");
+                    fdField.setAccessible(true);
+                    int realFd = fdField.getInt(slotLock);
+                    Assert.assertTrue("precondition: live flock fd", realFd >= 0);
+
+                    CountDownLatch borrowerAcquired = new CountDownLatch(1);
+                    CountDownLatch borrowerParked = new CountDownLatch(1);
+                    CountDownLatch releaseBorrower = new CountDownLatch(1);
+                    AtomicReference<Throwable> borrowerFailure = new AtomicReference<>();
+                    AtomicReference<PooledSender> recovered = new AtomicReference<>();
+                    Thread borrower = new Thread(() -> {
+                        try {
+                            recovered.set(pool.borrow());
+                            borrowerAcquired.countDown();
+                            if (!releaseBorrower.await(10, TimeUnit.SECONDS)) {
+                                throw new AssertionError("timed out waiting to release borrower");
+                            }
+                        } catch (Throwable t) {
+                            borrowerFailure.compareAndSet(null, t);
+                        } finally {
+                            PooledSender sender = recovered.get();
+                            if (sender != null) {
+                                sender.close();
+                            }
+                        }
+                    }, "sender-pool-deferred-release-waiter");
+
+                    try {
+                        synchronized (slotLock) {
+                            fdField.setInt(slotLock, 1_000_000_000);
+                        }
+                        invokeDiscardBroken(pool, lease);
+                        Assert.assertEquals("failed release must retire the only slot",
+                                1, pool.leakedSlotCount());
+                        Assert.assertFalse(engine.isCloseCompleted());
+
+                        pool.setBeforeBorrowWaitHook(borrowerParked::countDown);
+                        borrower.start();
+                        Assert.assertTrue("borrower must reach the condition wait with a long timeout",
+                                borrowerParked.await(5, TimeUnit.SECONDS));
+                        // The hook runs under the pool lock immediately before awaitNanos.
+                        // Acquiring that lock here proves awaitNanos atomically enqueued the
+                        // borrower and released the lock before restoration can start. This
+                        // read-only operation neither changes pool state nor signals a waiter.
+                        pool.availableSize();
+
+                        // This restored fd is the only source of progress: the retry driver
+                        // confirms the release. There is no housekeeper or pool mutation.
+                        synchronized (slotLock) {
+                            fdField.setInt(slotLock, realFd);
+                        }
+                        Assert.assertTrue("deferred flock release must wake the parked borrower",
+                                borrowerAcquired.await(5, TimeUnit.SECONDS));
+                        Assert.assertNull("borrower must not fail", borrowerFailure.get());
+                        Assert.assertEquals("release wakeup must recover retired capacity",
+                                0, pool.leakedSlotCount());
+                    } finally {
+                        pool.setBeforeBorrowWaitHook(null);
+                        releaseBorrower.countDown();
+                        if (!engine.isCloseCompleted()) {
+                            synchronized (slotLock) {
+                                fdField.setInt(slotLock, realFd);
+                            }
+                        }
+                        borrower.join(TimeUnit.SECONDS.toMillis(1));
+                        if (borrower.isAlive()) {
+                            borrower.interrupt();
+                            borrower.join(TimeUnit.SECONDS.toMillis(5));
+                        }
+                        Assert.assertFalse("borrower thread must finish", borrower.isAlive());
+                    }
+                    if (borrowerFailure.get() != null) {
+                        throw new AssertionError("borrower failed", borrowerFailure.get());
+                    }
+                }
+            }
+        });
+    }
+
     @Test
     public void testMixedRetiredSlotsRecoverWithoutLosingAccounting() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -2196,6 +2290,84 @@ public class SenderPoolSfTest {
                     // Sanity: the pool is still usable for normal borrows.
                     PooledSender a = pool.borrow();
                     a.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFailedOutOfRangeRecoveryRetriesAfterPrimaryReturns() throws Exception {
+        // A deferred pool can already have its sole in-range sender borrowed when
+        // startup recovery reaches an out-of-range slot left by a larger pool.
+        // A transient recoverer build failure must leave that candidate pending:
+        // after the primary lease returns, the SAME pool must retry and drain it.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String seedConfig = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                        + ";sender_id=default-1;close_flush_timeout_millis=0;";
+                try (Sender seed = Sender.fromConfig(seedConfig)) {
+                    seed.table("recover").longColumn("v", 1L).atNow();
+                    seed.flush();
+                }
+            }
+            Assert.assertTrue("out-of-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-1")));
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                AtomicBoolean primaryReturned = new AtomicBoolean();
+                AtomicInteger recoveryAttempts = new AtomicInteger();
+                IntFunction<Sender> factory = idx -> {
+                    if (idx == 1) {
+                        recoveryAttempts.incrementAndGet();
+                        if (!primaryReturned.get()) {
+                            throw new LineSenderException("transient out-of-range recovery failure");
+                        }
+                    }
+                    return Sender.builder(config).senderId("default-" + idx).build();
+                };
+
+                try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 5_000, factory)) {
+                    PooledSender primary = pool.borrow();
+                    Object primarySlot = slotOf(primary);
+
+                    Assert.assertFalse("first recovery attempt must stop at the transient failure",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertEquals("exactly one out-of-range recovery attempt", 1,
+                            recoveryAttempts.get());
+                    Assert.assertTrue("failed recovery must preserve the candidate",
+                            hasSegmentFile(slot("default-1")));
+                    Assert.assertEquals("out-of-range failure must not consume in-range capacity",
+                            0, pool.leakedSlotCount());
+                    Assert.assertTrue("out-of-range recoverer must not enter retired-slot bookkeeping",
+                            ((List<?>) getField(pool, "retiredSlots")).isEmpty());
+
+                    primary.close();
+                    primaryReturned.set(true);
+                    invokeRunStartupRecoveryOnce(pool);
+
+                    Assert.assertEquals("same live pool must retry the out-of-range candidate", 2,
+                            recoveryAttempts.get());
+                    Assert.assertFalse("retry must drain the preserved out-of-range data",
+                            hasSegmentFile(slot("default-1")));
+                    Assert.assertTrue("retry must deliver the recovered frame", handler.frames.get() >= 1);
+                    Assert.assertEquals("successful out-of-range retry must not consume capacity",
+                            0, pool.leakedSlotCount());
+                    Assert.assertTrue("out-of-range retry must leave retired slots untouched",
+                            ((List<?>) getField(pool, "retiredSlots")).isEmpty());
+
+                    PooledSender next = pool.borrow();
+                    try {
+                        Assert.assertSame("normal borrow must reuse the returned primary slot",
+                                primarySlot, slotOf(next));
+                    } finally {
+                        next.close();
+                    }
                 }
             }
         });

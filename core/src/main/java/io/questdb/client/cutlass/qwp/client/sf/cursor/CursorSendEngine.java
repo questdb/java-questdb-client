@@ -30,6 +30,8 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
 
+import java.util.ArrayDeque;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
@@ -65,7 +67,15 @@ public final class CursorSendEngine implements QuietCloseable {
     public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
+    private static final ThreadFactory DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY =
+            runnable -> new Thread(runnable, "qdb-sf-flock-release-retry");
+    private static final Object FLOCK_RELEASE_RETRY_LOCK = new Object();
+    private static final ArrayDeque<CursorSendEngine> FLOCK_RELEASE_RETRY_QUEUE = new ArrayDeque<>();
+    private static volatile Runnable afterFlockReleaseRetryFailureHook;
     private static volatile Runnable beforeDeferredCloseCreationHook;
+    private static Thread flockReleaseRetryThread;
+    private static volatile ThreadFactory flockReleaseRetryThreadFactory =
+            DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
     private final long appendDeadlineNanos;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
@@ -136,6 +146,9 @@ public final class CursorSendEngine implements QuietCloseable {
     // isCloseCompleted() from pool threads re-probing a retired slot (see the
     // getter for why it must not synchronize).
     private volatile boolean closeCompleted;
+    // Invoked after closeCompleted publishes a confirmed flock release. Used
+    // by an owning sender pool to wake capacity-starved borrowers immediately.
+    private volatile Runnable slotLockReleaseListener;
     // Test-only hook run by finishClose() between the terminal cleanup and
     // the flock release. Lets a test park the releasing thread inside the
     // cleanup/release window and assert that closeCompleted stays false —
@@ -143,8 +156,8 @@ public final class CursorSendEngine implements QuietCloseable {
     // held. volatile: finishClose may run on the manager worker's exit
     // thread while the hook is installed from a test thread.
     private volatile Runnable beforeFlockReleaseHook;
-    // Exactly one daemon drives a failed flock release to completion. The
-    // error path only: ordinary closes never allocate or start a thread.
+    // Ensures this engine has at most one entry in the shared flock-release
+    // retry driver. The error path only: ordinary closes never enqueue work.
     private final AtomicBoolean flockReleaseRetryStarted = new AtomicBoolean();
     // Published before deferredClose is registered. The manager lock provides
     // the callback handoff fence; volatile also covers a direct test/retry read.
@@ -782,6 +795,15 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Installs a hook invoked after each failed shared-driver flock release.
+     * Test-only: makes persistent retry progress observable without sleeps.
+     */
+    @TestOnly
+    public static void setAfterFlockReleaseRetryFailureHook(Runnable hook) {
+        afterFlockReleaseRetryFailureHook = hook;
+    }
+
+    /**
      * Installs a constructor fault hook immediately before the bound deferred
      * close callback is created. Test-only: proves callback allocation failure
      * occurs before an owned manager acquires native resources.
@@ -789,6 +811,23 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public static void setBeforeDeferredCloseCreationHook(Runnable hook) {
         beforeDeferredCloseCreationHook = hook;
+    }
+
+    /**
+     * Overrides creation of the single shared flock-release retry thread.
+     * Test-only: makes thread creation/start failure and persistent retry
+     * scalability deterministic without relying on scheduler timing.
+     */
+    @TestOnly
+    public static void setFlockReleaseRetryThreadFactory(ThreadFactory factory) {
+        synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+            if (flockReleaseRetryThread != null || !FLOCK_RELEASE_RETRY_QUEUE.isEmpty()) {
+                throw new IllegalStateException("flock-release retry driver is active");
+            }
+            flockReleaseRetryThreadFactory = factory == null
+                    ? DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY
+                    : factory;
+        }
     }
 
     /**
@@ -849,42 +888,97 @@ public final class CursorSendEngine implements QuietCloseable {
         }
         if (released) {
             closeCompleted = true;
+            Runnable listener = slotLockReleaseListener;
+            if (listener != null) {
+                try {
+                    listener.run();
+                } catch (Throwable ignored) {
+                    // A notification failure must not invalidate a confirmed release.
+                }
+            }
             return true;
         }
         startFlockReleaseRetry();
         return false;
     }
 
+    private static void runFlockReleaseRetryDriver() {
+        while (true) {
+            final int roundSize;
+            synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                roundSize = FLOCK_RELEASE_RETRY_QUEUE.size();
+                if (roundSize == 0) {
+                    flockReleaseRetryThread = null;
+                    return;
+                }
+            }
+            boolean hasFailures = false;
+            for (int i = 0; i < roundSize; i++) {
+                final CursorSendEngine engine;
+                synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                    engine = FLOCK_RELEASE_RETRY_QUEUE.pollFirst();
+                }
+                if (engine.retryFlockReleaseIfReady()) {
+                    engine.flockReleaseRetryStarted.set(false);
+                } else {
+                    synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                        FLOCK_RELEASE_RETRY_QUEUE.addLast(engine);
+                    }
+                    hasFailures = true;
+                    Runnable hook = afterFlockReleaseRetryFailureHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
+            }
+            if (hasFailures) {
+                // Interruption must not abandon a retained flock, but clear
+                // the flag so subsequent parks still throttle retries.
+                Thread.interrupted();
+                LockSupport.parkNanos(100_000_000L);
+            }
+        }
+    }
+
     private void startFlockReleaseRetry() {
         if (!flockReleaseRetryStarted.compareAndSet(false, true)) {
             return;
         }
-        try {
-            Thread retryThread = new Thread(() -> {
-                while (!retryFlockReleaseIfReady()) {
-                    try {
-                        Thread.sleep(100L);
-                    } catch (InterruptedException ignored) {
-                        // A failed flock release must remain retryable until
-                        // confirmed or process exit; interruption is not a
-                        // safe reason to abandon the slot permanently.
+        Throwable startFailure = null;
+        synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+            FLOCK_RELEASE_RETRY_QUEUE.addLast(this);
+            if (flockReleaseRetryThread == null) {
+                try {
+                    Thread retryThread = flockReleaseRetryThreadFactory.newThread(
+                            CursorSendEngine::runFlockReleaseRetryDriver);
+                    if (retryThread == null) {
+                        throw new IllegalStateException("retry thread factory returned null");
+                    }
+                    retryThread.setDaemon(true);
+                    flockReleaseRetryThread = retryThread;
+                    retryThread.start();
+                } catch (Throwable t) {
+                    startFailure = t;
+                    flockReleaseRetryThread = null;
+                    CursorSendEngine queued;
+                    while ((queued = FLOCK_RELEASE_RETRY_QUEUE.pollFirst()) != null) {
+                        queued.flockReleaseRetryStarted.set(false);
                     }
                 }
-            }, "qdb-sf-flock-release-retry");
-            retryThread.setDaemon(true);
-            retryThread.start();
+            }
+        }
+        if (startFailure == null) {
             LOG.error("SF slot flock release failed during engine close; keeping "
-                            + "closeCompleted=false and retrying outside the pool lock so "
+                            + "closeCompleted=false and retrying on the shared driver so "
                             + "retired capacity recovers after the transient failure [slot={}]",
                     sfDir == null ? "<memory>" : sfDir);
-        } catch (Throwable t) {
+        } else {
             // A later explicit close() can still retry without repeating the
-            // one-time ring/watermark cleanup. The kernel remains the final
-            // process-exit backstop if thread creation and all retries fail.
-            flockReleaseRetryStarted.set(false);
+            // one-time ring/watermark cleanup. The failed queue is cleared so
+            // the driver does not retain engines it cannot service.
             LOG.error("Could not start SF flock-release retry driver; close() may be "
                             + "invoked again to retry [slot={}, error={}]",
-                    sfDir == null ? "<memory>" : sfDir, String.valueOf(t));
+                    sfDir == null ? "<memory>" : sfDir, String.valueOf(startFailure));
         }
     }
 
@@ -908,6 +1002,17 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public boolean isCloseCompleted() {
         return closeCompleted;
+    }
+
+    /**
+     * Registers a callback for confirmed SF slot-lock release. If release
+     * already completed, invokes the callback before returning.
+     */
+    public void setSlotLockReleaseListener(Runnable listener) {
+        slotLockReleaseListener = listener;
+        if (listener != null && closeCompleted) {
+            listener.run();
+        }
     }
 
     /**
