@@ -573,9 +573,13 @@ public final class SegmentRing implements QuietCloseable {
         // Sealed segments are in baseSeq order, oldest first; once we hit one
         // that isn't fully acked, none of the later ones can be either.
         // Synchronized so the I/O thread's snapshotSealedSegments() can't
-        // race against the remove(0) shuffling slots underneath it.
-        while (sealedSegments.size() > 0) {
-            MmapSegment s = sealedSegments.get(0);
+        // race against the range removal shuffling slots underneath it.
+        // Collect the eligible prefix first, then remove it with a single
+        // range removal -- per-element remove(0) would shift the suffix on
+        // every iteration, making a bulk trim of S segments O(S^2).
+        int eligible = 0;
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment s = sealedSegments.get(i);
             long lastSeq = s.baseSeq() + s.frameCount() - 1;
             if (lastSeq > acked) {
                 break;
@@ -584,7 +588,10 @@ public final class SegmentRing implements QuietCloseable {
                 out = new ObjList<>();
             }
             out.add(s);
-            sealedSegments.remove(0);
+            eligible++;
+        }
+        if (eligible > 0) {
+            sealedSegments.remove(0, eligible - 1);
         }
         return out;
     }
