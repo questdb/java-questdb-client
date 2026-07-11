@@ -108,6 +108,7 @@ public final class BackgroundDrainer implements Runnable {
     private final String slotPath;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
+    private CursorSendEngine engineForTesting;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -530,8 +531,10 @@ public final class BackgroundDrainer implements Runnable {
             // holds it, the engine constructor throws and we exit silently
             // (no .failed sentinel — contention is expected, not an error).
             try {
-                engine = new CursorSendEngine(slotPath, segmentSizeBytes,
-                        sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                engine = engineForTesting != null
+                        ? engineForTesting
+                        : new CursorSendEngine(slotPath, segmentSizeBytes,
+                                sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
             } catch (IllegalStateException t) {
                 String msg = t.getMessage();
                 if (msg != null && msg.contains("already in use")) {
@@ -723,6 +726,15 @@ public final class BackgroundDrainer implements Runnable {
             // the pool's executor may have scheduled onto this same thread.
             runnerThread = null;
         }
+    }
+
+    /**
+     * Replaces the engine created by {@link #run()} so tests can drive the
+     * production teardown path with a controlled manager.
+     */
+    @TestOnly
+    public void setEngineForTesting(CursorSendEngine engineForTesting) {
+        this.engineForTesting = engineForTesting;
     }
 
     /**

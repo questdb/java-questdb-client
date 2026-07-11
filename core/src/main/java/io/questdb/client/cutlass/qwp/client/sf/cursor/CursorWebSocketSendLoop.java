@@ -843,6 +843,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Returns the I/O thread so lifecycle tests can wait for its exit path,
+     * which continues beyond the shutdown-latch countdown.
+     */
+    @TestOnly
+    public Thread getIoThreadForTesting() {
+        return ioThread;
+    }
+
+    /**
      * Typed server-rejection payload of the latched terminal error, or
      * {@code null} when the loop latched a wire-level failure (or nothing).
      * Derived from the latch — a server-rejection terminal is always latched
