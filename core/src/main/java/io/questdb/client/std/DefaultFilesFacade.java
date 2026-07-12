@@ -87,6 +87,11 @@ final class DefaultFilesFacade implements FilesFacade {
     }
 
     @Override
+    public int fsyncDir(String dir) {
+        return Files.fsyncDir(dir);
+    }
+
+    @Override
     public long length(int fd) {
         return Files.length(fd);
     }
@@ -104,6 +109,11 @@ final class DefaultFilesFacade implements FilesFacade {
     @Override
     public int mkdir(String path, int mode) {
         return Files.mkdir(path, mode);
+    }
+
+    @Override
+    public int msync(long addr, long len, boolean async) {
+        return Files.msync(addr, len, async);
     }
 
     @Override

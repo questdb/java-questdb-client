@@ -85,14 +85,15 @@ public class CursorSendEngineSlotReacquisitionTest {
 
     /**
      * The structural guarantee: while the manager worker is provably still
-     * inside a service pass for the engine's ring, {@code close()} must NOT
-     * hand the slot to anyone else. With the quiescence barrier reverted,
-     * close() releases the slot lock immediately and the mid-test
-     * {@code SlotLock.acquire} probe succeeds. Once the pass finishes, its
-     * deferred cleanup must release the slot without a direct close retry.
+     * inside a service pass for the engine's ring, repeated direct
+     * {@code close()} calls must NOT hand the slot to anyone else. With the
+     * duplicate-cleanup-owner branch reverted, the second close runs cleanup
+     * inline and the mid-test {@code SlotLock.acquire} probe succeeds. Once
+     * the pass finishes, its deferred cleanup must run exactly once and
+     * release the slot without another close retry.
      */
     @Test(timeout = 30_000L)
-    public void testCloseRetainsSlotWhileWorkerIsMidServicePass() throws Exception {
+    public void testRepeatedCloseRetainsSlotWhileWorkerIsMidServicePass() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             String slot = tmpDir + "/slot";
@@ -103,11 +104,15 @@ public class CursorSendEngineSlotReacquisitionTest {
             CountDownLatch workerBlocked = new CountDownLatch(1);
             CountDownLatch releaseWorker = new CountDownLatch(1);
             AtomicBoolean fired = new AtomicBoolean();
+            AtomicInteger cleanupCount = new AtomicInteger();
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             boolean managerClosed = false;
             CursorSendEngine engine = null;
             try {
-                manager.setAfterRingCleanupHook(cleanupFinished::countDown);
+                manager.setAfterRingCleanupHook(() -> {
+                    cleanupCount.incrementAndGet();
+                    cleanupFinished.countDown();
+                });
                 manager.setBeforeInstallSyncHook(() -> {
                     if (!fired.compareAndSet(false, true)) return;
                     workerBlocked.countDown();
@@ -136,6 +141,15 @@ public class CursorSendEngineSlotReacquisitionTest {
                 Assert.assertFalse("incomplete close must remain observable to the owner",
                         engine.isCloseCompleted());
 
+                // Exercise CursorSendEngine.close() directly again while the
+                // same pass already owns deferredClose. Sender.close() cannot
+                // reach this branch because its second call is a no-op.
+                engine.close();
+                Assert.assertFalse("repeated close must not steal deferred cleanup ownership",
+                        engine.isCloseCompleted());
+                Assert.assertEquals("cleanup ran while the worker pass was blocked",
+                        0, cleanupCount.get());
+
                 // The slot must still be locked: a replacement engine (or raw
                 // SlotLock) acquiring it now would race the stale worker.
                 try {
@@ -154,6 +168,8 @@ public class CursorSendEngineSlotReacquisitionTest {
                 releaseWorker.countDown();
                 Assert.assertTrue("ring pass did not finish deferred cleanup",
                         cleanupFinished.await(5, TimeUnit.SECONDS));
+                Assert.assertEquals("ring-pass cleanup must run exactly once",
+                        1, cleanupCount.get());
                 Assert.assertTrue("ring-pass cleanup must report complete cleanup",
                         engine.isCloseCompleted());
                 engine = null;
@@ -181,7 +197,7 @@ public class CursorSendEngineSlotReacquisitionTest {
     }
 
     /**
-     * Owned-manager twin of {@link #testCloseRetainsSlotWhileWorkerIsMidServicePass}:
+     * Owned-manager twin of {@link #testRepeatedCloseRetainsSlotWhileWorkerIsMidServicePass}:
      * the ONLY construction shape production uses (Sender.build, BackgroundDrainer,
      * QwpWebSocketSender.connect all own their manager). The owned close path does
      * not run the per-ring barrier at all — it relies on {@code manager.close()}'s

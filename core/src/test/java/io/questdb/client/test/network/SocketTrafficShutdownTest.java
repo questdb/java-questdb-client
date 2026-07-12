@@ -34,7 +34,9 @@ import io.questdb.client.network.PlainSocket;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketReadinessWaiter;
 import io.questdb.client.network.TlsSessionInitFailedException;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
+import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
@@ -260,6 +262,90 @@ public class SocketTrafficShutdownTest {
     @Test(timeout = 30_000L)
     public void testPlainSocketShutdownWakesMacOsKqueueAndRetainsFd() throws Exception {
         assertShutdownWakesMacOsKqueue(new PlainSocket(NF, LoggerFactory.getLogger(SocketTrafficShutdownTest.class)));
+    }
+
+    @Test(timeout = 30_000L)
+    public void testPlainSocketShutdownWakesWindowsRecvAndRetainsFd() throws Exception {
+        Assume.assumeTrue("real Winsock cancellation coverage runs on Windows", Os.type == Os.WINDOWS);
+
+        Socket socket = new PlainSocket(NF, LoggerFactory.getLogger(SocketTrafficShutdownTest.class));
+        AtomicBoolean recvDone = new AtomicBoolean();
+        AtomicInteger recvResult = new AtomicInteger(Integer.MIN_VALUE);
+        AtomicReference<Throwable> recvFailure = new AtomicReference<>();
+        CountDownLatch recvStarted = new CountDownLatch(1);
+
+        long buffer = 0;
+        int fd = -1;
+        Thread waiter = null;
+        try (ServerSocket listener = new ServerSocket()) {
+            listener.bind(new InetSocketAddress("127.0.0.1", 0));
+            long addrInfo = NF.getAddrInfo("127.0.0.1", listener.getLocalPort());
+            Assert.assertNotEquals(-1L, addrInfo);
+            try {
+                fd = NF.socketTcp(true);
+                Assert.assertTrue("could not allocate client socket", fd >= 0);
+                Assert.assertEquals(0, NF.connectAddrInfo(fd, addrInfo));
+            } finally {
+                NF.freeAddrInfo(addrInfo);
+            }
+
+            try (java.net.Socket peer = listener.accept()) {
+                socket.of(fd);
+                int retainedFd = fd;
+                fd = -1;
+                buffer = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+                long recvBuffer = buffer;
+
+                waiter = new Thread(() -> {
+                    recvStarted.countDown();
+                    try {
+                        recvResult.set(socket.recv(recvBuffer, 1));
+                    } catch (Throwable t) {
+                        recvFailure.set(t);
+                    } finally {
+                        recvDone.set(true);
+                    }
+                }, "socket-traffic-windows-recv-waiter");
+                waiter.setDaemon(true);
+                waiter.start();
+
+                Assert.assertTrue("waiter did not reach the receive call",
+                        recvStarted.await(5, TimeUnit.SECONDS));
+                Assert.assertFalse("peer unexpectedly made the receive complete", recvDone.get());
+
+                socket.closeTraffic();
+
+                waiter.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse("shutdown did not wake the native receive", waiter.isAlive());
+                Assert.assertNull("native receive failed", recvFailure.get());
+                Assert.assertTrue("shutdown must disconnect the native receive", recvResult.get() < 0);
+                Assert.assertEquals("traffic cancellation must retain fd ownership", retainedFd, socket.getFd());
+                Assert.assertFalse("traffic cancellation must not perform full close", socket.isClosed());
+                Assert.assertTrue("shutdown must leave the Winsock descriptor allocated", NF.getSndBuf(retainedFd) > 0);
+
+                socket.close();
+                Assert.assertTrue("full close must release the retained fd", socket.isClosed());
+                Assert.assertEquals("released Winsock descriptor must reject socket operations", -1, NF.getSndBuf(retainedFd));
+            }
+        } finally {
+            if (waiter != null && waiter.isAlive()) {
+                try {
+                    socket.closeTraffic();
+                } catch (Throwable ignored) {
+                    // Full close below is the final wake-up fallback.
+                }
+            }
+            socket.close();
+            if (waiter != null) {
+                waiter.join(TimeUnit.SECONDS.toMillis(5));
+            }
+            if (buffer != 0 && (waiter == null || !waiter.isAlive())) {
+                Unsafe.free(buffer, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (fd != -1) {
+                NF.close(fd);
+            }
+        }
     }
 
     @Test

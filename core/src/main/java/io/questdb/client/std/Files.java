@@ -409,6 +409,20 @@ public final class Files {
     public static native int fsync(int fd);
 
     /**
+     * Forces directory-entry updates under {@code dir} to durable storage.
+     * Returns 0 on success and non-zero on failure. Callers use this after
+     * unlinking files whose absence must survive a host crash.
+     */
+    public static int fsyncDir(String dir) {
+        long ptr = pathPtr(dir);
+        try {
+            return fsyncDir0(ptr);
+        } finally {
+            freePathPtr(ptr);
+        }
+    }
+
+    /**
      * Truncates the file to exactly {@code size} bytes via {@code ftruncate}.
      * Returns {@code true} on success. Does NOT reserve disk space — the
      * file's logical size is changed but blocks may be sparse.
@@ -554,6 +568,8 @@ public final class Files {
     public static native void findClose(long findPtr);
 
     static native int close0(int fd);
+
+    static native int fsyncDir0(long lpszName);
 
     static native int openRO0(long lpszName);
 

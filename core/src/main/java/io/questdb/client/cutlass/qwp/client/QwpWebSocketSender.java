@@ -195,6 +195,8 @@ public class QwpWebSocketSender implements Sender {
     // close() drain timeout in millis. Default applied at construction.
     // 0 or -1 means "fast close" (skip the drain); otherwise close blocks
     // up to this many millis for ackedFsn to catch up to publishedFsn.
+    private volatile boolean closeCleanupComplete;
+    private boolean closeCleanupStarted;
     private long closeFlushTimeoutMillis = 5_000L;
     private volatile boolean closed;
     // Test-only lifecycle witness. close() invokes and clears it strictly after
@@ -1206,135 +1208,25 @@ public class QwpWebSocketSender implements Sender {
             }
 
             if (!ioThreadStopped) {
-                // The I/O thread may still be using the socket and microbatch
-                // buffers. Freeing them would risk SIGSEGV.
-                LOG.error("I/O thread is still running, leaking WebSocket client and microbatch buffers");
-                // The engine, however, need not leak: delegate its close to
-                // the I/O thread's exit path, which runs it strictly after
-                // the thread's last engine access — the mapping and slot
-                // lock release as soon as the stuck wire call resolves
-                // (bounded by OS timeouts). slotLockReleased intentionally
-                // stays false: the lock is released only when the delegated
-                // close actually runs, so the pool must not reuse the slot
-                // meanwhile. A false return means the thread exited between
-                // the failed close() and now — then closing here is safe.
-                if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null) {
-                    if (cursorSendLoop.delegateEngineClose()) {
-                        // The I/O thread adopted the engine close and runs it on
-                        // its exit path. Keep the engine visible for re-probing:
-                        // isSlotLockReleased() flips true once that close
-                        // completes, letting a pool recover the retired slot.
-                        retainedEngine = cursorEngine;
-                    } else {
-                        CursorSendEngine engine = cursorEngine;
-                        try {
-                            engine.close();
-                        } catch (Throwable t) {
-                            LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
-                            terminalError = captureCloseError(terminalError, t);
-                        }
-                        if (engine.isCloseCompleted()) {
-                            cursorEngine = null;
-                            ownsCursorEngine = false;
-                            slotLockReleased = true;
-                        } else {
-                            // Engine cleanup is pending on its manager worker's
-                            // exit path (or leaked, for a shared manager). Report
-                            // the retained flock now; the getter re-probes the
-                            // retained engine so a late release is not lost.
-                            slotLockReleased = false;
-                            retainedEngine = engine;
-                        }
-                    }
+                // The worker may still touch every resource below. Hand the
+                // complete sender-owned tail to its exit path rather than
+                // permanently leaking everything except the engine. The
+                // callback is idempotence-gated by closeRemainingResources().
+                if (ownsCursorEngine && cursorEngine != null) {
+                    retainedEngine = cursorEngine;
                 }
-                rethrowTerminal(terminalError);
-                return;
-            }
-
-            if (buffer0 != null) {
-                try {
-                    buffer0.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing buffer0: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
+                Runnable closeCallback = () -> closeRemainingResources(null);
+                if (cursorSendLoop != null && cursorSendLoop.delegateClose(closeCallback)) {
+                    rethrowTerminal(terminalError);
+                    return;
                 }
-            }
-            if (buffer1 != null) {
-                try {
-                    buffer1.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing buffer1: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-            }
-
-            if (client != null) {
-                try {
-                    client.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing WebSocket client: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-                client = null;
-            }
-
-            if (ownsCursorEngine && cursorEngine != null) {
-                CursorSendEngine engine = cursorEngine;
-                try {
-                    engine.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-                if (engine.isCloseCompleted()) {
-                    cursorEngine = null;
-                    ownsCursorEngine = false;
-                    slotLockReleased = true;
-                } else {
-                    // The manager worker did not quiesce. Preserve ownership
-                    // and report the retained flock so pools retire this slot.
-                    // Repeated Sender.close() calls remain no-ops by contract.
-                    // Engine cleanup was handed to a safe manager-worker path:
-                    // owned-manager exit or shared-manager ring-pass completion.
-                    // The getter re-probes the retained engine so the pool can
-                    // reclaim the slot once cleanup actually completes.
-                    slotLockReleased = false;
-                    retainedEngine = engine;
-                }
+                // The worker exited between close() failing and delegation.
+                // Cleanup is safe here and its failures remain suppressed on
+                // the original close error.
+                terminalError = closeRemainingResources(terminalError);
             } else {
-                // This sender owns no cursor engine holding an SF flock.
-                slotLockReleased = true;
+                terminalError = closeRemainingResources(terminalError);
             }
-
-            // Shutdown order: dispatcher last, after the I/O loop has stopped
-            // producing into it. close() drains pending entries with a short
-            // deadline so any final errors land in the user's handler.
-            if (errorDispatcher != null) {
-                try {
-                    errorDispatcher.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing error dispatcher: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-            }
-            if (progressDispatcher != null) {
-                try {
-                    progressDispatcher.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing progress dispatcher: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-            }
-            if (connectionDispatcher != null) {
-                try {
-                    connectionDispatcher.close();
-                } catch (Throwable t) {
-                    LOG.error("Error closing connection dispatcher: {}", String.valueOf(t));
-                    terminalError = captureCloseError(terminalError, t);
-                }
-            }
-
-            LOG.info("QwpWebSocketSender closed");
 
             // If close() ended up holding the same instance the user already
             // caught earlier, suppress the rethrow. The user's catch block
@@ -1345,6 +1237,11 @@ public class QwpWebSocketSender implements Sender {
             }
             rethrowTerminal(terminalError);
         }
+    }
+
+    @TestOnly
+    public boolean isCloseCleanupComplete() {
+        return closeCleanupComplete;
     }
 
     /**
@@ -1808,6 +1705,21 @@ public class QwpWebSocketSender implements Sender {
         return d == null ? 0L : d.getDroppedNotifications();
     }
 
+    @TestOnly
+    public SenderConnectionDispatcher getConnectionDispatcherForTesting() {
+        return connectionDispatcher;
+    }
+
+    @TestOnly
+    public SenderErrorDispatcher getErrorDispatcherForTesting() {
+        return errorDispatcher;
+    }
+
+    @TestOnly
+    public SenderProgressDispatcher getProgressDispatcherForTesting() {
+        return progressDispatcher;
+    }
+
     /**
      * Number of {@link SenderError} notifications dropped because the
      * bounded inbox was full. Non-zero means the user-supplied
@@ -2234,6 +2146,11 @@ public class QwpWebSocketSender implements Sender {
         this.clientFactoryOverride = factory;
     }
 
+    @TestOnly
+    public void setClientForTesting(WebSocketClient client) {
+        this.client = client;
+    }
+
     /**
      * Installs a one-shot test witness that close-time drain invokes after it
      * observes a real unacknowledged target and before it starts waiting.
@@ -2342,6 +2259,25 @@ public class QwpWebSocketSender implements Sender {
         if (engine != null) {
             engine.setSlotLockReleaseListener(this::onSlotLockReleased);
         }
+    }
+
+    @TestOnly
+    public void setCursorSendLoopForTesting(CursorWebSocketSendLoop loop) {
+        cursorSendLoop = loop;
+        if (connectionDispatcher == null) {
+            connectionDispatcher = new SenderConnectionDispatcher(
+                    connectionListener, connectionListenerInboxCapacity);
+        }
+        if (errorDispatcher == null) {
+            errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
+        }
+        if (progressDispatcher == null) {
+            progressDispatcher = new SenderProgressDispatcher(
+                    progressHandler, SenderProgressDispatcher.DEFAULT_CAPACITY);
+        }
+        loop.setConnectionDispatcher(connectionDispatcher);
+        loop.setErrorDispatcher(errorDispatcher);
+        loop.setProgressDispatcher(progressDispatcher);
     }
 
     /**
@@ -3208,6 +3144,83 @@ public class QwpWebSocketSender implements Sender {
     private void checkTableSelected() {
         if (currentTableBuffer == null) {
             throw new LineSenderException("table() must be called before adding columns");
+        }
+    }
+
+    private synchronized Throwable closeRemainingResources(Throwable terminalError) {
+        if (closeCleanupStarted) {
+            return terminalError;
+        }
+        closeCleanupStarted = true;
+        try {
+            try {
+                buffer0.close();
+            } catch (Throwable t) {
+                LOG.error("Error closing buffer0: {}", String.valueOf(t));
+                terminalError = captureCloseError(terminalError, t);
+            }
+            try {
+                buffer1.close();
+            } catch (Throwable t) {
+                LOG.error("Error closing buffer1: {}", String.valueOf(t));
+                terminalError = captureCloseError(terminalError, t);
+            }
+            if (client != null) {
+                try {
+                    client.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing WebSocket client: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+                client = null;
+            }
+            if (ownsCursorEngine && cursorEngine != null) {
+                CursorSendEngine engine = cursorEngine;
+                try {
+                    engine.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+                if (engine.isCloseCompleted()) {
+                    cursorEngine = null;
+                    ownsCursorEngine = false;
+                    slotLockReleased = true;
+                } else {
+                    slotLockReleased = false;
+                    retainedEngine = engine;
+                }
+            } else {
+                slotLockReleased = true;
+            }
+            if (errorDispatcher != null) {
+                try {
+                    errorDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing error dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+            }
+            if (progressDispatcher != null) {
+                try {
+                    progressDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing progress dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+            }
+            if (connectionDispatcher != null) {
+                try {
+                    connectionDispatcher.close();
+                } catch (Throwable t) {
+                    LOG.error("Error closing connection dispatcher: {}", String.valueOf(t));
+                    terminalError = captureCloseError(terminalError, t);
+                }
+            }
+            LOG.info("QwpWebSocketSender closed");
+            return terminalError;
+        } finally {
+            closeCleanupComplete = true;
         }
     }
 

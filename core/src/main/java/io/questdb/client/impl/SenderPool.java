@@ -119,6 +119,10 @@ public final class SenderPool implements AutoCloseable {
     // RuntimeException Throwable (e.g. an -ea AssertionError) mid-prewarm,
     // exercising the Error-safe delegate cleanup loop.
     private final IntFunction<Sender> senderFactory;
+    // Test seam: runs immediately after a delegate factory returns, before
+    // listener registration and SenderSlot construction. Null in production;
+    // error-safety tests inject a preallocated throwable at this ownership gap.
+    private final Runnable postFactoryHook;
     // Factory for startup-recovery delegates. Distinct from senderFactory so a
     // recoverer can force a non-blocking initial connect (initial_connect_mode=
     // OFF) regardless of user config: a recovery build runs on the
@@ -189,6 +193,9 @@ public final class SenderPool implements AutoCloseable {
     // retiredSlots and returns any index whose flock has since dropped.
     // Guarded by lock; only ever ticks for SF slots.
     private int leakedSlots;
+    // Deterministic white-box complexity counter. Counts delegate release
+    // probes performed by direct callbacks and fallback scans. Guarded by lock.
+    private long retiredSlotProbeCount;
     // The retired slots behind the leakedSlots count: runtime reclaim paths
     // (discardBroken/reapIdle via reclaimSlot) and the in-range startup-
     // recovery pass (recoverOneSlotStep, which retains the recoverer slot for
@@ -284,6 +291,25 @@ public final class SenderPool implements AutoCloseable {
                 deferStartupRecovery, null, null, null);
     }
 
+    // Test-only constructor adding a deterministic fault hook for the ownership
+    // gap after a delegate factory returns.
+    @TestOnly
+    public SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            Runnable postFactoryHook
+    ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, null, null, null, postFactoryHook);
+    }
+
     // Full constructor adding the user-supplied ingest callbacks (error
     // handler, connection listener and background-drainer listener), applied
     // to every Sender the pool builds (see buildManagedSlotSender). The public
@@ -302,6 +328,26 @@ public final class SenderPool implements AutoCloseable {
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, errorHandler, connectionListener,
+                drainerListener, null);
+    }
+
+    private SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener,
+            Runnable postFactoryHook
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
@@ -319,6 +365,7 @@ public final class SenderPool implements AutoCloseable {
         this.acquireTimeoutMillis = acquireTimeoutMillis;
         this.idleTimeoutMillis = idleTimeoutMillis;
         this.maxLifetimeMillis = maxLifetimeMillis;
+        this.postFactoryHook = postFactoryHook;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
         this.retiredSlots = new ArrayList<>(maxSize);
@@ -564,7 +611,7 @@ public final class SenderPool implements AutoCloseable {
                     // the retirement would be permanent even after the release
                     // (fatal at maxSize=1: every later borrow would time out).
                     leakedSlots++;
-                    retiredSlots.add(retained[0]);
+                    addRetiredSlot(retained[0]);
                     LOG.warn("startup SF recovery: slot {} retired: delegate close() returned with "
                                     + "the flock still held (I/O or manager worker did not stop); pool capacity reduced by 1, "
                                     + "now {} of {} usable [leakedSlots={}]; the slot is re-probed and recovered "
@@ -699,8 +746,9 @@ public final class SenderPool implements AutoCloseable {
                     stopScan = true;
                 }
             } catch (Throwable drainErr) {
-                LOG.warn("startup SF recovery: drain failed for slot {} ({})",
+                LOG.warn("startup SF recovery: drain failed for slot {} ({}); deferring it",
                         slotPath, drainErr.toString());
+                stopScan = true;
             } finally {
                 try {
                     recoverer.delegate().close();
@@ -710,8 +758,9 @@ public final class SenderPool implements AutoCloseable {
                 }
             }
         } catch (Throwable scanErr) {
-            LOG.warn("startup SF recovery: scan failed for slot {} ({})",
+            LOG.warn("startup SF recovery: scan failed for slot {} ({}); deferring it",
                     slotPath, scanErr.toString());
+            stopScan = true;
         }
         if (recoverer != null && !flockReleased(recoverer)) {
             retainedOut[0] = recoverer;
@@ -1212,12 +1261,39 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
-    private SenderSlot createUnlocked(int slotIndex) {
-        Sender delegate = senderFactory.apply(slotIndex);
-        if (delegate instanceof QwpWebSocketSender) {
-            ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(this::recoverReleasedSlots);
+    private SenderSlot createSlot(IntFunction<Sender> factory, int slotIndex) {
+        Sender delegate = factory.apply(slotIndex);
+        try {
+            if (postFactoryHook != null) {
+                postFactoryHook.run();
+            }
+            SenderSlot slot = new SenderSlot(delegate, this, slotIndex);
+            if (delegate instanceof QwpWebSocketSender) {
+                ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(
+                        () -> recoverReleasedSlot(slot));
+            }
+            return slot;
+        } catch (Throwable failure) {
+            if (delegate instanceof QwpWebSocketSender) {
+                try {
+                    ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(null);
+                } catch (Throwable deregistrationFailure) {
+                    addSuppressed(failure, deregistrationFailure);
+                }
+            }
+            if (delegate != null) {
+                try {
+                    delegate.close();
+                } catch (Throwable closeFailure) {
+                    addSuppressed(failure, closeFailure);
+                }
+            }
+            throw failure;
         }
-        return new SenderSlot(delegate, this, slotIndex);
+    }
+
+    private SenderSlot createUnlocked(int slotIndex) {
+        return createSlot(senderFactory, slotIndex);
     }
 
     /**
@@ -1228,11 +1304,18 @@ public final class SenderPool implements AutoCloseable {
      * {@link #drainCandidateSlotForRecovery}.
      */
     private SenderSlot createRecoverer(int slotIndex) {
-        Sender delegate = recoverySenderFactory.apply(slotIndex);
-        if (delegate instanceof QwpWebSocketSender) {
-            ((QwpWebSocketSender) delegate).setSlotLockReleaseListener(this::recoverReleasedSlots);
+        return createSlot(recoverySenderFactory, slotIndex);
+    }
+
+    private static void addSuppressed(Throwable failure, Throwable cleanupFailure) {
+        if (failure != cleanupFailure) {
+            try {
+                failure.addSuppressed(cleanupFailure);
+            } catch (Throwable ignored) {
+                // Preserve the original construction failure even if recording
+                // the secondary cleanup failure cannot allocate.
+            }
         }
-        return new SenderSlot(delegate, this, slotIndex);
     }
 
     private Sender defaultSender(int slotIndex) {
@@ -1404,7 +1487,7 @@ public final class SenderPool implements AutoCloseable {
             return true;
         }
         leakedSlots++;
-        retiredSlots.add(s);
+        addRetiredSlot(s);
         LOG.warn("SF slot {} retired{}: delegate close() returned with the flock still held " +
                         "(I/O or manager worker did not stop); pool capacity reduced by 1, now {} of {} usable " +
                         "[leakedSlots={}]; the slot is re-probed and recovered if the worker releases the flock later",
@@ -1412,10 +1495,25 @@ public final class SenderPool implements AutoCloseable {
         return false;
     }
 
-    private void recoverReleasedSlots() {
+    private boolean recoverReleasedSlot(SenderSlot s) {
         lock.lock();
         try {
-            reprobeRetiredSlots();
+            int retiredIndex = s.retiredIndex();
+            if (retiredIndex < 0
+                    || retiredIndex >= retiredSlots.size()
+                    || retiredSlots.get(retiredIndex) != s) {
+                // The callback raced retirement, or is stale/duplicate. The
+                // retirement path probes before insertion, and periodic scans
+                // remain as a fallback, so no capacity can be lost here.
+                return false;
+            }
+            retiredSlotProbeCount++;
+            if (!flockReleased(s)) {
+                return false;
+            }
+            recoverRetiredSlotAt(retiredIndex);
+            slotReleased.signalAll();
+            return true;
         } finally {
             lock.unlock();
         }
@@ -1439,27 +1537,37 @@ public final class SenderPool implements AutoCloseable {
         boolean recovered = false;
         for (int i = retiredSlots.size() - 1; i >= 0; i--) {
             SenderSlot s = retiredSlots.get(i);
+            retiredSlotProbeCount++;
             if (flockReleased(s)) {
-                // Order is irrelevant. Swap with the tail before removing so
-                // each recovery does O(1) list work instead of shifting the
-                // remaining retired entries. The tail has already been probed
-                // by this reverse scan and, if still present, is unreleased.
-                int last = retiredSlots.size() - 1;
-                if (i < last) {
-                    retiredSlots.set(i, retiredSlots.get(last));
-                }
-                retiredSlots.remove(last);
-                leakedSlots--;
-                freeSlotIndex(s.slotIndex());
+                recoverRetiredSlotAt(i);
                 recovered = true;
-                LOG.info("SF slot {} recovered: deferred cleanup released the flock after retirement; " +
-                                "pool capacity restored, now {} of {} usable [leakedSlots={}]",
-                        s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
             }
         }
         if (recovered) {
             slotReleased.signalAll();
         }
         return recovered;
+    }
+
+    private void addRetiredSlot(SenderSlot s) {
+        s.retiredIndex(retiredSlots.size());
+        retiredSlots.add(s);
+    }
+
+    private void recoverRetiredSlotAt(int retiredIndex) {
+        SenderSlot s = retiredSlots.get(retiredIndex);
+        int last = retiredSlots.size() - 1;
+        if (retiredIndex < last) {
+            SenderSlot moved = retiredSlots.get(last);
+            retiredSlots.set(retiredIndex, moved);
+            moved.retiredIndex(retiredIndex);
+        }
+        retiredSlots.remove(last);
+        s.retiredIndex(-1);
+        leakedSlots--;
+        freeSlotIndex(s.slotIndex());
+        LOG.info("SF slot {} recovered: deferred cleanup released the flock after retirement; " +
+                        "pool capacity restored, now {} of {} usable [leakedSlots={}]",
+                s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
     }
 }

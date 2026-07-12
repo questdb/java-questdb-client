@@ -38,6 +38,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -428,9 +430,10 @@ public class SegmentRingTest {
     }
 
     @Test
-    public void testNextSealedAfterWalksThousandsOfSegmentsWithoutOverflow() throws Exception {
+    public void testNextSealedAfterWalksThousandsOfSegmentsInLinearOperations() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Regression for "sealed snapshot grew unexpectedly large".
+            // Regression for both "sealed snapshot grew unexpectedly large"
+            // and a later quadratic list traversal at every segment boundary.
             // The cursor I/O loop used to copy the entire sealed list into a
             // fixed-size array (initial 16, grown once to 32) on every advance.
             // Under load — producer outpacing the WS sender, no maxTotalBytes
@@ -462,7 +465,17 @@ public class SegmentRingTest {
                     // After the loop we have `sealedCount` sealed segments and one
                     // active (containing nothing yet — its base = sealedCount).
                     // Now walk: oldest sealed, then nextSealedAfter() repeatedly.
+                    SegmentRing.resetNextSealedComparisons();
                     MmapSegment cursor = ring.firstSealed();
+                    assertNotNull(cursor);
+                    for (int i = 1; i < sealedCount / 2; i++) {
+                        cursor = ring.nextSealedAfter(cursor);
+                        assertNotNull(cursor);
+                    }
+                    long halfWalkOperations = SegmentRing.getNextSealedComparisons();
+
+                    SegmentRing.resetNextSealedComparisons();
+                    cursor = ring.firstSealed();
                     assertNotNull(cursor);
                     assertEquals(0, cursor.baseSeq());
                     int visited = 1;
@@ -478,8 +491,14 @@ public class SegmentRingTest {
                         visited++;
                     }
                     assertEquals("must visit every sealed segment", sealedCount, visited);
-                    // Walking past the last sealed → null (caller falls through to active).
-                    assertNull(ring.nextSealedAfter(cursor));
+                    // The loop terminated when walking past the last sealed returned null.
+                    long comparisons = SegmentRing.getNextSealedComparisons();
+                    assertTrue("walk inspected " + comparisons + " entries for " + sealedCount
+                                    + " segments; successor traversal must remain O(N)",
+                            comparisons <= 2L * sealedCount);
+                    assertTrue("doubling the walk grew operations from " + halfWalkOperations
+                                    + " to " + comparisons + "; expected linear scaling",
+                            comparisons <= 2L * halfWalkOperations + 2L);
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
@@ -521,6 +540,73 @@ public class SegmentRingTest {
                     MmapSegment next = ring.nextSealedAfter(seg0Snapshot);
                     assertNotNull(next);
                     assertEquals(2L, next.baseSeq());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000L)
+    public void testNextSealedAfterSurvivesConcurrentRotationAndHeadTrim() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/race-0.sfa", 0, segSize);
+                try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                    fillPattern(buf, 16, 0);
+                    for (int i = 0; i < 3; i++) {
+                        assertEquals(i, ring.appendOrFsn(buf, 16));
+                        ring.installHotSpare(MmapSegment.create(
+                                tmpDir + "/race-" + (i + 1) + ".sfa",
+                                ring.nextSeqHint(), segSize));
+                    }
+                    MmapSegment cursor = ring.firstSealed();
+                    assertNotNull(cursor);
+                    ring.acknowledge(1);
+
+                    CountDownLatch ready = new CountDownLatch(2);
+                    CountDownLatch start = new CountDownLatch(1);
+                    AtomicReference<Throwable> failure = new AtomicReference<>();
+                    Thread rotate = new Thread(() -> {
+                        ready.countDown();
+                        try {
+                            start.await();
+                            assertEquals(3L, ring.appendOrFsn(buf, 16));
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                    }, "segment-rotate");
+                    Thread trim = new Thread(() -> {
+                        ready.countDown();
+                        try {
+                            start.await();
+                            ObjList<MmapSegment> drained = ring.drainTrimmable();
+                            assertNotNull(drained);
+                            assertEquals(2, drained.size());
+                            for (int i = 0; i < drained.size(); i++) {
+                                drained.get(i).close();
+                            }
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                    }, "segment-trim");
+
+                    synchronized (ring) {
+                        rotate.start();
+                        trim.start();
+                        ready.await();
+                        start.countDown();
+                    }
+                    rotate.join();
+                    trim.join();
+                    assertNull("concurrent mutation failed: " + failure.get(), failure.get());
+
+                    MmapSegment next = ring.nextSealedAfter(cursor);
+                    assertNotNull(next);
+                    assertEquals("trim fallback must skip both removed successors", 2L, next.baseSeq());
+                    assertEquals("rotation must leave the former active sealed", 1, ring.getSealedSegments().size());
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
@@ -596,6 +682,52 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRemovingAcknowledgedPrefixMovesLinearReferences() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1L;
+            long buf = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            try {
+                long previousMoves = -1;
+                for (int sealedCount = 64; sealedCount <= 256; sealedCount *= 2) {
+                    MmapSegment initial = MmapSegment.createInMemory(0, segSize);
+                    try (SegmentRing ring = new SegmentRing(initial, segSize)) {
+                        for (int i = 0; i < 2 * sealedCount; i++) {
+                            assertEquals(i, ring.appendOrFsn(buf, 1));
+                            ring.installHotSpare(MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                        }
+                        assertEquals(2L * sealedCount, ring.appendOrFsn(buf, 1));
+                        ring.acknowledge(sealedCount - 1L);
+                        SegmentRing.resetTrimMovedReferences();
+                        MmapSegment segment;
+                        int removed = 0;
+                        while ((segment = ring.firstTrimmable()) != null) {
+                            assertTrue(ring.removeTrimmable(segment));
+                            segment.close();
+                            removed++;
+                        }
+                        assertEquals(sealedCount, removed);
+                        assertEquals("unacknowledged suffix must remain live", sealedCount,
+                                ring.getSealedSegments().size());
+                        assertEquals(sealedCount, ring.firstSealed().baseSeq());
+                        long moves = SegmentRing.getTrimMovedReferences();
+                        assertTrue("removing " + sealedCount + " entries moved " + moves
+                                        + " references; expected amortized linear work",
+                                moves <= 2L * sealedCount);
+                        if (previousMoves >= 0) {
+                            assertTrue("doubling the acknowledged prefix grew moved references from "
+                                            + previousMoves + " to " + moves,
+                                    moves <= 2L * previousMoves + sealedCount);
+                        }
+                        previousMoves = moves;
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, 1, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

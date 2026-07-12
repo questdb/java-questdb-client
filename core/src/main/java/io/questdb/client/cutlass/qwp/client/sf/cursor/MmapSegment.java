@@ -95,6 +95,10 @@ public final class MmapSegment implements QuietCloseable {
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
     private volatile long publishedCursor;
+    // Monotonic in-memory link to the segment that immediately follows this
+    // one. SegmentRing publishes it before promoting the successor to active;
+    // close deliberately retains it so a cursor can advance after head trim.
+    private volatile MmapSegment successor;
     // Bytes between the last valid frame and the file end that look like an
     // attempted-but-invalid frame write (non-zero bytes at the bail-out
     // position). Zero for fresh segments and for cleanly partially-filled
@@ -436,6 +440,21 @@ public final class MmapSegment implements QuietCloseable {
 
     public long sizeBytes() {
         return sizeBytes;
+    }
+
+    void linkSuccessor(MmapSegment next) {
+        if (next == null) {
+            throw new IllegalArgumentException("successor must not be null");
+        }
+        MmapSegment existing = successor;
+        if (existing != null && existing != next) {
+            throw new IllegalStateException("segment successor already linked");
+        }
+        successor = next;
+    }
+
+    MmapSegment successor() {
+        return successor;
     }
 
     /**

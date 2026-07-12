@@ -26,6 +26,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
@@ -92,6 +93,7 @@ public final class CursorSendEngine implements QuietCloseable {
     // callback allocation failure cannot orphan manager resources. A timed-out
     // close can then hand it to either manager path without allocating.
     private final Runnable deferredClose;
+    private final FilesFacade filesFacade;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
     // case close() also stops the manager. When the manager is shared across
@@ -269,6 +271,7 @@ public final class CursorSendEngine implements QuietCloseable {
         this.sfDir = sfDir;
         this.segmentSizeBytes = segmentSizeBytes;
         this.manager = manager;
+        this.filesFacade = manager.filesFacade();
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
 
@@ -335,7 +338,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // open() returns null on any setup failure so a missing
                 // mmap doesn't take down the engine -- we just fall
                 // back to the bare lowestBase - 1 seed.
-                watermarkInProgress = AckWatermark.open(sfDir);
+                watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress != null
                         ? watermarkInProgress.read()
@@ -386,8 +389,8 @@ public final class CursorSendEngine implements QuietCloseable {
                 // so the new session's first read() correctly reports
                 // INVALID (magic=0 on a freshly zero-filled file).
                 if (!memoryMode) {
-                    AckWatermark.removeOrphan(sfDir);
-                    watermarkInProgress = AckWatermark.open(sfDir);
+                    AckWatermark.removeOrphan(filesFacade, sfDir);
+                    watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;
@@ -747,6 +750,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     private void finishClose(boolean fullyDrained) {
         try {
+            RuntimeException durabilityFailure = null;
             // On a fully-drained close, persist the final acked FSN through
             // the still-mapped watermark BEFORE closing the ring/watermark
             // and BEFORE unlinking any segment file. The manager persists
@@ -764,8 +768,14 @@ public final class CursorSendEngine implements QuietCloseable {
                     long finalAckedFsn = ring.ackedFsn();
                     if (finalAckedFsn >= 0) {
                         watermark.write(finalAckedFsn);
+                        watermark.sync();
+                        if (filesFacade.fsyncDir(sfDir) != 0) {
+                            throw new IllegalStateException(
+                                    "could not fsync SF slot directory before segment cleanup");
+                        }
                     }
-                } catch (Throwable ignored) {
+                } catch (RuntimeException e) {
+                    durabilityFailure = e;
                 }
             }
             try {
@@ -786,21 +796,22 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
-            if (fullyDrained) {
+            if (fullyDrained && watermark != null && durabilityFailure == null) {
                 boolean segmentsRemoved = false;
                 try {
-                    segmentsRemoved = unlinkAllSegmentFiles(sfDir);
+                    segmentsRemoved = unlinkAllSegmentFiles(filesFacade, sfDir);
                 } catch (Throwable ignored) {
                 }
-                // Remove the watermark ONLY once every segment file is
-                // confirmed gone. The watermark is what keeps residual
-                // acknowledged segments inert to a successor's recovery;
-                // removing it while any .sfa file survives would republish
-                // those already-acknowledged rows.
+                // Remove the watermark ONLY once every segment unlink is
+                // durable. Until the directory fsync succeeds, stable storage
+                // may still contain acknowledged segments and therefore still
+                // needs the durable watermark.
                 if (segmentsRemoved) {
-                    try {
-                        AckWatermark.removeOrphan(sfDir);
-                    } catch (Throwable ignored) {
+                    if (filesFacade.fsyncDir(sfDir) != 0) {
+                        durabilityFailure = new IllegalStateException(
+                                "could not fsync SF slot directory after segment cleanup");
+                    } else {
+                        AckWatermark.removeOrphan(filesFacade, sfDir);
                     }
                 } else {
                     LOG.warn("close-time segment cleanup incomplete on slot {}; retaining the ack "
@@ -808,6 +819,12 @@ public final class CursorSendEngine implements QuietCloseable {
                             + "engine on this slot recovers them as fully acked and retries the "
                             + "unlink on its own close", sfDir);
                 }
+            } else if (fullyDrained && watermark == null && sfDir != null) {
+                LOG.warn("close-time segment cleanup skipped on slot {} because no ack watermark "
+                        + "is available to cover a host crash during unlink", sfDir);
+            }
+            if (durabilityFailure != null) {
+                throw durabilityFailure;
             }
         } finally {
             // Reaching finishClose at all requires established quiescence, so
@@ -1247,9 +1264,9 @@ public final class CursorSendEngine implements QuietCloseable {
      * watermark on {@code false} so residual acknowledged segments stay
      * covered.
      */
-    private static boolean unlinkAllSegmentFiles(String dir) {
-        if (!io.questdb.client.std.Files.exists(dir)) return true;
-        long find = io.questdb.client.std.Files.findFirst(dir);
+    private static boolean unlinkAllSegmentFiles(FilesFacade filesFacade, String dir) {
+        if (!filesFacade.exists(dir)) return true;
+        long find = filesFacade.findFirst(dir);
         if (find < 0) {
             LOG.warn("close-time unlink could not enumerate {}; "
                     + "any residual sf-*.sfa files will be picked up by the next recovery", dir);
@@ -1261,14 +1278,14 @@ public final class CursorSendEngine implements QuietCloseable {
         try {
             while (rc > 0) {
                 String name = io.questdb.client.std.Files.utf8ToString(
-                        io.questdb.client.std.Files.findName(find));
-                rc = io.questdb.client.std.Files.findNext(find);
+                        filesFacade.findName(find));
+                rc = filesFacade.findNext(find);
                 if (name != null && name.endsWith(".sfa")) {
                     names.add(name);
                 }
             }
         } finally {
-            io.questdb.client.std.Files.findClose(find);
+            filesFacade.findClose(find);
         }
         if (rc < 0) {
             // A partial listing must not drive any unlink: removing only the
@@ -1285,7 +1302,7 @@ public final class CursorSendEngine implements QuietCloseable {
         });
         for (int i = 0, n = names.size(); i < n; i++) {
             String path = dir + "/" + names.get(i);
-            if (!io.questdb.client.std.Files.remove(path)) {
+            if (!filesFacade.remove(path)) {
                 LOG.warn("Failed to unlink fully-acked segment {} on close; stopping so the "
                         + "residual files stay a contiguous, watermark-covered range", path);
                 return false;

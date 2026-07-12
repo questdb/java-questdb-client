@@ -85,6 +85,10 @@ public interface FilesFacade {
 
     int fsync(int fd);
 
+    default int fsyncDir(String dir) {
+        return Files.fsyncDir(dir);
+    }
+
     long length(int fd);
 
     /**
@@ -106,6 +110,10 @@ public interface FilesFacade {
     int lock(int fd);
 
     int mkdir(String path, int mode);
+
+    default int msync(long addr, long len, boolean async) {
+        return Files.msync(addr, len, async);
+    }
 
     int openCleanRW(String path);
 

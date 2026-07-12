@@ -26,14 +26,19 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.Sender;
+import io.questdb.client.SenderConnectionEvent;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
-import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
+import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -457,6 +462,117 @@ public class SlotLockReleasedContractTest {
         });
     }
 
+    @Test(timeout = 30_000L)
+    public void testFailedIoStopReclaimsSenderResourcesAfterWorkerExit() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String tmpDir = Paths.get(System.getProperty("java.io.tmpdir"),
+                    "qdb-slot-lock-full-cleanup-" + System.nanoTime()).toString();
+            Assert.assertEquals(0, Files.mkdir(tmpDir, Files.DIR_MODE_DEFAULT));
+            String slot = tmpDir + "/slot";
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+            CountDownLatch enteredConnect = new CountDownLatch(1);
+            CountDownLatch releaseConnect = new CountDownLatch(1);
+            AtomicReference<Thread> ioThreadRef = new AtomicReference<>();
+            StubWebSocketClient loopClient = new StubWebSocketClient();
+            StubWebSocketClient senderClient = new StubWebSocketClient();
+            CursorSendEngine engine = new CursorSendEngine(slot, segSize);
+            CursorWebSocketSendLoop loop = null;
+            try {
+                CursorWebSocketSendLoop.ReconnectFactory stuckConnect = () -> {
+                    ioThreadRef.set(Thread.currentThread());
+                    enteredConnect.countDown();
+                    releaseConnect.await();
+                    return loopClient;
+                };
+                loop = new CursorWebSocketSendLoop(
+                        null, engine, 0L, 1_000L, stuckConnect,
+                        5_000L, 100L, 5_000L, false);
+                loop.start();
+                Assert.assertTrue("I/O thread never reached the connect factory",
+                        enteredConnect.await(5, TimeUnit.SECONDS));
+
+                QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 1);
+                sender.setConnectionListener(event -> {
+                });
+                sender.setErrorHandler(error -> {
+                });
+                sender.setProgressHandler(ackedFsn -> {
+                });
+                sender.setClientForTesting(senderClient);
+                sender.setCursorEngine(engine, true);
+                sender.setCursorSendLoopForTesting(loop);
+
+                SenderConnectionDispatcher connectionDispatcher = sender.getConnectionDispatcherForTesting();
+                SenderErrorDispatcher errorDispatcher = sender.getErrorDispatcherForTesting();
+                SenderProgressDispatcher progressDispatcher = sender.getProgressDispatcherForTesting();
+                Assert.assertTrue(connectionDispatcher.offer(new SenderConnectionEvent(
+                        SenderConnectionEvent.Kind.DISCONNECTED,
+                        null, SenderConnectionEvent.NO_PORT,
+                        null, SenderConnectionEvent.NO_PORT,
+                        SenderConnectionEvent.NO_ATTEMPT_NUMBER,
+                        SenderConnectionEvent.NO_ROUND_NUMBER,
+                        null, 0L)));
+                Assert.assertTrue(errorDispatcher.offer(new SenderError(
+                        SenderError.Category.UNKNOWN, SenderError.Policy.RETRIABLE,
+                        SenderError.NO_STATUS_BYTE, null, SenderError.NO_MESSAGE_SEQUENCE,
+                        -1L, -1L, null, 0L)));
+                Assert.assertTrue(progressDispatcher.offer(0L));
+                Thread connectionDispatcherThread = connectionDispatcher.getWorkerThreadForTesting();
+                Thread errorDispatcherThread = errorDispatcher.getWorkerThreadForTesting();
+                Thread progressDispatcherThread = progressDispatcher.getWorkerThreadForTesting();
+                Assert.assertNotNull(connectionDispatcherThread);
+                Assert.assertNotNull(errorDispatcherThread);
+                Assert.assertNotNull(progressDispatcherThread);
+
+                AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+                Thread closer = new Thread(() -> {
+                    Thread.currentThread().interrupt();
+                    try {
+                        sender.close();
+                    } catch (Throwable t) {
+                        closeFailure.set(t);
+                    }
+                }, "full-cleanup-closer");
+                closer.start();
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("closer thread did not finish", closer.isAlive());
+                Assert.assertNotNull("close() must surface the failed I/O-thread stop",
+                        closeFailure.get());
+
+                releaseConnect.countDown();
+                Thread ioThread = ioThreadRef.get();
+                Assert.assertNotNull(ioThread);
+                ioThread.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("I/O thread did not exit after release", ioThread.isAlive());
+                Assert.assertTrue("complete sender cleanup callback did not finish",
+                        sender.isCloseCleanupComplete());
+                Assert.assertTrue("loop-owned WebSocket client was not closed", loopClient.isClosed());
+                Assert.assertTrue("sender-owned WebSocket client was not closed", senderClient.isClosed());
+                Assert.assertFalse("connection dispatcher worker was not reclaimed",
+                        connectionDispatcherThread.isAlive());
+                Assert.assertFalse("error dispatcher worker was not reclaimed",
+                        errorDispatcherThread.isAlive());
+                Assert.assertFalse("progress dispatcher worker was not reclaimed",
+                        progressDispatcherThread.isAlive());
+                Assert.assertTrue("engine cleanup did not complete", engine.isCloseCompleted());
+                try (SlotLock probe = SlotLock.acquire(slot)) {
+                    Assert.assertNotNull(probe);
+                }
+            } finally {
+                releaseConnect.countDown();
+                Thread.interrupted();
+                if (loop != null) {
+                    try {
+                        loop.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                rmDirRecursive(tmpDir);
+                Files.remove(tmpDir);
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ utils
 
     private static void freeFieldQuietly(Object target, String name) {
@@ -528,14 +644,25 @@ public class SlotLockReleasedContractTest {
      * it (close is idempotent via the superclass).
      */
     private static final class StubWebSocketClient extends WebSocketClient {
+        private final AtomicBoolean isClosed = new AtomicBoolean();
 
         StubWebSocketClient() {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
         }
 
         @Override
+        public void close() {
+            isClosed.set(true);
+            super.close();
+        }
+
+        @Override
         protected void ioWait(int timeout, int op) {
             throw new UnsupportedOperationException("stub: no socket");
+        }
+
+        boolean isClosed() {
+            return isClosed.get();
         }
 
         @Override

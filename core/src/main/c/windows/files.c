@@ -215,6 +215,25 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsync
     return 0;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsyncDir0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    jint fd = open_file((const char *) (uintptr_t) lpszName,
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS);
+    if (fd < 0) {
+        return -1;
+    }
+    if (!FlushFileBuffers(FD_TO_HANDLE(fd))) {
+        SaveLastError();
+        CloseHandle(FD_TO_HANDLE(fd));
+        return -1;
+    }
+    CloseHandle(FD_TO_HANDLE(fd));
+    return 0;
+}
+
 JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
         (JNIEnv *e, jclass cl, jint fd, jlong size) {
     FILE_END_OF_FILE_INFO eof;

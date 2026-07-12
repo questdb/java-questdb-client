@@ -49,6 +49,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
@@ -866,6 +867,105 @@ public class SenderPoolSfTest {
                     if (borrowerFailure.get() != null) {
                         throw new AssertionError("borrower failed", borrowerFailure.get());
                     }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDirectRetiredSlotCallbacksHaveLinearProbeCount() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                final int slotCount = 32;
+                String config = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(
+                        config, 0, slotCount, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] leases = new PooledSender[slotCount];
+                    Sender[] delegates = new Sender[slotCount];
+                    Runnable[] callbacks = new Runnable[slotCount];
+                    for (int i = 0; i < slotCount; i++) {
+                        leases[i] = pool.borrow();
+                        delegates[i] = getDelegate(leases[i]);
+                        callbacks[i] = (Runnable) getField(delegates[i], "slotLockReleaseListener");
+                        Assert.assertNotNull(callbacks[i]);
+                    }
+                    for (int i = 0; i < slotCount; i++) {
+                        delegates[i].close();
+                        setBooleanField(delegates[i], "slotLockReleased", false);
+                        invokeDiscardBroken(pool, leases[i]);
+                    }
+                    Assert.assertEquals(slotCount, pool.leakedSlotCount());
+                    setLongField(pool, "retiredSlotProbeCount", 0);
+
+                    int[] geometricCheckpoints = {4, 8, 16, 32};
+                    int checkpoint = 0;
+                    for (int i = 0; i < slotCount; i++) {
+                        setBooleanField(delegates[i], "slotLockReleased", true);
+                        callbacks[i].run();
+                        if (i + 1 == geometricCheckpoints[checkpoint]) {
+                            Assert.assertEquals("direct release probes must grow linearly",
+                                    i + 1, getLongField(pool, "retiredSlotProbeCount"));
+                            checkpoint++;
+                        }
+                    }
+                    Assert.assertEquals(0, pool.leakedSlotCount());
+                    Assert.assertTrue(((List<?>) getField(pool, "retiredSlots")).isEmpty());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDirectRetiredSlotCallbackFallbackAndIdempotence() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (SenderPool pool = new SenderPool(config, 0, 3, 5_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender[] leases = new PooledSender[3];
+                    Sender[] delegates = new Sender[3];
+                    Runnable[] callbacks = new Runnable[3];
+                    for (int i = 0; i < 3; i++) {
+                        leases[i] = pool.borrow();
+                        delegates[i] = getDelegate(leases[i]);
+                        callbacks[i] = (Runnable) getField(delegates[i], "slotLockReleaseListener");
+                        delegates[i].close();
+                        setBooleanField(delegates[i], "slotLockReleased", false);
+                        invokeDiscardBroken(pool, leases[i]);
+                    }
+                    Assert.assertEquals(3, pool.leakedSlotCount());
+                    setLongField(pool, "retiredSlotProbeCount", 0);
+
+                    // Simulate callback registration becoming unavailable. The
+                    // periodic housekeeper scan must remain a complete fallback.
+                    ((QwpWebSocketSender) delegates[0]).setSlotLockReleaseListener(null);
+                    setBooleanField(delegates[0], "slotLockReleased", true);
+                    pool.reapIdle();
+                    Assert.assertEquals(2, pool.leakedSlotCount());
+
+                    // A premature callback must not remove an unreleased slot.
+                    callbacks[1].run();
+                    Assert.assertEquals(2, pool.leakedSlotCount());
+                    setBooleanField(delegates[1], "slotLockReleased", true);
+                    callbacks[1].run();
+                    Assert.assertEquals(1, pool.leakedSlotCount());
+
+                    // Duplicate and stale callbacks are idempotent and do not
+                    // probe or mutate the slot after its direct removal.
+                    setBooleanField(delegates[2], "slotLockReleased", true);
+                    callbacks[2].run();
+                    long probesAfterRecovery = getLongField(pool, "retiredSlotProbeCount");
+                    callbacks[2].run();
+                    callbacks[1].run();
+                    Assert.assertEquals(probesAfterRecovery,
+                            getLongField(pool, "retiredSlotProbeCount"));
+                    Assert.assertEquals(0, pool.leakedSlotCount());
+                    Assert.assertTrue(((List<?>) getField(pool, "retiredSlots")).isEmpty());
                 }
             }
         });
@@ -2374,6 +2474,85 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testDrainFailureRetriesInRangeAndOutOfRangeCandidates() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                for (int i = 0; i < 2; i++) {
+                    String seedConfig = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                            + ";sender_id=default-" + i + ";close_flush_timeout_millis=0;";
+                    try (Sender seed = Sender.fromConfig(seedConfig)) {
+                        seed.table("recover").longColumn("v", i).atNow();
+                        seed.flush();
+                    }
+                }
+            }
+            Assert.assertTrue("in-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-0")));
+            Assert.assertTrue("out-of-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-1")));
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+                IntFunction<Sender> factory = idx -> {
+                    if (attempts[idx].incrementAndGet() == 1) {
+                        return (Sender) Proxy.newProxyInstance(
+                                Sender.class.getClassLoader(),
+                                new Class[]{Sender.class},
+                                (proxy, method, args) -> {
+                                    if ("drain".equals(method.getName())) {
+                                        throw new LineSenderException("transient drain failure for slot " + idx);
+                                    }
+                                    if ("close".equals(method.getName())) {
+                                        return null;
+                                    }
+                                    throw new AssertionError("unexpected recovery sender call: " + method.getName());
+                                });
+                    }
+                    return Sender.builder(config).senderId("default-" + idx).build();
+                };
+
+                try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 5_000, factory)) {
+                    Assert.assertFalse("failed in-range drain must defer the same candidate",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertEquals(1, attempts[0].get());
+                    Assert.assertEquals(0, attempts[1].get());
+                    Assert.assertTrue("failed in-range drain must preserve durable data",
+                            hasSegmentFile(slot("default-0")));
+
+                    Assert.assertTrue("successful in-range retry may continue scanning",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertEquals("same live pool must retry the in-range candidate",
+                            2, attempts[0].get());
+                    Assert.assertFalse("in-range retry must drain the preserved data",
+                            hasSegmentFile(slot("default-0")));
+
+                    Assert.assertFalse("failed out-of-range drain must defer the same candidate",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertEquals(1, attempts[1].get());
+                    Assert.assertTrue("failed out-of-range drain must preserve durable data",
+                            hasSegmentFile(slot("default-1")));
+
+                    Assert.assertTrue("successful out-of-range retry may finish the candidate",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertEquals("same live pool must retry the out-of-range candidate",
+                            2, attempts[1].get());
+                    Assert.assertFalse("out-of-range retry must drain the preserved data",
+                            hasSegmentFile(slot("default-1")));
+                    Assert.assertFalse("final scan step must mark recovery complete",
+                            invokeRunStartupRecoveryStep(pool));
+                    Assert.assertTrue("both recovered frames must be delivered", handler.frames.get() >= 2);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testInRangeIdleSlotIsRecoveredAtStartupUnderSteadyLowLoad() throws Exception {
         // The drain exclusion is bounded to [0, maxSize) so a sibling's drainer
         // never adopts a slot dir the pool intends to (re)create -- that is what
@@ -3135,10 +3314,22 @@ public class SenderPoolSfTest {
         f.setBoolean(target, value);
     }
 
+    private static void setLongField(Object target, String name, long value) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.setLong(target, value);
+    }
+
     private static int getIntField(Object target, String name) throws Exception {
         Field f = target.getClass().getDeclaredField(name);
         f.setAccessible(true);
         return f.getInt(target);
+    }
+
+    private static long getLongField(Object target, String name) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getLong(target);
     }
 
     private static Object getField(Object target, String name) throws Exception {

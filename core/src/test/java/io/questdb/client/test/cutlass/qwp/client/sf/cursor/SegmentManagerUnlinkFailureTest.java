@@ -138,8 +138,8 @@ public class SegmentManagerUnlinkFailureTest {
                 Assert.assertNotNull("failed unlink removed the segment from ring bookkeeping",
                         ring.firstSealed());
                 Assert.assertEquals(failedPath, ring.firstSealed().path());
-                Assert.assertEquals("watermark advanced although unlink did not commit",
-                        -1L, watermark.read());
+                Assert.assertEquals("failed unlink must remain covered by the durable cumulative watermark",
+                        0L, watermark.read());
 
                 fill(payload, 32, (byte) 0x5A);
                 Assert.assertEquals("non-DEDUP successor must continue at the next FSN",

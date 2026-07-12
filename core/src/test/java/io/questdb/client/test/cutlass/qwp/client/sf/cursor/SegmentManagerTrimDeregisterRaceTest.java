@@ -43,7 +43,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -186,11 +185,8 @@ public class SegmentManagerTrimDeregisterRaceTest {
                                     + "`totalBytes -= sz` on a stillRegistered re-check "
                                     + "under the same lock that covers deregister.",
                             0L, observed);
-                    assertFalse("stale SegmentManager snapshot skipped drainTrimmable() "
-                                    + "after deregister and left a fully-acked sealed "
-                                    + "segment on disk. The registration guard should "
-                                    + "protect watermark/accounting only; trim ownership "
-                                    + "transfer must still close and unlink " + activePath,
+                    assertTrue("deregister before the durable barrier must preserve the segment "
+                                    + "for owner-side quiescent cleanup " + activePath,
                             Files.exists(activePath));
                 } finally {
                     mgr.setBeforeTrimSyncHook(null);

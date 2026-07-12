@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongSupplier;
 
 /**
  * Background worker that keeps every registered {@link SegmentRing} supplied
@@ -51,17 +52,6 @@ import java.util.concurrent.locks.LockSupport;
  * in a JVM). Polls each ring on a configurable tick (default 1 ms) — short
  * enough that a producer rarely sees {@link SegmentRing#BACKPRESSURE_NO_SPARE}
  * in the steady state, long enough that an idle JVM doesn't burn CPU.
- * <p>
- * <b>baseSeq race window:</b> the spare is created with
- * {@code baseSeq = ring.nextSeqHint()} as observed by the manager. If the
- * producer thread appends more frames before the rotation actually fires,
- * the spare's baseSeq will be stale and {@link SegmentRing#appendOrFsn} will
- * throw on the mismatch check. In practice this is benign — by the time
- * {@link SegmentRing#needsHotSpare()} returns true the producer has very
- * little room left in the active segment, and the manager polls fast enough
- * to install before the producer fills the rest. Hardening to make the race
- * impossible (lazy header write at rotation time) is a separate refinement
- * deferred to PR2.
  */
 public final class SegmentManager implements QuietCloseable {
 
@@ -77,6 +67,13 @@ public final class SegmentManager implements QuietCloseable {
     private static final AtomicIntegerFieldUpdater<RingEntry> ENTRY_STATE_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
+    private static final int MAX_TRIMS_PER_RING_PASS = 64;
+    private static final long TRIM_RETRY_INITIAL_NANOS = 4_000_000L;
+    private static final long TRIM_RETRY_MAX_NANOS = 1_024_000_000L;
+    private static final int TRIM_RETRY_NONE = 0;
+    private static final int TRIM_RETRY_POST_BARRIER = 3;
+    private static final int TRIM_RETRY_PRE_BARRIER = 1;
+    private static final int TRIM_RETRY_UNLINK = 2;
     private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
     private final AtomicLong fileGeneration = new AtomicLong();
@@ -97,6 +94,11 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
+    private final LongSupplier ticks;
+    // Reused by the worker for one bounded trim quantum. Keeping the unlinked
+    // prefix here until the post-unlink directory barrier succeeds avoids both
+    // per-pass allocation and publishing logical removal before it is durable.
+    private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
     // Test seam: runs after a deferred ring-pass cleanup returns. Null in
     // production; public sender/pool lifecycle tests use it to observe exact
     // callback completion without sleeps or polling.
@@ -126,6 +128,10 @@ public final class SegmentManager implements QuietCloseable {
     // entry-state check inside the trim block closes for watermark writes and
     // totalBytes accounting.
     private volatile Runnable beforeTrimSyncHook;
+    // Test seam invoked exactly when a retry transition/recovery is logged.
+    // Null in production; persistent-failure tests use it to prove log bounds
+    // without binding to a particular SLF4J backend.
+    private volatile Runnable retryLogHook;
     // Entry the worker is claiming or servicing, or null between passes.
     // Volatile publication lets teardown find the entry after deregister()
     // removes it from rings. RingEntry.state is the authoritative barrier:
@@ -174,11 +180,11 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE);
+        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE);
+        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     /**
@@ -204,11 +210,22 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
-        this(segmentSizeBytes, pollNanos, maxTotalBytes, FilesFacade.INSTANCE);
+        this(segmentSizeBytes, pollNanos, maxTotalBytes, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     @TestOnly
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
+        this(segmentSizeBytes, pollNanos, maxTotalBytes, filesFacade, System::nanoTime);
+    }
+
+    @TestOnly
+    public SegmentManager(
+            long segmentSizeBytes,
+            long pollNanos,
+            long maxTotalBytes,
+            FilesFacade filesFacade,
+            LongSupplier ticks
+    ) {
         // The pathScratch field initializer has already allocated its native
         // buffer by the time this body runs, so a validation throw must free
         // it or every failed construction leaks 256 bytes of native memory
@@ -227,6 +244,11 @@ public final class SegmentManager implements QuietCloseable {
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
         this.maxTotalBytes = maxTotalBytes;
+        this.ticks = ticks;
+    }
+
+    FilesFacade filesFacade() {
+        return filesFacade;
     }
 
     @Override
@@ -587,6 +609,11 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
+    public void setRetryLogHook(Runnable hook) {
+        this.retryLogHook = hook;
+    }
+
+    @TestOnly
     public void setWorkerJoinTimeoutMillis(long millis) {
         this.workerJoinTimeoutMillis = millis;
     }
@@ -691,17 +718,18 @@ public final class SegmentManager implements QuietCloseable {
         return displayPath;
     }
 
-    private void serviceRing(RingEntry e) {
+    private boolean serviceRing(RingEntry e) {
         // Publish before the CAS so deregister + await can always find the
         // entry. The state CAS is the ownership decision: if deregister won,
         // this stale snapshot pass skips the ring without touching it.
         inService = e;
         if (!ENTRY_STATE_UPDATER.compareAndSet(e, ENTRY_REGISTERED, ENTRY_IN_SERVICE)) {
             inService = null;
-            return;
+            return false;
         }
+        boolean hasMoreTrimmable;
         try {
-            serviceRing0(e);
+            hasMoreTrimmable = serviceRing0(e);
         } finally {
             e.finishService();
             Runnable cleanup = e.quiescenceCleanup == null
@@ -731,9 +759,10 @@ public final class SegmentManager implements QuietCloseable {
                 }
             }
         }
+        return hasMoreTrimmable;
     }
 
-    private void serviceRing0(RingEntry e) {
+    private boolean serviceRing0(RingEntry e) {
         // 1. Provision a hot spare if the ring needs one AND we have headroom
         //    under the disk-total cap. Cap check is per-tick; if we're capped
         //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
@@ -829,61 +858,206 @@ public final class SegmentManager implements QuietCloseable {
             }
         }
 
-        // 2. Trim any segments that the ring says are fully acked. For
-        //    memory-mode rings, "trim" is just close() (Unsafe.free) — no
-        //    file to unlink.
-        //
-        //    The watermark write and totalBytes commit are registration-gated
-        //    under `lock` so stale worker snapshots cannot touch the
-        //    engine-owned watermark or mutate accounting after deregister()
-        //    returns. Trimming still runs for stale snapshots: a successful
-        //    close + unlink transfers the fully-acked segment out of the ring,
-        //    preserving cleanup without touching deregistered accounting.
-        //
-        //    munmap + unlink stay outside the lock — they can be slow
-        //    and shouldn't block register/deregister or sibling rings.
+        // 2. Trim any segments that the ring says are fully acked. Memory
+        //    mode only frees native memory. Disk mode first makes the current
+        //    cumulative ACK durable, then durably establishes the watermark's
+        //    directory entry, unlinks one bounded batch, and finally commits
+        //    those directory removals before ring/accounting state changes.
+        //    No syscall runs under the manager lock.
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
             hook.run();
         }
+        MmapSegment first = e.ring.firstTrimmable();
+        if (first == null) {
+            // Preserve the cheap mmap-only watermark cadence for ACKs that do
+            // not yet cover a complete sealed segment.
+            synchronized (lock) {
+                if (e.isRegistered() && e.watermark != null) {
+                    long currentAck = e.ring.ackedFsn();
+                    if (currentAck > e.lastPersistedAck) {
+                        e.watermark.write(currentAck);
+                        e.lastPersistedAck = currentAck;
+                    }
+                }
+            }
+            return false;
+        }
+
+        if (memoryMode) {
+            int trimmed = 0;
+            while (trimmed < MAX_TRIMS_PER_RING_PASS) {
+                MmapSegment segment = e.ring.firstTrimmable();
+                if (segment == null) {
+                    break;
+                }
+                try {
+                    segment.close();
+                    synchronized (lock) {
+                        if (e.ring.removeTrimmable(segment)) {
+                            trimmed++;
+                            if (e.isRegistered()) {
+                                totalBytes -= segment.sizeBytes();
+                            }
+                        }
+                    }
+                } catch (Throwable t) {
+                    LOG.warn("Failed to trim memory segment", t);
+                    return false;
+                }
+            }
+            return trimmed == MAX_TRIMS_PER_RING_PASS && e.ring.firstTrimmable() != null;
+        }
+
+        // A deferred disk retry does no sync, unlink, or logging work. Signed
+        // subtraction is the standard wrap-safe deadline comparison because
+        // the bounded delay is many orders of magnitude below half the long
+        // range, even when the monotonic clock wraps.
+        long now = ticks.getAsLong();
+        if (e.trimRetryDelayNanos != 0 && now - e.trimRetryAtNanos < 0) {
+            return false;
+        }
+
+        // A disk segment cannot be safely unlinked without durable ACK cover.
+        // The registration check and mmap store are atomic with deregister.
+        // Once the store wins, deregistration may proceed, but its owner must
+        // await this in-service pass before closing the watermark or ring.
+        if (e.watermark == null) {
+            if (!e.missingWatermarkLogged) {
+                e.missingWatermarkLogged = true;
+                LOG.warn("Cannot durably trim acknowledged segments in {} without an ack watermark", e.dir);
+            }
+            return false;
+        }
+        long durableAck;
+        synchronized (lock) {
+            if (!e.isRegistered()) {
+                return false;
+            }
+            durableAck = e.ring.ackedFsn();
+            if (durableAck > e.lastPersistedAck) {
+                e.watermark.write(durableAck);
+                e.lastPersistedAck = durableAck;
+            }
+        }
+        try {
+            e.watermark.sync();
+            if (filesFacade.fsyncDir(e.dir) != 0) {
+                recordTrimFailure(e, TRIM_RETRY_PRE_BARRIER, now, null);
+                return false;
+            }
+        } catch (Throwable t) {
+            recordTrimFailure(e, TRIM_RETRY_PRE_BARRIER, now, t);
+            return false;
+        }
+
         boolean trimFailed = false;
-        while (true) {
-            MmapSegment segment = e.ring.firstTrimmable();
-            if (segment == null) {
+        Throwable trimFailure = null;
+        int unlinked = 0;
+        MmapSegment segment = first;
+        long coveredAck = durableAck;
+        while (segment != null && unlinked < MAX_TRIMS_PER_RING_PASS) {
+            long lastSeq = segment.baseSeq() + segment.frameCount() - 1L;
+            if (lastSeq > coveredAck) {
                 break;
             }
+            MmapSegment next = e.ring.nextSealedAfter(segment);
             String path = segment.path();
             try {
                 segment.close();
-                if (path != null && !filesFacade.remove(path)) {
+                // A retry after a post-unlink directory-sync failure sees an
+                // already absent path. Treat absence as the prior successful
+                // unlink and retry the batch barrier rather than wedging.
+                if (!filesFacade.remove(path) && filesFacade.exists(path)) {
                     trimFailed = true;
-                    LOG.warn("Failed to unlink trimmed segment {}", path);
                     break;
                 }
-                synchronized (lock) {
-                    if (e.ring.removeTrimmable(segment) && e.isRegistered()) {
-                        totalBytes -= segment.sizeBytes();
-                    }
-                }
+                trimBatch[unlinked++] = segment;
+                segment = next;
             } catch (Throwable t) {
                 trimFailed = true;
-                LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
+                trimFailure = t;
                 break;
             }
         }
-        // An unlink failure leaves the acknowledged segment in the ring and
-        // on disk. Do not advance the persisted watermark past it: recovery
-        // must continue to see the failed path as live bookkeeping rather
-        // than infer that trim committed. A later successful retry persists
-        // the current cumulative ACK normally.
-        synchronized (lock) {
-            if (!trimFailed && e.isRegistered() && e.watermark != null) {
-                long currentAck = e.ring.ackedFsn();
-                if (currentAck > e.lastPersistedAck) {
-                    e.watermark.write(currentAck);
-                    e.lastPersistedAck = currentAck;
+
+        if (unlinked > 0) {
+            try {
+                if (filesFacade.fsyncDir(e.dir) != 0) {
+                    for (int i = 0; i < unlinked; i++) {
+                        trimBatch[i] = null;
+                    }
+                    recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, null);
+                    return false;
+                }
+            } catch (Throwable t) {
+                for (int i = 0; i < unlinked; i++) {
+                    trimBatch[i] = null;
+                }
+                recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, t);
+                return false;
+            }
+            synchronized (lock) {
+                for (int i = 0; i < unlinked; i++) {
+                    MmapSegment removed = trimBatch[i];
+                    trimBatch[i] = null;
+                    if (e.ring.removeTrimmable(removed) && e.isRegistered()) {
+                        totalBytes -= removed.sizeBytes();
+                    }
                 }
             }
+        }
+        if (trimFailed) {
+            recordTrimFailure(e, TRIM_RETRY_UNLINK, now, trimFailure);
+            return false;
+        }
+        recordTrimSuccess(e);
+        return unlinked == MAX_TRIMS_PER_RING_PASS && e.ring.firstTrimmable() != null;
+    }
+
+    private void recordTrimFailure(RingEntry e, int failureKind, long now, Throwable failure) {
+        long delay = e.trimRetryDelayNanos == 0
+                ? TRIM_RETRY_INITIAL_NANOS
+                : Math.min(e.trimRetryDelayNanos << 1, TRIM_RETRY_MAX_NANOS);
+        e.trimRetryAtNanos = now + delay;
+        e.trimRetryDelayNanos = delay;
+        if (e.trimRetryFailureKind != failureKind) {
+            e.trimRetryFailureKind = failureKind;
+            if (failure == null) {
+                LOG.warn("Durable segment trim failed in {} during {} (retry delayed)",
+                        e.dir, trimFailureName(failureKind));
+            } else {
+                LOG.warn("Durable segment trim failed in {} during {} (retry delayed)",
+                        e.dir, trimFailureName(failureKind), failure);
+            }
+            Runnable hook = retryLogHook;
+            if (hook != null) {
+                hook.run();
+            }
+        }
+    }
+
+    private void recordTrimSuccess(RingEntry e) {
+        if (e.trimRetryDelayNanos != 0) {
+            e.trimRetryAtNanos = 0;
+            e.trimRetryDelayNanos = 0;
+            e.trimRetryFailureKind = TRIM_RETRY_NONE;
+            LOG.info("Durable segment trim recovered in {}", e.dir);
+            Runnable hook = retryLogHook;
+            if (hook != null) {
+                hook.run();
+            }
+        }
+    }
+
+    private static String trimFailureName(int failureKind) {
+        switch (failureKind) {
+            case TRIM_RETRY_PRE_BARRIER:
+                return "covering barrier";
+            case TRIM_RETRY_UNLINK:
+                return "segment unlink";
+            default:
+                return "directory commit barrier";
         }
     }
 
@@ -899,16 +1073,21 @@ public final class SegmentManager implements QuietCloseable {
                         ringSnapshot.add(rings.getQuick(i));
                     }
                 }
+                boolean hasMoreTrimmable = false;
                 for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
                     if (!running) break;
-                    serviceRing(ringSnapshot.getQuick(i));
+                    if (serviceRing(ringSnapshot.getQuick(i))) {
+                        hasMoreTrimmable = true;
+                    }
                 }
                 // Drop strong refs so a deregistered ring becomes collectable
                 // before the next tick (otherwise the snapshot pins it for up
                 // to pollNanos after deregister).
                 ringSnapshot.clear();
                 if (!running) break;
-                LockSupport.parkNanos(pollNanos);
+                if (!hasMoreTrimmable) {
+                    LockSupport.parkNanos(pollNanos);
+                }
             }
         } finally {
             // If a timed-out close() abandoned the reap, it handed
@@ -969,6 +1148,14 @@ public final class SegmentManager implements QuietCloseable {
         // Survives across multiple serviceRing ticks and avoids a
         // write-storm when ackedFsn is steady.
         long lastPersistedAck = -1L;
+        // Prevents a legacy disk registration without a watermark from
+        // flooding the log on every manager tick.
+        boolean missingWatermarkLogged;
+        // Zero-allocation manager-thread-only retry state. The deadline uses
+        // the manager's monotonic clock and the delay doubles to a fixed cap.
+        long trimRetryAtNanos;
+        long trimRetryDelayNanos;
+        int trimRetryFailureKind;
         // Updated lock-free by deferUntilRingQuiescent and pass completion.
         // The field updater avoids one AtomicReference allocation per ring.
         volatile Runnable quiescenceCleanup;

@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
@@ -49,11 +50,11 @@ import org.slf4j.LoggerFactory;
  *   offset 8:  i64 fsn
  * </pre>
  * <p>
- * <b>Zero-alloc, zero-syscall writes:</b> {@link #open(String)} opens the
+ * <b>Zero-alloc, store-only ACK writes:</b> {@link #open(String)} opens the
  * file and maps the 16 bytes once. {@link #write(long)} is a single
- * 8-byte aligned {@code Unsafe.putLong} into the mapped region. No
- * malloc/free, no read/write syscalls, no rename, on the manager's hot
- * tick path. An 8-byte aligned store is hardware-atomic on x86_64 and
+ * 8-byte aligned {@code Unsafe.putLong} into the mapped region. Ordinary
+ * ACK-only manager updates require no malloc/free, read/write syscalls, or
+ * rename. An 8-byte aligned store is hardware-atomic on x86_64 and
  * arm64, and disk-atomic within one sector (the file is 16 bytes —
  * trivially within one sector), so a torn FSN across a crash boundary
  * is not a concern.
@@ -67,11 +68,13 @@ import org.slf4j.LoggerFactory;
  * complexity (multi-store with fence + read-side validate) for
  * marginal additional safety.
  * <p>
- * <b>fsync cadence:</b> intentionally NOT performed. Host crash falls
- * back to recovery's {@code lowestBase - 1} seed (same as before this
- * feature, no regression), at the cost of a bounded re-replay window
- * for whatever durable-acks landed since the last successful page
- * cache flush.
+ * <b>fsync cadence:</b> ordinary ACK-only manager updates call
+ * {@link #write(long)} and stay syscall-free. Each non-empty background disk-trim
+ * quantum calls {@link #sync()} once (one mmap msync and one fd fsync), fsyncs
+ * the slot directory before unlinking, and fsyncs it again after the batch. A
+ * fully drained close uses the same
+ * covering order so the durable watermark guards any acknowledged segment that
+ * a host crash restores.
  * <p>
  * <b>Lifecycle:</b> single-writer (the {@link SegmentManager} worker
  * thread) after construction. Read once at engine startup (any thread,
@@ -98,6 +101,7 @@ public final class AckWatermark implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(AckWatermark.class);
     private static final int MAGIC_OFFSET = 0;
     private final int fd;
+    private final FilesFacade filesFacade;
     private final long mmapAddress;
     private boolean closed;
     // Stamped once per process either at open() (if the file already
@@ -108,8 +112,9 @@ public final class AckWatermark implements QuietCloseable {
     // construction; no synchronisation needed.
     private boolean magicWritten;
 
-    private AckWatermark(int fd, long mmapAddress, boolean magicAlreadyWritten) {
+    private AckWatermark(FilesFacade filesFacade, int fd, long mmapAddress, boolean magicAlreadyWritten) {
         this.fd = fd;
+        this.filesFacade = filesFacade;
         this.mmapAddress = mmapAddress;
         this.magicWritten = magicAlreadyWritten;
     }
@@ -122,7 +127,7 @@ public final class AckWatermark implements QuietCloseable {
             Files.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
         }
         if (fd >= 0) {
-            Files.close(fd);
+            filesFacade.close(fd);
         }
     }
 
@@ -136,6 +141,10 @@ public final class AckWatermark implements QuietCloseable {
      * stamps the magic and the new FSN atomically.
      */
     public static AckWatermark open(String slotDir) {
+        return open(FilesFacade.INSTANCE, slotDir);
+    }
+
+    static AckWatermark open(FilesFacade filesFacade, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
         // Decide by size: existing-and-correct -> openRW preserves the
         // previous session's watermark (defeating which is the whole
@@ -143,17 +152,17 @@ public final class AckWatermark implements QuietCloseable {
         // wrong-sized -> openCleanRW + allocate creates a fresh
         // FILE_SIZE-byte file (zero magic, read() reports INVALID until
         // the first write).
-        long existing = Files.exists(filePath) ? Files.length(filePath) : -1L;
+        long existing = filesFacade.exists(filePath) ? filesFacade.length(filePath) : -1L;
         int fd;
         if (existing == FILE_SIZE) {
-            fd = Files.openRW(filePath);
+            fd = filesFacade.openRW(filePath);
         } else {
-            fd = Files.openCleanRW(filePath);
-            if (fd >= 0 && !Files.allocate(fd, FILE_SIZE)) {
+            fd = filesFacade.openCleanRW(filePath);
+            if (fd >= 0 && !filesFacade.allocate(fd, FILE_SIZE)) {
                 // FilesFacade.allocate contract on a false return:
                 // close the fd AND unlink the partial file.
-                Files.close(fd);
-                Files.remove(filePath);
+                filesFacade.close(fd);
+                filesFacade.remove(filePath);
                 fd = -1;
             }
         }
@@ -165,7 +174,7 @@ public final class AckWatermark implements QuietCloseable {
         long addr = Files.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
         if (addr == Files.FAILED_MMAP_ADDRESS) {
             LOG.warn("ack watermark {} could not be mmapped; proceeding without it", filePath);
-            Files.close(fd);
+            filesFacade.close(fd);
             return null;
         }
         // Inspect the existing magic once at open time. If it's already
@@ -173,7 +182,7 @@ public final class AckWatermark implements QuietCloseable {
         // shutdown), the first write() can skip the magic store
         // entirely and degenerate to a single 8-byte FSN put.
         int magic = Unsafe.getUnsafe().getInt(addr + MAGIC_OFFSET);
-        return new AckWatermark(fd, addr, magic == FILE_MAGIC);
+        return new AckWatermark(filesFacade, fd, addr, magic == FILE_MAGIC);
     }
 
     /**
@@ -183,7 +192,11 @@ public final class AckWatermark implements QuietCloseable {
      * would only confuse the next session's seed.
      */
     public static void removeOrphan(String slotDir) {
-        Files.remove(slotDir + "/" + FILE_NAME);
+        removeOrphan(FilesFacade.INSTANCE, slotDir);
+    }
+
+    static boolean removeOrphan(FilesFacade filesFacade, String slotDir) {
+        return filesFacade.remove(slotDir + "/" + FILE_NAME);
     }
 
     /**
@@ -201,6 +214,23 @@ public final class AckWatermark implements QuietCloseable {
             return INVALID;
         }
         return Unsafe.getUnsafe().getLong(mmapAddress + FSN_OFFSET);
+    }
+
+    /**
+     * Flushes the mapped bytes and then the backing fd. The caller must sync
+     * the slot directory after this succeeds so a newly-created watermark's
+     * directory entry is durable before segment deletion begins.
+     */
+    public void sync() {
+        if (closed) {
+            throw new IllegalStateException("ack watermark is closed");
+        }
+        if (filesFacade.msync(mmapAddress, FILE_SIZE, false) != 0) {
+            throw new IllegalStateException("could not msync ack watermark");
+        }
+        if (filesFacade.fsync(fd) != 0) {
+            throw new IllegalStateException("could not fsync ack watermark");
+        }
     }
 
     /**
