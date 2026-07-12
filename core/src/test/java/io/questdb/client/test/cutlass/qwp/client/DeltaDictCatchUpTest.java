@@ -212,11 +212,15 @@ public class DeltaDictCatchUpTest {
     @Test
     public void testCatchUpEntryTooLargeForCapFailsTerminally() throws Exception {
         // A dictionary entry that exceeds the reconnect server's per-chunk budget
-        // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk.
-        // sendDictCatchUp must latch a clean terminal ("... during catch-up")
-        // rather than call fail(): pre-fix the oversized entry drove an endless
-        // reconnect loop (the entry never shrinks and the same cluster
-        // re-advertises the same cap) and re-entered connectLoop from the catch-up.
+        // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk. Every
+        // reachable node re-advertises the same small cap here, so the gap never
+        // resolves: sendDictCatchUp must retry across the settle budget and then
+        // latch a clean terminal ("... during catch-up") rather than call fail()
+        // (which from inside the catch-up re-enters connectLoop). Pre-fix it latched
+        // on the FIRST cap gap; the settle budget (MAX_CATCHUP_CAP_GAP_ATTEMPTS)
+        // rides out a transient smaller-cap window first (see the retry sibling in
+        // CursorWebSocketSendLoopCatchUpAlignmentTest), and only a persistent gap
+        // exhausts it. Small reconnect backoffs keep the budgeted attempts fast.
         //
         // Connection 1 advertises no cap, so the ~202-byte symbol registers and
         // enters the sent-dictionary mirror. The handler then shrinks the
@@ -234,7 +238,8 @@ public class DeltaDictCatchUpTest {
 
                 String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
                 LineSenderException terminal = null;
-                Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";");
+                Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;");
                 try {
                     sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
                     sender.flush();

@@ -133,6 +133,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
+    // Settle budget for the symbol-dict catch-up cap gap: how many CONSECUTIVE
+    // reconnect attempts may find a single dictionary entry too large for the fresh
+    // server's advertised batch cap before the sender latches a terminal. A
+    // homogeneous cluster never trips it -- an entry that fit its data frame under a
+    // cap always fits its bare catch-up frame under that same cap -- so this only
+    // affects a heterogeneous / rolling-cap cluster, where a failover to a
+    // smaller-cap node can hit it for an entry an earlier node accepted. Retrying
+    // rides out the transient window until a larger-cap node returns; only a
+    // persistent gap (every reachable node too small for this many attempts) latches
+    // terminal, matching the orphan drainer's DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS.
+    // A successful catch-up resets the counter (see sendDictCatchUp).
+    private static final int MAX_CATCHUP_CAP_GAP_ATTEMPTS = 16;
     // Hard ceiling for the lifetime-monotonic sent-dictionary mirror. The mirror
     // fields are int, so it cannot exceed Integer.MAX_VALUE bytes; reaching even
     // this needs ~200M+ distinct symbols on a single connection, far past any real
@@ -206,6 +218,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // for the connection's lifetime (a reconnect may need the whole dictionary at
     // any moment), so it cannot be dropped; it is an intentional cost of the feature.
     private final boolean deltaDictEnabled;
+    // Consecutive reconnect attempts whose symbol-dict catch-up found an entry too
+    // large for the fresh server's batch cap (see MAX_CATCHUP_CAP_GAP_ATTEMPTS). A
+    // successful catch-up resets it; it is NOT reset per connection -- it measures
+    // the cap-gap episode across reconnects so a persistent gap eventually latches.
+    // I/O-thread-only.
+    private int catchUpCapGapAttempts;
     // True once a real ring frame (data or commit) has been sent on the CURRENT
     // connection, as opposed to only the dictionary catch-up. The catch-up
     // consumes wire sequences (nextWireSeq), so nextWireSeq > 0 no longer implies
@@ -2243,24 +2261,36 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     + NativeBufferWriter.varintSize(1)
                     + entryBytes;
             if (soloFrameLen > frameLimit) {
-                // Non-retriable: the entry will not shrink and the same cluster
-                // re-advertises the same cap, so reconnecting would livelock.
-                // Latch a terminal (the data must be resent after the cap is
-                // raised) rather than calling fail() -- which, from inside the
-                // catch-up, would re-enter connectLoop (see CatchUpSendException).
+                // Cap gap: this entry cannot be re-registered under the fresh
+                // server's advertised cap. A HOMOGENEOUS cluster never reaches here
+                // (an entry that fit its data frame under a cap always fits its bare
+                // catch-up frame under that same cap), so the only way in is a
+                // heterogeneous / rolling-cap failover to a smaller-cap node.
                 //
-                // Tradeoff (heterogeneous / rolling-cap clusters): a symbol
-                // accepted under a larger/absent cap can hit this on failover to a
-                // smaller-cap node, and the hard terminal does NOT self-recover if
-                // a later node advertises a larger cap -- the producer must be
-                // resumed after the data is resent (or the cap raised). Bounding
-                // symbol size at ingest, or a settle budget across reconnects
-                // before latching, would relax this, but both are larger changes;
-                // the terminal keeps the homogeneous common case livelock-free.
+                // Give the cluster a settle budget instead of latching on first
+                // sight: a larger-cap node may return, so retry across reconnects
+                // and only latch a terminal after MAX_CATCHUP_CAP_GAP_ATTEMPTS
+                // consecutive attempts still find it too large. Under budget the
+                // throw is RETRIABLE (no recordFatal) -- connectLoop reconnects with
+                // backoff and re-runs the catch-up, which resets the counter on a
+                // node that accepts it. A transient reconnect (connect/upgrade
+                // failure, role reject) never reaches the catch-up, so it neither
+                // increments nor burns this budget. On exhaustion latch via
+                // recordFatal, NOT fail() -- failing from inside the catch-up would
+                // re-enter connectLoop (see CatchUpSendException); the data must be
+                // resent after the cap is raised.
+                catchUpCapGapAttempts++;
+                boolean exhausted = catchUpCapGapAttempts >= MAX_CATCHUP_CAP_GAP_ATTEMPTS;
                 LineSenderException err = new LineSenderException(
                         "symbol dictionary entry too large for the server batch cap during catch-up ["
-                                + "frameLen=" + soloFrameLen + ", cap=" + cap + ']');
-                recordFatal(err);
+                                + "frameLen=" + soloFrameLen + ", cap=" + cap + ", attempt="
+                                + catchUpCapGapAttempts + '/' + MAX_CATCHUP_CAP_GAP_ATTEMPTS + ']'
+                                + (exhausted
+                                ? "; the data must be resent after the cap is raised"
+                                : "; retrying -- a larger-cap node may return"));
+                if (exhausted) {
+                    recordFatal(err);
+                }
                 throw new CatchUpSendException(err);
             }
             if (chunkSymbols > 0 && chunkBytes + entryBytes > budget) {
@@ -2279,6 +2309,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes);
             framesSent++;
         }
+        // The whole dictionary re-registered without a cap gap: this node accepts
+        // every entry, so the cap-gap episode (if any) is over -- reset the budget.
+        catchUpCapGapAttempts = 0;
         return framesSent;
     }
 

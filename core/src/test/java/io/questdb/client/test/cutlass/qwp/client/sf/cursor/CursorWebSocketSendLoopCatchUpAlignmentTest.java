@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -258,6 +259,61 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             "CatchUpSendException", e.getCause().getClass().getSimpleName());
                     assertTrue("message must name the frame-size guard: " + e.getCause().getMessage(),
                             e.getCause().getMessage().contains("catch-up frame exceeds the maximum size"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCatchUpCapGapRetriesUntilBudgetThenLatches() throws Exception {
+        // M1: an entry too large for the fresh server's cap during catch-up (a
+        // heterogeneous / rolling-cap failover to a smaller-cap node) must NOT latch
+        // on first sight. sendDictCatchUp throws a RETRIABLE CatchUpSendException so
+        // the reconnect loop rides it out -- a larger-cap node may return -- and only
+        // after MAX_CATCHUP_CAP_GAP_ATTEMPTS consecutive cap gaps does it recordFatal.
+        // Pre-fix the first cap gap latched a terminal, so one transient failover to a
+        // smaller-cap node killed the sender. (A successful catch-up resets the budget;
+        // the other catch-up tests, which use a fitting cap, never trip it.)
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            // cap 160 => catch-up budget is below a ~216-byte solo frame for a 200-char symbol.
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    // Attempts 1 .. max-1 are retriable: no terminal is latched.
+                    for (int i = 1; i < maxAttempts; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                            assertTrue("attempt " + i + " must name the catch-up cap gap: "
+                                            + e.getCause().getMessage(),
+                                    e.getCause().getMessage().contains("during catch-up"));
+                        }
+                        loop.checkError(); // under budget => retriable => no terminal
+                    }
+                    // The exhausting attempt still throws, and now latches the terminal.
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                        fail("the exhausting cap gap must still raise CatchUpSendException");
+                    } catch (InvocationTargetException e) {
+                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    }
+                    try {
+                        loop.checkError();
+                        fail("exhausting the cap-gap settle budget must latch a terminal");
+                    } catch (LineSenderException terminal) {
+                        assertTrue("terminal must name the exhausted catch-up cap gap: " + terminal.getMessage(),
+                                terminal.getMessage().contains("during catch-up")
+                                        && terminal.getMessage().contains("must be resent"));
+                    }
                 } finally {
                     loop.close();
                 }

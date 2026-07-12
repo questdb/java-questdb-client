@@ -3512,11 +3512,19 @@ public class QwpWebSocketSender implements Sender {
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
-        if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
+        // Snapshot the volatile cap ONCE for this whole flush. The I/O thread lowers
+        // serverMaxBatchSize on a mid-stream failover to a smaller-cap node
+        // (applyServerBatchSizeLimit); if the split pre-flight and the publish loop
+        // re-read the field independently, a failover between them would size frames
+        // against two different caps -- breaking the all-or-nothing guarantee and
+        // firing the publish-loop assert on a legitimate race. Both use this snapshot;
+        // the next flush picks up the new cap.
+        int cap = serverMaxBatchSize;
+        if (cap > 0 && messageSize > cap) {
             // The combined frame's delta-entry bytes are byte-identical to the first
             // split frame's (same baseline + batch max), so capture the length now
             // for the arithmetic frame-sizing in flushPendingRowsSplit.
-            flushPendingRowsSplit(keys, deferCommit, encoder.getDeltaEntriesLen());
+            flushPendingRowsSplit(keys, deferCommit, encoder.getDeltaEntriesLen(), cap);
             return;
         }
 
@@ -3568,9 +3576,9 @@ public class QwpWebSocketSender implements Sender {
      *                    carry FLAG_DEFER_COMMIT. When false, only the
      *                    last message omits the flag.
      */
-    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit, int combinedDeltaEntriesLen) {
+    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit, int combinedDeltaEntriesLen, int cap) {
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", serverMaxBatchSize, deferCommit);
+            LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", cap, deferCommit);
         }
 
         // Collect non-empty table indices so we know which is last, AND pre-flight
@@ -3613,12 +3621,12 @@ public class QwpWebSocketSender implements Sender {
                     + (deltaCount > 0 ? combinedDeltaEntriesLen : 0)
                     + splitFrameBodyBytes.getQuick(bodyIdx);
             bodyIdx++;
-            if (messageSize > serverMaxBatchSize) {
+            if (messageSize > cap) {
                 resetTableBuffersAfterFlush(keys);
                 throw new LineSenderException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
-                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+                        .put(", serverMaxBatchSize=").put(cap).put(']');
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.
@@ -3655,12 +3663,14 @@ public class QwpWebSocketSender implements Sender {
             // The pre-flight pass above already verified every split frame fits the
             // cap, so none can be found oversized here -- which is what keeps this
             // loop from publishing (and stranding) a deferred prefix before an
-            // oversized table. The assert guards a future divergence between the two
-            // passes; it deliberately does NOT reset+throw here, because by this
-            // point a prefix may already be on the ring.
-            assert messageSize <= serverMaxBatchSize
+            // oversized table. Both passes size against the SAME snapshot cap, so a
+            // mid-flush failover cannot make them disagree; the assert therefore only
+            // catches a genuine divergence between the pre-flight arithmetic and the
+            // real encode (a future bug), not a cap race. It deliberately does NOT
+            // reset+throw here, because by this point a prefix may already be on the ring.
+            assert messageSize <= cap
                     : "split frame exceeded serverMaxBatchSize after pre-flight [table=" + tableName
-                    + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + serverMaxBatchSize + ']';
+                    + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
 
             // Write-ahead persist before publish (see flushPendingRows). The
             // first split frame carries the batch's new symbols; the rest are
