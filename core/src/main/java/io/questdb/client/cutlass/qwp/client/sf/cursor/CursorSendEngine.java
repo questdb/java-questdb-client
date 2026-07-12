@@ -96,6 +96,15 @@ public final class CursorSendEngine implements QuietCloseable {
     // covers them. Read by the sender's close-time drain to avoid waiting on
     // acks that cannot arrive.
     private long recoveredCommitBoundaryFsn = -1L;
+    // Highest symbol id any recovered delta frame references, or -1 for
+    // fresh/memory rings (and recovered rings with no symbol-bearing frame). A
+    // resuming producer seeds its dictionary baseline from the persisted
+    // .symbol-dict; if that dictionary was torn below this id by a host crash
+    // (the side-file is not fsync'd), the producer would re-use ids the surviving
+    // frames already define. seedGlobalDictionaryFromPersisted compares this
+    // against the recovered dictionary size to fail clean instead. Computed once
+    // in the constructor's recovery branch; -1 elsewhere.
+    private long recoveredMaxSymbolId = -1L;
     // FSN of the last frame of a recovered orphaned deferred tail, or -1 when
     // the recovered ring has no such tail. When >= 0, frames
     // [recoveredCommitBoundaryFsn + 1 .. recoveredOrphanTipFsn] all carry
@@ -312,6 +321,18 @@ public final class CursorSendEngine implements QuietCloseable {
                             publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
                             recoveredCommitBoundaryFsn, publishedFsn);
                 }
+                // Highest symbol id the surviving frames reference. A resuming
+                // producer compares this against its recovered dictionary size
+                // (seedGlobalDictionaryFromPersisted) to detect a host-crash tear:
+                // if a frame references an id the (unsynced, torn) .symbol-dict no
+                // longer holds, resuming would re-use it. maxSymbolDeltaEnd returns
+                // 0 when no frame carries a symbol, yielding -1 here. Computed
+                // before the I/O loop or producer append; single-threaded here.
+                this.recoveredMaxSymbolId = recovered.maxSymbolDeltaEnd(
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DELTA_SYMBOL_DICT,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE) - 1L;
             } else {
                 // Fresh start with no recovered segments. Any stale
                 // watermark from a prior fully-drained session refers
@@ -712,6 +733,16 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long recoveredCommitBoundaryFsn() {
         return recoveredCommitBoundaryFsn;
+    }
+
+    /**
+     * Highest symbol id any recovered delta frame references, or {@code -1} for
+     * fresh/memory rings (and recovered rings with no symbol-bearing frame). A
+     * resuming producer compares this against its recovered dictionary size to
+     * detect a host-crash tear of the persisted {@code .symbol-dict}.
+     */
+    public long recoveredMaxSymbolId() {
+        return recoveredMaxSymbolId;
     }
 
     /**

@@ -771,6 +771,75 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testTornDictSubsetFailsCleanOnResume() throws Exception {
+        // C1 regression: the persisted .symbol-dict is NOT fsync'd, so a host crash
+        // can lose its highest-id tail entries while the segment frames that
+        // introduced those ids survive (out-of-order page loss). Recovery then seeds
+        // the producer from the SHORTER dictionary, but the I/O-thread catch-up mirror
+        // rebuilds the missing ids from those surviving frames -- so a resumed producer
+        // would assign its next new symbol an id the frames already define, silently
+        // misattributing symbol values on the wire. The send loop's replay guard only
+        // catches a GAP (deltaStart > mirror); a frame introducing exactly the
+        // torn-off id slips through and self-heals the mirror, leaving only this
+        // producer diverged. seedGlobalDictionaryFromPersisted must detect that the
+        // surviving frames reference an id at/beyond the recovered dictionary size and
+        // fail clean. Without the fix the resume succeeds and the reuse corrupts
+        // silently -- so the build below would NOT throw and the test's fail() fires.
+        assertMemoryLeak(() -> {
+            // Phase 1: record three delta frames (a@0, b@1, c@2) to disk with nothing
+            // acked (silent server), so all three survive and replay on recovery.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Simulate the host-crash tear: rewrite the persisted dictionary to drop
+            // its highest entry (c@2), keeping a@0,b@1 -- while the frame referencing
+            // c@2 stays on disk. openClean truncates; the two appends leave the exact
+            // two-entry dictionary a torn tail would recover to.
+            String slotDir = Paths.get(sfDir, "default").toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                torn.appendSymbol("a");
+                torn.appendSymbol("b");
+                Assert.assertEquals(2, torn.size());
+            }
+
+            // Phase 2: a resuming sender must refuse -- the surviving frames reference
+            // id 2 but the recovered dictionary holds only 2 id(s) [0,1].
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try {
+                    Sender resumed = Sender.fromConfig(cfg);
+                    resumed.close();
+                    Assert.fail("resume on a torn (subset) dictionary must fail clean");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue("message must name the torn-dict/resend failure: " + expected.getMessage(),
+                            expected.getMessage().contains("subset of the surviving frames")
+                                    && expected.getMessage().contains("resend"));
+                }
+            }
+        });
+    }
+
     private static int globalDictSize(Sender sender) throws Exception {
         Field f = sender.getClass().getDeclaredField("globalSymbolDictionary");
         f.setAccessible(true);

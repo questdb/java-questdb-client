@@ -523,6 +523,72 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) that
+     * any symbol-dict delta frame in this segment references, or {@code 0} when no
+     * such frame carries a symbol. Read-only walk over the recovered frames, used
+     * once at recovery to detect a persisted {@code .symbol-dict} torn (host crash,
+     * out-of-order page loss) below the ids the surviving frames still reference: if
+     * the max here reaches at or beyond the recovered dictionary size, a resuming
+     * producer -- seeded from the shorter dictionary -- would re-use ids the frames
+     * already define. The frame layout mirrors {@link #findLastFrameFsnWithoutPayloadFlag}:
+     * the QWP message header ({@code qwpHeaderSize} bytes) is followed by the delta
+     * section {@code [deltaStart varint][deltaCount varint]...}.
+     *
+     * @param headerMagic   the QWP message magic identifying a well-formed frame
+     * @param flagsOffset   byte offset of the flags field within the QWP header
+     * @param flagDeltaMask the FLAG_DELTA_SYMBOL_DICT bit
+     * @param qwpHeaderSize the QWP message header size (delta section starts past it)
+     */
+    public long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize) {
+        long maxEnd = 0L;
+        long off = HEADER_SIZE;
+        long frames = frameCount;
+        for (long i = 0; i < frames; i++) {
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
+            long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+            if (payloadLen >= qwpHeaderSize
+                    && payloadLen > flagsOffset
+                    && Unsafe.getUnsafe().getInt(payload) == headerMagic
+                    && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagDeltaMask) != 0) {
+                long p = payload + qwpHeaderSize;
+                long limit = payload + payloadLen;
+                long deltaStart = 0L;
+                int shift = 0;
+                while (p < limit) {
+                    byte b = Unsafe.getUnsafe().getByte(p++);
+                    deltaStart |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) {
+                        break;
+                    }
+                    shift += 7;
+                    if (shift > 35) {
+                        break; // corrupt run; recovered frames are CRC-valid, so defensive only
+                    }
+                }
+                long deltaCount = 0L;
+                shift = 0;
+                while (p < limit) {
+                    byte b = Unsafe.getUnsafe().getByte(p++);
+                    deltaCount |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) {
+                        break;
+                    }
+                    shift += 7;
+                    if (shift > 35) {
+                        break;
+                    }
+                }
+                long end = deltaStart + deltaCount;
+                if (end > maxEnd) {
+                    maxEnd = end;
+                }
+            }
+            off += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return maxEnd;
+    }
+
+    /**
      * Number of frames written since {@link #create} (or recovered by
      * {@link #openExisting}). Used by {@code SegmentRing} to compute
      * {@code lastSeq = baseSeq + frameCount - 1} for ACK / trim decisions.

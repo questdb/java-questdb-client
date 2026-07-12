@@ -57,6 +57,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
+import io.questdb.client.std.IntList;
 import io.questdb.client.std.Misc;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
@@ -169,6 +170,11 @@ public class QwpWebSocketSender implements Sender {
     // behind a drainer's endpoint walk.
     private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
+    // Per-table encoded body byte counts captured during flushPendingRows' combined
+    // encode, reused by flushPendingRowsSplit to size each split frame arithmetically
+    // instead of re-encoding the batch a second time. Cleared and repopulated on every
+    // flush; only consumed on the (exceptional) split path. Reused to stay zero-GC.
+    private final IntList splitFrameBodyBytes = new IntList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
@@ -3474,6 +3480,15 @@ public class QwpWebSocketSender implements Sender {
         encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
                 symbolDeltaBaseline(), currentBatchMaxSymbolId);
+        // Record each table's encoded body size (position delta across addTable) so
+        // the split path can size its per-table frames arithmetically rather than
+        // re-encoding the whole batch. Body encoding is context-free (a table's bytes
+        // don't depend on its siblings or the delta section), so the size a table
+        // takes here equals the size it takes in its own split frame. Only consumed
+        // when the batch overflows the cap; the capture is a couple of int ops per
+        // table on the common path.
+        splitFrameBodyBytes.clear();
+        int bodyStart = encoder.getBuffer().getPosition();
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3490,12 +3505,18 @@ public class QwpWebSocketSender implements Sender {
             }
 
             encoder.addTable(tableBuffer);
+            int bodyEnd = encoder.getBuffer().getPosition();
+            splitFrameBodyBytes.add(bodyEnd - bodyStart);
+            bodyStart = bodyEnd;
         }
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
         if (serverMaxBatchSize > 0 && messageSize > serverMaxBatchSize) {
-            flushPendingRowsSplit(keys, deferCommit);
+            // The combined frame's delta-entry bytes are byte-identical to the first
+            // split frame's (same baseline + batch max), so capture the length now
+            // for the arithmetic frame-sizing in flushPendingRowsSplit.
+            flushPendingRowsSplit(keys, deferCommit, encoder.getDeltaEntriesLen());
             return;
         }
 
@@ -3547,7 +3568,7 @@ public class QwpWebSocketSender implements Sender {
      *                    carry FLAG_DEFER_COMMIT. When false, only the
      *                    last message omits the flag.
      */
-    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit) {
+    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit, int combinedDeltaEntriesLen) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", serverMaxBatchSize, deferCommit);
         }
@@ -3561,15 +3582,19 @@ public class QwpWebSocketSender implements Sender {
         // resetTableBuffersAfterFlush would discard every source row -- a partial
         // commit the caller was told (by the throw) had failed. Checking all sizes up
         // front makes the split all-or-nothing: either every frame fits and all
-        // publish, or none publish and we throw with nothing stranded. The cost is a
-        // second encode pass over the split batch, which is already the exceptional
-        // large-batch path. encode is read-only on the table buffer, and simBaseline
-        // mirrors the publish loop's baseline advance (advanceSentMaxSymbolId), so
-        // each measured size equals the frame the publish loop will build; this pass
-        // mutates no delta/persist state (the defer-commit flag is a header bit that
-        // does not change frame size).
+        // publish, or none publish and we throw with nothing stranded.
+        //
+        // Each split frame's size is derived ARITHMETICALLY from the combined encode
+        // flushPendingRows already performed -- header + the two delta-section varints
+        // + the delta entries (byte-identical to the combined frame's when this frame
+        // carries them) + the table's own body bytes (captured in splitFrameBodyBytes,
+        // context-free so identical here and in its solo frame) -- rather than
+        // re-encoding every table a second time. simBaseline mirrors the publish loop's
+        // baseline advance (advanceSentMaxSymbolId), so each size equals the frame the
+        // publish loop will build; this pass mutates no delta/persist state.
         int nonEmptyCount = 0;
         int simBaseline = symbolDeltaBaseline();
+        int bodyIdx = 0;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3580,9 +3605,14 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
             nonEmptyCount++;
-            encoder.beginMessage(1, globalSymbolDictionary, simBaseline, currentBatchMaxSymbolId);
-            encoder.addTable(tableBuffer);
-            int messageSize = encoder.finishMessage();
+            int deltaStart = simBaseline + 1;
+            int deltaCount = Math.max(0, currentBatchMaxSymbolId - simBaseline);
+            int messageSize = QwpConstants.HEADER_SIZE
+                    + NativeBufferWriter.varintSize(deltaStart)
+                    + NativeBufferWriter.varintSize(deltaCount)
+                    + (deltaCount > 0 ? combinedDeltaEntriesLen : 0)
+                    + splitFrameBodyBytes.getQuick(bodyIdx);
+            bodyIdx++;
             if (messageSize > serverMaxBatchSize) {
                 resetTableBuffersAfterFlush(keys);
                 throw new LineSenderException("single table batch too large for server batch cap")
@@ -3821,10 +3851,37 @@ public class QwpWebSocketSender implements Sender {
      * dictionary shorter than {@code pd.size()} and desyncing
      * {@code sentMaxSymbolId} from the mirror's {@code sentDictCount = pd.size()},
      * which silently misattributes later symbols after a reconnect.
+     * <p>
+     * <b>Host-crash tear guard.</b> The persisted dictionary is NOT fsync'd (see
+     * {@code PersistedSymbolDict}), so a host/power crash can lose its
+     * most-recently-written (highest-id) entries while the segment frames that
+     * introduced those ids survive -- and those newest frames, being the least
+     * likely to be acked, replay on recovery. The send loop's catch-up mirror then
+     * rebuilds the missing ids from those frames' own delta bytes, but THIS producer
+     * -- seeded only from the shorter dictionary -- would assign its next new symbol
+     * an id the surviving frames already define, putting two symbols on one id and
+     * silently misattributing values. The send loop's replay guard only catches a
+     * GAP ({@code deltaStart > sentDictCount}); a frame that introduces exactly the
+     * torn-off id ({@code deltaStart == pd.size()}) slips through and self-heals the
+     * mirror, leaving only this producer diverged. Detect it here -- the surviving
+     * frames reference an id at or beyond the recovered dictionary size -- and fail
+     * clean: the affected data must be resent, matching the design's torn-dict
+     * "resend required" contract. The recovered data is not lost; the background
+     * drainer still drains this slot (its mirror self-heals from the frames). Only a
+     * host crash reaches this -- a process crash keeps the page cache, so the
+     * write-ahead ordering keeps the dictionary a superset of the frames.
      */
     private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {
         if (pd == null || pd.size() == 0) {
             return;
+        }
+        if (cursorEngine != null && cursorEngine.recoveredMaxSymbolId() >= pd.size()) {
+            throw new LineSenderException(
+                    "recovered store-and-forward symbol dictionary is a subset of the surviving frames "
+                            + "(likely a host crash tore its unsynced tail): frames reference symbol id "
+                            + cursorEngine.recoveredMaxSymbolId() + " but the recovered dictionary holds only "
+                            + pd.size() + " id(s); resuming would reuse ids the frames already define -- "
+                            + "resend the affected data");
         }
         ObjList<String> symbols = pd.readLoadedSymbols();
         for (int i = 0, n = symbols.size(); i < n; i++) {
