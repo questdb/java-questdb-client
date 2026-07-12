@@ -260,6 +260,84 @@ public class SocketTrafficShutdownTest {
     }
 
     @Test(timeout = 30_000L)
+    public void testPlainSocketShutdownAfterPeerDisconnectRetainsFd() throws Exception {
+        Socket socket = new PlainSocket(NF, LoggerFactory.getLogger(SocketTrafficShutdownTest.class));
+
+        long buffer = 0;
+        int fd = -1;
+        try (ServerSocket listener = new ServerSocket()) {
+            listener.bind(new InetSocketAddress("127.0.0.1", 0));
+            long addrInfo = NF.getAddrInfo("127.0.0.1", listener.getLocalPort());
+            Assert.assertNotEquals(-1L, addrInfo);
+            try {
+                fd = NF.socketTcp(true);
+                Assert.assertTrue("could not allocate client socket", fd >= 0);
+                Assert.assertEquals(0, NF.connectAddrInfo(fd, addrInfo));
+            } finally {
+                NF.freeAddrInfo(addrInfo);
+            }
+
+            try (java.net.Socket peer = listener.accept()) {
+                socket.of(fd);
+                int retainedFd = fd;
+                fd = -1;
+                buffer = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+
+                peer.close();
+                Assert.assertTrue("client must observe the peer disconnect", socket.recv(buffer, 1) < 0);
+
+                socket.closeTraffic();
+                Assert.assertEquals("traffic cancellation must retain fd ownership", retainedFd, socket.getFd());
+                Assert.assertFalse("traffic cancellation must not perform full close", socket.isClosed());
+                Assert.assertTrue("shutdown must leave the descriptor allocated", NF.getSndBuf(retainedFd) > 0);
+
+                socket.close();
+                Assert.assertTrue("full close must release the retained fd", socket.isClosed());
+                Assert.assertEquals("released descriptor must reject socket operations", -1, NF.getSndBuf(retainedFd));
+            }
+        } finally {
+            socket.close();
+            if (buffer != 0) {
+                Unsafe.free(buffer, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (fd != -1) {
+                NF.close(fd);
+            }
+        }
+    }
+
+    @Test
+    public void testPlainSocketShutdownFailureStillThrows() {
+        AtomicInteger closeCount = new AtomicInteger();
+        NetworkFacade failingFacade = new CompatibilityNetworkFacade(closeCount) {
+            @Override
+            public int errno() {
+                return 1234;
+            }
+
+            @Override
+            public int shutdown(int fd) {
+                Assert.assertEquals(42, fd);
+                return -1;
+            }
+        };
+        PlainSocket socket = new PlainSocket(failingFacade, LoggerFactory.getLogger(SocketTrafficShutdownTest.class));
+        socket.of(42);
+
+        try {
+            socket.closeTraffic();
+            Assert.fail("expected genuine traffic shutdown failure");
+        } catch (IllegalStateException expected) {
+            Assert.assertEquals("could not shut down socket traffic [fd=42, errno=1234]", expected.getMessage());
+        } finally {
+            socket.close();
+        }
+
+        Assert.assertTrue(socket.isClosed());
+        Assert.assertEquals("full close must release facade ownership exactly once", 1, closeCount.get());
+    }
+
+    @Test(timeout = 30_000L)
     public void testPlainSocketShutdownWakesMacOsKqueueAndRetainsFd() throws Exception {
         assertShutdownWakesMacOsKqueue(new PlainSocket(NF, LoggerFactory.getLogger(SocketTrafficShutdownTest.class)));
     }

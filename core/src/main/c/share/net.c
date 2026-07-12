@@ -130,7 +130,8 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_send
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
         (JNIEnv *e, jclass cl, jint fd) {
-    return shutdown((int) fd, SHUT_RDWR);
+    const int result = shutdown((int) fd, SHUT_RDWR);
+    return result == -1 && errno == ENOTCONN ? 0 : result;
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_recv

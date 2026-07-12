@@ -234,6 +234,11 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
         (JNIEnv *e, jclass cl, jint fd) {
     const int result = shutdown((SOCKET) fd, SD_BOTH);
     if (result == SOCKET_ERROR) {
+        const int error = WSAGetLastError();
+        if (error == WSAENOTCONN) {
+            return 0;
+        }
+        WSASetLastError(error);
         SaveLastError();
     }
     return result;
