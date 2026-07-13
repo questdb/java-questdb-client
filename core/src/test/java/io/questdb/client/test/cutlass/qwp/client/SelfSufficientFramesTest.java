@@ -332,6 +332,55 @@ public class SelfSufficientFramesTest {
         });
     }
 
+    @Test
+    public void testFileModeSplitPersistsDictBeforePublish() throws Exception {
+        // File-mode store-and-forward + a SPLIT flush: a two-table batch whose combined
+        // size exceeds the server cap splits into one frame per table
+        // (flushPendingRowsSplit). The first split frame's write-ahead persist
+        // (persistNewSymbolsBeforePublish, the appendRawEntries fast path) must record
+        // the batch's new symbols in .symbol-dict BEFORE the frames publish, so a
+        // recovered / orphan-drained slot can rebuild what the delta frames reference.
+        // The other split tests run in memory mode, so this is the only coverage of the
+        // split x persist path with a live PersistedSymbolDict.
+        Path sfDir = Files.createTempDirectory("qwp-sf-split-persist");
+        try {
+            assertMemoryLeak(() -> {
+                CapturingHandler handler = new CapturingHandler();
+                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                    server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                    int port = server.getPort();
+                    server.start();
+                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
+                    String pad = new String(new char[60]).replace('\0', 'x');
+                    try (Sender sender = Sender.fromConfig(config)) {
+                        // Two tables, two new symbols, ONE flush -> the combined message
+                        // exceeds cap 150 and splits into two frames.
+                        sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                        sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.batches.size() >= 2, 5_000);
+
+                        // Check .symbol-dict while the sender is live: a fully-drained
+                        // close would unlink it. The split's first-frame write-ahead
+                        // persist must have recorded BOTH new symbols.
+                        Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
+                        byte[] dict = Files.readAllBytes(dictFile);
+                        Assert.assertTrue("split-flush persist must record alpha", containsUtf8(dict, "alpha"));
+                        Assert.assertTrue("split-flush persist must record bravo", containsUtf8(dict, "bravo"));
+                    }
+
+                    Assert.assertEquals("the oversized two-table batch must split into 2 frames",
+                            2, handler.batches.size());
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
     private static int readVarint(byte[] buf, int offset) {
         // Simple unsigned varint decode — sufficient for small values.
         int result = 0;
