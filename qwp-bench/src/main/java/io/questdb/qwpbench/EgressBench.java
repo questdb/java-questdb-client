@@ -62,8 +62,9 @@ public final class EgressBench {
             String[] notes = new String[tcount];
             for (int t = 0; t < tcount; t++) notes[t] = BenchSchema.noteTemplate(t, varcharLen);
 
-            // Same ws conf shape as IngressBench.run(): manual flush cadence only.
-            String ingestConf = "ws::addr=" + host + ":" + port + ";auto_flush=off;";
+            // Same ws:: conf as IngressBench.run() -- see IngressBench.ingestConf()
+            // for why auto-flush is pinned to max thresholds rather than disabled.
+            String ingestConf = IngressBench.ingestConf(host, port);
             try (Sender sender = Sender.fromConfig(ingestConf)) {
                 IngressBench.pass(sender, kind, rows, symCard, hiCard, notes, POPULATE_BATCH_ROWS);
             }

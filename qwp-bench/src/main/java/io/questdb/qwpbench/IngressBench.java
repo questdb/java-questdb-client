@@ -30,12 +30,10 @@ public final class IngressBench {
         long port = Env.zu("QDB_PORT", 9000);
         String table = kind.tableName();
         String base = "http://" + host + ":" + port;
-        // auto_flush=off -> LineSenderBuilder.disableAutoFlush() (verified in
-        // Sender.java); manual flush cadence only, no auto-flush interference.
         // Store-and-forward stays default memory mode (no sf_dir) and
         // transactional stays default off: both are opt-in builder settings
         // with no config-string key set here, so the defaults already apply.
-        String conf = "ws::addr=" + host + ":" + port + ";auto_flush=off;";
+        String conf = ingestConf(host, port);
 
         System.err.printf("[qwp_ingress_java] schema=%s rows=%d it=%d wu=%d batch=%d host=%s:%d%n",
                 kind, rows, iterations, warmups, maxBatch, host, port);
@@ -100,6 +98,27 @@ public final class IngressBench {
         report.put("paths", paths);
         System.out.println(report.render());
         return count == rows ? 0 : 2;
+    }
+
+    /**
+     * Ingest-mode {@code ws::} conf shared by {@link #run()} and
+     * {@link EgressBench}'s populate step. The WS engine's
+     * {@code validateParameters()} rejects fully disabling auto-flush --
+     * {@code autoFlushIntervalMillis == Integer.MAX_VALUE} throws
+     * "disabling auto-flush is not supported for WebSocket protocol"
+     * (Sender.java), which is what {@code auto_flush=off} maps to internally
+     * -- so auto-flush is instead pinned to the largest values the ws:: conf
+     * parser accepts: {@code Integer.MAX_VALUE} rows and
+     * {@code Integer.MAX_VALUE - 1} ms (exactly {@code MAX_VALUE} ms collides
+     * with the "off" sentinel and would trip the same rejection). Both are
+     * unreachable within a single batch, so the measured cadence stays
+     * caller-driven via the explicit {@code flushAndGetSequence()} per batch
+     * below, with an ack checkpoint every {@link #CHECKPOINT_BATCHES}
+     * batches.
+     */
+    static String ingestConf(String host, long port) {
+        return "ws::addr=" + host + ":" + port
+                + ";auto_flush_rows=2147483647;auto_flush_interval=2147483646;";
     }
 
     // package-private: EgressBench reuses this for its populate step (Task 5)
