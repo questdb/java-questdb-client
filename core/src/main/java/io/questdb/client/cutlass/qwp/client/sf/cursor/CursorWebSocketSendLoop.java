@@ -49,6 +49,7 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -88,6 +89,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * sub-second confirmation latency once the upload completes
      * server-side. {@code 0} or negative disables the keepalive entirely.
      */
+    /**
+     * Bounded-await backstop for {@link #close()}: the maximum time close()
+     * waits for the I/O thread to stop (count down {@code shutdownLatch})
+     * before it loud-fails and delegates final teardown to the I/O thread's
+     * exit path. In the common case the round-2 in-flight connect cancellation
+     * (see {@link ConnectCancellation}) makes the I/O thread unwind and count
+     * the latch down within milliseconds, so this budget is never reached. It
+     * only fires in the pathological, astronomically-rare TOCTOU window where
+     * {@code cancel()}'s {@code closeTraffic()} lands between the pre-connect
+     * guard and native fd creation, so it is a no-op and the connect blocks the
+     * full OS SYN-retry (~60-130s per endpoint, possibly across several).
+     * <p>
+     * {@code 30_000} ms is comfortably UNDER the sidecar's 120 s shutdown
+     * deadline (~4x headroom) yet ~1000x a healthy close's millisecond latch
+     * countdown, so it never prematurely abandons a legitimately draining
+     * close (the I/O thread only has to finish its current — now traffic-broken
+     * — native send/receive and run {@code ioLoop}'s finally). This bounds the
+     * WAIT inside close(), NOT the connect itself (rejected Option A): a
+     * legitimately slow SUCCESSFUL connect is unaffected — it is not concurrent
+     * with a close, and when close() does fire it cancels the in-flight connect
+     * rather than waiting it out.
+     */
+    public static final long DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS = 30_000L;
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**
@@ -163,6 +187,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // the durable watermark can lag behind the OK watermark.
     private final ArrayDeque<PendingDurableEntry> pendingDurable = new ArrayDeque<>();
     private final ArrayDeque<PendingDurableEntry> pendingDurablePool = new ArrayDeque<>();
+    // Race-safe cancellation handle for an in-flight connect attempt. Passed
+    // into reconnectFactory.reconnect(...) on the I/O thread so close() can
+    // break a connect blocked mid-attempt (a black-holed native connect that
+    // neither unpark nor interrupt cancels). See ConnectCancellation.
+    private final ConnectCancellation connectCancellation = new ConnectCancellation();
     // Optional reconnect plumbing. When non-null, a wire failure triggers a
     // reconnect attempt instead of a terminal fail(). The factory produces a
     // fresh, connected+upgraded WebSocketClient.
@@ -225,6 +254,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // it is engine.ackedFsn() + 1, so the first replayed frame on the new
     // connection is wireSeq=0 and server-side cumulative ACKs still line up.
     private long fsnAtZero;
+    // Bounded-await backstop budget for close() (see
+    // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS). Overridable via
+    // setShutdownAwaitTimeoutMillis so tests can exercise the timeout branch
+    // deterministically without a multi-second real wait; production always
+    // uses the default. Read only on the owner thread inside close().
+    private long shutdownAwaitTimeoutMillis = DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true. Used to
@@ -783,8 +818,55 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         );
                     }
                 }
+                // Cancel an in-flight connect attempt not yet installed as the
+                // `client` field: async initial connect leaves `client` null
+                // and a mid-flight reconnect leaves it pointing at the stale
+                // pre-drop client, so neither is reachable by the closeTraffic()
+                // above. The reconnect factory publishes the connecting client
+                // here before it blocks, so breaking its traffic unwinds a
+                // black-holed native connect (connect_timeout=0 => OS SYN-retry,
+                // ~60-130s) that would otherwise pin the untimed await below.
+                // Same loud-fail contract as the field client: a transport that
+                // cannot safely shut down traffic is not destructively closed;
+                // the worker's exit path retains ownership of final cleanup.
                 try {
-                    shutdownLatch.await();
+                    connectCancellation.cancel();
+                } catch (Throwable e) {
+                    throw new LineSenderException(
+                            "cursor I/O thread did not stop: active transport does not support safe traffic shutdown; "
+                                    + "client/engine teardown is delegated to the I/O thread's exit path",
+                            e
+                    );
+                }
+                try {
+                    // Bounded backstop: never wait forever. The round-2 in-flight
+                    // connect cancellation makes the I/O thread unwind and count
+                    // the latch down in milliseconds, so this await returns true
+                    // almost always. The timeout branch fires only in the
+                    // pathological uninterruptible-connect TOCTOU window where
+                    // cancel()'s closeTraffic() was a no-op and the connect blocks
+                    // the full OS SYN-retry -- guaranteeing close() still returns
+                    // (bounded, comfortably under the sidecar's 120s deadline)
+                    // rather than hanging on an untimed await.
+                    if (!shutdownLatch.await(shutdownAwaitTimeoutMillis, TimeUnit.MILLISECONDS)) {
+                        // Latch still up after the budget: the I/O thread did not
+                        // stop. Same failed-stop protocol as the interrupt branch
+                        // below -- loud-fail without touching the client/engine
+                        // (freeing native buffers under a still-live I/O thread
+                        // risks a C5 SEGV; a quiet return would let the owner
+                        // unmap the engine under it). The I/O thread's own exit
+                        // path (ioLoop's finally) retains ownership of final
+                        // cleanup; QwpWebSocketSender.close() keys its
+                        // ioThreadStopped guard on this throw and BackgroundDrainer
+                        // switches to delegateEngineClose(). ioThread stays set
+                        // (not nulled below, since we throw) so a duplicate close()
+                        // re-signals rather than silently succeeding.
+                        throw new LineSenderException(
+                                "cursor I/O thread did not stop: close() timed out after "
+                                        + shutdownAwaitTimeoutMillis + "ms awaiting shutdown; "
+                                        + "client/engine teardown is delegated to the I/O "
+                                        + "thread's exit path");
+                    }
                 } catch (InterruptedException e) {
                     // Re-assert the flag for the caller's stack, then decide.
                     // If the I/O thread has genuinely not exited (latch still
@@ -996,6 +1078,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.progressDispatcher = dispatcher;
     }
 
+    /**
+     * Test seam: shrink the {@link #close()} bounded-await backstop
+     * (default {@link #DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS}) so a test can
+     * exercise the timeout branch deterministically without a multi-second
+     * real wait. Production never calls this. Set before {@link #close()}.
+     */
+    @TestOnly
+    public void setShutdownAwaitTimeoutMillis(long millis) {
+        this.shutdownAwaitTimeoutMillis = millis;
+    }
+
     public synchronized void start() {
         if (ioThread != null) {
             throw new IllegalStateException("already started");
@@ -1172,7 +1265,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
-                WebSocketClient newClient = reconnectFactory.reconnect();
+                WebSocketClient newClient = reconnectFactory.reconnect(connectCancellation);
                 if (newClient != null) {
                     if (!running) {
                         // close() ran while this connect attempt was in
@@ -2049,6 +2142,104 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @FunctionalInterface
     public interface ReconnectFactory {
         WebSocketClient reconnect() throws Exception;
+
+        /**
+         * Cancellable variant of {@link #reconnect()}. The loop passes a
+         * per-attempt {@link ConnectCancellation} so a transport that blocks
+         * inside a native connect can publish the in-flight client to the
+         * handle BEFORE it blocks; {@link #close()} then breaks that client's
+         * traffic to unwind a black-holed connect promptly, rather than falling
+         * back to the bounded {@code shutdownLatch.await(...)} backstop (which
+         * only bounds the WAIT, not the connect).
+         * <p>
+         * Default: ignore the handle and delegate to {@link #reconnect()} --
+         * a transport that cannot publish its in-flight client is simply not
+         * cancellable mid-connect, and {@code close()} falls back to its
+         * existing field-client {@code closeTraffic()} / loud-fail path. The
+         * default keeps this a {@link FunctionalInterface} and preserves
+         * source compatibility for existing lambda / method-reference
+         * implementors (e.g. {@link #connectWithRetry}).
+         */
+        default WebSocketClient reconnect(ConnectCancellation cancellation) throws Exception {
+            return reconnect();
+        }
+    }
+
+    /**
+     * Race-safe cancellation handle for a single in-flight connect attempt.
+     * Owned per-loop and passed into {@link ReconnectFactory#reconnect(ConnectCancellation)}
+     * on the I/O thread. The transport's connect walk {@link #publish}es the
+     * {@link WebSocketClient} it is about to block on before the blocking
+     * {@code connect()}, and {@link #clear}s it once the attempt is installed
+     * or disposed. {@link #close()} (owner thread) calls {@link #cancel()} to
+     * break the in-flight client's traffic path so a black-holed native
+     * connect unwinds and the I/O thread counts down the shutdown latch.
+     * <p>
+     * Java 8: two volatiles, no locks. Visibility/ordering:
+     * <ul>
+     *   <li>{@code inFlight} is written by the I/O thread (publish/clear) and
+     *       read by the owner thread (cancel).</li>
+     *   <li>{@code cancelled} is written by the owner thread (cancel) and read
+     *       by the I/O thread (the pre-connect guard).</li>
+     * </ul>
+     * The publish (write inFlight, then read cancelled) / cancel (write
+     * cancelled, then read inFlight) handshake covers the close-vs-connect
+     * race in both directions: if the guard observes {@code cancelled==false}
+     * then, by the volatile total order, {@code cancel()} observed the
+     * published client and broke its traffic; if the guard observes
+     * {@code cancelled==true} it skips the blocking connect entirely.
+     */
+    public static final class ConnectCancellation {
+        // The client the connect walk is currently about to block / blocked
+        // on. Written by the I/O thread only (publish/clear); read by the
+        // owner thread (cancel). volatile for cross-thread visibility.
+        private volatile WebSocketClient inFlight;
+        // Latched once close() requested cancellation. Written by the owner
+        // thread (cancel); read by the I/O thread's pre-connect guard.
+        private volatile boolean cancelled;
+
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        /**
+         * I/O-thread hook: record the client the walk is about to block on,
+         * BEFORE the blocking {@code connect()}. Pairs with {@link #cancel()}
+         * so an attempt that publishes after cancellation is caught by the
+         * caller's {@link #isCancelled()} guard, and an attempt already
+         * blocked in {@code connect()} is broken by {@code cancel()}.
+         */
+        public void publish(WebSocketClient client) {
+            inFlight = client;
+        }
+
+        /**
+         * I/O-thread hook: the walk is done with the in-flight attempt
+         * (installed on success, disposed on failure). Drop the reference so a
+         * later {@link #cancel()} cannot touch a client the walk no longer
+         * owns. Single writer (I/O thread) for publish/clear, so no CAS is
+         * needed.
+         */
+        public void clear() {
+            inFlight = null;
+        }
+
+        /**
+         * Owner-thread hook from {@link #close()}: request cancellation, then
+         * break the traffic path of any in-flight connect so the I/O thread's
+         * connect walk unwinds. {@code cancelled} is written before reading
+         * {@code inFlight} to pair with {@link #publish(WebSocketClient)}. May
+         * throw when the transport cannot safely shut down traffic --
+         * {@code close()} maps that to its existing loud-fail, exactly as it
+         * does for the field client's {@code closeTraffic()}.
+         */
+        void cancel() {
+            cancelled = true;
+            WebSocketClient c = inFlight;
+            if (c != null) {
+                c.closeTraffic();
+            }
+        }
     }
 
     /**

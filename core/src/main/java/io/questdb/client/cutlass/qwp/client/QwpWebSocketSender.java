@@ -2768,22 +2768,37 @@ public class QwpWebSocketSender implements Sender {
      * reconnect and {@code close()} paths are therefore never queued
      * behind a drainer's endpoint walk.
      */
-    private WebSocketClient buildAndConnect(ReconnectSupplier ctx) {
+    private WebSocketClient buildAndConnect(ReconnectSupplier ctx, CursorWebSocketSendLoop.ConnectCancellation cancellation) {
         if (ctx.isBackground()) {
             // Lock-free: the walk below touches only internally-synchronized
             // hostTracker health state and walk-local/cursor-local state on
             // the background path.
-            return connectWalk(ctx);
+            return connectWalk(ctx, cancellation);
         }
         connectWalkLock.lock();
         try {
-            return connectWalk(ctx);
+            return connectWalk(ctx, cancellation);
         } finally {
             connectWalkLock.unlock();
         }
     }
 
-    private WebSocketClient connectWalk(ReconnectSupplier ctx) {
+    // Drop the in-flight connect handle once the walk has disposed a client on
+    // a connect/upgrade FAILURE, so inFlight never dangles at a disposed client
+    // across the inter-attempt backoff. Without this a concurrent
+    // close()->cancel() could closeTraffic() a client the walk no longer owns;
+    // proven a no-op on both production transports today (closed-fd closeTraffic
+    // no-ops), but a future custom transport that threw on a closed socket would
+    // spuriously loud-fail close(). Null-guarded: the no-arg reconnect() path
+    // and the Unsafe.allocateInstance bare-loop tests pass a null handle. Pairs
+    // with the success-path clear() after upgrade().
+    private static void clearInFlight(CursorWebSocketSendLoop.ConnectCancellation cancellation) {
+        if (cancellation != null) {
+            cancellation.clear();
+        }
+    }
+
+    private WebSocketClient connectWalk(ReconnectSupplier ctx, CursorWebSocketSendLoop.ConnectCancellation cancellation) {
         // Background (drainer) factories share this connect walk -- endpoint
         // list and hostTracker HEALTH state (never the shared round: a
         // background sweep walks its own RoundCursor and records with
@@ -2871,9 +2886,34 @@ public class QwpWebSocketSender implements Sender {
                 newClient.setQwpClientId(QwpConstants.CLIENT_ID);
                 newClient.setQwpRequestDurableAck(requestDurableAck);
                 newClient.setConnectTimeout(effectiveConnectTimeoutMs(background, connectTimeoutMs));
+                if (cancellation != null) {
+                    // Publish the client we are about to block on so a
+                    // concurrent CursorWebSocketSendLoop.close() can break its
+                    // traffic and unwind a black-holed native connect
+                    // (connect_timeout=0 => OS SYN-retry) instead of hanging on
+                    // the untimed shutdown-latch await. The publish-then-check
+                    // handshake pairs with ConnectCancellation.cancel(): if we
+                    // observe cancellation here we skip the blocking connect
+                    // entirely; otherwise cancel() observed this client and
+                    // breaks it. The walk's per-attempt catch disposes the
+                    // client and, since running has flipped false, the
+                    // top-of-loop ctx.isAborted() gate ends the walk.
+                    cancellation.publish(newClient);
+                    if (cancellation.isCancelled()) {
+                        throw new LineSenderException(ctx.abortMessage());
+                    }
+                }
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
                 newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
+                if (cancellation != null) {
+                    // connect()+upgrade() completed: this client is no longer
+                    // blocking, so drop it from the in-flight handle before it
+                    // becomes the loop's `client` field. close() must then break
+                    // its traffic via the field path exactly once -- leaving it
+                    // in the handle too would double-shut-down the socket.
+                    cancellation.clear();
+                }
             } catch (HttpClientException e) {
                 // Close BEFORE classify: the sibling catch (Error) below does not
                 // guard catch-arm bodies, so an Error thrown inside classify()
@@ -2883,6 +2923,7 @@ public class QwpWebSocketSender implements Sender {
                 // upgradeStatusCode) that are set during upgrade() and survive
                 // close().
                 newClient.close();
+                clearInFlight(cancellation);
                 HttpClientException classified = QwpUpgradeFailures.classify(newClient, ep.host, ep.port, e);
                 if (classified instanceof QwpIngressRoleRejectedException) {
                     QwpIngressRoleRejectedException re = (QwpIngressRoleRejectedException) classified;
@@ -2929,6 +2970,7 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             } catch (Exception e) {
                 newClient.close();
+                clearInFlight(cancellation);
                 hostTracker.recordTransportError(idx, !background);
                 lastError = e;
                 if (!background) {
@@ -2951,6 +2993,7 @@ public class QwpWebSocketSender implements Sender {
                 // the cursor reconnect loop, BackgroundDrainer) rethrows Error
                 // rather than retrying, so this stays a loud one-shot failure.
                 closeQuietlyOnError(newClient);
+                clearInFlight(cancellation);
                 throw e;
             }
             // Guard the post-upgrade tail: from here until newClient is
@@ -4008,7 +4051,12 @@ public class QwpWebSocketSender implements Sender {
 
         @Override
         public WebSocketClient reconnect() {
-            return buildAndConnect(this);
+            return buildAndConnect(this, null);
+        }
+
+        @Override
+        public WebSocketClient reconnect(CursorWebSocketSendLoop.ConnectCancellation cancellation) {
+            return buildAndConnect(this, cancellation);
         }
     }
 }
