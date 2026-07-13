@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -35,10 +36,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Stream;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -348,25 +347,7 @@ public class SelfSufficientFramesTest {
     }
 
     private static void rmDir(Path dir) {
-        try {
-            if (dir == null || !Files.exists(dir)) {
-                return;
-            }
-            // try-with-resources: Files.walk returns a Stream backed by an open
-            // directory handle that must be closed, or each rmDir leaks a descriptor.
-            try (Stream<Path> walk = Files.walk(dir)) {
-                walk.sorted(Comparator.reverseOrder())
-                        .forEach(p -> {
-                            try {
-                                Files.deleteIfExists(p);
-                            } catch (IOException ignored) {
-                                // best-effort
-                            }
-                        });
-            }
-        } catch (IOException ignored) {
-            // best-effort
-        }
+        TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {

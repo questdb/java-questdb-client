@@ -27,7 +27,6 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
-import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -76,9 +75,7 @@ public class DeltaDictRecoveryTest {
 
     @After
     public void tearDown() {
-        if (sfDir != null) {
-            rmDirRec(sfDir);
-        }
+        TestUtils.removeTmpDirRec(sfDir);
     }
 
     @Test
@@ -877,31 +874,6 @@ public class DeltaDictRecoveryTest {
             }
         }
         throw new IllegalStateException("varint truncated");
-    }
-
-    private static void rmDirRec(String dir) {
-        if (!Files.exists(dir)) {
-            return;
-        }
-        long find = Files.findFirst(dir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        String child = dir + "/" + name;
-                        if (!Files.remove(child)) {
-                            rmDirRec(child);
-                        }
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(dir);
     }
 
     /**

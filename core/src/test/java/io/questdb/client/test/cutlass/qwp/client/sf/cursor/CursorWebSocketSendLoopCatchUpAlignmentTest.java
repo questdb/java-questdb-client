@@ -321,6 +321,47 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         });
     }
 
+    @Test
+    public void testMirrorOverflowFailsLoud() throws Exception {
+        // ensureSentDictCapacity must latch a terminal -- not silently overflow the
+        // int capacity math into a heap-corrupting copyMemory -- when the sent-dict
+        // mirror would exceed MAX_SENT_DICT_BYTES. Unreachable at real cardinality
+        // (~200M+ symbols on one connection), so drive the guard directly with an
+        // oversized required, mirroring testCatchUpChunkFrameSizeOverflowFailsLoud.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_SENT_DICT_BYTES");
+            maxField.setAccessible(true);
+            long overCeiling = (long) maxField.getInt(null) + 1L;
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("ensureSentDictCapacity", long.class);
+                    m.setAccessible(true);
+                    try {
+                        m.invoke(loop, overCeiling);
+                        fail("a mirror capacity past MAX_SENT_DICT_BYTES must fail loud, not overflow");
+                    } catch (InvocationTargetException e) {
+                        assertEquals("overflow must surface as LineSenderException",
+                                "LineSenderException", e.getCause().getClass().getSimpleName());
+                        assertTrue("message must name the mirror ceiling: " + e.getCause().getMessage(),
+                                e.getCause().getMessage().contains("mirror exceeds the maximum size"));
+                    }
+                    // recordFatal (not a bare throw) latched the terminal, so the loop
+                    // winds down instead of reconnecting into the same overflow.
+                    try {
+                        loop.checkError();
+                        fail("mirror overflow must latch a terminal");
+                    } catch (LineSenderException terminal) {
+                        assertTrue(terminal.getMessage().contains("mirror exceeds the maximum size"));
+                    }
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private static void appendFrames(CursorSendEngine engine, int count) {
         long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
         try {

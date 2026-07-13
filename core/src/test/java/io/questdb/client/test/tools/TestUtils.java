@@ -216,6 +216,36 @@ public final class TestUtils {
     }
 
     /**
+     * Recursive counterpart to {@link #removeTmpDir(String)} for tests whose temp
+     * directory has subdirectories -- e.g. the store-and-forward slot layout
+     * {@code <dir>/default/...}, which the flat variant cannot clean up. A
+     * {@code null} argument is a no-op, so it is safe from {@code tearDown} before
+     * {@code setUp} ran. Uses {@code java.nio.file} (fully qualified to avoid the
+     * {@code io.questdb.client.std.Files} import clash) so subdirectories delete
+     * bottom-up.
+     */
+    public static void removeTmpDirRec(String tmpDir) {
+        if (tmpDir == null) {
+            return;
+        }
+        java.nio.file.Path root = java.nio.file.Paths.get(tmpDir);
+        if (!java.nio.file.Files.exists(root)) {
+            return;
+        }
+        // try-with-resources: the walk Stream holds an open directory handle that
+        // must be closed, or each call leaks a descriptor.
+        try (java.util.stream.Stream<java.nio.file.Path> walk = java.nio.file.Files.walk(root)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    java.nio.file.Files.deleteIfExists(p);
+                } catch (java.io.IOException ignored) {
+                }
+            });
+        } catch (java.io.IOException ignored) {
+        }
+    }
+
+    /**
      * Java 8 stand-in for {@code String.repeat(int)} (added in Java 11).
      */
     public static String repeat(CharSequence s, int count) {

@@ -32,13 +32,10 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Comparator;
-import java.util.stream.Stream;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -219,6 +216,43 @@ public class PersistedSymbolDictTest {
                 Assert.assertNotNull(d);
                 try {
                     Assert.assertEquals("bad-magic file recreated empty", 0, d.size());
+                    d.appendSymbol("X");
+                    Assert.assertEquals(1, d.size());
+                } finally {
+                    d.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testBadVersionIsRecreatedEmpty() throws Exception {
+        // A file with correct 'SYD1' magic and a VALID entry but an unknown version
+        // byte must be recreated empty -- its entries belong to a foreign/future
+        // format and must not be parsed as v2. Covers the version sub-condition
+        // specifically (testBadMagicIsRecreatedEmpty covers the magic one). Because
+        // the seeded "a" is a valid v2 entry, without the version check it would parse
+        // back (size 1), so this fails.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                Path f = dir.resolve(".symbol-dict");
+                // Build a real v2 dictionary with one valid entry...
+                PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(seed);
+                seed.appendSymbol("a");
+                seed.close();
+                // ...then corrupt ONLY the version byte (offset 4) to an unknown value.
+                byte[] bytes = Files.readAllBytes(f);
+                bytes[4] = (byte) 99;
+                Files.write(f, bytes);
+
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(d);
+                try {
+                    Assert.assertEquals("bad-version file recreated empty (entries must not parse)", 0, d.size());
                     d.appendSymbol("X");
                     Assert.assertEquals(1, d.size());
                 } finally {
@@ -451,6 +485,38 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testTooLargeToReopenRecreatesEmpty() throws Exception {
+        // A dictionary that legitimately grew past Integer.MAX_VALUE cannot be read
+        // into one int-sized buffer; open() must recreate it empty (fail-clean, like
+        // every other unreadable-file case) rather than truncate the multi-GB file
+        // via a negative/zero (int) length cast. A fault facade reports the huge
+        // length without needing a real 2GB file on disk.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                // Seed a small real file so exists() is true and the facade's huge
+                // length() drives the > Integer.MAX_VALUE reopen guard.
+                PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(seed);
+                seed.appendSymbol("a");
+                seed.close();
+
+                PersistedSymbolDict d = PersistedSymbolDict.open(new HugeLengthFacade(), dir.toString());
+                Assert.assertNotNull(d);
+                try {
+                    Assert.assertEquals("a >2GB dictionary must recreate empty", 0, d.size());
+                    d.appendSymbol("X");
+                    Assert.assertEquals(1, d.size());
+                } finally {
+                    d.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testTornTrailingEntrySelfHeals() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
@@ -548,32 +614,14 @@ public class PersistedSymbolDictTest {
     }
 
     private static void rmDir(Path dir) {
-        try {
-            if (dir == null || !Files.exists(dir)) {
-                return;
-            }
-            // try-with-resources: Files.walk returns a Stream backed by an open
-            // directory handle that must be closed, or each rmDir leaks a descriptor.
-            try (Stream<Path> walk = Files.walk(dir)) {
-                walk.sorted(Comparator.reverseOrder())
-                        .forEach(p -> {
-                            try {
-                                Files.deleteIfExists(p);
-                            } catch (IOException ignored) {
-                            }
-                        });
-            }
-        } catch (IOException ignored) {
-        }
+        TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
     }
 
     /**
-     * A {@link FilesFacade} that delegates every call to {@link FilesFacade#INSTANCE}
-     * except {@link #truncate(int, long)}, which always fails -- reproducing a
-     * host where the torn/stale-tail truncate cannot succeed (read-only remount,
-     * Windows share lock) so {@code open()}'s fail-clean recreate path runs.
+     * A {@link FilesFacade} that delegates every call to {@link FilesFacade#INSTANCE}.
+     * Subclasses inject a single fault; every other call hits the real filesystem.
      */
-    private static final class FailingTruncateFacade implements FilesFacade {
+    private static class DelegatingFilesFacade implements FilesFacade {
         @Override
         public long allocNativePath(String path) {
             return INSTANCE.allocNativePath(path);
@@ -696,12 +744,36 @@ public class PersistedSymbolDictTest {
 
         @Override
         public boolean truncate(int fd, long size) {
-            return false; // the fault under test
+            return INSTANCE.truncate(fd, size);
         }
 
         @Override
         public long write(int fd, long addr, long len, long offset) {
             return INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
+    /**
+     * Fails every {@link #truncate(int, long)} -- reproducing a host where the
+     * torn/stale-tail truncate cannot succeed (read-only remount, Windows share
+     * lock) so {@code open()}'s fail-clean recreate path runs.
+     */
+    private static final class FailingTruncateFacade extends DelegatingFilesFacade {
+        @Override
+        public boolean truncate(int fd, long size) {
+            return false;
+        }
+    }
+
+    /**
+     * Reports a dictionary length past {@link Integer#MAX_VALUE} -- reproducing a
+     * dictionary that legitimately grew beyond 2GB, which {@code open()} cannot read
+     * into one int-sized buffer and must recreate empty.
+     */
+    private static final class HugeLengthFacade extends DelegatingFilesFacade {
+        @Override
+        public long length(String path) {
+            return (long) Integer.MAX_VALUE + 1L;
         }
     }
 }

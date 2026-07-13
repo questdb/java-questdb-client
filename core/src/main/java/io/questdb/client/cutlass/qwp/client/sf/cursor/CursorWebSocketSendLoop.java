@@ -2911,6 +2911,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // path, where engine.acknowledge() no-ops at or below ackedFsn. A
                 // real replayed data frame is at fsn > ackedFsn, so it is never
                 // caught here.
+                //
+                // Catch-up frames therefore sit OUTSIDE the poison detector: a
+                // deterministically-NACKed catch-up recycles forever (paced, so no
+                // busy-loop). That is acceptable -- a catch-up only re-registers
+                // symbols the cluster already accepted, so a persistent NACK of one
+                // is a server bug, not a poison-frame the client can quarantine, and
+                // Invariant B's "retry a transient outage forever" applies.
                 handlePreSendRejection(wireSeq, status, category, policy);
                 return;
             }

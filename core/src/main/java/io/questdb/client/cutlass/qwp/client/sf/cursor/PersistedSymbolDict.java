@@ -33,6 +33,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.Utf8s;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -317,7 +318,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * (the entry's position). Writes {@code [len varint][utf8][crc32c]}, the CRC
      * covering the {@code [len][utf8]} bytes so a torn/stale entry is detected on
      * recovery.
+     * <p>
+     * Test-only: production persists a frame's whole new-symbol range in one write
+     * via {@link #appendSymbols} / {@link #appendRawEntries}. Tests use this to
+     * build a dictionary one entry at a time.
      */
+    @TestOnly
     public synchronized void appendSymbol(CharSequence symbol) {
         if (closed) {
             return;
@@ -516,6 +522,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     || Unsafe.getUnsafe().getByte(buf + 4) != VERSION) {
                 LOG.warn("symbol dict {} unreadable, bad magic or unknown version; recreating", filePath);
                 Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+                buf = 0L; // null after free so the catch below cannot double-free if ff.close throws
                 ff.close(fd);
                 return null;
             }

@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -36,9 +37,7 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -197,21 +196,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     }
 
     private static void rmDir(Path dir) throws IOException {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        // try-with-resources: Files.walk returns a Stream backed by an open
-        // directory handle that must be closed, or each rmDir leaks a descriptor.
-        try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try {
-                            Files.deleteIfExists(p);
-                        } catch (IOException ignored) {
-                            // best-effort
-                        }
-                    });
-        }
+        TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
