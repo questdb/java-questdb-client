@@ -11,6 +11,7 @@ utils/dependency-reduced-pom.xml
 examples/target
 compat/target
 qwp-bench/target
+qwp-bench/dependency-reduced-pom.xml
 core/node
 deploy*.bat
 win64svc/cmake-build-debug
