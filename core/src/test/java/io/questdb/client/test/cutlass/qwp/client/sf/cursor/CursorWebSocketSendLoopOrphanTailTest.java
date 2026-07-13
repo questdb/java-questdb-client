@@ -75,7 +75,9 @@ import static org.junit.Assert.assertTrue;
 public class CursorWebSocketSendLoopOrphanTailTest {
 
     private static final int FLAG_DEFER_COMMIT = 0x01;
+    private static final int FLAG_DELTA_SYMBOL_DICT = 0x08;
     private static final int HEADER_OFFSET_FLAGS = 5;
+    private static final int HEADER_SIZE = 12;
     private static final int MAGIC_MESSAGE = 0x31505751; // "QWP1" little-endian
 
     private String tmpDir;
@@ -221,6 +223,36 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    @Test
+    public void testRecoveredMaxSymbolIdExcludesOrphanTailFrames() throws Exception {
+        // recoveredMaxSymbolId must reflect only COMMITTED (transmitted) frames, not
+        // the aborted orphan-tail frames trySendOne retires without ever sending. A
+        // host crash that tears the persisted dictionary down to the committed ids
+        // while an orphan-tail frame introduced a HIGHER id must NOT over-reject the
+        // resume: the producer never reuses an orphan id on the wire (the tail retires
+        // first), so counting it would inflate recoveredMaxSymbolId and make
+        // seedGlobalDictionaryFromPersisted fail a fully-recoverable slot. The
+        // maxSymbolDeltaEnd walk is therefore bounded to recoveredCommitBoundaryFsn.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                // fsn 0: commit-bearing delta frame registering ids 0,1.
+                appendDeltaFrame(engine, false, 0, 2);
+                // fsn 1: DEFERRED delta frame registering id 2 -- the orphan tail.
+                appendDeltaFrame(engine, true, 2, 1);
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                assertTrue(engine.wasRecoveredFromDisk());
+                assertEquals("last commit-bearing frame", 0L, engine.recoveredCommitBoundaryFsn());
+                assertEquals("orphan tail tip", 1L, engine.recoveredOrphanTipFsn());
+                // Only the committed frame's ids (0,1) count -> highest id 1. The
+                // orphan-tail frame's id 2 is excluded, so a resume whose recovered
+                // dictionary holds ids 0,1 (size 2) is NOT over-rejected.
+                assertEquals("orphan-tail id 2 must be excluded from recoveredMaxSymbolId",
+                        1L, engine.recoveredMaxSymbolId());
+            }
+        });
+    }
+
     // ---------------------------------------------------------------------
     // harness
     // ---------------------------------------------------------------------
@@ -288,6 +320,27 @@ public class CursorWebSocketSendLoopOrphanTailTest {
             engine.appendBlocking(buf, 16);
         } finally {
             Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    // Appends a QWP frame carrying a symbol-dict delta section ([deltaStart varint]
+    // [deltaCount varint]) so the recovery walk's maxSymbolDeltaEnd counts it.
+    // deltaStart/deltaCount stay < 128 so each encodes in a single LEB128 byte.
+    private static void appendDeltaFrame(CursorSendEngine engine, boolean defer, int deltaStart, int deltaCount) {
+        int size = HEADER_SIZE + 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + HEADER_OFFSET_FLAGS,
+                    (byte) (FLAG_DELTA_SYMBOL_DICT | (defer ? FLAG_DEFER_COMMIT : 0)));
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE, (byte) deltaStart);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) deltaCount);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
         }
     }
 

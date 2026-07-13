@@ -530,23 +530,34 @@ public final class MmapSegment implements QuietCloseable {
      * out-of-order page loss) below the ids the surviving frames still reference: if
      * the max here reaches at or beyond the recovered dictionary size, a resuming
      * producer -- seeded from the shorter dictionary -- would re-use ids the frames
-     * already define. The frame layout mirrors {@link #findLastFrameFsnWithoutPayloadFlag}:
-     * the QWP message header ({@code qwpHeaderSize} bytes) is followed by the delta
-     * section {@code [deltaStart varint][deltaCount varint]...}.
+     * already define. Only frames at or below {@code maxFsnInclusive} count: frames
+     * above it are the aborted orphan-deferred tail, which {@code trySendOne} retires
+     * without ever transmitting, so their ids must not inflate the result (a resuming
+     * producer never reuses them on the wire). The frame layout mirrors
+     * {@link #findLastFrameFsnWithoutPayloadFlag}: the QWP message header
+     * ({@code qwpHeaderSize} bytes) is followed by the delta section
+     * {@code [deltaStart varint][deltaCount varint]...}.
      *
-     * @param headerMagic   the QWP message magic identifying a well-formed frame
-     * @param flagsOffset   byte offset of the flags field within the QWP header
-     * @param flagDeltaMask the FLAG_DELTA_SYMBOL_DICT bit
-     * @param qwpHeaderSize the QWP message header size (delta section starts past it)
+     * @param headerMagic     the QWP message magic identifying a well-formed frame
+     * @param flagsOffset     byte offset of the flags field within the QWP header
+     * @param flagDeltaMask   the FLAG_DELTA_SYMBOL_DICT bit
+     * @param qwpHeaderSize   the QWP message header size (delta section starts past it)
+     * @param maxFsnInclusive highest frame FSN to consider; frames above it are the
+     *                        retired orphan-deferred tail -- pass
+     *                        {@code recoveredCommitBoundaryFsn}
      */
-    public long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize) {
+    public long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
         long off = HEADER_SIZE;
         long frames = frameCount;
         for (long i = 0; i < frames; i++) {
+            long fsn = baseSeq + i;
             int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
             long payload = mmapAddress + off + FRAME_HEADER_SIZE;
-            if (payloadLen >= qwpHeaderSize
+            // Skip the orphan-deferred tail (fsn > maxFsnInclusive): retired, never
+            // sent, so its ids must not count. off still advances below.
+            if (fsn <= maxFsnInclusive
+                    && payloadLen >= qwpHeaderSize
                     && payloadLen > flagsOffset
                     && Unsafe.getUnsafe().getInt(payload) == headerMagic
                     && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagDeltaMask) != 0) {

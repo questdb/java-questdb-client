@@ -321,18 +321,22 @@ public final class CursorSendEngine implements QuietCloseable {
                             publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
                             recoveredCommitBoundaryFsn, publishedFsn);
                 }
-                // Highest symbol id the surviving frames reference. A resuming
-                // producer compares this against its recovered dictionary size
-                // (seedGlobalDictionaryFromPersisted) to detect a host-crash tear:
-                // if a frame references an id the (unsynced, torn) .symbol-dict no
-                // longer holds, resuming would re-use it. maxSymbolDeltaEnd returns
-                // 0 when no frame carries a symbol, yielding -1 here. Computed
-                // before the I/O loop or producer append; single-threaded here.
+                // Highest symbol id the surviving COMMITTED frames reference. A
+                // resuming producer compares this against its recovered dictionary
+                // size (seedGlobalDictionaryFromPersisted) to detect a host-crash
+                // tear: if a committed frame references an id the (unsynced, torn)
+                // .symbol-dict no longer holds, resuming would re-use it. The walk is
+                // bounded to recoveredCommitBoundaryFsn so the aborted orphan-deferred
+                // tail -- retired without ever being transmitted -- does not inflate
+                // this and over-reject an otherwise-recoverable slot. maxSymbolDeltaEnd
+                // returns 0 when no such frame carries a symbol, yielding -1 here.
+                // Computed before the I/O loop or producer append; single-threaded.
                 this.recoveredMaxSymbolId = recovered.maxSymbolDeltaEnd(
                         io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
                         io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
                         io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DELTA_SYMBOL_DICT,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE) - 1L;
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE,
+                        recoveredCommitBoundaryFsn) - 1L;
             } else {
                 // Fresh start with no recovered segments. Any stale
                 // watermark from a prior fully-drained session refers

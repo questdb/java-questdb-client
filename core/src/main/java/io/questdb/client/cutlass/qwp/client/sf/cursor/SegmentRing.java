@@ -547,20 +547,22 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Highest {@code deltaStart + deltaCount} any symbol-dict delta frame in the
-     * ring references (0 when none). See {@link MmapSegment#maxSymbolDeltaEnd};
-     * used once at recovery to detect a persisted dictionary torn below the ids
-     * the surviving frames reference.
+     * Highest {@code deltaStart + deltaCount} any symbol-dict delta frame at or below
+     * {@code maxFsnInclusive} references (0 when none). See
+     * {@link MmapSegment#maxSymbolDeltaEnd}; used once at recovery to detect a
+     * persisted dictionary torn below the ids the surviving committed frames
+     * reference. Frames above {@code maxFsnInclusive} are the retired orphan-deferred
+     * tail and are excluded.
      */
-    public synchronized long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize) {
+    public synchronized long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
         for (int i = 0, n = sealedSegments.size(); i < n; i++) {
-            long end = sealedSegments.get(i).maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize);
+            long end = sealedSegments.get(i).maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
             if (end > maxEnd) {
                 maxEnd = end;
             }
         }
-        long end = active.maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize);
+        long end = active.maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
         return Math.max(maxEnd, end);
     }
 
