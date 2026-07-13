@@ -63,10 +63,12 @@ public final class MmapSegment implements QuietCloseable {
     public static final int FILE_MAGIC = 0x31304653; // 'SF01' little-endian
     public static final int FRAME_HEADER_SIZE = 8;   // u32 crc + u32 payloadLen
     public static final int HEADER_SIZE = 24;
+    public static final byte MANIFEST_REQUIRED_FLAG = 1;
     public static final byte VERSION = 1;
     private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
+    private final FilesFacade filesFacade;
     private final String path;
     private final long sizeBytes;
     // memoryBacked: true when the segment buffer lives in malloc'd native
@@ -106,9 +108,10 @@ public final class MmapSegment implements QuietCloseable {
     // recovery callers for diagnostics. Final after construction.
     private final long tornTailBytes;
 
-    private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
+    private MmapSegment(FilesFacade filesFacade, String path, int fd, long mmapAddress, long sizeBytes,
                         long baseSeq, long initialCursor, long frameCount,
                         boolean memoryBacked, long tornTailBytes) {
+        this.filesFacade = filesFacade;
         this.path = path;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
@@ -149,9 +152,13 @@ public final class MmapSegment implements QuietCloseable {
      * that filesystem only.
      */
     public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes) {
+        return create(ff, path, baseSeq, sizeBytes, false);
+    }
+
+    static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes, boolean manifestRequired) {
         long pathPtr = ff.allocNativePath(path);
         try {
-            return create(ff, pathPtr, path, baseSeq, sizeBytes);
+            return create(ff, pathPtr, path, baseSeq, sizeBytes, manifestRequired);
         } finally {
             ff.freeNativePath(pathPtr);
         }
@@ -166,13 +173,17 @@ public final class MmapSegment implements QuietCloseable {
      * per-call {@code byte[]} + native-malloc the way the String overload does.
      */
     public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes) {
+        return create(ff, pathPtr, displayPath, baseSeq, sizeBytes, false);
+    }
+
+    static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes, boolean manifestRequired) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
         }
-        int fd = ff.openCleanRW(pathPtr);
+        int fd = ff.openRWExclusive(pathPtr);
         if (fd < 0) {
-            throw new MmapSegmentException("openCleanRW failed for " + displayPath);
+            throw new MmapSegmentException("exclusive create failed for " + displayPath);
         }
         // Reserve real disk blocks and advance EOF to sizeBytes in one
         // call. ENOSPC surfaces here, before the producer thread starts
@@ -190,21 +201,21 @@ public final class MmapSegment implements QuietCloseable {
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
         try {
-            addr = Files.mmap(fd, sizeBytes, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+            addr = ff.mmap(fd, sizeBytes, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
                 throw new MmapSegmentException("mmap failed for " + displayPath);
             }
             // Header goes straight into the mapping — no separate write syscall.
             Unsafe.getUnsafe().putInt(addr, FILE_MAGIC);
             Unsafe.getUnsafe().putByte(addr + 4, VERSION);
-            Unsafe.getUnsafe().putByte(addr + 5, (byte) 0); // flags
+            Unsafe.getUnsafe().putByte(addr + 5, manifestRequired ? MANIFEST_REQUIRED_FLAG : (byte) 0); // flags
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
+            return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
-                Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
+                ff.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
             }
             ff.close(fd);
             // mmap (or header writes) failed after a successful allocate —
@@ -238,7 +249,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L);
+            return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
@@ -284,7 +295,11 @@ public final class MmapSegment implements QuietCloseable {
     public static MmapSegment openExisting(FilesFacade ff, String path) {
         long fileSize = ff.length(path);
         if (fileSize < HEADER_SIZE) {
-            throw new MmapSegmentException("file shorter than header: " + path + " size=" + fileSize);
+            // Corruption, not an operational error: the bytes themselves prove
+            // this cannot be a whole segment (a create() is never durable at a
+            // sub-header size — allocate() reserves the full extent up front).
+            throw new MmapSegmentCorruptionException(
+                    "file shorter than header: " + path + " size=" + fileSize);
         }
         int fd = ff.openRW(path);
         if (fd < 0) {
@@ -292,17 +307,22 @@ public final class MmapSegment implements QuietCloseable {
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
         try {
-            addr = Files.mmap(fd, fileSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+            addr = ff.mmap(fd, fileSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
                 throw new MmapSegmentException("mmap failed for " + path);
             }
             int magic = Unsafe.getUnsafe().getInt(addr);
             if (magic != FILE_MAGIC) {
-                throw new MmapSegmentException(
+                throw new MmapSegmentCorruptionException(
                         "bad magic in " + path + ": 0x" + Integer.toHexString(magic));
             }
             byte version = Unsafe.getUnsafe().getByte(addr + 4);
             if (version != VERSION) {
+                // Deliberately NOT the corruption subtype: an unsupported
+                // version is a well-formed segment written by a different
+                // client build (e.g. after a downgrade). Quarantine-renaming
+                // it would strand its frames for the writer that CAN read it;
+                // failing recovery keeps the slot intact for that writer.
                 throw new MmapSegmentException("unsupported version in " + path + ": " + version);
             }
             long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
@@ -314,7 +334,7 @@ public final class MmapSegment implements QuietCloseable {
             // checks (which would place the segment last in baseSeq order
             // and trip the FSN-gap throw, taking the whole recovery down).
             if (baseSeq < 0L) {
-                throw new MmapSegmentException(
+                throw new MmapSegmentCorruptionException(
                         "bad baseSeq in " + path + ": " + baseSeq);
             }
             long lastGood = scanFrames(addr, fileSize);
@@ -328,10 +348,10 @@ public final class MmapSegment implements QuietCloseable {
                                 + "Investigate disk health or unexpected writer crash.",
                         path, tornTail, lastGood, fileSize, count);
             }
-            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count, false, tornTail);
+            return new MmapSegment(ff, path, fd, addr, fileSize, baseSeq, lastGood, count, false, tornTail);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
-                Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
+                ff.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
             }
             ff.close(fd);
             // The header reads above (magic/version/baseSeq) run before
@@ -347,7 +367,7 @@ public final class MmapSegment implements QuietCloseable {
             // covers the header block and any future reader placed ahead of the
             // scan.
             if (isMmapAccessFault(t)) {
-                throw new MmapSegmentException(
+                throw new MmapSegmentCorruptionException(
                         "unreadable mapped header page in " + path
                                 + " (unbacked/sparse page 0): " + t.getMessage(), t);
             }
@@ -379,13 +399,34 @@ public final class MmapSegment implements QuietCloseable {
             if (memoryBacked) {
                 Unsafe.free(mmapAddress, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             } else {
-                Files.munmap(mmapAddress, sizeBytes, MemoryTag.MMAP_DEFAULT);
+                filesFacade.munmap(mmapAddress, sizeBytes, MemoryTag.MMAP_DEFAULT);
             }
             mmapAddress = 0;
         }
         if (fd >= 0) {
-            Files.close(fd);
+            filesFacade.close(fd);
             fd = -1;
+        }
+    }
+
+    boolean manifestRequired() {
+        return !memoryBacked && (Unsafe.getUnsafe().getByte(mmapAddress + 5) & MANIFEST_REQUIRED_FLAG) != 0;
+    }
+
+    void markManifestRequired() {
+        if (memoryBacked || manifestRequired()) {
+            return;
+        }
+        Unsafe.getUnsafe().putByte(mmapAddress + 5, MANIFEST_REQUIRED_FLAG);
+        syncHeader();
+    }
+
+    void syncHeader() {
+        if (memoryBacked) {
+            return;
+        }
+        if (filesFacade.msync(mmapAddress, HEADER_SIZE, false) != 0 || filesFacade.fsync(fd) != 0) {
+            throw new MmapSegmentException("could not sync segment header " + path);
         }
     }
 
@@ -402,7 +443,7 @@ public final class MmapSegment implements QuietCloseable {
         if (memoryBacked) return; // no on-disk pages to flush
         long pub = publishedCursor;
         if (pub > HEADER_SIZE) {
-            Files.msync(mmapAddress, pub, false);
+            filesFacade.msync(mmapAddress, pub, false);
         }
     }
 

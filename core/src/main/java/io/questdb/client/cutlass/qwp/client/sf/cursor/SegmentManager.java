@@ -808,11 +808,18 @@ public final class SegmentManager implements QuietCloseable {
                         // rotation.
                         spare = MmapSegment.create(filesFacade,
                                 pathScratch.ptr(), path,
-                                e.ring.nextSeqHint(), segmentSizeBytes);
+                                e.ring.nextSeqHint(), segmentSizeBytes, true);
                     }
                     Runnable installHook = beforeInstallSyncHook;
                     if (installHook != null) {
                         installHook.run();
+                    }
+                    if (!memoryMode) {
+                        spare.syncHeader();
+                        if (filesFacade.fsyncDir(e.dir) != 0) {
+                            throw new MmapSegmentException(
+                                    "could not sync hot-spare directory " + e.dir);
+                        }
                     }
                     // Install + commit atomically under the manager lock.
                     // If `e.ring` was deregistered between the snapshot
@@ -844,14 +851,15 @@ public final class SegmentManager implements QuietCloseable {
                         } catch (Throwable ignored) {
                         }
                     }
-                    // Remove the file even when spare is null (i.e. when
-                    // MmapSegment.create itself threw): MmapSegment.create's
-                    // catch already best-effort removes, but if anything
-                    // before mmap (e.g. an exception thrown by the JVM
-                    // between openCleanRW and the try block) leaves a file
-                    // on disk, this is the second-line defense. Repeated
-                    // unlink on an already-removed path is a harmless no-op.
-                    if (path != null) {
+                    // Only remove the file when the spare object exists, i.e.
+                    // MmapSegment.create succeeded and ownership is ours but
+                    // installation was rejected (ring deregistered/closed).
+                    // When create() itself threw, its catch already removed
+                    // anything it put on disk -- and with exclusive create
+                    // (O_EXCL) a failure can also mean the path was ALREADY
+                    // occupied by a file some other lifecycle owns, which a
+                    // blanket unlink here would destroy.
+                    if (path != null && spare != null) {
                         filesFacade.remove(path);
                     }
                 }
@@ -964,6 +972,13 @@ public final class SegmentManager implements QuietCloseable {
             MmapSegment next = e.ring.nextSealedAfter(segment);
             String path = segment.path();
             try {
+                // Durably commit the head advance past this segment before
+                // unlinking it. The ring recomputes the successor under its
+                // own monitor -- computing it here from `next` would race
+                // with a concurrent rotation sealing the active, letting the
+                // head leapfrog a still-unacked sealed segment (whose file a
+                // later recovery would then discard as "stale below head").
+                e.ring.advanceManifestHeadPast(segment);
                 segment.close();
                 // A retry after a post-unlink directory-sync failure sees an
                 // already absent path. Treat absence as the prior successful

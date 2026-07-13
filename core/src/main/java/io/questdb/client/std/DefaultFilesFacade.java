@@ -112,8 +112,18 @@ final class DefaultFilesFacade implements FilesFacade {
     }
 
     @Override
+    public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+        return Files.mmap(fd, len, offset, flags, memoryTag);
+    }
+
+    @Override
     public int msync(long addr, long len, boolean async) {
         return Files.msync(addr, len, async);
+    }
+
+    @Override
+    public void munmap(long address, long len, int memoryTag) {
+        Files.munmap(address, len, memoryTag);
     }
 
     @Override
@@ -134,6 +144,16 @@ final class DefaultFilesFacade implements FilesFacade {
     @Override
     public int openRW(long pathPtr) {
         return Files.openRW(pathPtr);
+    }
+
+    @Override
+    public int openRWExclusive(String path) {
+        return Files.openRWExclusive(path);
+    }
+
+    @Override
+    public int openRWExclusive(long pathPtr) {
+        return Files.openRWExclusive(pathPtr);
     }
 
     @Override

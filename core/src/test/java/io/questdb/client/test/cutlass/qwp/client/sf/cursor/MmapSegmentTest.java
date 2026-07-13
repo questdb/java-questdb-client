@@ -128,7 +128,7 @@ public class MmapSegmentTest {
                 assertTrue(expected.getMessage(),
                         expected.getMessage().contains("pre-allocation failed"));
             }
-            assertEquals("openCleanRW must run exactly once", 1, ff.openCleanRWCalls);
+            assertEquals("exclusive create must run exactly once", 1, ff.openRWExclusiveCalls);
             assertEquals("allocate must run exactly once", 1, ff.allocateCalls);
             assertEquals("fd must be closed on allocate failure", 1, ff.closeCalls);
             assertEquals("file must be removed on allocate failure", 1, ff.removeCalls);
@@ -138,28 +138,31 @@ public class MmapSegmentTest {
     }
 
     @Test
-    public void testCreateFailsCleanlyWhenOpenCleanRWReturnsMinusOne() throws Exception {
+    public void testCreateFailsCleanlyWhenExclusiveOpenReturnsMinusOne() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-noopen.sfa";
             long sizeBytes = MmapSegment.HEADER_SIZE
                     + MmapSegment.FRAME_HEADER_SIZE + 64;
             FaultyFilesFacade ff = new FaultyFilesFacade();
-            ff.failOnOpenCleanRW = true;
+            ff.failOnOpenRWExclusive = true;
             try {
                 MmapSegment.create(ff, path, 0L, sizeBytes).close();
-                fail("expected MmapSegmentException from openCleanRW returning -1");
+                fail("expected MmapSegmentException from openRWExclusive returning -1");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("openCleanRW failed"));
+                        expected.getMessage().contains("exclusive create failed"));
             }
-            assertEquals("openCleanRW must run exactly once", 1, ff.openCleanRWCalls);
-            assertEquals("allocate must not run after openCleanRW failure",
+            assertEquals("exclusive create must run exactly once", 1, ff.openRWExclusiveCalls);
+            assertEquals("allocate must not run after exclusive-create failure",
                     0, ff.allocateCalls);
             assertEquals("close must not be called when no fd was opened",
                     0, ff.closeCalls);
-            assertEquals("remove must not be called when openCleanRW failed",
+            // With O_EXCL semantics a create failure can mean "path already
+            // exists and belongs to another lifecycle" -- create() must NOT
+            // unlink a file it never owned.
+            assertEquals("remove must not be called when exclusive create failed",
                     0, ff.removeCalls);
-            assertFalse("no file should exist when openCleanRW failed",
+            assertFalse("no file should exist when exclusive create failed",
                     Files.exists(path));
         });
     }
@@ -198,7 +201,7 @@ public class MmapSegmentTest {
             }
             assertEquals("no orphan files may survive repeated allocate failures",
                     0, survivors);
-            assertEquals(attempts, ff.openCleanRWCalls);
+            assertEquals(attempts, ff.openRWExclusiveCalls);
             assertEquals(attempts, ff.allocateCalls);
             assertEquals(attempts, ff.closeCalls);
             assertEquals(attempts, ff.removeCalls);
@@ -495,8 +498,28 @@ public class MmapSegmentTest {
         int closeCalls;
         boolean failOnAllocate;
         boolean failOnOpenCleanRW;
+        boolean failOnOpenRWExclusive;
         int openCleanRWCalls;
+        int openRWExclusiveCalls;
         int removeCalls;
+
+        @Override
+        public int openRWExclusive(String path) {
+            openRWExclusiveCalls++;
+            if (failOnOpenRWExclusive) {
+                return -1;
+            }
+            return INSTANCE.openRWExclusive(path);
+        }
+
+        @Override
+        public int openRWExclusive(long pathPtr) {
+            openRWExclusiveCalls++;
+            if (failOnOpenRWExclusive) {
+                return -1;
+            }
+            return INSTANCE.openRWExclusive(pathPtr);
+        }
 
         @Override
         public long allocNativePath(String path) {

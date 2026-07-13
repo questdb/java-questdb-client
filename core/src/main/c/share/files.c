@@ -65,6 +65,13 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRW0
     return (jint) fd;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRWExclusive0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_EXCL | O_RDWR, 0644), fd);
+    return (jint) fd;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
         (JNIEnv *e, jclass cl, jlong lpszName) {
     int fd;

@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
@@ -77,6 +78,7 @@ public final class SegmentRing implements QuietCloseable {
     // Test-only operation count for deterministic trim-complexity assertions.
     private static long trimMovedReferences;
     private final long maxBytesPerSegment;
+    private final SfManifest manifest;
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
     // Single-writer (producer thread, on rotation); single-reader at trim time
     // (the segment manager). For now, both sides synchronize via the single-
@@ -129,10 +131,15 @@ public final class SegmentRing implements QuietCloseable {
      * frameCount == 0); typically supplied by the segment manager at startup.
      */
     public SegmentRing(MmapSegment initialActive, long maxBytesPerSegment) {
+        this(initialActive, maxBytesPerSegment, null);
+    }
+
+    SegmentRing(MmapSegment initialActive, long maxBytesPerSegment, SfManifest manifest) {
         if (initialActive == null) {
             throw new IllegalArgumentException("initialActive must not be null");
         }
         this.active = initialActive;
+        this.manifest = manifest;
         this.maxBytesPerSegment = maxBytesPerSegment;
         // 3/4 of capacity gives the manager a full quarter-segment of producer
         // runway before backpressure kicks in. Long math, no float, no alloc.
@@ -142,193 +149,486 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Recovers a ring from segments already on disk in {@code sfDir}. Used at
-     * sender startup when the user's previous session left durable but
-     * not-yet-acked frames behind. Walks every {@code *.sfa} file in the
-     * directory, opens each via {@link MmapSegment#openExisting}, and
-     * arranges them by baseSeq:
-     * <ul>
-     *   <li>Highest-baseSeq segment becomes the active (further appends land
-     *       there until it fills, at which point normal rotation kicks in).</li>
-     *   <li>All others become sealed segments awaiting ACK and trim.</li>
-     * </ul>
-     * Returns {@code null} if the directory is empty or contains no
-     * recognizable {@code .sfa} files -- the caller should then construct a
-     * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
-     * created initial segment.
-     * <p>
-     * Recovery is best-effort: a single bad-magic file is silently skipped
-     * (logged-then-ignored is the right call here; a stray unrelated file in
-     * the SF dir shouldn't take the whole sender down). A failure to open
-     * an otherwise-valid segment IS fatal -- the caller's data integrity
-     * depends on every segment being readable.
+     * Compatibility wrapper using the production facade. New startup code uses
+     * {@link #recover(FilesFacade, String, long)} so EMPTY is explicit.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
-        if (!Files.exists(sfDir)) {
-            return null;
+        return openExisting(FilesFacade.INSTANCE, sfDir, maxBytesPerSegment);
+    }
+
+    /**
+     * Facade-aware variant of {@link #openExisting(String, long)}: every
+     * filesystem touch (enumeration, open, mmap, quarantine rename, manifest
+     * I/O) goes through {@code filesFacade} so recovery's fail-closed behavior
+     * can be fault-injected in tests. Returns {@code null} when the slot holds
+     * nothing recoverable; throws {@link MmapSegmentException} when the slot's
+     * state cannot be proven safe.
+     */
+    public static SegmentRing openExisting(FilesFacade filesFacade, String sfDir, long maxBytesPerSegment) {
+        Recovery recovery = recover(filesFacade, sfDir, maxBytesPerSegment);
+        return recovery.status == RecoveryStatus.EMPTY ? null : recovery.ring;
+    }
+
+    /**
+     * Exhaustively discovers and validates an SF slot without mutation. Only
+     * after enumeration, opens, CRC scans, contiguity and manifest boundaries
+     * all succeed does it migrate a legacy chain or discard validated spares.
+     */
+    static Recovery recover(FilesFacade filesFacade, String sfDir, long maxBytesPerSegment) {
+        if (!filesFacade.exists(sfDir)) {
+            return Recovery.empty();
         }
-        ObjList<MmapSegment> opened = new ObjList<>();
-        long find = Files.findFirst(sfDir);
+        ObjList<String> names = new ObjList<>();
+        long find = filesFacade.findFirst(sfDir);
         if (find < 0) {
-            LOG.warn("openExisting could not enumerate {} - treating as empty, "
-                    + "but this may indicate a permission or transient error", sfDir);
-            return null;
+            throw new MmapSegmentException("could not enumerate SF directory " + sfDir);
         }
-        if (find == 0) {
-            return null;
-        }
-        // Outer try-catch: anything escaping the recovery body -- IOOBE from
-        // ObjList growth, OOM from native mmap during MmapSegment.openExisting,
-        // unforeseen RuntimeException from the contiguity check, etc. -- must
-        // not leave fds + mmaps owned by `opened` orphaned. Close every
-        // recovered segment and rethrow so the engine surfaces the failure.
-        try {
+        if (find > 0) {
+            int rc = 1;
             try {
-                int rc = 1;
                 while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
+                    String name = Files.utf8ToString(filesFacade.findName(find));
                     if (name != null && name.endsWith(".sfa")) {
-                        String path = sfDir + "/" + name;
-                        MmapSegment seg = null;
-                        try {
-                            seg = MmapSegment.openExisting(path);
-                            // Filter out empty leftovers -- typically hot-spare
-                            // segments the manager pre-allocated for a prior
-                            // session that never got rotated into active. They
-                            // carry the provisional baseSeq=0 and frameCount=0,
-                            // which would otherwise collide with the real
-                            // baseSeq=0 segment and trip the contiguity check
-                            // below. No data to recover; close and unlink.
-                            // Without the unlink the file persists across crash
-                            // cycles and the disk leak compounds with every
-                            // unclean shutdown.
-                            //
-                            // CAUTION: only unlink when the file is genuinely
-                            // empty past the header. If frame[0] failed CRC
-                            // (bit-rot, partial-page-write at crash, etc.) but
-                            // valid frames followed, scanFrames returns
-                            // lastGood=HEADER_SIZE and frameCount=0 -- yet
-                            // tornTailBytes is non-zero. Treating that as
-                            // "empty hot-spare" would silently destroy every
-                            // surviving frame. Quarantine to <path>.corrupt
-                            // instead so a postmortem can recover what's left.
-                            if (seg.frameCount() == 0) {
-                                long torn = seg.tornTailBytes();
-                                seg.close();
-                                seg = null;
-                                if (torn > 0) {
-                                    Files.rename(path, path + ".corrupt");
-                                } else {
-                                    Files.remove(path);
-                                }
-                            } else {
-                                opened.add(seg);
-                                seg = null;
-                            }
-                        } catch (MmapSegmentException t) {
-                            // Per-file data error (bad magic, bad header,
-                            // unsupported version, mmap rejection on this one
-                            // file). Don't take down recovery for one corrupt
-                            // .sfa -- log and skip so siblings still recover.
-                            // Resource exhaustion (OOM) and programmer errors
-                            // (IOOBE) deliberately propagate to the outer
-                            // catch, which closes every already-recovered
-                            // segment and rethrows: continuing the loop after
-                            // an OOM would just fail again on the next file
-                            // while silently leaking the segments we managed
-                            // to recover before it.
-                            LOG.warn("openExisting: skipping {} -- {}", path, t.toString());
-                        } finally {
-                            // Close any seg whose ownership wasn't transferred
-                            // (either to opened, or via the empty-branch close
-                            // above). Fires on a propagating throw between
-                            // open and transfer -- most importantly an OOM
-                            // from ObjList.add growing its backing array
-                            // after the mmap+fd were already acquired.
-                            if (seg != null) {
-                                try {
-                                    seg.close();
-                                } catch (Throwable closeErr) {
-                                    LOG.warn("openExisting: error closing in-flight segment {}",
-                                            path, closeErr);
-                                }
-                            }
-                        }
+                        names.add(name);
                     }
-                    rc = Files.findNext(find);
+                    rc = filesFacade.findNext(find);
+                }
+                if (rc < 0) {
+                    throw new MmapSegmentException("could not fully enumerate SF directory " + sfDir);
                 }
             } finally {
-                Files.findClose(find);
+                filesFacade.findClose(find);
             }
-            if (opened.size() == 0) {
-                return null;
-            }
-            // Sort by baseSeq ascending. Worst-case segment count is
-            // sf_max_total_bytes / sf_max_bytes -- at the documented ceiling
-            // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
-            // multiple seconds in compares + shifts before the I/O thread can
-            // start. In-place quicksort with median-of-three pivot keeps the
-            // no-allocation discipline of the surrounding code; median-of-three
-            // is required because readdir on many filesystems returns entries
-            // in lexicographic (== baseSeq-hex) order and a naive first-element
-            // pivot would degrade back to O(N²) on exactly that common case.
-            sortByBaseSeq(opened, 0, opened.size());
-            // Sanity: the recovered segments must form a contiguous FSN range.
-            // Detect gaps so they don't silently produce duplicate or missing
-            // FSNs after recovery. A gap means a segment went missing (a
-            // manual deletion) or a sealed segment under-recovered -- its tail
-            // was cut short by a sparse/unbacked page or a mid-file media error
-            // (bad sector), the same class of fault scanFrames tolerates on the
-            // active segment but which corrupts the range on a sealed one.
-            for (int i = 1, n = opened.size(); i < n; i++) {
-                MmapSegment prev = opened.get(i - 1);
-                MmapSegment curr = opened.get(i);
-                long expected = prev.baseSeq() + prev.frameCount();
-                if (curr.baseSeq() != expected) {
-                    throw new MmapSegmentException(
-                            "FSN gap in recovered segments: prev baseSeq=" + prev.baseSeq()
-                                    + " frameCount=" + prev.frameCount()
-                                    + " expected next baseSeq=" + expected
-                                    + " but got " + curr.baseSeq()
-                                    + " -- a segment was deleted, or a sealed segment's tail was"
-                                    + " truncated (sparse/unbacked page or disk media error);"
-                                    + " check disk health");
-                }
-            }
-            // Publish the immutable in-memory successor chain before exposing
-            // the recovered ring. The final sealed segment links to the active.
-            for (int i = 1, n = opened.size(); i < n; i++) {
-                opened.get(i - 1).linkSuccessor(opened.get(i));
-            }
-            // The newest segment becomes the active. Even if it's full, that's OK:
-            // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
-            // installs a hot spare, the producer rotates. Same fast path as a
-            // mid-life ring.
-            int last = opened.size() - 1;
-            MmapSegment active = opened.get(last);
-            opened.remove(last);
-            SegmentRing ring = new SegmentRing(active, maxBytesPerSegment);
-            // Older segments become sealed in baseSeq order.
-            for (int i = 0, n = opened.size(); i < n; i++) {
-                ring.sealedSegments.add(opened.get(i));
-            }
-            return ring;
-        } catch (Throwable t) {
-            // Close every recovered MmapSegment that's still in `opened`.
-            // After the success path, `opened` no longer contains the active
-            // segment (removed above), but the sealed segments transferred to
-            // ring.sealedSegments are still owned by the ring once it's
-            // returned -- so this catch only fires before the return statement.
-            for (int i = 0, n = opened.size(); i < n; i++) {
+        }
+
+        ObjList<MmapSegment> all = new ObjList<>();
+        // Files whose own bytes prove corruption (bad magic, sub-header size,
+        // negative baseSeq, unreadable header page). They are excluded from
+        // the chain and quarantined to <name>.corrupt — but only AFTER the
+        // surviving chain validates (or resolves to EMPTY), so a failed
+        // recovery never mutates the slot. Whether a quarantined file was
+        // load-bearing is decided by the manifest-boundary / contiguity
+        // checks below, not by the skip itself. Operational open errors
+        // (EMFILE, EACCES, mmap rejection, unsupported version) are NOT in
+        // this bucket: they throw the plain MmapSegmentException type and
+        // abort recovery, because the underlying file may be perfectly
+        // intact and silently dropping it could lose durable frames.
+        ObjList<String> corruptPaths = null;
+        SfManifest manifest = null;
+        try {
+            for (int i = 0, n = names.size(); i < n; i++) {
+                String path = sfDir + "/" + names.get(i);
                 try {
-                    opened.get(i).close();
-                } catch (Throwable closeErr) {
-                    LOG.warn("openExisting: error closing recovered segment during cleanup",
-                            closeErr);
+                    all.add(MmapSegment.openExisting(filesFacade, path));
+                } catch (MmapSegmentCorruptionException e) {
+                    LOG.warn("recovery: {} is not a readable SF segment; excluding it and "
+                            + "deferring quarantine until the surviving chain validates -- {}",
+                            path, e.toString());
+                    if (corruptPaths == null) {
+                        corruptPaths = new ObjList<>();
+                    }
+                    corruptPaths.add(path);
+                } catch (MmapSegmentException e) {
+                    throw new MmapSegmentException("recovery failed for recognized segment " + path, e);
                 }
+            }
+            manifest = SfManifest.open(filesFacade, sfDir);
+            if (all.size() == 0) {
+                if (corruptPaths != null) {
+                    // Nothing valid survived. With a manifest this is still a
+                    // hole we can prove (boundaries reference segments that are
+                    // now unreadable) -- fail without mutating. Without one,
+                    // legacy semantics apply: quarantine and start fresh.
+                    if (manifest != null) {
+                        throw new MmapSegmentException("every SF segment in " + sfDir
+                                + " is corrupt but " + SfManifest.FILE_NAME
+                                + " references durable data");
+                    }
+                    quarantineCorrupt(filesFacade, corruptPaths);
+                    return Recovery.empty();
+                }
+                if (manifest != null) {
+                    // No .sfa files at all. Two legitimate protocols produce
+                    // this: the close-time drain unlinks the last segment
+                    // before it removes the manifest, and a fresh-start crash
+                    // can leave a boundary-less (0,0) manifest behind. In
+                    // both cases nothing recoverable exists, so accept EMPTY
+                    // -- but shout, because a manual wipe of segment files
+                    // looks identical and the operator should know.
+                    LOG.warn("SF manifest exists in {} with no segment files "
+                            + "(clean-drain or fresh-start crash window, or manual "
+                            + "segment removal); discarding it and starting fresh", sfDir);
+                    manifest.close();
+                    manifest = null;
+                    if (!SfManifest.removeFile(filesFacade, sfDir)) {
+                        throw new MmapSegmentException(
+                                "could not remove stale SF manifest in " + sfDir);
+                    }
+                }
+                return Recovery.empty();
+            }
+
+            ObjList<MmapSegment> data = new ObjList<>();
+            boolean requiresManifest = false;
+            for (int i = 0, n = all.size(); i < n; i++) {
+                MmapSegment segment = all.get(i);
+                requiresManifest |= segment.manifestRequired();
+                if (segment.frameCount() > 0) {
+                    data.add(segment);
+                }
+            }
+            sortByBaseSeq(data, 0, data.size());
+            if (manifest == null && requiresManifest) {
+                throw new MmapSegmentException("new-format SF segment exists but "
+                        + SfManifest.FILE_NAME + " is missing");
+            }
+
+            MmapSegment active;
+            ObjList<MmapSegment> chain = new ObjList<>();
+            long headBase;
+            long activeBase;
+            if (manifest == null) {
+                if (data.size() > 0) {
+                    validateContiguous(data);
+                    for (int i = 0, n = data.size(); i < n; i++) {
+                        chain.add(data.get(i));
+                    }
+                    active = chain.get(chain.size() - 1);
+                    headBase = chain.get(0).baseSeq();
+                    activeBase = active.baseSeq();
+                } else {
+                    active = chooseEmptyInitial(all, sfDir);
+                    if (active == null) {
+                        // Legacy slot holding only empty leftovers, every one
+                        // of them torn (a clean empty would have been chosen).
+                        // Nothing recoverable: quarantine the torn evidence,
+                        // drop the clean debris, start fresh -- exactly the
+                        // pre-manifest behavior.
+                        for (int i = 0, n = all.size(); i < n; i++) {
+                            MmapSegment segment = all.get(i);
+                            String path = segment.path();
+                            long torn = segment.tornTailBytes();
+                            segment.close();
+                            if (torn > 0) {
+                                quarantineFile(filesFacade, path);
+                            } else if (!filesFacade.remove(path)) {
+                                LOG.warn("could not remove empty SF leftover {}", path);
+                            }
+                        }
+                        all.clear();
+                        quarantineCorrupt(filesFacade, corruptPaths);
+                        return Recovery.empty();
+                    }
+                    chain.add(active);
+                    headBase = active.baseSeq();
+                    activeBase = active.baseSeq();
+                }
+                manifest = SfManifest.create(filesFacade, sfDir, headBase, activeBase);
+                for (int i = 0, n = chain.size(); i < n; i++) {
+                    chain.get(i).markManifestRequired();
+                }
+            } else {
+                headBase = manifest.headBase();
+                activeBase = manifest.activeBase();
+                for (int i = 0, n = data.size(); i < n; i++) {
+                    MmapSegment segment = data.get(i);
+                    long end = segment.baseSeq() + segment.frameCount();
+                    if (segment.baseSeq() < headBase) {
+                        if (end > headBase) {
+                            throw new MmapSegmentException("segment overlaps committed SF head boundary");
+                        }
+                        continue; // acknowledged stale file after manifest-before-unlink crash
+                    }
+                    if (segment.baseSeq() > activeBase) {
+                        throw new MmapSegmentException("segment exists beyond committed SF active boundary");
+                    }
+                    chain.add(segment);
+                }
+                if (chain.size() > 0) {
+                    validateContiguous(chain);
+                    if (chain.get(0).baseSeq() != headBase) {
+                        throw new MmapSegmentException("missing expected SF head segment at base " + headBase);
+                    }
+                }
+                active = findActive(all, activeBase);
+                if (active == null) {
+                    if (chain.size() == 0 && headBase == activeBase && corruptPaths == null) {
+                        // Clean-drain crash window: the close-time drain first
+                        // durably collapses the boundaries to head == active
+                        // (declaring every frame acked), then unlinks segments
+                        // in ascending order -- so dying between the active's
+                        // unlink and the spare's/manifest's leaves exactly
+                        // this state: no data frame anywhere, no file at the
+                        // committed active base, only empty spares and/or
+                        // acked stale files. Nothing recoverable exists;
+                        // accept EMPTY and clear the debris. Guarded on
+                        // corruptPaths because an unreadable .sfa of unknown
+                        // identity could be the real active -- in that case
+                        // fail closed instead of guessing.
+                        LOG.warn("SF manifest in {} has collapsed boundaries ({}) with no "
+                                + "segment at the active base and no recovered frames; "
+                                + "accepting the clean-drain crash window as empty",
+                                sfDir, activeBase);
+                        for (int i = 0, n = all.size(); i < n; i++) {
+                            MmapSegment segment = all.get(i);
+                            String path = segment.path();
+                            long torn = segment.tornTailBytes();
+                            segment.close();
+                            if (torn > 0) {
+                                quarantineFile(filesFacade, path);
+                            } else if (!filesFacade.remove(path)) {
+                                LOG.warn("could not remove drained SF leftover {}", path);
+                            }
+                        }
+                        all.clear();
+                        manifest.close();
+                        manifest = null;
+                        if (!SfManifest.removeFile(filesFacade, sfDir)) {
+                            throw new MmapSegmentException(
+                                    "could not remove stale SF manifest in " + sfDir);
+                        }
+                        return Recovery.empty();
+                    }
+                    throw new MmapSegmentException("missing expected SF active segment at base " + activeBase);
+                }
+                if (chain.size() == 0) {
+                    if (headBase != activeBase || active.frameCount() != 0 || corruptPaths != null) {
+                        // corruptPaths guard: with an unreadable .sfa in the
+                        // slot, the innocent-looking empty at the active base
+                        // could be a leftover spare coincidentally carrying
+                        // the same provisional baseSeq as a corrupted real
+                        // active -- accepting it would quarantine unacked
+                        // frames and re-issue their FSNs. Fail closed.
+                        throw new MmapSegmentException(
+                                "missing SF chain between committed boundaries"
+                                        + (corruptPaths != null
+                                        ? " (a corrupt segment prevents proving the empty state)" : ""));
+                    }
+                    chain.add(active);
+                } else if (chain.get(chain.size() - 1) != active) {
+                    MmapSegment tail = chain.get(chain.size() - 1);
+                    long chainEnd = tail.baseSeq() + tail.frameCount();
+                    if (corruptPaths == null && active.frameCount() == 0 && active.baseSeq() == chainEnd) {
+                        // Rotation committed (manifest fsync'd, promoted spare's
+                        // header synced) but the process/OS died before a single
+                        // frame of the new active reached disk: the sealed chain
+                        // ends exactly where the empty active begins. Legal
+                        // crash state -- resume appending into it. Refused when
+                        // corrupt segments exist (same stand-in hazard as the
+                        // empty-chain acceptance above).
+                        chain.add(active);
+                    } else {
+                        throw new MmapSegmentException(
+                                "missing expected SF active/tail segment at base " + activeBase);
+                    }
+                }
+                for (int i = 0, n = chain.size() - 1; i < n; i++) {
+                    if (chain.get(i).tornTailBytes() > 0) {
+                        throw new MmapSegmentException("corrupt torn tail in sealed SF segment " + chain.get(i).path());
+                    }
+                }
+                for (int i = 0, n = chain.size(); i < n; i++) {
+                    chain.get(i).markManifestRequired();
+                }
+            }
+
+            for (int i = 1, n = chain.size(); i < n; i++) {
+                chain.get(i - 1).linkSuccessor(chain.get(i));
+            }
+            SegmentRing ring = new SegmentRing(active, maxBytesPerSegment, manifest);
+            manifest = null;
+            for (int i = 0, n = chain.size() - 1; i < n; i++) {
+                ring.sealedSegments.add(chain.get(i));
+            }
+            // Ownership of the chain transferred. Clean up only validated
+            // extras; recovery is already successful, so cleanup failure
+            // must never turn startup into a partially-mutating error or
+            // orphan the constructed ring -- swallow and let the next
+            // startup re-examine the leftovers. Extras with a torn tail
+            // carry evidence of attempted writes -- keep the bytes under a
+            // .corrupt name instead of unlinking them.
+            try {
+                for (int i = 0, n = all.size(); i < n; i++) {
+                    MmapSegment segment = all.get(i);
+                    if (!containsIdentity(chain, segment)) {
+                        String path = segment.path();
+                        long torn = segment.tornTailBytes();
+                        segment.close();
+                        if (torn > 0) {
+                            quarantineFile(filesFacade, path);
+                        } else if (!filesFacade.remove(path)) {
+                            LOG.warn("could not remove validated stale/empty SF segment {}", path);
+                        }
+                    }
+                }
+                all.clear();
+                quarantineCorrupt(filesFacade, corruptPaths);
+            } catch (Throwable cleanupError) {
+                LOG.warn("post-recovery cleanup failed; leftover files will be "
+                        + "re-examined on the next startup", cleanupError);
+            }
+            return Recovery.recovered(ring);
+        } catch (Throwable t) {
+            for (int i = 0, n = all.size(); i < n; i++) {
+                try {
+                    all.get(i).close();
+                } catch (Throwable closeError) {
+                    LOG.warn("error closing SF segment after recovery failure", closeError);
+                }
+            }
+            if (manifest != null) {
+                manifest.close();
             }
             throw t;
         }
+    }
+
+    /**
+     * Durably advances the manifest head past {@code trimming} (the sealed
+     * segment the manager is about to unlink). The successor and the current
+     * active are both read under the ring monitor, so a concurrent rotation
+     * (which also mutates the manifest under this monitor) can never make the
+     * head leapfrog a still-live sealed segment: if rotation sealed the old
+     * active after the caller's snapshot, {@code trimming.successor()} now
+     * points at that sealed segment, not at the new active.
+     */
+    synchronized void advanceManifestHeadPast(MmapSegment trimming) {
+        if (manifest == null) {
+            return;
+        }
+        MmapSegment successor = trimming.successor();
+        long newHeadBase = (successor == null || successor == active)
+                ? active.baseSeq()
+                : successor.baseSeq();
+        manifest.update(newHeadBase, active.baseSeq());
+    }
+
+    /**
+     * Picks the clean (untorn) empty segment to reuse as a legacy slot's
+     * initial active, preferring {@code sf-initial.sfa}. Returns {@code null}
+     * when no clean empty exists; torn empties are never reused here because
+     * their bytes are quarantine evidence, not blank space.
+     */
+    private static MmapSegment chooseEmptyInitial(ObjList<MmapSegment> all, String sfDir) {
+        String initialPath = sfDir + "/sf-initial.sfa";
+        MmapSegment selected = null;
+        for (int i = 0, n = all.size(); i < n; i++) {
+            MmapSegment segment = all.get(i);
+            if (segment.frameCount() != 0 || segment.tornTailBytes() > 0) {
+                continue;
+            }
+            if (selected == null || initialPath.equals(segment.path())) {
+                selected = segment;
+            }
+        }
+        return selected;
+    }
+
+    /** Renames every collected corrupt path to {@code <path>.corrupt}, best-effort. */
+    private static void quarantineCorrupt(FilesFacade filesFacade, ObjList<String> corruptPaths) {
+        if (corruptPaths == null) {
+            return;
+        }
+        for (int i = 0, n = corruptPaths.size(); i < n; i++) {
+            quarantineFile(filesFacade, corruptPaths.get(i));
+        }
+    }
+
+    private static void quarantineFile(FilesFacade filesFacade, String path) {
+        if (filesFacade.rename(path, path + ".corrupt") != 0) {
+            LOG.warn("could not quarantine {} to {}.corrupt; it will be re-examined "
+                    + "on the next recovery", path, path);
+        }
+    }
+
+    private static boolean containsIdentity(ObjList<MmapSegment> list, MmapSegment value) {
+        for (int i = 0, n = list.size(); i < n; i++) {
+            if (list.get(i) == value) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Locates the segment the manifest's {@code activeBase} refers to.
+     * Preference order among same-base candidates:
+     * <ol>
+     *   <li>a segment with recovered frames (the durable chain tail);</li>
+     *   <li>an empty segment with a torn tail (the promoted active whose
+     *       first frame write was cut short — an attempted write marks it as
+     *       the one rotation actually exposed);</li>
+     *   <li>a clean empty segment.</li>
+     * </ol>
+     * Multiple equivalent empties at the same base are NOT an error: a fresh
+     * start or a rotation crash routinely leaves both the initial/promoted
+     * segment and a provisioned hot spare carrying the same provisional
+     * baseSeq. They are interchangeable blanks — pick one deterministically
+     * and let the extras cleanup discard the rest. Bricking startup on this
+     * state would turn every "kill -9 shortly after start" into a manual
+     * repair.
+     */
+    private static MmapSegment findActive(ObjList<MmapSegment> all, long activeBase) {
+        MmapSegment tornEmpty = null;
+        MmapSegment cleanEmpty = null;
+        for (int i = 0, n = all.size(); i < n; i++) {
+            MmapSegment segment = all.get(i);
+            if (segment.baseSeq() != activeBase) {
+                continue;
+            }
+            if (segment.frameCount() > 0) {
+                return segment;
+            }
+            if (segment.tornTailBytes() > 0) {
+                if (tornEmpty == null) {
+                    tornEmpty = segment;
+                }
+            } else if (cleanEmpty == null) {
+                cleanEmpty = segment;
+            }
+        }
+        return tornEmpty != null ? tornEmpty : cleanEmpty;
+    }
+
+    private static void validateContiguous(ObjList<MmapSegment> segments) {
+        for (int i = 1, n = segments.size(); i < n; i++) {
+            MmapSegment previous = segments.get(i - 1);
+            MmapSegment current = segments.get(i);
+            long expected = previous.baseSeq() + previous.frameCount();
+            if (current.baseSeq() != expected) {
+                throw new MmapSegmentException("FSN gap in recovered segments: expected "
+                        + expected + " but got " + current.baseSeq());
+            }
+        }
+    }
+
+    static final class Recovery {
+        private final SegmentRing ring;
+        private final RecoveryStatus status;
+
+        private Recovery(RecoveryStatus status, SegmentRing ring) {
+            this.status = status;
+            this.ring = ring;
+        }
+
+        static Recovery empty() {
+            return new Recovery(RecoveryStatus.EMPTY, null);
+        }
+
+        SegmentRing ring() {
+            return ring;
+        }
+
+        static Recovery recovered(SegmentRing ring) {
+            return new Recovery(RecoveryStatus.RECOVERED, ring);
+        }
+
+        RecoveryStatus status() {
+            return status;
+        }
+    }
+
+    enum RecoveryStatus {
+        EMPTY,
+        RECOVERED
     }
 
     /**
@@ -396,11 +696,45 @@ public final class SegmentRing implements QuietCloseable {
             MmapSegment previous = active;
             long actualBase = previous.baseSeq() + previous.frameCount();
             spare.rebaseSeq(actualBase);
+            if (manifest != null) {
+                // Make the spare's rebased identity durable BEFORE the manifest
+                // references it. Without this barrier an OS crash could leave a
+                // durable manifest pointing at baseSeq=actualBase while the
+                // spare's on-disk header still carries the manager's
+                // provisional guess -- recovery would then find no segment at
+                // the committed active boundary and fail a startup that lost
+                // nothing. One msync per rotation, amortized over a whole
+                // segment of appends; runs outside the monitor because the
+                // spare is not yet visible to any other thread.
+                //
+                // Deliberately NOT msync'd here: the sealed predecessor's
+                // data pages. A power loss can therefore tear the sealed
+                // tail after the boundary is committed, and recovery will
+                // fail closed on chainEnd != activeBase. That is the
+                // intended semantics -- page-level durability of frame data
+                // follows the sender's opt-in msync cadence, and recovery
+                // must refuse to guess when the two disagree.
+                spare.syncHeader();
+            }
             // Publish the successor before the volatile active promotion. The
             // same monitor protects the sealed list and nextSealedAfter's trim
             // fallback, while the volatile link also remains readable from a
             // current segment after the manager removes and closes it.
             synchronized (this) {
+                if (manifest != null) {
+                    // Inside the monitor: serialized with the trim path's
+                    // advanceManifestHeadPast so neither writer publishes a
+                    // boundary computed from a state the other has already
+                    // moved past (SfManifest additionally clamps monotonic).
+                    // BEFORE any ring mutation: if the manifest fsync throws,
+                    // the rotation never happened -- previous stays active,
+                    // the spare stays installed, and the producer's retry
+                    // re-runs this block from a consistent state.
+                    long headBase = sealedHead < sealedSegments.size()
+                            ? sealedSegments.get(sealedHead).baseSeq()
+                            : previous.baseSeq();
+                    manifest.update(headBase, actualBase);
+                }
                 previous.linkSuccessor(spare);
                 sealedSegments.add(previous);
                 active = spare;
@@ -461,6 +795,9 @@ public final class SegmentRing implements QuietCloseable {
         }
         sealedSegments.clear();
         sealedHead = 0;
+        if (manifest != null) {
+            manifest.close();
+        }
     }
 
     /**

@@ -286,9 +286,11 @@ public final class CursorSendEngine implements QuietCloseable {
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
             // already on disk and corrupting ACK translation, trim, and replay.
-            SegmentRing recovered = memoryMode ? null
-                    : SegmentRing.openExisting(sfDir, segmentSizeBytes);
-            this.wasRecoveredFromDisk = recovered != null;
+            SegmentRing.Recovery recovery = memoryMode ? null
+                    : SegmentRing.recover(filesFacade, sfDir, segmentSizeBytes);
+            SegmentRing recovered = recovery == null ? null : recovery.ring();
+            this.wasRecoveredFromDisk = recovery != null
+                    && recovery.status() == SegmentRing.RecoveryStatus.RECOVERED;
             if (recovered != null) {
                 ringInProgress = recovered;
                 // Seed ackedFsn to one below the lowest segment's baseSeq.
@@ -394,18 +396,49 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 MmapSegment initial;
                 String initialPath = null;
+                SfManifest initialManifest = null;
                 if (memoryMode) {
                     initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
                 } else {
+                    // Created WITHOUT the manifest-required flag: the flag is
+                    // a durable promise that sf-manifest.bin exists, so it
+                    // must only be stamped after the manifest itself is on
+                    // disk. Stamping it at create time would leave a crash
+                    // window (initial durable, manifest not yet created)
+                    // whose recovery hard-fails with "segment requires
+                    // missing manifest" even though nothing was lost.
                     initialPath = sfDir + "/sf-initial.sfa";
-                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+                    initial = MmapSegment.create(filesFacade, initialPath, 0L, segmentSizeBytes);
                 }
                 try {
-                    ringInProgress = new SegmentRing(initial, segmentSizeBytes);
+                    if (!memoryMode) {
+                        // Ordering is load-bearing for crash recovery:
+                        //   1. initial segment durable (header + dirent),
+                        //   2. manifest created (its own create fsyncs),
+                        //   3. flag stamped on the segment.
+                        // A crash after (1) recovers via the legacy
+                        // (manifest-less) path; after (2) via the manifest
+                        // path with an unflagged-but-valid empty active;
+                        // after (3) it is the steady state. Every window
+                        // self-heals without operator action.
+                        initial.syncHeader();
+                        if (filesFacade.fsyncDir(sfDir) != 0) {
+                            throw new MmapSegmentException(
+                                    "could not sync fresh SF segment directory " + sfDir);
+                        }
+                        initialManifest = SfManifest.create(filesFacade, sfDir, 0L, 0L);
+                        initial.markManifestRequired();
+                    }
+                    ringInProgress = new SegmentRing(initial, segmentSizeBytes, initialManifest);
+                    initialManifest = null;
                 } catch (Throwable t) {
                     initial.close();
+                    if (initialManifest != null) {
+                        initialManifest.close();
+                        SfManifest.removeFile(filesFacade, sfDir);
+                    }
                     if (initialPath != null) {
-                        Files.remove(initialPath);
+                        filesFacade.remove(initialPath);
                     }
                     throw t;
                 }
@@ -1247,17 +1280,24 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Unlinks every {@code .sfa} file under {@code dir}. Called only on
-     * clean shutdown when the ring confirms every published FSN has been
-     * acked — at that moment the slot has no recoverable work and the
-     * files are pure noise that would mislead the next sender's recovery.
+     * Unlinks every {@code .sfa} file under {@code dir}, then the SF
+     * manifest. Called only on clean shutdown when the ring confirms every
+     * published FSN has been acked — at that moment the slot has no
+     * recoverable work and the files are pure noise that would mislead the
+     * next sender's recovery.
      * <p>
-     * Removal runs in ascending segment order and STOPS at the first
-     * failure, so whatever survives (a failure here, or a crash mid-loop)
-     * is always a contiguous top slice of the ring: recovery's
-     * FSN-contiguity check still passes, and the retained ack watermark
-     * (== the final acked FSN == the highest frame on disk) still covers
-     * every surviving frame, so a successor replays nothing.
+     * Crash safety comes from a single durable manifest update committed
+     * BEFORE the first unlink: collapsing the boundaries to
+     * {@code head == active} declares every frame below the active base
+     * trimmed, so any subset of surviving files recovers cleanly (stale
+     * files are discarded, a surviving active recovers as the whole chain,
+     * zero files with a leftover manifest is the recognized drain window
+     * and recovers as EMPTY). Removal still runs in ascending segment order
+     * and STOPS at the first failure; the retained ack watermark (== the
+     * final acked FSN) covers every surviving frame, so a successor replays
+     * nothing. Legacy slots without a manifest keep the pre-manifest
+     * argument: ascending-order removal preserves a contiguous top slice
+     * that passes FSN-contiguity.
      *
      * @return {@code true} only when enumeration succeeded and every
      * {@code .sfa} file was confirmed removed — the caller keeps the ack
@@ -1300,13 +1340,54 @@ public final class CursorSendEngine implements QuietCloseable {
             int byRank = Long.compare(segmentCleanupRank(a), segmentCleanupRank(b));
             return byRank != 0 ? byRank : a.compareTo(b);
         });
-        for (int i = 0, n = names.size(); i < n; i++) {
-            String path = dir + "/" + names.get(i);
-            if (!filesFacade.remove(path)) {
-                LOG.warn("Failed to unlink fully-acked segment {} on close; stopping so the "
-                        + "residual files stay a contiguous, watermark-covered range", path);
+        // Manifest-aware drain protocol. Before removing anything, durably
+        // collapse the committed boundaries to head == active. From that
+        // moment EVERY crash state is a valid recovery input:
+        //   - surviving data below the active base is "stale below head"
+        //     (acked by definition here) and is discarded by recovery;
+        //   - a surviving active-base segment recovers as the whole chain;
+        //   - empty spares are validated extras;
+        //   - zero segment files with the manifest still present is the
+        //     recognized drain window and recovers as EMPTY.
+        // Without this barrier, deleting the file the manifest calls "head"
+        // would make the next startup fail on a slot that lost nothing.
+        // The manifest itself is removed last, after every segment unlink.
+        SfManifest manifest = null;
+        try {
+            try {
+                manifest = SfManifest.open(filesFacade, dir);
+            } catch (Throwable t) {
+                LOG.warn("close-time unlink could not read the SF manifest in {}; leaving "
+                        + "all files for the next recovery", dir, t);
                 return false;
             }
+            if (manifest != null && !names.isEmpty()) {
+                try {
+                    long activeBase = manifest.activeBase();
+                    manifest.update(activeBase, activeBase);
+                } catch (Throwable t) {
+                    LOG.warn("close-time unlink could not commit drain boundaries in {}; "
+                            + "leaving all files for the next recovery", dir, t);
+                    return false;
+                }
+            }
+            for (int i = 0, n = names.size(); i < n; i++) {
+                String path = dir + "/" + names.get(i);
+                if (!filesFacade.remove(path)) {
+                    LOG.warn("Failed to unlink fully-acked segment {} on close; stopping so the "
+                            + "residual files stay a watermark-covered, manifest-consistent range", path);
+                    return false;
+                }
+            }
+        } finally {
+            if (manifest != null) {
+                manifest.close();
+            }
+        }
+        if (!SfManifest.removeFile(filesFacade, dir)) {
+            // Safe to proceed: a manifest with zero segment files is the
+            // recognized drain window and recovers as EMPTY.
+            LOG.warn("could not remove SF manifest in {} after full segment cleanup", dir);
         }
         return true;
     }

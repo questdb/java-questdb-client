@@ -25,23 +25,26 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 /**
- * Hard failure of the MmapSegment layer — bad header, mmap rejection, file
- * too short for header, etc. Indicates the segment is unusable, not that
- * the disk is full (the latter surfaces as backpressure on the producer
- * via {@link io.questdb.client.cutlass.qwp.client.LineSenderException}).
+ * Positively-identified segment corruption: the file's own bytes prove it is
+ * not (or no longer) a readable SF segment — truncated below the fixed header,
+ * wrong magic, a negative {@code baseSeq}, or an unreadable (unbacked/torn)
+ * header page. Distinct from its parent {@link MmapSegmentException}, which
+ * recovery treats as an <b>operational</b> failure (open/mmap error on a file
+ * whose contents may be perfectly intact) and must therefore be fatal.
  * <p>
- * Recovery distinguishes two flavors: this base type marks <b>operational</b>
- * failures (open/mmap/enumeration errors — the file's contents may be fine,
- * so recovery must fail closed), while the {@link MmapSegmentCorruptionException}
- * subtype marks <b>positively-identified corruption</b> in the file's own
- * bytes, which recovery may quarantine instead of aborting.
+ * Recovery quarantines corruption (rename to {@code <name>.corrupt}) and
+ * relies on manifest boundaries / FSN contiguity to decide whether the
+ * quarantined file was load-bearing; operational failures always abort
+ * startup so a transient {@code EMFILE}/{@code ENOMEM} can never silently
+ * drop durable frames.
  */
-public class MmapSegmentException extends RuntimeException {
-    public MmapSegmentException(String message) {
+public final class MmapSegmentCorruptionException extends MmapSegmentException {
+
+    public MmapSegmentCorruptionException(String message) {
         super(message);
     }
 
-    public MmapSegmentException(String message, Throwable cause) {
+    public MmapSegmentCorruptionException(String message, Throwable cause) {
         super(message, cause);
     }
 }

@@ -111,8 +111,16 @@ public interface FilesFacade {
 
     int mkdir(String path, int mode);
 
+    default long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+        return Files.mmap(fd, len, offset, flags, memoryTag);
+    }
+
     default int msync(long addr, long len, boolean async) {
         return Files.msync(addr, len, async);
+    }
+
+    default void munmap(long address, long len, int memoryTag) {
+        Files.munmap(address, len, memoryTag);
     }
 
     int openCleanRW(String path);
@@ -129,6 +137,14 @@ public interface FilesFacade {
 
     /** Variant of {@link #openRW(String)} taking a pre-encoded native UTF-8 path pointer. */
     int openRW(long pathPtr);
+
+    default int openRWExclusive(String path) {
+        return Files.openRWExclusive(path);
+    }
+
+    default int openRWExclusive(long pathPtr) {
+        return Files.openRWExclusive(pathPtr);
+    }
 
     /**
      * Variant of {@code length(String)} taking a pre-encoded native UTF-8 path

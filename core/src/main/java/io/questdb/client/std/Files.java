@@ -155,6 +155,24 @@ public final class Files {
     }
 
     /**
+     * Atomically creates {@code path} for read-write access. Fails with -1
+     * when the path already exists; existing bytes are never truncated.
+     */
+    public static int openRWExclusive(String path) {
+        long ptr = pathPtr(path);
+        try {
+            return openRWExclusive0(ptr);
+        } finally {
+            freePathPtr(ptr);
+        }
+    }
+
+    /** Native-path variant of {@link #openRWExclusive(String)}. */
+    public static int openRWExclusive(long pathPtr) {
+        return openRWExclusive0(pathPtr);
+    }
+
+    /**
      * Opens {@code path} for append-only writes, creating it (mode 0644) if
      * absent. Every {@link #append(int, long, long)} writes at end-of-file
      * regardless of the current logical position. Returns a non-negative fd
@@ -574,6 +592,8 @@ public final class Files {
     static native int openRO0(long lpszName);
 
     static native int openRW0(long lpszName);
+
+    static native int openRWExclusive0(long lpszName);
 
     static native int openAppend0(long lpszName);
 

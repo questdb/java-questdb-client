@@ -103,6 +103,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRW0
                      FILE_ATTRIBUTE_NORMAL);
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRWExclusive0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    return open_file((const char *) (uintptr_t) lpszName,
+                     GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     CREATE_NEW,
+                     FILE_ATTRIBUTE_NORMAL);
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
         (JNIEnv *e, jclass cl, jlong lpszName) {
     jint fd = open_file((const char *) (uintptr_t) lpszName,
