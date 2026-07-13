@@ -16,6 +16,17 @@ import java.time.temporal.ChronoUnit;
 public final class IngressBench {
     static final int CHECKPOINT_BATCHES = 64;
     static final long ACK_TIMEOUT_MS = 120_000;
+    // Precomputed column names for S2_WIDE's wide symbol/double columns --
+    // avoids a per-row "s" + c / "d" + k allocation in the timed pass() loop.
+    // Mirrors Rust's S_NAMES/D_NAMES in qwp_ingress_row.rs.
+    private static final String[] S_NAMES = names("s", BenchSchema.N_WIDE_SYMS);
+    private static final String[] D_NAMES = names("d", BenchSchema.N_WIDE_DOUBLES);
+
+    private static String[] names(String prefix, int count) {
+        String[] out = new String[count + 1];
+        for (int i = 1; i <= count; i++) out[i] = prefix + i;
+        return out;
+    }
 
     public static int run() throws Exception {
         BenchSchema.Kind kind = BenchSchema.Kind.parse(Env.str("SCHEMA", "s1-narrow"));
@@ -134,7 +145,7 @@ public final class IngressBench {
                 sender.symbol("sym", BenchSchema.sym(i, symCard));
                 if (kind == BenchSchema.Kind.S2_WIDE) {
                     for (int c = 1; c <= BenchSchema.N_WIDE_SYMS; c++) {
-                        sender.symbol("s" + c, BenchSchema.hiSym(c, i, hiCard));
+                        sender.symbol(S_NAMES[c], BenchSchema.hiSym(c, i, hiCard));
                     }
                 }
                 sender.longColumn("id", BenchSchema.id(i));
@@ -142,18 +153,26 @@ public final class IngressBench {
                 sender.stringColumn("note", notes[(int) (i % notes.length)]);
                 if (kind == BenchSchema.Kind.S2_WIDE) {
                     for (int k = 1; k <= BenchSchema.N_WIDE_DOUBLES; k++) {
-                        sender.doubleColumn("d" + k, BenchSchema.wideDouble(i, k));
+                        sender.doubleColumn(D_NAMES[k], BenchSchema.wideDouble(i, k));
                     }
                 }
                 sender.at(BenchSchema.tsNanos(i), ChronoUnit.NANOS);
             }
             lastFsn = sender.flushAndGetSequence();
             if (++batchNo % CHECKPOINT_BATCHES == 0 && lastFsn >= 0) {
-                sender.awaitAckedFsn(lastFsn, ACK_TIMEOUT_MS);
+                if (!sender.awaitAckedFsn(lastFsn, ACK_TIMEOUT_MS)) {
+                    throw new RuntimeException(
+                            "[qwp_ingress_java] checkpoint ack timed out for fsn=" + lastFsn
+                                    + " after " + ACK_TIMEOUT_MS + "ms");
+                }
             }
         }
         if (lastFsn >= 0) {
-            sender.awaitAckedFsn(lastFsn, ACK_TIMEOUT_MS);
+            if (!sender.awaitAckedFsn(lastFsn, ACK_TIMEOUT_MS)) {
+                throw new RuntimeException(
+                        "[qwp_ingress_java] final ack timed out for fsn=" + lastFsn
+                                + " after " + ACK_TIMEOUT_MS + "ms");
+            }
         }
     }
 

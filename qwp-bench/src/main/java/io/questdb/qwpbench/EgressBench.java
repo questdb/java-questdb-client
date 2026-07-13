@@ -208,7 +208,9 @@ public final class EgressBench {
                                     break;
                                 case QwpConstants.TYPE_DOUBLE:
                                     for (int r = 0; r < nrows; r++) {
-                                        checksum[0] += col.getDoubleValue(r);
+                                        if (!col.isNull(r)) {
+                                            checksum[0] += col.getDoubleValue(r);
+                                        }
                                     }
                                     break;
                                 case QwpConstants.TYPE_SYMBOL:
