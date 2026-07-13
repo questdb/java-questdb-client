@@ -66,7 +66,7 @@ public final class EgressBench {
             // for why auto-flush is pinned to max thresholds rather than disabled.
             String ingestConf = IngressBench.ingestConf(host, port);
             try (Sender sender = Sender.fromConfig(ingestConf)) {
-                IngressBench.pass(sender, kind, rows, symCard, hiCard, notes, POPULATE_BATCH_ROWS);
+                IngressBench.pass(sender, kind, 0, rows, symCard, hiCard, notes, POPULATE_BATCH_ROWS);
             }
             System.err.printf("[qwp_egress_java] waiting for WAL apply (count == %d)%n", rows);
             long count = http.waitForCount(table, rows);

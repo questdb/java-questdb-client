@@ -3,6 +3,11 @@ package io.questdb.qwpbench;
 import io.questdb.client.Sender;
 
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * Row-API ingress bench over QWP/WebSocket, mirroring the cadence of
@@ -28,6 +33,17 @@ public final class IngressBench {
         return out;
     }
 
+    /**
+     * Sender {@code k} (0-based) of {@code senders} owns global rows
+     * {@code [rows*k/senders, rows*(k+1)/senders)}. Multiply-first long math:
+     * ranges tile [0, rows) exactly for any senders count (empty ranges when
+     * senders > rows are legal no-ops). Same split as the Rust/C twins'
+     * sender_range(s).
+     */
+    static long[] senderRange(long rows, int senders, int k) {
+        return new long[]{rows * k / senders, rows * (k + 1) / senders};
+    }
+
     public static int run() throws Exception {
         BenchSchema.Kind kind = BenchSchema.Kind.parse(Env.str("SCHEMA", "s1-narrow"));
         long rows = Env.zu("ROWS", 10_000_000);
@@ -37,6 +53,8 @@ public final class IngressBench {
         int iterations = (int) Env.zu("ITERATIONS", 5);
         int warmups = (int) Env.zu("WARMUPS", 2);
         long maxBatch = Env.zu("MAX_BATCH_ROWS", 10_000);
+        int senders = (int) Env.zu("SENDERS", 1);
+        if (senders < 1) senders = 1;
         String host = Env.str("QDB_HOST", "127.0.0.1");
         long port = Env.zu("QDB_PORT", 9000);
         String table = kind.tableName();
@@ -46,8 +64,8 @@ public final class IngressBench {
         // with no config-string key set here, so the defaults already apply.
         String conf = ingestConf(host, port);
 
-        System.err.printf("[qwp_ingress_java] schema=%s rows=%d it=%d wu=%d batch=%d host=%s:%d%n",
-                kind, rows, iterations, warmups, maxBatch, host, port);
+        System.err.printf("[qwp_ingress_java] schema=%s rows=%d it=%d wu=%d batch=%d host=%s:%d senders=%d%n",
+                kind, rows, iterations, warmups, maxBatch, host, port, senders);
 
         BenchHttp http = new BenchHttp(base);
         http.execSql("DROP TABLE IF EXISTS " + table);
@@ -61,14 +79,28 @@ public final class IngressBench {
         String[] notes = new String[tcount];
         for (int t = 0; t < tcount; t++) notes[t] = BenchSchema.noteTemplate(t, varcharLen);
 
-        try (Sender sender = Sender.fromConfig(conf)) {
-            for (int w = 0; w < warmups; w++) pass(sender, kind, rows, symCard, hiCard, notes, maxBatch);
+        Sender[] pool = new Sender[senders];
+        long[][] ranges = new long[senders][];
+        ExecutorService exec = senders > 1 ? Executors.newFixedThreadPool(senders) : null;
+        try {
+            for (int k = 0; k < senders; k++) {
+                pool[k] = Sender.fromConfig(conf);
+                ranges[k] = senderRange(rows, senders, k);
+            }
+            for (int w = 0; w < warmups; w++) {
+                multiPass(exec, pool, ranges, kind, symCard, hiCard, notes, maxBatch);
+            }
             for (int it = 0; it < iterations; it++) {
                 long g0 = BenchJson.gcMs(), c0 = BenchJson.processCpuNs(), t0 = BenchJson.nowNs();
-                pass(sender, kind, rows, symCard, hiCard, notes, maxBatch);
+                multiPass(exec, pool, ranges, kind, symCard, hiCard, notes, maxBatch);
                 wall[it] = BenchJson.nowNs() - t0;
                 cpu[it] = BenchJson.processCpuNs() - c0;
                 gc[it] = BenchJson.gcMs() - g0;
+            }
+        } finally {
+            if (exec != null) exec.shutdownNow();
+            for (Sender s : pool) {
+                if (s != null) s.close();
             }
         }
         long count = http.waitForCount(table, rows);
@@ -82,6 +114,7 @@ public final class IngressBench {
         report.put("run_mode", Env.str("RUN_MODE", "full"));
         report.put("warmups", (long) warmups);
         report.put("wire_bytes", 0L);
+        report.put("senders", (long) senders);
         BenchJson.Obj machine = new BenchJson.Obj();
         machine.put("platform", System.getProperty("os.name").toLowerCase().contains("linux") ? "linux" : "macos");
         machine.put("arch", System.getProperty("os.arch"));
@@ -133,12 +166,12 @@ public final class IngressBench {
     }
 
     // package-private: EgressBench reuses this for its populate step (Task 5)
-    static void pass(Sender sender, BenchSchema.Kind kind, long rows,
+    static void pass(Sender sender, BenchSchema.Kind kind, long lo, long hi,
                       int symCard, int hiCard, String[] notes, long maxBatch) throws Exception {
         long batchNo = 0;
         long lastFsn = -1;
-        for (long start = 0; start < rows; start += maxBatch) {
-            long end = Math.min(start + maxBatch, rows);
+        for (long start = lo; start < hi; start += maxBatch) {
+            long end = Math.min(start + maxBatch, hi);
             for (long i = start; i < end; i++) {
                 sender.table(kind.tableName());
                 // symbols must precede other columns (Sender contract)
@@ -173,6 +206,31 @@ public final class IngressBench {
                         "[qwp_ingress_java] final ack timed out for fsn=" + lastFsn
                                 + " after " + ACK_TIMEOUT_MS + "ms");
             }
+        }
+    }
+
+    /**
+     * One e2e pass over all senders. senders == 1 runs inline (no executor
+     * hop in the timed region); otherwise each sender's range runs on the
+     * shared pool and Future.get() rethrows the first worker failure.
+     */
+    private static void multiPass(ExecutorService exec, Sender[] pool, long[][] ranges,
+                                  BenchSchema.Kind kind, int symCard, int hiCard,
+                                  String[] notes, long maxBatch) throws Exception {
+        if (pool.length == 1) {
+            pass(pool[0], kind, ranges[0][0], ranges[0][1], symCard, hiCard, notes, maxBatch);
+            return;
+        }
+        List<Future<?>> futures = new ArrayList<>(pool.length);
+        for (int k = 0; k < pool.length; k++) {
+            final int kk = k;
+            futures.add(exec.submit(() -> {
+                pass(pool[kk], kind, ranges[kk][0], ranges[kk][1], symCard, hiCard, notes, maxBatch);
+                return null;
+            }));
+        }
+        for (Future<?> f : futures) {
+            f.get();
         }
     }
 
