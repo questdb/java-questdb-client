@@ -686,6 +686,101 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * Adversarial-order companion to
+     * {@link #testLargeSegmentCountReopensInOrder}: that test covers the
+     * already-sorted readdir order median-of-three was chosen for; this one
+     * covers the orders median-of-three does NOT defend. On the
+     * pre-introsort quicksort, exact simulation at N=16384 measured ~22.6M
+     * comparisons for organ-pipe, ~134M (full N²/2) for mass-duplicate
+     * baseSeqs and ~50.7M for Musser's median-of-three-killer permutation.
+     * The heapsort fallback caps the worst of these at ~3.8·N·log₂(N)
+     * (~860K), so the 8·N·log₂(N) bound below keeps >2x headroom against
+     * harmless implementation drift while sitting ~26x under the mildest
+     * quadratic blow-up. Also pins unsigned key ordering: baseSeqs with the
+     * sign bit set must sort above {@code Long.MAX_VALUE}, not below zero.
+     * <p>
+     * A healthy client cannot produce these orders (recovery validation
+     * rejects duplicate or non-contiguous baseSeqs moments after the sort),
+     * but corrupted-yet-parseable headers or operator file copies feed the
+     * sort BEFORE validation runs, so the sort itself must stay log-linear.
+     * Sorts in-memory segments directly: staging 16K adversarial header
+     * files on disk per pattern would dominate the test's runtime without
+     * adding coverage.
+     */
+    @Test
+    public void testAdversarialSegmentOrdersSortLogLinear() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int n = 16384;
+            final long bound = 8L * n * (long) (Math.log(n) / Math.log(2));
+
+            // Organ pipe: 0,1,...,n/2-1,n/2-1,...,1,0.
+            long[] organPipe = new long[n];
+            for (int i = 0; i < n / 2; i++) {
+                organPipe[i] = i;
+                organPipe[n - 1 - i] = i;
+            }
+            assertAdversarialSortWithinBound("organ-pipe", organPipe, bound);
+
+            long[] allDuplicates = new long[n];
+            for (int i = 0; i < n; i++) {
+                allDuplicates[i] = 42;
+            }
+            assertAdversarialSortWithinBound("all-duplicates", allDuplicates, bound);
+
+            long[] fewDistinct = new long[n];
+            for (int i = 0; i < n; i++) {
+                fewDistinct[i] = i % 4;
+            }
+            assertAdversarialSortWithinBound("few-distinct", fewDistinct, bound);
+
+            // Musser's median-of-three killer permutation of 1..n.
+            long[] med3Killer = new long[n];
+            int half = n / 2;
+            for (int i = 1; i <= half; i++) {
+                if (i % 2 == 1) {
+                    med3Killer[i - 1] = i;
+                    med3Killer[i] = half + i;
+                }
+                med3Killer[half + i - 1] = 2L * i;
+            }
+            assertAdversarialSortWithinBound("median-of-three-killer", med3Killer, bound);
+
+            // High-bit keys interleaved with small ones: exercises the
+            // unsigned comparison contract alongside the comparison bound.
+            long[] unsignedMix = new long[n];
+            for (int i = 0; i < n; i++) {
+                unsignedMix[i] = (i % 2 == 0) ? (0x8000000000000000L | i) : i;
+            }
+            assertAdversarialSortWithinBound("unsigned-mix", unsignedMix, bound);
+        });
+    }
+
+    private static void assertAdversarialSortWithinBound(String label, long[] baseSeqs, long bound) {
+        final long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
+        ObjList<MmapSegment> list = new ObjList<>();
+        try {
+            for (long baseSeq : baseSeqs) {
+                list.add(MmapSegment.createInMemory(baseSeq, segSize));
+            }
+            SegmentRing.resetSortComparisons();
+            SegmentRing.sortByBaseSeqForTest(list);
+            long comparisons = SegmentRing.getSortComparisons();
+            for (int i = 1, size = list.size(); i < size; i++) {
+                assertTrue(label + ": unsigned baseSeq order violated at index " + i,
+                        Long.compareUnsigned(list.get(i - 1).baseSeq(), list.get(i).baseSeq()) <= 0);
+            }
+            assertTrue(label + " sort took " + comparisons + " comparisons (expected < " + bound
+                            + " = 8 * N * log2(N) for N=" + baseSeqs.length
+                            + "); regression suggests the introsort heapsort fallback stopped engaging",
+                    comparisons < bound);
+        } finally {
+            for (int i = 0, size = list.size(); i < size; i++) {
+                list.get(i).close();
+            }
+        }
+    }
+
     @Test
     public void testRemovingAcknowledgedPrefixMovesLinearReferences() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

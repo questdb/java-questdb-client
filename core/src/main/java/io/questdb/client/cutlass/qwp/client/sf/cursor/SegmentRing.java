@@ -71,8 +71,9 @@ public final class SegmentRing implements QuietCloseable {
     // openExisting() recovery on this JVM. Used by SegmentRingTest to
     // assert the sort stays O(N log N) without relying on wall-clock time
     // (CI runner variance makes elapsed-millisecond bounds flaky). Cheap
-    // in production: one volatile-free add per partition pass, dwarfed by
-    // the mmap I/O the recovery does on every segment.
+    // in production: one volatile-free add per partition pass (plus two per
+    // sift level in the rare heapsort fallback), dwarfed by the mmap I/O
+    // the recovery does on every segment.
     private static long sortComparisons;
     // References copied while compacting the logical sealed-segment head.
     // Test-only operation count for deterministic trim-complexity assertions.
@@ -1110,9 +1111,10 @@ public final class SegmentRing implements QuietCloseable {
      * {@link #sortByBaseSeq} since the last {@link #resetSortComparisons()}
      * (or process start). The count is incremented once per partition pass
      * for the median-of-three pivot pick plus once per element compared
-     * against the pivot, so a clean run on N segments adds roughly
-     * {@code 3 + (hi - lo - 1)} per recursive frame, summing to O(N log N).
-     * Exposed for {@code SegmentRingTest} to detect O(N²) regressions
+     * against the pivot ({@code 3 + (hi - lo - 1)} per pass), and by two per
+     * sift-down level when a range falls back to heapsort, so it strictly
+     * upper-bounds the true compare count and sums to O(N log N) on every
+     * input. Exposed for {@code SegmentRingTest} to detect O(N²) regressions
      * deterministically.
      */
     @TestOnly
@@ -1145,15 +1147,46 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * In-place quicksort over {@code list[lo, hi)} keyed by ascending
-     * {@code baseSeq}. Median-of-three pivot avoids the pathological O(N²)
-     * on already-sorted input that lexicographic readdir produces (our
-     * filenames are zero-padded hex of {@code baseSeq}). Recursion depth is
-     * bounded by ~2 log₂(N) -- for the documented 16K-segment ceiling, well
-     * under the JVM default stack.
+     * Drives the recovery-time baseSeq sort over the whole list. Exposed so
+     * {@code SegmentRingTest} can feed adversarial orders (organ-pipe, mass
+     * duplicates, median-of-three killer, unsigned-boundary keys) straight
+     * into the sort and assert comparison bounds without staging thousands
+     * of segment files on disk.
+     */
+    @TestOnly
+    public static void sortByBaseSeqForTest(ObjList<MmapSegment> list) {
+        sortByBaseSeq(list, 0, list.size());
+    }
+
+    /**
+     * In-place introsort over {@code list[lo, hi)} keyed by ascending
+     * unsigned {@code baseSeq}. Median-of-three quicksort handles the readdir
+     * orders a healthy slot produces (lexicographic enumeration of the
+     * generation-numbered filenames yields already-sorted baseSeqs; hashed
+     * directory order is effectively random), and a partition-pass budget of
+     * 2·⌊log₂(N)⌋ demotes any range that keeps splitting badly to in-place
+     * heapsort. Without that budget, Lomuto with a median-of-three pivot is
+     * O(N²) on organ-pipe, duplicate-heavy and median-of-three-killer orders
+     * -- reachable only through corrupted-yet-parseable or operator-copied
+     * headers, but at the documented 16K-segment ceiling that is 10⁷..10⁸
+     * comparisons of startup stall before recovery validation gets to
+     * reject the slot, so the fallback makes O(N log N) unconditional.
+     * Recursion depth stays under log₂(N) (recurse on the smaller side,
+     * loop on the larger), well within the JVM default stack.
      */
     private static void sortByBaseSeq(ObjList<MmapSegment> list, int lo, int hi) {
+        int n = hi - lo;
+        if (n > 1) {
+            sortByBaseSeq(list, lo, hi, 2 * (31 - Integer.numberOfLeadingZeros(n)));
+        }
+    }
+
+    private static void sortByBaseSeq(ObjList<MmapSegment> list, int lo, int hi, int budget) {
         while (hi - lo > 1) {
+            if (budget-- == 0) {
+                heapSortByBaseSeq(list, lo, hi);
+                return;
+            }
             int mid = (lo + hi) >>> 1;
             long a = list.get(lo).baseSeq();
             long b = list.get(mid).baseSeq();
@@ -1183,14 +1216,58 @@ public final class SegmentRing implements QuietCloseable {
             }
             swap(list, store, hi - 1);
             // Recurse on the smaller partition; loop on the larger to keep
-            // recursion depth bounded by log₂(N).
+            // recursion depth bounded by log₂(N). Children inherit the
+            // remaining pass budget: it counts passes along a root-to-leaf
+            // path, so a chain of bad splits exhausts it after ~2 log₂(N)
+            // levels no matter how the work is divided.
             if (store - lo < hi - store - 1) {
-                sortByBaseSeq(list, lo, store);
+                sortByBaseSeq(list, lo, store, budget);
                 lo = store + 1;
             } else {
-                sortByBaseSeq(list, store + 1, hi);
+                sortByBaseSeq(list, store + 1, hi, budget);
                 hi = store;
             }
+        }
+    }
+
+    /**
+     * In-place heapsort over {@code list[lo, hi)} keyed by ascending unsigned
+     * {@code baseSeq}: the introsort fallback for ranges whose partition-pass
+     * budget ran out. Guaranteed O(N log N) for any key distribution and any
+     * initial order; no allocation.
+     */
+    private static void heapSortByBaseSeq(ObjList<MmapSegment> list, int lo, int hi) {
+        int n = hi - lo;
+        for (int root = (n >>> 1) - 1; root >= 0; root--) {
+            siftDownByBaseSeq(list, lo, root, n);
+        }
+        for (int end = n - 1; end > 0; end--) {
+            swap(list, lo, lo + end);
+            siftDownByBaseSeq(list, lo, 0, end);
+        }
+    }
+
+    private static void siftDownByBaseSeq(ObjList<MmapSegment> list, int lo, int root, int heapSize) {
+        while (true) {
+            int child = (root << 1) + 1;
+            if (child >= heapSize) {
+                return;
+            }
+            // At most two unsigned compares per level (sibling pick + parent
+            // test); bump the counter by the constant 2 up front -- same
+            // cheap-upper-bound convention as the partition pass.
+            sortComparisons += 2;
+            if (child + 1 < heapSize
+                    && Long.compareUnsigned(list.get(lo + child).baseSeq(),
+                    list.get(lo + child + 1).baseSeq()) < 0) {
+                child++;
+            }
+            if (Long.compareUnsigned(list.get(lo + root).baseSeq(),
+                    list.get(lo + child).baseSeq()) >= 0) {
+                return;
+            }
+            swap(list, lo + root, lo + child);
+            root = child;
         }
     }
 
