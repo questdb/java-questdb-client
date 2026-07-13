@@ -608,6 +608,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 LOG.warn("symbol dict {} could not drop its torn/stale tail (truncate failed); recreating", filePath);
                 if (entriesAddr != 0L) {
                     Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                    // Null after freeing (like buf above) so the catch below cannot
+                    // double-free entriesAddr if the following ff.close throws.
+                    entriesAddr = 0L;
+                    entriesLen = 0;
                 }
                 ff.close(fd);
                 return null;
@@ -617,10 +621,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (buf != 0L) {
                 Unsafe.free(buf, (int) fileLen, MemoryTag.NATIVE_DEFAULT);
             }
-            // entriesAddr is transferred to the returned dict on the success path,
-            // and the catch only runs before that return, so freeing it here cannot
-            // double-free. Unreachable today (nothing between its malloc and the
-            // return throws), but keeps the error path leak-free against a future edit.
+            // Free entriesAddr if it was allocated and not yet handed off. The success
+            // path transfers it to the returned dict, and every path that frees it
+            // earlier (the truncate-failure branch above) also nulls it, so this cannot
+            // double-free. Keeps the error path leak-free on any throw between its
+            // malloc and the return.
             if (entriesAddr != 0L) {
                 Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
             }
