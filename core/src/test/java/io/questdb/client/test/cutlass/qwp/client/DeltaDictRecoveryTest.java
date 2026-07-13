@@ -171,19 +171,21 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Simulate a host/power crash: the segment frames survive but the persisted
-            // dictionary is lost, and the ack watermark was left mid-stream. Truncate
-            // .symbol-dict to its 8-byte header (0 symbols) and stamp the watermark at
-            // FSN 2, so recovery replays from FSN 3 -- a frame with deltaStart=3.
+            // Simulate a host/power crash: the segment frames survive but the WHOLE
+            // persisted dictionary is lost (truncate .symbol-dict to its 8-byte header,
+            // 0 symbols), and the ack watermark was left mid-stream (FSN 2). The
+            // surviving frames still reference the lost ids.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
             byte[] header = Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8);
             java.nio.file.Files.write(dict, header);
             writeAckWatermark(slot.resolve(".ack-watermark"), 2);
 
-            // Phase 2: recover against a fresh counting server. The replay guard must
-            // fire (frame deltaStart 3 > recovered dictionary size 0) and fail terminally
-            // rather than send a gapped frame that would corrupt the table.
+            // Phase 2: recover against a fresh counting server. With the whole
+            // dictionary lost (size 0) while the surviving frames still reference its
+            // ids, seedGlobalDictionaryFromPersisted must refuse the resume at BUILD --
+            // its size==0 short-circuit must NOT skip the torn-dict guard -- rather than
+            // let the producer resume unseeded and silently misattribute reused ids.
             CountingHandler handler = new CountingHandler();
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
@@ -192,47 +194,34 @@ public class DeltaDictRecoveryTest {
 
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
                 LineSenderException terminal = null;
-                Sender s2 = Sender.fromConfig(cfg);
                 try {
-                    // Poll for the replay guard to fire (it recordFatal's on the I/O
-                    // thread); flush() surfaces the latched terminal to the producer.
-                    // A bounded poll replaces a fixed sleep and captures it as soon as
-                    // it fires; close() below is the fallback if it surfaces only there.
-                    long deadline = System.currentTimeMillis() + 10_000;
-                    while (System.currentTimeMillis() < deadline && terminal == null) {
-                        try {
-                            s2.flush();
-                            Thread.sleep(20);
-                        } catch (LineSenderException e) {
-                            terminal = e;
-                        }
-                    }
-                } finally {
-                    try {
-                        s2.close();
-                    } catch (LineSenderException e) {
-                        if (terminal == null) {
-                            terminal = e;
-                        }
-                    }
+                    Sender s2 = Sender.fromConfig(cfg);
+                    s2.close();
+                } catch (LineSenderException e) {
+                    terminal = e;
                 }
                 Assert.assertEquals("no frame may be replayed to a fresh server with a torn dictionary",
                         0, handler.frames.get());
                 Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
                 Assert.assertTrue(terminal.getMessage(),
-                        terminal.getMessage().contains("symbol dictionary is incomplete"));
+                        terminal.getMessage().contains("subset of the surviving frames")
+                                && terminal.getMessage().contains("resend"));
             }
         });
     }
 
     @Test
     public void testTornDictionaryOneIdGapFailsCleanly() throws Exception {
-        // Boundary variant of testTornDictionaryFailsCleanlyInsteadOfCorrupting: the
-        // recovered dictionary is short by EXACTLY ONE id -- the tightest gap the
-        // guard must still reject (deltaStart == recoveredSize + 1). A one-entry-short
-        // tail is the common host-crash outcome, so this pins the guard's
-        // false-negative edge: a "deltaStart > size + 1" mutation would let this
-        // single-id gap through and null-pad the missing symbol on the server.
+        // One-id-gap boundary variant of
+        // testUnopenablePersistedDictStillGuardsAgainstReplayingDeltaFrames: the first
+        // replayed frame starts EXACTLY ONE id past the empty mirror -- the tightest
+        // gap the I/O-thread replay guard must still reject (deltaStart ==
+        // sentDictCount + 1). It reaches that guard via the unopenable-dictionary path
+        // (deltaDictEnabled=false), NOT a size-0 openable dict, which now fails clean
+        // earlier in seedGlobalDictionaryFromPersisted. A one-entry-short tail is the
+        // common host-crash outcome, so this pins the guard's false-negative edge: a
+        // "deltaStart > size + 1" mutation would let this single-id gap through and
+        // null-pad the missing symbol on the server.
         assertMemoryLeak(() -> {
             // Phase 1: each row introduces a new symbol (frame i carries deltaStart=i).
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
@@ -249,15 +238,17 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Lose the whole dictionary (truncate to the 8-byte header, size 0) but
-            // stamp the watermark at FSN 0, so recovery replays from FSN 1 -- a frame
-            // with deltaStart=1. The dictionary covers no ids, so id 0 is the single
-            // missing entry: deltaStart(1) == recoveredSize(0) + 1. Because size is 0
-            // no catch-up is sent, so any counted frame would be the gapped data frame.
+            // Make the persisted dictionary UNOPENABLE (replace .symbol-dict with a
+            // directory, so both openRW and openCleanRW fail and the engine reports
+            // deltaDictEnabled=false), then stamp the watermark at FSN 0 so recovery
+            // replays from FSN 1 -- a frame with deltaStart=1. The mirror is unseeded
+            // (size 0), so id 0 is the single missing entry: deltaStart(1) ==
+            // sentDictCount(0) + 1. No catch-up is sent, so any counted frame would be
+            // the gapped data frame.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
-            byte[] header = Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8);
-            java.nio.file.Files.write(dict, header);
+            java.nio.file.Files.delete(dict);
+            java.nio.file.Files.createDirectory(dict);
             writeAckWatermark(slot.resolve(".ack-watermark"), 0);
 
             // Phase 2: recover against a fresh counting server. The guard must fire on
@@ -828,6 +819,75 @@ public class DeltaDictRecoveryTest {
                     Sender resumed = Sender.fromConfig(cfg);
                     resumed.close();
                     Assert.fail("resume on a torn (subset) dictionary must fail clean");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue("message must name the torn-dict/resend failure: " + expected.getMessage(),
+                            expected.getMessage().contains("subset of the surviving frames")
+                                    && expected.getMessage().contains("resend"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTornDictTotalLossFailsCleanOnResume() throws Exception {
+        // C1 regression (TOTAL-loss variant of testTornDictSubsetFailsCleanOnResume):
+        // a host crash can lose the ENTIRE persisted .symbol-dict (size 0) while the
+        // frames that introduced its ids survive; equivalently, a prior session whose
+        // openClean failed ran full-dict mode and never wrote the side-file, so this
+        // session recovers those frames against a FRESH EMPTY dictionary. The recovered
+        // frames start at deltaStart=0 and self-heal the I/O-thread catch-up mirror, so
+        // the send loop's replay guard (deltaStart > mirror) never fires -- only
+        // seedGlobalDictionaryFromPersisted can catch it. Its pd.size()==0 early return
+        // must NOT skip the torn-dict guard: the surviving frames reference id 2 while
+        // the recovered dictionary holds 0 id(s), so resuming unseeded would reuse those
+        // ids and silently misattribute symbol values on the wire. Without the fix the
+        // build below does NOT throw (the guard is bypassed) and the test's fail() fires.
+        assertMemoryLeak(() -> {
+            // Phase 1: record three delta frames (a@0, b@1, c@2) with nothing acked, so
+            // all three survive and replay -- from FSN 0 (deltaStart=0), the case the
+            // I/O-thread guard self-heals rather than rejects.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Total dictionary loss: openClean truncates .symbol-dict to its bare header
+            // (size 0) with zero appends, while every frame -- including the ones
+            // referencing a@0,b@1,c@2 -- stays on disk. This is the fresh-empty-dict
+            // state a full-dict-mode prior session or a total host-crash tear leaves.
+            String slotDir = Paths.get(sfDir, "default").toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                Assert.assertEquals(0, torn.size());
+            }
+
+            // Phase 2: a resuming sender must refuse at build -- the surviving frames
+            // reference id 2 but the recovered dictionary holds 0 id(s). The I/O-thread
+            // guard cannot help (deltaStart 0 self-heals the mirror), so the seed-time
+            // guard is the sole defense.
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try {
+                    Sender resumed = Sender.fromConfig(cfg);
+                    resumed.close();
+                    Assert.fail("resume on a totally lost (size 0) dictionary must fail clean");
                 } catch (LineSenderException expected) {
                     Assert.assertTrue("message must name the torn-dict/resend failure: " + expected.getMessage(),
                             expected.getMessage().contains("subset of the surviving frames")

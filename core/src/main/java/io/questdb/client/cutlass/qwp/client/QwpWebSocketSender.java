@@ -3882,9 +3882,18 @@ public class QwpWebSocketSender implements Sender {
      * write-ahead ordering keeps the dictionary a superset of the frames.
      */
     private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {
-        if (pd == null || pd.size() == 0) {
+        if (pd == null) {
             return;
         }
+        // Run the torn-dictionary guard BEFORE the empty-dictionary short-circuit
+        // below: a TOTAL tear (pd.size() == 0) with surviving symbol-bearing frames
+        // must fail clean too, not slip through. Such a frame starts at deltaStart=0
+        // and self-heals the I/O-thread catch-up mirror, so the send loop's replay
+        // guard (deltaStart > sentDictCount) never fires -- this seed-time guard is
+        // then the only defense against the producer resuming unseeded and silently
+        // reusing ids the frames already define. A genuinely empty slot (no
+        // symbol-bearing frames) has recoveredMaxSymbolId() == -1, so -1 >= 0 is false
+        // and the pd.size() == 0 return below still fires.
         if (cursorEngine != null && cursorEngine.recoveredMaxSymbolId() >= pd.size()) {
             throw new LineSenderException(
                     "recovered store-and-forward symbol dictionary is a subset of the surviving frames "
@@ -3892,6 +3901,9 @@ public class QwpWebSocketSender implements Sender {
                             + cursorEngine.recoveredMaxSymbolId() + " but the recovered dictionary holds only "
                             + pd.size() + " id(s); resuming would reuse ids the frames already define -- "
                             + "resend the affected data");
+        }
+        if (pd.size() == 0) {
+            return;
         }
         ObjList<String> symbols = pd.readLoadedSymbols();
         for (int i = 0, n = symbols.size(); i < n; i++) {
