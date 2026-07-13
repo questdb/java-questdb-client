@@ -212,7 +212,10 @@ public final class IngressBench {
     /**
      * One e2e pass over all senders. senders == 1 runs inline (no executor
      * hop in the timed region); otherwise each sender's range runs on the
-     * shared pool and Future.get() rethrows the first worker failure.
+     * shared pool. The completion loop awaits EVERY worker before returning
+     * or throwing — no sender is still mid-flush when the caller's finally
+     * closes the pool — then rethrows the first failure with any others
+     * attached as suppressed exceptions.
      */
     private static void multiPass(ExecutorService exec, Sender[] pool, long[][] ranges,
                                   BenchSchema.Kind kind, int symCard, int hiCard,
@@ -229,8 +232,20 @@ public final class IngressBench {
                 return null;
             }));
         }
+        Exception first = null;
         for (Future<?> f : futures) {
-            f.get();
+            try {
+                f.get();
+            } catch (Exception e) {
+                if (first == null) {
+                    first = e;
+                } else {
+                    first.addSuppressed(e);
+                }
+            }
+        }
+        if (first != null) {
+            throw first;
         }
     }
 
