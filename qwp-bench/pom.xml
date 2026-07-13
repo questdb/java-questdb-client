@@ -35,6 +35,13 @@
     <finalName>qwp-bench-java</finalName>
     <plugins>
       <plugin>
+        <!-- Pin the compiler plugin: Maven 3.8.x's lifecycle default (3.1)
+             ignores maven.compiler.release and compiles at source/target 5. -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
