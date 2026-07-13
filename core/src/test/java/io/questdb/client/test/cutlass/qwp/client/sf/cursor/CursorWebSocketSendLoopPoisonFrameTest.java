@@ -697,6 +697,48 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     @Test
+    public void testPostSendCatchUpNackAtAckedFsnBoundaryDoesNotStrike() throws Exception {
+        // Boundary companion to testPostSendCatchUpNackDoesNotStrikeOrLaunderPoisonState:
+        // the COMMON single-frame catch-up maps its only catch-up frame to
+        // fsn == ackedFsn EXACTLY (the last catch-up frame lands on replayStart-1 ==
+        // ackedFsn). The pre-send routing guard is "fsn <= ackedFsn", so this equality
+        // case must also skip the poison strike. Without pinning it a "<=" -> "<"
+        // mutation would slip the single/last catch-up frame's NACK onto the post-send
+        // poison-strike path and launder the detector -- exactly the hazard the guard
+        // closes -- yet the strictly-below test above would still pass.
+        TestUtils.assertMemoryLeak(() -> {
+            List<WebSocketClient> clients = new ArrayList<>();
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 2);
+                CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
+                // 1 catch-up frame (wire seq 0) + 1 data frame (wire seq 1), nothing
+                // acked (ackedFsn = -1), so fsnAtZero = replayStart(0) - catchUpFrames(1)
+                // = -1. A NACK of catch-up wire seq 0 maps to fsn -1 == ackedFsn exactly.
+                setPostCatchUpDataFrameBaseline(loop, -1L, 2L);
+                assertEquals("precondition: no strikes yet",
+                        0L, getLongField(loop, "poisonStrikes"));
+
+                deliverRetriableNack(loop, 0, "disk full");
+
+                // poisonStrikes -- NOT poisonFsn -- is the discriminator at this exact
+                // boundary: a wrongly-charged strike calls recordHeadRejectionStrike(-1),
+                // which sets poisonFsn to the rejected fsn -1 -- the "no suspect"
+                // sentinel -- so a poisonFsn check cannot see the laundering here. It
+                // still bumps poisonStrikes 0 -> 1, so the correct pre-send routing (no
+                // strike) shows as poisonStrikes staying 0. A "<=" -> "<" mutation of the
+                // fsn-vs-ackedFsn guard charges the strike and fails this.
+                assertEquals("catch-up NACK at fsn == ackedFsn must not charge a poison strike",
+                        0L, getLongField(loop, "poisonStrikes"));
+                assertEquals("... and must leave the poison sentinel intact",
+                        -1L, getLongField(loop, "poisonFsn"));
+                loop.checkError();
+            } finally {
+                closeAll(clients);
+            }
+        });
+    }
+
+    @Test
     public void testPostSendNotWritableNackNeverEscalatesToPoisonTerminal() throws Exception {
         // RETRIABLE_OTHER (NOT_WRITABLE) is a node-state verdict, not a frame
         // verdict: an all-replica window answers it on every rotated endpoint
