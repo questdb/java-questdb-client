@@ -10,6 +10,28 @@ class BenchJsonTest {
         assertEquals("1", BenchJson.f64(1.0));
         assertEquals("0.516397779494", BenchJson.f64(0.5163977794943222));
     }
+    @Test void f64RoundsExactlyLikeCPrintf() {
+        // String.format("%.12f") is not correctly rounded in rare cases; C printf is.
+        // Reviewer counterexample: the exact binary value rounds to ...709, not ...710.
+        assertEquals("4287.413072708709", BenchJson.f64(4287.4130727087095));
+        // C printf preserves the sign when a negative value rounds to zero -> "-0".
+        assertEquals("-0", BenchJson.f64(-1e-13));
+    }
+    @Test void mibPerSBranchesLikeCPathSummary() {
+        long[] wall = {2_000_000_000L};
+        long[] cpu = {1_000_000_000L};
+        long[] gc = {0};
+        // Floor phase: mib_per_s is JSON null regardless of wireBytes (C passes NULL rate ptr).
+        String floor = BenchJson.pathSummary(wall, cpu, gc, 1, 10, 5, 2097152L, "floor", true).render();
+        assertTrue(floor.contains("\"mib_per_s\":null"), floor);
+        // E2e phase with wireBytes == 0: literal 0, not null (C passes a valid ptr to a 0 value).
+        String e2e = BenchJson.pathSummary(wall, cpu, gc, 1, 10, 5, 0, "e2e", true).render();
+        assertTrue(e2e.contains("\"mib_per_s\":0,"), e2e);
+        assertFalse(e2e.contains("\"mib_per_s\":null"), e2e);
+        // E2e phase with wireBytes > 0: computed rate (2 MiB over 2 s -> 1 MiB/s).
+        String e2eRate = BenchJson.pathSummary(wall, cpu, gc, 1, 10, 5, 2097152L, "e2e", true).render();
+        assertTrue(e2eRate.contains("\"mib_per_s\":1,"), e2eRate);
+    }
     @Test void sortedKeysAndEscapes() {
         BenchJson.Obj o = new BenchJson.Obj();
         o.put("b", 1L);

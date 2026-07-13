@@ -66,12 +66,25 @@ public final class BenchJson {
      * {@code %.12f}, trailing zeros trimmed, then a trailing '.' trimmed.
      * Mirrors json_f64() in bench_json_c.c, including its "-0" -> "-0" quirk
      * (only an empty string or a lone "-" collapses to "0").
+     *
+     * <p>Rendering goes through BigDecimal on the exact binary value with
+     * round-half-even rather than {@code String.format("%.12f")}: the latter is
+     * not correctly rounded in rare cases (e.g. 4287.4130727087095 formats as
+     * ...710 instead of C printf's correct ...709), while BigDecimal HALF_EVEN
+     * matches printf's round-to-nearest semantics on the exact decimal
+     * expansion. BigDecimal has no negative zero, so the sign of negative
+     * values that round to zero is restored explicitly (C printf keeps it).
      */
     public static String f64(double v) {
         if (!Double.isFinite(v)) {
             return "null";
         }
-        String s = String.format(Locale.ROOT, "%.12f", v);
+        java.math.BigDecimal bd = new java.math.BigDecimal(v)
+                .setScale(12, java.math.RoundingMode.HALF_EVEN);
+        String s = bd.toPlainString();
+        if (bd.signum() == 0 && Math.copySign(1.0, v) < 0) {
+            s = "-" + s;
+        }
         int dot = s.indexOf('.');
         if (dot >= 0) {
             int end = s.length() - 1;
@@ -163,11 +176,11 @@ public final class BenchJson {
                 : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
     }
 
-    private static double percentile(double[] sorted, int n, float p) {
+    private static double percentile(double[] sorted, int n, double p) {
         if (n == 0) {
             return 0.0;
         }
-        int idx = Math.round((n - 1) * p);
+        int idx = (int) Math.round((n - 1) * p);
         if (idx > n - 1) {
             idx = n - 1;
         }
@@ -211,7 +224,7 @@ public final class BenchJson {
         obj.put("mean_s", mean);
         obj.put("min_s", n > 0 ? sorted[0] : 0.0);
         obj.put("max_s", n > 0 ? sorted[n - 1] : 0.0);
-        obj.put("p95_s", percentile(sorted, n, 0.95f));
+        obj.put("p95_s", percentile(sorted, n, 0.95));
         obj.put("stdev_s", stdev);
         obj.put("cov", mean != 0.0 ? stdev / mean : 0.0);
         if (median != 0.0) {
