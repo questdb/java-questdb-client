@@ -322,6 +322,63 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testSuccessfulCatchUpResetsCapGapBudget() throws Exception {
+        // The cap-gap settle budget (catchUpCapGapAttempts) counts CONSECUTIVE cap
+        // gaps across reconnects; a successful catch-up ends the episode and MUST reset
+        // it to 0 (sendDictCatchUp's final line). Otherwise cap gaps interspersed with
+        // successful catch-ups -- a rolling-cap cluster where a larger-cap node comes
+        // and goes -- would accumulate to a spurious terminal over a long-lived sender.
+        // testCatchUpCapGapRetriesUntilBudgetThenLatches only accrues gaps under one
+        // fixed cap with no success interleaved, so it cannot pin the reset.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160); // too small for a 200-char symbol
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    // Accrue max-1 consecutive cap gaps (each retriable, no terminal).
+                    for (int i = 1; i < maxAttempts; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                    }
+                    assertEquals("precondition: budget accrued to max-1",
+                            maxAttempts - 1, readInt(loop, "catchUpCapGapAttempts"));
+
+                    // A larger-cap node returns: the whole dictionary re-registers with
+                    // no cap gap, so the settle budget must reset to 0.
+                    client.cap = 0; // no cap => the 200-char symbol fits one frame
+                    invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                    assertEquals("a successful catch-up must reset the cap-gap settle budget",
+                            0, readInt(loop, "catchUpCapGapAttempts"));
+
+                    // Behavioural proof the budget is genuinely fresh: max-1 more cap
+                    // gaps still latch NO terminal (they would if the counter had stayed
+                    // at max-1 -- one more gap would have hit the cap and killed the sender).
+                    client.cap = 160;
+                    for (int i = 1; i < maxAttempts; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("post-reset cap gap must be retriable (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                        loop.checkError(); // fresh budget => still under max => no terminal
+                    }
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testMirrorOverflowFailsLoud() throws Exception {
         // ensureSentDictCapacity must latch a terminal -- not silently overflow the
         // int capacity math into a heap-corrupting copyMemory -- when the sent-dict
@@ -539,7 +596,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     // when throwOnSend is set -- raises a transient wire error to model the fresh
     // connection dropping mid-catch-up.
     private static final class CatchUpCapturingClient extends WebSocketClient {
-        private final int cap;
+        // Mutable so a test can model a rolling-cap cluster: raise it for a node that
+        // accepts the dictionary, lower it for a smaller-cap node that cap-gaps.
+        private int cap;
         private final boolean throwOnSend;
         private int framesSent;
 
