@@ -1285,6 +1285,74 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testTableBodyEncodingIsContextFree() throws Exception {
+        // The split-flush path (QwpWebSocketSender.flushPendingRowsSplit) sizes each
+        // per-table frame ARITHMETICALLY from splitFrameBodyBytes -- the body byte
+        // count captured during the COMBINED encode in flushPendingRows -- instead of
+        // re-encoding to measure. That is sound only while a table's body bytes are
+        // context-free: identical whether the table is encoded solo or as the k-th
+        // table after other tables and the delta section. Today every column encoder
+        // is stateless and symbol cells carry absolute global ids, so the property
+        // holds; this pins it so a future column encoder that ever carried
+        // cross-table state (which would break the arithmetic sizing and could strand
+        // a deferred prefix mid-split) fails loudly here rather than silently in
+        // production.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer t0 = new QwpTableBuffer("alpha");
+                 QwpTableBuffer t1 = new QwpTableBuffer("bravo");
+                 QwpTableBuffer t2 = new QwpTableBuffer("charlie")) {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                int aapl = dict.getOrAddSymbol("AAPL"); // 0
+                int goog = dict.getOrAddSymbol("GOOG"); // 1
+                int msft = dict.getOrAddSymbol("MSFT"); // 2
+
+                // Distinct schemas + a symbol column (absolute global ids) so a
+                // positional / cross-table encoder bug would shift the body bytes.
+                t0.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbolWithGlobalId("AAPL", aapl);
+                t0.getOrCreateColumn("v", TYPE_LONG, false).addLong(1L);
+                t0.nextRow();
+
+                t1.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbolWithGlobalId("GOOG", goog);
+                t1.getOrCreateColumn("d", TYPE_DOUBLE, false).addDouble(2.5);
+                t1.getOrCreateColumn("s", TYPE_VARCHAR, true).addString("hello");
+                t1.nextRow();
+
+                t2.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbolWithGlobalId("MSFT", msft);
+                t2.getOrCreateDesignatedTimestampColumn(TYPE_TIMESTAMP).addLong(1_000_000L);
+                t2.nextRow();
+
+                QwpTableBuffer[] tables = {t0, t1, t2};
+                int confirmedMaxId = -1;
+                int batchMaxId = 2;
+
+                // Combined encode: capture each table's body bytes exactly as
+                // flushPendingRows' splitFrameBodyBytes does (position delta per addTable).
+                int[] combinedBody = new int[tables.length];
+                encoder.beginMessage(tables.length, dict, confirmedMaxId, batchMaxId);
+                int bodyStart = encoder.getBuffer().getPosition();
+                for (int i = 0; i < tables.length; i++) {
+                    encoder.addTable(tables[i]);
+                    int bodyEnd = encoder.getBuffer().getPosition();
+                    combinedBody[i] = bodyEnd - bodyStart;
+                    bodyStart = bodyEnd;
+                }
+
+                // Solo encode each table under the SAME baseline/batch max, as the
+                // split publish loop does, and assert the body bytes match the capture.
+                for (int i = 0; i < tables.length; i++) {
+                    encoder.beginMessage(1, dict, confirmedMaxId, batchMaxId);
+                    int soloBodyStart = encoder.getBuffer().getPosition();
+                    encoder.addTable(tables[i]);
+                    int soloBody = encoder.getBuffer().getPosition() - soloBodyStart;
+                    Assert.assertEquals("table " + i + " body must encode identically solo vs combined "
+                            + "(splitFrameBodyBytes relies on a context-free body)", combinedBody[i], soloBody);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testVersionByteInHeader() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();

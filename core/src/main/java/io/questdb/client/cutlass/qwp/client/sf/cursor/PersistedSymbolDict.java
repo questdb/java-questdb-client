@@ -532,7 +532,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 LOG.warn("symbol dict {} unreadable, bad magic or unknown version; recreating", filePath);
                 Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
                 buf = 0L; // null after free so the catch below cannot double-free if ff.close throws
-                ff.close(fd);
+                int fdToClose = fd;
+                fd = -1; // relinquish before close so the catch cannot double-close if close throws
+                ff.close(fdToClose);
                 return null;
             }
             // Parse complete, CRC-valid entries after the header; stop at the first
@@ -622,7 +624,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     entriesAddr = 0L;
                     entriesLen = 0;
                 }
-                ff.close(fd);
+                int fdToClose = fd;
+                fd = -1; // relinquish before close so the catch cannot double-close if close throws
+                ff.close(fdToClose);
                 return null;
             }
             return new PersistedSymbolDict(ff, fd, validLen, count, entriesAddr, entriesLen);
@@ -638,7 +642,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (entriesAddr != 0L) {
                 Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
             }
-            ff.close(fd);
+            if (fd >= 0) { // a branch that already closed fd relinquished it to -1
+                ff.close(fd);
+            }
             LOG.warn("symbol dict {} recovery failed ({}); recreating", filePath, String.valueOf(t));
             return null;
         }
@@ -660,7 +666,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putByte(hdr + 7, (byte) 0);
             long written = ff.write(fd, hdr, HEADER_SIZE, 0);
             if (written != HEADER_SIZE) {
-                ff.close(fd);
+                int fdToClose = fd;
+                fd = -1; // relinquish before close so the catch cannot double-close if close throws
+                ff.close(fdToClose);
                 ff.remove(filePath);
                 LOG.warn("symbol dict {} header write failed; proceeding without it", filePath);
                 return null;
@@ -670,7 +678,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // throwing; the Unsafe puts target a valid 8-byte buffer and an 8-byte
             // malloc cannot realistically OOM), but close the fd against a future
             // edit so it cannot leak -- mirroring openExisting's error handling.
-            ff.close(fd);
+            if (fd >= 0) { // the header-write branch relinquished fd to -1 before closing
+                ff.close(fd);
+            }
             LOG.warn("symbol dict {} creation failed ({}); proceeding without it", filePath, String.valueOf(t));
             return null;
         } finally {

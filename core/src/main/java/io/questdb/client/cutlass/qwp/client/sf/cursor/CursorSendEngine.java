@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
@@ -307,10 +308,10 @@ public final class CursorSendEngine implements QuietCloseable {
                 // commit would resurrect half a transaction -- see the WARN
                 // below. Computed before the I/O loop or producer append.
                 this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE
+                        QwpConstants.HEADER_OFFSET_FLAGS,
+                        QwpConstants.FLAG_DEFER_COMMIT,
+                        QwpConstants.MAGIC_MESSAGE,
+                        QwpConstants.HEADER_SIZE
                 );
                 if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
                     this.recoveredOrphanTipFsn = publishedFsn;
@@ -332,10 +333,10 @@ public final class CursorSendEngine implements QuietCloseable {
                 // returns 0 when no such frame carries a symbol, yielding -1 here.
                 // Computed before the I/O loop or producer append; single-threaded.
                 this.recoveredMaxSymbolId = recovered.maxSymbolDeltaEnd(
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DELTA_SYMBOL_DICT,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE,
+                        QwpConstants.MAGIC_MESSAGE,
+                        QwpConstants.HEADER_OFFSET_FLAGS,
+                        QwpConstants.FLAG_DELTA_SYMBOL_DICT,
+                        QwpConstants.HEADER_SIZE,
                         recoveredCommitBoundaryFsn) - 1L;
             } else {
                 // Fresh start with no recovered segments. Any stale
