@@ -523,9 +523,16 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) that
-     * any symbol-dict delta frame in this segment references, or {@code 0} when no
-     * such frame carries a symbol. Read-only walk over the recovered frames, used
+     * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) any
+     * delta-flagged frame in this segment carries, or {@code 0} only when NO
+     * delta-flagged frame is present. A frame with {@code deltaCount == 0} (a commit
+     * or a symbol-reusing frame -- the encoder always sets the delta flag) still
+     * contributes its {@code deltaStart}, i.e. the producer's baseline at encode
+     * time, NOT 0. That is deliberate: it anchors the torn-dict guard at that
+     * baseline so a dictionary torn below it is detected -- a conservative
+     * over-strand (it may over-reject a frame whose rows reference only surviving
+     * ids), never an under-strand that could silently shift the dense id map.
+     * Read-only walk over the recovered frames, used
      * once at recovery to detect a persisted {@code .symbol-dict} torn (host crash,
      * out-of-order page loss) below the ids the surviving frames still reference: if
      * the max here reaches at or beyond the recovered dictionary size, a resuming

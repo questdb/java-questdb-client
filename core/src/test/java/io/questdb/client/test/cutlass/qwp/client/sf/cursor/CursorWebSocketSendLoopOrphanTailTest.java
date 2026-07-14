@@ -253,6 +253,53 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    @Test
+    public void testZeroCountDeltaFrameAnchorsRecoveredMaxSymbolIdAtItsBaseline() throws Exception {
+        // A committed delta frame that introduces NO new symbol (deltaCount == 0 -- a
+        // commit frame, or one whose rows only re-use existing ids) still carries
+        // deltaStart == the producer's baseline at encode time, because beginMessage
+        // ALWAYS sets FLAG_DELTA_SYMBOL_DICT. maxSymbolDeltaEnd counts it as
+        // deltaStart + deltaCount == deltaStart (NOT 0), so recoveredMaxSymbolId ==
+        // deltaStart - 1 even though the frame introduces nothing.
+        //
+        // This is the mechanism behind the torn-dict guard's deliberate CONSERVATIVE
+        // over-strand (see seedGlobalDictionaryFromPersisted): if a host crash tears
+        // the persisted dictionary below such a frame's baseline while its
+        // symbol-introducing predecessors were already acked and trimmed, both the
+        // seed-time guard (recoveredMaxSymbolId >= pd.size()) and the drainer's replay
+        // guard (deltaStart > sentDictCount) fire and quarantine the slot -- fail-clean
+        // "resend required" -- even though the frame's rows may reference only ids the
+        // truncated dictionary still holds.
+        //
+        // Counting the zero-count frame's baseline is load-bearing SAFETY: a "fix" that
+        // skipped zero-count frames (returning 0 for them) would UNDER-strand and let a
+        // genuinely torn dictionary through, silently shifting the dense id map. This
+        // pins that a zero-count delta frame is anchored at its baseline, not skipped.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                // fsn 0: commit-bearing delta frame that genuinely registers ids 0..4.
+                appendDeltaFrame(engine, false, 0, 5);
+                // fsn 1: commit-bearing delta frame with deltaStart 10, deltaCount 0 --
+                // introduces NOTHING, but its baseline (10) sits ABOVE every id any
+                // surviving frame actually introduces (max 4). Models a commit /
+                // symbol-reusing frame emitted after ids 5..9 were registered by
+                // predecessor frames that have since been acked and trimmed away.
+                appendDeltaFrame(engine, false, 10, 0);
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                assertTrue(engine.wasRecoveredFromDisk());
+                assertEquals("both frames are commit-bearing", 1L, engine.recoveredCommitBoundaryFsn());
+                // The zero-count frame drives recoveredMaxSymbolId to 9 (its baseline
+                // 10, minus 1), NOT to 4 (the highest id any surviving frame actually
+                // introduces) and NOT to 0 (which skipping it would yield). This
+                // inflation is exactly what makes seedGlobalDictionaryFromPersisted
+                // over-reject a dictionary holding ids 0..4 (size 5).
+                assertEquals("a zero-count delta frame anchors recoveredMaxSymbolId at its baseline-1",
+                        9L, engine.recoveredMaxSymbolId());
+            }
+        });
+    }
+
     // ---------------------------------------------------------------------
     // harness
     // ---------------------------------------------------------------------

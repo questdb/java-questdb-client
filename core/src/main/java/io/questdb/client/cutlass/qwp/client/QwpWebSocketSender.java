@@ -3876,9 +3876,23 @@ public class QwpWebSocketSender implements Sender {
      * mirror, leaving only this producer diverged. Detect it here -- the surviving
      * frames reference an id at or beyond the recovered dictionary size -- and fail
      * clean: the affected data must be resent, matching the design's torn-dict
-     * "resend required" contract. The recovered data is not lost; the background
-     * drainer still drains this slot (its mirror self-heals from the frames). Only a
-     * host crash reaches this -- a process crash keeps the page cache, so the
+     * "resend required" contract.
+     * <p>
+     * The background drainer self-heals the mirror ONLY when a surviving frame
+     * STRADDLES the tear ({@code deltaStart <= pd.size() < deltaStart + deltaCount}):
+     * such a frame carries the torn-off ids in its own delta and
+     * {@code accumulateSentDict} re-registers them, so the drainer drains the slot.
+     * But when the symbol-introducing frames were already acked and trimmed and only
+     * a HIGHER-baseline frame survives ({@code deltaStart > pd.size()} -- e.g. a
+     * commit or a symbol-reusing frame, since {@code beginMessage} always sets the
+     * delta flag), the drainer's own replay guard ({@code deltaStart > sentDictCount})
+     * fires too and quarantines the slot: the recorded bytes are not silently lost,
+     * but the slot is NOT auto-drained -- it must be resent. That is a deliberate
+     * CONSERVATIVE over-strand -- the guard keys on {@code deltaStart}, not on the
+     * frame's actual highest referenced id, to avoid parsing row data at recovery,
+     * so it may reject a frame whose rows reference only ids the truncated
+     * dictionary still holds. It fails clean rather than risk a silent id shift.
+     * Only a host crash reaches this -- a process crash keeps the page cache, so the
      * write-ahead ordering keeps the dictionary a superset of the frames.
      */
     private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {

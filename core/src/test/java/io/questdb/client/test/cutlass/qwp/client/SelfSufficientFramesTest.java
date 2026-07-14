@@ -381,6 +381,75 @@ public class SelfSufficientFramesTest {
         }
     }
 
+    @Test
+    public void testSplitPreflightAdvancesBaselineSoLaterFramesArentSizedWithTheDelta() throws Exception {
+        // Regression for the split pre-flight baseline advance in flushPendingRowsSplit
+        // (the "Mirror advanceSentMaxSymbolId" step). Only the FIRST split frame ships
+        // the batch's symbol-dict delta; the rest ship an EMPTY delta and reference ids
+        // the first frame already registered. The pre-flight size pass must advance
+        // simBaseline after the first table so it STOPS adding combinedDeltaEntriesLen
+        // to the later frames' estimated sizes. Without that advance, a later table
+        // whose real (empty-delta) frame fits the cap is mis-estimated as still carrying
+        // the whole delta and wrongly rejected with "single table batch too large" --
+        // discarding a legitimately shippable batch (fail-closed data loss).
+        //
+        // Shape (memory mode, delta enabled): a LARGE combined delta (two ~64-char
+        // symbols) rides only the first split frame. The first table (added first, so
+        // the first split frame) has a tiny body, so delta + body1 fits the cap. The
+        // second table has a big body: body2 alone fits the cap, but delta + body2 does
+        // NOT. The real code splits and ships both frames; the un-advanced pre-flight
+        // would size the second frame WITH the delta and throw. Table order is
+        // insertion order (CharSequenceObjHashMap.keys()), so t1 is the delta frame.
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(200);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Two long symbols => a large combined delta section (~130 bytes) that
+                // rides ONLY the first split frame. The symbol STRINGS live in the delta,
+                // not in either table body (the body carries only the varint global id).
+                String longSymA = new String(new char[64]).replace('\0', 'a');
+                String longSymB = new String(new char[64]).replace('\0', 'b');
+                String bigPad = new String(new char[100]).replace('\0', 'x');
+                // auto_flush off so both rows batch into one flush (byte-based auto-flush
+                // is otherwise clamped under the cap and would flush before the split).
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
+                    // t1 (added first -> first split frame): carries the whole delta but a
+                    // tiny body, so delta + body1 fits the 200-byte cap.
+                    sender.table("t1").symbol("s", longSymA).longColumn("v", 1L).atNow();
+                    // t2 (second split frame): empty delta but a big body. body2 alone
+                    // fits the cap; delta + body2 does NOT -- the mis-size the advance
+                    // prevents.
+                    sender.table("t2").symbol("s", longSymB).stringColumn("p", bigPad).longColumn("v", 2L).atNow();
+                    // Must NOT throw: with the baseline advanced, t2's frame is sized
+                    // WITHOUT the delta and fits. A broken advance throws "too large" here.
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
+                }
+
+                Assert.assertEquals("the batch must split into 2 frames, neither spuriously rejected",
+                        2, handler.batches.size());
+                byte[] f1 = handler.batches.get(0);
+                byte[] f2 = handler.batches.get(1);
+                // First split frame ships the whole delta (both new symbols, ids 0 and 1).
+                Assert.assertEquals("first split frame deltaStart must be 0",
+                        0, readVarint(f1, DELTA_START_OFFSET));
+                Assert.assertEquals("first split frame ships both new symbols",
+                        2, readVarint(f1, DELTA_START_OFFSET + 1));
+                // Second split frame carries an EMPTY delta above the advanced baseline --
+                // the whole point: it is not re-sized (or re-sent) with the delta.
+                Assert.assertEquals("second split frame deltaStart must be 2 (baseline advanced)",
+                        2, readVarint(f2, DELTA_START_OFFSET));
+                Assert.assertEquals("second split frame carries no new symbols",
+                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
     private static int readVarint(byte[] buf, int offset) {
         // Simple unsigned varint decode — sufficient for small values.
         int result = 0;

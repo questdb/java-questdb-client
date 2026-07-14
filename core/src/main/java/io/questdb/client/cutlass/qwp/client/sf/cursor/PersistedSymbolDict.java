@@ -170,17 +170,19 @@ public final class PersistedSymbolDict implements QuietCloseable {
     public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
         long existing = ff.exists(filePath) ? ff.length(filePath) : -1L;
-        // A dictionary that legitimately grew past Integer.MAX_VALUE cannot be
-        // reopened: openExisting reads it into ONE int-sized native buffer, and
-        // the (int) cast of a >2GB length is either negative (malloc rejects it),
-        // exactly zero (getInt then reads 4 bytes past a zero-size allocation), or
-        // a small positive prefix (whose validLen < len branch would then
-        // DESTRUCTIVELY truncate the multi-GB file). Recreate empty instead --
-        // fail-clean, exactly like every other unreadable-file case here, so the
-        // sender falls back to full self-sufficient frames. Reaching this needs
-        // ~100M+ distinct symbols on one slot (far past realistic symbol
-        // cardinality); the guard keeps the read/write size boundary safe anyway.
-        if (existing > Integer.MAX_VALUE) {
+        // A dictionary that grew to or past Integer.MAX_VALUE cannot be reopened:
+        // openExisting reads it into ONE int-sized native buffer. PAST 2GiB the
+        // (int) cast is either negative (malloc rejects it), exactly zero (getInt
+        // then reads 4 bytes past a zero-size allocation), or a small positive prefix
+        // (whose validLen < len branch would then DESTRUCTIVELY truncate the multi-GB
+        // file); AT exactly Integer.MAX_VALUE the cast is exact but the ~2GB malloc is
+        // doomed to OutOfMemoryError. The >= guard short-circuits every case to a
+        // clean re-create instead of the doomed allocation -- fail-clean, exactly like
+        // every other unreadable-file case here, so the sender falls back to full
+        // self-sufficient frames. Reaching this needs ~100M+ distinct symbols on one
+        // slot (far past realistic symbol cardinality); the guard keeps the read/write
+        // size boundary safe anyway.
+        if (existing >= Integer.MAX_VALUE) {
             LOG.warn("symbol dict {} too large ({} bytes) to reopen; recreating empty", filePath, existing);
             return openFresh(ff, filePath);
         }
@@ -463,6 +465,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     break;
                 }
                 shift += 7;
+                if (shift > 35) {
+                    // Bound the varint like decodeVarint / appendRawEntries /
+                    // readVarintAt: a canonical length is <= 5 bytes. open() already
+                    // CRC-validated these bytes, so this is defensive only; the
+                    // p + len > limit check below then rejects the over-long run.
+                    break;
+                }
             }
             if (p + len > limit) {
                 break; // defensive: torn tail (should not happen past parse in open)

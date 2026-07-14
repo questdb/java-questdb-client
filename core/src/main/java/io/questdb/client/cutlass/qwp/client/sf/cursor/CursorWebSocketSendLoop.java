@@ -133,17 +133,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
-    // Settle budget for the symbol-dict catch-up cap gap: how many CONSECUTIVE
-    // reconnect attempts may find a single dictionary entry too large for the fresh
-    // server's advertised batch cap before the sender latches a terminal. A
-    // homogeneous cluster never trips it -- an entry that fit its data frame under a
-    // cap always fits its bare catch-up frame under that same cap -- so this only
-    // affects a heterogeneous / rolling-cap cluster, where a failover to a
-    // smaller-cap node can hit it for an entry an earlier node accepted. Retrying
-    // rides out the transient window until a larger-cap node returns; only a
-    // persistent gap (every reachable node too small for this many attempts) latches
-    // terminal, matching the orphan drainer's DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS.
-    // A successful catch-up resets the counter (see sendDictCatchUp).
+    // Settle budget for the symbol-dict catch-up cap gap: how many cap-gap attempts
+    // -- catch-ups that reached a fresh server and found a single dictionary entry
+    // too large for its advertised batch cap -- may occur, with no intervening
+    // SUCCESSFUL catch-up, before the sender latches a terminal. This is a SANCTIONED
+    // terminal (a genuine cluster batch-size capability gap), the connect-time analog
+    // of the orphan drainer's durable-ack capability gap
+    // (DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS). A homogeneous cluster never trips
+    // it -- an entry that fit its data frame under a cap always fits its bare catch-up
+    // frame under that same cap -- so it only affects a heterogeneous / rolling-cap
+    // cluster, where a failover to a smaller-cap node can hit it for an entry an
+    // earlier node accepted. Retrying rides out the transient window until a
+    // larger-cap node returns; only a persistent gap (this many cap gaps with no
+    // successful catch-up in between) latches.
+    //
+    // Budget accounting (satisfies "a transient must never burn the terminal
+    // budget"): catchUpCapGapAttempts increments ONLY inside sendDictCatchUp when a
+    // node is reached and an entry is oversized, and resets ONLY when a catch-up fully
+    // succeeds. A TRANSIENT reconnect (connect refuse, upgrade/role failure) never
+    // reaches the catch-up, so it NEITHER increments nor resets the counter -- it only
+    // lengthens the wall-clock settle window. The terminal therefore always requires
+    // this many GENUINE cap gaps; a transient can never inflate it. Deliberately NOT
+    // reset on a mere successful RECONNECT: a reconnect to the small-cap node itself
+    // produces the cap gap, so resetting there would stop a persistent gap from ever
+    // latching -- the reset must gate on a successful CATCH-UP, not on connecting.
     private static final int MAX_CATCHUP_CAP_GAP_ATTEMPTS = 16;
     // Hard ceiling for the lifetime-monotonic sent-dictionary mirror. The mirror
     // fields are int, so it cannot exceed Integer.MAX_VALUE bytes; reaching even
@@ -218,11 +231,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // for the connection's lifetime (a reconnect may need the whole dictionary at
     // any moment), so it cannot be dropped; it is an intentional cost of the feature.
     private final boolean deltaDictEnabled;
-    // Consecutive reconnect attempts whose symbol-dict catch-up found an entry too
-    // large for the fresh server's batch cap (see MAX_CATCHUP_CAP_GAP_ATTEMPTS). A
-    // successful catch-up resets it; it is NOT reset per connection -- it measures
-    // the cap-gap episode across reconnects so a persistent gap eventually latches.
-    // I/O-thread-only.
+    // Cap-gap attempts -- catch-ups that reached a node and found an entry too large
+    // for its batch cap -- since the last SUCCESSFUL catch-up (see
+    // MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting). A successful
+    // catch-up resets it (sendDictCatchUp); a transient reconnect neither increments
+    // nor resets it. NOT reset per connection -- it measures the cap-gap episode
+    // across reconnects so a persistent gap eventually latches. I/O-thread-only.
     private int catchUpCapGapAttempts;
     // True once a real ring frame (data or commit) has been sent on the CURRENT
     // connection, as opposed to only the dictionary catch-up. The catch-up
