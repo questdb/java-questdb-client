@@ -280,6 +280,19 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
             maxField.setAccessible(true);
             int maxAttempts = maxField.getInt(null);
+            // Pin the budget against a LITERAL before deriving anything from it. The
+            // retriable loop below is bounded by maxAttempts, so keying this test purely
+            // off the constant under test makes it TAUTOLOGICAL: a regression of
+            // MAX_CATCHUP_CAP_GAP_ATTEMPTS to 1 -- which is precisely the pre-fix bug this
+            // test names, a single cap gap killing the sender -- would run the loop ZERO
+            // times, the "exhausting" attempt would become the FIRST attempt, and the test
+            // would still pass green. Requiring > 1 makes that regression fail here, and it
+            // also guarantees the loop runs at least once, so the first cap gap is genuinely
+            // asserted retriable rather than vacuously skipped.
+            assertTrue("the cap-gap settle budget must tolerate MORE THAN ONE gap, else a single "
+                            + "transient failover to a smaller-cap node kills the sender "
+                            + "[MAX_CATCHUP_CAP_GAP_ATTEMPTS=" + maxAttempts + ']',
+                    maxAttempts > 1);
             // cap 160 => catch-up budget is below a ~216-byte solo frame for a 200-char symbol.
             CatchUpCapturingClient client = new CatchUpCapturingClient(160);
             try (CursorSendEngine engine = newEngine()) {
@@ -334,6 +347,13 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
             maxField.setAccessible(true);
             int maxAttempts = maxField.getInt(null);
+            // Same anti-tautology pin as testCatchUpCapGapRetriesUntilBudgetThenLatches.
+            // With maxAttempts == 1 the accrual loop below would run ZERO times and the
+            // "budget accrued to max-1" precondition would degenerate to 0 == 0, so the
+            // reset-to-0 assertion that is the whole point of this test would prove nothing.
+            assertTrue("the cap-gap settle budget must tolerate MORE THAN ONE gap "
+                            + "[MAX_CATCHUP_CAP_GAP_ATTEMPTS=" + maxAttempts + ']',
+                    maxAttempts > 1);
             CatchUpCapturingClient client = new CatchUpCapturingClient(160); // too small for a 200-char symbol
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);

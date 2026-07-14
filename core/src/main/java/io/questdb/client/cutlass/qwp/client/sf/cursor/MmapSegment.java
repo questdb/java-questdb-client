@@ -28,9 +28,11 @@ import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.std.str.Utf8s;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -553,6 +555,121 @@ public final class MmapSegment implements QuietCloseable {
      *                        retired orphan-deferred tail -- pass
      *                        {@code recoveredCommitBoundaryFsn}
      */
+    /**
+     * Rebuilds, from the frames' own delta sections, the symbols a replay of
+     * {@code [minFsnInclusive .. maxFsnInclusive]} would register ABOVE {@code coverage},
+     * appending them to {@code out} in ascending id order. Returns the coverage the walk
+     * establishes (one past the highest id registered), or {@code -1} when a frame's delta
+     * starts ABOVE the coverage reached so far.
+     * <p>
+     * This is the recovery-time twin of {@code CursorWebSocketSendLoop.accumulateSentDict}:
+     * it visits the same frames, in the same FSN order, and extracts exactly the entries
+     * that method will add to the send loop's mirror as those frames go back on the wire.
+     * The producer's dictionary is seeded from it so the producer's delta baseline and the
+     * loop's mirror coverage stay in lockstep BY CONSTRUCTION -- which is what makes a slot
+     * whose {@code .symbol-dict} was torn (or lost entirely) recoverable, as long as the
+     * surviving frames define the ids themselves.
+     * <p>
+     * A {@code -1} return is a genuine GAP: the ids between the coverage and the frame's
+     * delta start were introduced by frames that were acked and trimmed away, so they lived
+     * ONLY in the lost dictionary and cannot be rebuilt from anything. That is the one case
+     * the data really must be resent, and it is exactly the condition the send loop's
+     * torn-dictionary guard ({@code deltaStart > sentDictCount}) would trip on at replay --
+     * so the two agree, rather than the producer failing on slots the drainer drains fine.
+     * <p>
+     * Same frame layout and FSN bound as {@link #maxSymbolDeltaEnd}.
+     */
+    public long collectReplaySymbolsAbove(
+            int headerMagic,
+            int flagsOffset,
+            int flagDeltaMask,
+            int qwpHeaderSize,
+            long minFsnInclusive,
+            long maxFsnInclusive,
+            long coverage,
+            ObjList<String> out
+    ) {
+        long off = HEADER_SIZE;
+        long frames = frameCount;
+        for (long i = 0; i < frames; i++) {
+            long fsn = baseSeq + i;
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
+            long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+            if (fsn >= minFsnInclusive
+                    && fsn <= maxFsnInclusive
+                    && payloadLen >= qwpHeaderSize
+                    && payloadLen > flagsOffset
+                    && Unsafe.getUnsafe().getInt(payload) == headerMagic
+                    && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagDeltaMask) != 0) {
+                long p = payload + qwpHeaderSize;
+                long limit = payload + payloadLen;
+                long deltaStart = 0L;
+                int shift = 0;
+                while (p < limit) {
+                    byte b = Unsafe.getUnsafe().getByte(p++);
+                    deltaStart |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) {
+                        break;
+                    }
+                    shift += 7;
+                    if (shift > 35) {
+                        break; // corrupt run; recovered frames are CRC-valid, so defensive only
+                    }
+                }
+                long deltaCount = 0L;
+                shift = 0;
+                while (p < limit) {
+                    byte b = Unsafe.getUnsafe().getByte(p++);
+                    deltaCount |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) {
+                        break;
+                    }
+                    shift += 7;
+                    if (shift > 35) {
+                        break;
+                    }
+                }
+                if (deltaStart > coverage) {
+                    return -1L; // gap: ids [coverage, deltaStart) are unrecoverable
+                }
+                // Walk this frame's [len varint][utf8] entries. Ids below the coverage we
+                // already hold are skipped (a replayed frame legitimately overlaps the tip);
+                // ids at or above it extend the dictionary.
+                long id = deltaStart;
+                for (long k = 0; k < deltaCount; k++, id++) {
+                    long len = 0L;
+                    shift = 0;
+                    while (p < limit) {
+                        byte b = Unsafe.getUnsafe().getByte(p++);
+                        len |= (long) (b & 0x7F) << shift;
+                        if ((b & 0x80) == 0) {
+                            break;
+                        }
+                        shift += 7;
+                        if (shift > 35) {
+                            break;
+                        }
+                    }
+                    if (p + len > limit) {
+                        // Malformed entry region. Do NOT guess: report it as unrecoverable
+                        // so the caller fails clean rather than seeding a shifted dictionary.
+                        return -1L;
+                    }
+                    if (id >= coverage) {
+                        out.add(Utf8s.stringFromUtf8Bytes(p, p + len));
+                    }
+                    p += len;
+                }
+                long deltaEnd = deltaStart + deltaCount;
+                if (deltaEnd > coverage) {
+                    coverage = deltaEnd;
+                }
+            }
+            off += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return coverage;
+    }
+
     public long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
         long off = HEADER_SIZE;

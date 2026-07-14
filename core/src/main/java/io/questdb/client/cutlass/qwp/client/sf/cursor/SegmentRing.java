@@ -554,6 +554,41 @@ public final class SegmentRing implements QuietCloseable {
      * reference. Frames above {@code maxFsnInclusive} are the retired orphan-deferred
      * tail and are excluded.
      */
+    /**
+     * Rebuilds the symbols a replay of {@code [minFsnInclusive .. maxFsnInclusive]} would
+     * register ABOVE {@code baseline}, appending them to {@code out} in ascending id order.
+     * Returns the coverage the replay establishes, or {@code -1} on a genuine gap. See
+     * {@link MmapSegment#collectReplaySymbolsAbove}.
+     * <p>
+     * Walks the segments in ascending FSN order -- {@code sealedSegments} are held in
+     * baseSeq order and {@code active} is the newest (see {@code recover}) -- threading the
+     * coverage through, because unlike {@link #maxSymbolDeltaEnd} (a plain max) this walk is
+     * ORDER-DEPENDENT: each frame may only extend a dictionary the frames before it built.
+     */
+    public synchronized long collectReplaySymbolsAbove(
+            int headerMagic,
+            int flagsOffset,
+            int flagDeltaMask,
+            int qwpHeaderSize,
+            long minFsnInclusive,
+            long maxFsnInclusive,
+            long baseline,
+            ObjList<String> out
+    ) {
+        long coverage = baseline;
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            coverage = sealedSegments.get(i).collectReplaySymbolsAbove(
+                    headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize,
+                    minFsnInclusive, maxFsnInclusive, coverage, out);
+            if (coverage < 0) {
+                return -1L;
+            }
+        }
+        return active.collectReplaySymbolsAbove(
+                headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize,
+                minFsnInclusive, maxFsnInclusive, coverage, out);
+    }
+
     public synchronized long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
         for (int i = 0, n = sealedSegments.size(); i < n; i++) {

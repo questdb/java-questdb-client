@@ -3847,91 +3847,88 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * On recovery, repopulates the producer's {@link GlobalSymbolDictionary} from
-     * the slot's persisted dictionary (ids assigned in the same ascending order,
-     * so they match the recovered frames) and resumes the delta baseline at the
-     * recovered tip, so newly ingested symbols continue above the recovered ids.
+     * On recovery, repopulates the producer's {@link GlobalSymbolDictionary} so that newly
+     * ingested symbols continue ABOVE every id the surviving frames already define, and
+     * resumes the delta baseline at that tip.
      * <p>
-     * Uses {@link GlobalSymbolDictionary#addRecoveredSymbol} (append, NOT de-dup):
-     * the persisted dictionary, the on-wire delta and the send-loop catch-up mirror
-     * all key on the entry POSITION (id), so the producer id space must match the
-     * persisted entry count exactly. {@code getOrAddSymbol} would collapse two
-     * source strings that decode to the same characters -- only malformed lone
-     * UTF-16 surrogates, which UTF-8-encode to {@code '?'} -- leaving this
-     * dictionary shorter than {@code pd.size()} and desyncing
-     * {@code sentMaxSymbolId} from the mirror's {@code sentDictCount = pd.size()},
-     * which silently misattributes later symbols after a reconnect.
+     * Seeds from TWO sources, in this order:
+     * <ol>
+     *   <li>the slot's persisted {@code .symbol-dict} -- its intact prefix; then</li>
+     *   <li>the surviving frames' OWN delta sections, for every id above that prefix
+     *       ({@link CursorSendEngine#collectReplaySymbolsAbove}).</li>
+     * </ol>
+     * Those are exactly the two sources, in exactly the order, that the send loop's mirror
+     * is built from: its constructor seeds {@code sentDictCount} from the same dictionary,
+     * and {@code accumulateSentDict} then extends it from the same frames as they replay. So
+     * the producer's {@code sentMaxSymbolId + 1} and the loop's {@code sentDictCount} land on
+     * the same number BY CONSTRUCTION -- the invariant the torn-dictionary guard rests on --
+     * rather than by the two happening to agree.
      * <p>
-     * <b>Host-crash tear guard.</b> The persisted dictionary is NOT fsync'd (see
-     * {@code PersistedSymbolDict}), so a host/power crash can lose its
-     * most-recently-written (highest-id) entries while the segment frames that
-     * introduced those ids survive -- and those newest frames, being the least
-     * likely to be acked, replay on recovery. The send loop's catch-up mirror then
-     * rebuilds the missing ids from those frames' own delta bytes, but THIS producer
-     * -- seeded only from the shorter dictionary -- would assign its next new symbol
-     * an id the surviving frames already define, putting two symbols on one id and
-     * silently misattributing values. The send loop's replay guard only catches a
-     * GAP ({@code deltaStart > sentDictCount}); a frame that introduces exactly the
-     * torn-off id ({@code deltaStart == pd.size()}) slips through and self-heals the
-     * mirror, leaving only this producer diverged. Detect it here -- the surviving
-     * frames reference an id at or beyond the recovered dictionary size -- and fail
-     * clean: the affected data must be resent, matching the design's torn-dict
-     * "resend required" contract.
+     * Uses {@link GlobalSymbolDictionary#addRecoveredSymbol} (append, NOT de-dup): the
+     * persisted dictionary, the on-wire delta and the mirror all key on the entry POSITION
+     * (id), so the producer's id space must match the recovered entry count exactly.
+     * {@code getOrAddSymbol} would collapse two source strings that decode to the same
+     * characters -- only malformed lone UTF-16 surrogates, which UTF-8-encode to {@code '?'}
+     * -- leaving this dictionary SHORTER than the count and silently misattributing later
+     * symbols.
      * <p>
-     * The background drainer self-heals the mirror ONLY when a surviving frame
-     * STRADDLES the tear ({@code deltaStart <= pd.size() < deltaStart + deltaCount}):
-     * such a frame carries the torn-off ids in its own delta and
-     * {@code accumulateSentDict} re-registers them, so the drainer drains the slot.
-     * But when the symbol-introducing frames were already acked and trimmed and only
-     * a HIGHER-baseline frame survives ({@code deltaStart > pd.size()} -- e.g. a
-     * commit or a symbol-reusing frame, since {@code beginMessage} always sets the
-     * delta flag), the drainer's own replay guard ({@code deltaStart > sentDictCount})
-     * fires too and quarantines the slot: the recorded bytes are not silently lost,
-     * but the slot is NOT auto-drained -- it must be resent. That is a deliberate
-     * CONSERVATIVE over-strand -- the guard keys on {@code deltaStart}, not on the
-     * frame's actual highest referenced id, to avoid parsing row data at recovery,
-     * so it may reject a frame whose rows reference only ids the truncated
-     * dictionary still holds. It fails clean rather than risk a silent id shift.
-     * Only a host crash reaches this -- a process crash keeps the page cache, so the
-     * write-ahead ordering keeps the dictionary a superset of the frames.
+     * <b>Why seeding from the frames matters.</b> The dictionary is not fsync'd (see
+     * {@code PersistedSymbolDict}), so a host/power crash can tear off its newest entries
+     * while the segment frames that introduced those ids survive -- and those newest frames,
+     * being the least likely to be acked, are exactly the ones that replay. Seeded from the
+     * short dictionary alone, this producer would hand its next new symbol an id those frames
+     * already define, putting two symbols on one id and silently misattributing values. The
+     * old code detected that and threw, which was safe but far too blunt: it bricked
+     * {@code build()} for slots the background drainer replays PERFECTLY, because the frames
+     * carry the torn-off symbols in their own deltas and {@code accumulateSentDict} rebuilds
+     * the dictionary from them. This method now rebuilds the producer from the same bytes,
+     * so a torn -- or entirely lost -- dictionary is recoverable whenever the surviving
+     * frames define the ids themselves. The next flush's write-ahead persist then re-writes
+     * those ids (it resumes from {@code pd.size()}), healing the side-file on disk.
+     * <p>
+     * <b>What still fails clean.</b> A genuine GAP: the ids below a surviving frame's delta
+     * start were introduced by frames that were acked and TRIMMED away, so they lived only in
+     * the lost dictionary and nothing can rebuild them.
+     * {@code collectReplaySymbolsAbove} returns -1 for that and we throw. It is the same
+     * condition the send loop's replay guard ({@code deltaStart > sentDictCount}) trips on, so
+     * producer and drainer now agree on exactly which slots are recoverable, instead of the
+     * producer rejecting slots the drainer drains.
      */
     private void seedGlobalDictionaryFromPersisted(PersistedSymbolDict pd) {
-        if (pd == null) {
+        if (cursorEngine == null) {
             return;
         }
-        // Run the torn-dictionary guard BEFORE the empty-dictionary short-circuit
-        // below: a TOTAL tear (pd.size() == 0) of a DELTA dictionary with surviving
-        // symbol-bearing frames must fail clean too, not slip through. Such a frame
-        // starts at deltaStart=0 and self-heals the I/O-thread catch-up mirror, so the
-        // send loop's replay guard (deltaStart > sentDictCount) never fires -- this
-        // seed-time guard is then the only defense against the producer resuming
-        // unseeded and silently reusing ids the frames already define. A genuinely
-        // empty slot (no symbol-bearing frames) has recoveredMaxSymbolId() == -1, so
-        // -1 >= 0 is false and the pd.size() == 0 return below still fires.
-        //
-        // This guard fires ONLY for a torn DELTA dictionary. The other way the frames
-        // can out-reach the recovered dictionary -- a slot written in FULL-DICT
-        // fallback (the dictionary never opened when writing, every frame
-        // self-sufficient at deltaStart=0), then recovered against a fresh empty one --
-        // is caught upstream in CursorSendEngine, which discards the empty side-file so
-        // isDeltaDictEnabled() is false and this seed never runs. Those frames need no
-        // dictionary; failing clean here would needlessly brick build() for a slot the
-        // orphan drainer drains fine.
-        if (cursorEngine != null && cursorEngine.recoveredMaxSymbolId() >= pd.size()) {
+        // 1. The dictionary's intact prefix. addRecoveredSymbol appends without de-dup, so
+        //    the producer's size tracks pd.size() exactly -- which is what the send loop's
+        //    mirror also seeds sentDictCount from.
+        int baseline = 0;
+        if (pd != null && pd.size() > 0) {
+            ObjList<String> persisted = pd.readLoadedSymbols();
+            for (int i = 0, n = persisted.size(); i < n; i++) {
+                globalSymbolDictionary.addRecoveredSymbol(persisted.getQuick(i));
+            }
+            baseline = globalSymbolDictionary.size();
+        }
+        // 2. Everything the surviving frames define above that prefix, straight out of their
+        //    own delta sections -- the same bytes, in the same order, accumulateSentDict will
+        //    feed the mirror as those frames go back on the wire.
+        ObjList<String> fromFrames = new ObjList<>();
+        long coverage = cursorEngine.collectReplaySymbolsAbove(baseline, fromFrames);
+        if (coverage < 0) {
             throw new LineSenderException(
-                    "recovered store-and-forward symbol dictionary is a subset of the surviving frames "
-                            + "(likely a host crash tore its unsynced tail): frames reference symbol id "
-                            + cursorEngine.recoveredMaxSymbolId() + " but the recovered dictionary holds only "
-                            + pd.size() + " id(s); resuming would reuse ids the frames already define -- "
-                            + "resend the affected data");
+                    "recovered store-and-forward symbol dictionary is incomplete and cannot be "
+                            + "rebuilt from the surviving frames (likely a host crash tore its unsynced "
+                            + "tail): the frames reference symbol ids below their own delta start, which "
+                            + "were introduced by frames since acked and trimmed away, so nothing still "
+                            + "holds them; the recovered dictionary holds only "
+                            + (pd == null ? 0 : pd.size()) + " id(s) -- resend the affected data");
         }
-        if (pd.size() == 0) {
-            return;
+        for (int i = 0, n = fromFrames.size(); i < n; i++) {
+            globalSymbolDictionary.addRecoveredSymbol(fromFrames.getQuick(i));
         }
-        ObjList<String> symbols = pd.readLoadedSymbols();
-        for (int i = 0, n = symbols.size(); i < n; i++) {
-            globalSymbolDictionary.addRecoveredSymbol(symbols.getQuick(i));
-        }
+        // Producer baseline == the coverage the replay will establish == the mirror's
+        // sentDictCount once those frames have gone out. The first new frame therefore
+        // starts its delta exactly at the tip, and the replay guard passes.
         sentMaxSymbolId = globalSymbolDictionary.size() - 1;
     }
 

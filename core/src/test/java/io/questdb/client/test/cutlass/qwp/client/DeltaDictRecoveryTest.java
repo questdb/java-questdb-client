@@ -204,7 +204,7 @@ public class DeltaDictRecoveryTest {
                         0, handler.frames.get());
                 Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
                 Assert.assertTrue(terminal.getMessage(),
-                        terminal.getMessage().contains("subset of the surviving frames")
+                        terminal.getMessage().contains("cannot be rebuilt from the surviving frames")
                                 && terminal.getMessage().contains("resend"));
             }
         });
@@ -343,6 +343,106 @@ public class DeltaDictRecoveryTest {
                     Assert.assertEquals("sym-" + i, dict.get(i));
                 }
                 Assert.assertEquals("brand-new", dict.get(DISTINCT_SYMBOLS));
+            }
+        });
+    }
+
+    @Test
+    public void testUnopenablePersistedDictReplaysSelfSufficientFrameSequence() throws Exception {
+        // Untrimmed counterpart of
+        // testUnopenablePersistedDictStillGuardsAgainstReplayingDeltaFrames.
+        //
+        // Same failure mode -- the persisted dictionary cannot be OPENED, so
+        // CursorSendEngine.isDeltaDictEnabled() is false -- but NOTHING was acked, so
+        // replay starts at the FIRST frame. Frames 0..5 carry deltaStart 0..5 and are
+        // COLLECTIVELY self-sufficient: replayed in order from id 0, the server
+        // accumulates the dictionary contiguously, needing no dictionary file at all.
+        //
+        // Pre-fix, accumulateSentDict was gated on deltaDictEnabled while the
+        // torn-dict guard was NOT, so sentDictCount froze at 0: frame 0 (deltaStart=0)
+        // passed the guard, but frame 1 (deltaStart=1 > 0) tripped it and latched a
+        // terminal -- and for the background drainer that means markFailed + a .failed
+        // sentinel, permanently quarantining a slot that drains perfectly. A store-
+        // and-forward contract violation: a TRANSIENT disk condition (fd exhaustion, a
+        // read-only remount, ENOSPC) stranding recoverable data.
+        //
+        // The trimmed sibling pins the other half of the contract: when replay starts
+        // ABOVE the frames that introduced the ids, the terminal is still correct.
+        assertMemoryLeak(() -> {
+            // Phase 1: each row introduces a new symbol => frame i carries deltaStart=i.
+            // The server never acks, so nothing is trimmed and replay starts at frame 0
+            // (the common orphan-drain profile: the server was down the whole time).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Make the persisted dictionary UNOPENABLE: a directory of the same name
+            // defeats both openRW and openCleanRW, so PersistedSymbolDict.open()
+            // returns null. Deliberately do NOT stamp the ack watermark -- replay must
+            // start at frame 0, which is what makes the sequence self-sufficient.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            java.nio.file.Files.createDirectory(dict);
+
+            // Phase 2: recover against a fresh server that reconstructs its per-
+            // connection dictionary from the wire exactly as the real one does --
+            // null-padding any gap, so a gap surfaces as a null rather than passing
+            // silently.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                LineSenderException terminal = null;
+                Sender s2 = Sender.fromConfig(cfg);
+                try {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < 6
+                            && terminal == null) {
+                        try {
+                            s2.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        s2.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
+                    }
+                }
+
+                // Pre-fix: the "symbol dictionary is incomplete" terminal fires on frame 1.
+                Assert.assertNull("a self-sufficient frame sequence must replay without a terminal: "
+                                + (terminal == null ? "" : terminal.getMessage()),
+                        terminal);
+                // Pre-fix: the server dictionary stops at ["sym-0"] -- frame 1 never shipped.
+                List<String> serverDict = handler.dictSnapshot();
+                Assert.assertEquals("every delta frame must replay [dict=" + serverDict + ']',
+                        6, serverDict.size());
+                for (int i = 0; i < 6; i++) {
+                    Assert.assertEquals("id " + i + " must resolve; a null here is a server-side "
+                                    + "null-pad, i.e. a silently NULL symbol column [dict=" + serverDict + ']',
+                            "sym-" + i, serverDict.get(i));
+                }
             }
         });
     }
@@ -760,23 +860,29 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testTornDictSubsetFailsCleanOnResume() throws Exception {
-        // C1 regression: the persisted .symbol-dict is NOT fsync'd, so a host crash
-        // can lose its highest-id tail entries while the segment frames that
-        // introduced those ids survive (out-of-order page loss). Recovery then seeds
-        // the producer from the SHORTER dictionary, but the I/O-thread catch-up mirror
-        // rebuilds the missing ids from those surviving frames -- so a resumed producer
-        // would assign its next new symbol an id the frames already define, silently
-        // misattributing symbol values on the wire. The send loop's replay guard only
-        // catches a GAP (deltaStart > mirror); a frame introducing exactly the
-        // torn-off id slips through and self-heals the mirror, leaving only this
-        // producer diverged. seedGlobalDictionaryFromPersisted must detect that the
-        // surviving frames reference an id at/beyond the recovered dictionary size and
-        // fail clean. Without the fix the resume succeeds and the reuse corrupts
-        // silently -- so the build below would NOT throw and the test's fail() fires.
+    public void testTornDictSubsetRebuildsFromSurvivingFrames() throws Exception {
+        // The persisted .symbol-dict is NOT fsync'd, so a host crash can lose its
+        // highest-id tail entries while the segment frames that introduced those ids
+        // survive (out-of-order page loss). Those frames carry the torn-off symbols in
+        // their OWN delta sections -- which is exactly why the background drainer replays
+        // such a slot perfectly: accumulateSentDict rebuilds the dictionary from them.
+        //
+        // The producer must do the same. Pre-fix it seeded ONLY from the short dictionary,
+        // saw that the frames out-reached it, and threw -- permanently bricking
+        // Sender.build() for a slot the drainer drains fine. And the brick is permanent:
+        // build()'s catch releases the slot lock, but the sender that would have hosted the
+        // orphan drainer is the one that just failed, so nothing drains the slot and the
+        // retry recovers it and throws again. seedGlobalDictionaryFromPersisted now seeds
+        // from the dictionary's intact prefix AND THEN from the surviving frames' deltas,
+        // so the producer's baseline lands on exactly the coverage the send loop's mirror
+        // will reach.
+        //
+        // testTornDictionaryFailsCleanlyInsteadOfCorrupting pins the other half of the
+        // contract: when the symbol-introducing frames were acked and TRIMMED away, the ids
+        // really are unrecoverable and the resume must still fail clean.
         assertMemoryLeak(() -> {
-            // Phase 1: record three delta frames (a@0, b@1, c@2) to disk with nothing
-            // acked (silent server), so all three survive and replay on recovery.
+            // Phase 1: three delta frames (a@0, b@1, c@2) with nothing acked, so all three
+            // survive and replay from frame 0.
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
@@ -796,10 +902,10 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Simulate the host-crash tear: rewrite the persisted dictionary to drop
-            // its highest entry (c@2), keeping a@0,b@1 -- while the frame referencing
-            // c@2 stays on disk. openClean truncates; the two appends leave the exact
-            // two-entry dictionary a torn tail would recover to.
+            // Simulate the host-crash tear: rewrite the dictionary to drop its highest
+            // entry (c@2), keeping a@0,b@1 -- while the frame that introduced c@2 stays on
+            // disk. openClean truncates; the two appends leave exactly the two-entry
+            // dictionary a torn tail would recover to.
             String slotDir = Paths.get(sfDir, "default").toString();
             try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
                 Assert.assertNotNull(torn);
@@ -808,44 +914,58 @@ public class DeltaDictRecoveryTest {
                 Assert.assertEquals(2, torn.size());
             }
 
-            // Phase 2: a resuming sender must refuse -- the surviving frames reference
-            // id 2 but the recovered dictionary holds only 2 id(s) [0,1].
-            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+            // Phase 2: the resuming sender must REBUILD c@2 from that surviving frame,
+            // replay everything, and keep ingesting ABOVE the recovered tip.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
                 good.start();
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                try {
-                    Sender resumed = Sender.fromConfig(cfg);
-                    resumed.close();
-                    Assert.fail("resume on a torn (subset) dictionary must fail clean");
-                } catch (LineSenderException expected) {
-                    Assert.assertTrue("message must name the torn-dict/resend failure: " + expected.getMessage(),
-                            expected.getMessage().contains("subset of the surviving frames")
-                                    && expected.getMessage().contains("resend"));
+                // Pre-fix this line THREW ("subset of the surviving frames").
+                try (Sender resumed = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 3) {
+                        Thread.sleep(20);
+                    }
+                    // A NEW symbol must land ABOVE the recovered tip. Seeded short, the
+                    // producer would hand "d" an id the surviving frames already define,
+                    // silently overwriting that symbol on the server -- the corruption the
+                    // old throw existed to prevent, and which this seeding removes at the
+                    // source rather than by refusing to start.
+                    resumed.table("m").symbol("s", "d").longColumn("v", 3).atNow();
+                    resumed.flush();
+                    deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 4) {
+                        Thread.sleep(20);
+                    }
                 }
+
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("dictionary must rebuild gap-free [" + dict + ']', 4, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+                Assert.assertEquals("b", dict.get(1));
+                // Rebuilt from the surviving frame's own delta, not from the torn file.
+                Assert.assertEquals("c", dict.get(2));
+                // The new symbol, placed above the recovered tip -- no id reuse.
+                Assert.assertEquals("d", dict.get(3));
             }
         });
     }
 
     @Test
-    public void testTornDictTotalLossFailsCleanOnResume() throws Exception {
-        // C1 regression (TOTAL-loss variant of testTornDictSubsetFailsCleanOnResume):
-        // a host crash can lose the ENTIRE persisted .symbol-dict (size 0) while the
-        // frames that introduced its ids survive; equivalently, a prior session whose
-        // openClean failed ran full-dict mode and never wrote the side-file, so this
-        // session recovers those frames against a FRESH EMPTY dictionary. The recovered
-        // frames start at deltaStart=0 and self-heal the I/O-thread catch-up mirror, so
-        // the send loop's replay guard (deltaStart > mirror) never fires -- only
-        // seedGlobalDictionaryFromPersisted can catch it. Its pd.size()==0 early return
-        // must NOT skip the torn-dict guard: the surviving frames reference id 2 while
-        // the recovered dictionary holds 0 id(s), so resuming unseeded would reuse those
-        // ids and silently misattribute symbol values on the wire. Without the fix the
-        // build below does NOT throw (the guard is bypassed) and the test's fail() fires.
+    public void testTornDictTotalLossRebuildsFromSurvivingFrames() throws Exception {
+        // The total-loss counterpart of testTornDictSubsetRebuildsFromSurvivingFrames: the
+        // whole dictionary is gone (size 0) but the file still opens, so
+        // isDeltaDictEnabled() stays true and the engine does NOT discard it (the frames
+        // carry deltaStart 0,1,2, so maxSymbolDeltaStart != 0 and the full-dict-fallback
+        // discard correctly stays out of the way).
+        //
+        // The surviving frames start at id 0 and are collectively self-sufficient, so the
+        // producer can rebuild the ENTIRE dictionary from their deltas -- exactly as the
+        // send loop's mirror does. Pre-fix this threw and bricked build().
         assertMemoryLeak(() -> {
-            // Phase 1: record three delta frames (a@0, b@1, c@2) with nothing acked, so
-            // all three survive and replay -- from FSN 0 (deltaStart=0), the case the
-            // I/O-thread guard self-heals rather than rejects.
+            // Phase 1: a@0, b@1, c@2; nothing acked, so all three replay from frame 0.
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
@@ -865,35 +985,48 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Total dictionary loss: openClean truncates .symbol-dict to its bare header
-            // (size 0) with zero appends, while every frame -- including the ones
-            // referencing a@0,b@1,c@2 -- stays on disk. This is the fresh-empty-dict
-            // state a full-dict-mode prior session or a total host-crash tear leaves.
+            // Total tear: the dictionary recovers EMPTY but still opens.
             String slotDir = Paths.get(sfDir, "default").toString();
             try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
                 Assert.assertNotNull(torn);
                 Assert.assertEquals(0, torn.size());
             }
 
-            // Phase 2: a resuming sender must refuse at build -- the surviving frames
-            // reference id 2 but the recovered dictionary holds 0 id(s). The I/O-thread
-            // guard cannot help (deltaStart 0 self-heals the mirror), so the seed-time
-            // guard is the sole defense.
-            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
                 good.start();
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                try {
-                    Sender resumed = Sender.fromConfig(cfg);
-                    resumed.close();
-                    Assert.fail("resume on a totally lost (size 0) dictionary must fail clean");
-                } catch (LineSenderException expected) {
-                    Assert.assertTrue("message must name the torn-dict/resend failure: " + expected.getMessage(),
-                            expected.getMessage().contains("subset of the surviving frames")
-                                    && expected.getMessage().contains("resend"));
+                // Pre-fix this line THREW.
+                try (Sender resumed = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 3) {
+                        Thread.sleep(20);
+                    }
+                    resumed.table("m").symbol("s", "d").longColumn("v", 3).atNow();
+                    resumed.flush();
+                    deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 4) {
+                        Thread.sleep(20);
+                    }
                 }
+
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("the whole dictionary must rebuild from the frames [" + dict + ']',
+                        4, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+                Assert.assertEquals("b", dict.get(1));
+                Assert.assertEquals("c", dict.get(2));
+                Assert.assertEquals("d", dict.get(3));
             }
+            // The side-file is healed in passing -- persistNewSymbolsBeforePublish resumes
+            // from pd.size() (0 here), so the flush above re-persisted the rebuilt ids
+            // a,b,c along with d. That is not asserted on disk because it is not
+            // observable here: the slot drains fully, and a fully-drained close removes
+            // the dictionary (CursorSendEngine -> PersistedSymbolDict.removeOrphan), so
+            // re-opening it would just yield a fresh empty file. The persist-resumes-from-
+            // pd.size() behaviour is pinned by the testFailedPublish* tests.
         });
     }
 

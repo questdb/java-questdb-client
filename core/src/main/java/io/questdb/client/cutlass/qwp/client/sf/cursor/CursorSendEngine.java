@@ -662,6 +662,44 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Rebuilds, from the surviving frames' OWN delta sections, the symbols the upcoming
+     * replay will register ABOVE {@code baseline}, appending them to {@code out} in
+     * ascending id order. Returns the coverage the replay establishes (one past the highest
+     * id it registers), or {@code -1} when the frames have a genuine GAP above the baseline.
+     * <p>
+     * The producer seeds its dictionary from the persisted {@code .symbol-dict} and THEN
+     * from this, so it is fed the same entries, in the same order, that the send loop's
+     * {@code accumulateSentDict} will feed its mirror from as those very frames replay. The
+     * producer's delta baseline and the loop's mirror coverage therefore land on the same
+     * number by construction, which is the invariant the torn-dictionary guard rests on.
+     * <p>
+     * This is what makes a slot whose dictionary was torn -- or lost outright -- still
+     * recoverable when the surviving frames define the ids themselves (they carry the
+     * symbols in their own deltas; it is why the orphan drainer can drain such a slot). Only
+     * a real gap, where the ids were introduced by frames since acked and trimmed away, is
+     * unrecoverable -- and that is precisely when this returns -1.
+     * <p>
+     * Bounded above by {@link #recoveredCommitBoundaryFsn} like {@link #recoveredMaxSymbolId}:
+     * frames past it are the aborted orphan-deferred tail, retired without ever being
+     * transmitted, so their ids never reach a server and must not inflate the baseline.
+     */
+    public long collectReplaySymbolsAbove(int baseline, ObjList<String> out) {
+        if (ring == null) {
+            return baseline;
+        }
+        return ring.collectReplaySymbolsAbove(
+                QwpConstants.MAGIC_MESSAGE,
+                QwpConstants.HEADER_OFFSET_FLAGS,
+                QwpConstants.FLAG_DELTA_SYMBOL_DICT,
+                QwpConstants.HEADER_SIZE,
+                ackedFsn() + 1L,
+                recoveredCommitBoundaryFsn,
+                baseline,
+                out
+        );
+    }
+
+    /**
      * Pass-through to {@link SegmentRing#findSegmentContaining(long)}.
      */
     public MmapSegment findSegmentContaining(long fsn) {

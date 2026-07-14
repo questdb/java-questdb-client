@@ -168,11 +168,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
-    // True when this loop delta-encodes symbol dictionaries: it keeps a reconnect
-    // catch-up mirror (sentDict*) and re-registers the whole dictionary on a fresh
-    // server before replaying delta frames. See the sentDict* fields in the mutable
-    // section for the full mechanism. Gates all the delta-dict state.
-    private final boolean deltaDictEnabled;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
     private final long durableAckKeepaliveIntervalNanos;
@@ -239,17 +234,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
-    // Delta symbol dictionary catch-up state (see swapClient, deltaDictEnabled).
-    // Active in memory mode, and in disk mode whenever the per-slot persisted
-    // dictionary opened -- fresh slots included, not just recovered / orphan-drained
-    // ones. On a recovered / orphan-drained slot the constructor additionally SEEDS
-    // sentDict* from that persisted dictionary; a fresh slot starts with an empty
-    // mirror and grows it as frames are sent. The loop mirrors, in sentDict*, every
-    // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
-    // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that on
-    // reconnect it can re-register the whole dictionary on the fresh server (which
-    // discards its dictionary on every disconnect) before replaying frames whose
-    // deltas start above id 0. All of this is touched only by the I/O thread.
+    // Delta symbol dictionary catch-up state (see swapClient).
+    // ALWAYS active -- in memory mode, in disk mode, and (critically) even when the
+    // per-slot persisted dictionary failed to open. sentDictCount is this loop's model
+    // of how many ids the CURRENT server has been told about, and the torn-dict guard
+    // in trySendOne reads it, so it must track the wire in every mode; gating it on
+    // engine.isDeltaDictEnabled() is what once froze it at 0 and terminal'd a slot
+    // whose frames replay perfectly from id 0 (see the constructor). On a recovered /
+    // orphan-drained slot the constructor SEEDS sentDict* from the persisted
+    // dictionary when there is one; otherwise the mirror starts empty and grows from
+    // the frames themselves. The loop mirrors, in sentDict*, every symbol it has ever
+    // sent -- the concatenated [len varint][utf8] bytes in global-id order
+    // (sentDictBytes*) plus the count (sentDictCount) -- so that on reconnect it can
+    // re-register the whole dictionary on the fresh server (which discards its
+    // dictionary on every disconnect) before replaying frames whose deltas start above
+    // id 0. All of this is touched only by the I/O thread.
     // Footprint note: this mirror is a SECOND copy of the dictionary -- the same
     // symbols the producer's GlobalSymbolDictionary already holds as Java Strings --
     // kept as native UTF-8 bytes for the reconnect-catch-up capability. So a
@@ -571,39 +570,50 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         this.client = client;
         this.engine = engine;
-        this.deltaDictEnabled = engine.isDeltaDictEnabled();
         // Recovery / orphan-drain: the loop starts with a fresh in-memory mirror,
         // so seed it from the slot's persisted dictionary. That way the very first
         // connection re-registers the whole dictionary (via a catch-up frame)
         // before replaying the recovered delta frames.
-        if (deltaDictEnabled) {
-            PersistedSymbolDict pd = engine.getPersistedSymbolDict();
-            if (pd != null && pd.size() > 0) {
-                int len = pd.loadedEntriesLen();
-                if (len > 0) {
-                    // COPY the persisted dictionary's loaded-entries buffer into this
-                    // loop's own mirror rather than taking ownership of it. The engine
-                    // (and its PersistedSymbolDict) OUTLIVES this loop on the orphan
-                    // drainer path: BackgroundDrainer builds a fresh send loop per wire
-                    // session against the same engine on a durable-ack capability-gap
-                    // recycle. A one-shot ownership transfer would leave every loop
-                    // after the first with an EMPTY mirror -- it would then send no
-                    // reconnect catch-up, and the first replayed delta frame
-                    // (deltaStart > 0) would trip the torn-dict guard, falsely
-                    // quarantining a healthy slot. Copying keeps the dictionary's
-                    // loaded entries intact for the engine's lifetime so every
-                    // recycled loop re-seeds; pd.close() (at engine close) frees the
-                    // dictionary's copy, this loop frees its own copy on exit.
-                    sentDictBytesAddr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
-                    Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
-                    sentDictBytesCapacity = len;
-                    sentDictBytesLen = len;
-                    // Set the count only alongside the bytes so sentDictCount can
-                    // never claim symbols the mirror does not hold. A recovered slot
-                    // always has loadedEntriesLen > 0 when size > 0, so this is the
-                    // same result -- it just makes the coupling explicit.
-                    sentDictCount = pd.size();
-                }
+        //
+        // Deliberately NOT gated on engine.isDeltaDictEnabled(). The mirror, the
+        // catch-up and the replay guard together are this loop's model of what the
+        // SERVER's dictionary holds, and that model must track every mode. Gating
+        // them on that flag is what once bricked a recoverable slot: an unopenable
+        // .symbol-dict reports isDeltaDictEnabled()=false, yet the frames already on
+        // disk are still DELTA frames (deltaStart 0,1,2,...). With the mirror gated
+        // off, sentDictCount froze at 0 while the ungated guard kept comparing
+        // against it, so the frame at deltaStart=1 tripped a terminal -- even though
+        // replaying the whole sequence from id 0 rebuilds the dictionary on the
+        // server contiguously and drains perfectly. isDeltaDictEnabled() decides
+        // what the PRODUCER emits and persists; it must never decide what this loop
+        // tracks. When the dictionary could not be opened, pd is null, the mirror
+        // simply starts empty and grows from the frames themselves.
+        PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+        if (pd != null && pd.size() > 0) {
+            int len = pd.loadedEntriesLen();
+            if (len > 0) {
+                // COPY the persisted dictionary's loaded-entries buffer into this
+                // loop's own mirror rather than taking ownership of it. The engine
+                // (and its PersistedSymbolDict) OUTLIVES this loop on the orphan
+                // drainer path: BackgroundDrainer builds a fresh send loop per wire
+                // session against the same engine on a durable-ack capability-gap
+                // recycle. A one-shot ownership transfer would leave every loop
+                // after the first with an EMPTY mirror -- it would then send no
+                // reconnect catch-up, and the first replayed delta frame
+                // (deltaStart > 0) would trip the torn-dict guard, falsely
+                // quarantining a healthy slot. Copying keeps the dictionary's
+                // loaded entries intact for the engine's lifetime so every
+                // recycled loop re-seeds; pd.close() (at engine close) frees the
+                // dictionary's copy, this loop frees its own copy on exit.
+                sentDictBytesAddr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
+                sentDictBytesCapacity = len;
+                sentDictBytesLen = len;
+                // Set the count only alongside the bytes so sentDictCount can
+                // never claim symbols the mirror does not hold. A recovered slot
+                // always has loadedEntriesLen > 0 when size > 0, so this is the
+                // same result -- it just makes the coupling explicit.
+                sentDictCount = pd.size();
             }
         }
         this.fsnAtZero = fsnAtZero;
@@ -2055,7 +2065,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handleServerRejection can tell "only the catch-up went out" from "the
         // head data frame went out".
         dataFrameSentThisConnection = false;
-        if (client != null && deltaDictEnabled && sentDictCount > 0) {
+        // Not gated on isDeltaDictEnabled() -- see the constructor. The mirror is
+        // non-empty exactly when this loop has already put symbols on a wire, and a
+        // FRESH server holds none of them, so it must be re-registered before any
+        // frame that back-references an id. In full-dict mode the mirror is non-empty
+        // too and the catch-up is then redundant (the next frame re-registers from id
+        // 0 anyway) but harmless: the server overwrites identical ids with identical
+        // symbols. Redundant-but-uniform beats a mode flag that can go false while the
+        // frames on disk are still deltas.
+        if (client != null && sentDictCount > 0) {
             this.nextWireSeq = 0L;
             // The catch-up may span several frames when the dictionary exceeds the
             // server's batch cap; each consumes a wire sequence (0 .. n-1) that maps
@@ -2493,24 +2511,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // Torn-dictionary guard. Decode the delta start unconditionally (-1 for a
-        // non-delta frame); the guard MUST run even when deltaDictEnabled is false.
-        // A disk slot recovered with its persisted dictionary unavailable
-        // (PersistedSymbolDict.open() returned null -- fd exhaustion, a read-only
-        // remount, ENOSPC) reports deltaDictEnabled=false, yet its recorded frames
-        // are still DELTA frames (deltaStart > 0). Replaying those against a fresh
-        // empty-dictionary server would null-pad the missing ids and SILENTLY
-        // corrupt the table -- precisely what this guard exists to prevent -- so it
-        // cannot be gated on the very flag that goes false in that failure mode. In
-        // normal operation a delta frame's start id never exceeds the dictionary
-        // coverage established so far (replayed frames overlap the catch-up dict;
-        // fresh frames extend it contiguously), so a gap here means the recovered
-        // dictionary is incomplete (a host/power crash that lost recently-written
-        // entries, SF being process-crash but not host-crash durable). Fail
-        // terminally; the unreplayable data must be resent. Full-dict / fallback
-        // frames carry deltaStart=0 with sentDictCount=0, so 0 > 0 never
-        // false-positives; only the sent-dictionary mirror below stays gated on
-        // deltaDictEnabled.
+        // Torn-dictionary guard. sentDictCount is this loop's model of how many ids
+        // the CURRENT server has been told about: seeded from the persisted
+        // dictionary, re-registered by the catch-up, and extended by
+        // accumulateSentDict as each frame goes out. A frame whose delta starts ABOVE
+        // that coverage references ids the server was never given; replaying it would
+        // make the server null-pad the hole (QwpMessageCursor grows the dict with
+        // nulls to deltaStart+deltaCount) and land rows with SILENTLY NULL symbols.
+        // Fail terminally instead; the unreplayable data must be resent.
+        //
+        // The guard, the mirror and the catch-up are ONE mechanism and are all
+        // ungated (see the constructor). A frame at deltaStart == sentDictCount is
+        // contiguous and extends the coverage, so a slot whose frames start at id 0
+        // replays cleanly with no persisted dictionary at all -- which is exactly why
+        // the mirror below must keep advancing even when the dictionary is missing.
+        // A gap here therefore means genuine loss: a host/power crash tore the
+        // unsynced .symbol-dict below the ids the surviving frames still reference
+        // (SF is process-crash but not host-crash durable).
         int deltaStart = frameDeltaStart(frameAddr, payloadLen);
         if (deltaStart > sentDictCount) {
             recordFatal(new LineSenderException(
@@ -2530,10 +2547,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // key their poison-strike vs pre-send decision off this, not off nextWireSeq
         // (which the catch-up advances).
         dataFrameSentThisConnection = true;
-        if (deltaDictEnabled && deltaStart >= 0) {
-            // Mirror the symbols this frame introduced so a later reconnect can
-            // rebuild the whole dictionary. Idempotent on replay: a frame whose
-            // delta we already hold advances nothing.
+        if (deltaStart >= 0) {
+            // Mirror the symbols this frame just registered on the server, so a later
+            // reconnect can rebuild the whole dictionary and the guard above keeps an
+            // accurate view of the server's coverage. Idempotent on replay: a frame
+            // whose delta we already hold advances nothing.
+            //
+            // Ungated (see the constructor): this is the ONLY thing that advances
+            // sentDictCount from the frames themselves, so gating it while leaving the
+            // guard ungated froze the coverage at 0 and terminal'd a slot that replays
+            // perfectly from id 0.
             accumulateSentDict(frameAddr, payloadLen, deltaStart);
         }
         lastFrameOrPingNanos = System.nanoTime();
