@@ -1965,6 +1965,23 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsRawDotSegments() throws Exception {
+        // a RAW (unencoded) ".." or "." path segment carries no '%' or '\' (so endpointPathHasEncodedSeparator
+        // passes it) and no '?'/'#'/control (so Endpoint.parse accepts it), yet a lenient server normalizes
+        // .../realms/acme/../evil/token to a different realm - so the segment scan in isEndpointUnderIssuerPath
+        // must reject a bare '.'/'..' segment. Every OTHER traversal test feeds a percent-encoded or '#'/'?'
+        // form caught by an earlier gate; only these bare-dot cases exercise that dot-segment loop.
+        String issuer = "https://idp.example.com/realms/acme";
+        // control: a genuine sub-path endpoint stays accepted (proves the check is not rejecting everything)
+        Assert.assertTrue(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/token", issuer));
+        // a parent-traversal segment escapes the issuer path once the server normalizes it -> rejected
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/../evil/token", issuer));
+        // a single-dot segment and a mix are likewise normalized away and must not slip the scan
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/./../evil/token", issuer));
+        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/./acme/token", issuer));
+    }
+
+    @Test(timeout = 30_000)
     public void testIssuerPathScopingRejectsSplitEncodedAndBackslashSeparators() throws Exception {
         // hardening: an encoded path separator can hide behind a SPLIT encoding (%2%66 -> %2f -> '/') or a
         // double encoding (%252f), and a literal backslash is folded to '/' by decodePathSegments. Each lets an

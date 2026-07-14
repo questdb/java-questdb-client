@@ -321,6 +321,71 @@ public class WebSocketTokenProviderTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testCredentialFailureTimerResetsAcrossTransientReconnectFailures() throws Exception {
+        assertMemoryLeak(() -> {
+            // The SF credential terminal budget must accumulate only across an UNINTERRUPTED run of
+            // credential-acquisition failures: a transient reconnect failure (here a 421 role reject) between
+            // credential blips must RESET the timer, so a provider that fails only intermittently - interleaved
+            // with transport/role failures - never terminates the sender even when the total credential-failing
+            // span far exceeds the reconnect budget. Without the reset (credentialFailingSinceNanos = 0L on the
+            // transport / role-mismatch catch) the credential blips accumulate and terminate the sender at the
+            // budget, so batch 2 would never land.
+            AtomicInteger calls = new AtomicInteger();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                long budgetMillis = 800; // short: WITHOUT the reset, accumulation terminates well before recovery
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .reconnectInitialBackoffMillis(20)
+                        .reconnectMaxBackoffMillis(20)
+                        .reconnectMaxDurationMillis(budgetMillis)
+                        .httpTokenProvider(() -> {
+                            int n = calls.incrementAndGet();
+                            // call 1: the initial connect (must succeed). Then alternate on every reconnect
+                            // attempt: even calls THROW (a credential blip -> timer starts), odd calls RETURN a
+                            // valid token (whose connect then hits the transient 421 role reject below -> the
+                            // role-mismatch catch RESETS the timer). So credential blips and role rejects strictly
+                            // alternate: the timer is set then reset each cycle and never approaches the budget.
+                            if (n > 1 && n % 2 == 0) {
+                                throw new OidcAuthException("transient: a silent refresh failed");
+                            }
+                            return "TOKEN-" + n;
+                        })
+                        .build()) {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    // reject every NEW handshake with a transient 421 role reject BEFORE the drop, so the
+                    // reconnect attempts deterministically hit it (no race where a reconnect succeeds first). The
+                    // already-established initial connection is unaffected and still ships batch 1.
+                    server.setRejectWithRole("replica");
+                    // batch 1 lands on the established connection and is ACKed, then the server drops the socket
+                    // -> the background reconnect loop starts and enters the credential-blip / role-reject cycle
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
+
+                    // let the interleaved credential + role failures run for well over the budget; if the reset
+                    // were broken the credential blips would accumulate and terminate the sender by now
+                    Thread.sleep(budgetMillis * 3);
+
+                    // clear the reject: the next token-returning reconnect attempt now succeeds. The sender must
+                    // still be alive (never terminated during the reject phase), so batch 2 lands.
+                    server.setRejectWithRole(null);
+                    sender.table("foo").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
+                    Assert.assertTrue("the provider must have been re-queried across the reconnect phase, got " + calls.get(),
+                            calls.get() >= 4);
+                }
+            }
+        });
+    }
+
     @Test
     public void testUsernamePasswordStillSuppliedOverWebSocket() throws Exception {
         assertMemoryLeak(() -> {

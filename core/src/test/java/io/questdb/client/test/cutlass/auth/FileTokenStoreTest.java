@@ -736,11 +736,24 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
-            Files.createDirectories(dir);
-            byte[] big = new byte[(1 << 20) + 1];
-            java.util.Arrays.fill(big, (byte) ' ');
-            Files.write(tokenFile(dir, key), big);
-            Assert.assertNull(store.load(key));
+            // Baseline: a normal, fingerprint-matching token loads. This proves the oversized file below is
+            // rejected by the size cap ALONE, not by a fingerprint/version/parse mismatch (the flaw in the old
+            // all-spaces file, which parsed to version 0 and would return null even with the cap removed).
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("a normal valid token must load", store.load(key));
+            // A valid, fingerprint-matching token whose two large fields push the FILE past MAX_FILE_BYTES
+            // (1 MiB) while each field stays under the per-value lexer limit (also 1 MiB), so without the size
+            // cap this parses and loads. readBounded caps on channel.size() before reading, so the oversized
+            // file is rejected up front - the real point of the cap (avoid an unbounded read / OOM on an
+            // attacker-grown file), which the guard now demonstrably enforces.
+            char[] big = new char[600_000];
+            Arrays.fill(big, 'a');
+            String bigField = new String(big);
+            store.save(key, sampleToken(bigField, bigField));
+            Assert.assertTrue("the test file must exceed the 1 MiB size cap to isolate it",
+                    Files.size(tokenFile(dir, key)) > (1 << 20));
+            Assert.assertNull("an oversized but otherwise valid, fingerprint-matching file must be rejected by the size cap",
+                    store.load(key));
         });
     }
 
@@ -749,13 +762,20 @@ public class FileTokenStoreTest {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
             Files.createDirectories(dir);
-            FileTokenStore store = new FileTokenStore(dir, 2000, 100);
+            // Stale window 60s, lock backdated only 10s: a STAMPED (readable) lock this fresh would NOT be
+            // stolen (10s < 60s). So the steal below can only happen because the oversized lock reads as
+            // unreadable/null via MAX_LOCK_FILE_BYTES and is stolen on the shorter empty-lock grace (5s < 10s).
+            // This isolates the read cap: remove it and readLockHolder reads the 64 KiB as a live stamp -> the
+            // lock is judged fresh, not stolen, acquisition degrades lock-free, and the lock file is NOT
+            // released, failing the Files.exists assertion below. The old 100ms window stole on staleness
+            // regardless of the cap, so the cap was untested.
+            FileTokenStore store = new FileTokenStore(dir, 2000, 60_000);
             TokenStoreKey key = sampleKey();
             Path lock = lockFile(dir, key);
-            // a corrupt/hostile lock far larger than the read cap, backdated past the staleness window. The
-            // steal reads the owner stamp with a hard cap (not Files.readAllBytes, which on an attacker-grown
-            // lock could OutOfMemoryError on the refresh path): a bounded read reports an oversized lock as
-            // unreadable, which the steal treats as abandoned junk - it must still acquire, not wedge.
+            // a corrupt/hostile lock far larger than the read cap. The steal reads the owner stamp with a hard
+            // cap (not Files.readAllBytes, which on an attacker-grown lock could OutOfMemoryError on the refresh
+            // path): a bounded read reports an oversized lock as unreadable, which the steal treats as abandoned
+            // junk - it must still acquire, not wedge.
             byte[] huge = new byte[64 * 1024];
             Arrays.fill(huge, (byte) 'x');
             Files.write(lock, huge);

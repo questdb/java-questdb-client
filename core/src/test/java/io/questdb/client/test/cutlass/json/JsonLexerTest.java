@@ -742,6 +742,44 @@ public class JsonLexerTest {
     }
 
     @Test
+    public void testUnicodeEscapeWithNonAsciiCharInWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            // a backslash-u escape whose four-hex window's first char is a non-ASCII code point, fed as the
+            // valid UTF-8 a hostile IdP response would carry (0xC3 0xA9 -> U+00E9, 233). parseHex4 indexes
+            // Numbers.hexNumbers (int[128]) only behind a c<128 guard, so 233 is a non-hex digit and the escape
+            // is kept verbatim (lenient), not decoded. WITHOUT the guard, hexNumbers[233] throws an
+            // ArrayIndexOutOfBoundsException that escapes as an unchecked exception - the OIDC callers catch
+            // only JsonException - so this pins that the guard is present.
+            byte[] bytes = {'{', '"', 'v', '"', ':', '"', 'x', '\\', 'u',
+                    (byte) 0xC3, (byte) 0xA9, // valid UTF-8 for U+00E9 (e-acute); lands right after the backslash-u
+                    'A', 'B', 'C', 'y', '"', '}'};
+            int len = bytes.length;
+            long address = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+            StringSink captured = new StringSink();
+            JsonParser parser = (code, tag, position) -> {
+                if (code == JsonLexer.EVT_VALUE) {
+                    captured.clear();
+                    captured.put(tag);
+                }
+            };
+            try {
+                for (int i = 0; i < len; i++) {
+                    Unsafe.getUnsafe().putByte(address + i, bytes[i]);
+                }
+                try (JsonLexer lexer = new JsonLexer(4, 1024)) {
+                    lexer.parse(address, address + len, parser);
+                    lexer.parseLast();
+                    // the escape stayed literal (lenient): x, then a verbatim backslash-u, then the decoded
+                    // e-acute (U+00E9), then ABCy
+                    TestUtils.assertEquals("x\\u\u00e9ABCy", captured);
+                }
+            } finally {
+                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testStringEscapesExoticAndLenient() throws Exception {
         assertMemoryLeak(() -> {
             String bs = String.valueOf((char) 92); // a single backslash, built without a literal escape
