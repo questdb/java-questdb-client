@@ -45,9 +45,9 @@ import java.util.concurrent.TimeUnit;
 public class CursorSendEngineCrashConsistencyTest {
 
     @Test
-    public void testCloseDurabilityOrderAndSyncFailurePropagation() throws Exception {
+    public void testCloseDurabilityOrderAndPostCleanupSyncFailurePropagation() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            for (int failAt : new int[]{-1, 0, 1, 2, 4}) {
+            for (int failAt : new int[]{-1, 4}) {
                 String root = Paths.get(System.getProperty("java.io.tmpdir"),
                         "qdb-close-crash-" + failAt + "-" + System.nanoTime()).toString();
                 String slot = root + "/slot";
@@ -69,24 +69,16 @@ public class CursorSendEngineCrashConsistencyTest {
                     ff.beginClose();
                     try {
                         engine.close();
-                        if (failAt >= 0 && failAt != 3) {
+                        if (failAt >= 0) {
                             Assert.fail("sync failure was swallowed at boundary " + failAt);
                         }
                     } catch (IllegalStateException expected) {
-                        Assert.assertTrue("unexpected close failure: " + expected,
-                                failAt >= 0 && failAt != 3);
+                        Assert.assertTrue("unexpected close failure: " + expected, failAt >= 0);
                     }
                     engine = null;
 
-                    if (failAt >= 0 && failAt <= 2) {
-                        Assert.assertFalse("segment deletion started after watermark barrier failure",
-                                ff.events.contains("segment-remove"));
-                        Assert.assertTrue("watermark was removed after its durability barrier failed",
-                                Files.exists(slot + "/" + AckWatermark.FILE_NAME));
-                    } else {
-                        Assert.assertFalse("simulated crash replays acknowledged rows at boundary " + failAt,
-                                ff.durableSegments && !ff.durableWatermark);
-                    }
+                    Assert.assertFalse("simulated crash replays acknowledged rows at boundary " + failAt,
+                            ff.durableSegments && !ff.durableWatermark);
                     if (failAt == -1) {
                         Assert.assertEquals(Arrays.asList("watermark-msync", "watermark-fsync",
                                         "dir-fsync", "segment-remove", "dir-fsync", "watermark-remove"),
@@ -105,6 +97,138 @@ public class CursorSendEngineCrashConsistencyTest {
         });
     }
 
+    @Test
+    public void testFinalWatermarkBarrierFailureRetainsSlotUntilRetry() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            for (String barrier : Arrays.asList("watermark-msync", "watermark-fsync", "dir-fsync")) {
+                String root = Paths.get(System.getProperty("java.io.tmpdir"),
+                        "qdb-close-barrier-" + barrier + "-" + System.nanoTime()).toString();
+                String slot = root + "/slot";
+                SegmentManager manager = null;
+                CursorSendEngine predecessor = null;
+                CursorSendEngine successor = null;
+                CrashImageFilesFacade ff = null;
+                long payload = 0;
+                Throwable failure = null;
+                try {
+                    Assert.assertEquals(0, Files.mkdir(root, Files.DIR_MODE_DEFAULT));
+                    ff = new CrashImageFilesFacade(slot, -1);
+                    long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+                    manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60),
+                            SegmentManager.UNLIMITED_TOTAL_BYTES, ff);
+                    payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+                    predecessor = new CursorSendEngine(slot, segmentSize, manager);
+                    Unsafe.getUnsafe().setMemory(payload, 32, (byte) 7);
+                    Assert.assertEquals(0L, predecessor.appendBlocking(payload, 32));
+                    Assert.assertTrue(predecessor.acknowledge(0L));
+
+                    ff.failPersistently(barrier);
+                    try {
+                        predecessor.close();
+                        Assert.fail("expected close to report failed final barrier " + barrier);
+                    } catch (IllegalStateException expected) {
+                        Assert.assertTrue("unexpected close failure: " + expected,
+                                expected.getMessage().contains("ack watermark")
+                                        || expected.getMessage().contains("slot directory"));
+                    }
+                    try {
+                        successor = new CursorSendEngine(slot, segmentSize, manager);
+                        Assert.fail("successor acquired a slot whose final ACK barrier failed: " + barrier);
+                    } catch (IllegalStateException expected) {
+                        Assert.assertTrue("successor failed for the wrong reason: " + expected,
+                                expected.getMessage().contains("slot already in use"));
+                    }
+
+                    ff.clearPersistentFailure();
+                    awaitCloseCompleted(predecessor);
+                    predecessor = null;
+
+                    successor = new CursorSendEngine(slot, segmentSize, manager);
+                    Assert.assertEquals("successful retry must leave no ACKed frame to replay",
+                            -1L, successor.publishedFsn());
+                    successor.close();
+                    Assert.assertTrue(successor.isCloseCompleted());
+                    successor = null;
+                } catch (Throwable t) {
+                    failure = t;
+                } finally {
+                    if (failure != null && ff != null) {
+                        // Let a retained predecessor converge before cleanup.
+                        // The exact red assertion remains attached to failure.
+                        ff.clearPersistentFailure();
+                    }
+                    failure = closeEngine(failure, successor);
+                    failure = closeEngine(failure, predecessor);
+                    failure = closeManager(failure, manager);
+                    failure = freePayload(failure, payload);
+                    failure = removeRoot(failure, root);
+                }
+                rethrow(failure);
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveredSlotRejectsMissingWatermark() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String root = Paths.get(System.getProperty("java.io.tmpdir"),
+                    "qdb-missing-watermark-" + System.nanoTime()).toString();
+            String slot = root + "/slot";
+            SegmentManager manager = null;
+            CursorSendEngine predecessor = null;
+            CursorSendEngine successor = null;
+            long payload = 0;
+            Throwable failure = null;
+            try {
+                Assert.assertEquals(0, Files.mkdir(root, Files.DIR_MODE_DEFAULT));
+                CrashImageFilesFacade ff = new CrashImageFilesFacade(slot, -1);
+                long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+                manager = new SegmentManager(segmentSize, TimeUnit.SECONDS.toNanos(60),
+                        SegmentManager.UNLIMITED_TOTAL_BYTES, ff);
+                payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+                predecessor = new CursorSendEngine(slot, segmentSize, manager);
+                Unsafe.getUnsafe().setMemory(payload, 32, (byte) 7);
+                Assert.assertEquals(0L, predecessor.appendBlocking(payload, 32));
+                Assert.assertTrue(predecessor.acknowledge(0L));
+                ff.beginClose();
+                ff.blockSegmentRemove = true;
+                predecessor.close();
+                Assert.assertTrue(predecessor.isCloseCompleted());
+                predecessor = null;
+                Assert.assertTrue("precondition: ACKed segment residue must survive",
+                        Files.exists(slot + "/sf-initial.sfa"));
+
+                ff.failWatermarkOpen = true;
+                try {
+                    successor = new CursorSendEngine(slot, segmentSize, manager);
+                    Assert.fail("recovered disk slot started without a usable ACK watermark");
+                } catch (IllegalStateException expected) {
+                    Assert.assertTrue("successor failed for the wrong reason: " + expected,
+                            expected.getMessage().contains("ack watermark"));
+                }
+
+                ff.failWatermarkOpen = false;
+                ff.blockSegmentRemove = false;
+                successor = new CursorSendEngine(slot, segmentSize, manager);
+                Assert.assertTrue(successor.wasRecoveredFromDisk());
+                Assert.assertTrue("successor exposes predecessor's ACKed frame",
+                        successor.ackedFsn() >= successor.publishedFsn());
+                successor.close();
+                Assert.assertTrue(successor.isCloseCompleted());
+                successor = null;
+            } catch (Throwable t) {
+                failure = t;
+            } finally {
+                failure = closeEngine(failure, successor);
+                failure = closeEngine(failure, predecessor);
+                failure = closeManager(failure, manager);
+                failure = freePayload(failure, payload);
+                failure = removeRoot(failure, root);
+            }
+            rethrow(failure);
+        });
+    }
+
     private static Throwable addCleanupFailure(Throwable failure, Throwable cleanupFailure) {
         if (failure == null) {
             return cleanupFailure;
@@ -113,6 +237,14 @@ public class CursorSendEngineCrashConsistencyTest {
             failure.addSuppressed(cleanupFailure);
         }
         return failure;
+    }
+
+    private static void awaitCloseCompleted(CursorSendEngine engine) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!engine.isCloseCompleted() && System.nanoTime() < deadline) {
+            Thread.yield();
+        }
+        Assert.assertTrue("close retry did not complete", engine.isCloseCompleted());
     }
 
     private static Throwable closeEngine(Throwable failure, CursorSendEngine engine) {
@@ -196,9 +328,12 @@ public class CursorSendEngineCrashConsistencyTest {
         private final int failAt;
         private final String slot;
         private boolean active;
+        private boolean blockSegmentRemove;
         private boolean durableSegments = true;
         private boolean durableWatermark;
         private int eventIndex;
+        private boolean failWatermarkOpen;
+        private String persistentFailure;
         private int watermarkFd = -1;
 
         private CrashImageFilesFacade(String slot, int failAt) {
@@ -212,9 +347,20 @@ public class CursorSendEngineCrashConsistencyTest {
             eventIndex = 0;
         }
 
+        private void clearPersistentFailure() {
+            persistentFailure = null;
+        }
+
         private boolean fail(String event) {
             events.add(event);
-            return eventIndex++ == failAt;
+            return event.equals(persistentFailure) || eventIndex++ == failAt;
+        }
+
+        private void failPersistently(String event) {
+            active = true;
+            events.clear();
+            eventIndex = 0;
+            persistentFailure = event;
         }
 
         @Override
@@ -269,6 +415,7 @@ public class CursorSendEngineCrashConsistencyTest {
         }
         @Override
         public int openCleanRW(String path) {
+            if (failWatermarkOpen && path.equals(slot + "/" + AckWatermark.FILE_NAME)) return -1;
             int fd = INSTANCE.openCleanRW(path);
             if (path.equals(slot + "/" + AckWatermark.FILE_NAME)) watermarkFd = fd;
             return fd;
@@ -277,6 +424,7 @@ public class CursorSendEngineCrashConsistencyTest {
         public int openCleanRW(long pathPtr) { return INSTANCE.openCleanRW(pathPtr); }
         @Override
         public int openRW(String path) {
+            if (failWatermarkOpen && path.equals(slot + "/" + AckWatermark.FILE_NAME)) return -1;
             int fd = INSTANCE.openRW(path);
             if (path.equals(slot + "/" + AckWatermark.FILE_NAME)) watermarkFd = fd;
             return fd;
@@ -290,7 +438,7 @@ public class CursorSendEngineCrashConsistencyTest {
         @Override
         public boolean remove(String path) {
             if (active && path.endsWith(".sfa")) {
-                if (fail("segment-remove")) return false;
+                if (blockSegmentRemove || fail("segment-remove")) return false;
             } else if (active && path.equals(slot + "/" + AckWatermark.FILE_NAME)) {
                 if (fail("watermark-remove")) return false;
             }

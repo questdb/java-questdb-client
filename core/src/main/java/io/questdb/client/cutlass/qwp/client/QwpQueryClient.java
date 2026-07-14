@@ -165,6 +165,10 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
+    // Deterministic lifecycle barrier used by facade shutdown tests. Null in
+    // production; close() clears and invokes it after winning close ownership
+    // without allowing hook failures to prevent resource teardown.
+    private volatile Runnable beforeCloseHook;
     // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
     // the OS connect timeout.
     private int connectTimeoutMs = 0;
@@ -620,6 +624,16 @@ public class QwpQueryClient implements QuietCloseable {
             // scratch, double-freeing it.
             return;
         }
+        Runnable hook = beforeCloseHook;
+        beforeCloseHook = null;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (Throwable ignored) {
+                // Omit diagnostics for this test-only hook: even rendering its
+                // failure must not prevent production resource cleanup.
+            }
+        }
         connected = false;
         lastCloseTimedOut = false;
         try {
@@ -1002,6 +1016,11 @@ public class QwpQueryClient implements QuietCloseable {
         synchronized (failoverRandom) {
             failoverRandom.setSeed(seed);
         }
+    }
+
+    @TestOnly
+    public void setBeforeCloseHookForTest(Runnable hook) {
+        beforeCloseHook = hook;
     }
 
     /**

@@ -128,11 +128,12 @@ public final class CursorSendEngine implements QuietCloseable {
     // range with a cumulative self-acknowledge once everything below is
     // server-acked (CursorWebSocketSendLoop.tryRetireOrphanTail).
     private long recoveredOrphanTipFsn = -1L;
-    // Engine-owned mmap'd watermark file. {@code null} in memory mode and
-    // in disk mode if open() failed (we proceed without it; recovery just
-    // falls back to lowestBase - 1). Lifetime tied to the engine: opened
-    // in the constructor, closed by {@link #close()}. The segment manager
-    // writes through this on every tick where ackedFsn has advanced.
+    // Engine-owned mmap'd watermark file. {@code null} only in memory mode;
+    // disk mode fails construction unless the watermark is usable because
+    // segment-derived recovery cannot distinguish acknowledged residue from
+    // replayable frames. Lifetime tied to the engine: opened in the
+    // constructor, closed by {@link #close()}. The segment manager writes
+    // through this on every tick where ackedFsn has advanced.
     private final AckWatermark watermark;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
@@ -179,6 +180,11 @@ public final class CursorSendEngine implements QuietCloseable {
     // With the CAS the worker's cleanup never blocks, so the join returns as
     // soon as the pass ends.
     private final AtomicBoolean terminalCleanupClaimed = new AtomicBoolean();
+    // True only after a quiescent close reached the final watermark barrier
+    // and that barrier failed. It permits the shared retry driver to claim
+    // terminal cleanup; false while cleanup is merely waiting for manager
+    // quiescence, where an independent retry would race the live worker.
+    private volatile boolean terminalCleanupRetryReady;
     // Published only after ring/watermark/unlink cleanup is finished. A close
     // that loses terminalCleanupClaimed may retry the flock only after this
     // becomes true, otherwise it could expose the slot while cleanup is live.
@@ -337,14 +343,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 //   - trim ran before persist: segments are gone (so
                 //     lowestBase is higher than watermark), watermark
                 //     is stale; max picks lowestBase - 1.
-                // open() returns null on any setup failure so a missing
-                // mmap doesn't take down the engine -- we just fall
-                // back to the bare lowestBase - 1 seed.
+                // Segment-derived state cannot tell whether frames in the
+                // lowest surviving segment were acknowledged. Starting
+                // without the watermark would therefore expose acknowledged
+                // residue for replay, so disk recovery must fail closed when
+                // the file cannot be opened or mapped.
                 watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
+                if (watermarkInProgress == null) {
+                    throw new IllegalStateException(
+                            "could not open required ack watermark for SF slot " + sfDir);
+                }
                 long baseSeed = lowestBase - 1;
-                long watermarkFsn = watermarkInProgress != null
-                        ? watermarkInProgress.read()
-                        : AckWatermark.INVALID;
+                long watermarkFsn = watermarkInProgress.read();
                 // Reject watermarks past publishedFsn: a correctly
                 // operating prior session cannot have produced one, so
                 // a value above the on-disk frame ceiling is corruption
@@ -393,6 +403,10 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (!memoryMode) {
                     AckWatermark.removeOrphan(filesFacade, sfDir);
                     watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
+                    if (watermarkInProgress == null) {
+                        throw new IllegalStateException(
+                                "could not open required ack watermark for SF slot " + sfDir);
+                    }
                 }
                 MmapSegment initial;
                 String initialPath = null;
@@ -782,35 +796,36 @@ public final class CursorSendEngine implements QuietCloseable {
      * against a close() that holds the monitor while joining the worker.
      */
     private void finishClose(boolean fullyDrained) {
+        // On a fully-drained close, persist the final acked FSN through the
+        // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
+        // unlinking any segment file. The manager persists the watermark only
+        // on its own tick, so it may lag the final ack. If any part of this
+        // covering barrier fails, retain the ring, watermark and slot flock:
+        // publishing the slot would let a successor recover acknowledged
+        // residue from a stale durable watermark. The shared retry driver owns
+        // convergence after the one-shot public close reports the failure.
+        if (fullyDrained && watermark != null) {
+            try {
+                long finalAckedFsn = ring.ackedFsn();
+                if (finalAckedFsn >= 0) {
+                    watermark.write(finalAckedFsn);
+                    watermark.sync();
+                    if (filesFacade.fsyncDir(sfDir) != 0) {
+                        throw new IllegalStateException(
+                                "could not fsync SF slot directory before segment cleanup");
+                    }
+                }
+            } catch (RuntimeException | Error e) {
+                terminalCleanupRetryReady = true;
+                terminalCleanupClaimed.set(false);
+                startFlockReleaseRetry();
+                throw e;
+            }
+        }
+        terminalCleanupRetryReady = false;
+
         try {
             RuntimeException durabilityFailure = null;
-            // On a fully-drained close, persist the final acked FSN through
-            // the still-mapped watermark BEFORE closing the ring/watermark
-            // and BEFORE unlinking any segment file. The manager persists
-            // the watermark only on its own tick, so it may lag the final
-            // ack. If the unlink below then fails (or the process dies
-            // mid-unlink), residual acknowledged .sfa files without an
-            // up-to-date watermark would seed the successor's recovery at
-            // lowestBase - 1 and replay already-acknowledged rows --
-            // duplicates on a non-DEDUP table. The write is a single mmap
-            // store, so it succeeds even when the unlink is about to fail
-            // (e.g. the slot dir turned read-only). Quiescence is already
-            // established here, so no manager tick can race this write.
-            if (fullyDrained && watermark != null) {
-                try {
-                    long finalAckedFsn = ring.ackedFsn();
-                    if (finalAckedFsn >= 0) {
-                        watermark.write(finalAckedFsn);
-                        watermark.sync();
-                        if (filesFacade.fsyncDir(sfDir) != 0) {
-                            throw new IllegalStateException(
-                                    "could not fsync SF slot directory before segment cleanup");
-                        }
-                    }
-                } catch (RuntimeException e) {
-                    durabilityFailure = e;
-                }
-            }
             try {
                 ring.close();
             } catch (Throwable ignored) {
@@ -829,7 +844,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
-            if (fullyDrained && watermark != null && durabilityFailure == null) {
+            if (fullyDrained && watermark != null) {
                 boolean segmentsRemoved = false;
                 try {
                     segmentsRemoved = unlinkAllSegmentFiles(filesFacade, sfDir);
@@ -852,17 +867,15 @@ public final class CursorSendEngine implements QuietCloseable {
                             + "engine on this slot recovers them as fully acked and retries the "
                             + "unlink on its own close", sfDir);
                 }
-            } else if (fullyDrained && watermark == null && sfDir != null) {
-                LOG.warn("close-time segment cleanup skipped on slot {} because no ack watermark "
-                        + "is available to cover a host crash during unlink", sfDir);
             }
             if (durabilityFailure != null) {
                 throw durabilityFailure;
             }
         } finally {
-            // Reaching finishClose at all requires established quiescence, so
-            // releasing the flock is safe even if a step above threw. Leaking
-            // it would strand the slot until process exit for no reason.
+            // The final watermark covering barrier has succeeded, so terminal
+            // resources can be released even if later best-effort cleanup or
+            // its post-unlink directory sync failed. The durable watermark
+            // still covers any segment a host crash restores.
             //
             // ORDER MATTERS: explicitly release the flock, verify it, and
             // only then publish closeCompleted. Pools read isCloseCompleted()
@@ -973,7 +986,19 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     private boolean retryFlockReleaseIfReady() {
-        if (closeCompleted || !terminalResourcesCleaned) {
+        if (closeCompleted) {
+            return true;
+        }
+        if (!terminalResourcesCleaned) {
+            if (!terminalCleanupRetryReady
+                    || !terminalCleanupClaimed.compareAndSet(false, true)) {
+                return false;
+            }
+            try {
+                finishClose(fullyDrainedForDeferredClose);
+            } catch (Throwable ignored) {
+                return false;
+            }
             return closeCompleted;
         }
         boolean released;
@@ -1091,8 +1116,8 @@ public final class CursorSendEngine implements QuietCloseable {
             }
         }
         if (startFailure == null) {
-            LOG.error("SF slot flock release failed during engine close; keeping "
-                            + "closeCompleted=false and retrying on the shared driver so "
+            LOG.error("SF terminal cleanup or slot flock release failed during engine close; "
+                            + "keeping closeCompleted=false and retrying on the shared driver so "
                             + "retired capacity recovers after the transient failure [slot={}]",
                     sfDir == null ? "<memory>" : sfDir);
         } else {
@@ -1141,10 +1166,11 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * Re-arms the shared flock-release retry for an engine whose terminal
-     * cleanup finished but whose confirmed flock release is still pending
-     * and no longer scheduled — the retry driver thread failed to start when
-     * the release first failed (e.g. OOM at thread creation).
+     * Re-arms the shared terminal retry for an engine whose final watermark
+     * barrier or confirmed flock release is still pending and no longer
+     * scheduled because the retry driver thread failed to start (e.g. OOM at
+     * thread creation). A close still waiting for worker quiescence cannot be
+     * retried here because terminal cleanup may not race that worker.
      * {@code Sender.close()} is one-shot by contract, so pool probes
      * ({@code QwpWebSocketSender.isSlotLockReleased()}) call this to keep a
      * retired slot's capacity recoverable instead of lost until process
@@ -1153,10 +1179,9 @@ public final class CursorSendEngine implements QuietCloseable {
      * may call it under their capacity lock.
      */
     public void ensureFlockReleaseRetryScheduled() {
-        if (closeCompleted || !terminalResourcesCleaned) {
-            return;
+        if (!closeCompleted && (terminalResourcesCleaned || terminalCleanupRetryReady)) {
+            startFlockReleaseRetry();
         }
-        startFlockReleaseRetry();
     }
 
     /**

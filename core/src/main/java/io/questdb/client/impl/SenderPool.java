@@ -107,6 +107,10 @@ public final class SenderPool implements AutoCloseable {
     private final ArrayList<SenderSlot> all;
     private final ArrayDeque<SenderSlot> available;
     private final String configurationString;
+    // Signals completion of internally owned creation lifecycles. Kept
+    // separate from slotReleased so a capacity waiter cannot consume the only
+    // wakeup intended for close().
+    private final Condition creationFinished;
     // User-supplied ingest callbacks, shared across every pooled Sender this
     // pool builds. Null -> each sender keeps its loud-not-silent default.
     private final SenderConnectionListener connectionListener;
@@ -369,6 +373,7 @@ public final class SenderPool implements AutoCloseable {
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
         this.retiredSlots = new ArrayList<>(maxSize);
+        this.creationFinished = lock.newCondition();
         this.slotReleased = lock.newCondition();
         // Probe the config once, up front: this validates it eagerly (so a
         // bad config fails at construction even when minSize == 0) and tells
@@ -810,33 +815,26 @@ public final class SenderPool implements AutoCloseable {
                         // idempotent, so undoing the reservation for any
                         // throwable is safe.
                         lock.lock();
-                        inFlightCreations--;
-                        freeSlotIndex(slotIndex);
-                        slotReleased.signal();
-                        lock.unlock();
+                        try {
+                            inFlightCreations--;
+                            freeSlotIndex(slotIndex);
+                            creationFinished.signalAll();
+                            slotReleased.signal();
+                        } finally {
+                            lock.unlock();
+                        }
                         throw e;
                     }
                     lock.lock();
-                    inFlightCreations--;
                     if (closed) {
-                        // Pool was closed mid-creation -- destroy the new connection
-                        // rather than leaking it. Other waiters have been signaled
-                        // by close() already. The delegate is closed OUTSIDE the
-                        // lock (mirroring retireLease): its close() can block for
-                        // seconds (bounded ack drain, drainer-pool wind-down) or
-                        // longer (unbounded I/O-thread latch await behind an
-                        // OS-level connect), which held here would stall close(),
-                        // giveBack/retireLease and reapIdle behind the pool lock.
-                        // Accounting first, under the lock: for an SF slot the
-                        // index reservation moves from inFlightCreations to
-                        // closingSlots until the close below releases the flock,
-                        // and pendingLeaseTeardowns keeps the out-of-lock close
-                        // visible to close()'s outstanding-teardown wait.
+                        // Pool was closed mid-creation. Keep inFlightCreations
+                        // reserved while the delegate is closed outside the
+                        // lock: close() waits on that counter, so the creation
+                        // remains internally owned until its teardown completes.
                         boolean reserved = created.slotIndex() >= 0;
                         if (reserved) {
                             closingSlots++;
                         }
-                        pendingLeaseTeardowns++;
                         lock.unlock();
                         try {
                             created.delegate().close();
@@ -844,23 +842,24 @@ public final class SenderPool implements AutoCloseable {
                             // Best-effort: an Error (e.g. -ea AssertionError)
                             // from teardown must not mask the closed-pool signal.
                         } finally {
-                            // Re-lock to reclaim the SF slot index and signal a
-                            // close() waiting on this teardown. MUST run even if
-                            // the delegate close threw, otherwise the slot stays
-                            // reserved forever and close() waits out its full
-                            // budget on a teardown that already happened.
                             lock.lock();
-                            pendingLeaseTeardowns--;
-                            if (reserved) {
-                                reclaimSlot(created, " after closed-mid-creation teardown");
+                            try {
+                                if (reserved) {
+                                    reclaimSlot(created, " after closed-mid-creation teardown");
+                                }
+                                inFlightCreations--;
+                                creationFinished.signalAll();
+                                slotReleased.signalAll();
+                            } finally {
+                                lock.unlock();
                             }
-                            slotReleased.signalAll();
-                            lock.unlock();
                         }
                         throw new LineSenderException("QuestDB handle is closed");
                     }
                     all.add(created);
                     created.bumpGeneration();
+                    inFlightCreations--;
+                    creationFinished.signalAll();
                     return new PooledSender(created, created.generation());
                 }
                 // Capacity-starved: re-probe retired slots BEFORE the terminal
@@ -938,6 +937,8 @@ public final class SenderPool implements AutoCloseable {
      * free their native memory under its feet -- a use-after-free / SEGV, not
      * an exception (C1). Instead:
      * <ol>
+     * <li>waits for every internally owned creation to publish or complete its
+     * closed-mid-creation teardown; then</li>
      * <li>waits boundedly (up to {@code acquireTimeoutMillis}, hard-capped at
      * {@link #MAX_CLOSE_LEASE_WAIT_MILLIS}) for outstanding leases to come home -- {@link #giveBack} and {@link #discardBroken}
      * observe {@code closed} and tear each delegate down on the returning
@@ -964,6 +965,15 @@ public final class SenderPool implements AutoCloseable {
             closed = true;
             // Wake parked borrowers so they observe the shutdown and throw.
             slotReleased.signalAll();
+            // A creation reservation represents pool-owned resources from the
+            // moment borrow() leaves the lock through either publication or
+            // completed cleanup. Unlike an abandoned user-visible lease, this
+            // ownership cannot be leaked after close() returns, so wait without
+            // a timeout. awaitUninterruptibly preserves the interrupt flag while
+            // maintaining the shutdown ownership invariant.
+            while (inFlightCreations > 0) {
+                creationFinished.awaitUninterruptibly();
+            }
             // Bounded graceful wait for outstanding leases. A slot is borrowed
             // iff it is in `all` but not in `available`; retireLease's
             // delegate-close section (running outside the lock on a returning

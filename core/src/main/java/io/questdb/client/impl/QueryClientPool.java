@@ -60,6 +60,10 @@ public final class QueryClientPool implements AutoCloseable {
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
     private final String configurationString;
+    // Signals completion of internally owned creation lifecycles. Kept
+    // separate from workerReleased so an acquire waiter cannot consume the only
+    // wakeup intended for close().
+    private final Condition creationFinished;
     // Test seam. Production connects via QwpQueryClient.connect(); white-box
     // tests in io.questdb.client.test.impl reach the package-private constructor
     // by reflection to inject a hook that throws a non-RuntimeException
@@ -146,6 +150,7 @@ public final class QueryClientPool implements AutoCloseable {
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
+        this.creationFinished = lock.newCondition();
         this.workerReleased = lock.newCondition();
         int built = 0;
         // Tracks a worker built by createUnlocked() but not yet added to `all`:
@@ -231,16 +236,11 @@ public final class QueryClientPool implements AutoCloseable {
                         // incremented, permanently shrinking pool capacity until
                         // every acquire() times out. Restoring the reservation
                         // for any throwable is safe.
-                        lock.lock();
-                        inFlightCreations--;
-                        workerReleased.signal();
-                        lock.unlock();
                         // createUnlocked() returns a fully connected client
                         // (socket + native scratch + I/O thread), so if start()
                         // threw afterwards we must close it here -- nothing else
-                        // references it. createUnlocked() already self-cleans
-                        // when connect() throws, leaving created == null, so
-                        // this only fires on the start()-throws path.
+                        // references it. Keep the creation reservation until
+                        // that cleanup finishes so close() cannot return first.
                         if (created != null) {
                             try {
                                 created.shutdown();
@@ -249,33 +249,45 @@ public final class QueryClientPool implements AutoCloseable {
                                 // original creation failure rethrown below.
                             }
                         }
+                        lock.lock();
+                        try {
+                            inFlightCreations--;
+                            creationFinished.signalAll();
+                            workerReleased.signal();
+                        } finally {
+                            lock.unlock();
+                        }
                         throw new QueryException((byte) 0,
                                 "failed to create query client: " + e.getMessage(), e);
                     }
                     lock.lock();
-                    inFlightCreations--;
                     if (closed) {
-                        // Pool was closed mid-creation -- tear the fresh worker
-                        // down rather than leaking it, but OUTSIDE the lock:
-                        // shutdown() joins the dispatch thread for up to
-                        // SHUTDOWN_JOIN_MILLIS, and close()/release()/discard()/
-                        // cancelIfCurrent() all contend on this lock (whose
-                        // contract is "held only briefly"). The accounting above
-                        // already ran under the lock, and the worker never
-                        // entered `all`, so close()'s snapshot loop cannot race
-                        // this teardown.
+                        // Keep inFlightCreations reserved while shutdown runs
+                        // outside the lock. The worker never entered `all`, so
+                        // this reservation is close()'s sole ownership record.
                         lock.unlock();
                         try {
                             created.shutdown();
                         } catch (Throwable ignored) {
                             // Best-effort: an Error from teardown must not mask
                             // the closed-pool signal.
+                        } finally {
+                            lock.lock();
+                            try {
+                                inFlightCreations--;
+                                creationFinished.signalAll();
+                                workerReleased.signalAll();
+                            } finally {
+                                lock.unlock();
+                            }
                         }
                         throw new QueryException((byte) 0, "QuestDB handle is closed");
                     }
                     all.add(created);
                     // Stamp the first lease id for this freshly built worker.
                     created.bumpGeneration();
+                    inFlightCreations--;
+                    creationFinished.signalAll();
                     return created;
                 }
                 if (remainingNanos <= 0) {
@@ -307,6 +319,14 @@ public final class QueryClientPool implements AutoCloseable {
             }
             closed = true;
             workerReleased.signalAll();
+            // A reservation owns every resource created outside the lock until
+            // the worker is either published in `all` or fully torn down. No
+            // user ever received these workers, so close() must not apply an
+            // abandoned-lease timeout. Preserve interrupts while waiting for
+            // the internal ownership count to reach zero.
+            while (inFlightCreations > 0) {
+                creationFinished.awaitUninterruptibly();
+            }
             snapshot = new ArrayList<>(all);
         } finally {
             lock.unlock();

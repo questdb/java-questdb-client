@@ -134,9 +134,9 @@ public final class AckWatermark implements QuietCloseable {
     /**
      * Opens (creating if absent) the watermark file in {@code slotDir}
      * and maps it for the engine's lifetime. Returns {@code null} on
-     * any setup failure (open fail, mmap fail, unexpected size) — the
-     * caller falls back to the no-watermark behaviour, no exception
-     * escapes. Idempotent at the engine layer: a stale file from a
+     * any setup failure (open fail, mmap fail, unexpected size), leaving
+     * the caller to choose whether its durability contract permits operation
+     * without one. Idempotent at the engine layer: a stale file from a
      * prior session is reused as-is; the first {@link #write(long)}
      * stamps the magic and the new FSN atomically.
      */
@@ -167,13 +167,12 @@ public final class AckWatermark implements QuietCloseable {
             }
         }
         if (fd < 0) {
-            LOG.warn("ack watermark {} could not be opened (rc={}); proceeding without it",
-                    filePath, fd);
+            LOG.warn("ack watermark {} could not be opened (rc={})", filePath, fd);
             return null;
         }
         long addr = Files.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
         if (addr == Files.FAILED_MMAP_ADDRESS) {
-            LOG.warn("ack watermark {} could not be mmapped; proceeding without it", filePath);
+            LOG.warn("ack watermark {} could not be mmapped", filePath);
             filesFacade.close(fd);
             return null;
         }
