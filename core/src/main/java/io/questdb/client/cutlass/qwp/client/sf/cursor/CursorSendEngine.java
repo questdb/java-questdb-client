@@ -27,8 +27,10 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.concurrent.locks.LockSupport;
 
@@ -154,9 +156,29 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos) {
+        this(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadlineNanos, FilesFacade.INSTANCE);
+    }
+
+    /**
+     * As {@link #CursorSendEngine(String, long, long, long)}, but with an explicit
+     * {@link FilesFacade} for the persisted symbol dictionary.
+     * <p>
+     * The seam exists so a test can drive a dictionary I/O fault -- a short write from
+     * a full disk or an exhausted quota -- through the REAL producer path
+     * ({@code flush()} -> the write-ahead persist), and assert it surfaces as a
+     * {@code LineSenderException} like every other flush-path failure rather than as a
+     * raw {@code IllegalStateException} that would sail past every caller's
+     * {@code catch (LineSenderException)}. Nothing else could reach that translation:
+     * {@code PersistedSymbolDict} has facade-aware overloads, but the engine used to
+     * call only the {@code FilesFacade.INSTANCE} ones, so no fault could be injected
+     * from outside.
+     */
+    @TestOnly
+    public CursorSendEngine(String sfDir, long segmentSizeBytes,
+                            long maxTotalBytes, long appendDeadlineNanos, FilesFacade dictFf) {
         this(sfDir, segmentSizeBytes,
                 new SegmentManager(segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes),
-                true, appendDeadlineNanos);
+                true, appendDeadlineNanos, dictFf);
     }
 
     /**
@@ -165,11 +187,12 @@ public final class CursorSendEngine implements QuietCloseable {
      * ownership of the manager. Uses the default append deadline.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager) {
-        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS);
+        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS,
+                FilesFacade.INSTANCE);
     }
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long appendDeadlineNanos) {
+                             boolean ownsManager, long appendDeadlineNanos, FilesFacade dictFf) {
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
         //                  cursor architecture, no disk involvement; segments
         //                  live in malloc'd native memory.
@@ -278,7 +301,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // Load the persisted symbol dictionary so delta-encoded frames
                 // in this recovered slot can be re-registered on the fresh
                 // server before replay. Null on open failure -> delta disabled.
-                persistedDictInProgress = PersistedSymbolDict.open(sfDir);
+                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress != null
                         ? watermarkInProgress.read()
@@ -389,7 +412,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     // Windows share lock); if the clean open itself fails,
                     // persistedSymbolDict stays null and the sender falls back to full
                     // self-sufficient frames, which is also safe.
-                    persistedDictInProgress = PersistedSymbolDict.openClean(sfDir);
+                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;

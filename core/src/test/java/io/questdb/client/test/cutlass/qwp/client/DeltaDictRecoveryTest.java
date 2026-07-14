@@ -26,6 +26,9 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -576,6 +579,56 @@ public class DeltaDictRecoveryTest {
                                 + "(recovery would then diverge from the persisted dictionary): " + dict,
                         1, dict.size());
                 Assert.assertEquals("a", dict.get(0));
+            }
+        });
+    }
+
+    @Test
+    public void testPersistFailureSurfacesAsLineSenderException() throws Exception {
+        // A dictionary write that fails mid-flush -- a full disk, an exhausted quota --
+        // must reach the caller as a LineSenderException, like every other flush-path
+        // failure. PersistedSymbolDict throws a low-level IllegalStateException on a short
+        // write; persistNewSymbolsBeforePublish wraps it. Without the wrap the raw
+        // IllegalStateException sails straight past every user's
+        // `catch (LineSenderException)` around flush() and takes the application down.
+        //
+        // Nothing could reach that translation before: PersistedSymbolDict has
+        // facade-aware overloads, but CursorSendEngine called only the
+        // FilesFacade.INSTANCE ones, so no test could inject a dictionary I/O fault
+        // through the real producer path. The engine now takes a FilesFacade for exactly
+        // this, and the sender is built on that engine directly -- the same
+        // QwpWebSocketSender.connect(..., CursorSendEngine) entry point Sender.build uses.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                String slot = Paths.get(sfDir, "default").toString();
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                ShortDictWriteFacade ff = new ShortDictWriteFacade();
+                // The engine owns the dictionary; the fault facade reaches only it, so the
+                // segment files still write normally and the ONLY failure is the persist.
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine)) {
+                    ff.armed = true; // the next dictionary append short-writes
+                    sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("a short write to the symbol dictionary must fail the flush");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue("the persist failure must be reported as a sender error, "
+                                        + "not leak a raw IllegalStateException: " + expected.getMessage(),
+                                expected.getMessage().contains("failed to persist symbol dictionary before publish"));
+                    }
+                } catch (LineSenderException ignored) {
+                    // close() re-flushes the still-buffered row; the facade has disarmed, so
+                    // this normally succeeds. Either way it is not what we assert.
+                }
             }
         });
     }
@@ -1256,4 +1309,22 @@ public class DeltaDictRecoveryTest {
             return buf;
         }
     }
+    /**
+     * Short-writes the FIRST dictionary append after it is armed, modelling a disk that
+     * fills mid-flush. Offset 0 is left alone so the file header still writes -- only the
+     * entry append fails, which is the path under test.
+     */
+    private static final class ShortDictWriteFacade extends DelegatingFilesFacade {
+        boolean armed;
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            if (armed && offset > 0 && len > 1) {
+                armed = false;
+                return INSTANCE.write(fd, addr, len - 1, offset);
+            }
+            return INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
 }

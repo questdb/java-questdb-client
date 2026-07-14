@@ -26,6 +26,8 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.std.ObjList;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -330,6 +332,89 @@ public class SelfSufficientFramesTest {
                                 + "earlier table's frame must not strand on the ring", 0, dataFrames);
             }
         });
+    }
+
+    @Test
+    public void testFileModeSplitPersistsDictBeforeAFAILEDPublish() throws Exception {
+        // The SPLIT path's write-ahead ordering: persistNewSymbolsBeforePublish must run
+        // BEFORE sealAndSwapBuffer publishes the frame to the ring, exactly as it does on
+        // the non-split path.
+        //
+        // Its sibling below (testFileModeSplitPersistsDictBeforePublish) checks the dict
+        // after a SUCCESSFUL flush, which proves nothing about ORDER -- the symbols land
+        // in the file either way. Only a publish that FAILS while the symbols are new can
+        // tell the two apart: with the write-ahead intact the symbols are already durable
+        // when the publish throws; with the persist moved after the publish, the throw
+        // beats it and the dictionary is still empty. (The non-split path is pinned this
+        // way by DeltaDictRecoveryTest.testFailedPublishDoesNotDuplicatePersistedSymbols;
+        // the split path had no equivalent.)
+        //
+        // Why it matters: store-and-forward is process-crash durable. If a split frame
+        // reaches the ring before its symbols reach .symbol-dict, a JVM crash in that
+        // window leaves a recorded frame whose deltaStart exceeds the recovered
+        // dictionary -- so recovery declares the slot unreplayable and quarantines a slot
+        // that should have drained cleanly.
+        //
+        // Setup: the server cap (150) splits the two-table batch, and each split frame
+        // still FITS that cap, so the split pre-flight passes and the publish is actually
+        // attempted. sf_max_bytes=64 then makes every frame larger than the segment, so
+        // appendBlocking fails with PAYLOAD_TOO_LARGE -- deterministically, no
+        // backpressure timing needed.
+        Path sfDir = Files.createTempDirectory("qwp-sf-split-persist-fail");
+        try {
+            assertMemoryLeak(() -> {
+                CapturingHandler handler = new CapturingHandler();
+                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                    server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                    int port = server.getPort();
+                    server.start();
+                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                            + ";sf_max_bytes=64;";
+                    String pad = TestUtils.repeat("x", 60);
+                    Sender sender = Sender.fromConfig(config);
+                    try {
+                        sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                        sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                        try {
+                            sender.flush();
+                            Assert.fail("a split frame larger than the segment must fail to publish");
+                        } catch (LineSenderException expected) {
+                            // PAYLOAD_TOO_LARGE -- the publish, not the pre-flight.
+                        }
+                        Assert.assertEquals("the publish must fail, so no frame reaches the server",
+                                0, handler.batches.size());
+
+                        // The write-ahead already ran: both of the batch's new symbols are
+                        // durable even though the frame that references them never
+                        // published. Move the persist after sealAndSwapBuffer and this is 0.
+                        PersistedSymbolDict pd = PersistedSymbolDict.open(
+                                sfDir.resolve("default").toString());
+                        Assert.assertNotNull(pd);
+                        try {
+                            Assert.assertEquals("the split path must persist its new symbols BEFORE "
+                                    + "publishing the frame that references them", 2, pd.size());
+                            ObjList<String> symbols = pd.readLoadedSymbols();
+                            Assert.assertEquals("alpha", symbols.getQuick(0));
+                            Assert.assertEquals("bravo", symbols.getQuick(1));
+                        } finally {
+                            pd.close();
+                        }
+                    } finally {
+                        try {
+                            sender.close();
+                        } catch (LineSenderException ignored) {
+                            // close() re-flushes the still-buffered oversized rows and fails
+                            // again; expected, and not what this test asserts. close() still
+                            // runs its resource cleanup, so no native memory leaks.
+                        }
+                    }
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
     }
 
     @Test

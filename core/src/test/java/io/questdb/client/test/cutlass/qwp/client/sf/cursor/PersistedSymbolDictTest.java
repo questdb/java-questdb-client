@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
@@ -833,141 +834,6 @@ public class PersistedSymbolDictTest {
         TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
     }
 
-    /**
-     * A {@link FilesFacade} that delegates every call to {@link FilesFacade#INSTANCE}.
-     * Subclasses inject a single fault; every other call hits the real filesystem.
-     */
-    private static class DelegatingFilesFacade implements FilesFacade {
-        @Override
-        public long allocNativePath(String path) {
-            return INSTANCE.allocNativePath(path);
-        }
-
-        @Override
-        public boolean allocate(int fd, long size) {
-            return INSTANCE.allocate(fd, size);
-        }
-
-        @Override
-        public int close(int fd) {
-            return INSTANCE.close(fd);
-        }
-
-        @Override
-        public boolean exists(String path) {
-            return INSTANCE.exists(path);
-        }
-
-        @Override
-        public void findClose(long findPtr) {
-            INSTANCE.findClose(findPtr);
-        }
-
-        @Override
-        public long findFirst(String dir) {
-            return INSTANCE.findFirst(dir);
-        }
-
-        @Override
-        public long findName(long findPtr) {
-            return INSTANCE.findName(findPtr);
-        }
-
-        @Override
-        public int findNext(long findPtr) {
-            return INSTANCE.findNext(findPtr);
-        }
-
-        @Override
-        public int findType(long findPtr) {
-            return INSTANCE.findType(findPtr);
-        }
-
-        @Override
-        public void freeNativePath(long pathPtr) {
-            INSTANCE.freeNativePath(pathPtr);
-        }
-
-        @Override
-        public int fsync(int fd) {
-            return INSTANCE.fsync(fd);
-        }
-
-        @Override
-        public long length(int fd) {
-            return INSTANCE.length(fd);
-        }
-
-        @Override
-        public long length(String path) {
-            return INSTANCE.length(path);
-        }
-
-        @Override
-        public long length(long pathPtr) {
-            return INSTANCE.length(pathPtr);
-        }
-
-        @Override
-        public int lock(int fd) {
-            return INSTANCE.lock(fd);
-        }
-
-        @Override
-        public int mkdir(String path, int mode) {
-            return INSTANCE.mkdir(path, mode);
-        }
-
-        @Override
-        public int openCleanRW(String path) {
-            return INSTANCE.openCleanRW(path);
-        }
-
-        @Override
-        public int openCleanRW(long pathPtr) {
-            return INSTANCE.openCleanRW(pathPtr);
-        }
-
-        @Override
-        public int openRW(String path) {
-            return INSTANCE.openRW(path);
-        }
-
-        @Override
-        public int openRW(long pathPtr) {
-            return INSTANCE.openRW(pathPtr);
-        }
-
-        @Override
-        public long read(int fd, long addr, long len, long offset) {
-            return INSTANCE.read(fd, addr, len, offset);
-        }
-
-        @Override
-        public boolean remove(String path) {
-            return INSTANCE.remove(path);
-        }
-
-        @Override
-        public boolean remove(long pathPtr) {
-            return INSTANCE.remove(pathPtr);
-        }
-
-        @Override
-        public int rename(String oldPath, String newPath) {
-            return INSTANCE.rename(oldPath, newPath);
-        }
-
-        @Override
-        public boolean truncate(int fd, long size) {
-            return INSTANCE.truncate(fd, size);
-        }
-
-        @Override
-        public long write(int fd, long addr, long len, long offset) {
-            return INSTANCE.write(fd, addr, len, offset);
-        }
-    }
 
     /**
      * Fails every {@link #truncate(int, long)} -- reproducing a host where the

@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
@@ -608,11 +609,12 @@ public class CursorSendEngineTest {
     private static Throwable invokeOwnedPrivateConstructorExpectingFailure(
             String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
         Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
-                String.class, long.class, SegmentManager.class, boolean.class, long.class);
+                String.class, long.class, SegmentManager.class, boolean.class, long.class,
+                FilesFacade.class);
         ctor.setAccessible(true);
         try {
             ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, FilesFacade.INSTANCE);
             fail("expected constructor failure");
             return null;
         } catch (InvocationTargetException e) {

@@ -44,6 +44,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -219,6 +221,69 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveredMaxSymbolIdSpansSealedSegments() throws Exception {
+        // The torn-dict detector must walk the SEALED segments too, not just the active
+        // one. Every other test in the suite fits its whole slot in a single active
+        // segment, so the sealed walk in SegmentRing.maxSymbolDeltaEnd was dead code as
+        // far as the tests were concerned: deleting it left them all green while
+        // recoveredMaxSymbolId silently collapsed to -1.
+        //
+        // -1 is not a benign wrong answer. seedGlobalDictionaryFromPersisted's guard is
+        // `recoveredMaxSymbolId >= pd.size()`, so a value that is too LOW never fires: a
+        // torn dictionary is trusted, the producer resumes seeded from the short
+        // dictionary, and it hands ids the surviving frames already define to different
+        // symbols -- the exact silent misattribution the whole feature exists to prevent.
+        //
+        // The shape that needs the sealed walk is the crash the guard was built for. In a
+        // plain multi-segment slot the ACTIVE segment holds the newest frames and thus the
+        // highest ids, so an active-only walk happens to get the right answer. It stops
+        // being right when the active segment contributes NOTHING to the committed range
+        // -- here, a producer that died mid-transaction, leaving an aborted deferred tail
+        // long enough to overflow into a fresh segment. maxSymbolDeltaEnd skips those
+        // frames (fsn > recoveredCommitBoundaryFsn), so the highest COMMITTED id is left
+        // sitting in a SEALED segment, reachable only through the sealed walk.
+        TestUtils.assertMemoryLeak(() -> {
+            // Small segments so the tail really does roll one. Each frame is
+            // FRAME_HEADER_SIZE + (QWP HEADER_SIZE + 2) = 22 bytes, against 256 - 24
+            // usable, so a segment holds ~10.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 256)) {
+                // Committed delta frames registering ids 0,1,2 -- the highest COMMITTED
+                // ids in the slot.
+                for (int i = 0; i < 3; i++) {
+                    appendDeltaFrame(engine, false, i, 1);
+                }
+                assertNull("the committed frames must still be in the ACTIVE segment here",
+                        engine.firstSealed());
+                // The aborted transaction: deferred frames with no covering commit. Keep
+                // appending until they overflow the segment, then a few more, so the
+                // committed frames end up SEALED and the active segment holds nothing but
+                // the tail. Ids stay small so the test's one-byte varint encoding holds.
+                int deferredId = 3;
+                for (int i = 0; i < 64 && engine.firstSealed() == null; i++) {
+                    appendDeltaFrame(engine, true, deferredId++, 1);
+                }
+                assertNotNull("the deferred tail must have rolled a segment", engine.firstSealed());
+                for (int i = 0; i < 3; i++) {
+                    appendDeltaFrame(engine, true, deferredId++, 1);
+                }
+            }
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 256)) {
+                assertTrue(engine.wasRecoveredFromDisk());
+                assertNotNull("the recovered slot must have a sealed segment", engine.firstSealed());
+                assertEquals("the last commit-bearing frame is fsn 2",
+                        2L, engine.recoveredCommitBoundaryFsn());
+                // ids 0,1,2 were introduced by the committed frames, all of which now live
+                // in a SEALED segment. The active segment holds only the deferred tail,
+                // which the walk skips -- so an active-only walk returns 0 and this comes
+                // back -1.
+                assertEquals("the highest COMMITTED id lives in a SEALED segment; "
+                                + "maxSymbolDeltaEnd must walk the sealed segments to see it",
+                        2L, engine.recoveredMaxSymbolId());
             }
         });
     }
