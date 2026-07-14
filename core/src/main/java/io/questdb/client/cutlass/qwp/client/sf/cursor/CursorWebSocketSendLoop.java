@@ -43,6 +43,8 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
+import io.questdb.client.std.str.Utf8s;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
@@ -697,6 +699,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // always has loadedEntriesLen > 0 when size > 0, so this is the
                 // same result -- it just makes the coupling explicit.
                 sentDictCount = pd.size();
+            }
+        }
+        // ...and then from the surviving frames' own delta sections, exactly as the producer
+        // seeds its dictionary. The mirror is the loop's model of what the SERVER holds and it
+        // is what the catch-up frame ships, so when it stops at the persisted prefix while the
+        // producer's baseline runs past it, the loop condemns (deltaStart > sentDictCount) a
+        // slot the producer just seeded successfully. Same two sources, same order, so the two
+        // land on the same number by construction.
+        // ...but ONLY when a surviving frame actually depends on ids it does not carry
+        // (recoveredMaxSymbolDeltaStart > 0). At zero every frame is self-sufficient and
+        // re-registers its dictionary from id 0 as it replays, so seeding the mirror would buy
+        // nothing and cost a catch-up frame on every connection -- full-dict slots must stay
+        // catch-up-free.
+        if (engine.recoveredMaxSymbolDeltaStart() > 0L) {
+            ObjList<String> fromFrames = new ObjList<>();
+            if (engine.collectReplaySymbolsAbove(sentDictCount, fromFrames) >= 0) {
+                for (int i = 0, n = fromFrames.size(); i < n; i++) {
+                    appendSymbolToMirror(fromFrames.getQuick(i));
+                }
             }
         }
         this.fsnAtZero = fsnAtZero;
@@ -2266,6 +2287,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
         sentDictBytesLen += regionBytes;
         sentDictCount += (int) newCount;
+    }
+
+    /**
+     * Appends one symbol to the sent-dictionary mirror in wire form
+     * ({@code [len varint][utf8]}), advancing {@code sentDictCount}. Seeds the mirror at
+     * construction; {@link #accumulateSentDict} extends it from live frames thereafter.
+     */
+    private void appendSymbolToMirror(CharSequence symbol) {
+        int utf8Len = Utf8s.utf8Bytes(symbol);
+        int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len;
+        ensureSentDictCapacity((long) sentDictBytesLen + wireLen);
+        long p = NativeBufferWriter.writeVarint(sentDictBytesAddr + sentDictBytesLen, utf8Len);
+        if (utf8Len > 0) {
+            Utf8s.strCpyUtf8(symbol, p, utf8Len);
+        }
+        sentDictBytesLen += wireLen;
+        sentDictCount++;
     }
 
     private void ensureSentDictCapacity(long required) {

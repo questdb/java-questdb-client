@@ -108,6 +108,14 @@ public final class CursorSendEngine implements QuietCloseable {
     // against the recovered dictionary size to fail clean instead. Computed once
     // in the constructor's recovery branch; -1 elsewhere.
     private long recoveredMaxSymbolId = -1L;
+    // Highest deltaStart across the recovered COMMITTED frames; 0 when none carries a symbol
+    // dictionary. ZERO means every surviving frame is SELF-SUFFICIENT -- it re-registers its
+    // dictionary from id 0 -- so the slot replays with no dictionary at all and the send loop
+    // needs no catch-up. ABOVE zero means at least one frame is a true delta whose ids depend
+    // on registrations it does not itself carry, so the loop must seed its mirror (and ship a
+    // catch-up) before replaying. Both the full-dict-fallback discard below and the send
+    // loop's mirror seeding key off this.
+    private long recoveredMaxSymbolDeltaStart;
     // FSN of the last frame of a recovered orphaned deferred tail, or -1 when
     // the recovered ring has no such tail. When >= 0, frames
     // [recoveredCommitBoundaryFsn + 1 .. recoveredOrphanTipFsn] all carry
@@ -380,14 +388,15 @@ public final class CursorSendEngine implements QuietCloseable {
                 // dictionary. The recoveredMaxSymbolId >= size guard means this never
                 // fires for a slot whose dictionary is intact, nor for an empty slot
                 // (recoveredMaxSymbolId == -1). Single-threaded; before the I/O loop.
-                if (persistedDictInProgress != null
-                        && recoveredMaxSymbolId >= persistedDictInProgress.size()
-                        && recovered.maxSymbolDeltaStart(
+                this.recoveredMaxSymbolDeltaStart = recovered.maxSymbolDeltaStart(
                         QwpConstants.MAGIC_MESSAGE,
                         QwpConstants.HEADER_OFFSET_FLAGS,
                         QwpConstants.FLAG_DELTA_SYMBOL_DICT,
                         QwpConstants.HEADER_SIZE,
-                        recoveredCommitBoundaryFsn) == 0L) {
+                        recoveredCommitBoundaryFsn);
+                if (persistedDictInProgress != null
+                        && recoveredMaxSymbolId >= persistedDictInProgress.size()
+                        && recoveredMaxSymbolDeltaStart == 0L) {
                     persistedDictInProgress.close();
                     persistedDictInProgress = null;
                 }
@@ -715,7 +724,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 QwpConstants.HEADER_OFFSET_FLAGS,
                 QwpConstants.FLAG_DELTA_SYMBOL_DICT,
                 QwpConstants.HEADER_SIZE,
-                ackedFsn() + 1L,
+                // Walk from the LOWEST frame still on disk, not from ackedFsn+1. An acked frame
+                // is not trimmed the instant it is acked -- trim drops whole SEALED segments --
+                // so the symbols it registered are usually still sitting right there, and they
+                // are exactly the ids the replay set's deltas start above. Skipping them threw
+                // away the only surviving copy of those symbols and condemned a slot that had
+                // everything it needed. A slot whose registering frames really HAVE been
+                // trimmed still reports the gap, because then no frame on disk holds them.
+                0L,
                 recoveredCommitBoundaryFsn,
                 baseline,
                 out
@@ -840,6 +856,20 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long recoveredMaxSymbolId() {
         return recoveredMaxSymbolId;
+    }
+
+    /**
+     * Highest {@code deltaStart} across the recovered committed frames; {@code 0} when every
+     * surviving frame is self-sufficient (or none carries a dictionary at all).
+     * <p>
+     * The send loop uses this to decide whether it needs a catch-up: at zero, every frame
+     * re-registers its dictionary from id 0 as it replays, so seeding the mirror -- and
+     * shipping a catch-up frame off it -- would be pure redundancy. Above zero, at least one
+     * frame's delta starts above ids it does not itself carry, so the mirror must hold those
+     * ids before the replay begins or the server null-pads the hole.
+     */
+    public long recoveredMaxSymbolDeltaStart() {
+        return recoveredMaxSymbolDeltaStart;
     }
 
     /**

@@ -2258,7 +2258,11 @@ public class QwpWebSocketSender implements Sender {
         // persisted dictionary so newly ingested symbols continue from the
         // recovered ids (rather than colliding with them at 0), and the delta
         // baseline resumes where the crashed session left off.
-        if (deltaDictEnabled && engine.wasRecoveredFromDisk()) {
+        // NOT gated on deltaDictEnabled. That flag is false exactly when the slot's dictionary
+        // failed to open -- which is precisely when the frames on disk are the only surviving
+        // copy of the symbols and the rebuild matters most. Gating the seed on it made the
+        // rebuild dead code for the very case it was written for.
+        if (engine != null && engine.wasRecoveredFromDisk()) {
             seedGlobalDictionaryFromPersisted(engine.getPersistedSymbolDict());
         }
     }
