@@ -75,6 +75,8 @@ public class WsSenderConfigHonoredTest {
         assertHonored("max_background_drainers=6", "max_background_drainers", 6);
         assertHonored("max_frame_rejections=6", "max_frame_rejections", 6);
         assertHonored("poison_min_escalation_window_millis=7500", "poison_min_escalation_window_millis", 7500L);
+        assertHonored("catchup_cap_gap_min_escalation_window_millis=90000",
+                "catchup_cap_gap_min_escalation_window_millis", 90000L);
         assertHonored("error_inbox_capacity=128", "error_inbox_capacity", 128);
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");
