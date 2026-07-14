@@ -54,6 +54,7 @@ import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -324,12 +325,18 @@ public final class FileTokenStore implements TokenStore {
         return lockStaleMillis;
     }
 
-    private static void createLockFile(Path lock) throws IOException {
+    private static void createLockFile(Path lock, String nonce) throws IOException {
+        // Exclusively create the lock (O_CREAT|O_EXCL via CREATE_NEW) AND write the owner nonce in a single
+        // open, so there is NO create->stamp gap for a GC/safepoint pause (or a cross-machine clock skew) to
+        // straddle and make our freshly-created lock look empty-and-stale to a peer. FileAlreadyExists means a
+        // peer already holds it. releaseLock and stealIfStale verify this nonce before deleting. Keep the
+        // owner-only perms (and the non-POSIX fallback) to match the store's other files.
+        final byte[] bytes = nonce.getBytes(StandardCharsets.UTF_8);
         try {
-            Files.createFile(lock, FILE_ATTRS);
+            writeNewFile(lock, bytes, FILE_ATTRS);
         } catch (UnsupportedOperationException e) {
             warnNoPosixPermsOnce();
-            Files.createFile(lock);
+            writeNewFile(lock, bytes);
         }
     }
 
@@ -649,30 +656,14 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private static boolean writeLockHolder(Path lock, String nonce) {
-        // stamp the lock with the owner nonce. Unlike the staleness mtime (which only needs to be recent),
-        // this content is what releaseLock checks before deleting, so it must be written reliably; report a
-        // failure so acquireLock drops an unverifiable lock rather than hold one it cannot safely release.
-        // Writing also refreshes the mtime, which is what the staleness age check reads
-        try {
-            // acquireLock created this lock empty; if it already carries a stamp, a peer judged it stale and
-            // stole+restamped it in the create->stamp gap (a long GC/suspend pause between the two syscalls, or
-            // a cross-machine clock skew wider than the empty-lock grace). A plain WRITE|TRUNCATE_EXISTING has no
-            // exclusivity and would overwrite that stamp, leaving two processes each believing they hold the
-            // lock, so refuse when a stamp is already present - honouring releaseLock's own-stamp ownership rule.
-            // This read-then-write is two syscalls, so like releaseLock's own read-then-delete it only NARROWS
-            // the clobber window (a steal landing between the read and the write is still overwritten); it does
-            // not close it. There is no atomic "write-only-if-still-empty" primitive to close it with. The
-            // residual degrades to at most the documented double-refresh (a re-prompt on a rotating IdP), never
-            // a torn or forged credential - Layer-1's atomic rename holds regardless. A readLockHolder that
-            // throws (our file was moved away during the peer's steal) is caught below and likewise fails the stamp.
-            if (readLockHolder(lock) != null) {
-                return false;
+    private static void writeNewFile(Path file, byte[] content, FileAttribute<?>... attrs) throws IOException {
+        // exclusive-create (CREATE_NEW = O_CREAT|O_EXCL) with the given perms and write the content in one
+        // open; FileAlreadyExistsException is raised when the file already exists
+        try (FileChannel channel = FileChannel.open(file, EnumSet.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), attrs)) {
+            ByteBuffer buffer = ByteBuffer.wrap(content);
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
             }
-            Files.write(lock, nonce.getBytes(StandardCharsets.UTF_8), StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
-            return true;
-        } catch (Exception e) {
-            return false;
         }
     }
 
@@ -684,27 +675,10 @@ public final class FileTokenStore implements TokenStore {
         final long deadline = System.currentTimeMillis() + lockAcquireBudgetMillis;
         while (true) {
             try {
-                createLockFile(lock);
-                if (writeLockHolder(lock, nonce)) {
-                    return nonce;
-                }
-                // the exclusive create won the lock but the owner nonce could not be stamped, so releaseLock
-                // could not later prove ownership and would risk deleting a peer's lock; drop the file we just
-                // created and degrade to a lock-free refresh rather than hold an unverifiable lock. Remove it
-                // only while it is still the empty file we created: writeLockHolder also returns false when a
-                // peer stole and restamped this path in the create->stamp gap, and deleting that peer's non-empty
-                // live lock by bare path would admit a third holder (mirrors releaseLock's own-stamp rule). Like
-                // writeLockHolder's read-then-write, this size-check-then-delete is two syscalls, so it narrows
-                // but does not fully close that window; the residual degrades to the documented double-refresh,
-                // never a torn credential.
-                try {
-                    if (Files.size(lock) == 0) {
-                        Files.deleteIfExists(lock);
-                    }
-                } catch (IOException ignore) {
-                    // gone (a peer moved it during its steal) or unreadable; another acquirer settles the race
-                }
-                return null;
+                // atomic exclusive-create + stamp in one call: no create->stamp gap, so a GC/safepoint pause
+                // can no longer make our freshly-created lock look empty-and-stale to a peer mid-acquisition
+                createLockFile(lock, nonce);
+                return nonce;
             } catch (FileAlreadyExistsException e) {
                 // the lock exists; if a crashed holder abandoned it, steal it - atomically and stamp-verified,
                 // so a stealer never removes a peer's freshly-created live lock (see stealIfStale). Then fall
@@ -716,7 +690,15 @@ public final class FileTokenStore implements TokenStore {
                 }
                 Os.sleep(LOCK_POLL_SLICE_MILLIS);
             } catch (IOException e) {
-                return null; // unexpected IO; degrade to no lock
+                // the exclusive create may have succeeded and only the nonce write failed, leaving a partial
+                // lock; best-effort remove it (the create was exclusive, so the file is ours) so it does not
+                // wedge peers, then degrade to a lock-free refresh
+                try {
+                    Files.deleteIfExists(lock);
+                } catch (IOException ignore) {
+                    // a peer's steal moved it, or it is unreadable; the staleness/grace path settles it
+                }
+                return null;
             }
         }
     }
@@ -784,17 +766,16 @@ public final class FileTokenStore implements TokenStore {
                 return;
             }
         } else if (!isOlderThan(lock, Math.min(EMPTY_LOCK_STEAL_GRACE_MILLIS, lockStaleMillis))) {
-            // an empty/unreadable lock is never a validly-held lock (a holder stamps right after creating): it
-            // is a peer mid-create/stamp (recovers on its own in microseconds) or one a crash orphaned in that
-            // gap. Steal it on the short empty-lock grace rather than the full staleness window, so a crash
-            // orphan stops wedging peers for the whole window. The grace normally dwarfs the create->stamp gap,
-            // but a pause wider than the grace (a long GC/safepoint or a suspend landing between the two
-            // syscalls) or a cross-machine clock skew (isOlderThan compares the local clock to the file mtime)
-            // can still make a freshly-created empty lock look stale and pre-empt a peer mid-stamp. That never
-            // forges or tears a credential - Layer-1 atomic rename holds, and the pre-empted peer's
-            // writeLockHolder refuses to overwrite this stamp - it degrades to a concurrent refresh (a re-prompt
-            // on a rotating-refresh-token IdP), the same best-effort residual inLock already accepts. The
-            // capture-verify below still confirms the lock is unchanged before completing the steal.
+            // an empty/unreadable lock is never a validly-held lock: acquireLock creates the lock and writes
+            // the owner nonce in ONE atomic call (createLockFile via CREATE_NEW), so a live lock always carries
+            // a stamp. An empty lock therefore means a crash mid-write - the exclusive create succeeded but the
+            // nonce write did not - a rare, narrow window with NO Java-level create->stamp gap for a GC/safepoint
+            // pause to straddle (the pause would have to land inside the single write call). Steal it on the
+            // short empty-lock grace rather than the full staleness window, so a crash orphan stops wedging peers
+            // for the whole window; the capture-verify below still confirms the lock is unchanged before
+            // completing the steal. (A cross-machine clock skew wider than the grace could still pre-empt such a
+            // partial lock, but that never forges or tears a credential - Layer-1's atomic rename holds - it
+            // degrades to at most a concurrent refresh, the best-effort residual inLock already accepts.)
             return;
         }
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");

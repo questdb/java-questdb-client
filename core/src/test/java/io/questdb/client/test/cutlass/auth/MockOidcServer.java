@@ -99,6 +99,12 @@ public class MockOidcServer implements Closeable {
         return response;
     }
 
+    public static MockResponse dribble() {
+        MockResponse response = new MockResponse(200, "", true);
+        response.dribble = true;
+        return response;
+    }
+
     public static MockResponse stall() {
         MockResponse response = new MockResponse(200, "", true);
         response.stall = true;
@@ -283,6 +289,29 @@ public class MockOidcServer implements Closeable {
             }
             return;
         }
+        if (response.dribble) {
+            // send chunked headers, then dribble the chunk-size LINE one hex digit at a time (never the
+            // terminating CRLF), so the client's single recv() keeps looping on the incomplete line while
+            // wall-clock accumulates. This exercises the WHOLE-read timeout bound, not the per-read one: each
+            // recvOrDie makes progress (gets a byte) within its shrinking budget, so a client that only re-armed
+            // a per-read timeout would loop forever, while one bounding the whole read aborts on its deadline.
+            // A modest digit count keeps the accumulated chunk size within a long. Stop once the client aborts
+            // and closes the socket (the write throws).
+            out.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            try {
+                for (int i = 0; i < 100; i++) {
+                    // leading-zero hex digits of a never-terminated chunk-size line: the parsed size stays 0
+                    // (so nothing overflows) while the line never completes, keeping recv() looping
+                    out.write('0');
+                    out.flush();
+                    Thread.sleep(100);
+                }
+            } catch (IOException | InterruptedException ignore) {
+                // the client aborted on its whole-read deadline and closed the socket
+            }
+            return;
+        }
         byte[] bodyBytes = response.body.getBytes(StandardCharsets.UTF_8);
         StringSink head = new StringSink();
         head.put("HTTP/1.1 ").put(response.status).put(' ').put(reason(response.status)).put("\r\n");
@@ -346,6 +375,7 @@ public class MockOidcServer implements Closeable {
         final String body;
         final boolean chunked;
         final int status;
+        boolean dribble;
         boolean dropConnection;
         long oversizedBodyBytes;
         String rawResponse;

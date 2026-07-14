@@ -84,6 +84,42 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFlushResponseBodyDribbleAbortsOnRequestTimeout() throws Exception {
+        assertMemoryLeak(() -> {
+            // A flush whose response BODY dribbles (chunked headers sent, then the chunk-size line one byte at
+            // a time, never completing) must abort the read on the configured request timeout: the no-arg
+            // recv() the flush uses now bounds the WHOLE body read, not each socket read. Drives that bound end
+            // to end over a real socket from a real flush (the Response classes are unit-tested in isolation;
+            // the ILP flush path - consumeChunkedResponse -> recv() - is covered here). Without the whole-read
+            // bound the dribble would re-arm the per-read timeout forever and this test would hit its @Test
+            // timeout.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.dribble())) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(1_000)                    // the whole-body-read bound the no-arg recv() applies
+                        .retryTimeoutMillis(0)                       // give up after the first aborted read, not retry to a deadline
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the dribbled response-body read to abort the flush");
+                    } catch (LineSenderException e) {
+                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                        // aborted on the ~1s whole-read bound. The mock dribbles for ~10s, so the old per-read
+                        // re-arm behavior would not abort until ~11s (then the 30s @Test timeout); the < 5s
+                        // ceiling fails on that path while giving the 1s bound generous CI headroom.
+                        Assert.assertTrue("aborted too fast to be the 1s read bound: " + elapsedMillis + "ms", elapsedMillis >= 500);
+                        Assert.assertTrue("aborted too slowly - re-armed per-read instead of bounding the whole read? " + elapsedMillis + "ms", elapsedMillis < 5_000);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testServerAuthErrorBodyControlAndBidiAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // a 401/403 body is echoed into the exception verbatim (read as raw bytes, not through the JSON

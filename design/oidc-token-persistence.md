@@ -374,14 +374,15 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
 - **Use a lock *file*, not an OS advisory lock.** Java `FileLock` maps to `fcntl` POSIX
   record locks on Unix while Python's `fcntl.flock` is BSD `flock`; the two **do not
   interoperate on Linux**. A lock file acquired with `O_CREAT|O_EXCL` (Java
-  `Files.createFile`, Python `os.open(..., O_CREAT|O_EXCL)` / `open(p,"x")`) is a plain
-  filesystem primitive that interoperates trivially. The contract mandates the lock-file
-  scheme; OS advisory locks are out.
+  `FileChannel.open(..., CREATE_NEW, WRITE)`, Python `os.open(..., O_CREAT|O_EXCL|O_WRONLY)`
+  / `open(p,"x")`) is a plain filesystem primitive that interoperates trivially. The contract
+  mandates the lock-file scheme; OS advisory locks are out.
 - **Lock file:** `<hex>.lock` beside the token file, containing a unique per-acquisition
   owner stamp — the holder's `pid@host`, a creation timestamp, and a random nonce.
-  Acquire by exclusive-create; on contention, spin with short backoff up to a small
-  acquire budget (~3s); if it still cannot be acquired, **proceed without it** (degrade to
-  Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
+  Acquire by an exclusive-create that writes the owner stamp in the SAME atomic open (create
+  and stamp are one operation, not two — see the empty-lock note below); on contention, spin
+  with short backoff up to a small acquire budget (~3s); if it still cannot be acquired,
+  **proceed without it** (degrade to Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
   is treated as abandoned and stolen, so a crashed holder cannot wedge others. The window
   must dominate the worst-case time a live holder can hold the lock. That worst case has two
   parts: the refresh I/O under the lock — send + await + parse, plus a body drain on a parse
@@ -395,23 +396,21 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   raises the HTTP timeout must raise this window in step. A client MUST NOT advertise a tighter
   guarantee than this (an earlier draft claimed ~480s alone, omitting the connection phase).
 - **An empty/unstamped lock is reclaimable on a short grace, not the full staleness window.**
-  Acquire is exclusive-create followed by a separate stamp write, so a holder that crashes
-  between the two leaves an empty `<hex>.lock` whose mtime is fresh — which the staleness check
-  would protect for the whole window, wedging peers into lock-free refreshes. Treat a lock that
-  carries no readable owner stamp as stealable once it is older than a short grace (a few
-  seconds) instead of the full window. The grace normally dwarfs the create→stamp gap
-  (microseconds), but cannot be guaranteed to: a pause wider than the grace (a long GC/safepoint
-  or a process suspend landing between the two syscalls) or a cross-machine clock skew (the age
-  check compares the local clock against the file's mtime) can make a freshly-created empty lock
-  look stale and let a peer pre-empt a holder mid-stamp. This never forges or tears a credential —
-  Layer 1's atomic replacement always holds — it degrades to a concurrent refresh (a re-prompt on
-  a rotating-refresh-token IdP), the same best-effort residual as running lock-free. To keep that
-  residual bounded, the **stamp write and the stamp-failure cleanup verify ownership** the way
-  release does: a holder stamps only a lock still empty (never overwriting a stamp a peer wrote
-  while the holder was pre-empted), and on a stamp failure drops only a lock still empty (never a
-  peer's non-empty live lock by bare path). The capture-then-verify steal below still aborts if
-  the lock acquires a stamp in the gap. The Python client MUST mirror this empty-lock grace, and
-  SHOULD mirror the ownership-verified stamp write.
+  Acquire writes the owner stamp in the SAME atomic exclusive-create (one `O_CREAT|O_EXCL` open,
+  then the nonce), so a LIVE lock always carries a stamp and there is **no create→stamp gap** for
+  a GC/safepoint pause to straddle. An empty `<hex>.lock` can therefore arise only from a crash
+  mid-write — the exclusive create succeeded but the nonce write did not — a rare, narrow window
+  entirely inside the single write call (no bytecode boundary between two separate syscalls where
+  a pause is reported). Its mtime is fresh, which the staleness check would protect for the whole
+  window, wedging peers into lock-free refreshes; so treat a lock that carries no readable owner
+  stamp as stealable once it is older than a short grace (a few seconds) instead of the full
+  window. A cross-machine clock skew wider than the grace (the age check compares the local clock
+  against the file's mtime) could still pre-empt such a partial lock, but that never forges or
+  tears a credential — Layer 1's atomic replacement always holds — it degrades to a concurrent
+  refresh (a re-prompt on a rotating-refresh-token IdP), the same best-effort residual as running
+  lock-free. The capture-then-verify steal below still aborts if the captured lock does not match
+  what was judged stale. The Python client MUST mirror this atomic create-with-stamp and the
+  empty-lock grace.
 - **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
   **only when it still carries that holder's own owner stamp**, never by bare path. Should
   a hold ever outrun the staleness window and be stolen and recreated by a peer, the
