@@ -3,6 +3,7 @@ package io.questdb.qwpbench;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -80,5 +81,32 @@ class BenchSchemaTest {
         assertEquals("s4_000001", BenchSchema.hiSym(5, 100001, 100000)); // 100001 % 100000 == 1
         assertEquals("s0_000005", BenchSchema.hiSym(1, 5, 1000));
         assertEquals("s4_099999", BenchSchema.hiSym(5, 99999, 1000000));
+    }
+
+    @Test
+    void labelPoolsMatchPerRowGenerators() {
+        // symPool: pool[v] == sym(v, card); pool[(int) (i % card)] must
+        // reproduce the old per-row sym(i, card) call for any row index i.
+        String[] symPool = BenchSchema.symPool(8);
+        assertEquals(8, symPool.length);
+        assertEquals("sym_0000", symPool[0]);
+        assertEquals("sym_0007", symPool[7]);
+        for (long i : new long[]{0, 3, 9, 100_001, 9_999_999L, 3_000_000_007L}) {
+            assertEquals(BenchSchema.sym(i, 8), symPool[(int) (i % 8)]);
+        }
+
+        // hiSymPools: 1-based outer index like IngressBench.S_NAMES;
+        // pools[c][v] == hiSym(c, v, card).
+        String[][] hiPools = BenchSchema.hiSymPools(1000);
+        assertEquals(BenchSchema.N_WIDE_SYMS + 1, hiPools.length);
+        assertNull(hiPools[0]);
+        assertEquals("s0_000000", hiPools[1][0]);
+        assertEquals("s4_000999", hiPools[5][999]);
+        for (int c = 1; c <= BenchSchema.N_WIDE_SYMS; c++) {
+            assertEquals(1000, hiPools[c].length);
+            for (long i : new long[]{0, 7, 999, 1000, 123_456, 9_999_999L}) {
+                assertEquals(BenchSchema.hiSym(c, i, 1000), hiPools[c][(int) (i % 1000)]);
+            }
+        }
     }
 }

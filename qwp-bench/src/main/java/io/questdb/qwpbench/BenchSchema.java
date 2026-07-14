@@ -86,6 +86,33 @@ public final class BenchSchema {
         return String.format("s%d_%06d", col - 1, i % card);
     }
 
+    /**
+     * Precomputed low-cardinality {@code sym} label pool: {@code pool[v] ==
+     * sym(v, card)}, so {@code pool[(int) (i % card)]} reproduces the per-row
+     * {@code sym(i, card)} call byte-for-byte. Built once outside the timed
+     * loop: per-row String.format costs ~0.5 us/row on s2-wide (6 labels) and
+     * would otherwise be roughly half the measured pass.
+     */
+    public static String[] symPool(int card) {
+        String[] pool = new String[card];
+        for (int v = 0; v < card; v++) pool[v] = sym(v, card);
+        return pool;
+    }
+
+    /**
+     * Precomputed high-cardinality label pools for the s1..s5 wide SYMBOL
+     * columns, 1-based like IngressBench's S_NAMES ({@code pools[0]} unused):
+     * {@code pools[c][v] == hiSym(c, v, card)}.
+     */
+    public static String[][] hiSymPools(int card) {
+        String[][] pools = new String[N_WIDE_SYMS + 1][];
+        for (int c = 1; c <= N_WIDE_SYMS; c++) {
+            pools[c] = new String[card];
+            for (int v = 0; v < card; v++) pools[c][v] = hiSym(c, v, card);
+        }
+        return pools;
+    }
+
     public static long tsNanos(long i) {
         return TS_BASE_NANOS + i * TS_STEP_NANOS;
     }
