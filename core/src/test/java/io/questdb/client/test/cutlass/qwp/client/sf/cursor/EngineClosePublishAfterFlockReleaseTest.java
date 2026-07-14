@@ -200,6 +200,15 @@ public class EngineClosePublishAfterFlockReleaseTest {
             fdField.setAccessible(true);
             int realFd = fdField.getInt(slotLock);
             assertTrue("precondition: live flock fd", realFd >= 0);
+
+            // This test owns the explicit close() retry. Prevent the shared
+            // asynchronous retry driver from racing it and from surviving into
+            // another test class; FlockReleaseRetryDriverTest covers the real
+            // driver lifecycle separately. A start failure synchronously clears
+            // the shared retry queue and resets the engine's scheduling flag.
+            CursorSendEngine.setFlockReleaseRetryThreadFactory(task -> {
+                throw new IllegalStateException("retry driver disabled for explicit close retry test");
+            });
             try {
                 // A non-negative fd no process has open: close(2) fails EBADF,
                 // so finishClose's release() confirmation fails.
@@ -230,11 +239,15 @@ public class EngineClosePublishAfterFlockReleaseTest {
                     // good — eventual completion implies reusable capacity.
                 }
             } finally {
-                // If an assertion failed before the successful retry, restore
-                // and release the real fd so the test never leaks a flock.
-                if (!engine.isCloseCompleted()) {
-                    fdField.setInt(slotLock, realFd);
-                    assertTrue("restored fd must release cleanly", slotLock.release());
+                try {
+                    // If an assertion failed before the successful retry, restore
+                    // and release the real fd so the test never leaks a flock.
+                    if (!engine.isCloseCompleted()) {
+                        fdField.setInt(slotLock, realFd);
+                        assertTrue("restored fd must release cleanly", slotLock.release());
+                    }
+                } finally {
+                    CursorSendEngine.setFlockReleaseRetryThreadFactory(null);
                 }
             }
         });
