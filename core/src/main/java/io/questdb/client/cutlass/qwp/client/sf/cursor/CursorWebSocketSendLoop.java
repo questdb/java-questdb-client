@@ -168,6 +168,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    // True when this loop delta-encodes symbol dictionaries: it keeps a reconnect
+    // catch-up mirror (sentDict*) and re-registers the whole dictionary on a fresh
+    // server before replaying delta frames. See the sentDict* fields in the mutable
+    // section for the full mechanism. Gates all the delta-dict state.
+    private final boolean deltaDictEnabled;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
     private final long durableAckKeepaliveIntervalNanos;
@@ -211,51 +216,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
-    // Delta symbol dictionary catch-up state (see swapClient). Active in memory
-    // mode, and in disk mode whenever the per-slot persisted dictionary opened --
-    // fresh slots included, not just recovered / orphan-drained ones. On a
-    // recovered / orphan-drained slot the constructor additionally SEEDS sentDict*
-    // from that persisted dictionary; a fresh slot starts with an empty mirror and
-    // grows it as frames are sent.
-    // deltaDictEnabled gates all of it. The loop mirrors, in sentDict*, every
-    // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
-    // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that
-    // on reconnect it can re-register the whole dictionary on the fresh server
-    // (which discards its dictionary on every disconnect) before replaying frames
-    // whose deltas start above id 0. All of this is touched only by the I/O thread.
-    // Footprint note: this mirror is a SECOND copy of the dictionary -- the same
-    // symbols the producer's GlobalSymbolDictionary already holds as Java Strings --
-    // kept as native UTF-8 bytes for the reconnect-catch-up capability. So a
-    // memory-mode connection's steady-state dictionary footprint is ~2x the symbol
-    // set. It is bounded by distinct-symbol count (not per-row) and never trimmed
-    // for the connection's lifetime (a reconnect may need the whole dictionary at
-    // any moment), so it cannot be dropped; it is an intentional cost of the feature.
-    private final boolean deltaDictEnabled;
-    // Cap-gap attempts -- catch-ups that reached a node and found an entry too large
-    // for its batch cap -- since the last SUCCESSFUL catch-up (see
-    // MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting). A successful
-    // catch-up resets it (sendDictCatchUp); a transient reconnect neither increments
-    // nor resets it. NOT reset per connection -- it measures the cap-gap episode
-    // across reconnects so a persistent gap eventually latches. I/O-thread-only.
-    private int catchUpCapGapAttempts;
-    // True once a real ring frame (data or commit) has been sent on the CURRENT
-    // connection, as opposed to only the dictionary catch-up. The catch-up
-    // consumes wire sequences (nextWireSeq), so nextWireSeq > 0 no longer implies
-    // "the head frame was sent": onClose's poison-strike gate and
-    // handleServerRejection's pre-send gate key off THIS instead. Without it, a
-    // transient outage AFTER the catch-up but BEFORE the first data frame (a
-    // flapping LB/middlebox that accepts the upgrade + catch-up then closes) would
-    // be mistaken for a deterministic head-frame rejection and escalate to a
-    // PROTOCOL_VIOLATION terminal -- breaking the store-and-forward "retry a
-    // transient outage forever" contract. Reset per connection in
-    // setWireBaselineWithCatchUp; set in trySendOne after a successful send.
-    private boolean dataFrameSentThisConnection;
-    private long sentDictBytesAddr;
-    private int sentDictBytesCapacity;
-    private int sentDictBytesLen;
-    private int sentDictCount;
-    // End position (native address) written by the last readVarintAt() call.
-    private long varintEnd;
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
     private final AtomicLong totalAcks = new AtomicLong();
     // Counters for observability of the durable-ack path. Both are zero
@@ -279,6 +239,49 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
+    // Delta symbol dictionary catch-up state (see swapClient, deltaDictEnabled).
+    // Active in memory mode, and in disk mode whenever the per-slot persisted
+    // dictionary opened -- fresh slots included, not just recovered / orphan-drained
+    // ones. On a recovered / orphan-drained slot the constructor additionally SEEDS
+    // sentDict* from that persisted dictionary; a fresh slot starts with an empty
+    // mirror and grows it as frames are sent. The loop mirrors, in sentDict*, every
+    // symbol it has ever sent -- the concatenated [len varint][utf8] bytes in
+    // global-id order (sentDictBytes*) plus the count (sentDictCount) -- so that on
+    // reconnect it can re-register the whole dictionary on the fresh server (which
+    // discards its dictionary on every disconnect) before replaying frames whose
+    // deltas start above id 0. All of this is touched only by the I/O thread.
+    // Footprint note: this mirror is a SECOND copy of the dictionary -- the same
+    // symbols the producer's GlobalSymbolDictionary already holds as Java Strings --
+    // kept as native UTF-8 bytes for the reconnect-catch-up capability. So a
+    // memory-mode connection's steady-state dictionary footprint is ~2x the symbol
+    // set. It is bounded by distinct-symbol count (not per-row) and never trimmed for
+    // the connection's lifetime (a reconnect may need the whole dictionary at any
+    // moment), so it cannot be dropped; it is an intentional cost of the feature.
+    private long sentDictBytesAddr;
+    private int sentDictBytesCapacity;
+    private int sentDictBytesLen;
+    private int sentDictCount;
+    // Cap-gap attempts -- catch-ups that reached a node and found an entry too large
+    // for its batch cap -- since the last SUCCESSFUL catch-up (see
+    // MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting). A successful
+    // catch-up resets it (sendDictCatchUp); a transient reconnect neither increments
+    // nor resets it. NOT reset per connection -- it measures the cap-gap episode
+    // across reconnects so a persistent gap eventually latches. I/O-thread-only.
+    private int catchUpCapGapAttempts;
+    // True once a real ring frame (data or commit) has been sent on the CURRENT
+    // connection, as opposed to only the dictionary catch-up. The catch-up consumes
+    // wire sequences (nextWireSeq), so nextWireSeq > 0 no longer implies "the head
+    // frame was sent": onClose's poison-strike gate and handleServerRejection's
+    // pre-send gate key off THIS instead. Without it, a transient outage AFTER the
+    // catch-up but BEFORE the first data frame (a flapping LB/middlebox that accepts
+    // the upgrade + catch-up then closes) would be mistaken for a deterministic
+    // head-frame rejection and escalate to a PROTOCOL_VIOLATION terminal -- breaking
+    // the store-and-forward "retry a transient outage forever" contract. Reset per
+    // connection in setWireBaselineWithCatchUp; set in trySendOne after a successful
+    // send.
+    private boolean dataFrameSentThisConnection;
+    // End position (native address) written by the last readVarintAt() call.
+    private long varintEnd;
     private WebSocketClient client;
     // Optional: when non-null, every server-rejection error (retriable and
     // terminal alike) is offered to the dispatcher for async delivery to the user's

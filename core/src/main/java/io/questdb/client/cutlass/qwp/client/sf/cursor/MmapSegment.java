@@ -607,6 +607,62 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Highest {@code deltaStart} any delta-flagged frame at or below
+     * {@code maxFsnInclusive} carries, or {@code 0} when NO delta-flagged frame is
+     * present. A result of {@code 0} means every surviving symbol-bearing frame is
+     * SELF-SUFFICIENT -- it re-registers its dictionary from id 0 (a full-dict
+     * frame), so the slot replays with no persisted dictionary at all; a result
+     * {@code > 0} means at least one frame is a non-self-sufficient delta whose ids
+     * depend on a prior frame's (or the persisted dictionary's) registrations.
+     * {@link CursorSendEngine} pairs this with {@link #maxSymbolDeltaEnd} at
+     * recovery: when the persisted {@code .symbol-dict} is a subset of the ids the
+     * frames reference BUT this returns {@code 0}, the slot was written in full-dict
+     * fallback (the dictionary never opened when writing) and recovers in full-dict
+     * mode instead of failing clean; a torn DELTA dictionary has a {@code
+     * deltaStart > 0} frame and still fails clean. Same read-only frame walk and
+     * layout as {@link #maxSymbolDeltaEnd}; only frames at or below {@code
+     * maxFsnInclusive} count (the retired orphan-deferred tail is excluded).
+     */
+    public long maxSymbolDeltaStart(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
+        long maxStart = 0L;
+        long off = HEADER_SIZE;
+        long frames = frameCount;
+        for (long i = 0; i < frames; i++) {
+            long fsn = baseSeq + i;
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
+            long payload = mmapAddress + off + FRAME_HEADER_SIZE;
+            // Skip the orphan-deferred tail (fsn > maxFsnInclusive): retired, never
+            // sent, so its baseline must not count. off still advances below.
+            if (fsn <= maxFsnInclusive
+                    && payloadLen >= qwpHeaderSize
+                    && payloadLen > flagsOffset
+                    && Unsafe.getUnsafe().getInt(payload) == headerMagic
+                    && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagDeltaMask) != 0) {
+                long p = payload + qwpHeaderSize;
+                long limit = payload + payloadLen;
+                long deltaStart = 0L;
+                int shift = 0;
+                while (p < limit) {
+                    byte b = Unsafe.getUnsafe().getByte(p++);
+                    deltaStart |= (long) (b & 0x7F) << shift;
+                    if ((b & 0x80) == 0) {
+                        break;
+                    }
+                    shift += 7;
+                    if (shift > 35) {
+                        break; // corrupt run; recovered frames are CRC-valid, so defensive only
+                    }
+                }
+                if (deltaStart > maxStart) {
+                    maxStart = deltaStart;
+                }
+            }
+            off += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return maxStart;
+    }
+
+    /**
      * Number of frames written since {@link #create} (or recovered by
      * {@link #openExisting}). Used by {@code SegmentRing} to compute
      * {@code lastSeq = baseSeq + frameCount - 1} for ACK / trim decisions.

@@ -338,6 +338,36 @@ public final class CursorSendEngine implements QuietCloseable {
                         QwpConstants.FLAG_DELTA_SYMBOL_DICT,
                         QwpConstants.HEADER_SIZE,
                         recoveredCommitBoundaryFsn) - 1L;
+                // Full-dict-fallback recovery. When the persisted .symbol-dict is a
+                // SUBSET of the ids the surviving frames reference
+                // (recoveredMaxSymbolId >= its size) YET every such frame is
+                // self-sufficient (maxSymbolDeltaStart == 0 -- a full-dict frame that
+                // re-registers its dictionary from id 0), the slot was written in
+                // full-dict fallback: the dictionary never opened when writing, so no
+                // side-file exists and this recovery opened a FRESH EMPTY one. Those
+                // frames replay with no dictionary, so discard the empty side-file and
+                // recover in full-dict mode -- isDeltaDictEnabled() then reports false
+                // and the producer + send loop both run full-dict, exactly as the slot
+                // was written. Without this the sender's seed-time guard would treat the
+                // empty dictionary as a host-crash tear and brick build(), even though
+                // the orphan drainer drains the same frames fine. A genuine torn DELTA
+                // dictionary keeps a frame with deltaStart > 0 (maxSymbolDeltaStart > 0)
+                // and is NOT discarded here: it still fails clean at seed time, since
+                // the ids its delta frames reference cannot be rebuilt without the lost
+                // dictionary. The recoveredMaxSymbolId >= size guard means this never
+                // fires for a slot whose dictionary is intact, nor for an empty slot
+                // (recoveredMaxSymbolId == -1). Single-threaded; before the I/O loop.
+                if (persistedDictInProgress != null
+                        && recoveredMaxSymbolId >= persistedDictInProgress.size()
+                        && recovered.maxSymbolDeltaStart(
+                        QwpConstants.MAGIC_MESSAGE,
+                        QwpConstants.HEADER_OFFSET_FLAGS,
+                        QwpConstants.FLAG_DELTA_SYMBOL_DICT,
+                        QwpConstants.HEADER_SIZE,
+                        recoveredCommitBoundaryFsn) == 0L) {
+                    persistedDictInProgress.close();
+                    persistedDictInProgress = null;
+                }
             } else {
                 // Fresh start with no recovered segments. Any stale
                 // watermark from a prior fully-drained session refers

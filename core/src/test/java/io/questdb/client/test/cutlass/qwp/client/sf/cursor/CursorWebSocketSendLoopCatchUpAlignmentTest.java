@@ -528,7 +528,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     private CursorSendEngine newEngine() {
-        return new CursorSendEngine(tmpDir, 16384);
+        return new CursorSendEngine(tmpDir, 16_384);
     }
 
     private static long readLong(CursorWebSocketSendLoop loop, String name) throws Exception {

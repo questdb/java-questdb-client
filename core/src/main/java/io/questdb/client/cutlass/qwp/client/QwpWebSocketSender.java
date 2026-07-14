@@ -3900,14 +3900,23 @@ public class QwpWebSocketSender implements Sender {
             return;
         }
         // Run the torn-dictionary guard BEFORE the empty-dictionary short-circuit
-        // below: a TOTAL tear (pd.size() == 0) with surviving symbol-bearing frames
-        // must fail clean too, not slip through. Such a frame starts at deltaStart=0
-        // and self-heals the I/O-thread catch-up mirror, so the send loop's replay
-        // guard (deltaStart > sentDictCount) never fires -- this seed-time guard is
-        // then the only defense against the producer resuming unseeded and silently
-        // reusing ids the frames already define. A genuinely empty slot (no
-        // symbol-bearing frames) has recoveredMaxSymbolId() == -1, so -1 >= 0 is false
-        // and the pd.size() == 0 return below still fires.
+        // below: a TOTAL tear (pd.size() == 0) of a DELTA dictionary with surviving
+        // symbol-bearing frames must fail clean too, not slip through. Such a frame
+        // starts at deltaStart=0 and self-heals the I/O-thread catch-up mirror, so the
+        // send loop's replay guard (deltaStart > sentDictCount) never fires -- this
+        // seed-time guard is then the only defense against the producer resuming
+        // unseeded and silently reusing ids the frames already define. A genuinely
+        // empty slot (no symbol-bearing frames) has recoveredMaxSymbolId() == -1, so
+        // -1 >= 0 is false and the pd.size() == 0 return below still fires.
+        //
+        // This guard fires ONLY for a torn DELTA dictionary. The other way the frames
+        // can out-reach the recovered dictionary -- a slot written in FULL-DICT
+        // fallback (the dictionary never opened when writing, every frame
+        // self-sufficient at deltaStart=0), then recovered against a fresh empty one --
+        // is caught upstream in CursorSendEngine, which discards the empty side-file so
+        // isDeltaDictEnabled() is false and this seed never runs. Those frames need no
+        // dictionary; failing clean here would needlessly brick build() for a slot the
+        // orphan drainer drains fine.
         if (cursorEngine != null && cursorEngine.recoveredMaxSymbolId() >= pd.size()) {
             throw new LineSenderException(
                     "recovered store-and-forward symbol dictionary is a subset of the surviving frames "

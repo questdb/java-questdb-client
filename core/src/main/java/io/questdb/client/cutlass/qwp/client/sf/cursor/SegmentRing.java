@@ -566,6 +566,25 @@ public final class SegmentRing implements QuietCloseable {
         return Math.max(maxEnd, end);
     }
 
+    /**
+     * Highest {@code deltaStart} any symbol-dict delta frame at or below
+     * {@code maxFsnInclusive} carries (0 when none, or when every such frame is
+     * self-sufficient). See {@link MmapSegment#maxSymbolDeltaStart}; paired with
+     * {@link #maxSymbolDeltaEnd} at recovery to tell a full-dict-fallback slot
+     * (recoverable with no dictionary) from a torn delta dictionary (fails clean).
+     */
+    public synchronized long maxSymbolDeltaStart(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
+        long maxStart = 0L;
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            long start = sealedSegments.get(i).maxSymbolDeltaStart(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
+            if (start > maxStart) {
+                maxStart = start;
+            }
+        }
+        long start = active.maxSymbolDeltaStart(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
+        return Math.max(maxStart, start);
+    }
+
     public MmapSegment getActive() {
         return active;
     }

@@ -897,6 +897,87 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testFullDictFramesRecoverInFullDictModeInsteadOfBricking() throws Exception {
+        // M1 regression (counterpoint to testTornDictTotalLossFailsCleanOnResume): a
+        // slot written in FULL-DICT fallback -- the .symbol-dict could not open when
+        // writing, so isDeltaDictEnabled() was false and every frame re-ships the
+        // whole dictionary from id 0 (deltaStart=0) -- leaves SELF-SUFFICIENT frames
+        // and NO side-file. On recovery the engine opens a FRESH EMPTY .symbol-dict,
+        // so the surviving frames out-reach it (recoveredMaxSymbolId >= pd.size()==0).
+        // Those frames carry their whole dictionary inline and need no side-file, so
+        // they must RECOVER, not brick build(). CursorSendEngine detects them
+        // (maxSymbolDeltaStart == 0) and discards the empty side-file, recovering the
+        // slot in full-dict mode. Before the fix the sender's seed-time guard treated
+        // the empty dictionary as a host-crash tear and threw from Sender.build(),
+        // even though the orphan drainer drains the very same frames fine. A torn
+        // DELTA dictionary (deltaStart > 0) still fails clean -- see that other test.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            // Force full-dict fallback in phase 1: plant a non-empty DIRECTORY where
+            // the dictionary file belongs, so openCleanRW fails and delta encoding
+            // stays disabled -- the frames are then written self-sufficient.
+            java.nio.file.Files.createDirectories(dict);
+            java.nio.file.Path blocker = dict.resolve("blocker");
+            java.nio.file.Files.createFile(blocker);
+
+            // Phase 1: silent server (no acks). Sender 1 writes new-symbol rows in
+            // full-dict mode and close-fast, leaving unacked self-sufficient frames.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                // The planted directory is untouched -- the dictionary never opened,
+                // so the frames were written full-dict with no side-file.
+                Assert.assertTrue("full-dict fallback: .symbol-dict must stay a directory",
+                        java.nio.file.Files.isDirectory(dict));
+            }
+
+            // Drop the planted directory so recovery opens a FRESH EMPTY .symbol-dict
+            // where it belongs -- exactly the state a full-dict-fallback slot recovers
+            // into (frames on disk, no dictionary behind them).
+            java.nio.file.Files.delete(blocker);
+            java.nio.file.Files.delete(dict);
+
+            // Phase 2: recover. build() must SUCCEED (not throw the torn-dict guard),
+            // and the self-sufficient frames replay against a fresh server gap-free.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) { // must NOT throw
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+                // Full-dict recovery re-ships the whole dictionary inline on every
+                // frame, so there is NO 0-table catch-up frame (that is the delta-mode
+                // reconnect path). The reconstructed dictionary is still gap-free.
+                Assert.assertFalse("full-dict recovery must NOT send a catch-up frame",
+                        handler.sawCatchUpFrame);
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size", DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+        });
+    }
+
     private static int globalDictSize(Sender sender) throws Exception {
         Field f = sender.getClass().getDeclaredField("globalSymbolDictionary");
         f.setAccessible(true);
