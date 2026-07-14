@@ -132,6 +132,33 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code LineSenderBuilder.poisonMinEscalationWindowMillis(long)}.
      */
     public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
+    /**
+     * Default minimum wall-clock dwell (millis) a symbol-dict catch-up CAP GAP must
+     * persist before the loop latches a terminal, even once
+     * {@link #MAX_CATCHUP_CAP_GAP_ATTEMPTS} cap gaps have accrued. Same idea as
+     * {@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}, for the same reason: a
+     * strike count measures "how many times did we look", not "how long has this been
+     * true", and only the latter distinguishes a permanent cluster capability gap from
+     * a node that is briefly away.
+     * <p>
+     * It matters here because the cap gap's trigger IS a failover. With the reconnect
+     * backoff capped at {@link #DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS} (5 s), 16 cap
+     * gaps accrue in roughly two minutes -- comfortably less than an ordinary rolling
+     * restart of the larger-cap node. A count-only budget would therefore hard-fail a
+     * live store-and-forward producer during a routine cluster operation, which is
+     * exactly the transient the budget exists to ride out. Requiring the dwell as well
+     * means the terminal needs BOTH "we have looked many times" AND "it has stayed true
+     * for a long time"; a node that returns inside the window ends the episode and the
+     * producer never notices.
+     * <p>
+     * 5 minutes -- the same figure as {@link #DEFAULT_RECONNECT_MAX_DURATION_MILLIS},
+     * this codebase's existing notion of how long a transient outage may plausibly
+     * last. Configurable per sender via the
+     * {@code catchup_cap_gap_min_escalation_window_millis} connect-string key or
+     * {@code LineSenderBuilder.catchUpCapGapMinEscalationWindowMillis(long)}; {@code 0}
+     * restores count-only escalation.
+     */
+    public static final long DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS = 300_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     // Settle budget for the symbol-dict catch-up cap gap: how many cap-gap attempts
     // -- catch-ups that reached a fresh server and found a single dictionary entry
@@ -185,6 +212,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by the server -- holding stale watermarks across the wire boundary
     // would falsely advance trim before re-confirmation.
     private final CharSequenceLongHashMap durableTableWatermarks = new CharSequenceLongHashMap();
+    // Pre-converted to nanos. Zero disables the dwell entirely (count-only escalation
+    // at MAX_CATCHUP_CAP_GAP_ATTEMPTS) -- the raw-constructor default; the user-facing
+    // 5-minute default is applied at the config layer, mirroring
+    // poisonMinEscalationWindowNanos.
+    private final long catchUpCapGapMinEscalationWindowNanos;
     private final CursorSendEngine engine;
     private final long parkNanos;
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
@@ -267,6 +299,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // nor resets it. NOT reset per connection -- it measures the cap-gap episode
     // across reconnects so a persistent gap eventually latches. I/O-thread-only.
     private int catchUpCapGapAttempts;
+    // System.nanoTime() of the FIRST cap gap of the current episode, or -1 when no
+    // episode is open. Anchors the escalation dwell. Reset together with
+    // catchUpCapGapAttempts on a successful catch-up, so a node that accepts the
+    // dictionary ends the episode outright. Anchoring at the FIRST gap (not at loop
+    // entry, and not refreshed per attempt) is what keeps a TRANSIENT from burning the
+    // terminal budget: a transient never reaches the catch-up, so it neither increments
+    // the counter nor moves the anchor -- it can only lengthen the wall clock, which
+    // alone can never latch the terminal because the strike count still has to be
+    // satisfied. I/O-thread-only, like catchUpCapGapAttempts.
+    private long catchUpCapGapFirstNanos = -1L;
     // True once a real ring frame (data or commit) has been sent on the CURRENT
     // connection, as opposed to only the dictionary catch-up. The catch-up consumes
     // wire sequences (nextWireSeq), so nextWireSeq > 0 no longer implies "the head
@@ -535,13 +577,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Master constructor — also accepts the poison-frame detector threshold
-     * ({@code max_frame_rejections}): consecutive server-active rejections of
-     * the same head-of-line frame, with no ack progress in between, before the
-     * loop escalates to a typed terminal. Must be {@code >= 1}. The final
-     * argument is the minimum wall-clock dwell (millis) the suspect must stay
-     * poisoned before escalation ({@code poison_min_escalation_window_millis};
-     * {@code >= 0}, where 0 = legacy immediate escalation at the threshold).
+     * Twelve-arg overload — omits the symbol-dict cap-gap escalation dwell, which
+     * defaults to {@code 0} (legacy: escalate as soon as
+     * {@link #MAX_CATCHUP_CAP_GAP_ATTEMPTS} cap gaps accrue, with no minimum
+     * wall-clock). Like the poison dwell, the user-facing default
+     * ({@link #DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
+     * config layer (Sender / QwpWebSocketSender), so this raw constructor stays
+     * unopinionated for tests and internal callers that want deterministic strike-count
+     * escalation.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -553,6 +596,39 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis, 0L);
+    }
+
+    /**
+     * Master constructor — also accepts the poison-frame detector threshold
+     * ({@code max_frame_rejections}): consecutive server-active rejections of
+     * the same head-of-line frame, with no ack progress in between, before the
+     * loop escalates to a typed terminal. Must be {@code >= 1}. Then the minimum
+     * wall-clock dwell (millis) the suspect must stay poisoned before escalation
+     * ({@code poison_min_escalation_window_millis}; {@code >= 0}, where 0 = legacy
+     * immediate escalation at the threshold).
+     * <p>
+     * The final argument is the analogous dwell for the symbol-dict catch-up cap gap
+     * ({@code catchup_cap_gap_min_escalation_window_millis}; {@code >= 0}, where 0 =
+     * escalate as soon as {@link #MAX_CATCHUP_CAP_GAP_ATTEMPTS} cap gaps accrue). See
+     * {@link #DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS} for why a strike
+     * count alone is not a safe escalation signal on a live producer.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis) {
         if (maxHeadFrameRejections < 1) {
             throw new IllegalArgumentException(
                     "maxHeadFrameRejections must be >= 1: " + maxHeadFrameRejections);
@@ -561,6 +637,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             throw new IllegalArgumentException(
                     "poisonMinEscalationWindowMillis must be >= 0: " + poisonMinEscalationWindowMillis);
         }
+        if (catchUpCapGapMinEscalationWindowMillis < 0) {
+            throw new IllegalArgumentException(
+                    "catchUpCapGapMinEscalationWindowMillis must be >= 0: "
+                            + catchUpCapGapMinEscalationWindowMillis);
+        }
+        this.catchUpCapGapMinEscalationWindowNanos =
+                catchUpCapGapMinEscalationWindowMillis * 1_000_000L;
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -2314,12 +2397,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // recordFatal, NOT fail() -- failing from inside the catch-up would
                 // re-enter connectLoop (see CatchUpSendException); the data must be
                 // resent after the cap is raised.
+                // Escalation needs BOTH the strike count AND a minimum wall-clock dwell
+                // (see DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS). A count
+                // alone measures how often we looked, not how long the gap has held --
+                // and 16 attempts at the capped backoff take only ~2 minutes, less than
+                // an ordinary rolling restart of the larger-cap node. Escalating on the
+                // count alone would therefore hard-fail a live store-and-forward
+                // producer during a routine cluster operation.
+                long nowNanos = System.nanoTime();
+                if (catchUpCapGapFirstNanos < 0) {
+                    catchUpCapGapFirstNanos = nowNanos;
+                }
                 catchUpCapGapAttempts++;
-                boolean exhausted = catchUpCapGapAttempts >= MAX_CATCHUP_CAP_GAP_ATTEMPTS;
+                long episodeNanos = nowNanos - catchUpCapGapFirstNanos;
+                boolean exhausted = catchUpCapGapAttempts >= MAX_CATCHUP_CAP_GAP_ATTEMPTS
+                        && episodeNanos >= catchUpCapGapMinEscalationWindowNanos;
                 LineSenderException err = new LineSenderException(
                         "symbol dictionary entry too large for the server batch cap during catch-up ["
                                 + "frameLen=" + soloFrameLen + ", cap=" + cap + ", attempt="
-                                + catchUpCapGapAttempts + '/' + MAX_CATCHUP_CAP_GAP_ATTEMPTS + ']'
+                                + catchUpCapGapAttempts + '/' + MAX_CATCHUP_CAP_GAP_ATTEMPTS
+                                + ", episodeMillis=" + (episodeNanos / 1_000_000L)
+                                + '/' + (catchUpCapGapMinEscalationWindowNanos / 1_000_000L) + ']'
                                 + (exhausted
                                 ? "; the data must be resent after the cap is raised"
                                 : "; retrying -- a larger-cap node may return"));
@@ -2345,8 +2443,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             framesSent++;
         }
         // The whole dictionary re-registered without a cap gap: this node accepts
-        // every entry, so the cap-gap episode (if any) is over -- reset the budget.
+        // every entry, so the cap-gap episode (if any) is over -- reset BOTH the strike
+        // count and the wall-clock anchor. Resetting only the count would leave a stale
+        // anchor from an old episode, so the very first strike of a LATER episode would
+        // already satisfy the dwell.
         catchUpCapGapAttempts = 0;
+        catchUpCapGapFirstNanos = -1L;
         return framesSent;
     }
 

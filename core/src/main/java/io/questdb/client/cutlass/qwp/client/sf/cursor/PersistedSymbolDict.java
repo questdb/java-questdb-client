@@ -50,20 +50,37 @@ import org.slf4j.LoggerFactory;
  * {@link AckWatermark} -- a discardable optimization protected by a
  * {@code max()} clamp -- this file is <b>load-bearing</b>: a surviving frame
  * that references an id missing from it is unrecoverable. It is therefore held
- * to a stronger durability contract.
+ * to a stronger durability contract, and {@link #open} never destroys it (see
+ * "Never recreate over an existing file" below).
  * <p>
  * <b>Layout</b> (little-endian):
  * <pre>
  *   offset 0: u32 magic = 'SYD1'
- *   offset 4: u8  version = 2
+ *   offset 4: u8  version = 3
  *   offset 5: 3 bytes reserved (zero)
- *   offset 8: entries, each [len: varint][utf8 bytes][crc32c: u32], in ascending global-id order
+ *   offset 8: chunks, each
+ *             [entryCount: varint][entryBytes: varint][entries][crc32c: u32]
+ *             where entries = [len: varint][utf8] repeated entryCount times,
+ *             occupying exactly entryBytes bytes, and the CRC-32C covers the
+ *             two header varints AND the entry region.
  * </pre>
- * Symbol id {@code i} is the {@code i}-th entry (ids are dense and assigned
- * sequentially from 0), so no id needs to be stored. Each entry carries a
- * CRC-32C over its {@code [len][utf8]} bytes (the same checksum the SF segment
- * frames use), so a torn or stale entry is detected on recovery instead of
- * being silently mis-parsed.
+ * A <b>chunk</b> is one append -- i.e. exactly the set of symbols one frame
+ * introduces, since the producer persists a frame's new symbols in a single call
+ * before publishing it. Symbol id {@code i} is the {@code i}-th entry across all
+ * chunks (ids are dense and assigned sequentially from 0), so no id is stored.
+ * <p>
+ * <b>Why the checksum is per chunk, not per entry.</b> The only consumer of the
+ * recovered prefix is the send loop's replay guard, which compares a surviving
+ * frame's {@code deltaStart} against the recovered dictionary size -- and every
+ * {@code deltaStart} is a chunk boundary, because chunks and frame deltas are
+ * written one-for-one. A tear inside a chunk therefore invalidates exactly the
+ * frames a per-entry checksum would have invalidated anyway: per-entry
+ * granularity buys no extra recoverable prefix. It costs a great deal, though.
+ * {@link Crc32c#update} is a native call, so checksumming per entry put one JNI
+ * transition -- plus one sub-cache-line copy and one redundant varint decode --
+ * on the producer thread for every new symbol. On the high-cardinality batch this
+ * feature exists to serve (one new symbol per row), that is a thousand native
+ * calls per flush where the chunk needs one.
  * <p>
  * <b>Durability / write-ahead ordering:</b> the producer appends the symbols a
  * frame introduces BEFORE that frame is published to the ring, but does NOT
@@ -76,14 +93,12 @@ import org.slf4j.LoggerFactory;
  * exactly as the segment frames themselves may be lost on a host crash. Two
  * layers keep a host-crash tear from silently corrupting data:
  * <ul>
- *   <li>The per-entry CRC-32C: {@link #open} verifies every entry and stops at
+ *   <li>The per-chunk CRC-32C: {@link #open} verifies every chunk and stops at
  *       the first one whose checksum fails, so an interior page lost out of
- *       order (reading back as zeroes) or a stale entry left past the end by a
+ *       order (reading back as zeroes) or a stale chunk left past the end by a
  *       failed truncate is DETECTED and the trusted region ends before it --
- *       recovery never mis-parses a corrupt entry as a real symbol nor shifts
- *       the dense id->symbol map. The truncate that drops a torn/stale tail is
- *       now failure-checked (see {@link #open}): a file that cannot be trimmed
- *       is untrusted and recreated empty rather than left exposing stale bytes.</li>
+ *       recovery never mis-parses a corrupt chunk as real symbols nor shifts the
+ *       dense id-&gt;symbol map.</li>
  *   <li>The send loop's replay guard: once recovery trusts only the intact
  *       prefix, a surviving frame whose delta start id exceeds that prefix
  *       fails loudly (the unreplayable data must be resent) rather than sending
@@ -93,10 +108,22 @@ import org.slf4j.LoggerFactory;
  * "resend required" instead of a silent symbol misattribution -- the same
  * CRC-32C protection the segment frames carry. A tear that happened to leave a
  * byte run whose CRC still matches is not distinguished, but that is a 1-in-2^32
- * collision per corrupted entry, no weaker than the frames' own checksum.
+ * collision per corrupted chunk, no weaker than the frames' own checksum.
  * <p>
- * A torn trailing entry from a crash mid-append is self-healing: {@link #open}
- * stops parsing at the first incomplete entry and the next append overwrites it.
+ * A torn trailing chunk from a crash mid-append is self-healing: {@link #open}
+ * stops parsing at the first incomplete chunk and the next append overwrites it.
+ * <p>
+ * <b>Never recreate over an existing file.</b> {@link #open} -- the RECOVERY
+ * entry point -- returns {@code null} when an existing file cannot be read or
+ * parsed, and NEVER falls back to recreating it empty. Recreating would mean
+ * {@code O_TRUNC} over the only copy of load-bearing state, so a single transient
+ * read error (an EIO on a flaky disk, a short read) would permanently destroy the
+ * dictionary the surviving delta frames reference -- turning a recoverable outage
+ * into unrecoverable data. A {@code null} instead degrades the sender to full
+ * self-sufficient frames and leaves every byte on disk, so a later attempt, once
+ * the transient clears, can still recover the slot in full. Only
+ * {@link #openClean} -- the FRESH-slot path, where discarding is the whole point
+ * -- truncates.
  * <p>
  * <b>Lifecycle:</b> single-writer (the producer / user thread) for appends. Read
  * once at {@link #open} to seed in-memory state on recovery or orphan-drain. The
@@ -115,10 +142,25 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * OrphanScanner, trim) skip it automatically.
      */
     public static final String FILE_NAME = ".symbol-dict";
-    static final int CRC_SIZE = 4; // u32 CRC-32C trailing every entry
+    static final int CRC_SIZE = 4; // u32 CRC-32C trailing every chunk
     static final int FILE_MAGIC = 0x31445953; // 'SYD1' little-endian
     static final int HEADER_SIZE = 8;
-    static final byte VERSION = 2; // v2 appended the per-entry CRC-32C
+    /**
+     * Upper bound on a chunk's two header varints ({@code entryCount} and
+     * {@code entryBytes}): each is at most 5 bytes for a 32-bit value. The
+     * encoders reserve this much in front of the entry region so the header can
+     * be back-filled once the region's exact size is known, keeping header,
+     * entries and CRC one contiguous run.
+     */
+    static final int MAX_CHUNK_HEADER_SIZE = 10;
+    /**
+     * Ceiling for the append scratch buffer, mirroring
+     * {@code CursorWebSocketSendLoop.MAX_SENT_DICT_BYTES}: the capacity math is
+     * int-typed, so a larger buffer cannot be addressed. Exceeding it throws --
+     * {@link #ensureScratch} never silently under-allocates.
+     */
+    static final int MAX_SCRATCH_BYTES = Integer.MAX_VALUE - 8;
+    static final byte VERSION = 3; // v3 moved the CRC-32C from per-entry to per-chunk
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
     // Filesystem seam. Production is FilesFacade.INSTANCE (straight to Files);
@@ -127,14 +169,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private final FilesFacade ff;
     private long appendOffset;
     private boolean closed;
-    // In-memory copy of the entry region [len][utf8]... exactly as on disk,
-    // populated only when open() recovered existing entries (recovery /
-    // orphan-drain). Zero/empty for a freshly created file. READ (not consumed) to
-    // seed the producer's id map (readLoadedSymbols) and to seed the send loop's
-    // catch-up mirror, which COPIES it. This file retains ownership for the engine's
-    // lifetime -- the orphan drainer builds a fresh send loop per wire session
-    // against the same engine, and each must re-seed its mirror -- and frees this
-    // buffer in close().
+    // In-memory copy of the WIRE entry region [len][utf8]... -- chunk headers and
+    // CRCs stripped -- populated only when open() recovered existing chunks
+    // (recovery / orphan-drain). Zero/empty for a freshly created file. READ (not
+    // consumed) to seed the producer's id map (readLoadedSymbols) and to seed the
+    // send loop's catch-up mirror, which COPIES it. This file retains ownership for
+    // the engine's lifetime -- the orphan drainer builds a fresh send loop per wire
+    // session against the same engine, and each must re-seed its mirror -- and frees
+    // this buffer in close().
     private long loadedEntriesAddr;
     private int loadedEntriesLen;
     private long scratchAddr;
@@ -151,12 +193,16 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Opens (creating if absent) the dictionary file in {@code slotDir}. An
-     * existing file is parsed and its complete entries are loaded into memory
-     * (see {@link #loadedEntriesAddr()}); a missing or invalid file is (re)created
-     * with a fresh header. Returns {@code null} on any I/O failure -- the caller
-     * then falls back to full-dictionary (self-sufficient) frames for this slot,
-     * so a broken side-file degrades gracefully rather than aborting the sender.
+     * Opens the dictionary file in {@code slotDir} for RECOVERY, creating it only
+     * when it does not already exist. An existing file is parsed and its complete,
+     * CRC-valid chunks are loaded into memory (see {@link #loadedEntriesAddr()}).
+     * <p>
+     * Returns {@code null} on any I/O or parse failure -- including an existing file
+     * that cannot be read, carries an unknown version, or fails its checksums. The
+     * caller then falls back to full-dictionary (self-sufficient) frames for this
+     * slot, so a broken side-file degrades gracefully rather than aborting the
+     * sender. Crucially, a {@code null} return NEVER destroys the file: see the
+     * class-level "Never recreate over an existing file" note.
      */
     public static PersistedSymbolDict open(String slotDir) {
         return open(FilesFacade.INSTANCE, slotDir);
@@ -170,30 +216,27 @@ public final class PersistedSymbolDict implements QuietCloseable {
     public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
         long existing = ff.exists(filePath) ? ff.length(filePath) : -1L;
-        // A dictionary that grew to or past Integer.MAX_VALUE cannot be reopened:
-        // openExisting reads it into ONE int-sized native buffer. PAST 2GiB the
-        // (int) cast is either negative (malloc rejects it), exactly zero (getInt
-        // then reads 4 bytes past a zero-size allocation), or a small positive prefix
-        // (whose validLen < len branch would then DESTRUCTIVELY truncate the multi-GB
-        // file); AT exactly Integer.MAX_VALUE the cast is exact but the ~2GB malloc is
-        // doomed to OutOfMemoryError. The >= guard short-circuits every case to a
-        // clean re-create instead of the doomed allocation -- fail-clean, exactly like
-        // every other unreadable-file case here, so the sender falls back to full
-        // self-sufficient frames. Reaching this needs ~100M+ distinct symbols on one
-        // slot (far past realistic symbol cardinality); the guard keeps the read/write
-        // size boundary safe anyway.
-        if (existing >= Integer.MAX_VALUE) {
-            LOG.warn("symbol dict {} too large ({} bytes) to reopen; recreating empty", filePath, existing);
-            return openFresh(ff, filePath);
-        }
         if (existing >= HEADER_SIZE) {
-            PersistedSymbolDict d = openExisting(ff, filePath, existing);
-            if (d != null) {
-                return d;
+            // A dictionary at or past Integer.MAX_VALUE cannot be read back:
+            // openExisting reads it into ONE int-sized native buffer, and the (int)
+            // cast is either negative (malloc rejects it) or a small positive prefix
+            // (whose parse would then trim the real multi-GB file). Degrade to full
+            // self-sufficient frames and leave the file alone. Reaching this needs
+            // ~100M+ distinct symbols on one slot, far past realistic cardinality;
+            // the guard keeps the read/write size boundary safe anyway.
+            if (existing >= Integer.MAX_VALUE) {
+                LOG.warn("symbol dict {} too large ({} bytes) to reopen; "
+                        + "falling back to full-dictionary frames (file left intact)", filePath, existing);
+                return null;
             }
-            // Fall through to a clean re-create: a header/parse failure on an
-            // existing file means it cannot be trusted for delta replay.
+            // NEVER recreate over an existing file on the recovery path: openFresh
+            // truncates, and these bytes are the only copy of state the surviving
+            // delta frames reference. A null degrades this slot to full
+            // self-sufficient frames and preserves the file for a later attempt.
+            return openExisting(ff, filePath, existing);
         }
+        // Absent, or a sub-header stub left by a crash inside openFresh: no
+        // load-bearing content to lose, so create it.
         return openFresh(ff, filePath);
     }
 
@@ -204,14 +247,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * dictionary left by a prior lifecycle -- a fully-drained slot whose
      * best-effort delete failed, or a crash in the close window -- must NOT be
      * inherited. Unlike {@link #open}, which parses and TRUSTS an existing file for
-     * recovery/orphan-drain replay, this truncates it: the fresh-start producer is
-     * not seeded from the dictionary, so trusting a survivor would leave the
-     * producer's ids diverged from the dictionary the send loop replays and
-     * silently misattribute symbols on the next reconnect. Truncating (rather than
-     * relying on an unlink succeeding first) closes the gap even when the delete is
-     * refused -- e.g. a Windows share lock. Returns {@code null} on I/O failure, so
-     * the caller falls back to full self-sufficient frames exactly as {@link #open}
-     * does.
+     * recovery/orphan-drain replay and never destroys it, this truncates: the
+     * fresh-start producer is not seeded from the dictionary, so trusting a survivor
+     * would leave the producer's ids diverged from the dictionary the send loop
+     * replays and silently misattribute symbols on the next reconnect. Truncating
+     * (rather than relying on an unlink succeeding first) closes the gap even when
+     * the delete is refused -- e.g. a Windows share lock. Returns {@code null} on
+     * I/O failure, so the caller falls back to full self-sufficient frames exactly
+     * as {@link #open} does.
      */
     public static PersistedSymbolDict openClean(String slotDir) {
         return openClean(FilesFacade.INSTANCE, slotDir);
@@ -244,28 +287,33 @@ public final class PersistedSymbolDict implements QuietCloseable {
 
     /**
      * Appends {@code count} wire entries -- {@code [len varint][utf8]...}, the
-     * symbol-dict delta section the frame encoder just wrote -- to the on-disk
-     * dictionary, computing and appending a per-entry CRC-32C as it copies so the
-     * producer does not re-encode the symbols. The on-disk layout is
-     * {@code [len varint][utf8][crc32c]} per entry (see the class layout note); the
-     * {@code addr}/{@code len} bytes carry no CRC, so this walks the {@code count}
-     * entries to insert one. Advances {@code size} by {@code count}. Same
-     * durability/idempotency contract as {@link #appendSymbols}: no fsync, and a
-     * short write throws WITHOUT advancing {@code size}/{@code appendOffset}, so a
-     * retry keyed off {@link #size()} re-persists the same range at the same
-     * offset. No-op when the range is empty or the dictionary is closed.
+     * symbol-dict delta section the frame encoder just wrote -- as ONE chunk.
+     * <p>
+     * The consistency walk below decodes each entry's length varint, but the bytes
+     * themselves are copied in a SINGLE {@code copyMemory} and checksummed by a
+     * SINGLE {@link Crc32c#update} covering the whole chunk. A per-entry checksum
+     * would put one JNI transition, one sub-cache-line copy and one redundant varint
+     * decode on the producer thread per new symbol; the chunk needs one of each.
+     * <p>
+     * Advances {@code size} by {@code count}. Same durability/idempotency contract
+     * as {@link #appendSymbols}: no fsync, and a short write throws WITHOUT
+     * advancing {@code size}/{@code appendOffset}, so a retry keyed off
+     * {@link #size()} re-persists the same range at the same offset. No-op when the
+     * range is empty or the dictionary is closed.
      */
     public synchronized void appendRawEntries(long addr, int len, int count) {
         if (closed || count <= 0 || len <= 0) {
             return;
         }
-        int outLen = len + count * CRC_SIZE;
-        ensureScratch(outLen);
+        // Validate the (addr, len, count) triple BEFORE writing anything: an
+        // inconsistent triple would record a chunk whose stored entryCount disagreed
+        // with the entries it holds, shifting the dense id->symbol map on recovery.
+        // The sole caller derives count and len from one beginMessage, so this cannot
+        // fire today -- but the file this guards is the one the "resend required"
+        // contract rests on, so it stays.
         long src = addr;
         long srcLimit = addr + len;
-        long dst = scratchAddr;
         for (int i = 0; i < count; i++) {
-            long entryStart = src;
             long symLen = 0;
             int shift = 0;
             while (src < srcLimit) {
@@ -277,51 +325,37 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 shift += 7;
                 if (shift > 35) {
                     // A canonical entry-length varint is <= 5 bytes; a longer
-                    // continuation run is corrupt. The downstream entryEnd > srcLimit
-                    // check then rejects it. Matches decodeVarint / readVarintAt.
+                    // continuation run is corrupt. The bound check below rejects it.
                     break;
                 }
             }
-            long entryEnd = src + symLen; // src is just past the len varint
-            if (entryEnd > srcLimit) {
+            src += symLen; // src was just past the len varint
+            if (src > srcLimit) {
                 throw new IllegalStateException("malformed raw symbol-dict entries to " + FILE_NAME
                         + " [entry=" + i + ", count=" + count + ']');
             }
-            int wireSpan = (int) (entryEnd - entryStart); // [len][utf8]
-            Unsafe.getUnsafe().copyMemory(entryStart, dst, wireSpan);
-            Unsafe.getUnsafe().putInt(dst + wireSpan, Crc32c.update(Crc32c.INIT, entryStart, wireSpan));
-            dst += wireSpan + CRC_SIZE;
-            src = entryEnd;
         }
         if (src != srcLimit) {
-            // The count entries did not consume exactly len bytes -- a caller passed an
-            // inconsistent (addr, len, count) triple. Writing outLen would flush an
-            // uninitialised scratch tail and mis-advance size, so fail loudly. The sole
-            // caller derives count and len from one beginMessage, so this cannot fire
-            // today.
             throw new IllegalStateException("raw symbol-dict entries under-filled the buffer to "
                     + FILE_NAME + " [count=" + count + ", len=" + len
                     + ", consumed=" + (int) (src - addr) + ']');
         }
-        long written = ff.write(fd, scratchAddr, outLen, appendOffset);
-        if (written != outLen) {
-            throw new IllegalStateException("short write to " + FILE_NAME
-                    + " [expected=" + outLen + ", actual=" + written + ']');
-        }
-        appendOffset += outLen;
-        size += count;
+        int hdrLen = NativeBufferWriter.varintSize(count) + NativeBufferWriter.varintSize(len);
+        ensureScratch((long) hdrLen + len + CRC_SIZE);
+        long p = NativeBufferWriter.writeVarint(scratchAddr, count);
+        NativeBufferWriter.writeVarint(p, len);
+        Unsafe.getUnsafe().copyMemory(addr, scratchAddr + hdrLen, len);
+        flushChunk(scratchAddr, hdrLen, len, count);
     }
 
     /**
-     * Appends one symbol, extending the on-disk dictionary. The caller appends a
-     * frame's new symbols BEFORE publishing that frame, so the write ordering
-     * (dictionary entry before referencing frame) holds; no fsync is performed
-     * (see the class-level durability note). Assigns the next dense id implicitly
-     * (the entry's position). Writes {@code [len varint][utf8][crc32c]}, the CRC
-     * covering the {@code [len][utf8]} bytes so a torn/stale entry is detected on
-     * recovery.
+     * Appends one symbol as a single-entry chunk, extending the on-disk dictionary.
+     * The caller appends a frame's new symbols BEFORE publishing that frame, so the
+     * write ordering (dictionary entry before referencing frame) holds; no fsync is
+     * performed (see the class-level durability note). Assigns the next dense id
+     * implicitly (the entry's position).
      * <p>
-     * Test-only: production persists a frame's whole new-symbol range in one write
+     * Test-only: production persists a frame's whole new-symbol range in one chunk
      * via {@link #appendSymbols} / {@link #appendRawEntries}. Tests use this to
      * build a dictionary one entry at a time.
      */
@@ -331,65 +365,49 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return;
         }
         int utf8Len = Utf8s.utf8Bytes(symbol);
-        int varLen = NativeBufferWriter.varintSize(utf8Len);
-        int wireLen = varLen + utf8Len;  // [len][utf8]
-        int recLen = wireLen + CRC_SIZE; // + trailing crc
-        ensureScratch(recLen);
-        long p = NativeBufferWriter.writeVarint(scratchAddr, utf8Len);
+        int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len; // [len][utf8]
+        ensureScratch((long) MAX_CHUNK_HEADER_SIZE + wireLen + CRC_SIZE);
+        long entryStart = scratchAddr + MAX_CHUNK_HEADER_SIZE;
+        long p = NativeBufferWriter.writeVarint(entryStart, utf8Len);
         if (utf8Len > 0) {
             Utf8s.strCpyUtf8(symbol, p, utf8Len);
         }
-        Unsafe.getUnsafe().putInt(scratchAddr + wireLen, Crc32c.update(Crc32c.INIT, scratchAddr, wireLen));
-        long written = ff.write(fd, scratchAddr, recLen, appendOffset);
-        if (written != recLen) {
-            throw new IllegalStateException("short write to " + FILE_NAME
-                    + " [expected=" + recLen + ", actual=" + written + ']');
-        }
-        appendOffset += recLen;
-        size++;
+        writeChunkFromScratch(wireLen, 1);
     }
 
     /**
-     * Appends the dense id range {@code [from .. to]} in a SINGLE write. Encodes
-     * the whole {@code [len varint][utf8][crc32c]...} region into scratch first,
-     * then issues one positioned write -- versus one {@code pwrite(2)} per symbol
-     * via {@link #appendSymbol}. That per-symbol syscall count is the hot-path
-     * cost on a high-cardinality batch (one new symbol per row), which is exactly
-     * the store-and-forward workload delta encoding targets. Each entry carries a
-     * trailing CRC-32C over its {@code [len][utf8]} bytes. Callers pass the
-     * dictionary and the range so the ids resolve to their symbol strings.
+     * Appends the dense id range {@code [from .. to]} as ONE chunk, in a SINGLE
+     * write with a SINGLE checksum. Encodes the whole entry region into scratch
+     * first -- versus one {@code pwrite(2)} and one native CRC call per symbol.
+     * That per-symbol syscall and JNI count is the hot-path cost on a
+     * high-cardinality batch (one new symbol per row), which is exactly the
+     * store-and-forward workload delta encoding targets. Callers pass the dictionary
+     * and the range so the ids resolve to their symbol strings.
      * <p>
-     * Same durability and idempotency contract as {@link #appendSymbol}: no
-     * fsync, and a short write throws WITHOUT advancing {@code size}/{@code
-     * appendOffset}, so a retry keyed off {@link #size()} re-encodes the same
-     * range and overwrites at the same offset. No-op when the range is empty or
-     * the dictionary is closed.
+     * Same durability and idempotency contract as {@link #appendSymbol}: no fsync,
+     * and a short write throws WITHOUT advancing {@code size}/{@code appendOffset},
+     * so a retry keyed off {@link #size()} re-encodes the same range and overwrites
+     * at the same offset. No-op when the range is empty or the dictionary is closed.
      */
     public synchronized void appendSymbols(GlobalSymbolDictionary dict, int from, int to) {
         if (closed || to < from) {
             return;
         }
-        int len = 0;
+        int count = to - from + 1;
+        int entriesLen = 0;
         for (int id = from; id <= to; id++) {
             CharSequence symbol = dict.getSymbol(id);
             int utf8Len = Utf8s.utf8Bytes(symbol);
             int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len; // [len][utf8]
-            ensureScratch(len + wireLen + CRC_SIZE);
-            long entryStart = scratchAddr + len;
+            ensureScratch((long) MAX_CHUNK_HEADER_SIZE + entriesLen + wireLen + CRC_SIZE);
+            long entryStart = scratchAddr + MAX_CHUNK_HEADER_SIZE + entriesLen;
             long p = NativeBufferWriter.writeVarint(entryStart, utf8Len);
             if (utf8Len > 0) {
                 Utf8s.strCpyUtf8(symbol, p, utf8Len);
             }
-            Unsafe.getUnsafe().putInt(entryStart + wireLen, Crc32c.update(Crc32c.INIT, entryStart, wireLen));
-            len += wireLen + CRC_SIZE;
+            entriesLen += wireLen;
         }
-        long written = ff.write(fd, scratchAddr, len, appendOffset);
-        if (written != len) {
-            throw new IllegalStateException("short write to " + FILE_NAME
-                    + " [expected=" + len + ", actual=" + written + ']');
-        }
-        appendOffset += len;
-        size += to - from + 1;
+        writeChunkFromScratch(entriesLen, count);
     }
 
     @Override
@@ -418,8 +436,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
 
     /**
      * Base address of the loaded entry region -- the concatenated
-     * {@code [len][utf8]} bytes of every recovered symbol in id order, exactly
-     * as a delta section carries them. Zero when nothing was recovered.
+     * {@code [len][utf8]} bytes of every recovered symbol in id order, exactly as a
+     * delta section carries them (chunk headers and CRCs stripped). Zero when
+     * nothing was recovered.
      * <p>
      * <b>Construction-phase only.</b> This hands out a raw pointer into native
      * memory that {@link #close()} frees and nulls, with no closed-guard and no
@@ -466,10 +485,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 }
                 shift += 7;
                 if (shift > 35) {
-                    // Bound the varint like decodeVarint / appendRawEntries /
-                    // readVarintAt: a canonical length is <= 5 bytes. open() already
-                    // CRC-validated these bytes, so this is defensive only; the
-                    // p + len > limit check below then rejects the over-long run.
+                    // Bound the varint like the other decoders: a canonical length is
+                    // <= 5 bytes. open() already CRC-validated these bytes, so this is
+                    // defensive only; the p + len > limit check below rejects the
+                    // over-long run.
                     break;
                 }
             }
@@ -489,47 +508,25 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return size;
     }
 
-    /**
-     * Decodes an unsigned LEB128 varint from {@code buf[pos..limit)}. Returns
-     * {@code [value, newPos]} or {@code null} if the varint is truncated
-     * (torn tail).
-     */
-    private static long[] decodeVarint(long buf, int pos, int limit) {
-        long value = 0;
-        int shift = 0;
-        int cur = pos;
-        while (cur < limit) {
-            byte b = Unsafe.getUnsafe().getByte(buf + cur);
-            cur++;
-            value |= (long) (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                return new long[]{value, cur};
-            }
-            shift += 7;
-            if (shift > 35) {
-                return null; // implausible for an entry length; treat as torn
-            }
-        }
-        return null;
-    }
-
     private static PersistedSymbolDict openExisting(FilesFacade ff, String filePath, long fileLen) {
         int fd = ff.openRW(filePath);
         if (fd < 0) {
-            LOG.warn("symbol dict {} could not be opened (rc={}); recreating", filePath, fd);
+            LOG.warn("symbol dict {} could not be opened (rc={}); "
+                    + "falling back to full-dictionary frames (file left intact)", filePath, fd);
             return null;
         }
         long buf = 0L;
         long entriesAddr = 0L;
-        int entriesLen = 0;
+        int entriesCap = 0;
         try {
-            int len = (int) fileLen;
+            int len = (int) fileLen; // open() bounds fileLen to [HEADER_SIZE, Integer.MAX_VALUE)
             buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
             long read = ff.read(fd, buf, len, 0);
             if (read != len
                     || Unsafe.getUnsafe().getInt(buf) != FILE_MAGIC
                     || Unsafe.getUnsafe().getByte(buf + 4) != VERSION) {
-                LOG.warn("symbol dict {} unreadable, bad magic or unknown version; recreating", filePath);
+                LOG.warn("symbol dict {} unreadable, bad magic or unknown version; "
+                        + "falling back to full-dictionary frames (file left intact)", filePath);
                 Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
                 buf = 0L; // null after free so the catch below cannot double-free if ff.close throws
                 int fdToClose = fd;
@@ -537,92 +534,89 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 ff.close(fdToClose);
                 return null;
             }
-            // Parse complete, CRC-valid entries after the header; stop at the first
-            // torn/incomplete OR crc-mismatched entry. The CRC turns an interior
-            // tear (a lost page reading back as zeroes) or a stale entry left past
-            // the end by a failed truncate into a clean stop point, so recovery
-            // trusts only the intact prefix instead of silently mis-parsing a
-            // corrupt entry and shifting the dense id->symbol map.
-            int diskPos = HEADER_SIZE; // walks the on-disk [len][utf8][crc] entries
-            int count = 0;
-            int wireLen = 0;           // running size of the crc-stripped copy
-            while (diskPos < len) {
-                long[] vr = decodeVarint(buf, diskPos, len);
-                if (vr == null) {
-                    break; // torn length varint
-                }
-                long symLen = vr[0];
-                int afterVar = (int) vr[1];
-                // [len varint][utf8] then a u32 CRC. symLen stays a long so a
-                // corrupt multi-gigabyte length cannot wrap an int back under the
-                // bound check. No fixed per-entry ceiling -- the write path applies
-                // none, so a legitimately large symbol must recover here.
-                long wireEnd = (long) afterVar + symLen; // end of [len][utf8]
-                if (wireEnd + CRC_SIZE > len) {
-                    break; // torn/incomplete trailing entry (its CRC doesn't fit)
-                }
-                int wireEndI = (int) wireEnd;
-                int wireSpan = wireEndI - diskPos;
-                int crcStored = Unsafe.getUnsafe().getInt(buf + wireEndI);
-                int crcCalc = Crc32c.update(Crc32c.INIT, buf + diskPos, wireSpan);
-                if (crcCalc != crcStored) {
-                    break; // corrupt/stale entry -- stop before it (fail-clean)
-                }
-                diskPos = wireEndI + CRC_SIZE;
-                wireLen += wireSpan;
-                count++;
+            // Parse the chunks after the header, copying each chunk's entry region
+            // into entriesAddr AS WE VALIDATE IT -- one pass over the file, not two.
+            // Every chunk sheds its two header varints and its CRC, so the entry
+            // region is strictly smaller than the file and len - HEADER_SIZE is a safe
+            // upper bound to allocate up front; we shrink to the exact size below.
+            //
+            // Stop at the first torn/incomplete OR crc-mismatched chunk. The CRC turns
+            // an interior tear (a lost page reading back as zeroes) or a stale chunk
+            // left past the end by a failed truncate into a clean stop point, so
+            // recovery trusts only the intact prefix instead of silently mis-parsing a
+            // corrupt chunk and shifting the dense id->symbol map.
+            entriesCap = len - HEADER_SIZE;
+            long dst = 0L;
+            if (entriesCap > 0) {
+                entriesAddr = Unsafe.malloc(entriesCap, MemoryTag.NATIVE_DEFAULT);
+                dst = entriesAddr;
             }
-            int diskConsumed = diskPos - HEADER_SIZE; // valid entries incl. their CRCs
-            // Materialise the trusted entries as WIRE bytes ([len][utf8]..., no
-            // CRC) so loadedEntries*/readLoadedSymbols and the send-loop catch-up
-            // mirror stay wire-shaped -- the on-disk CRC is stripped here, once, at
-            // open. A second no-alloc walk over the already-validated region.
-            if (wireLen > 0) {
-                entriesAddr = Unsafe.malloc(wireLen, MemoryTag.NATIVE_DEFAULT);
-                // Record the length alongside the malloc so the catch below frees the
-                // right size (not 0) if this copy walk ever throws.
-                entriesLen = wireLen;
-                long dst = entriesAddr;
-                int p = HEADER_SIZE;
-                for (int i = 0; i < count; i++) {
-                    int vp = p;
-                    long symLen = 0;
-                    int shift = 0;
-                    while (true) {
-                        byte b = Unsafe.getUnsafe().getByte(buf + vp++);
-                        symLen |= (long) (b & 0x7F) << shift;
-                        if ((b & 0x80) == 0) {
-                            break;
-                        }
-                        shift += 7;
-                        if (shift > 35) {
-                            break; // corrupt run; these entries were CRC-validated above
-                        }
-                    }
-                    int wireSpan = (vp - p) + (int) symLen; // [len][utf8], no CRC
-                    Unsafe.getUnsafe().copyMemory(buf + p, dst, wireSpan);
-                    dst += wireSpan;
-                    p += wireSpan + CRC_SIZE; // skip the entry's CRC
+            Varint v = new Varint();
+            int diskPos = HEADER_SIZE;
+            int count = 0;
+            while (diskPos < len) {
+                if (!v.decode(buf, diskPos, len)) {
+                    break; // torn entryCount varint
                 }
+                long entryCount = v.value;
+                if (!v.decode(buf, v.end, len)) {
+                    break; // torn entryBytes varint
+                }
+                long entryBytes = v.value;
+                int entriesStart = v.end;
+                // entryCount/entryBytes stay long so a corrupt multi-gigabyte value
+                // cannot wrap an int back under the bound checks.
+                long chunkEnd = (long) entriesStart + entryBytes; // end of the entry region
+                if (chunkEnd + CRC_SIZE > len) {
+                    break; // torn/incomplete trailing chunk (its CRC doesn't fit)
+                }
+                int chunkEndI = (int) chunkEnd;
+                int crcStored = Unsafe.getUnsafe().getInt(buf + chunkEndI);
+                int crcCalc = Crc32c.update(Crc32c.INIT, buf + diskPos, chunkEndI - diskPos);
+                if (crcCalc != crcStored) {
+                    break; // corrupt/stale chunk -- stop before it (fail-clean)
+                }
+                // A chunk carries at least one entry, and the ids are int-dense. A
+                // CRC-valid chunk cannot violate either at realistic cardinality, but
+                // keep the int narrowing honest rather than wrapping the id space.
+                if (entryCount <= 0 || (long) count + entryCount > Integer.MAX_VALUE) {
+                    break;
+                }
+                Unsafe.getUnsafe().copyMemory(buf + entriesStart, dst, entryBytes);
+                dst += entryBytes;
+                diskPos = chunkEndI + CRC_SIZE;
+                count += (int) entryCount;
+            }
+            int entriesLen = entriesAddr != 0L ? (int) (dst - entriesAddr) : 0;
+            int diskConsumed = diskPos - HEADER_SIZE; // valid chunks incl. headers and CRCs
+            if (entriesAddr != 0L && entriesLen == 0) {
+                Unsafe.free(entriesAddr, entriesCap, MemoryTag.NATIVE_DEFAULT);
+                entriesAddr = 0L;
+                entriesCap = 0;
+            } else if (entriesAddr != 0L && entriesLen < entriesCap) {
+                // Shrink the upper-bound allocation to what the trusted prefix used.
+                entriesAddr = Unsafe.realloc(entriesAddr, entriesCap, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                entriesCap = entriesLen;
             }
             Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
             buf = 0L;
             // Drop any torn/stale trailing bytes so a LATER, shorter append cannot
-            // leave residue past its own end. Unlike before, the truncate result IS
-            // checked: a file we cannot trim could still expose stale post-end bytes
-            // whose (self-consistent) per-entry CRC the parse would accept at a
-            // shifted position, so a failed truncate makes the file untrusted --
-            // open() then recreates it empty (fail-clean) rather than risk a silent
-            // misattribution.
+            // leave residue past its own end. The truncate result IS checked: a file
+            // we cannot trim could still expose stale post-end bytes whose
+            // (self-consistent) chunk CRC the parse would accept at a shifted
+            // position, so a failed truncate makes the file untrusted -- return null
+            // (the sender falls back to full self-sufficient frames) and, per the
+            // never-destroy contract, leave every byte on disk.
             long validLen = HEADER_SIZE + diskConsumed;
             if (validLen < len && !ff.truncate(fd, validLen)) {
-                LOG.warn("symbol dict {} could not drop its torn/stale tail (truncate failed); recreating", filePath);
+                LOG.warn("symbol dict {} could not drop its torn/stale tail (truncate failed); "
+                        + "falling back to full-dictionary frames (file left intact)", filePath);
                 if (entriesAddr != 0L) {
-                    Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(entriesAddr, entriesCap, MemoryTag.NATIVE_DEFAULT);
                     // Null after freeing (like buf above) so the catch below cannot
                     // double-free entriesAddr if the following ff.close throws.
                     entriesAddr = 0L;
-                    entriesLen = 0;
+                    entriesCap = 0;
                 }
                 int fdToClose = fd;
                 fd = -1; // relinquish before close so the catch cannot double-close if close throws
@@ -640,12 +634,16 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // double-free. Keeps the error path leak-free on any throw between its
             // malloc and the return.
             if (entriesAddr != 0L) {
-                Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(entriesAddr, entriesCap, MemoryTag.NATIVE_DEFAULT);
             }
             if (fd >= 0) { // a branch that already closed fd relinquished it to -1
                 ff.close(fd);
             }
-            LOG.warn("symbol dict {} recovery failed ({}); recreating", filePath, String.valueOf(t));
+            // Pass the throwable as a trailing argument with no matching placeholder so
+            // slf4j prints the stack trace: this WARN is the only forensic record of why
+            // a load-bearing dictionary was abandoned.
+            LOG.warn("symbol dict {} recovery failed; falling back to full-dictionary frames "
+                    + "(file left intact)", filePath, t);
             return null;
         }
     }
@@ -669,19 +667,23 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 int fdToClose = fd;
                 fd = -1; // relinquish before close so the catch cannot double-close if close throws
                 ff.close(fdToClose);
-                ff.remove(filePath);
+                ff.remove(filePath); // drop the headerless stub rather than litter
                 LOG.warn("symbol dict {} header write failed; proceeding without it", filePath);
                 return null;
             }
         } catch (Throwable t) {
-            // Unreachable today (Files.write is native and returns -1 rather than
-            // throwing; the Unsafe puts target a valid 8-byte buffer and an 8-byte
-            // malloc cannot realistically OOM), but close the fd against a future
-            // edit so it cannot leak -- mirroring openExisting's error handling.
+            // Unreachable with FilesFacade.INSTANCE (Files.write is native and returns
+            // -1 rather than throwing; the Unsafe puts target a valid 8-byte buffer and
+            // an 8-byte malloc cannot realistically OOM), but the ff seam exists so
+            // tests CAN inject a throwing facade -- close the fd and drop the stub so
+            // neither leaks.
             if (fd >= 0) { // the header-write branch relinquished fd to -1 before closing
-                ff.close(fd);
+                int fdToClose = fd;
+                fd = -1;
+                ff.close(fdToClose);
+                ff.remove(filePath);
             }
-            LOG.warn("symbol dict {} creation failed ({}); proceeding without it", filePath, String.valueOf(t));
+            LOG.warn("symbol dict {} creation failed; proceeding without it", filePath, t);
             return null;
         } finally {
             if (hdr != 0L) {
@@ -691,19 +693,107 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return new PersistedSymbolDict(ff, fd, HEADER_SIZE, 0, 0L, 0);
     }
 
-    private void ensureScratch(int required) {
+    /**
+     * Grows the append scratch buffer to hold at least {@code required} bytes.
+     * <p>
+     * Throws when {@code required} exceeds {@link #MAX_SCRATCH_BYTES} rather than
+     * clamping to it: a clamp would hand back a buffer SMALLER than the caller asked
+     * for and return normally, and every caller then writes {@code required} bytes
+     * into it -- turning a clean out-of-memory into a silent native-heap overflow, on
+     * the very write path the dictionary's integrity rests on. This is the same
+     * loud-failure shape {@code CursorWebSocketSendLoop.ensureSentDictCapacity} uses
+     * on the same bound. Unreachable at any realistic cardinality (it needs a ~2 GiB
+     * dictionary section in a single frame, itself bounded by the server's batch
+     * cap), but a size guard on a data-integrity write path must never
+     * under-allocate.
+     */
+    private void ensureScratch(long required) {
         if (scratchCap >= required) {
             return;
         }
+        if (required > MAX_SCRATCH_BYTES) {
+            throw new IllegalStateException("symbol dict scratch buffer exceeds the maximum size to "
+                    + FILE_NAME + " [required=" + required + ", max=" + MAX_SCRATCH_BYTES + ']');
+        }
         // Double in long: scratchCap * 2 as an int overflows negative past ~1 GB and
-        // would make the realloc size negative. required is bounded by one frame's
-        // entries (the server batch cap), so this never actually caps -- it mirrors the
-        // long-math growth in CursorWebSocketSendLoop.ensureSentDictCapacity.
+        // would make the realloc size negative.
         long newCap = Math.max(required, Math.max(256L, (long) scratchCap * 2));
-        if (newCap > Integer.MAX_VALUE - 8) {
-            newCap = Integer.MAX_VALUE - 8;
+        if (newCap > MAX_SCRATCH_BYTES) {
+            newCap = MAX_SCRATCH_BYTES;
         }
         scratchAddr = Unsafe.realloc(scratchAddr, scratchCap, (int) newCap, MemoryTag.NATIVE_DEFAULT);
         scratchCap = (int) newCap;
+    }
+
+    /**
+     * Checksums {@code [recStart, recStart + hdrLen + entriesLen)} in ONE native
+     * call, appends the CRC, and issues ONE positioned write. Advances
+     * {@code size}/{@code appendOffset} only on a complete write, so a short write
+     * throws and a retry keyed off {@link #size()} re-persists the same range at the
+     * same offset.
+     */
+    private void flushChunk(long recStart, int hdrLen, int entriesLen, int count) {
+        int bodyLen = hdrLen + entriesLen;
+        int recLen = bodyLen + CRC_SIZE;
+        Unsafe.getUnsafe().putInt(recStart + bodyLen, Crc32c.update(Crc32c.INIT, recStart, bodyLen));
+        long written = ff.write(fd, recStart, recLen, appendOffset);
+        if (written != recLen) {
+            throw new IllegalStateException("short write to " + FILE_NAME
+                    + " [expected=" + recLen + ", actual=" + written + ']');
+        }
+        appendOffset += recLen;
+        size += count;
+    }
+
+    /**
+     * Writes one chunk whose entry region is ALREADY encoded in scratch at offset
+     * {@link #MAX_CHUNK_HEADER_SIZE}. Back-fills the header immediately in front of
+     * the entries -- the header is at most {@code MAX_CHUNK_HEADER_SIZE} bytes, so it
+     * always fits the reserve -- leaving header, entries and CRC one contiguous run
+     * for a single checksum and a single write.
+     */
+    private void writeChunkFromScratch(int entriesLen, int count) {
+        int hdrLen = NativeBufferWriter.varintSize(count) + NativeBufferWriter.varintSize(entriesLen);
+        long recStart = scratchAddr + MAX_CHUNK_HEADER_SIZE - hdrLen;
+        long p = NativeBufferWriter.writeVarint(recStart, count);
+        NativeBufferWriter.writeVarint(p, entriesLen);
+        flushChunk(recStart, hdrLen, entriesLen, count);
+    }
+
+    /**
+     * Zero-allocation LEB128 decoder, one instance per {@link #openExisting} call --
+     * not one per chunk. The previous {@code long[]}-returning decoder allocated once
+     * per ENTRY, so a million-symbol recovery churned a million throwaway arrays in a
+     * class that is otherwise strictly allocation-free.
+     */
+    private static final class Varint {
+        int end;
+        long value;
+
+        /**
+         * Decodes the varint at {@code buf[pos..limit)}. Returns false -- leaving
+         * {@code value}/{@code end} undefined -- when the varint is truncated (a torn
+         * tail) or runs longer than a canonical 5-byte length.
+         */
+        boolean decode(long buf, int pos, int limit) {
+            long v = 0;
+            int shift = 0;
+            int cur = pos;
+            while (cur < limit) {
+                byte b = Unsafe.getUnsafe().getByte(buf + cur);
+                cur++;
+                v |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    value = v;
+                    end = cur;
+                    return true;
+                }
+                shift += 7;
+                if (shift > 35) {
+                    return false; // implausible for a chunk header; treat as torn
+                }
+            }
+            return false;
+        }
     }
 }

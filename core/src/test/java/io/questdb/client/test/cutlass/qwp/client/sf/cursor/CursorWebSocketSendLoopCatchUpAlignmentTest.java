@@ -40,6 +40,7 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.util.concurrent.TimeUnit;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -259,6 +260,112 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             "CatchUpSendException", e.getCause().getClass().getSimpleName());
                     assertTrue("message must name the frame-size guard: " + e.getCause().getMessage(),
                             e.getCause().getMessage().contains("catch-up frame exceeds the maximum size"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCatchUpCapGapStrikesAloneDoNotLatchWithinTheEscalationWindow() throws Exception {
+        // The strike count alone must NOT latch a terminal: escalation also requires the
+        // cap-gap episode to have persisted for catchUpCapGapMinEscalationWindowMillis.
+        //
+        // This is what keeps a routine rolling restart from killing a live producer.
+        // MAX_CATCHUP_CAP_GAP_ATTEMPTS strikes accrue in ~2 minutes at the capped
+        // reconnect backoff -- less than the time the larger-cap node is away -- so a
+        // count-only budget would hard-fail the sender on the very transient the budget
+        // exists to ride out. Here we drive far MORE than the budget's strikes inside a
+        // (deliberately huge) window and assert the sender stays alive.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160);
+            try (CursorSendEngine engine = newEngine()) {
+                // A one-hour dwell the test cannot possibly elapse.
+                CursorWebSocketSendLoop loop = newLoop(engine, client, 3_600_000L);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    for (int i = 1; i <= maxAttempts + 4; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                        // The producer-facing latch must stay clear on EVERY attempt,
+                        // including the ones past the strike budget.
+                        loop.checkError();
+                    }
+                    assertTrue("the strikes really did exceed the budget",
+                            readInt(loop, "catchUpCapGapAttempts") > maxAttempts);
+
+                    // Backdate the episode anchor past the window: the very next cap gap
+                    // now satisfies BOTH conditions and latches. This pins the AND -- if
+                    // escalation ignored the wall clock the loop would already have
+                    // latched above; if it ignored the strike count it could never latch.
+                    Field anchor = CursorWebSocketSendLoop.class.getDeclaredField("catchUpCapGapFirstNanos");
+                    anchor.setAccessible(true);
+                    anchor.setLong(loop, System.nanoTime() - TimeUnit.HOURS.toNanos(2));
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                        fail("the escalating cap gap must still raise CatchUpSendException");
+                    } catch (InvocationTargetException e) {
+                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    }
+                    try {
+                        loop.checkError();
+                        fail("a cap gap that outlives the escalation window must latch a terminal");
+                    } catch (LineSenderException terminal) {
+                        assertTrue("terminal must name the exhausted catch-up cap gap: " + terminal.getMessage(),
+                                terminal.getMessage().contains("during catch-up")
+                                        && terminal.getMessage().contains("must be resent"));
+                    }
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTransientCatchUpFailureDoesNotBurnTheCapGapBudget() throws Exception {
+        // A TRANSIENT catch-up failure (the wire drops mid-catch-up -- a flapping LB, a
+        // reset) must never increment the cap-gap terminal budget. The budget exists to
+        // prove a PERSISTENT cluster capability gap; letting a transient feed it means
+        // enough wire flaps hard-fail a live store-and-forward producer, which is the
+        // exact failure store-and-forward promises cannot happen.
+        //
+        // The production code is correct, but nothing pinned it: the counter is never
+        // read by the existing transient test, and one transient can never reach a
+        // 16-strike budget anyway. So drive MORE transients than the whole budget and
+        // assert the counter never moves and no terminal ever latches.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            // A cap that FITS (no cap gap), but whose sendBinary always throws: every
+            // failure here is transport-transient, never a capability gap.
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0, true);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client, 0L);
+                try {
+                    seedMirror(loop, "alpha");
+                    for (int i = 1; i <= maxAttempts + 4; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("a transient send failure must raise CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                        loop.checkError(); // a transient is retriable, forever
+                        assertEquals("a transient must NOT burn the cap-gap terminal budget",
+                                0, readInt(loop, "catchUpCapGapAttempts"));
+                        assertEquals("a transient must NOT anchor a cap-gap episode",
+                                -1L, readLong(loop, "catchUpCapGapFirstNanos"));
+                    }
                 } finally {
                     loop.close();
                 }
@@ -539,12 +646,27 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
+        return newLoop(engine, client, 0L);
+    }
+
+    /**
+     * As {@link #newLoop(CursorSendEngine, WebSocketClient)} but with an explicit
+     * cap-gap escalation dwell. {@code 0} (the default here) means count-only
+     * escalation, which is what the raw constructor gives and what the strike-count
+     * tests want; the user-facing 5-minute default is applied at the config layer.
+     */
+    private CursorWebSocketSendLoop newLoop(
+            CursorSendEngine engine, WebSocketClient client, long capGapWindowMillis
+    ) {
         return new CursorWebSocketSendLoop(
                 client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                5_000L, 100L, 5_000L, false);
+                5_000L, 100L, 5_000L, false,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                0L, capGapWindowMillis);
     }
 
     private CursorSendEngine newEngine() {

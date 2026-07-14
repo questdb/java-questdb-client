@@ -38,6 +38,8 @@ import io.questdb.client.cutlass.qwp.client.QwpUdpSender;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -988,6 +990,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // build() time. 0 or negative is a documented "disable" value, so
         // a Long.MIN_VALUE sentinel keeps it distinguishable from "unset".
         private static final long DURABLE_ACK_KEEPALIVE_NOT_SET = Long.MIN_VALUE;
+        private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(LineSenderBuilder.class);
+        // How many quarantined copies of one slot may pile up under sf_dir before build()
+        // refuses to set aside another. Each is an unreplayable slot a human still has to
+        // look at; accumulating them without bound would turn a disk-space problem into a
+        // second incident.
+        private static final int MAX_QUARANTINE_SLOT_ATTEMPTS = 64;
         private static final int MIN_BUFFER_SIZE = AuthUtils.CHALLENGE_LEN + 1; // challenge size + 1;
         // sf-client.md section 4.4: the inbox capacity must accommodate the
         // distinct error categories in a bursty error stream so that drop-oldest
@@ -1003,6 +1011,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_TCP = 0;
         private static final int PROTOCOL_UDP = 3;
         private static final int PROTOCOL_WEBSOCKET = 2;
+        // Suffix for a slot set aside by quarantineTornSlot. Deliberately NOT the
+        // sender's own slot name, so OrphanScanner sees the quarantined copy and the
+        // orphan drainer can still deliver it if its frames turn out to be replayable.
+        private static final String QUARANTINE_SLOT_SUFFIX = ".unreplayable-";
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
@@ -1051,6 +1063,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
         private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private long catchUpCapGapMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1505,6 +1518,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 long actualPoisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
                         ? poisonMinEscalationWindowMillis
                         : CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
+                long actualCatchUpCapGapMinEscalationWindowMillis =
+                        catchUpCapGapMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
+                                ? catchUpCapGapMinEscalationWindowMillis
+                                : CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1543,6 +1560,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                if (cursorEngine.isRecoveredDictionaryIncomplete()) {
+                    cursorEngine = quarantineTornSlot(
+                            cursorEngine, sfDir, senderId, slotPath, actualSfMaxBytes,
+                            actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                }
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1578,7 +1600,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             connectionListener,
                             actualConnectionListenerInboxCapacity,
                             actualMaxFrameRejections,
-                            actualPoisonMinEscalationWindowMillis
+                            actualPoisonMinEscalationWindowMillis,
+                            actualCatchUpCapGapMinEscalationWindowMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1720,6 +1743,37 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * <p>
          * WebSocket transport only.
          */
+        /**
+         * Minimum wall-clock time (millis) a symbol-dictionary catch-up CAP GAP must
+         * persist before the sender gives up on it and fails.
+         * <p>
+         * A cap gap means a symbol already accepted by one node is too large to
+         * re-register on the node the sender just failed over to, because that node
+         * advertises a smaller maximum batch size. On a homogeneous cluster this cannot
+         * happen; it takes a heterogeneous or mid-roll cluster, or an operator lowering
+         * the cap below existing data.
+         * <p>
+         * The sender retries such a gap across reconnects rather than failing on sight,
+         * because the larger-cap node may simply be away -- a rolling restart is the most
+         * likely reason a failover happened at all. It gives up only once the gap has BOTH
+         * recurred many times AND persisted for this long, so an ordinary cluster
+         * operation cannot bring down a live producer. Raise it for a cluster whose
+         * rolling restarts take longer than the 5-minute default; set it to {@code 0} to
+         * fail as soon as the retry count is exhausted.
+         * <p>
+         * WebSocket transport only.
+         */
+        public LineSenderBuilder catchUpCapGapMinEscalationWindowMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
+            }
+            if (millis < 0) {
+                throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis must be >= 0: ").put(millis);
+            }
+            this.catchUpCapGapMinEscalationWindowMillis = millis;
+            return this;
+        }
+
         public LineSenderBuilder closeFlushTimeoutMillis(long timeoutMillis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
@@ -2916,6 +2970,77 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
         }
 
+        /**
+         * Sets a recovered slot whose symbol dictionary cannot cover its surviving frames
+         * aside, and returns a fresh engine on an empty slot so the producer can keep
+         * producing.
+         * <p>
+         * Such a slot is unreplayable BY THIS PRODUCER: its frames reference symbol ids the
+         * recovered dictionary lost (a host/power crash tore the unsynced side-file), so a
+         * producer seeded from the short dictionary would hand those ids to different
+         * symbols and silently misattribute values. Detecting that is correct and
+         * load-bearing -- but simply THROWING is not a safe response. {@code senderId}
+         * defaults to a stable name, so a restarted process re-adopts the same slot; the
+         * engine's close retains a slot that is not fully drained; and so every subsequent
+         * {@code build()} would re-recover the same slot and throw again -- forever, until
+         * an operator deleted the directory by hand. The application could not construct a
+         * Sender at all, and so could not even BUFFER new rows. That trades a bounded,
+         * already-lost batch for an unbounded outage of everything after it, which inverts
+         * the one guarantee store-and-forward exists to give.
+         * <p>
+         * So: rename the slot aside instead. The bytes are preserved for forensics and for
+         * the orphan drainer, which reaches the same verdict independently (its send loop's
+         * replay guard fires and it marks the slot {@code .failed}) -- and which, on a slot
+         * that turns out to be drainable after all (frames written in full-dictionary
+         * fallback mode are self-sufficient), simply drains it. The new name is NOT the
+         * sender's own slot name, so {@code OrphanScanner} will consider it. The producer,
+         * meanwhile, starts on a clean empty slot and never notices.
+         * <p>
+         * If the rename fails (a Windows share lock, a read-only mount) there is no way to
+         * free the slot name without destroying data, so fall back to the old behaviour and
+         * throw -- loudly, and never silently dropping bytes.
+         */
+        private static CursorSendEngine quarantineTornSlot(
+                CursorSendEngine torn, String sfDir, String senderId, String slotPath,
+                long sfMaxBytes, long sfMaxTotalBytes, long sfAppendDeadlineNanos
+        ) {
+            long recoveredMaxSymbolId = torn.recoveredMaxSymbolId();
+            PersistedSymbolDict dict = torn.getPersistedSymbolDict();
+            int coverage = dict != null ? dict.size() : 0;
+            String detail = "recovered store-and-forward symbol dictionary cannot cover the surviving "
+                    + "frames (likely a host crash tore its unsynced tail): frames reference symbol id "
+                    + recoveredMaxSymbolId + " but the recovered dictionary holds only " + coverage
+                    + " id(s)";
+            // Release the slot lock and the dictionary fd before renaming. The slot is not
+            // fully drained, so close() retains every file.
+            torn.close();
+
+            String quarantinePath = null;
+            for (int i = 0; i < MAX_QUARANTINE_SLOT_ATTEMPTS; i++) {
+                String candidate = sfDir + "/" + senderId + QUARANTINE_SLOT_SUFFIX + i;
+                if (!Files.exists(candidate)) {
+                    quarantinePath = candidate;
+                    break;
+                }
+            }
+            if (quarantinePath == null || Files.rename(slotPath, quarantinePath) != 0) {
+                throw new LineSenderException(
+                        detail + "; the affected data must be resent. The slot could not be set aside "
+                                + "automatically (" + (quarantinePath == null
+                                ? "too many quarantined slots already under " + sfDir
+                                : "rename to " + quarantinePath + " failed")
+                                + "), so this sender cannot start until "
+                                + slotPath + " is moved or removed by hand");
+            }
+            // Mark the quarantined copy so the orphan drainer treats it as a
+            // human-in-the-loop slot rather than silently retrying it forever.
+            OrphanScanner.markFailed(quarantinePath, detail);
+            LOG.error("{} -- the slot has been set aside at {} and the affected data must be resent; "
+                            + "this sender continues on a fresh, empty slot at {}",
+                    detail, quarantinePath, slotPath);
+            return new CursorSendEngine(slotPath, sfMaxBytes, sfMaxTotalBytes, sfAppendDeadlineNanos);
+        }
+
         private static int resolveIPv4(String host) {
             try {
                 byte[] addr = InetAddress.getByName(host).getAddress();
@@ -3413,6 +3538,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "poison_min_escalation_window_millis");
                     poisonMinEscalationWindowMillis(parseLongValue(sink, "poison_min_escalation_window_millis"));
+                } else if (Chars.equals("catchup_cap_gap_min_escalation_window_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "catchup_cap_gap_min_escalation_window_millis");
+                    catchUpCapGapMinEscalationWindowMillis(parseLongValue(sink, "catchup_cap_gap_min_escalation_window_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -3686,6 +3817,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("poison_min_escalation_window_millis")) {
                     poisonMinEscalationWindowMillis(wsLong(view, v, "poison_min_escalation_window_millis"));
                 }
+                if (view.has("catchup_cap_gap_min_escalation_window_millis")) {
+                    catchUpCapGapMinEscalationWindowMillis(wsLong(view, v, "catchup_cap_gap_min_escalation_window_millis"));
+                }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
@@ -3862,6 +3996,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_background_drainers", maxBackgroundDrainers);
             m.put("max_frame_rejections", maxFrameRejections);
             m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
+            m.put("catchup_cap_gap_min_escalation_window_millis", catchUpCapGapMinEscalationWindowMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

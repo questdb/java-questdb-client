@@ -745,6 +745,38 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Whether this RECOVERED slot's surviving frames reference symbol ids the
+     * recovered dictionary cannot cover -- i.e. the slot cannot be drained by a
+     * producer that shares its id space, and a producer seeded from the short
+     * dictionary would reuse ids those frames already define.
+     * <p>
+     * True in two situations, both of which mean the same thing to the caller:
+     * <ul>
+     *   <li>the dictionary opened but is SHORT of the frames (a host/power crash
+     *       tore its unsynced tail -- see {@code PersistedSymbolDict}'s durability
+     *       note); or</li>
+     *   <li>the dictionary did not open at all ({@code persistedSymbolDict == null}
+     *       -- an unreadable or torn side-file, fd exhaustion, a read-only remount)
+     *       while the surviving frames are DELTA frames that need one. Coverage is
+     *       then zero, so any frame referencing an id at all is unreplayable.</li>
+     * </ul>
+     * Always false for a fresh (non-recovered) slot: {@code recoveredMaxSymbolId} is
+     * -1 there, and -1 is below every coverage.
+     * <p>
+     * The caller must NOT drain such a slot with a live producer attached. The
+     * foreground sender quarantines it and starts on a fresh slot
+     * ({@code Sender.build()}); the orphan drainer reaches the same verdict
+     * independently via the send loop's replay guard and marks the slot failed.
+     * Either way the recorded bytes stay on disk and the affected data must be
+     * resent -- but the producer keeps producing, which is the whole point of
+     * store-and-forward.
+     */
+    public boolean isRecoveredDictionaryIncomplete() {
+        long coverage = persistedSymbolDict != null ? persistedSymbolDict.size() : 0;
+        return recoveredMaxSymbolId >= coverage;
+    }
+
+    /**
      * Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}.
      */
     public MmapSegment nextSealedAfter(MmapSegment current) {

@@ -41,6 +41,11 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class PersistedSymbolDictTest {
 
+    // On-disk geometry, mirrored from PersistedSymbolDict so the layout-derived
+    // corruption tests below read as arithmetic rather than magic numbers.
+    private static final int CRC_SIZE = 4;
+    private static final int HEADER_SIZE = 8;
+
     @Test
     public void testAppendPersistsAcrossReopen() throws Exception {
         assertMemoryLeak(() -> {
@@ -331,21 +336,57 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testBadMagicIsRecreatedEmpty() throws Exception {
+    public void testBatchAppendWritesOneChunkWithOneChecksum() throws Exception {
+        // A batch append must write ONE chunk -- one [entryCount][entryBytes] header and
+        // ONE trailing CRC-32C for the whole range -- not one checksummed record per
+        // symbol.
+        //
+        // This is the load-bearing property of the v3 layout, and it is a producer-thread
+        // cost, not a cosmetic one: Crc32c.update is a NATIVE call, so a per-entry
+        // checksum put one JNI transition (plus one sub-cache-line copy and one redundant
+        // varint decode) on the flush path for every new symbol. On the high-cardinality
+        // batch this whole feature exists to serve -- one new symbol per row -- that is a
+        // thousand native calls per flush where the chunk needs one.
+        //
+        // Asserted through the file size, which is exact and cheap: N single-byte ASCII
+        // symbols cost N * ([len varint] + 1 utf8 byte) of entries, wrapped in one chunk.
+        // Per-entry CRCs would add 4 * N bytes instead of 4.
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
             try {
-                // A file with the right size but garbage content (bad magic).
-                Path f = dir.resolve(".symbol-dict");
-                Files.write(f, new byte[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+                final int n = 26; // 'a'..'z' -- distinct, and one UTF-8 byte each
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                for (int i = 0; i < n; i++) {
+                    dict.getOrAddSymbol(String.valueOf((char) ('a' + i)));
+                }
+                Assert.assertEquals(n, dict.size());
                 PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
                 Assert.assertNotNull(d);
                 try {
-                    Assert.assertEquals("bad-magic file recreated empty", 0, d.size());
-                    d.appendSymbol("X");
-                    Assert.assertEquals(1, d.size());
+                    d.appendSymbols(dict, 0, n - 1);
+                    Assert.assertEquals(n, d.size());
                 } finally {
                     d.close();
+                }
+
+                int entryBytes = n * 2;                       // [len=1 varint][1 utf8 byte]
+                int chunkHeader = 1 + varintSize(entryBytes); // entryCount=50 fits one byte
+                long expected = HEADER_SIZE + chunkHeader + entryBytes + CRC_SIZE;
+                Assert.assertEquals(
+                        "a batch append must cost ONE chunk checksum, not one per symbol",
+                        expected, Files.size(dir.resolve(".symbol-dict")));
+
+                // And it must still read back symbol-for-symbol.
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(re);
+                try {
+                    Assert.assertEquals(n, re.size());
+                    ObjList<String> got = re.readLoadedSymbols();
+                    for (int i = 0; i < n; i++) {
+                        Assert.assertEquals(dict.getSymbol(i), got.getQuick(i));
+                    }
+                } finally {
+                    re.close();
                 }
             } finally {
                 rmDir(dir);
@@ -353,37 +394,66 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    private static int varintSize(int v) {
+        int n = 1;
+        while ((v >>>= 7) != 0) {
+            n++;
+        }
+        return n;
+    }
+
     @Test
-    public void testBadVersionIsRecreatedEmpty() throws Exception {
-        // A file with correct 'SYD1' magic and a VALID entry but an unknown version
-        // byte must be recreated empty -- its entries belong to a foreign/future
-        // format and must not be parsed as v2. Covers the version sub-condition
-        // specifically (testBadMagicIsRecreatedEmpty covers the magic one). Because
-        // the seeded "a" is a valid v2 entry, without the version check it would parse
-        // back (size 1), so this fails.
+    public void testBadMagicDegradesWithoutDestroyingTheFile() throws Exception {
+        // An unparseable existing file must degrade to null -- the sender falls back
+        // to full self-sufficient frames -- and must NOT be recreated. open() used to
+        // fall through to openFresh(), which is O_TRUNC: a single unreadable byte
+        // destroyed the only copy of load-bearing state.
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
             try {
                 Path f = dir.resolve(".symbol-dict");
-                // Build a real v2 dictionary with one valid entry...
+                byte[] original = new byte[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+                Files.write(f, original);
+                Assert.assertNull("an unparseable existing dict must degrade to null",
+                        PersistedSymbolDict.open(dir.toString()));
+                Assert.assertArrayEquals("open() must NOT destroy an existing dictionary",
+                        original, Files.readAllBytes(f));
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testBadVersionDegradesWithoutDestroyingTheFile() throws Exception {
+        // A file with correct 'SYD1' magic and a VALID chunk but an unknown version
+        // byte belongs to a foreign/future format and must not be parsed as v3.
+        // Covers the version sub-condition specifically (testBadMagicDegrades... covers
+        // the magic one).
+        //
+        // The file must SURVIVE. This is the client-rollback trap: a newer client
+        // writes v4, ops roll back to this build, and if open() recreated the file the
+        // v4 dictionary would be gone for good -- rolling forward again could not
+        // recover it, and every surviving delta frame would be permanently
+        // unreplayable. Degrading to null instead leaves the bytes for the client that
+        // does understand them.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                Path f = dir.resolve(".symbol-dict");
                 PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString());
                 Assert.assertNotNull(seed);
                 seed.appendSymbol("a");
                 seed.close();
-                // ...then corrupt ONLY the version byte (offset 4) to an unknown value.
+                // Corrupt ONLY the version byte (offset 4) to an unknown value.
                 byte[] bytes = Files.readAllBytes(f);
                 bytes[4] = (byte) 99;
                 Files.write(f, bytes);
 
-                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
-                Assert.assertNotNull(d);
-                try {
-                    Assert.assertEquals("bad-version file recreated empty (entries must not parse)", 0, d.size());
-                    d.appendSymbol("X");
-                    Assert.assertEquals(1, d.size());
-                } finally {
-                    d.close();
-                }
+                Assert.assertNull("an unknown-version dict must degrade to null",
+                        PersistedSymbolDict.open(dir.toString()));
+                Assert.assertArrayEquals("open() must NOT destroy a future-version dictionary",
+                        bytes, Files.readAllBytes(f));
             } finally {
                 rmDir(dir);
             }
@@ -446,11 +516,11 @@ public class PersistedSymbolDictTest {
     @Test
     public void testInteriorCorruptionIsCaughtNotSilentlyMisattributed() throws Exception {
         // A host-crash interior tear (a lost page reading back as zeroes) or a
-        // stale entry left past the end by a failed truncate can change the bytes
-        // of a NON-trailing entry. Without the per-entry CRC the parse would
+        // stale chunk left past the end by a failed truncate can change the bytes
+        // of a NON-trailing chunk. Without the per-chunk CRC the parse would
         // accept those bytes, shifting the dense id->symbol map and silently
         // misattributing symbol-column values on replay. With the CRC the corrupt
-        // entry fails verification and the parse stops there, so recovery trusts
+        // chunk fails verification and the parse stops there, so recovery trusts
         // only the intact prefix (fail-clean: the send loop's torn-dict guard then
         // forces a resend of the rest).
         assertMemoryLeak(() -> {
@@ -468,25 +538,27 @@ public class PersistedSymbolDictTest {
                     d.close();
                 }
 
-                // Corrupt one byte inside the 3rd entry's UTF-8 (id 2). On-disk
-                // entry layout is [len varint][utf8][crc32c u32]; a 2-byte ASCII
-                // symbol is 1 + 2 + 4 = 7 bytes, after the 8-byte header:
-                //   header[0,8) e0[8,15) e1[15,22) e2[22,29) ...
-                // Offset 23 is "s2"'s first UTF-8 byte; flipping it leaves e2's
-                // stored CRC stale.
+                // Corrupt one byte inside the 3rd chunk's entry region (id 2). Each
+                // appendSymbol writes one single-entry chunk
+                // ([entryCount][entryBytes][len][utf8][crc32c]), and all five symbols
+                // are the same width, so the five chunks are equal-sized -- derive the
+                // stride from the file rather than hard-coding it. The byte flipped is
+                // the last one before the chunk's trailing CRC, so that CRC goes stale.
                 Path f = dir.resolve(".symbol-dict");
                 byte[] bytes = Files.readAllBytes(f);
-                bytes[23] ^= 0x7F;
+                int chunkLen = (bytes.length - HEADER_SIZE) / 5;
+                int chunk2 = HEADER_SIZE + 2 * chunkLen;
+                bytes[chunk2 + chunkLen - CRC_SIZE - 1] ^= 0x7F;
                 Files.write(f, bytes);
 
                 PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
                 Assert.assertNotNull(re);
                 try {
-                    // Only the intact prefix [s0, s1] is trusted; the corrupt e2
+                    // Only the intact prefix [s0, s1] is trusted; the corrupt chunk
                     // and everything after it are dropped. No recovered symbol is
                     // the corrupted string -- the tear is DETECTED, never silently
                     // misattributed.
-                    Assert.assertEquals("parse must stop at the corrupt interior entry", 2, re.size());
+                    Assert.assertEquals("parse must stop at the corrupt interior chunk", 2, re.size());
                     ObjList<String> s = re.readLoadedSymbols();
                     Assert.assertEquals("s0", s.getQuick(0));
                     Assert.assertEquals("s1", s.getQuick(1));
@@ -611,31 +683,40 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testTooLargeToReopenRecreatesEmpty() throws Exception {
-        // A dictionary that legitimately grew past Integer.MAX_VALUE cannot be read
-        // into one int-sized buffer; open() must recreate it empty (fail-clean, like
-        // every other unreadable-file case) rather than truncate the multi-GB file
-        // via a negative/zero (int) length cast. A fault facade reports the huge
-        // length without needing a real 2GB file on disk.
+    public void testTooLargeToReopenDegradesWithoutOpeningTheFile() throws Exception {
+        // A dictionary at or past Integer.MAX_VALUE cannot be read into one int-sized
+        // buffer, so open() must short-circuit to null BEFORE touching the file.
+        //
+        // The facade reports 2^32 + 100 -- deliberately NOT Integer.MAX_VALUE + 1.
+        // That value casts to Integer.MIN_VALUE, which Unsafe.malloc rejects anyway,
+        // so openExisting's catch would produce the same null and the test could not
+        // tell the guard from its absence (it was exactly that vacuous before). A
+        // length of 2^32 + k instead casts to a SMALL POSITIVE prefix -- the branch
+        // the guard's own javadoc calls out -- under which openExisting would happily
+        // malloc, read a truncated prefix, and parse it.
+        //
+        // The assertion that pins the guard is therefore NOT the null (both paths give
+        // null) but that the file is never even OPENED: with the guard, open() returns
+        // before openRW; without it, openExisting opens the file and parses garbage.
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
             try {
-                // Seed a small real file so exists() is true and the facade's huge
-                // length() drives the > Integer.MAX_VALUE reopen guard.
                 PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString());
                 Assert.assertNotNull(seed);
-                seed.appendSymbol("a");
-                seed.close();
-
-                PersistedSymbolDict d = PersistedSymbolDict.open(new HugeLengthFacade(), dir.toString());
-                Assert.assertNotNull(d);
-                try {
-                    Assert.assertEquals("a >2GB dictionary must recreate empty", 0, d.size());
-                    d.appendSymbol("X");
-                    Assert.assertEquals(1, d.size());
-                } finally {
-                    d.close();
+                for (int i = 0; i < 40; i++) {
+                    seed.appendSymbol("sym" + i);
                 }
+                seed.close();
+                Path f = dir.resolve(".symbol-dict");
+                byte[] before = Files.readAllBytes(f);
+
+                HugeLengthFacade ff = new HugeLengthFacade();
+                Assert.assertNull("a >=2GB dictionary must degrade to null",
+                        PersistedSymbolDict.open(ff, dir.toString()));
+                Assert.assertEquals("the guard must short-circuit BEFORE opening the file",
+                        0, ff.openRwCalls);
+                Assert.assertArrayEquals("open() must NOT destroy or trim an oversized dictionary",
+                        before, Files.readAllBytes(f));
             } finally {
                 rmDir(dir);
             }
@@ -693,15 +774,19 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testTruncateFailureRecreatesEmpty() throws Exception {
-        // A host crash can leave a torn/stale tail past the last complete entry.
+    public void testTruncateFailureDegradesWithoutDestroyingTheFile() throws Exception {
+        // A host crash can leave a torn/stale tail past the last complete chunk.
         // open() drops it with a truncate; if that truncate FAILS (a read-only
         // remount, a Windows share lock), the file still exposes the stale bytes,
-        // whose self-consistent per-entry CRC a later shifted parse could accept as
-        // a real symbol. So a failed truncate must make the file UNTRUSTED --
-        // open() recreates it empty (fail-clean) rather than returning a dict laid
-        // over stale bytes. Drive the truncate failure with a facade and assert the
-        // reopened dictionary is empty, not the [one, two] prefix.
+        // whose self-consistent chunk CRC a later shifted parse could accept as a real
+        // symbol. So a failed truncate must make the file UNTRUSTED -- open() degrades
+        // to null (the sender falls back to full self-sufficient frames) rather than
+        // returning a dict laid over stale bytes.
+        //
+        // It must NOT recreate the file, which is what it used to do: a read-only
+        // remount is transient, and destroying the [one, two] prefix on the way past it
+        // makes every surviving delta frame permanently unreplayable. Degrading leaves
+        // the bytes for the next attempt, once the mount is writable again.
         assertMemoryLeak(() -> {
             Path dir = Files.createTempDirectory("qwp-symdict");
             try {
@@ -710,26 +795,31 @@ public class PersistedSymbolDictTest {
                 d.appendSymbol("two");
                 d.close();
 
-                // Append a torn trailing record (length prefix 5, only 2 bytes) so
-                // the reopen parses [one, two], then finds validLen < len and tries
-                // to truncate the tail -- the branch under test.
+                // Append a torn trailing record so the reopen parses [one, two], then
+                // finds validLen < len and tries to truncate the tail -- the branch
+                // under test.
                 Path f = dir.resolve(".symbol-dict");
                 long cleanLen = Files.size(f); // header + "one" + "two", no tail
                 Files.write(f, new byte[]{(byte) 5, (byte) 'x', (byte) 'y'}, StandardOpenOption.APPEND);
                 Assert.assertEquals("torn tail present before reopen", cleanLen + 3, Files.size(f));
+                byte[] before = Files.readAllBytes(f);
 
                 // Reopen through a facade whose truncate() fails.
-                PersistedSymbolDict re = PersistedSymbolDict.open(new FailingTruncateFacade(), dir.toString());
+                Assert.assertNull("a dict whose torn tail cannot be trimmed must degrade to null",
+                        PersistedSymbolDict.open(new FailingTruncateFacade(), dir.toString()));
+                Assert.assertArrayEquals("a failed truncate must NOT destroy the dictionary",
+                        before, Files.readAllBytes(f));
+
+                // And once the filesystem is writable again, the SAME file recovers its
+                // intact prefix in full -- which is the whole point of not destroying it.
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
                 Assert.assertNotNull(re);
                 try {
-                    // The failed truncate made the file untrusted, so open() recreated
-                    // it empty rather than trusting the [one, two] prefix over a stale
-                    // tail: size()==0, not 2, and no recovered symbols.
-                    Assert.assertEquals("failed truncate must recreate the dictionary empty", 0, re.size());
-                    Assert.assertEquals(0, re.readLoadedSymbols().size());
-                    // openFresh rewrote a bare 8-byte header (magic + version), so both
-                    // the two entries and the torn tail are gone.
-                    Assert.assertEquals("recreated file is a bare header", 8L, Files.size(f));
+                    Assert.assertEquals("the intact prefix survives the transient", 2, re.size());
+                    ObjList<String> s = re.readLoadedSymbols();
+                    Assert.assertEquals("one", s.getQuick(0));
+                    Assert.assertEquals("two", s.getQuick(1));
+                    Assert.assertEquals("the torn tail is trimmed once truncate works", cleanLen, Files.size(f));
                 } finally {
                     re.close();
                 }
@@ -894,12 +984,28 @@ public class PersistedSymbolDictTest {
     /**
      * Reports a dictionary length past {@link Integer#MAX_VALUE} -- reproducing a
      * dictionary that legitimately grew beyond 2GB, which {@code open()} cannot read
-     * into one int-sized buffer and must recreate empty.
+     * into one int-sized buffer and must refuse before touching the file.
+     * <p>
+     * The length is {@code 2^32 + 100}, NOT {@code Integer.MAX_VALUE + 1}. The latter
+     * casts to {@code Integer.MIN_VALUE}, which {@code Unsafe.malloc} rejects on its
+     * own, so {@code openExisting}'s catch would produce the same {@code null} with or
+     * without the guard -- which is precisely what made the old version of this test
+     * vacuous. {@code 2^32 + k} casts to a small POSITIVE prefix instead, so without
+     * the guard {@code openExisting} really would open the file and parse a truncated
+     * prefix of it. {@link #openRwCalls} is what catches that.
      */
     private static final class HugeLengthFacade extends DelegatingFilesFacade {
+        int openRwCalls;
+
         @Override
         public long length(String path) {
-            return (long) Integer.MAX_VALUE + 1L;
+            return (1L << 32) + 100L;
+        }
+
+        @Override
+        public int openRW(String path) {
+            openRwCalls++;
+            return super.openRW(path);
         }
     }
 

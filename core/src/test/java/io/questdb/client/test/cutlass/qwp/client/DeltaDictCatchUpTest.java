@@ -238,8 +238,17 @@ public class DeltaDictCatchUpTest {
 
                 String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
                 LineSenderException terminal = null;
+                // catchup_cap_gap_min_escalation_window_millis=0 restores count-only
+                // escalation, so the terminal latches as soon as the settle budget's
+                // strikes are exhausted. The DEFAULT is a 5-minute wall-clock dwell on
+                // top of the strike count, precisely so a cap gap that lasts only as
+                // long as a rolling restart cannot hard-fail a live producer -- and a
+                // test cannot wait that out. Zeroing it here is what makes the terminal
+                // observable; the dwell itself is covered by
+                // CursorWebSocketSendLoopCatchUpAlignmentTest.
                 Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                        + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50;");
+                        + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50"
+                        + ";catchup_cap_gap_min_escalation_window_millis=0;");
                 try {
                     sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
                     sender.flush();
