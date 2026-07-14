@@ -32,6 +32,8 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.IdentityHashMap;
+
 /**
  * Chain of {@link MmapSegment}s presented to the user thread as one logical
  * append-only log keyed by frame sequence number (FSN). Owns segment
@@ -63,6 +65,8 @@ public final class SegmentRing implements QuietCloseable {
     public static final long BACKPRESSURE_NO_SPARE = -1L;
     /** Sentinel: append failed because the payload doesn't fit in a fresh segment. */
     public static final long PAYLOAD_TOO_LARGE = -2L;
+    private static final RetainedSegmentMembershipMode DEFAULT_MEMBERSHIP_MODE =
+            RetainedSegmentMembershipMode.IDENTITY;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
     // Tally of sealed-list entries inspected by nextSealedAfter(). Test-only
     // operation count for deterministic traversal-complexity assertions.
@@ -176,6 +180,15 @@ public final class SegmentRing implements QuietCloseable {
      * all succeed does it migrate a legacy chain or discard validated spares.
      */
     static Recovery recover(FilesFacade filesFacade, String sfDir, long maxBytesPerSegment) {
+        return recover(filesFacade, sfDir, maxBytesPerSegment, null);
+    }
+
+    static Recovery recover(
+            FilesFacade filesFacade,
+            String sfDir,
+            long maxBytesPerSegment,
+            MembershipObserver membershipObserver
+    ) {
         if (!filesFacade.exists(sfDir)) {
             return Recovery.empty();
         }
@@ -433,52 +446,72 @@ public final class SegmentRing implements QuietCloseable {
                 }
             }
 
+            // Build membership and clean validated extras while every mmap and
+            // the manifest still have one local owner. In particular, an OOM
+            // while allocating the identity map falls through to the outer
+            // failure cleanup instead of stranding extras after transfer.
+            RetainedSegmentMembership retained = newDefaultMembership(chain, membershipObserver);
+            for (int i = 0, n = all.size(); i < n; i++) {
+                MmapSegment segment = all.get(i);
+                if (!retained.contains(segment)) {
+                    String path = null;
+                    long torn = 0;
+                    Throwable inspectionError = null;
+                    try {
+                        path = segment.path();
+                        torn = segment.tornTailBytes();
+                    } catch (Throwable error) {
+                        inspectionError = error;
+                    }
+                    // A close failure is not best-effort: keep local ownership
+                    // and fail through the outer cleanup rather than transfer a
+                    // ring while an extra may still own an mmap or fd.
+                    segment.close();
+                    all.setQuick(i, null);
+                    if (inspectionError != null) {
+                        warnPostRecoveryCleanupFailure(inspectionError);
+                        continue;
+                    }
+                    try {
+                        cleanupClosedExtra(filesFacade, path, torn);
+                    } catch (Throwable cleanupError) {
+                        warnPostRecoveryCleanupFailure(cleanupError);
+                    }
+                }
+            }
+            quarantineCorrupt(filesFacade, corruptPaths);
+
             for (int i = 1, n = chain.size(); i < n; i++) {
                 chain.get(i - 1).linkSuccessor(chain.get(i));
             }
             SegmentRing ring = new SegmentRing(active, maxBytesPerSegment, manifest);
-            manifest = null;
             for (int i = 0, n = chain.size() - 1; i < n; i++) {
                 ring.sealedSegments.add(chain.get(i));
             }
-            // Ownership of the chain transferred. Clean up only validated
-            // extras; recovery is already successful, so cleanup failure
-            // must never turn startup into a partially-mutating error or
-            // orphan the constructed ring -- swallow and let the next
-            // startup re-examine the leftovers. Extras with a torn tail
-            // carry evidence of attempted writes -- keep the bytes under a
-            // .corrupt name instead of unlinking them.
-            try {
-                for (int i = 0, n = all.size(); i < n; i++) {
-                    MmapSegment segment = all.get(i);
-                    if (!containsIdentity(chain, segment)) {
-                        String path = segment.path();
-                        long torn = segment.tornTailBytes();
-                        segment.close();
-                        if (torn > 0) {
-                            quarantineFile(filesFacade, path);
-                        } else if (!filesFacade.remove(path)) {
-                            LOG.warn("could not remove validated stale/empty SF segment {}", path);
-                        }
-                    }
-                }
-                all.clear();
-                quarantineCorrupt(filesFacade, corruptPaths);
-            } catch (Throwable cleanupError) {
-                LOG.warn("post-recovery cleanup failed; leftover files will be "
-                        + "re-examined on the next startup", cleanupError);
-            }
-            return Recovery.recovered(ring);
+            // Allocate the return wrapper before transfer. Until this succeeds,
+            // the outer catch remains the sole owner and can close all segments
+            // and the manifest if construction or sealed-list growth fails.
+            Recovery recovery = Recovery.recovered(ring);
+            manifest = null;
+            all.clear();
+            return recovery;
         } catch (Throwable t) {
             for (int i = 0, n = all.size(); i < n; i++) {
-                try {
-                    all.get(i).close();
-                } catch (Throwable closeError) {
-                    LOG.warn("error closing SF segment after recovery failure", closeError);
+                MmapSegment segment = all.get(i);
+                if (segment != null) {
+                    try {
+                        segment.close();
+                    } catch (Throwable closeError) {
+                        warnRecoveryCloseFailure(closeError);
+                    }
                 }
             }
             if (manifest != null) {
-                manifest.close();
+                try {
+                    manifest.close();
+                } catch (Throwable closeError) {
+                    warnRecoveryCloseFailure(closeError);
+                }
             }
             throw t;
         }
@@ -525,13 +558,81 @@ public final class SegmentRing implements QuietCloseable {
         return selected;
     }
 
+    private static void cleanupClosedExtra(FilesFacade filesFacade, String path, long torn) {
+        if (torn > 0) {
+            quarantineFile(filesFacade, path);
+        } else if (!filesFacade.remove(path)) {
+            LOG.warn("could not remove validated stale/empty SF segment {}", path);
+        }
+    }
+
+    private static RetainedSegmentMembership newDefaultMembership(
+            final ObjList<MmapSegment> chain,
+            final MembershipObserver observer
+    ) {
+        if (observer != null) {
+            observer.beforeMembershipAllocation();
+        }
+        if (DEFAULT_MEMBERSHIP_MODE == RetainedSegmentMembershipMode.LINEAR) {
+            if (observer == null) {
+                return new RetainedSegmentMembership() {
+                    @Override
+                    public boolean contains(MmapSegment segment) {
+                        for (int i = 0, n = chain.size(); i < n; i++) {
+                            if (chain.get(i) == segment) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                };
+            }
+            return new RetainedSegmentMembership() {
+                @Override
+                public boolean contains(MmapSegment segment) {
+                    for (int i = 0, n = chain.size(); i < n; i++) {
+                        observer.onMembershipOperation();
+                        if (chain.get(i) == segment) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            };
+        }
+
+        final IdentityHashMap<MmapSegment, Boolean> retained = new IdentityHashMap<>(chain.size());
+        for (int i = 0, n = chain.size(); i < n; i++) {
+            retained.put(chain.get(i), Boolean.TRUE);
+        }
+        if (observer == null) {
+            return new RetainedSegmentMembership() {
+                @Override
+                public boolean contains(MmapSegment segment) {
+                    return retained.containsKey(segment);
+                }
+            };
+        }
+        return new RetainedSegmentMembership() {
+            @Override
+            public boolean contains(MmapSegment segment) {
+                observer.onMembershipOperation();
+                return retained.containsKey(segment);
+            }
+        };
+    }
+
     /** Renames every collected corrupt path to {@code <path>.corrupt}, best-effort. */
     private static void quarantineCorrupt(FilesFacade filesFacade, ObjList<String> corruptPaths) {
         if (corruptPaths == null) {
             return;
         }
         for (int i = 0, n = corruptPaths.size(); i < n; i++) {
-            quarantineFile(filesFacade, corruptPaths.get(i));
+            try {
+                quarantineFile(filesFacade, corruptPaths.get(i));
+            } catch (Throwable cleanupError) {
+                warnPostRecoveryCleanupFailure(cleanupError);
+            }
         }
     }
 
@@ -540,13 +641,6 @@ public final class SegmentRing implements QuietCloseable {
             LOG.warn("could not quarantine {} to {}.corrupt; it will be re-examined "
                     + "on the next recovery", path, path);
         }
-    }
-
-    private static boolean containsIdentity(ObjList<MmapSegment> list, MmapSegment value) {
-        for (int i = 0, n = list.size(); i < n; i++) {
-            if (list.get(i) == value) return true;
-        }
-        return false;
     }
 
     /**
@@ -601,6 +695,29 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
+    private static void warnPostRecoveryCleanupFailure(Throwable cleanupError) {
+        try {
+            LOG.warn("post-recovery cleanup failed; leftover files will be "
+                    + "re-examined on the next startup", cleanupError);
+        } catch (Throwable ignored) {
+            // Cleanup diagnostics must not invalidate a recovered ring.
+        }
+    }
+
+    private static void warnRecoveryCloseFailure(Throwable closeError) {
+        try {
+            LOG.warn("error closing SF resource after recovery failure", closeError);
+        } catch (Throwable ignored) {
+            // Preserve the original recovery failure and continue closing.
+        }
+    }
+
+    interface MembershipObserver {
+        void beforeMembershipAllocation();
+
+        void onMembershipOperation();
+    }
+
     static final class Recovery {
         private final SegmentRing ring;
         private final RecoveryStatus status;
@@ -630,6 +747,15 @@ public final class SegmentRing implements QuietCloseable {
     enum RecoveryStatus {
         EMPTY,
         RECOVERED
+    }
+
+    interface RetainedSegmentMembership {
+        boolean contains(MmapSegment segment);
+    }
+
+    private enum RetainedSegmentMembershipMode {
+        IDENTITY,
+        LINEAR
     }
 
     /**

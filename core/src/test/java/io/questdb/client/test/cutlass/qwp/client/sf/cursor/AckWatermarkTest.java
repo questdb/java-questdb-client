@@ -26,6 +26,8 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -72,6 +74,45 @@ public class AckWatermarkTest {
                 assertNotNull(w2);
                 assertEquals("recovered value must match written value",
                         12_345L, w2.read());
+            }
+        });
+    }
+
+    @Test
+    public void testFallsBackFromTornPlausibleHighValue() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                watermark.write(255L);
+                watermark.write(256L);
+                watermark.sync();
+            }
+
+            // Model a torn little-endian 255 -> 256 transition: the high byte
+            // reached storage while the low byte retained 0xff, yielding the
+            // false FSN 511. A recovered ring with publishedFsn=599 cannot
+            // reject that value using its segment ceiling.
+            long publishedFsn = 599L;
+            long corruptFsn = 511L;
+            assertTrue(corruptFsn <= publishedFsn);
+            String path = slotDir + "/" + AckWatermark.FILE_NAME;
+            int fd = Files.openRW(path);
+            assertTrue(fd >= 0);
+            long corruptByte = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().putByte(corruptByte, (byte) 0xff);
+                long fsnOffset = AckWatermark.FILE_SIZE == 16 ? 8L : 16L;
+                assertEquals(1L, Files.write(fd, corruptByte, 1, fsnOffset));
+                assertEquals(0, Files.fsync(fd));
+            } finally {
+                Files.close(fd);
+                Unsafe.free(corruptByte, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                assertEquals("torn latest record must fall back to the older watermark",
+                        255L, watermark.read());
             }
         });
     }

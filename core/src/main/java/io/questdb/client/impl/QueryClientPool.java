@@ -27,6 +27,8 @@ package io.questdb.client.impl;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import org.jetbrains.annotations.TestOnly;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -56,6 +58,11 @@ public final class QueryClientPool implements AutoCloseable {
     // close() can never block the caller unbounded. Tunable per pool via
     // closeQueryTimeoutMillis(long).
     static final long DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS = 5_000;
+    // Hard cap on close()'s wait for a creation blocked in DNS, TCP, TLS, or
+    // WebSocket setup. A late creator retains the client and native-scratch
+    // cleanup obligation until it returns and observes the closed pool.
+    static final long MAX_CLOSE_CREATION_WAIT_MILLIS = 5_000;
+    private static final Logger LOG = LoggerFactory.getLogger(QueryClientPool.class);
     private final long acquireTimeoutMillis;
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
@@ -319,13 +326,34 @@ public final class QueryClientPool implements AutoCloseable {
             }
             closed = true;
             workerReleased.signalAll();
-            // A reservation owns every resource created outside the lock until
-            // the worker is either published in `all` or fully torn down. No
-            // user ever received these workers, so close() must not apply an
-            // abandoned-lease timeout. Preserve interrupts while waiting for
-            // the internal ownership count to reach zero.
-            while (inFlightCreations > 0) {
-                creationFinished.awaitUninterruptibly();
+            // A creator can block in DNS, TCP, TLS, WebSocket upgrade, or the
+            // SERVER_INFO handshake. Wait boundedly rather than turning an
+            // unset connect_timeout into an unbounded QuestDB.close(). Timing
+            // out does not abandon the client or its native scratch: the creator
+            // keeps the reservation and, once construction returns, observes
+            // closed and shuts the worker down before releasing ownership.
+            // Preserve interruption while applying the same finite budget.
+            final long creationWaitMillis = Math.max(0,
+                    Math.min(acquireTimeoutMillis, MAX_CLOSE_CREATION_WAIT_MILLIS));
+            final long creationWaitNanos = TimeUnit.MILLISECONDS.toNanos(creationWaitMillis);
+            final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
+            long creationRemainingNanos = creationWaitNanos;
+            boolean creationWaitInterrupted = false;
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                }
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            }
+            if (creationWaitInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (inFlightCreations > 0) {
+                LOG.warn("QueryClientPool.close(): {} query client creation(s) still in flight after {}ms; "
+                                + "each creator retains cleanup ownership until construction returns",
+                        inFlightCreations, creationWaitMillis);
             }
             snapshot = new ArrayList<>(all);
         } finally {

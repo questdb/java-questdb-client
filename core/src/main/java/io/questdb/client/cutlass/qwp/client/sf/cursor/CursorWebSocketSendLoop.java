@@ -304,11 +304,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long nextWireSeq;
     private volatile SenderProgressDispatcher progressDispatcher;
     // Frames sent during the post-reconnect catch-up window — i.e. frames
-    // whose FSN was already published before the wire dropped. A non-zero
+    // whose FSN completed a send on an earlier connection. A non-zero
     // value confirms replay is working; a sustained nonzero rate means
     // the connection is flapping and replay is doing real work each cycle.
-    // Set at swapClient time to publishedFsn at that moment; cleared back
-    // to -1 once trySendOne has caught up past it. Used to count replay
+    // Snapshotted when an established connection enters reconnect; cleared
+    // back to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
     // Recovered orphaned deferred tail: frames [orphanSkipStartFsn ..
@@ -1227,6 +1227,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             recordFatal(initial);
             return;
         }
+        snapshotReplayTarget();
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
         long outageStartNanos = System.nanoTime();
@@ -1932,6 +1933,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Freezes the highest FSN that completed a send on the connection which
+     * just failed. Frames published before the first connection, or while a
+     * reconnect is in progress, have not been sent and therefore do not belong
+     * to the replay metric. Keep an older, higher target when another failure
+     * interrupts catch-up so the remaining frames still count as re-sends on
+     * the following connection.
+     */
+    private void snapshotReplayTarget() {
+        if (hasEverConnected && nextWireSeq > 0L) {
+            long lastSentFsn = fsnAtZero + (nextWireSeq - 1L);
+            if (lastSentFsn > replayTargetFsn) {
+                replayTargetFsn = lastSentFsn;
+            }
+        }
+    }
+
+    /**
      * Reset wire state for a fresh connection: install the new client,
      * realign {@code fsnAtZero} to the next unacked FSN, restart wire
      * sequencing from 0, and reposition the cursor so the next
@@ -1959,11 +1977,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
-        // Snapshot publishedFsn at swap time — frames at FSN ≤ this value
-        // were already on the wire before the drop and will be replayed.
-        // trySendOne resets replayTargetFsn to -1 once we cross the boundary.
-        long pubAtSwap = engine.publishedFsn();
-        this.replayTargetFsn = pubAtSwap >= replayStart ? pubAtSwap : -1L;
+        // snapshotReplayTarget froze the completed-send boundary when the
+        // outage began. ACK progress can move replayStart past that boundary;
+        // in that case no frame needs re-sending on this connection.
+        if (replayTargetFsn < replayStart) {
+            replayTargetFsn = -1L;
+        }
         // Drop any durable-ack tracking from the previous connection. The
         // new connection will re-OK every replayed batch and the server
         // re-emits cumulative durable-ack watermarks from scratch, so

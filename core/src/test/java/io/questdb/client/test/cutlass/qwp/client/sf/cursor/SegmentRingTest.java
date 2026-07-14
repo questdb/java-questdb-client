@@ -616,22 +616,19 @@ public class SegmentRingTest {
 
     /**
      * Open-time sort regression: at the documented {@code sf_max_total_bytes
-     * / sf_max_bytes} ceiling (~16K segments) an O(N²) sort over the
-     * recovered segments burns multi-second wall time before the I/O thread
-     * can start. The previous selection-sort implementation regressed an
-     * earlier perf fix on the legacy {@code SegmentLog} path; this test
-     * guards the cursor path against the same regression.
+     * / sf_max_bytes} ceiling (~16K segments), an O(N²) sort over the
+     * recovered segments delays the I/O thread. This test guards the sort
+     * with a deterministic comparison count.
      * <p>
      * Constructs N=2048 valid one-frame segments with names assigned in
      * lexicographic order — the exact pattern {@code readdir} produces on
      * many filesystems (and the worst case for a naive first-element pivot).
      * Recovers, asserts contiguous baseSeq ordering and total frame count,
-     * and bounds wall time at 5 s. With the median-of-three quicksort the
-     * test completes in well under a second; an O(N²) regression at this
-     * scale climbs back into multi-second territory.
+     * and bounds sort comparisons independently of CI timing or filesystem
+     * throughput.
      */
     @Test
-    public void testLargeSegmentCountReopensInOrder() throws Exception {
+    public void testLargeSegmentCountRecoveryIsLogLinear() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final int n = 2048;
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
@@ -663,6 +660,8 @@ public class SegmentRingTest {
                             n, ring.nextSeqHint());
                     // publishedFsn = n - 1 (last frame visible).
                     assertEquals(n - 1, ring.publishedFsn());
+                    assertEquals("full valid chain must retain every segment",
+                            n - 1, ring.getSealedSegments().size());
                     // O(N log N) quicksort with good pivots does ~2-3 * N * log2(N)
                     // comparisons; the partition-pass + median-of-three counter we
                     // increment per recursive frame upper-bounds this at roughly
@@ -688,7 +687,7 @@ public class SegmentRingTest {
 
     /**
      * Adversarial-order companion to
-     * {@link #testLargeSegmentCountReopensInOrder}: that test covers the
+     * {@link #testLargeSegmentCountRecoveryIsLogLinear}: that test covers the
      * already-sorted readdir order median-of-three was chosen for; this one
      * covers the orders median-of-three does NOT defend. On the
      * pre-introsort quicksort, exact simulation at N=16384 measured ~22.6M

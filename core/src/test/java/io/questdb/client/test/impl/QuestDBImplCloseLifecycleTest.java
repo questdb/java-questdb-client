@@ -31,6 +31,8 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.impl.QueryClientPool;
 import io.questdb.client.impl.QuestDBImpl;
 import io.questdb.client.impl.SenderPool;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
@@ -51,6 +53,294 @@ public class QuestDBImplCloseLifecycleTest {
 
     private static final String QUERY_CFG = "ws::addr=127.0.0.1:9000;";
     private static final String SENDER_CFG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
+
+    @Test(timeout = 30_000)
+    public void facadeCloseIsBoundedByZeroAcquireTimeoutDuringQueryCreation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inCreation = new CountDownLatch(1);
+            CountDownLatch releaseCreation = new CountDownLatch(1);
+            AtomicInteger teardownCount = new AtomicInteger();
+            Consumer<QwpQueryClient> connectHook = client -> {
+                client.setBeforeCloseHookForTest(teardownCount::incrementAndGet);
+                inCreation.countDown();
+                awaitOrFail(releaseCreation, "test never released query creation");
+            };
+            QuestDBImpl db = newQuestDB(
+                    SENDER_CFG, 0, 0, 0, slotIndex -> fakeSender(null, null, null), connectHook);
+            QueryClientPool pool = (QueryClientPool) getField(db, "queryPool");
+            AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+            Thread borrower = new Thread(() -> {
+                try {
+                    db.borrowQuery();
+                } catch (Throwable t) {
+                    borrowOutcome.set(t);
+                }
+            }, "bounded-query-borrower");
+            Thread closer = new Thread(db::close, "bounded-query-closer");
+            long nativeBaseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+            try {
+                borrower.start();
+                Assert.assertTrue("query borrow never reached construction",
+                        inCreation.await(10, TimeUnit.SECONDS));
+                Assert.assertEquals(1, pool.inFlightCreations());
+
+                closer.start();
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse(
+                        "facade close exceeded its zero creation-wait budget",
+                        closer.isAlive());
+                Assert.assertEquals(
+                        "close must retain late-completion cleanup ownership",
+                        1, pool.inFlightCreations());
+                Assert.assertEquals("the still-constructing query client must remain live", 0, teardownCount.get());
+
+                releaseCreation.countDown();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("query borrower did not finish", borrower.isAlive());
+                Assert.assertEquals("late query creation must be torn down exactly once", 1, teardownCount.get());
+                Assert.assertEquals("late query creation reservation must be released", 0, pool.inFlightCreations());
+                Assert.assertEquals("late query cleanup must release native scratch",
+                        nativeBaseline, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT));
+                Assert.assertTrue("borrowQuery() must report facade closure, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof QueryException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+            } finally {
+                releaseCreation.countDown();
+                db.close();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void facadeCloseIsBoundedByZeroAcquireTimeoutDuringSenderCreation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inCreation = new CountDownLatch(1);
+            CountDownLatch releaseCreation = new CountDownLatch(1);
+            AtomicInteger teardownCount = new AtomicInteger();
+            IntFunction<Sender> senderFactory = slotIndex -> {
+                inCreation.countDown();
+                awaitOrFail(releaseCreation, "test never released sender creation");
+                return fakeSender(teardownCount, null, null);
+            };
+            String senderConfig = "ws::addr=localhost:1;sf_dir="
+                    + System.getProperty("java.io.tmpdir") + "/qdb-bounded-pool-" + System.nanoTime() + ";";
+            QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 0, senderFactory, client -> {
+            });
+            SenderPool pool = (SenderPool) getField(db, "senderPool");
+            AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+            Thread borrower = new Thread(() -> {
+                try {
+                    db.borrowSender();
+                } catch (Throwable t) {
+                    borrowOutcome.set(t);
+                }
+            }, "bounded-sender-borrower");
+            Thread closer = new Thread(db::close, "bounded-sender-closer");
+            try {
+                borrower.start();
+                Assert.assertTrue("sender borrow never reached construction",
+                        inCreation.await(10, TimeUnit.SECONDS));
+                Assert.assertEquals(1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertTrue("SF slot must stay reserved during creation",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+
+                closer.start();
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse(
+                        "facade close exceeded its zero creation-wait budget",
+                        closer.isAlive());
+                Assert.assertEquals(
+                        "close must retain late-completion cleanup ownership",
+                        1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertTrue("close must not abandon the reserved SF slot",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+
+                releaseCreation.countDown();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("sender borrower did not finish", borrower.isAlive());
+                Assert.assertEquals("late sender creation must be torn down exactly once", 1, teardownCount.get());
+                Assert.assertEquals("late sender creation reservation must be released",
+                        0, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertFalse("late sender cleanup must release the SF slot",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                Assert.assertTrue("borrowSender() must report facade closure, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof LineSenderException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+            } finally {
+                releaseCreation.countDown();
+                db.close();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void facadeCloseIsBoundedUnderRepeatedInterruptsDuringQueryCreation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inCreation = new CountDownLatch(1);
+            CountDownLatch releaseCreation = new CountDownLatch(1);
+            AtomicInteger teardownCount = new AtomicInteger();
+            Consumer<QwpQueryClient> connectHook = client -> {
+                client.setBeforeCloseHookForTest(teardownCount::incrementAndGet);
+                inCreation.countDown();
+                awaitOrFail(releaseCreation, "test never released query creation");
+            };
+            QuestDBImpl db = newQuestDB(
+                    SENDER_CFG, 0, 0, 100, slotIndex -> fakeSender(null, null, null), connectHook);
+            QueryClientPool pool = (QueryClientPool) getField(db, "queryPool");
+            AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+            AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
+            AtomicBoolean keepInterrupting = new AtomicBoolean(true);
+            AtomicInteger interruptCount = new AtomicInteger();
+            Thread borrower = new Thread(() -> {
+                try {
+                    db.borrowQuery();
+                } catch (Throwable t) {
+                    borrowOutcome.set(t);
+                }
+            }, "interrupted-query-borrower");
+            Thread closer = new Thread(() -> {
+                db.close();
+                closeReturnedInterrupted.set(Thread.currentThread().isInterrupted());
+            }, "interrupted-query-closer");
+            Thread interrupter = new Thread(() -> {
+                while (keepInterrupting.get()) {
+                    interruptCount.incrementAndGet();
+                    closer.interrupt();
+                    Thread.yield();
+                }
+            }, "query-close-interrupter");
+            long nativeBaseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+            try {
+                borrower.start();
+                Assert.assertTrue("query borrow never reached construction",
+                        inCreation.await(10, TimeUnit.SECONDS));
+                Assert.assertEquals(1, pool.inFlightCreations());
+
+                closer.start();
+                awaitCreationWaiter(pool,
+                        "facade close did not wait while query construction was internally owned");
+                interrupter.start();
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse(
+                        "repeated interrupts restarted the query creation-wait deadline",
+                        closer.isAlive());
+                Assert.assertTrue("test did not repeatedly interrupt query close", interruptCount.get() > 1);
+                Assert.assertTrue("facade close must restore query closer interruption",
+                        closeReturnedInterrupted.get());
+                Assert.assertEquals(
+                        "close must retain late-completion cleanup ownership",
+                        1, pool.inFlightCreations());
+                Assert.assertEquals("the still-constructing query client must remain live", 0, teardownCount.get());
+
+                releaseCreation.countDown();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("query borrower did not finish", borrower.isAlive());
+                Assert.assertEquals("late query creation must be torn down exactly once", 1, teardownCount.get());
+                Assert.assertEquals("late query creation reservation must be released", 0, pool.inFlightCreations());
+                Assert.assertEquals("late query cleanup must release native scratch",
+                        nativeBaseline, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT));
+                Assert.assertTrue("borrowQuery() must report facade closure, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof QueryException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+            } finally {
+                keepInterrupting.set(false);
+                releaseCreation.countDown();
+                interrupter.join(TimeUnit.SECONDS.toMillis(10));
+                db.close();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void facadeCloseIsBoundedUnderRepeatedInterruptsDuringSenderCreation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inCreation = new CountDownLatch(1);
+            CountDownLatch releaseCreation = new CountDownLatch(1);
+            AtomicInteger teardownCount = new AtomicInteger();
+            IntFunction<Sender> senderFactory = slotIndex -> {
+                inCreation.countDown();
+                awaitOrFail(releaseCreation, "test never released sender creation");
+                return fakeSender(teardownCount, null, null);
+            };
+            String senderConfig = "ws::addr=localhost:1;sf_dir="
+                    + System.getProperty("java.io.tmpdir") + "/qdb-interrupted-pool-" + System.nanoTime() + ";";
+            QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 100, senderFactory, client -> {
+            });
+            SenderPool pool = (SenderPool) getField(db, "senderPool");
+            AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
+            AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
+            AtomicBoolean keepInterrupting = new AtomicBoolean(true);
+            AtomicInteger interruptCount = new AtomicInteger();
+            Thread borrower = new Thread(() -> {
+                try {
+                    db.borrowSender();
+                } catch (Throwable t) {
+                    borrowOutcome.set(t);
+                }
+            }, "interrupted-sender-borrower");
+            Thread closer = new Thread(() -> {
+                db.close();
+                closeReturnedInterrupted.set(Thread.currentThread().isInterrupted());
+            }, "interrupted-sender-closer");
+            Thread interrupter = new Thread(() -> {
+                while (keepInterrupting.get()) {
+                    interruptCount.incrementAndGet();
+                    closer.interrupt();
+                    Thread.yield();
+                }
+            }, "sender-close-interrupter");
+            try {
+                borrower.start();
+                Assert.assertTrue("sender borrow never reached construction",
+                        inCreation.await(10, TimeUnit.SECONDS));
+                Assert.assertEquals(1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertTrue("SF slot must stay reserved during creation",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+
+                closer.start();
+                awaitCreationWaiter(pool,
+                        "facade close did not wait while sender construction was internally owned");
+                interrupter.start();
+                closer.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse(
+                        "repeated interrupts restarted the sender creation-wait deadline",
+                        closer.isAlive());
+                Assert.assertTrue("test did not repeatedly interrupt sender close", interruptCount.get() > 1);
+                Assert.assertTrue("facade close must restore sender closer interruption",
+                        closeReturnedInterrupted.get());
+                Assert.assertEquals(
+                        "close must retain late-completion cleanup ownership",
+                        1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertTrue("close must not abandon the reserved SF slot",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+
+                releaseCreation.countDown();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("sender borrower did not finish", borrower.isAlive());
+                Assert.assertEquals("late sender creation must be torn down exactly once", 1, teardownCount.get());
+                Assert.assertEquals("late sender creation reservation must be released",
+                        0, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertFalse("late sender cleanup must release the SF slot",
+                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                Assert.assertTrue("borrowSender() must report facade closure, got: " + borrowOutcome.get(),
+                        borrowOutcome.get() instanceof LineSenderException
+                                && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
+            } finally {
+                keepInterrupting.set(false);
+                releaseCreation.countDown();
+                interrupter.join(TimeUnit.SECONDS.toMillis(10));
+                db.close();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        });
+    }
 
     @Test(timeout = 30_000)
     public void facadeCloseWaitsForQueryCreationAndTeardown() throws Exception {
@@ -282,11 +572,22 @@ public class QuestDBImplCloseLifecycleTest {
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook
     ) {
+        return newQuestDB(SENDER_CFG, senderMin, queryMin, 10_000L, senderFactory, connectHook);
+    }
+
+    private static QuestDBImpl newQuestDB(
+            String senderConfig,
+            int senderMin,
+            int queryMin,
+            long acquireTimeoutMillis,
+            IntFunction<Sender> senderFactory,
+            Consumer<QwpQueryClient> connectHook
+    ) {
         return new QuestDBImpl(
-                SENDER_CFG, QUERY_CFG,
+                senderConfig, QUERY_CFG,
                 senderMin, 1,
                 queryMin, 1,
-                10_000L,
+                acquireTimeoutMillis,
                 Long.MAX_VALUE,
                 Long.MAX_VALUE,
                 Long.MAX_VALUE,

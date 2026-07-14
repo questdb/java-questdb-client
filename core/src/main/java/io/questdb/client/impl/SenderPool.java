@@ -96,6 +96,11 @@ public final class SenderPool implements AutoCloseable {
     // -- the residual window documented on recoverOneSlotStep -- because the
     // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
+    // Hard cap on close()'s wait for a creation that is blocked in DNS, TCP,
+    // TLS, or WebSocket setup. The creator retains ownership after this budget:
+    // once construction returns, borrow() observes closed and tears down the
+    // delegate before releasing its reservation (including an SF slot).
+    static final long MAX_CLOSE_CREATION_WAIT_MILLIS = 5_000;
     // Hard cap on close()'s outstanding-lease wait. The acquire timeout is a
     // BORROW policy -- Long.MAX_VALUE legitimately means "block until a slot
     // frees" -- and must never unbound SHUTDOWN: without this cap a forgotten
@@ -937,8 +942,9 @@ public final class SenderPool implements AutoCloseable {
      * free their native memory under its feet -- a use-after-free / SEGV, not
      * an exception (C1). Instead:
      * <ol>
-     * <li>waits for every internally owned creation to publish or complete its
-     * closed-mid-creation teardown; then</li>
+     * <li>waits boundedly for internally owned creations; a late creator keeps
+     * ownership and performs its closed-mid-creation teardown asynchronously;
+     * then</li>
      * <li>waits boundedly (up to {@code acquireTimeoutMillis}, hard-capped at
      * {@link #MAX_CLOSE_LEASE_WAIT_MILLIS}) for outstanding leases to come home -- {@link #giveBack} and {@link #discardBroken}
      * observe {@code closed} and tear each delegate down on the returning
@@ -965,14 +971,34 @@ public final class SenderPool implements AutoCloseable {
             closed = true;
             // Wake parked borrowers so they observe the shutdown and throw.
             slotReleased.signalAll();
-            // A creation reservation represents pool-owned resources from the
-            // moment borrow() leaves the lock through either publication or
-            // completed cleanup. Unlike an abandoned user-visible lease, this
-            // ownership cannot be leaked after close() returns, so wait without
-            // a timeout. awaitUninterruptibly preserves the interrupt flag while
-            // maintaining the shutdown ownership invariant.
-            while (inFlightCreations > 0) {
-                creationFinished.awaitUninterruptibly();
+            // A creator can block in DNS, TCP, TLS, or WebSocket setup. Wait
+            // boundedly rather than turning an unset connect_timeout into an
+            // unbounded QuestDB.close(). Timing out does not abandon ownership:
+            // the reservation and any SF slot stay assigned to the creator,
+            // which observes closed and tears down a late result before releasing
+            // them. Preserve the caller's interrupt status while still applying
+            // the same finite wait budget.
+            final long creationWaitMillis = Math.max(0,
+                    Math.min(acquireTimeoutMillis, MAX_CLOSE_CREATION_WAIT_MILLIS));
+            final long creationWaitNanos = TimeUnit.MILLISECONDS.toNanos(creationWaitMillis);
+            final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
+            long creationRemainingNanos = creationWaitNanos;
+            boolean creationWaitInterrupted = false;
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                }
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            }
+            if (creationWaitInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (inFlightCreations > 0) {
+                LOG.warn("SenderPool.close(): {} sender creation(s) still in flight after {}ms; "
+                                + "each creator retains cleanup ownership and releases its SF slot when construction returns",
+                        inFlightCreations, creationWaitMillis);
             }
             // Bounded graceful wait for outstanding leases. A slot is borrowed
             // iff it is in `all` but not in `available`; retireLease's

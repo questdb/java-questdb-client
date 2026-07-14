@@ -181,15 +181,15 @@ public final class QuestDBImpl implements QuestDB {
         return senderPool.borrow();
     }
 
-    // synchronized so concurrent close() callers serialize THROUGH shutdown
-    // completion, not merely through the `closed` flip. `closed` is set before
-    // the teardown chain runs, so a plain volatile guard (or a bare CAS) would
-    // let a second caller observe closed==true and return while the first is
-    // still inside closeQuietly(senderPool) releasing the flock/mmap/I/O-thread
-    // resources -- a premature return that breaks the AutoCloseable contract
-    // that shutdown has completed once close() returns. The monitor makes the
-    // losing caller block until the winner finishes, then it enters, sees
-    // `closed` and returns a no-op. No deadlock: the teardown steps
+    // synchronized so concurrent close() callers serialize THROUGH the bounded
+    // shutdown sequence, not merely through the `closed` flip. `closed` is set
+    // before the teardown chain runs, so a plain volatile guard (or a bare CAS)
+    // would let a second caller observe closed==true and return while the first
+    // is still closing published resources. The monitor makes the losing caller
+    // block until the winner finishes, then it enters, sees `closed` and returns
+    // a no-op. A pool creator that outlives its finite shutdown wait retains and
+    // eventually cleans its unpublished resources on the creator thread; this
+    // monitor does not wait past that budget. No deadlock: the teardown steps
     // (markClosing/housekeeper.stop()/queryPool.close()/senderPool.close())
     // never call back into QuestDBImpl.close() on another thread, so nothing
     // contends for this monitor from within the critical section.

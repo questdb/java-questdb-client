@@ -130,10 +130,17 @@ public interface QuestDB extends Closeable {
     Sender borrowSender();
 
     /**
-     * Shuts down the pools, closing every underlying {@link Sender} and
-     * query client. Idempotent. Threads currently blocked in
-     * {@link #borrowSender()} or {@link Query#submit()} are released with an
-     * error.
+     * Shuts down the pools and their published clients. Idempotent. Threads
+     * currently blocked in {@link #borrowSender()} or {@link Query#submit()}
+     * are released with an error.
+     * <p>
+     * In-progress client creation: close() waits up to the builder's
+     * {@link QuestDBBuilder#acquireTimeoutMillis(long) acquire timeout},
+     * hard-capped at 5 seconds, for a creation blocked in DNS, TCP, TLS, or a
+     * WebSocket handshake. If that budget expires, the creator retains cleanup
+     * ownership and closes its unpublished client (and releases any SF slot)
+     * when construction returns. This keeps close() bounded even when
+     * {@code connect_timeout} is unset without abandoning late resources.
      * <p>
      * Outstanding leases: a borrowed {@link Sender} is never torn down
      * underneath the thread using it. Instead, close() waits up to the
