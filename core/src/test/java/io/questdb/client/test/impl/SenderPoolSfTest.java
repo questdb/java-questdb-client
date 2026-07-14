@@ -47,7 +47,9 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
@@ -58,6 +60,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -2634,6 +2637,355 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testDirectRecoveryContinuesAfterFiniteBudgetExhaustion() throws Exception {
+        createCandidateSlot("default-0");
+        createCandidateSlot("default-1");
+        CountDownLatch drained = new CountDownLatch(2);
+        AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+        IntFunction<Sender> factory = idx -> {
+            attempts[idx].incrementAndGet();
+            return successfulRecoverySender(idx, drained);
+        };
+        String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+        try (SenderPool pool = newPoolWithFactory(config, 0, 1, 0, factory)) {
+            Assert.assertTrue("direct pool must continue recovery after its inline budget expires",
+                    drained.await(5, TimeUnit.SECONDS));
+            Assert.assertEquals("in-range candidate must be recovered", 1, attempts[0].get());
+            Assert.assertEquals("out-of-range candidate must be recovered", 1, attempts[1].get());
+        }
+    }
+
+    @Test
+    public void testDirectRecoveryCloseJoinsDriverAndStopsRemainingCandidates() throws Exception {
+        createCandidateSlot("default-0");
+        createCandidateSlot("default-1");
+        CountDownLatch afterJoin = new CountDownLatch(1);
+        CountDownLatch beforeJoin = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        CountDownLatch delegateCloseStarted = new CountDownLatch(1);
+        CountDownLatch drainStarted = new CountDownLatch(1);
+        CountDownLatch releaseDelegateClose = new CountDownLatch(1);
+        CountDownLatch releaseDrain = new CountDownLatch(1);
+        AtomicBoolean driverAliveAfterJoin = new AtomicBoolean();
+        AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        IntFunction<Sender> senderFactory = idx -> {
+            attempts[idx].incrementAndGet();
+            return blockingFakeSender(
+                    idx, drainStarted, releaseDrain, delegateCloseStarted, releaseDelegateClose);
+        };
+
+        SenderPool pool = newPoolWithFactory(
+                "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
+                0, 2, 0, senderFactory);
+        Thread recoveryThread = (Thread) getField(pool, "startupRecoveryThread");
+        invokeSetStartupRecoveryJoinHooks(
+                pool, beforeJoin::countDown,
+                () -> {
+                    driverAliveAfterJoin.set(recoveryThread.isAlive());
+                    afterJoin.countDown();
+                });
+        Thread closeThread = new Thread(() -> {
+            try {
+                pool.close();
+            } catch (Throwable t) {
+                closeFailure.set(t);
+            } finally {
+                closeReturned.countDown();
+            }
+        }, "test-direct-pool-close");
+        try {
+            Assert.assertTrue("direct recovery driver must enter the first drain",
+                    drainStarted.await(10, TimeUnit.SECONDS));
+            Assert.assertTrue("direct recovery driver must be running", recoveryThread.isAlive());
+
+            closeThread.start();
+            Assert.assertTrue("close must enter its direct-driver join operation",
+                    beforeJoin.await(10, TimeUnit.SECONDS));
+            Assert.assertTrue("close itself must raise the shutdown signal before joining",
+                    (Boolean) getField(pool, "closed"));
+
+            releaseDrain.countDown();
+            Assert.assertTrue("driver must remain deliberately held before termination",
+                    delegateCloseStarted.await(10, TimeUnit.SECONDS));
+            Assert.assertEquals("close must not return while its driver is held",
+                    1L, closeReturned.getCount());
+
+            releaseDelegateClose.countDown();
+            Assert.assertTrue("close must return after the driver is released",
+                    closeReturned.await(10, TimeUnit.SECONDS));
+            Assert.assertTrue("close must complete its join operation",
+                    afterJoin.await(10, TimeUnit.SECONDS));
+            if (closeFailure.get() != null) {
+                throw new AssertionError("close failed", closeFailure.get());
+            }
+            Assert.assertFalse("the recovery driver must be dead when close's join returns",
+                    driverAliveAfterJoin.get());
+            Assert.assertFalse("close must leave the direct recovery driver quiescent",
+                    recoveryThread.isAlive());
+            Assert.assertEquals("the in-flight candidate must have been built", 1, attempts[0].get());
+            Assert.assertEquals("shutdown must prevent a later candidate build", 0, attempts[1].get());
+        } finally {
+            releaseDrain.countDown();
+            releaseDelegateClose.countDown();
+            closeThread.join(TimeUnit.SECONDS.toMillis(10));
+            pool.close();
+        }
+    }
+
+    @Test
+    public void testDirectRecoveryFailedAttemptEntersRetryWait() throws Throwable {
+        createCandidateSlot("default-0");
+        CountDownLatch beforeJoin = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        CountDownLatch recoveryOperationObserved = new CountDownLatch(1);
+        CountDownLatch releaseWait = new CountDownLatch(1);
+        CountDownLatch waitEntered = new CountDownLatch(1);
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        IntFunction<Sender> senderFactory = idx -> {
+            if (attempts.incrementAndGet() > 1) {
+                recoveryOperationObserved.countDown();
+            }
+            throw new LineSenderException("injected recovery failure");
+        };
+        Runnable recoveryWaiter = () -> {
+            waitEntered.countDown();
+            recoveryOperationObserved.countDown();
+            try {
+                releaseWait.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        SenderPool pool = newPoolWithRecoveryControls(
+                "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
+                0, 1, 0, senderFactory, null, recoveryWaiter, null);
+        invokeSetStartupRecoveryJoinHooks(pool, beforeJoin::countDown, null);
+        Thread closeThread = new Thread(() -> {
+            try {
+                pool.close();
+            } catch (Throwable t) {
+                closeFailure.set(t);
+            } finally {
+                closeReturned.countDown();
+            }
+        }, "test-retry-wait-close");
+        try {
+            Assert.assertTrue("recovery must either wait or retry after the failed attempt",
+                    recoveryOperationObserved.await(10, TimeUnit.SECONDS));
+            Assert.assertEquals("a failed recovery attempt must enter the retry-wait operation",
+                    0L, waitEntered.getCount());
+            Assert.assertEquals("the driver must wait immediately after its first failed attempt",
+                    1, attempts.get());
+
+            closeThread.start();
+            Assert.assertTrue("close must reach the driver join while the waiter is held",
+                    beforeJoin.await(10, TimeUnit.SECONDS));
+            releaseWait.countDown();
+            Assert.assertTrue("close must finish after the retry waiter is released",
+                    closeReturned.await(10, TimeUnit.SECONDS));
+            if (closeFailure.get() != null) {
+                throw new AssertionError("close failed", closeFailure.get());
+            }
+            Assert.assertEquals("shutdown must prevent another recovery attempt", 1, attempts.get());
+        } finally {
+            releaseWait.countDown();
+            closeThread.join(TimeUnit.SECONDS.toMillis(10));
+            pool.close();
+        }
+    }
+
+    @Test
+    public void testDirectRecoveryThreadCreationFailureClosesPrewarmedDelegates() throws Throwable {
+        createCandidateSlot("default-2");
+        AssertionError failure = new AssertionError("injected recovery thread creation failure");
+        AtomicInteger[] closeCalls = {new AtomicInteger(), new AtomicInteger()};
+        IntFunction<Sender> senderFactory = idx -> closeCountingSender(idx, closeCalls, idx == 0);
+        ThreadFactory threadFactory = runnable -> {
+            throw failure;
+        };
+
+        try {
+            newPoolWithRecoveryThreadFactory(
+                    "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
+                    2, 2, 0, senderFactory, threadFactory);
+            Assert.fail("construction must propagate the recovery thread creation failure");
+        } catch (AssertionError actual) {
+            Assert.assertSame("construction must preserve throwable identity", failure, actual);
+        }
+        Assert.assertEquals("cleanup must attempt the first prewarmed delegate", 1, closeCalls[0].get());
+        Assert.assertEquals("one close failure must not strand the next delegate", 1, closeCalls[1].get());
+    }
+
+    @Test
+    public void testDirectRecoveryThreadCreationFailureReleasesPrewarmedSfFlocks() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            createCandidateSlot("default-2");
+            AssertionError failure = new AssertionError("injected recovery thread creation failure");
+            ThreadFactory threadFactory = runnable -> {
+                throw failure;
+            };
+
+            try (TestWebSocketServer ack = new TestWebSocketServer(new CountingAckHandler())) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                try {
+                    newPoolWithRecoveryThreadFactory(config, 2, 2, 0, null, threadFactory);
+                    Assert.fail("construction must propagate the recovery thread creation failure");
+                } catch (AssertionError actual) {
+                    Assert.assertSame("construction must preserve throwable identity", failure, actual);
+                } catch (Throwable unexpected) {
+                    throw new AssertionError("unexpected construction failure", unexpected);
+                }
+
+                try (SlotLock ignored0 = SlotLock.acquire(slot("default-0"));
+                     SlotLock ignored1 = SlotLock.acquire(slot("default-1"))) {
+                    // Reacquisition proves failed construction closed both real
+                    // prewarmed delegates and released their SF flocks.
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDirectRecoveryThreadStartFailureClosesPrewarmedDelegates() throws Throwable {
+        createCandidateSlot("default-2");
+        AssertionError failure = new AssertionError("injected recovery thread start failure");
+        AtomicBoolean cleanupBeforeDriverQuiescence = new AtomicBoolean();
+        AtomicInteger failedJoinCalls = new AtomicInteger();
+        AtomicInteger[] closeCalls = {new AtomicInteger(), new AtomicInteger()};
+        AtomicReference<Thread> recoveryThread = new AtomicReference<>();
+        CountDownLatch releaseDriver = new CountDownLatch(1);
+        CountDownLatch running = new CountDownLatch(1);
+        IntFunction<Sender> senderFactory = idx -> closeCountingSender(
+                idx, closeCalls, false, recoveryThread, cleanupBeforeDriverQuiescence, releaseDriver);
+        ThreadFactory threadFactory = runnable -> {
+            Thread thread = new Thread(() -> {
+                running.countDown();
+                try {
+                    releaseDriver.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                runnable.run();
+            }, "test-started-recovery-driver") {
+                @Override
+                public synchronized void start() {
+                    super.start();
+                    try {
+                        if (!running.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("recovery driver did not start");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("interrupted waiting for recovery driver", e);
+                    }
+                    throw failure;
+                }
+            };
+            recoveryThread.set(thread);
+            return thread;
+        };
+        Runnable beforeFailedJoin = () -> {
+            failedJoinCalls.incrementAndGet();
+            releaseDriver.countDown();
+        };
+
+        try {
+            newPoolWithRecoveryControls(
+                    "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
+                    2, 2, 0, senderFactory, threadFactory, null, beforeFailedJoin);
+            Assert.fail("construction must propagate the recovery thread start failure");
+        } catch (AssertionError actual) {
+            Assert.assertSame("construction must preserve throwable identity", failure, actual);
+        } finally {
+            releaseDriver.countDown();
+        }
+        Assert.assertEquals("constructor cleanup must enter the failed-driver join", 1, failedJoinCalls.get());
+        Assert.assertFalse("delegate cleanup must not begin while the failed driver is alive",
+                cleanupBeforeDriverQuiescence.get());
+        Assert.assertFalse("a possibly-started failed driver must terminate before delegate cleanup",
+                recoveryThread.get().isAlive());
+        Assert.assertEquals("cleanup must close the first prewarmed delegate", 1, closeCalls[0].get());
+        Assert.assertEquals("cleanup must close the second prewarmed delegate", 1, closeCalls[1].get());
+    }
+
+    @Test
+    public void testDirectRecoveryRetriesTransientFailureAndRemainingSlots() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                for (int i = 0; i < 2; i++) {
+                    String seedConfig = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                            + ";sender_id=default-" + i + ";close_flush_timeout_millis=0;";
+                    try (Sender seed = Sender.fromConfig(seedConfig)) {
+                        seed.table("recover").longColumn("v", i).atNow();
+                        seed.flush();
+                    }
+                }
+            }
+            Assert.assertTrue("in-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-0")));
+            Assert.assertTrue("out-of-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-1")));
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+                CountDownLatch drained = new CountDownLatch(2);
+                IntFunction<Sender> factory = idx -> {
+                    int attempt = attempts[idx].incrementAndGet();
+                    if (idx == 0 && attempt == 1) {
+                        throw new LineSenderException("transient direct recovery failure");
+                    }
+                    Sender delegate = Sender.builder(config).senderId("default-" + idx).build();
+                    return notifyingCloseSender(delegate, drained);
+                };
+
+                try (SenderPool pool = newPoolWithFactory(config, 0, 1, 5_000, factory)) {
+                    Assert.assertTrue("both recovery delegates must drain and close",
+                            drained.await(15, TimeUnit.SECONDS));
+                    Assert.assertFalse("failed in-range candidate must be retried and delivered",
+                            hasSegmentFile(slot("default-0")));
+                    Assert.assertFalse("remaining out-of-range candidate must also be delivered",
+                            hasSegmentFile(slot("default-1")));
+                    Assert.assertEquals("failed in-range candidate must be retried", 2, attempts[0].get());
+                    Assert.assertEquals("remaining out-of-range candidate must also be recovered",
+                            1, attempts[1].get());
+                    Assert.assertTrue("both recovered frames must reach the server",
+                            handler.frames.get() >= 2);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testLongMaxStartupRecoveryBudgetDoesNotOverflow() throws Exception {
+        createCandidateSlot("default-0");
+        AtomicInteger attempts = new AtomicInteger();
+        IntFunction<Sender> factory = idx -> {
+            attempts.incrementAndGet();
+            return successfulRecoverySender(idx, new CountDownLatch(0));
+        };
+        String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+        try (SenderPool pool = newPoolWithFactory(config, 0, 1, Long.MAX_VALUE, factory)) {
+            Assert.assertEquals("Long.MAX_VALUE must leave a positive inline recovery budget",
+                    1, attempts.get());
+            Assert.assertTrue("the inline scan must complete", (Boolean) getField(pool, "recoveryComplete"));
+        }
+    }
+
+    @Test
     public void testStartupRecoveryIsBoundedByASharedBudget() throws Exception {
         // Regression for the startup-recovery budget (M1).
         // recoverOneSlotStep() runs synchronously in the SenderPool
@@ -3048,8 +3400,95 @@ public class SenderPoolSfTest {
     // Helpers.
     // ----------------------------------------------------------------------
 
+    private static Sender closeCountingSender(
+            int idx, AtomicInteger[] closeCalls, boolean throwOnClose
+    ) {
+        return closeCountingSender(idx, closeCalls, throwOnClose, null, null, null);
+    }
+
+    private static Sender closeCountingSender(
+            int idx,
+            AtomicInteger[] closeCalls,
+            boolean throwOnClose,
+            AtomicReference<Thread> recoveryThread,
+            AtomicBoolean cleanupBeforeDriverQuiescence,
+            CountDownLatch releaseDriver
+    ) {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "close":
+                            if (recoveryThread != null && recoveryThread.get().isAlive()) {
+                                cleanupBeforeDriverQuiescence.set(true);
+                                releaseDriver.countDown();
+                            }
+                            closeCalls[idx].incrementAndGet();
+                            if (throwOnClose) {
+                                throw new AssertionError("injected delegate close failure");
+                            }
+                            return null;
+                        case "toString":
+                            return "CloseCountingSender-" + idx;
+                        case "hashCode":
+                            return System.identityHashCode(proxy);
+                        case "equals":
+                            return proxy == args[0];
+                        default:
+                            throw new AssertionError("unexpected prewarmed sender call: " + method.getName());
+                    }
+                });
+    }
+
+    private void createCandidateSlot(String name) throws IOException {
+        java.nio.file.Path dir = Paths.get(slot(name));
+        java.nio.file.Files.createDirectories(dir);
+        java.nio.file.Files.write(dir.resolve("0.sfa"), new byte[]{1});
+    }
+
+    private static Sender notifyingCloseSender(Sender delegate, CountDownLatch closed) {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    try {
+                        Object result = method.invoke(delegate, args);
+                        if ("close".equals(method.getName())) {
+                            closed.countDown();
+                        }
+                        return result;
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
     private String slot(String name) {
         return sfDir + "/" + name;
+    }
+
+    private static Sender successfulRecoverySender(int idx, CountDownLatch drained) {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "drain":
+                            drained.countDown();
+                            return true;
+                        case "close":
+                            return null;
+                        case "toString":
+                            return "SuccessfulRecoverySender-" + idx;
+                        case "hashCode":
+                            return System.identityHashCode(proxy);
+                        case "equals":
+                            return proxy == args[0];
+                        default:
+                            throw new AssertionError("unexpected recovery sender call: " + method.getName());
+                    }
+                });
     }
 
     private void assertPreallocatedExitHandoffCleansStartupRecoverer(
@@ -3362,6 +3801,46 @@ public class SenderPoolSfTest {
         return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, senderFactory);
     }
 
+    private static SenderPool newPoolWithRecoveryControls(
+            String cfg,
+            int min,
+            int max,
+            long acquireMs,
+            IntFunction<Sender> senderFactory,
+            ThreadFactory threadFactory,
+            Runnable recoveryWaiter,
+            Runnable beforeFailedRecoveryJoinHook
+    ) throws Throwable {
+        Constructor<SenderPool> constructor = SenderPool.class.getDeclaredConstructor(
+                String.class, int.class, int.class, long.class, long.class, long.class,
+                IntFunction.class, boolean.class,
+                io.questdb.client.SenderErrorHandler.class,
+                io.questdb.client.SenderConnectionListener.class,
+                io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener.class,
+                Runnable.class, ThreadFactory.class, Runnable.class, Runnable.class);
+        constructor.setAccessible(true);
+        try {
+            return constructor.newInstance(
+                    cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE,
+                    senderFactory, false, null, null, null, null, threadFactory,
+                    recoveryWaiter, beforeFailedRecoveryJoinHook);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
+    }
+
+    private static SenderPool newPoolWithRecoveryThreadFactory(
+            String cfg,
+            int min,
+            int max,
+            long acquireMs,
+            IntFunction<Sender> senderFactory,
+            ThreadFactory threadFactory
+    ) throws Throwable {
+        return newPoolWithRecoveryControls(
+                cfg, min, max, acquireMs, senderFactory, threadFactory, null, null);
+    }
+
     // Uses the @TestOnly 8-arg constructor (deferStartupRecovery=true) so a test
     // can build a pool whose SF startup recovery is NOT run inline -- mirroring
     // the pooled QuestDB handle, which defers it to the housekeeper.
@@ -3394,6 +3873,15 @@ public class SenderPoolSfTest {
         m.invoke(pool);
     }
 
+    private static void invokeSetStartupRecoveryJoinHooks(
+            SenderPool pool, Runnable beforeJoinHook, Runnable afterJoinHook
+    ) throws Exception {
+        Method m = SenderPool.class.getDeclaredMethod(
+                "setStartupRecoveryJoinHooks", Runnable.class, Runnable.class);
+        m.setAccessible(true);
+        m.invoke(pool, beforeJoinHook, afterJoinHook);
+    }
+
     // Deferred pool (deferStartupRecovery=true) WITH an injected factory, so a
     // test can drive the housekeeper recovery path against fully controlled
     // (fake) recoverers.
@@ -3402,9 +3890,23 @@ public class SenderPoolSfTest {
         return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, factory, true);
     }
 
-    // Fake Sender whose drain() (for slot 0 only) parks until released, opening a
-    // deterministic shutdown-during-recovery window. Holds no native resources.
-    private static Sender blockingFakeSender(int idx, CountDownLatch drainStarted, CountDownLatch release) {
+    private static Sender blockingFakeSender(
+            int idx, CountDownLatch drainStarted, CountDownLatch releaseDrain
+    ) {
+        return blockingFakeSender(
+                idx, drainStarted, releaseDrain, new CountDownLatch(0), new CountDownLatch(0));
+    }
+
+    // Fake Sender whose drain() and close() (for slot 0 only) park until
+    // released, opening deterministic shutdown and pre-termination windows.
+    // Holds no native resources.
+    private static Sender blockingFakeSender(
+            int idx,
+            CountDownLatch drainStarted,
+            CountDownLatch releaseDrain,
+            CountDownLatch closeStarted,
+            CountDownLatch releaseClose
+    ) {
         return (Sender) java.lang.reflect.Proxy.newProxyInstance(
                 Sender.class.getClassLoader(),
                 new Class[]{Sender.class},
@@ -3413,10 +3915,14 @@ public class SenderPoolSfTest {
                         case "drain":
                             if (idx == 0) {
                                 drainStarted.countDown();
-                                release.await();
+                                releaseDrain.await();
                             }
                             return true;
                         case "close":
+                            if (idx == 0) {
+                                closeStarted.countDown();
+                                releaseClose.await();
+                            }
                             return null;
                         case "toString":
                             return "BlockingFakeSender-" + idx;

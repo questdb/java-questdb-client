@@ -40,6 +40,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -85,8 +86,8 @@ public final class SenderPool implements AutoCloseable {
     // Per-slot wall-clock cap on a single startup-recovery drain. Kept BELOW the
     // PoolHousekeeper stop/join budget (PoolHousekeeper.STOP_TIMEOUT_MILLIS) so a
     // recovery drain still in flight when close() arrives cannot outlive the
-    // housekeeper join -- the residual-budget bound that, together with the
-    // early markClosing() signal, keeps close() prompt (C1 fix).
+    // driver join -- the residual-budget bound that, together with the early
+    // markClosing() signal, keeps close() prompt (C1 fix).
     //
     // This caps only the DRAIN. The recovery build that precedes it is bounded
     // separately: recovery delegates force initial_connect_mode=OFF (see
@@ -96,6 +97,10 @@ public final class SenderPool implements AutoCloseable {
     // -- the residual window documented on recoverOneSlotStep -- because the
     // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
+    // A direct SenderPool has no PoolHousekeeper to retry a transient startup
+    // recovery failure. Its private driver waits this long between failed
+    // attempts so an unavailable server does not cause a hot retry loop.
+    private static final long RECOVERY_RETRY_INTERVAL_MILLIS = 1_000;
     // Hard cap on close()'s wait for a creation that is blocked in DNS, TCP,
     // TLS, or WebSocket setup. The creator retains ownership after this budget:
     // once construction returns, borrow() observes closed and tears down the
@@ -111,6 +116,11 @@ public final class SenderPool implements AutoCloseable {
     private final long acquireTimeoutMillis;
     private final ArrayList<SenderSlot> all;
     private final ArrayDeque<SenderSlot> available;
+    // Test-only constructor seam. Runs immediately before a possibly-started
+    // recovery driver is joined after constructor failure. Null in production;
+    // lifecycle tests use it to release a deliberately held driver and prove
+    // delegate cleanup happens only after the join.
+    private final Runnable beforeFailedStartupRecoveryJoinHook;
     private final String configurationString;
     // Signals completion of internally owned creation lifecycles. Kept
     // separate from slotReleased so a capacity waiter cannot consume the only
@@ -134,13 +144,13 @@ public final class SenderPool implements AutoCloseable {
     private final Runnable postFactoryHook;
     // Factory for startup-recovery delegates. Distinct from senderFactory so a
     // recoverer can force a non-blocking initial connect (initial_connect_mode=
-    // OFF) regardless of user config: a recovery build runs on the
-    // PoolHousekeeper thread and must NOT inherit SYNC (auto-enabled by any
-    // reconnect_* knob), which would retry the connect for the whole reconnect
-    // budget inside build() -- far past PoolHousekeeper.STOP_TIMEOUT_MILLIS, so
-    // a close() landing during that build would make housekeeper.stop()'s join
-    // time out and leave the recoverer holding the slot flock after close()
-    // returned (M1). Mirrors senderFactory's test seam: an injected factory
+    // OFF) regardless of user config: a recovery build runs on a private direct
+    // driver or the PoolHousekeeper thread and must NOT inherit SYNC
+    // (auto-enabled by any reconnect_* knob), which would retry the connect for
+    // the whole reconnect budget inside build() -- far past
+    // PoolHousekeeper.STOP_TIMEOUT_MILLIS, so a close() landing during that
+    // build could make its driver join time out and leave the recoverer holding
+    // the slot flock after close() returned (M1). Mirrors senderFactory's test seam: an injected factory
     // (non-null) drives BOTH paths so white-box recovery tests keep control.
     private final IntFunction<Sender> recoverySenderFactory;
     private final ReentrantLock lock = new ReentrantLock();
@@ -161,11 +171,28 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     // True iff the configuration enables store-and-forward (sf_dir set).
     private final boolean storeAndForward;
+    // Direct pools run one inline recovery attempt for backwards-compatible
+    // startup behavior, then this daemon continues any backlog left by budget
+    // exhaustion or a transient failure. Deferred pools use PoolHousekeeper and
+    // leave this null.
+    private final Object startupRecoverySignal = new Object();
+    private final Thread startupRecoveryThread;
+    // Test-only constructor seam for the failed-retry operation. Production
+    // uses waitForStartupRecoveryRetry(), which performs the one-second signal
+    // wait; lifecycle tests inject an event barrier without wall-clock checks.
+    private final Runnable startupRecoveryWaiter;
+    // Test seam: runs after the direct recovery driver's bounded join returns.
+    // Null in production; lifecycle tests prove the joined thread is quiescent.
+    private volatile Runnable afterStartupRecoveryJoinHook;
     // Test seam: runs immediately before a capacity-starved borrow enters its
     // condition wait, while it still holds the pool lock. Null in production;
     // concurrency tests use a latch here to prove that several borrowers have
     // all reached the wait path before recovering retired capacity.
     private volatile Runnable beforeBorrowWaitHook;
+    // Test seam: runs immediately before the direct recovery driver's bounded
+    // join. Null in production; lifecycle tests coordinate close() with a
+    // deliberately held driver.
+    private volatile Runnable beforeStartupRecoveryJoinHook;
     // Test seam: runs after a capacity-starved borrow's condition wait has
     // exhausted its positive timeout, before the loop's terminal pass. Null in
     // production; regression tests release a retired slot here to prove that
@@ -223,14 +250,15 @@ public final class SenderPool implements AutoCloseable {
     // (recoverOneSlotStep): each is reserved under `lock` for the
     // duration of its drain and counted in the borrow() cap check so a
     // concurrent borrow can neither over-allocate past maxSize nor target a
-    // dir being recovered. Only ever non-zero on the deferred (housekeeper-
-    // driven) recovery path, where recovery overlaps borrow()/return; on the
-    // inline construction path the pool is still single-threaded. Guarded by
-    // lock; only ever ticks for SF slots.
+    // dir being recovered. The inline constructor drive is single-threaded,
+    // but the continuing direct-pool driver and deferred housekeeper driver can
+    // overlap borrow()/return after publication. Guarded by lock; only ever
+    // ticks for SF slots.
     private int recoveringSlots;
     // Resumable startup-recovery scan cursor. Advanced only by the single
-    // recovery driver -- the inline constructor loop (single-threaded,
-    // unpublished) or the PoolHousekeeper thread (the sole deferred driver) --
+    // recovery driver -- the inline constructor loop followed by its private
+    // direct-pool thread, or the PoolHousekeeper thread (the sole deferred
+    // driver) --
     // so the cursor itself needs no lock; the per-slot reservation it performs
     // (slotInUse/recoveringSlots) is still taken under `lock` because borrow()
     // races it. recoveryInRangeNext is the next in-range index in [0, maxSize)
@@ -253,7 +281,7 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor exposing the senderFactory seam: production builds
@@ -282,8 +310,8 @@ public final class SenderPool implements AutoCloseable {
     // reachable-but-not-acking server; the owner (QuestDBImpl) then drives
     // recovery one slot per tick on the PoolHousekeeper thread via
     // runStartupRecoveryStep(). White-box SF tests call this directly; the
-    // in-range recovery pass is concurrency-safe against borrow()/return on the
-    // deferred path -- see recoverOneSlotStep().
+    // in-range recovery pass is concurrency-safe against borrow()/return after
+    // pool publication -- see recoverOneSlotStep().
     @TestOnly
     public SenderPool(
             String configurationString,
@@ -297,7 +325,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null);
+                deferStartupRecovery, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor adding a deterministic fault hook for the ownership
@@ -316,7 +344,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null, postFactoryHook);
+                deferStartupRecovery, null, null, null, postFactoryHook, null, null, null);
     }
 
     // Full constructor adding the user-supplied ingest callbacks (error
@@ -340,7 +368,7 @@ public final class SenderPool implements AutoCloseable {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
                 deferStartupRecovery, errorHandler, connectionListener,
-                drainerListener, null);
+                drainerListener, null, null, null, null);
     }
 
     private SenderPool(
@@ -355,7 +383,10 @@ public final class SenderPool implements AutoCloseable {
             SenderErrorHandler errorHandler,
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener,
-            Runnable postFactoryHook
+            Runnable postFactoryHook,
+            ThreadFactory recoveryThreadFactory,
+            Runnable recoveryWaiter,
+            Runnable beforeFailedRecoveryJoinHook
     ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
@@ -375,6 +406,10 @@ public final class SenderPool implements AutoCloseable {
         this.idleTimeoutMillis = idleTimeoutMillis;
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.postFactoryHook = postFactoryHook;
+        this.beforeFailedStartupRecoveryJoinHook = beforeFailedRecoveryJoinHook;
+        this.startupRecoveryWaiter = recoveryWaiter != null
+                ? recoveryWaiter
+                : this::waitForStartupRecoveryRetry;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
         this.retiredSlots = new ArrayList<>(maxSize);
@@ -410,17 +445,7 @@ public final class SenderPool implements AutoCloseable {
             // propagate without running the cleanup below, leaking every
             // already-built delegate's flock + mmap'd ring + I/O thread and
             // resurrecting "sf slot already in use" on the next attempt.
-            for (int i = 0; i < built; i++) {
-                try {
-                    all.get(i).delegate().close();
-                } catch (Throwable ignored) {
-                    // Best-effort cleanup: a delegate close() can throw an
-                    // Error (e.g. an -ea AssertionError) as well as a
-                    // RuntimeException. Swallow either so we still close the
-                    // remaining pre-warmed slots and rethrow the original
-                    // construction failure below.
-                }
-            }
+            closePrewarmedDelegates(built);
             throw e;
         }
         // Prewarm succeeded. Recover any unacked data a previous run left in
@@ -429,18 +454,43 @@ public final class SenderPool implements AutoCloseable {
         // (deferStartupRecovery=true) so QuestDB.build() never blocks on a slow
         // or reachable-but-not-acking server; direct constructions run it inline
         // here, while still single-threaded and unpublished.
-        if (!deferStartupRecovery) {
-            runStartupRecoveryToCompletion();
+        Thread recoveryThread = null;
+        try {
+            if (!deferStartupRecovery) {
+                runStartupRecoveryToCompletion();
+                if (storeAndForward && !recoveryComplete) {
+                    ThreadFactory threadFactory = recoveryThreadFactory != null
+                            ? recoveryThreadFactory
+                            : SenderPool::createStartupRecoveryThread;
+                    recoveryThread = threadFactory.newThread(this::runStartupRecoveryLoop);
+                    recoveryThread.setDaemon(true);
+                }
+            }
+            this.startupRecoveryThread = recoveryThread;
+            if (recoveryThread != null) {
+                recoveryThread.start();
+            }
+        } catch (Throwable e) {
+            // Thread allocation, configuration, or start can throw after
+            // prewarm transferred delegate ownership to this constructor. The
+            // pool cannot be returned, so stop a possibly-started driver before
+            // tearing down delegates it could otherwise still recover against.
+            // Preserve the construction throwable; cleanup is best-effort.
+            markClosing();
+            stopFailedStartupRecoveryDriver(recoveryThread);
+            closePrewarmedDelegates(built);
+            throw e;
         }
     }
 
     /**
-     * Drives startup SF recovery to completion in a single call, bounded by one
-     * shared {@code acquireTimeoutMillis} wall-clock budget (and each individual
-     * drain by {@link #RECOVERY_DRAIN_BUDGET_MILLIS}). Used by the inline
-     * construction path -- single-threaded and unpublished -- and by manual /
-     * test drives. No-op when SF is off, the pool is shutting down, or recovery
-     * has already finished. Idempotent.
+     * Drives startup SF recovery toward completion in a single call, bounded by
+     * one shared {@code acquireTimeoutMillis} wall-clock budget (and each
+     * individual drain by {@link #RECOVERY_DRAIN_BUDGET_MILLIS}). Used by the
+     * inline construction path -- single-threaded and unpublished -- and by
+     * manual / test drives. Budget exhaustion or a transient slot failure leaves
+     * the cursor pending for the pool's continuing driver. No-op when SF is off,
+     * the pool is shutting down, or recovery has already finished. Idempotent.
      */
     void runStartupRecoveryToCompletion() {
         if (!storeAndForward) {
@@ -452,15 +502,25 @@ public final class SenderPool implements AutoCloseable {
         // accepted for a single borrow, so we reuse it as the total budget; once
         // spent, the remaining slots wait for a later attempt (data stays
         // durable on disk).
-        final long deadlineNanos =
-                System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(acquireTimeoutMillis);
+        final long budgetNanos = TimeUnit.MILLISECONDS.toNanos(acquireTimeoutMillis);
+        final long startNanos = System.nanoTime();
         while (!closed && !recoveryComplete) {
-            long remainingMillis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
-            if (remainingMillis <= 0) {
+            // Subtract nanoTime samples before comparing them with the duration.
+            // This avoids an overflowed absolute deadline when
+            // acquireTimeoutMillis is Long.MAX_VALUE and keeps the intended
+            // duration comparison explicit.
+            long elapsedNanos = System.nanoTime() - startNanos;
+            if (elapsedNanos >= budgetNanos) {
                 LOG.warn("startup SF recovery: {}ms budget exhausted; "
-                        + "skipping remaining slots", acquireTimeoutMillis);
-                recoveryComplete = true;
+                        + "deferring remaining slots", acquireTimeoutMillis);
                 return;
+            }
+            long remainingNanos = budgetNanos - elapsedNanos;
+            long remainingMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+            if (remainingMillis == 0) {
+                // drain() accepts milliseconds; preserve a positive sub-ms
+                // remainder instead of treating truncation as exhaustion.
+                remainingMillis = 1;
             }
             if (!recoverOneSlotStep(Math.min(remainingMillis, RECOVERY_DRAIN_BUDGET_MILLIS))) {
                 return;
@@ -468,17 +528,38 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
+    private void runStartupRecoveryLoop() {
+        while (!closed && !recoveryComplete) {
+            boolean hasImmediateWork;
+            try {
+                hasImmediateWork = runStartupRecoveryStep();
+            } catch (Throwable ignored) {
+                // Match PoolHousekeeper: startup recovery is best-effort and a
+                // delegate Error must not permanently kill its only driver.
+                hasImmediateWork = false;
+            }
+            if (closed || recoveryComplete) {
+                return;
+            }
+            if (!hasImmediateWork) {
+                startupRecoveryWaiter.run();
+                if (Thread.currentThread().isInterrupted()) {
+                    return;
+                }
+            }
+        }
+    }
+
     /**
      * Recovers at most ONE stranded managed slot and reports whether more remain.
-     * Driven by the {@link PoolHousekeeper} one slot per step, back-to-back, on
-     * the reap-loop thread: each step performs at most one drain bounded by
-     * {@link #RECOVERY_DRAIN_BUDGET_MILLIS} -- kept below the housekeeper
-     * stop/join budget -- on a delegate whose initial connect is forced OFF
+     * The private direct driver or {@link PoolHousekeeper} drives steps
+     * back-to-back: each step performs at most one drain bounded by
+     * {@link #RECOVERY_DRAIN_BUDGET_MILLIS} -- kept below the driver stop/join
+     * budget -- on a delegate whose initial connect is forced OFF
      * ({@link #defaultRecoverySender}) so the build makes at most one connect
-     * attempt. The housekeeper re-checks {@code stop} between steps while
-     * {@link QuestDBImpl#close()} raises the {@code closed} shutdown signal (via
-     * {@link #markClosing()}) BEFORE stopping it, so a {@code close()} landing
-     * mid-recovery normally only has to wait out a single bounded drain. The one
+     * attempt. Each owner raises the {@code closed} shutdown signal before
+     * joining its driver, so a {@code close()} landing mid-recovery normally
+     * only has to wait out a single bounded drain. The one
      * exception is an in-flight connect to a black-holed host, which blocks on
      * the OS connect timeout -- see the residual-window note on
      * {@link #recoverOneSlotStep}.
@@ -519,8 +600,8 @@ public final class SenderPool implements AutoCloseable {
      * <p>
      * The in-range pass reserves each slot index under {@code lock} for the
      * duration of its recovery AND counts it in the borrow() capacity check (via
-     * {@code recoveringSlots}), so a concurrent borrow on the deferred path can
-     * neither target the dir being recovered nor over-allocate past
+     * {@code recoveringSlots}), so a concurrent borrow after pool publication
+     * can neither target the dir being recovered nor over-allocate past
      * {@code maxSize}. Prewarmed/borrowed slots (already live, holding their
      * flock) are skipped, as are empty slots (a cheap directory probe); only a
      * slot that actually holds stranded data spends the step's single drain. The
@@ -530,13 +611,14 @@ public final class SenderPool implements AutoCloseable {
      * Best-effort throughout: a build/close Error or a slow drain is logged and
      * never propagates, since the data stays durable on disk for a later attempt.
      * A build failure or drain timeout stops the current drive but leaves its
-     * candidate pending so a later housekeeper tick can retry after a transient
+     * candidate pending so a later driver attempt can retry after a transient
      * condition clears; it does not poison recovery for the life of the pool.
      * <p>
-     * <b>Boundedness / residual window.</b> Recovery is driven on the
-     * PoolHousekeeper thread, and {@code close()} relies on a step finishing
-     * within {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. A step is build +
-     * drain + close. The drain is capped by {@link #RECOVERY_DRAIN_BUDGET_MILLIS}
+     * <b>Boundedness / residual window.</b> A continuing recovery step runs on
+     * either the direct pool's private driver or the PoolHousekeeper thread, and
+     * {@code close()} relies on a step finishing within
+     * {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. A step is build + drain +
+     * close. The drain is capped by {@link #RECOVERY_DRAIN_BUDGET_MILLIS}
      * and the build forces {@code initial_connect_mode=OFF} (see
      * {@link #defaultRecoverySender}), so it makes at most ONE connect attempt
      * instead of a SYNC reconnect-budget retry loop. That removes the
@@ -544,7 +626,7 @@ public final class SenderPool implements AutoCloseable {
      * One residual window remains and is NOT closed here: a single in-flight
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
      * (the transport exposes no application-level connect timeout to clamp it).
-     * If {@code close()} lands during that one connect the housekeeper join can
+     * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly
      * after {@code close()} returns. No data is lost (the slot stays durable on
      * disk); the exposure is a brief "sf slot already in use" window on an
@@ -567,8 +649,8 @@ public final class SenderPool implements AutoCloseable {
                 return false;
             }
             int i = recoveryInRangeNext;
-            // Reserve this index unless prewarm (or a concurrent borrow, on the
-            // deferred path) already holds it live. Count the reservation in
+            // Reserve this index unless prewarm (or a concurrent borrow after
+            // publication) already holds it live. Count the reservation in
             // recoveringSlots so the borrow() cap check cannot over-allocate
             // while this slot is held for recovery.
             boolean reserved;
@@ -629,9 +711,9 @@ public final class SenderPool implements AutoCloseable {
                             i, maxSize - leakedSlots, maxSize, leakedSlots);
                 } else {
                     slotInUse[i] = false;
-                    // On the deferred path a borrow may be waiting on capacity
-                    // this recovery held; the freed index can now admit a
-                    // creation.
+                    // On a post-publication drive, a borrow may be waiting on
+                    // capacity this recovery held; the freed index can now admit
+                    // a creation.
                     slotReleased.signal();
                 }
             } finally {
@@ -699,6 +781,22 @@ public final class SenderPool implements AutoCloseable {
         return false;
     }
 
+    private void closePrewarmedDelegates(int built) {
+        for (int i = 0; i < built; i++) {
+            try {
+                all.get(i).delegate().close();
+            } catch (Throwable ignored) {
+                // Best-effort cleanup: one delegate close failure must not
+                // strand later prewarmed delegates or replace the original
+                // construction throwable.
+            }
+        }
+    }
+
+    private static Thread createStartupRecoveryThread(Runnable runnable) {
+        return new Thread(runnable, "questdb-sender-pool-recovery");
+    }
+
     /**
      * Drains one candidate orphan slot dir within {@code remainingMillis},
      * best-effort and never throwing. Builds a recoverer on {@code slotIndex}
@@ -733,8 +831,8 @@ public final class SenderPool implements AutoCloseable {
                 // Recovery delegate: forced OFF-mode initial connect (see
                 // createRecoverer / defaultRecoverySender), so this build does
                 // at most ONE connect attempt -- it never inherits the SYNC
-                // reconnect-budget retry loop that would block this
-                // (PoolHousekeeper) thread for minutes (M1).
+                // reconnect-budget retry loop that would block this recovery
+                // driver for minutes (M1).
                 recoverer = createRecoverer(slotIndex);
             } catch (Throwable buildErr) {
                 // A build/connect failure (e.g. server unreachable) will very
@@ -921,10 +1019,10 @@ public final class SenderPool implements AutoCloseable {
 
     /**
      * Raises the shutdown signal early -- without tearing down live delegates --
-     * so an in-flight startup-recovery step driven on the {@link PoolHousekeeper}
-     * thread stops promptly between slots. {@link QuestDBImpl#close()} calls this
-     * BEFORE stopping the housekeeper, so the housekeeper join cannot time out
-     * waiting on a fresh slot's recovery drain. Idle-delegate teardown and the
+     * so an in-flight startup-recovery step stops promptly between slots. Direct
+     * {@link #close()} calls this before joining its private driver;
+     * {@link QuestDBImpl#close()} calls it before stopping the housekeeper.
+     * Idle-delegate teardown and the
      * outstanding-lease wait still happen in {@link #close()} (guarded by
      * {@code closeStarted}, so this early signal never short-circuits them);
      * borrowed delegates returned after this signal are torn down on the
@@ -933,6 +1031,9 @@ public final class SenderPool implements AutoCloseable {
      */
     void markClosing() {
         closed = true;
+        synchronized (startupRecoverySignal) {
+            startupRecoverySignal.notifyAll();
+        }
     }
 
     /**
@@ -959,6 +1060,11 @@ public final class SenderPool implements AutoCloseable {
      */
     @Override
     public void close() {
+        // Direct pools own their continuing recovery driver. Stop it before
+        // snapshotting/closing delegates; deferred pools have a null thread and
+        // QuestDBImpl stops their external PoolHousekeeper before calling here.
+        markClosing();
+        stopStartupRecoveryDriver();
         SenderSlot[] idleSnapshot;
         lock.lock();
         try {
@@ -1097,6 +1203,62 @@ public final class SenderPool implements AutoCloseable {
         // retireLease re-validates the lease generation under the lock and
         // signals the close() thread waiting for outstanding leases.
         retireLease(ps, " during pool shutdown");
+    }
+
+    @TestOnly
+    private void setStartupRecoveryJoinHooks(Runnable beforeJoinHook, Runnable afterJoinHook) {
+        this.beforeStartupRecoveryJoinHook = beforeJoinHook;
+        this.afterStartupRecoveryJoinHook = afterJoinHook;
+    }
+
+    private void stopFailedStartupRecoveryDriver(Thread recoveryThread) {
+        if (recoveryThread == null || recoveryThread == Thread.currentThread()) {
+            return;
+        }
+        if (beforeFailedStartupRecoveryJoinHook != null) {
+            beforeFailedStartupRecoveryJoinHook.run();
+        }
+        boolean interrupted = false;
+        while (recoveryThread.isAlive()) {
+            try {
+                recoveryThread.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void stopStartupRecoveryDriver() {
+        if (startupRecoveryThread == null || startupRecoveryThread == Thread.currentThread()) {
+            return;
+        }
+        if (beforeStartupRecoveryJoinHook != null) {
+            beforeStartupRecoveryJoinHook.run();
+        }
+        try {
+            startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (afterStartupRecoveryJoinHook != null) {
+            afterStartupRecoveryJoinHook.run();
+        }
+    }
+
+    private void waitForStartupRecoveryRetry() {
+        synchronized (startupRecoverySignal) {
+            if (closed || recoveryComplete) {
+                return;
+            }
+            try {
+                startupRecoverySignal.wait(RECOVERY_RETRY_INTERVAL_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**
@@ -1361,9 +1523,10 @@ public final class SenderPool implements AutoCloseable {
     /**
      * Same managed-slot delegate as {@link #defaultSender}, but with the
      * initial connect forced to {@link Sender.InitialConnectMode#OFF}. Used
-     * only for startup recovery, which runs on the PoolHousekeeper thread: OFF
-     * makes the build do at most ONE connect attempt instead of retrying for
-     * the whole reconnect budget (SYNC, auto-enabled by any reconnect_* knob),
+     * only for startup recovery, which runs on a private direct driver or the
+     * PoolHousekeeper thread: OFF makes the build do at most ONE connect attempt
+     * instead of retrying for the whole reconnect budget (SYNC, auto-enabled by
+     * any reconnect_* knob),
      * keeping a recovery step bounded below
      * {@code PoolHousekeeper.STOP_TIMEOUT_MILLIS}. See M1 / the residual-window
      * note on {@link #recoverOneSlotStep}.
@@ -1432,8 +1595,8 @@ public final class SenderPool implements AutoCloseable {
             // its OWN slot (the one recoverOneSlotStep is processing); it must
             // never start a BackgroundDrainerPool for sibling/foreign orphans.
             // If it did, the delegate's close() -- called from
-            // drainCandidateSlotForRecovery() on the PoolHousekeeper thread,
-            // BEFORE its cursorEngine.close() releases the slot flock -- would
+            // drainCandidateSlotForRecovery() on the recovery driver, BEFORE
+            // its cursorEngine.close() releases the slot flock -- would
             // block in BackgroundDrainerPool.close() for up to
             // GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS (3s) against a
             // reachable-but-not-acking server. That overruns a recovery step's
