@@ -64,6 +64,12 @@ public interface TokenStore {
      * non-rotating refresh token; {@link FileTokenStore} overrides it with a lock-file protocol. An
      * implementation that cannot acquire the lock should run {@code action} anyway (degrade) rather than
      * fail a sign-in.
+     * <p>
+     * {@code OidcDeviceAuth} calls this while holding its own instance lock, and {@code action} runs
+     * synchronously on the calling thread. An implementation therefore must not call back into the owning
+     * {@code OidcDeviceAuth} (for example {@code signIn()}/{@code getToken()}) from {@code inLock},
+     * {@code load}, or {@code save}, and must not block waiting on another thread that could need that
+     * instance lock - either would re-enter or deadlock. Do the store I/O only.
      *
      * @param key    the identity to lock
      * @param action the critical section; its boolean result is returned unchanged

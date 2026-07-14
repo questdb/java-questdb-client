@@ -80,6 +80,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * a stale lock left by a crashed holder, and degrades to running without the lock (Layer 1 still protects
  * integrity) rather than stall a sign-in if it cannot acquire one.
  * <p>
+ * That degrade has a residual worth understanding: if a peer's refresh genuinely outlasts the acquire
+ * budget (a slow or stalled IdP), or its lock is judged stale and stolen mid-refresh, two processes can
+ * POST the same parent refresh token concurrently. On an IdP that does not detect refresh-token reuse this
+ * costs only a redundant refresh; on one that DOES (for example Auth0's default), reusing one parent token
+ * twice can revoke the whole token family, forcing every process to re-run the interactive device flow -
+ * which, for a headless {@code getToken()} consumer with no interactive fallback, is a hard failure until a
+ * human re-signs in. If that matters, widen the acquire budget / staleness window, or back the store with a
+ * keychain or secrets manager instead.
+ * <p>
  * The store never writes a token value into a log or an exception message; only file paths and IO error
  * kinds may surface.
  */
@@ -98,7 +107,9 @@ public final class FileTokenStore implements TokenStore {
     // timeout does NOT bound and which the OS bounds instead (a black-holed connect is ~tcp-connect-timeout,
     // commonly ~2 minutes on Linux). This 10-minute window leaves ample headroom above ~480s + a typical
     // connection stall; a pathological DNS/connection hang longer than that headroom can still let a peer
-    // steal a live holder's lock, degrading (best-effort) to a re-prompt on a rotating-refresh-token IdP
+    // steal a live holder's lock mid-refresh, degrading to a concurrent refresh of the same parent refresh
+    // token: a redundant refresh on most IdPs, but on a reuse-detecting one (e.g. Auth0 default) a possible
+    // token-family revocation and re-prompt / headless hard-failure (see the class javadoc residual note)
     private static final long DEFAULT_LOCK_STALE_MILLIS = 600_000L;
     private static final FileAttribute<Set<PosixFilePermission>> DIR_ATTRS =
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));

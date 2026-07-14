@@ -38,8 +38,13 @@ import io.questdb.client.std.Chars;
  * not block on interactive input. A quick silent token refresh is fine, but it must not start an
  * interactive sign-in; a provider that coordinates a shared token store across processes (for example
  * {@code OidcDeviceAuth} with a {@code FileTokenStore}) may add a brief, bounded wait to acquire that
- * store's cross-process lock before such a refresh, which still counts as a quick silent refresh. An
- * exception from {@link #getToken()} fails the in-flight flush (HTTP) or the connection attempt (WebSocket).
+ * store's cross-process lock before such a refresh, which still counts as a quick silent refresh. Note
+ * that "quick" bounds the interactive wait, not the network: the silent refresh is a synchronous HTTP
+ * round-trip to the token endpoint, and its connection phase (DNS, TCP connect, TLS) is bounded by the OS,
+ * not by the client timeout - so a black-holed token endpoint can stall a refresh for the OS connect
+ * timeout (commonly ~2 minutes on Linux). A producer sizing flush backpressure against this call should
+ * expect that worst case. An exception from {@link #getToken()} fails the in-flight flush (HTTP) or the
+ * connection attempt (WebSocket).
  *
  * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */

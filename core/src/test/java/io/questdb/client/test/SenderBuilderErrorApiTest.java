@@ -230,12 +230,11 @@ public class SenderBuilderErrorApiTest {
 
     @Test
     public void testCategoryAndPolicyAreStillEnumerable() {
-        // Cross-check that the enum surface is fully reachable from
-        // user-side code via the builder import path.
-        SenderError.Category c = SenderError.Category.SCHEMA_MISMATCH;
-        SenderError.Policy p = SenderError.Policy.RETRIABLE;
-        Assert.assertNotNull(c);
-        Assert.assertNotNull(p);
+        // Cross-check that the user-facing SenderError enum surface is intact. valueOf(name) throws at
+        // RUNTIME if a constant is renamed or removed, so this actually fails on a regression - unlike
+        // asserting a compiled constant reference is non-null, which the compiler already guarantees.
+        Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, SenderError.Category.valueOf("SCHEMA_MISMATCH"));
+        Assert.assertEquals(SenderError.Policy.RETRIABLE, SenderError.Policy.valueOf("RETRIABLE"));
     }
 
     @Test

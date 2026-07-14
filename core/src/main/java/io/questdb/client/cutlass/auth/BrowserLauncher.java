@@ -43,6 +43,15 @@ final class BrowserLauncher {
     }
 
     /**
+     * Whether the automatic browser launch is enabled - the {@code questdb.client.oidc.open.browser}
+     * kill-switch (default enabled; set to {@code false} to disable). Package-private so a test can assert
+     * the kill-switch without triggering a real browser launch, which is otherwise unobservable.
+     */
+    static boolean isBrowserOpenEnabled() {
+        return Boolean.parseBoolean(System.getProperty(OPEN_BROWSER_PROPERTY, "true"));
+    }
+
+    /**
      * Opens {@code url} in the default browser when it is an http(s) URL and a desktop browser is
      * available. Does nothing on a headless JVM, for a non-http(s) URL, on a launch failure, or when the
      * {@code questdb.client.oidc.open.browser} system property is set to {@code false}. May throw a
@@ -50,7 +59,7 @@ final class BrowserLauncher {
      * treats that as "no browser available".
      */
     static void open(String url) {
-        if (!Boolean.parseBoolean(System.getProperty(OPEN_BROWSER_PROPERTY, "true"))) {
+        if (!isBrowserOpenEnabled()) {
             return;
         }
         URI uri = safeHttpUri(url);

@@ -55,16 +55,21 @@ public class BrowserLauncherTest {
 
     @Test
     public void testOpenRespectsDisableProperty() throws Exception {
-        // a VALID http(s) URL: if open() did not short-circuit on the kill-switch it would proceed toward
-        // java.awt.Desktop, so asserting safeHttpUri accepts it proves the no-op below is the kill-switch,
-        // not URL rejection. This gate is also what keeps the suite from launching a real browser on a
-        // developer machine.
+        // the kill-switch itself is asserted via isBrowserOpenEnabled() - a real browser launch is
+        // unobservable (no-op on a headless JVM either way), so asserting the property read directly is the
+        // only way to prove the gate actually flips. A VALID http(s) URL confirms the no-op under "false"
+        // below is the kill-switch, not URL rejection; this gate also keeps the suite from popping a browser.
         String validUrl = "https://idp.example.com/device?user_code=ABCD";
         Assert.assertNotNull("the URL must be one open() would otherwise launch", invokeSafeHttpUri(validUrl));
         String prop = "questdb.client.oidc.open.browser";
         String prev = System.getProperty(prop);
-        System.setProperty(prop, "false");
         try {
+            System.clearProperty(prop);
+            Assert.assertTrue("the browser launch must default to enabled", invokeIsBrowserOpenEnabled());
+            System.setProperty(prop, "true");
+            Assert.assertTrue("\"true\" must enable the browser launch", invokeIsBrowserOpenEnabled());
+            System.setProperty(prop, "false");
+            Assert.assertFalse("\"false\" must disable the browser launch (the kill-switch)", invokeIsBrowserOpenEnabled());
             invokeOpen(validUrl); // kill-switch off: must return without launching and without throwing
         } finally {
             if (prev == null) {
@@ -90,6 +95,12 @@ public class BrowserLauncherTest {
 
     // BrowserLauncher is a package-private helper; the client is an open module, so reflection reaches its
     // static methods without widening production visibility for the test (mirrors invokeIsLoopbackHost).
+    private static boolean invokeIsBrowserOpenEnabled() throws Exception {
+        Method m = Class.forName("io.questdb.client.cutlass.auth.BrowserLauncher").getDeclaredMethod("isBrowserOpenEnabled");
+        m.setAccessible(true);
+        return (boolean) m.invoke(null);
+    }
+
     private static void invokeOpen(String url) throws Exception {
         Method m = Class.forName("io.questdb.client.cutlass.auth.BrowserLauncher").getDeclaredMethod("open", String.class);
         m.setAccessible(true);

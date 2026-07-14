@@ -836,6 +836,39 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testDiscoveryIgnoresArrayWrappedConfig() throws Exception {
+        assertMemoryLeak(() -> {
+            // a tampered /settings wraps the config object in an ARRAY - {"config":[{...}]} - so the config
+            // keys sit inside an array element rather than the trusted top-level "config" object. The parser
+            // must not surface an array element's object as config (mirroring FileTokenStore's array
+            // rejection), so OIDC reads as disabled and fromQuestDB fails rather than trusting wrapped config.
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{\"config\":[{"
+                            + "\"acl.oidc.enabled\":true,"
+                            + "\"acl.oidc.client.id\":\"questdb\","
+                            + "\"acl.oidc.scope\":\"openid\","
+                            + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl(TOKEN_PATH) + "\","
+                            + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl(DEVICE_PATH) + "\""
+                            + "}]}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-X", "ID-X", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure());
+                    Assert.fail("array-wrapped config must not be trusted as OIDC config");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("OIDC is not enabled"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDiscoveryIgnoresPreferencesKeys() throws Exception {
         assertMemoryLeak(() -> {
             // the unprivileged-writable "preferences" object tries to poison discovery (flip enabled

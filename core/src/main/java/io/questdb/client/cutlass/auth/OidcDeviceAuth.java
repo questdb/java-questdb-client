@@ -453,9 +453,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         closed = true;
         lock.lock();
         try {
+            // free the native lexer first: its close() is a bare Unsafe.free that cannot throw, whereas an
+            // HttpClient close conceivably could - freeing the native buffer first means such a throw cannot
+            // strand it (Misc.free nulls each field, so a second close() is still a safe no-op)
+            jsonLexer = Misc.free(jsonLexer);
             plainClient = Misc.free(plainClient);
             tlsClient = Misc.free(tlsClient);
-            jsonLexer = Misc.free(jsonLexer);
         } finally {
             lock.unlock();
         }
@@ -1878,6 +1881,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         final StringSink verificationUriComplete = new StringSink();
         int expiresIn;
         int interval;
+        // objects nested inside a JSON array are never trusted: an array-wrapped response must not surface its
+        // element object's fields at the top-level depth. arrayDepth gates every name/value read on being 0.
+        private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
 
@@ -1891,6 +1897,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             verificationUriComplete.clear();
             expiresIn = 0;
             interval = 0;
+            arrayDepth = 0;
             depth = 0;
             field = FIELD_NONE;
         }
@@ -1898,6 +1905,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         @Override
         public void onEvent(int code, CharSequence tag, int position) {
             switch (code) {
+                case JsonLexer.EVT_ARRAY_START:
+                    arrayDepth++;
+                    break;
+                case JsonLexer.EVT_ARRAY_END:
+                    arrayDepth--;
+                    break;
                 case JsonLexer.EVT_OBJ_START:
                     depth++;
                     break;
@@ -1905,7 +1918,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     depth--;
                     break;
                 case JsonLexer.EVT_NAME:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         if (Chars.equals("device_code", tag)) {
                             field = FIELD_DEVICE_CODE;
                         } else if (Chars.equals("user_code", tag)) {
@@ -1928,7 +1941,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     }
                     break;
                 case JsonLexer.EVT_VALUE:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         switch (field) {
                             case FIELD_DEVICE_CODE:
                                 putNonNull(deviceCode, tag);
@@ -2124,6 +2137,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         final StringSink tokenEndpoint = new StringSink();
         boolean groupsInToken;
         boolean isOidcEnabled;
+        // objects nested inside a JSON array are never trusted config: track array depth and require it 0 for
+        // every name/value/config-arming decision, so a tampered {"config":[{...}]} (or a top-level array
+        // wrapper) cannot surface the array element's object at the config depth. Array VALUES are ignored
+        // regardless; legitimate array-valued config keys (never read here) are harmlessly skipped.
+        private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
         private boolean isConfigNext;
@@ -2132,9 +2150,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         @Override
         public void onEvent(int code, CharSequence tag, int position) {
             switch (code) {
+                case JsonLexer.EVT_ARRAY_START:
+                    arrayDepth++;
+                    break;
+                case JsonLexer.EVT_ARRAY_END:
+                    arrayDepth--;
+                    break;
                 case JsonLexer.EVT_OBJ_START:
                     depth++;
-                    if (depth == 2 && isConfigNext) {
+                    if (arrayDepth == 0 && depth == 2 && isConfigNext) {
                         isInConfig = true;
                     }
                     isConfigNext = false;
@@ -2146,12 +2170,12 @@ public class OidcDeviceAuth implements QuietCloseable {
                     depth--;
                     break;
                 case JsonLexer.EVT_NAME:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         // only the top-level "config" object is trusted; the sibling "preferences" object
                         // holds arbitrary user-written keys and must not feed OIDC discovery
                         isConfigNext = Chars.equals("config", tag);
                         field = FIELD_NONE;
-                    } else if (depth == 2 && isInConfig) {
+                    } else if (arrayDepth == 0 && depth == 2 && isInConfig) {
                         if (Chars.equals("acl.oidc.enabled", tag)) {
                             field = FIELD_ENABLED;
                         } else if (Chars.equals("acl.oidc.client.id", tag)) {
@@ -2174,7 +2198,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     }
                     break;
                 case JsonLexer.EVT_VALUE:
-                    if (depth == 2 && isInConfig) {
+                    if (arrayDepth == 0 && depth == 2 && isInConfig) {
                         switch (field) {
                             case FIELD_ENABLED:
                                 isOidcEnabled = Chars.equals("true", tag);
@@ -2223,6 +2247,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         final StringSink idToken = new StringSink();
         final StringSink refreshToken = new StringSink();
         int expiresIn;
+        // objects nested inside a JSON array are never trusted: an array-wrapped response must not surface its
+        // element object's fields at the top-level depth. arrayDepth gates every name/value read on being 0.
+        private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
 
@@ -2234,6 +2261,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             idToken.clear();
             refreshToken.clear();
             expiresIn = 0;
+            arrayDepth = 0;
             depth = 0;
             field = FIELD_NONE;
         }
@@ -2241,6 +2269,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         @Override
         public void onEvent(int code, CharSequence tag, int position) {
             switch (code) {
+                case JsonLexer.EVT_ARRAY_START:
+                    arrayDepth++;
+                    break;
+                case JsonLexer.EVT_ARRAY_END:
+                    arrayDepth--;
+                    break;
                 case JsonLexer.EVT_OBJ_START:
                     depth++;
                     break;
@@ -2248,7 +2282,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     depth--;
                     break;
                 case JsonLexer.EVT_NAME:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         if (Chars.equals("access_token", tag)) {
                             field = FIELD_ACCESS_TOKEN;
                         } else if (Chars.equals("id_token", tag)) {
@@ -2267,7 +2301,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     }
                     break;
                 case JsonLexer.EVT_VALUE:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         switch (field) {
                             case FIELD_ACCESS_TOKEN:
                                 putNonNull(accessToken, tag);
@@ -2305,12 +2339,21 @@ public class OidcDeviceAuth implements QuietCloseable {
         private static final int FIELD_TOKEN_ENDPOINT = 2;
         final StringSink deviceAuthorizationEndpoint = new StringSink();
         final StringSink tokenEndpoint = new StringSink();
+        // objects nested inside a JSON array are never trusted: an array-wrapped document must not surface its
+        // element object's fields at the top-level depth. arrayDepth gates every name/value read on being 0.
+        private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
 
         @Override
         public void onEvent(int code, CharSequence tag, int position) {
             switch (code) {
+                case JsonLexer.EVT_ARRAY_START:
+                    arrayDepth++;
+                    break;
+                case JsonLexer.EVT_ARRAY_END:
+                    arrayDepth--;
+                    break;
                 case JsonLexer.EVT_OBJ_START:
                     depth++;
                     break;
@@ -2320,7 +2363,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 case JsonLexer.EVT_NAME:
                     // the OIDC discovery document is a flat top-level object; only read top-level keys so a
                     // nested value cannot be mistaken for an endpoint
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         if (Chars.equals("device_authorization_endpoint", tag)) {
                             field = FIELD_DEVICE_AUTHORIZATION_ENDPOINT;
                         } else if (Chars.equals("token_endpoint", tag)) {
@@ -2331,7 +2374,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                     }
                     break;
                 case JsonLexer.EVT_VALUE:
-                    if (depth == 1) {
+                    if (arrayDepth == 0 && depth == 1) {
                         switch (field) {
                             case FIELD_DEVICE_AUTHORIZATION_ENDPOINT:
                                 putNonNull(deviceAuthorizationEndpoint, tag);
