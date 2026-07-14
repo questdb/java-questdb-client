@@ -87,6 +87,40 @@ public class LineHttpSenderTokenProviderTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testChangedProviderTokenIsRevalidated() throws Exception {
+        assertMemoryLeak(() -> {
+            // the per-flush token validation is skipped only for the SAME instance already validated, so a
+            // token that CHANGES to a bad one must still be re-validated and rejected - the identity guard must
+            // not cache a previously-valid result past a token change. First flush a valid token, then return a
+            // CR/LF token and require the next flush to reject it rather than splice it onto the wire.
+            AtomicInteger calls = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                HttpTokenProvider provider = () -> calls.incrementAndGet() == 1
+                        ? "GOODTOKEN"
+                        : "abc" + (char) 0x0d + (char) 0x0a + "def"; // second pull: CR/LF injected
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush(); // first flush: GOODTOKEN validated and sent
+                    try {
+                        // the second flush's first row re-pulls the provider -> the changed, bad token
+                        sender.table("t").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        Assert.fail("a changed, bad token must be re-validated and rejected");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("control or non-ASCII character"));
+                    }
+                }
+                Assert.assertEquals("the provider is re-pulled per flush", 2, calls.get());
+            }
+        });
+    }
+
     @Test
     public void testControlOrNonAsciiProviderTokenIsRejected() throws Exception {
         assertMemoryLeak(() -> {

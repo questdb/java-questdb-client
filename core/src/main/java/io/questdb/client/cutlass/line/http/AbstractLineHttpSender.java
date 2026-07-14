@@ -94,6 +94,9 @@ public abstract class AbstractLineHttpSender implements Sender {
     private boolean isTokenPending;
     private JsonErrorParser jsonErrorParser;
     private boolean lastFlushFailed;
+    // the last provider token instance validated in stampTokenIfPending(); lets an unchanged multi-KB token
+    // skip re-validation (a full scan) on every flush. Identity only, never dereferenced for content.
+    private CharSequence lastValidatedToken;
     private long pendingRows;
     private int rowBookmark;
     private RequestState state = RequestState.EMPTY;
@@ -204,8 +207,8 @@ public abstract class AbstractLineHttpSender implements Sender {
                     : HttpClientFactory.newPlainTextInstance(clientConfiguration);
         }
         this.questDBVersion = new BuildInformationHolder().getSwVersion();
-        // precompute the User-Agent header value once: newRequest() runs on every flush (and twice per flush
-        // for a token provider), so concatenating it there would allocate a String each time
+        // precompute the User-Agent header value once: newRequest() runs on every flush, so concatenating it
+        // there would allocate a String each time
         this.userAgent = "QuestDB/java/" + questDBVersion;
         this.request = newRequest();
         this.maxNameLength = maxNameLength;
@@ -414,12 +417,15 @@ public abstract class AbstractLineHttpSender implements Sender {
                 throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
         }
         if (httpTokenProvider != null) {
-            // The constructor already built the initial request without a token. Defer the first
-            // getToken() off this build path to the first row (table()), so a provider that signs in
-            // lazily - e.g. OidcDeviceAuth::getToken - can be wired before sign-in completes,
-            // and the token pull stays on the use/flush path the provider documents.
+            // The constructor built the initial request before the provider was wired (httpTokenProvider was
+            // still null, so it took the no-auth path with withContent). Rebuild it via the deferred path now
+            // that the provider is set: this leaves the request at the header stage with the token pending,
+            // matching the reset() path, so the first row's stampTokenIfPending() finishes it (appends the auth
+            // header + withContent()) without a second client.newRequest(). Deferring the first getToken() off
+            // the build path also lets a lazily-signing-in provider (e.g. OidcDeviceAuth::getToken) be wired
+            // before sign-in completes, keeping the token pull on the use/flush path the provider documents.
             sender.httpTokenProvider = httpTokenProvider;
-            sender.isTokenPending = true;
+            sender.request = sender.newRequest();
         }
         return sender;
     }
@@ -757,10 +763,6 @@ public abstract class AbstractLineHttpSender implements Sender {
     }
 
     private HttpClient.Request newRequest() {
-        return newRequest(false);
-    }
-
-    private HttpClient.Request newRequest(boolean pullProviderToken) {
         HttpClient.Request r = client.newRequest(currentHost(), currentPort())
                 .POST()
                 .url(path)
@@ -768,22 +770,17 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (username != null) {
             r.authBasic(username, password);
         } else if (httpTokenProvider != null) {
-            if (pullProviderToken) {
-                // pull a fresh token per request so a long-lived sender follows token refreshes;
-                // validateToken rejects a null/empty/blank return, or a token carrying a control or
-                // non-ASCII char (both forbidden by the HttpTokenProvider contract), rather than splice a
-                // malformed or CR/LF-injected "Authorization: Bearer " header onto the wire
-                CharSequence token = httpTokenProvider.getToken();
-                HttpTokenProvider.validateToken(token);
-                r.authToken(token);
-            } else {
-                // do NOT pull the token on the construct/flush path: getToken() can throw (not signed in
-                // yet, or a failed silent refresh). Here - after client.newRequest() reset and re-headered
-                // the shared request but before withContent() - a throw would leave a half-built request
-                // and corrupt the sender, turning an already-successful flush into an exception. Defer to
-                // the first row (stampTokenIfPending), where a failed pull is retriable and rebuilds cleanly.
-                isTokenPending = true;
-            }
+            // Do NOT pull the token here (the construct / flush-completion path): getToken() can throw (not
+            // signed in yet, or a failed silent refresh), and a throw after client.newRequest() reset the
+            // shared request would corrupt the sender, turning an already-successful flush into an exception.
+            // Leave the request at the header stage (no withContent() yet) with the token pending, so the first
+            // row's stampTokenIfPending() appends the Authorization header + withContent() on THIS request
+            // WITHOUT a second client.newRequest() - the request line and headers are written once per flush,
+            // not twice. bufferView() reads empty meanwhile (contentStart is -1, so getContentLength() is 0).
+            isTokenPending = true;
+            rowBookmark = r.getContentLength();
+            state = RequestState.EMPTY;
+            return r;
         } else if (authToken != null) {
             r.authToken(authToken);
         }
@@ -820,13 +817,32 @@ public abstract class AbstractLineHttpSender implements Sender {
     private void stampTokenIfPending() {
         if (isTokenPending) {
             // The construct/flush path deferred the token so a lazily-signing-in provider (e.g.
-            // OidcDeviceAuth::getToken) could be wired before sign-in completed, and so a provider
-            // failure never strikes after a successful send. The caller is now starting the first row, so
-            // rebuild the still-empty request to carry the token before any row data goes in. Clear the
-            // flag only after newRequest(true) succeeds: a pull that throws (not signed in yet, or a failed
-            // refresh) leaves the stamp pending, so the next row re-runs this and fully rebuilds the
-            // request - the sender is never left corrupted.
-            request = newRequest(true);
+            // OidcDeviceAuth::getToken) could be wired before sign-in completed, and so a provider failure
+            // never strikes after a successful send. The caller is now starting the first row, so finish the
+            // request newRequest() left at the header stage: pull a fresh token (so a long-lived sender
+            // follows token rotation), then append the Authorization header + withContent() on THIS request -
+            // no second client.newRequest(), so the request line and headers are written once, not twice.
+            //
+            // The throwing operations run BEFORE the request is mutated: a getToken()/validateToken() throw
+            // (not signed in yet, a failed refresh, or a rejected token) leaves isTokenPending set and the
+            // request untouched at the header stage, so the next row retries cleanly - the sender is never left
+            // corrupted. validateToken (which scans the whole token) is skipped when the provider returned the
+            // same instance already validated: an unchanged multi-KB id token is otherwise re-scanned every
+            // flush. A provider returning the same instance must not mutate its content (HttpTokenProvider
+            // contract), so the skip cannot let a changed token bypass validation.
+            CharSequence token = httpTokenProvider.getToken();
+            // always validate a null token (it must be rejected, and null is the initial lastValidatedToken
+            // value); otherwise skip re-validation only for the exact same instance already validated.
+            // lastValidatedToken is assigned only after a successful validation, so it never holds a rejected
+            // (null/blank/bad-char) token - a re-returned bad token is therefore re-validated and re-rejected.
+            if (token == null || token != lastValidatedToken) {
+                HttpTokenProvider.validateToken(token);
+                lastValidatedToken = token;
+            }
+            request.authToken(token);
+            request.withContent();
+            rowBookmark = request.getContentLength();
+            state = RequestState.EMPTY;
             isTokenPending = false;
         }
     }
