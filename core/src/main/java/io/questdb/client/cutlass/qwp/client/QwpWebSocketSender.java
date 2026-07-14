@@ -47,6 +47,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionLis
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderProgressDispatcher;
@@ -3926,7 +3927,10 @@ public class QwpWebSocketSender implements Sender {
         ObjList<String> fromFrames = new ObjList<>();
         long coverage = cursorEngine.collectReplaySymbolsAbove(baseline, fromFrames);
         if (coverage < 0) {
-            throw new LineSenderException(
+            // Typed, because Sender.build() sets such a slot aside instead of failing: this
+            // is the point at which every source of truth has been tried and none of them
+            // holds the missing ids. See UnreplayableSlotException.
+            throw new UnreplayableSlotException(
                     "recovered store-and-forward symbol dictionary is incomplete and cannot be "
                             + "rebuilt from the surviving frames (likely a host crash tore its unsynced "
                             + "tail): the frames reference symbol ids below their own delta start, which "

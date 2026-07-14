@@ -40,6 +40,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -1560,11 +1561,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         slotPath, actualSfMaxBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
-                if (cursorEngine.isRecoveredDictionaryIncomplete()) {
-                    cursorEngine = quarantineTornSlot(
-                            cursorEngine, sfDir, senderId, slotPath, actualSfMaxBytes,
-                            actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
-                }
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1576,7 +1572,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 for (int i = 0, n = hosts.size(); i < n; i++) {
                     wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
                 }
-                QwpWebSocketSender connected;
+                // The recovery seed inside connect() is the authority on whether a recovered
+                // slot can be replayed: it rebuilds the dictionary from its intact prefix and
+                // then from the surviving frames' own delta sections, and throws
+                // UnreplayableSlotException only once neither source holds the missing ids.
+                // Quarantining on anything weaker would set aside slots that recovery can
+                // still rescue, so build() waits for that verdict rather than pre-judging it.
+                QwpWebSocketSender connected = null;
+                boolean quarantined = false;
+                while (connected == null) {
                 try {
                     connected = QwpWebSocketSender.connect(
                             wsEndpoints,
@@ -1603,6 +1607,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualPoisonMinEscalationWindowMillis,
                             actualCatchUpCapGapMinEscalationWindowMillis
                     );
+                } catch (UnreplayableSlotException e) {
+                    // The one failure build() recovers from. The slot's frames reference ids
+                    // that nothing still holds, so they can never go on the wire -- but that is
+                    // no reason to take the producer down with them. Before this, the throw
+                    // escaped build() and, because senderId is stable and a not-fully-drained
+                    // slot is retained on close, every retry re-recovered the same slot and
+                    // threw again: the application could not construct a Sender at all, so it
+                    // could not even BUFFER new rows. An already-lost batch became an unbounded
+                    // outage of everything after it.
+                    //
+                    // Set the slot aside instead, keep its bytes for forensics and resend, and
+                    // start the producer on a clean one. Once only: a second such failure would
+                    // mean the FRESH slot is unreplayable, which cannot happen, so let it out
+                    // rather than loop.
+                    if (quarantined || slotPath == null) {
+                        try {
+                            cursorEngine.close();
+                        } catch (Throwable ignored) {
+                            // best-effort
+                        }
+                        throw e;
+                    }
+                    quarantined = true;
+                    cursorEngine = quarantineTornSlot(
+                            cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxBytes,
+                            actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
                     // transferred — close it ourselves.
@@ -1612,6 +1642,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         // best-effort
                     }
                     throw t;
+                }
                 }
                 // connect() succeeded — `connected` now owns cursorEngine
                 // via setCursorEngine(engine, true). From here on, ANY
@@ -3001,18 +3032,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * throw -- loudly, and never silently dropping bytes.
          */
         private static CursorSendEngine quarantineTornSlot(
-                CursorSendEngine torn, String sfDir, String senderId, String slotPath,
+                CursorSendEngine torn, UnreplayableSlotException cause, String sfDir,
+                String senderId, String slotPath,
                 long sfMaxBytes, long sfMaxTotalBytes, long sfAppendDeadlineNanos
         ) {
-            long recoveredMaxSymbolId = torn.recoveredMaxSymbolId();
-            PersistedSymbolDict dict = torn.getPersistedSymbolDict();
-            int coverage = dict != null ? dict.size() : 0;
-            String detail = "recovered store-and-forward symbol dictionary cannot cover the surviving "
-                    + "frames (likely a host crash tore its unsynced tail): frames reference symbol id "
-                    + recoveredMaxSymbolId + " but the recovered dictionary holds only " + coverage
-                    + " id(s)";
-            // Release the slot lock and the dictionary fd before renaming. The slot is not
-            // fully drained, so close() retains every file.
+            // The verdict, and the reason, come from the recovery seed -- the only code that
+            // has tried every source of truth. Recomputing them here would mean a second,
+            // independently-drifting notion of "unreplayable".
+            final String detail = cause.getMessage();
+            // Release the slot lock and the dictionary fd before renaming. connect()'s failure
+            // path already closed the engine; close() is idempotent, so make it explicit rather
+            // than depend on that.
             torn.close();
 
             String quarantinePath = null;

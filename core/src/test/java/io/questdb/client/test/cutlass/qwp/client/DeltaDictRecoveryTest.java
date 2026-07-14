@@ -156,6 +156,71 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testUnreplayableSlotIsSetAsideAndTheProducerKeepsProducing() throws Exception {
+        // The point of setting an unreplayable slot aside rather than failing: the
+        // producer stays ALIVE and its new data still reaches the server. This is the
+        // property store-and-forward exists to guarantee, and the one bricking build()
+        // destroyed -- one host crash and the application could never construct a Sender
+        // again, so every row after the tear was lost too, not just the torn batch.
+        //
+        // Asserted end to end against a real wire: the fresh rows arrive and the server's
+        // reconstructed dictionary holds EXACTLY the post-recovery symbols. Not one
+        // symbol from the unreplayable slot appears -- so the producer kept producing
+        // AND the torn frames stayed off the wire.
+        assertMemoryLeak(() -> {
+            // Phase 1: record delta frames, then lose the whole dictionary (host crash).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "torn-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.write(dict,
+                    Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8)); // header only: 0 symbols
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+
+            // Phase 2: the recovering sender sets the slot aside and keeps producing.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "fresh-a").longColumn("v", 100).atNow();
+                    s2.table("m").symbol("s", "fresh-b").longColumn("v", 101).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.dictSnapshot().size() < 2) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertEquals("the new rows must reach the server",
+                            2, handler.dictSnapshot().size());
+                }
+
+                assertUnreplayableSlotSetAside();
+                List<String> dict2 = handler.dictSnapshot();
+                Assert.assertEquals("the server must hold exactly the post-recovery symbols",
+                        Arrays.asList("fresh-a", "fresh-b"), dict2);
+                for (String s : dict2) {
+                    Assert.assertFalse("no symbol of the unreplayable slot may reach the server: " + s,
+                            s.startsWith("torn-"));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testTornDictionaryFailsCleanlyInsteadOfCorrupting() throws Exception {
         assertMemoryLeak(() -> {
             // Phase 1: each row introduces a new symbol, so frame i carries deltaStart=i.
@@ -196,19 +261,20 @@ public class DeltaDictRecoveryTest {
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
 
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                LineSenderException terminal = null;
-                try {
-                    Sender s2 = Sender.fromConfig(cfg);
-                    s2.close();
-                } catch (LineSenderException e) {
-                    terminal = e;
-                }
+                // The dictionary cannot be rebuilt from any source, so this slot is genuinely
+                // unreplayable -- and build() SETS IT ASIDE rather than failing. Failing here
+                // is what bricked the sender: senderId is stable and a not-fully-drained slot
+                // is retained on close, so every retry re-recovered the same slot and threw
+                // again, and the application could not construct a Sender at all -- it could
+                // not even buffer new rows. Now the producer comes up on a clean slot and the
+                // unreplayable bytes are kept aside for resend.
+                Sender.fromConfig(cfg).close();
+
+                // The safety property is unchanged: not one frame of the unreplayable slot
+                // may reach the server.
                 Assert.assertEquals("no frame may be replayed to a fresh server with a torn dictionary",
                         0, handler.frames.get());
-                Assert.assertNotNull("a torn dictionary must surface a terminal error", terminal);
-                Assert.assertTrue(terminal.getMessage(),
-                        terminal.getMessage().contains("cannot be rebuilt from the surviving frames")
-                                && terminal.getMessage().contains("resend"));
+                assertUnreplayableSlotSetAside();
             }
         });
     }
@@ -1325,6 +1391,41 @@ public class DeltaDictRecoveryTest {
             }
             return INSTANCE.write(fd, addr, len, offset);
         }
+    }
+
+
+    /**
+     * The unreplayable-slot contract: a recovered slot whose symbol dictionary cannot be
+     * rebuilt -- not from its own intact prefix, not from the surviving frames' delta
+     * sections -- is SET ASIDE, never silently drained and never allowed to brick the
+     * sender.
+     * <p>
+     * The bytes are kept for forensics and resend, the {@code .failed} sentinel tells the
+     * orphan drainer to treat the copy as human-in-the-loop rather than retry it forever,
+     * and the producer continues on a fresh, empty slot.
+     */
+    private void assertUnreplayableSlotSetAside() {
+        java.nio.file.Path aside = Paths.get(sfDir, "default.unreplayable-0");
+        Assert.assertTrue("the unreplayable slot must be set aside, not deleted: " + aside,
+                java.nio.file.Files.isDirectory(aside));
+        Assert.assertTrue("the set-aside slot must keep its recorded frames for resend",
+                hasSegmentFile(aside));
+        Assert.assertTrue("the set-aside slot must carry the .failed sentinel",
+                java.nio.file.Files.exists(aside.resolve(".failed")));
+        Assert.assertTrue("the sender must continue on a live slot",
+                java.nio.file.Files.isDirectory(Paths.get(sfDir, "default")));
+    }
+
+    private static boolean hasSegmentFile(java.nio.file.Path dir) {
+        java.io.File[] files = dir.toFile().listFiles();
+        if (files != null) {
+            for (java.io.File f : files) {
+                if (f.getName().endsWith(".sfa") && f.length() > 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
 }
