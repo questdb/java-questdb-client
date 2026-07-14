@@ -301,15 +301,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // nor resets it. NOT reset per connection -- it measures the cap-gap episode
     // across reconnects so a persistent gap eventually latches. I/O-thread-only.
     private int catchUpCapGapAttempts;
-    // System.nanoTime() of the FIRST cap gap of the current episode, or -1 when no
-    // episode is open. Anchors the escalation dwell. Reset together with
-    // catchUpCapGapAttempts on a successful catch-up, so a node that accepts the
-    // dictionary ends the episode outright. Anchoring at the FIRST gap (not at loop
-    // entry, and not refreshed per attempt) is what keeps a TRANSIENT from burning the
-    // terminal budget: a transient never reaches the catch-up, so it neither increments
-    // the counter nor moves the anchor -- it can only lengthen the wall clock, which
-    // alone can never latch the terminal because the strike count still has to be
-    // satisfied. I/O-thread-only, like catchUpCapGapAttempts.
+    // System.nanoTime() of the FIRST cap gap of the current episode. Anchors the
+    // escalation dwell. Reset together with catchUpCapGapAttempts on a successful
+    // catch-up, so a node that accepts the dictionary ends the episode outright.
+    // Anchoring at the FIRST gap (not at loop entry, and not refreshed per attempt) is
+    // what keeps a TRANSIENT from burning the terminal budget: a transient never reaches
+    // the catch-up, so it neither increments the counter nor moves the anchor -- it can
+    // only lengthen the wall clock, which alone can never latch the terminal because the
+    // strike count still has to be satisfied. I/O-thread-only, like catchUpCapGapAttempts.
+    //
+    // -1 marks "no episode open" for a debugger or a heap dump, but it is NOT the test
+    // for one -- catchUpCapGapAttempts == 0 is (see sendDictCatchUp). A nanoTime instant
+    // is only meaningful as a difference: its origin is arbitrary and the spec permits
+    // negative values, so no state may ride on this field's sign.
     private long catchUpCapGapFirstNanos = -1L;
     // True once a real ring frame (data or commit) has been sent on the CURRENT
     // connection, as opposed to only the dictionary catch-up. The catch-up consumes
@@ -2442,8 +2446,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // an ordinary rolling restart of the larger-cap node. Escalating on the
                 // count alone would therefore hard-fail a live store-and-forward
                 // producer during a routine cluster operation.
+                //
+                // The STRIKE COUNT -- never the anchor's sign -- says whether an episode is
+                // already open. A System.nanoTime() instant is only meaningful as a
+                // difference: its origin is arbitrary and the spec permits negative values,
+                // so a sign test cannot tell an unset anchor from a real one. Wherever it
+                // misreads a real anchor as unset it re-anchors to now on EVERY strike,
+                // pinning episodeNanos at ~0, and the dwell can then never be satisfied --
+                // the terminal never latches, however long the gap truly persists.
+                // recordHeadRejectionStrike keys its episode off poisonStrikes for the same
+                // reason.
                 long nowNanos = System.nanoTime();
-                if (catchUpCapGapFirstNanos < 0) {
+                if (catchUpCapGapAttempts == 0) {
                     catchUpCapGapFirstNanos = nowNanos;
                 }
                 catchUpCapGapAttempts++;

@@ -331,6 +331,71 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testCapGapEpisodeWithANegativeAnchorStillEscalates() throws Exception {
+        // A cap-gap episode anchored at a NEGATIVE nanoTime instant must escalate like any
+        // other. A System.nanoTime() value is only meaningful as a difference -- its origin
+        // is arbitrary and the spec permits negative values -- so no state may ride on the
+        // anchor's sign. sendDictCatchUp once tested catchUpCapGapFirstNanos < 0 to mean "no
+        // episode open": that read a negative anchor as unset, re-anchored it to now on every
+        // strike and pinned episodeNanos at ~0, so the dwell was never satisfied and the
+        // terminal could never latch, however long the cap gap truly persisted.
+        //
+        // That is what reddened CI. The sibling test above backdates the anchor two hours,
+        // and on Linux nanoTime() is nanos-since-boot: on a CI agent up ten minutes it is
+        // ~6e11, so "two hours ago" comes out ~ -6.6e12 -- negative. The defect therefore
+        // only surfaced where uptime is under that backdate: every fresh CI agent, and never
+        // a long-lived dev box (which is why it passed locally). Planting the negative anchor
+        // directly pins the sentinel on ANY machine, whatever its uptime.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160);
+            try (CursorSendEngine engine = newEngine()) {
+                // A one-hour dwell, against an anchor two hours back: satisfied on elapsed,
+                // but only if the negative anchor survives to the subtraction.
+                CursorWebSocketSendLoop loop = newLoop(engine, client, 3_600_000L);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    // Satisfy the strike half of the AND, one short of the budget.
+                    for (int i = 1; i < maxAttempts; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                        loop.checkError(); // dwell unmet => retriable, whatever the count
+                    }
+                    // The episode began two hours ago on a machine booted minutes ago.
+                    Field anchor = CursorWebSocketSendLoop.class.getDeclaredField("catchUpCapGapFirstNanos");
+                    anchor.setAccessible(true);
+                    anchor.setLong(loop, -TimeUnit.HOURS.toNanos(2));
+
+                    // Both halves now hold, so this strike must latch the terminal.
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                        fail("the escalating cap gap must still raise CatchUpSendException");
+                    } catch (InvocationTargetException e) {
+                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    }
+                    try {
+                        loop.checkError();
+                        fail("a cap-gap episode anchored at a negative nanoTime instant must still "
+                                + "escalate -- the anchor's sign carries no meaning");
+                    } catch (LineSenderException terminal) {
+                        assertTrue("terminal must name the exhausted catch-up cap gap: " + terminal.getMessage(),
+                                terminal.getMessage().contains("during catch-up")
+                                        && terminal.getMessage().contains("must be resent"));
+                    }
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testTransientCatchUpFailureDoesNotBurnTheCapGapBudget() throws Exception {
         // A TRANSIENT catch-up failure (the wire drops mid-catch-up -- a flapping LB, a
         // reset) must never increment the cap-gap terminal budget. The budget exists to
