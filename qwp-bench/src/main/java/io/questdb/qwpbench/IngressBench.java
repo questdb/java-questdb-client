@@ -78,6 +78,12 @@ public final class IngressBench {
         int tcount = BenchSchema.noteTemplateCount(rows);
         String[] notes = new String[tcount];
         for (int t = 0; t < tcount; t++) notes[t] = BenchSchema.noteTemplate(t, varcharLen);
+        // Label pools -- built once, outside every timed region, shared
+        // read-only across sender threads. The timed loop then does O(1)
+        // array lookups only; per-row String.format for the up-to-6 symbol
+        // labels would otherwise be roughly half the measured pass.
+        String[] symPool = BenchSchema.symPool(symCard);
+        String[][] hiPools = kind == BenchSchema.Kind.S2_WIDE ? BenchSchema.hiSymPools(hiCard) : null;
 
         Sender[] pool = new Sender[senders];
         long[][] ranges = new long[senders][];
@@ -88,11 +94,11 @@ public final class IngressBench {
                 ranges[k] = senderRange(rows, senders, k);
             }
             for (int w = 0; w < warmups; w++) {
-                multiPass(exec, pool, ranges, kind, symCard, hiCard, notes, maxBatch);
+                multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
             }
             for (int it = 0; it < iterations; it++) {
                 long g0 = BenchJson.gcMs(), c0 = BenchJson.processCpuNs(), t0 = BenchJson.nowNs();
-                multiPass(exec, pool, ranges, kind, symCard, hiCard, notes, maxBatch);
+                multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
                 wall[it] = BenchJson.nowNs() - t0;
                 cpu[it] = BenchJson.processCpuNs() - c0;
                 gc[it] = BenchJson.gcMs() - g0;
@@ -165,9 +171,11 @@ public final class IngressBench {
                 + ";auto_flush_rows=2147483647;auto_flush_interval=2147483646;";
     }
 
-    // package-private: EgressBench reuses this for its populate step (Task 5)
+    // package-private: EgressBench reuses this for its populate step.
+    // symPool/hiPools are read-only and safely shared across sender threads;
+    // hiPools is null iff kind != S2_WIDE (never dereferenced then).
     static void pass(Sender sender, BenchSchema.Kind kind, long lo, long hi,
-                      int symCard, int hiCard, String[] notes, long maxBatch) throws Exception {
+                      String[] symPool, String[][] hiPools, String[] notes, long maxBatch) throws Exception {
         long batchNo = 0;
         long lastFsn = -1;
         for (long start = lo; start < hi; start += maxBatch) {
@@ -175,10 +183,10 @@ public final class IngressBench {
             for (long i = start; i < end; i++) {
                 sender.table(kind.tableName());
                 // symbols must precede other columns (Sender contract)
-                sender.symbol("sym", BenchSchema.sym(i, symCard));
+                sender.symbol("sym", symPool[(int) (i % symPool.length)]);
                 if (kind == BenchSchema.Kind.S2_WIDE) {
                     for (int c = 1; c <= BenchSchema.N_WIDE_SYMS; c++) {
-                        sender.symbol(S_NAMES[c], BenchSchema.hiSym(c, i, hiCard));
+                        sender.symbol(S_NAMES[c], hiPools[c][(int) (i % hiPools[c].length)]);
                     }
                 }
                 sender.longColumn("id", BenchSchema.id(i));
@@ -218,17 +226,17 @@ public final class IngressBench {
      * attached as suppressed exceptions.
      */
     private static void multiPass(ExecutorService exec, Sender[] pool, long[][] ranges,
-                                  BenchSchema.Kind kind, int symCard, int hiCard,
+                                  BenchSchema.Kind kind, String[] symPool, String[][] hiPools,
                                   String[] notes, long maxBatch) throws Exception {
         if (pool.length == 1) {
-            pass(pool[0], kind, ranges[0][0], ranges[0][1], symCard, hiCard, notes, maxBatch);
+            pass(pool[0], kind, ranges[0][0], ranges[0][1], symPool, hiPools, notes, maxBatch);
             return;
         }
         List<Future<?>> futures = new ArrayList<>(pool.length);
         for (int k = 0; k < pool.length; k++) {
             final int kk = k;
             futures.add(exec.submit(() -> {
-                pass(pool[kk], kind, ranges[kk][0], ranges[kk][1], symCard, hiCard, notes, maxBatch);
+                pass(pool[kk], kind, ranges[kk][0], ranges[kk][1], symPool, hiPools, notes, maxBatch);
                 return null;
             }));
         }

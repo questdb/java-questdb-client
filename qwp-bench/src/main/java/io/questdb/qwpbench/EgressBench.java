@@ -61,12 +61,15 @@ public final class EgressBench {
             int tcount = BenchSchema.noteTemplateCount(rows);
             String[] notes = new String[tcount];
             for (int t = 0; t < tcount; t++) notes[t] = BenchSchema.noteTemplate(t, varcharLen);
+            // Populate is untimed, but reuses pass() -- same pools contract.
+            String[] symPool = BenchSchema.symPool(symCard);
+            String[][] hiPools = kind == BenchSchema.Kind.S2_WIDE ? BenchSchema.hiSymPools(hiCard) : null;
 
             // Same ws:: conf as IngressBench.run() -- see IngressBench.ingestConf()
             // for why auto-flush is pinned to max thresholds rather than disabled.
             String ingestConf = IngressBench.ingestConf(host, port);
             try (Sender sender = Sender.fromConfig(ingestConf)) {
-                IngressBench.pass(sender, kind, 0, rows, symCard, hiCard, notes, POPULATE_BATCH_ROWS);
+                IngressBench.pass(sender, kind, 0, rows, symPool, hiPools, notes, POPULATE_BATCH_ROWS);
             }
             System.err.printf("[qwp_egress_java] waiting for WAL apply (count == %d)%n", rows);
             long count = http.waitForCount(table, rows);
