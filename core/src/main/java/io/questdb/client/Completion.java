@@ -36,15 +36,22 @@ import java.util.concurrent.TimeUnit;
  * {@link #await(long, TimeUnit)} returning {@code true}, or an explicit
  * {@link #cancel()} that races to terminal).
  * <p>
- * Signaling: the Completion is signaled from the I/O thread of the pooled
- * query client when the handler's terminal callback ({@code onEnd},
- * {@code onError}, or {@code onExecDone}) returns.
+ * Signaling: the Completion is signaled on the worker (dispatch) thread of the
+ * pooled query client when the handler's terminal callback ({@code onEnd},
+ * {@code onError}, or {@code onExecDone}) returns -- that callback runs inline
+ * on the worker thread, not on the I/O thread. Because of this, {@code await()}
+ * must never be called from inside a handler (it would self-deadlock on the
+ * worker thread); use {@link #cancel()} to stop a query from inside a handler.
  */
 public interface Completion {
 
     /**
      * Blocks until the query completes. Rethrows any server-reported failure
      * as a {@link QueryException}. Returns normally on success.
+     * <p>
+     * Must NOT be called from a result handler (it runs on the worker thread
+     * and would self-deadlock); calling it there throws
+     * {@link IllegalStateException}. Use {@link #cancel()} instead.
      *
      * @throws QueryException       if the server reported an error or
      *                              {@link #cancel()} won the race

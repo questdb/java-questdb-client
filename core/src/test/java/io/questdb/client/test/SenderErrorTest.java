@@ -40,22 +40,24 @@ public class SenderErrorTest {
         // Pin the public enum values — adding/removing requires a deliberate spec change
         // (and an update to wire-classification mapping in the I/O loop).
         SenderError.Category[] cats = SenderError.Category.values();
-        Assert.assertEquals(7, cats.length);
+        Assert.assertEquals(8, cats.length);
         Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, SenderError.Category.valueOf("SCHEMA_MISMATCH"));
         Assert.assertEquals(SenderError.Category.PARSE_ERROR, SenderError.Category.valueOf("PARSE_ERROR"));
         Assert.assertEquals(SenderError.Category.INTERNAL_ERROR, SenderError.Category.valueOf("INTERNAL_ERROR"));
         Assert.assertEquals(SenderError.Category.SECURITY_ERROR, SenderError.Category.valueOf("SECURITY_ERROR"));
         Assert.assertEquals(SenderError.Category.WRITE_ERROR, SenderError.Category.valueOf("WRITE_ERROR"));
+        Assert.assertEquals(SenderError.Category.NOT_WRITABLE, SenderError.Category.valueOf("NOT_WRITABLE"));
         Assert.assertEquals(SenderError.Category.PROTOCOL_VIOLATION, SenderError.Category.valueOf("PROTOCOL_VIOLATION"));
         Assert.assertEquals(SenderError.Category.UNKNOWN, SenderError.Category.valueOf("UNKNOWN"));
     }
 
     @Test
-    public void testBothPoliciesEnumerable() {
+    public void testAllPoliciesEnumerable() {
         SenderError.Policy[] policies = SenderError.Policy.values();
-        Assert.assertEquals(2, policies.length);
-        Assert.assertEquals(SenderError.Policy.DROP_AND_CONTINUE, SenderError.Policy.valueOf("DROP_AND_CONTINUE"));
-        Assert.assertEquals(SenderError.Policy.HALT, SenderError.Policy.valueOf("HALT"));
+        Assert.assertEquals(3, policies.length);
+        Assert.assertEquals(SenderError.Policy.RETRIABLE, SenderError.Policy.valueOf("RETRIABLE"));
+        Assert.assertEquals(SenderError.Policy.RETRIABLE_OTHER, SenderError.Policy.valueOf("RETRIABLE_OTHER"));
+        Assert.assertEquals(SenderError.Policy.TERMINAL, SenderError.Policy.valueOf("TERMINAL"));
     }
 
     @Test
@@ -63,7 +65,7 @@ public class SenderErrorTest {
         long t = System.nanoTime();
         SenderError e = new SenderError(
                 SenderError.Category.SCHEMA_MISMATCH,
-                SenderError.Policy.DROP_AND_CONTINUE,
+                SenderError.Policy.RETRIABLE,
                 0x03,
                 "column 'price' missing",
                 42L,
@@ -74,7 +76,7 @@ public class SenderErrorTest {
         );
 
         Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, e.getCategory());
-        Assert.assertEquals(SenderError.Policy.DROP_AND_CONTINUE, e.getAppliedPolicy());
+        Assert.assertEquals(SenderError.Policy.RETRIABLE, e.getAppliedPolicy());
         Assert.assertEquals(0x03, e.getServerStatusByte());
         Assert.assertEquals("column 'price' missing", e.getServerMessage());
         Assert.assertEquals(42L, e.getMessageSequence());
@@ -90,7 +92,7 @@ public class SenderErrorTest {
         SenderErrorHandler h = received::set;
         SenderError e = new SenderError(
                 SenderError.Category.UNKNOWN,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 0x7F,
                 "weird",
                 0L, 0L, 0L, null, 0L
@@ -103,7 +105,7 @@ public class SenderErrorTest {
     public void testNullableFieldsAccepted() {
         SenderError e = new SenderError(
                 SenderError.Category.PROTOCOL_VIOLATION,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 SenderError.NO_STATUS_BYTE,
                 null, // serverMessage
                 SenderError.NO_MESSAGE_SEQUENCE,
@@ -122,7 +124,7 @@ public class SenderErrorTest {
     public void testServerExceptionIsLineSenderException() {
         SenderError e = new SenderError(
                 SenderError.Category.PARSE_ERROR,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 0x05,
                 "bad frame",
                 1L, 1L, 1L, null, 0L
@@ -137,7 +139,7 @@ public class SenderErrorTest {
     public void testServerExceptionMessageMentionsCategoryStatusFsn() {
         SenderError e = new SenderError(
                 SenderError.Category.SCHEMA_MISMATCH,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 0x03,
                 "no such column 'foo'",
                 7L,
@@ -159,7 +161,7 @@ public class SenderErrorTest {
     public void testServerExceptionMessageOmitsSentinelFields() {
         SenderError e = new SenderError(
                 SenderError.Category.PROTOCOL_VIOLATION,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 SenderError.NO_STATUS_BYTE,
                 "ws-close[1002]: bad frame",
                 SenderError.NO_MESSAGE_SEQUENCE,
@@ -184,7 +186,7 @@ public class SenderErrorTest {
     public void testServerExceptionWrapsSenderError() {
         SenderError e = new SenderError(
                 SenderError.Category.SECURITY_ERROR,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 0x08,
                 "permission denied",
                 12L,
@@ -201,7 +203,7 @@ public class SenderErrorTest {
     public void testToStringContainsLoadBearingFields() {
         SenderError e = new SenderError(
                 SenderError.Category.WRITE_ERROR,
-                SenderError.Policy.DROP_AND_CONTINUE,
+                SenderError.Policy.RETRIABLE,
                 0x09,
                 "table not accepting writes",
                 7L,
@@ -212,7 +214,7 @@ public class SenderErrorTest {
         );
         String s = e.toString();
         Assert.assertTrue(s, s.contains("WRITE_ERROR"));
-        Assert.assertTrue(s, s.contains("DROP_AND_CONTINUE"));
+        Assert.assertTrue(s, s.contains("RETRIABLE"));
         Assert.assertTrue(s, s.contains("0x9"));
         Assert.assertTrue(s, s.contains("[500,500]"));
         Assert.assertTrue(s, s.contains("events"));
@@ -223,7 +225,7 @@ public class SenderErrorTest {
     public void testToStringRendersMultiTableTableNameAsMulti() {
         SenderError e = new SenderError(
                 SenderError.Category.SCHEMA_MISMATCH,
-                SenderError.Policy.DROP_AND_CONTINUE,
+                SenderError.Policy.RETRIABLE,
                 0x03,
                 "msg",
                 1L, 1L, 1L,

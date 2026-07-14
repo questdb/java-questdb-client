@@ -32,9 +32,11 @@ import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
+import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
@@ -61,10 +63,11 @@ import java.util.concurrent.locks.LockSupport;
  *       cumulative wire sequence {@code N}, calls
  *       {@code engine.acknowledge(fsnAtZero + N)} so the segment manager
  *       can trim fully-acked segments.</li>
- *   <li>On wire failure, runs the configured reconnect policy: backoff
- *       with jitter up to {@code reconnect_max_duration_millis}, with
- *       auth-style failures (401/403/non-101 upgrade reject) treated as
- *       terminal. On reconnect success, repositions the cursor at
+ *   <li>On wire failure, runs the configured reconnect policy: capped
+ *       exponential backoff with jitter, retried indefinitely (Invariant B --
+ *       a store-and-forward drainer never gives up on a wall-clock budget),
+ *       with only auth-style failures (401/403/non-101 upgrade reject) treated
+ *       as terminal. On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
  * No locks on the steady-state path. The producer thread (user) writes
@@ -100,6 +103,33 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Default per-outage reconnect time cap (5 min).
      */
     public static final long DEFAULT_RECONNECT_MAX_DURATION_MILLIS = 300_000L;
+    /**
+     * Default poison-frame detector threshold: consecutive server-active
+     * rejections (NACK or non-orderly close) of the same head-of-line frame, with
+     * no ack progress in between, before the loop declares the frame poisoned and
+     * halts with a typed {@link SenderError.Category#PROTOCOL_VIOLATION} terminal.
+     * Below the threshold a retriable rejection recycles the connection and
+     * replays from ackedFsn+1. Configurable per sender via the
+     * {@code max_frame_rejections} connect-string key or
+     * {@code LineSenderBuilder.maxFrameRejections(int)}.
+     */
+    public static final int DEFAULT_MAX_HEAD_FRAME_REJECTIONS = 4;
+    /**
+     * Default minimum wall-clock dwell (millis) a suspected frame must remain
+     * poisoned before the detector escalates to a typed terminal, even once
+     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS} strikes have accrued. Decouples
+     * "how many strikes prove determinism" from "how long a transient is allowed
+     * to look poisoned": with pacing, strikes can accrue in well under a second
+     * (e.g. an accepting middlebox/LB that closes each cycle while its backend is
+     * briefly down), so a strike count alone can false-positive a transient into
+     * a producer-fatal terminal. Requiring the suspect to survive this window
+     * gives a brief outage time to clear (an OK at/beyond the suspect resets the
+     * detector) before escalation. {@code 0} = legacy immediate escalation at the
+     * strike threshold. Configurable per sender via the
+     * {@code poison_min_escalation_window_millis} connect-string key or
+     * {@code LineSenderBuilder.poisonMinEscalationWindowMillis(long)}.
+     */
+    public static final long DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS = 5_000L;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
@@ -140,6 +170,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final ReconnectFactory reconnectFactory;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
+    // Retained for constructor symmetry and passed in by callers, but NOT
+    // consulted by the background loop: Invariant B removed the wall-clock
+    // give-up from connectLoop. The budget still bounds the blocking (non-lazy)
+    // initial connect via QwpWebSocketSender -> connectWithRetry, which takes it
+    // as an explicit argument rather than reading this field.
     private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
@@ -163,19 +198,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final AtomicLong totalReconnectAttempts = new AtomicLong();
     private final AtomicLong totalReconnects = new AtomicLong();
     // Total non-OK / non-DURABLE_ACK frames received from the server, classified
-    // by category. Includes both DROP_AND_CONTINUE and HALT outcomes — i.e. every
+    // by category. Includes both retriable and terminal outcomes — i.e. every
     // server-side rejection observed regardless of how the loop reacted.
     private final AtomicLong totalServerErrors = new AtomicLong();
     private WebSocketClient client;
-    // Optional: when non-null, every server-rejection error (DROP and HALT
-    // alike) is offered to the dispatcher for async delivery to the user's
+    // Optional: when non-null, every server-rejection error (retriable and
+    // terminal alike) is offered to the dispatcher for async delivery to the user's
     // handler. Null disables async delivery entirely; the producer-side
     // typed-throw path is unaffected.
-    // Optional: when non-null, RECONNECT_BUDGET_EXHAUSTED is offered to the
-    // dispatcher for async delivery to the user's listener at the moment
-    // connectLoop gives up. Sender-side fire points (CONNECTED, FAILED_OVER,
-    // ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE) write
-    // directly to the same dispatcher from QwpWebSocketSender.
+    // Optional: when non-null, sender-side connection events (CONNECTED,
+    // FAILED_OVER, ENDPOINT_ATTEMPT_FAILED, AUTH_FAILED, ALL_ENDPOINTS_UNREACHABLE)
+    // are written to this dispatcher from QwpWebSocketSender. connectLoop itself
+    // no longer emits a terminal budget-exhaustion event (Invariant B: it retries
+    // indefinitely and never gives up on a wall-clock budget).
     private volatile SenderConnectionDispatcher connectionDispatcher;
     private volatile SenderErrorDispatcher errorDispatcher;
     // The send cursor has two coordinate systems:
@@ -194,11 +229,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true. Used to
-    // distinguish "never reached the server" budget exhaustion (looks like a
+    // distinguish a "never reached the server" terminal failure (looks like a
     // config typo or firewall block) from "lost connection after we were
     // up" (looks transient).
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
+    // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
+    // terminalError latch, so a checkError() caller that observes the latch is
+    // guaranteed to observe this marker too) when a reconnect sweep threw
+    // QwpDurableAckMismatchException. The orphan drainer consults it to route
+    // a mid-drain capability gap into its budgeted settle-retry
+    // (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining
+    // the slot on the first sweep; the foreground sender ignores it and keeps
+    // its spec'd loud-fail (sf-client.md section 8.1). Write-once alongside
+    // terminalError: the only writer runs on the I/O thread under the same
+    // first-writer-wins latch.
+    private volatile QwpDurableAckMismatchException capabilityGapTerminal;
+    // Failed-stop hand-off flag: set by delegateEngineClose() when an owner's
+    // close() could not stop the I/O thread and the engine close is therefore
+    // performed by the I/O thread's exit path. Write-once, owner thread only;
+    // read by the I/O thread strictly after its shutdown-latch countdown (see
+    // the handshake contract on delegateEngineClose).
+    private volatile boolean engineCloseDelegated;
     // The latched terminal failure — THE exception every checkError() call
     // rethrows. Write-once for the loop's lifetime: the only writer is
     // recordFatal on the I/O thread (first-writer-wins). The whole
@@ -224,6 +276,76 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // to -1 once trySendOne has caught up past it. Used to count replay
     // frames without a per-frame branch on the steady-state path.
     private long replayTargetFsn = -1L;
+    // Recovered orphaned deferred tail: frames [orphanSkipStartFsn ..
+    // orphanSkipTipFsn] carry FLAG_DEFER_COMMIT with no covering commit frame
+    // -- a transaction whose commit was never published (producer crashed or
+    // closed mid-transaction). They must never reach the wire: a
+    // commit-bearing frame from THIS session would commit them server-side
+    // and resurrect a partial transaction. trySendOne stops the cursor at the
+    // tail; tryRetireOrphanTail retires it with a cumulative self-acknowledge
+    // once everything below is server-acked. -1 when none/retired. Written by
+    // the constructor and start() (user thread, before the I/O thread exists)
+    // and by the I/O thread afterwards -- never concurrently.
+    private long orphanSkipStartFsn = -1L;
+    private long orphanSkipTipFsn = -1L;
+    // Poison-frame detector state (I/O thread only). poisonFsn is the FSN of the
+    // frame implicated by the most recent server-active rejection: the NACK-named
+    // frame, or the OK-level head-of-line frame (highestOkFsn+1) for a
+    // non-orderly close after at least one send on the connection. poisonStrikes
+    // counts consecutive rejections of that same FSN; an OK at-or-beyond
+    // poisonFsn proves the rejection was not deterministic and resets both.
+    // Progress is deliberately measured against highestOkFsn -- OK-level wire
+    // progress -- and NOT against the engine's trim watermark: in durable-ack
+    // mode ackedFsn advances only on STATUS_DURABLE_ACK coverage, so a
+    // post-NACK recycle replays from the durable watermark and re-OKs frames
+    // BEHIND the poisoned one; keying or resetting on trim would let those
+    // re-OKs launder the strike count every cycle and a deterministically-
+    // NACKing frame would recycle the connection forever. At
+    // maxHeadFrameRejections strikes the frame is declared poisoned: the server
+    // (or an intermediary) deterministically rejects these exact bytes, so
+    // replay cannot succeed and the loop halts with a typed PROTOCOL_VIOLATION
+    // terminal instead of reconnect-looping forever. Both fields deliberately
+    // survive reconnects (swapClient) -- the detector spans connections.
+    private long poisonFsn = -1L;
+    private int poisonStrikes;
+    // Wall-clock nanos of the FIRST strike of the current poisonFsn run. The
+    // detector escalates only once poisonStrikes >= maxHeadFrameRejections AND
+    // at least poisonMinEscalationWindowNanos have elapsed since this instant,
+    // so a transient shorter than the window always gets a reset chance. I/O
+    // thread only; survives reconnects alongside poisonFsn/poisonStrikes.
+    private long poisonFirstStrikeNanos;
+    // Highest FSN the server has acknowledged at the OK level (STATUS_OK),
+    // across connections. In default mode this tracks the trim watermark
+    // exactly; in durable-ack mode it runs AHEAD of ackedFsn, which waits for
+    // STATUS_DURABLE_ACK coverage. I/O thread only; survives reconnects. Used
+    // by the poison-frame detector to measure genuine acceptance progress.
+    private long highestOkFsn = -1L;
+    // Zero-progress recycle pacer (I/O thread only; survives reconnects).
+    // Counts consecutive strike-EXEMPT recycles -- orderly closes
+    // (NORMAL_CLOSURE/GOING_AWAY), non-orderly closes before any send on the
+    // connection, and pre-send RETRIABLE_OTHER rejections -- with no
+    // acceptance progress in between. These paths deliberately carry no
+    // poison strike (they are not a verdict on the bytes), which also exempts
+    // them from failPaced's strike-keyed dose; and a peer that completes
+    // TCP+TLS+upgrade before closing makes every connect attempt "succeed",
+    // so connectLoop's failed-connect backoff never engages either. Without
+    // this counter such recycles churn at handshake RTT rate with no bound
+    // (Invariant B removed the wall-clock cap), each cycle burning a fresh
+    // WebSocketClient + SSLContext/trust-store read. Progress is measured as
+    // max(ackedFsn, highestOkFsn): both watermarks are monotonic and advance
+    // only on genuine new acceptance (replayed re-OKs of already-OK'd frames
+    // advance neither), so replay cannot launder the counter. Pacing only --
+    // this counter NEVER escalates to a terminal (Invariant B).
+    private int zeroProgressRecycles;
+    private long progressAtLastExemptRecycle = Long.MIN_VALUE;
+    // Poison-frame detector threshold for this loop. Constructor-configured
+    // (connect-string key max_frame_rejections); defaults to
+    // DEFAULT_MAX_HEAD_FRAME_REJECTIONS.
+    private final int maxHeadFrameRejections;
+    // Minimum wall-clock dwell (nanos) a suspect frame must stay poisoned before
+    // escalation, even after the strike threshold is hit (connect-string key
+    // poison_min_escalation_window_millis). 0 = legacy immediate escalation.
+    private final long poisonMinEscalationWindowNanos;
     private volatile boolean running;
     // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
     // byte. Initialized to MmapSegment.HEADER_SIZE on a fresh segment.
@@ -249,9 +371,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code client} may be {@code null} only if {@code reconnectFactory}
      * is non-null — this is the async-initial-connect path: the I/O thread
      * runs the same retry loop on its first iteration to obtain a live
-     * client, and a terminal failure (auth/upgrade reject or budget
-     * exhaustion) is delivered through the dispatcher rather than thrown
-     * to the constructor's caller.
+     * client, and a terminal failure (auth/upgrade reject) is delivered
+     * through the dispatcher rather than thrown to the constructor's
+     * caller; plain connect failures are retried indefinitely
+     * (Invariant B: no wall-clock budget give-up).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -301,6 +424,63 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
+    }
+
+    /**
+     * Eleven-arg overload — omits the poison-escalation dwell window, which
+     * defaults to {@code 0} (legacy: escalate as soon as maxHeadFrameRejections
+     * strikes accrue, with no minimum wall-clock). The user-facing 5s default
+     * ({@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
+     * config layer (Sender / QwpWebSocketSender), so this raw constructor stays
+     * unopinionated for tests and internal callers that want deterministic
+     * strike-count escalation.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
+    }
+
+    /**
+     * Master constructor — also accepts the poison-frame detector threshold
+     * ({@code max_frame_rejections}): consecutive server-active rejections of
+     * the same head-of-line frame, with no ack progress in between, before the
+     * loop escalates to a typed terminal. Must be {@code >= 1}. The final
+     * argument is the minimum wall-clock dwell (millis) the suspect must stay
+     * poisoned before escalation ({@code poison_min_escalation_window_millis};
+     * {@code >= 0}, where 0 = legacy immediate escalation at the threshold).
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis) {
+        if (maxHeadFrameRejections < 1) {
+            throw new IllegalArgumentException(
+                    "maxHeadFrameRejections must be >= 1: " + maxHeadFrameRejections);
+        }
+        if (poisonMinEscalationWindowMillis < 0) {
+            throw new IllegalArgumentException(
+                    "poisonMinEscalationWindowMillis must be >= 0: " + poisonMinEscalationWindowMillis);
+        }
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -320,11 +500,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.durableAckKeepaliveIntervalNanos = durableAckKeepaliveIntervalMillis > 0
                 ? durableAckKeepaliveIntervalMillis * 1_000_000L
                 : 0L;
+        this.maxHeadFrameRejections = maxHeadFrameRejections;
+        this.poisonMinEscalationWindowNanos = poisonMinEscalationWindowMillis > 0
+                ? poisonMinEscalationWindowMillis * 1_000_000L
+                : 0L;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup
         // hands null and lets the I/O thread connect — hasEverConnected
         // stays false until swapClient sees its first success.
         this.hasEverConnected = client != null;
+        // Adopt the engine's recovered orphaned-deferred-tail range (if any).
+        // See the field docs on orphanSkipStartFsn/orphanSkipTipFsn; the
+        // BackgroundDrainer path builds its loop through this same
+        // constructor, so drained orphan slots get the identical containment.
+        long orphanTip = engine.recoveredOrphanTipFsn();
+        if (orphanTip >= 0) {
+            this.orphanSkipStartFsn = engine.recoveredCommitBoundaryFsn() + 1L;
+            this.orphanSkipTipFsn = orphanTip;
+        }
     }
 
     /**
@@ -343,17 +536,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Category.SECURITY_ERROR;
             case WebSocketResponse.STATUS_WRITE_ERROR:
                 return SenderError.Category.WRITE_ERROR;
+            case WebSocketResponse.STATUS_NOT_WRITABLE:
+                return SenderError.Category.NOT_WRITABLE;
             default:
                 return SenderError.Category.UNKNOWN;
         }
     }
 
     /**
-     * Same retry-with-exponential-backoff-and-jitter loop the I/O thread
-     * uses on a wire failure, but reusable from {@code ensureConnected} to
-     * implement {@code initial_connect_retry=true}. Returns the connected
-     * client on success; throws on terminal upgrade error (won't retry) or
-     * budget exhaustion.
+     * Same exponential-backoff-with-jitter machinery as the I/O thread's
+     * {@code connectLoop}, but reusable from {@code ensureConnected} to
+     * implement {@code initial_connect_retry=true}. Unlike {@code connectLoop}
+     * (which retries indefinitely under Invariant B), this blocking variant
+     * IS bounded by {@code maxDurationMillis}: it returns the connected
+     * client on success and throws on terminal upgrade error (won't retry)
+     * or budget exhaustion.
      * <p>
      * Caller-supplied {@code factory} is invoked once per attempt and
      * should produce a fresh, connected, upgraded client (or throw). The
@@ -399,15 +596,35 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         contextLabel, e.getMessage());
                 throw e;
             } catch (Throwable e) {
+                if (e instanceof Error) {
+                    // JVM/programming failure (OOM, LinkageError): not a
+                    // transport outage, retrying cannot clear it. Propagate
+                    // to the caller instead of burning the connect budget.
+                    throw (Error) e;
+                }
                 lastError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {} failed: {}",
-                            contextLabel, attempts, e.getMessage());
+                    if (e instanceof QwpVersionMismatchException) {
+                        // Reachable but protocol-incompatible: consumes the connect
+                        // budget (walks the cluster across a rolling-upgrade window)
+                        // and, on exhaustion, surfaces as the terminal
+                        // LineSenderException below. Name the condition so a version
+                        // skew is diagnosable, not read as a generic connect failure.
+                        LOG.warn("{} attempt {}: every reachable endpoint advertises an unsupported "
+                                        + "QWP protocol version ({}); retrying within connect budget",
+                                contextLabel, attempts, e.getMessage());
+                    } else {
+                        LOG.warn("{} attempt {} failed: {}",
+                                contextLabel, attempts, e.getMessage());
+                    }
                     lastLogNanos = now;
                 }
             }
-            long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+            // Math.max guards nextLong's bound>0 contract (IAE on <= 0)
+            // against non-builder callers -- builder-validated config keeps
+            // this > 0. Mirrors BackgroundDrainer's sweep-loop jitter guard.
+            long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
             long sleepMillis = backoffMillis + jitter;
             long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
             if (remainingMillis <= 0) {
@@ -428,34 +645,42 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Default policy per spec § "Default category → policy". User overrides
-     * (builder + connect-string) plug in here in a later commit; today this is
-     * the only resolver. Exposed for unit tests.
+     * Default category → policy mapping. There is no drop policy: a rejection is
+     * either replayed (RETRIABLE / RETRIABLE_OTHER — the bytes stay in the SF log,
+     * the connection is recycled, replay resumes from ackedFsn+1) or halts the
+     * sender loudly (TERMINAL — reserved for rejections that are deterministic
+     * under byte-identical replay; the bytes stay on disk). UNKNOWN fails open to
+     * RETRIABLE so a status byte from a newer server degrades to retry, not to a
+     * dead sender; a deterministic repeat is caught by the poison-frame detector.
+     * User overrides (builder + connect-string) plug in here in a later commit;
+     * today this is the only resolver. Exposed for unit tests.
      */
     @TestOnly
     public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
         switch (category) {
-            case SCHEMA_MISMATCH:
-            case WRITE_ERROR:
-                return SenderError.Policy.DROP_AND_CONTINUE;
-            case PARSE_ERROR:
-            case INTERNAL_ERROR:
-            case SECURITY_ERROR:
+            case WRITE_ERROR:     // transient server state (disk pressure, suspended table)
+            case INTERNAL_ERROR:  // transient by definition; deterministic repeats poison-escalate
+            case UNKNOWN:         // fail open: status byte from a newer server
+                return SenderError.Policy.RETRIABLE;
+            case NOT_WRITABLE:    // read-only replica / demoting primary: rotate endpoints
+                return SenderError.Policy.RETRIABLE_OTHER;
+            case SCHEMA_MISMATCH: // deterministic: same bytes, same mismatch
+            case PARSE_ERROR:     // deterministic: malformed bytes never parse
+            case SECURITY_ERROR:  // ACL denial on a writable node (read-only refusals arrive as role-change closes)
             case PROTOCOL_VIOLATION:
-            case UNKNOWN:
             default:
-                return SenderError.Policy.HALT;
+                return SenderError.Policy.TERMINAL;
         }
     }
 
     /**
-     * True if a WebSocket close code signals an unrecoverable protocol-layer
-     * violation: replaying the same bytes will produce the same close. Reserved
-     * codes that "MUST NOT be sent in a Close frame" (1004/1005/1006/1015) are
-     * intentionally not classified as terminal here — when they arrive in
-     * practice they signal abnormal disconnect rather than the server's
-     * reasoned rejection of payload bytes, so reconnect is the right reaction.
-     * Exposed for unit tests.
+     * True if a WebSocket close code nominally signals a protocol-layer
+     * violation per RFC 6455. NO LONGER consulted by the policy path: WS close
+     * codes carry no policy semantics (policy travels only in QWP NACK frames),
+     * every close is reconnect-eligible, and a frame that deterministically
+     * kills the connection is caught behaviorally by the poison-frame detector
+     * ({@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) rather than by this code list.
+     * Retained for diagnostics and tests.
      */
     @TestOnly
     public static boolean isTerminalCloseCode(int code) {
@@ -485,6 +710,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             synchronouslySurfacedError = e;
             throw e;
         }
+    }
+
+    /**
+     * The typed durable-ack capability-gap terminal, or {@code null} if the
+     * loop's terminal (if any) is a different failure class. Non-null only
+     * after {@link #checkError()} started throwing: the marker is written
+     * before the {@code terminalError} latch, both on the I/O thread.
+     * <p>
+     * Consumer contract: the orphan drainer ({@code BackgroundDrainer})
+     * checks this after a {@code checkError()} throw to decide between
+     * re-entering its budgeted settle-retry (capability gap: the rolling
+     * upgrade may still settle) and quarantining the slot (every other
+     * terminal). Package-private on purpose -- the foreground sender must
+     * not branch on it (spec'd loud-fail, sf-client.md section 8.1).
+     */
+    QwpDurableAckMismatchException capabilityGapTerminal() {
+        return capabilityGapTerminal;
     }
 
     /**
@@ -524,8 +766,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (t.isAlive()) {
                 try {
                     shutdownLatch.await();
-                } catch (InterruptedException ignored) {
+                } catch (InterruptedException e) {
+                    // Re-assert the flag for the caller's stack, then decide.
+                    // If the I/O thread has genuinely not exited (latch still
+                    // up — it may be inside a blocking native connect/send
+                    // that neither unpark nor interrupt cancels), touching the
+                    // client here would free native buffers under a possibly
+                    // mid-send thread, and returning quietly would let the
+                    // owner unmap the engine under it (C5 SEGV). Signal the
+                    // failed stop loudly instead: QwpWebSocketSender.close()
+                    // keys its ioThreadStopped guard on this throw, and
+                    // BackgroundDrainer switches to delegateEngineClose().
+                    // The I/O thread's own exit path (ioLoop's finally)
+                    // disposes of the client either way. ioThread stays set,
+                    // so a duplicate close() re-signals rather than silently
+                    // succeeding against a still-live thread.
                     Thread.currentThread().interrupt();
+                    if (shutdownLatch.getCount() != 0L) {
+                        throw new LineSenderException(
+                                "cursor I/O thread did not stop: close() was interrupted "
+                                        + "while awaiting shutdown; client/engine teardown "
+                                        + "is delegated to the I/O thread's exit path");
+                    }
+                    // Latch hit zero concurrently with the interrupt: the
+                    // thread is past its last client/engine access — proceed
+                    // with normal teardown.
                 }
             }
             ioThread = null;
@@ -534,9 +799,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // replaced the original (and closed it); the owner only retains
         // the stale pre-reconnect reference. Without closing the live
         // client here, its native socket and fds leak past sender.close()
-        // every time the loop reconnected at least once. close() is
-        // idempotent, so the owner's duplicate close on its stale
-        // reference is still safe.
+        // every time the loop reconnected at least once. ioLoop's finally
+        // also closes the current client on I/O-thread exit, so this read
+        // matters chiefly when the loop never started (SYNC construction,
+        // close() before start()) — and doubles as a safety net. close()
+        // is idempotent, so duplicate closes on any path are safe.
         WebSocketClient c = client;
         if (c != null) {
             try {
@@ -546,6 +813,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             client = null;
         }
+    }
+
+    /**
+     * Failed-stop hand-off for the engine. Called by an owner whose
+     * {@link #close()} threw because the I/O thread would not stop: the owner
+     * must not free the engine (munmap/Unsafe.free of segment memory) while
+     * the thread may still touch it with raw {@code Unsafe} reads. Setting
+     * the delegation flag makes the I/O thread run {@code engine.close()} on
+     * its exit path, strictly after its last engine access and after the
+     * shutdown-latch countdown — releasing the slot lock as soon as the
+     * stuck wire call resolves (bounded by OS timeouts) instead of leaking
+     * the mapping and lock forever.
+     * <p>
+     * Returns {@code true} when the I/O thread is still live and has adopted
+     * the engine close; {@code false} when the thread has already exited —
+     * the caller must close the engine itself.
+     * <p>
+     * Memory model — the classic store/load handshake: this method writes the
+     * volatile flag, then reads the latch count; the exit path counts the
+     * latch down, then reads the flag. Under the sequential consistency of
+     * volatile (and AQS latch state) accesses, if this method observes the
+     * latch still up, the exit path is guaranteed to observe the flag — no
+     * missed close. If both sides act, {@link CursorSendEngine#close()} is
+     * synchronized and idempotent, so the double close is benign.
+     */
+    public boolean delegateEngineClose() {
+        engineCloseDelegated = true;
+        return shutdownLatch.getCount() != 0L;
     }
 
     /**
@@ -636,7 +931,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Total server-side rejection frames observed since the loop started. Counts both
-     * DROP_AND_CONTINUE and HALT outcomes — every non-OK frame the server sent that
+     * retriable and terminal outcomes — every non-OK frame the server sent that
      * the client classified as a {@link SenderError}.
      */
     public long getTotalServerErrors() {
@@ -647,7 +942,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * True iff the I/O loop has at least once installed a live (connected
      * + upgraded) WebSocket client. Sticky — once true, stays true even
      * after a subsequent disconnect. Lets a {@code SenderErrorHandler}
-     * disambiguate a "never reached the server" budget exhaustion (likely
+     * disambiguate a "never reached the server" terminal failure (likely
      * a config typo or firewall block) from a "lost connection after we
      * were up" failure (likely transient).
      */
@@ -661,10 +956,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Plug an async-delivery sink for {@link SenderConnectionEvent}
-     * notifications. The loop fires {@code RECONNECT_BUDGET_EXHAUSTED}
-     * through this sink when {@code connectLoop} gives up; other connection
-     * events fire from {@code QwpWebSocketSender.buildAndConnect} directly
-     * into the same dispatcher. Same lifecycle contract as
+     * notifications. Connection events fire from
+     * {@code QwpWebSocketSender.buildAndConnect} directly into this dispatcher;
+     * {@code connectLoop} no longer emits a terminal budget-exhaustion event
+     * (Invariant B: it retries indefinitely). Same lifecycle contract as
      * {@link #setErrorDispatcher}.
      */
     public void setConnectionDispatcher(SenderConnectionDispatcher dispatcher) {
@@ -786,13 +1081,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
      * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
-     * a terminal upgrade reject or budget exhaustion is delivered through
-     * the dispatcher, not thrown to the producer.
+     * connect failures are retried indefinitely (Invariant B), and a
+     * terminal upgrade reject is delivered through the dispatcher, not
+     * thrown to the producer.
      */
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(
                         "async initial connect deferred to I/O thread"),
-                "initial connect");
+                "initial connect", 0L);
     }
 
     private void clearDurableAckTracking() {
@@ -815,8 +1111,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@link #attemptInitialConnect()} for the async-initial-connect path
      * (phase="initial connect"). The phase string only affects log lines
      * and the {@link SenderError} message — control flow is identical.
+     * {@code paceFirstAttemptMillis} > 0 parks for that long (+jitter)
+     * before the first connect attempt — see {@link #failPaced}.
      */
-    private void connectLoop(Throwable initial, String phase) {
+    private void connectLoop(Throwable initial, String phase, long paceFirstAttemptMillis) {
         if (reconnectFactory == null || !running) {
             recordFatal(initial);
             return;
@@ -824,17 +1122,73 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
         long outageStartNanos = System.nanoTime();
-        long deadlineNanos = outageStartNanos + reconnectMaxDurationMillis * 1_000_000L;
+        // INVARIANT B: a store-and-forward drainer must NEVER terminate on a
+        // wall-clock reconnect budget. A replica-only / all-endpoints-replica
+        // window is TRANSIENT -- a replica gets promoted, a primary reappears --
+        // so this background loop retries for as long as it is running, backing
+        // off between attempts. The ONLY terminal conditions are a genuinely
+        // non-retriable upgrade (auth / non-421 upgrade / durable-ack capability
+        // gap), which return directly below, a credential the client cannot
+        // ACQUIRE (QwpCredentialUnavailableException -- see its catch below), or
+        // the sender being stopped. SF exhaustion is surfaced to the PRODUCER as
+        // append backpressure, never here. reconnect_max_duration_millis is
+        // intentionally NOT consulted for a TRANSPORT outage: for those it bounds
+        // only the blocking (non-lazy) initial connect in
+        // QwpWebSocketSender.buildAndConnect, never this background loop. It does
+        // bound an uninterrupted run of credential-acquisition failures, which no
+        // amount of retrying can clear.
         long backoffMillis = reconnectInitialBackoffMillis;
+        if (paceFirstAttemptMillis > 0 && running) {
+            // NACK-initiated recycle against a reachable server: pace the
+            // recycle with a backoff+jitter dose (sized by the caller --
+            // failPaced escalates it with consecutive same-frame strikes),
+            // or the recycle loop runs at server NACK rate. The dose is a
+            // hard pacing guarantee, so ride out spurious parkNanos returns
+            // and stale unpark permits with a deadline loop; close() flips
+            // running=false and unparks, exiting promptly.
+            long jitter = ThreadLocalRandom.current().nextLong(paceFirstAttemptMillis);
+            long deadlineNanos = System.nanoTime()
+                    + (paceFirstAttemptMillis + jitter) * 1_000_000L;
+            long remaining;
+            while (running && (remaining = deadlineNanos - System.nanoTime()) > 0) {
+                LockSupport.parkNanos(remaining);
+            }
+        }
         int attempts = 0;
         long lastLogNanos = 0L;
         Throwable lastReconnectError = initial;
-        while (running && System.nanoTime() < deadlineNanos) {
+        // Start of the current UNINTERRUPTED run of credential-acquisition failures; 0 when none is in
+        // flight. Any other outcome (a connect, or a transport-class failure) clears it, so only a
+        // sustained inability to obtain a credential burns the budget and terminates -- a token blip
+        // between transport errors still recovers.
+        long credentialFailingSinceNanos = 0L;
+        while (running) {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
             try {
                 WebSocketClient newClient = reconnectFactory.reconnect();
                 if (newClient != null) {
+                    if (!running) {
+                        // close() ran while this connect attempt was in
+                        // flight. Its latch await may have been interrupted
+                        // (BackgroundDrainerPool.close()'s shutdownNow path)
+                        // and returned already — the owner's teardown,
+                        // including the engine unmap in BackgroundDrainer's
+                        // finally, can be complete. Installing the client now
+                        // would (a) touch engine memory via positionCursorAt
+                        // after a possible unmap and (b) abandon a live socket
+                        // in a loop nothing will revisit — close() has run,
+                        // its client read saw the pre-connect field. The
+                        // attempt owns the client until it is installed, so
+                        // dispose of it here, on the I/O thread, and exit
+                        // through the quiet stopped path below.
+                        try {
+                            newClient.close();
+                        } catch (Throwable ignored) {
+                            // best-effort
+                        }
+                        break;
+                    }
                     swapClient(newClient);
                     totalReconnects.incrementAndGet();
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
@@ -858,7 +1212,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long toFsn = Math.max(fromFsn, engine.publishedFsn());
                 SenderError err = new SenderError(
                         SenderError.Category.SECURITY_ERROR,
-                        SenderError.Policy.HALT,
+                        SenderError.Policy.TERMINAL,
                         SenderError.NO_STATUS_BYTE,
                         "ws-upgrade-failed: " + e.getMessage(),
                         SenderError.NO_MESSAGE_SEQUENCE,
@@ -879,11 +1233,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // not SECURITY_ERROR -- this is not an auth failure.
                 LOG.error("durable-ack mismatch during {} -- won't retry: {}",
                         phase, e.getMessage());
+                if (terminalError == null) {
+                    // Mirror recordFatal's first-writer-wins latch: only the
+                    // sweep that owns the terminal may mark the gap, and the
+                    // marker must be visible before the terminalError volatile
+                    // write that checkError() keys on.
+                    capabilityGapTerminal = e;
+                }
                 long fromFsn = engine.ackedFsn() + 1L;
                 long toFsn = Math.max(fromFsn, engine.publishedFsn());
                 SenderError err = new SenderError(
                         SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.HALT,
+                        SenderError.Policy.TERMINAL,
                         SenderError.NO_STATUS_BYTE,
                         "durable-ack-mismatch: " + e.getMessage(),
                         SenderError.NO_MESSAGE_SEQUENCE,
@@ -896,106 +1257,140 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
                 return;
-            } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
-                // Role mismatch: cluster reconfigured during this connect, the
-                // previously-writable endpoint is now read-only. Reset backoff
-                // (don't double on each role reject -- failover usually clears
-                // within seconds) and park for the initial interval before the
-                // next attempt.
-                backoffMillis = reconnectInitialBackoffMillis;
-                lastReconnectError = e;
-                if (running) {
-                    long remainingNanos = deadlineNanos - System.nanoTime();
-                    if (remainingNanos <= 0L) {
-                        break;
-                    }
-                    long parkNanos = Math.min(reconnectInitialBackoffMillis * 1_000_000L, remainingNanos);
-                    LockSupport.parkNanos(parkNanos);
+            } catch (QwpCredentialUnavailableException e) {
+                // The token provider threw instead of returning a credential. Unlike a transport outage
+                // (Invariant B), retrying alone cannot clear this: the loop cannot conjure a token the
+                // provider will not hand over. But a silent refresh can fail transiently, so retry while
+                // one still might recover -- bounded by the reconnect budget -- and only terminate once
+                // credential acquisition has failed for that whole uninterrupted window. Terminating is
+                // what keeps a dead credential ("not signed in") from reconnect-looping forever behind
+                // throttled logs: it surfaces the provider's own message to the producer via checkError()
+                // and to the async handler, exactly as a server-side 401/403 does above.
+                long now = System.nanoTime();
+                if (credentialFailingSinceNanos == 0L) {
+                    credentialFailingSinceNanos = now;
                 }
-                continue;
-            } catch (Throwable e) {
+                // Compare in millis, not nanos: the builder puts no upper bound on the budget, and a
+                // millis-to-nanos multiply of a large one overflows to a negative bound -- which would
+                // terminate on the FIRST credential blip instead of never.
+                if ((now - credentialFailingSinceNanos) / 1_000_000L > reconnectMaxDurationMillis) {
+                    LOG.error("token provider failed for {}ms during {} -- won't retry: {}",
+                            reconnectMaxDurationMillis, phase, e.getMessage());
+                    long fromFsn = engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    SenderError err = new SenderError(
+                            SenderError.Category.SECURITY_ERROR,
+                            SenderError.Policy.TERMINAL,
+                            SenderError.NO_STATUS_BYTE,
+                            "token-provider-failed: " + e.getMessage(),
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            fromFsn,
+                            toFsn,
+                            null,
+                            System.nanoTime()
+                    );
+                    totalServerErrors.incrementAndGet();
+                    recordFatal(new LineSenderServerException(err));
+                    dispatchError(err);
+                    return;
+                }
+                lastReconnectError = e;
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: the token provider failed ({}); retrying within the "
+                                    + "credential budget -- if this persists the sender terminates",
+                            phase, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+                // fall through to the shared capped-backoff block
+            } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
+                credentialFailingSinceNanos = 0L;
+                // Role mismatch: every reachable endpoint role-rejected the
+                // upgrade -- right now they are all replicas / primary-catchup.
+                // This is a TRANSIENT failover window (a replica is promotable),
+                // so keep retrying with no wall-clock deadline (Invariant B).
+                // Do NOT reset the backoff or pin it at the initial interval:
+                // fall through to the shared capped exponential backoff-with-
+                // jitter block below. Pinning at reconnectInitialBackoffMillis
+                // turned a persistent all-replica window (e.g. an address list
+                // pointing at replicas only, now surfaced here as a retriable
+                // role reject rather than a terminal durable-ack mismatch) into
+                // a fixed ~10/s storm of fresh TLS handshakes -- new
+                // WebSocketClient, new SSLContext, trust-store re-read -- per
+                // endpoint, forever. Growing to reconnectMaxBackoffMillis
+                // mirrors the orphan drainer's role-reject path and honours the
+                // documented capped-exponential-backoff contract.
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {} failed: {}", phase, attempts, e.getMessage());
+                    LOG.warn("{} attempt {}: every reachable endpoint is a replica "
+                                    + "(transient failover window); retrying with capped backoff -- "
+                                    + "if this persists the configured address list may point at replicas only",
+                            phase, attempts);
+                    lastLogNanos = now;
+                }
+                // fall through to the shared capped-backoff block
+            } catch (Throwable e) {
+                if (e instanceof Error) {
+                    // JVM/programming failure (OOM, LinkageError): retrying
+                    // cannot clear it -- Invariant B covers transport outages
+                    // only. Latch it as terminal FIRST so a producer parked in
+                    // checkError() observes the failure and `running` flips
+                    // false, then rethrow so the I/O thread dies loudly
+                    // instead of reconnect-looping. The fail() call site sits
+                    // inside ioLoop's catch, so ioLoop's finally still counts
+                    // down the shutdown latch and close() cannot hang.
+                    recordFatal(e);
+                    throw (Error) e;
+                }
+                credentialFailingSinceNanos = 0L;
+                lastReconnectError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    if (e instanceof QwpVersionMismatchException) {
+                        // Not a transport failure: the server completed the WS
+                        // upgrade but advertised a QWP version this client cannot
+                        // speak. Retried indefinitely under Invariant B (a rolling
+                        // upgrade clears it once peers converge), but log the real
+                        // condition so a persistent client/cluster version skew is
+                        // diagnosable instead of reading as a generic connect fail.
+                        LOG.warn("{} attempt {}: every reachable endpoint advertises an unsupported "
+                                        + "QWP protocol version ({}); retrying (rolling-upgrade window) -- "
+                                        + "if this persists the client is version-incompatible with the cluster",
+                                phase, attempts, e.getMessage());
+                    } else {
+                        LOG.warn("{} attempt {} failed: {}", phase, attempts, e.getMessage());
+                    }
                     lastLogNanos = now;
                 }
             }
             if (running) {
-                long jitter = ThreadLocalRandom.current().nextLong(backoffMillis);
+                // Math.max guards nextLong's bound>0 contract (IAE on <= 0):
+                // an IAE here would climb through fail() into ioLoop's
+                // secondary-failure guard and latch a terminal -- correct but
+                // needlessly fatal for a jitter computation. Builder-validated
+                // config keeps this > 0; the guard covers direct constructor
+                // use. Mirrors BackgroundDrainer's sweep-loop jitter guard.
+                long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
                 long sleepMillis = backoffMillis + jitter;
-                long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
-                if (remainingMillis <= 0) {
-                    break;
-                }
-                if (sleepMillis > remainingMillis) {
-                    sleepMillis = remainingMillis;
-                }
                 LockSupport.parkNanos(sleepMillis * 1_000_000L);
                 backoffMillis = Math.min(backoffMillis * 2, reconnectMaxBackoffMillis);
             }
         }
+        // The loop exits ONLY because running == false, i.e. the sender is
+        // closing / stopping. Under Invariant B this is NOT a budget give-up
+        // (there is no wall-clock terminal): we retried until asked to stop, so
+        // we return quietly and let close() drive shutdown. Un-acked rows remain
+        // in on-disk SF for this sender's next run or an orphan drainer to ship.
         long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
-        String lastMsg = lastReconnectError.getMessage();
-        LOG.error("cursor I/O loop giving up {} after {}ms, {} attempts; last error: {}",
+        String lastMsg = lastReconnectError == null ? "n/a" : lastReconnectError.getMessage();
+        LOG.info("cursor I/O loop {} stopped after {}ms, {} attempts (sender closing); "
+                        + "un-acked rows remain in SF for retry; last error: {}",
                 phase, elapsedMs, attempts, lastMsg);
-        long fromFsn = engine.ackedFsn() + 1L;
-        long toFsn = Math.max(fromFsn, engine.publishedFsn());
-        // Disambiguate by what the sender saw on the wire: if we never got
-        // a successful upgrade, the user is most likely looking at a config
-        // problem (typo in addr, wrong port, firewall, server not deployed
-        // yet); if we connected at least once and then exhausted the budget,
-        // it's a transient connectivity issue (server down, network flap).
-        // Tag and free-text hint encode the same signal so both grep-the-logs
-        // and read-the-message users get it without parsing.
-        String connectivityTag;
-        String connectivityHint;
-        if (hasEverConnected) {
-            connectivityTag = "connection-lost-budget-exhausted";
-            connectivityHint = "server unreachable since last connect (transient)";
-        } else {
-            connectivityTag = "never-connected-budget-exhausted";
-            connectivityHint = "never reached the server (check addr/port/firewall)";
-        }
-        SenderError err = new SenderError(
-                SenderError.Category.PROTOCOL_VIOLATION,
-                SenderError.Policy.HALT,
-                SenderError.NO_STATUS_BYTE,
-                connectivityTag + ": " + elapsedMs + "ms / " + attempts
-                        + " attempts; " + connectivityHint
-                        + "; last error: " + lastMsg,
-                SenderError.NO_MESSAGE_SEQUENCE,
-                fromFsn,
-                toFsn,
-                null,
-                System.nanoTime()
-        );
-        totalServerErrors.incrementAndGet();
-        // recordFatal MUST run before dispatchError so the producer-observable
-        // terminal error is latched before the handler is invoked.
-        recordFatal(new LineSenderServerException(err));
-        dispatchError(err);
-        // Surface the terminal classification through the connection-event
-        // dispatcher too. Listeners learn about budget exhaustion without
-        // having to also subscribe to SenderError. Fire AFTER recordFatal so
-        // a listener that immediately checks the producer-side terminal state
-        // sees a consistent picture.
-        SenderConnectionDispatcher cd = connectionDispatcher;
-        if (cd != null) {
-            cd.offer(new SenderConnectionEvent(
-                    SenderConnectionEvent.Kind.RECONNECT_BUDGET_EXHAUSTED,
-                    null, SenderConnectionEvent.NO_PORT,
-                    null, SenderConnectionEvent.NO_PORT,
-                    attempts,
-                    SenderConnectionEvent.NO_ROUND_NUMBER,
-                    lastReconnectError,
-                    System.currentTimeMillis()));
-        }
     }
 
     /**
      * Send {@code err} to the async-delivery dispatcher if one is configured.
-     * Producer-side typed throw (HALT) goes through {@code recordFatal} +
+     * Producer-side typed throw (TERMINAL) goes through {@code recordFatal} +
      * {@code checkError} regardless — this is purely the async observer path.
      */
     private void dispatchError(SenderError err) {
@@ -1003,6 +1398,80 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (d != null) {
             d.offer(err);
         }
+    }
+
+    /**
+     * Poison-frame detector: record a server-active rejection (NACK, or non-orderly
+     * close after at least one send on this connection) of {@code rejectedFsn} —
+     * the NACK-named frame, or the OK-level head-of-line frame for a close.
+     * Returns true when that same FSN has now been rejected
+     * {@code maxHeadFrameRejections} consecutive times (configurable; default
+     * {@link #DEFAULT_MAX_HEAD_FRAME_REJECTIONS}) with no OK-level acceptance
+     * at or beyond it in between — the frame is poisoned and replay is
+     * deterministic. Strikes are keyed on the rejected frame itself, never on
+     * the engine's trim watermark: in durable-ack mode the trim watermark lags
+     * OK-level progress, and both the key and the reset must be immune to the
+     * replay re-OKs of frames behind the suspect. I/O thread only.
+     */
+    private boolean recordHeadRejectionStrike(long rejectedFsn) {
+        long now = System.nanoTime();
+        if (rejectedFsn == poisonFsn) {
+            poisonStrikes++;
+        } else {
+            poisonFsn = rejectedFsn;
+            poisonStrikes = 1;
+            poisonFirstStrikeNanos = now;
+        }
+        if (poisonStrikes < maxHeadFrameRejections) {
+            return false;
+        }
+        // Minimum wall-clock dwell gate: even once the strike count proves
+        // determinism, hold escalation until the suspect has stayed poisoned for
+        // at least poisonMinEscalationWindowNanos. Strikes can accrue in well
+        // under a second (paced recycles against a reachable-but-closing
+        // middlebox, or a fast NACK loop), so the count alone would false-
+        // positive a brief outage into a producer-fatal terminal. Any OK at/
+        // beyond the suspect during the window resets the detector (see the
+        // STATUS_OK handler). Window 0 = legacy immediate escalation.
+        return (now - poisonFirstStrikeNanos) >= poisonMinEscalationWindowNanos;
+    }
+
+    /**
+     * Escalate a poisoned frame to a typed terminal: the server (or an intermediary)
+     * has deterministically rejected the same frame {@code maxHeadFrameRejections}
+     * consecutive times with no OK-level acceptance at or beyond it, so
+     * replaying it cannot succeed and retrying would loop forever. recordFatal runs
+     * before dispatchError so the producer-observable terminal is latched before the
+     * user's handler is invoked. The rejected bytes remain in the SF log on disk —
+     * nothing is silently discarded.
+     */
+    private void haltOnPoisonedFrame(String lastRejection, long toFsnHint) {
+        // Name the frame the server actually rejected (the strike key), not
+        // ackedFsn+1: in durable-ack mode the trim watermark can sit on
+        // frames the server already ACCEPTED at the OK level, and pointing
+        // the operator at those bytes would misattribute the poison. The
+        // caller supplies the span end: a NACK names the exact frame, so the
+        // span is that single frame; a non-orderly close cannot single one
+        // out, so it spans to publishedFsn.
+        long fromFsn = poisonFsn;
+        long toFsn = Math.max(fromFsn, toFsnHint);
+        String msg = "frame at fsn=" + fromFsn + " rejected " + poisonStrikes
+                + " consecutive times with no acceptance at or beyond it -- poisoned frame, replay cannot succeed (last: "
+                + lastRejection + ')';
+        SenderError err = new SenderError(
+                SenderError.Category.PROTOCOL_VIOLATION,
+                SenderError.Policy.TERMINAL,
+                SenderError.NO_STATUS_BYTE,
+                msg,
+                SenderError.NO_MESSAGE_SEQUENCE,
+                fromFsn,
+                toFsn,
+                null,
+                System.nanoTime()
+        );
+        totalServerErrors.incrementAndGet();
+        recordFatal(new LineSenderServerException(err));
+        dispatchError(err);
     }
 
     /**
@@ -1022,7 +1491,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Pop every head entry whose tables are all covered by the durable
      * watermarks and call {@link CursorSendEngine#acknowledge} once with
      * the highest popped wireSeq. Trivially-durable entries (tableCount=0,
-     * from empty-WAL OK frames or NACK frames) pop unconditionally.
+     * from empty-WAL OK frames) pop unconditionally.
      */
     private void drainPendingDurable() {
         long highest = Long.MIN_VALUE;
@@ -1044,10 +1513,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Stash a wireSeq + per-table seqTxns from the current OK / NACK frame
-     * for later durable-ack confirmation. {@link #response} must hold the
-     * OK or rejection frame at call time. NACK frames carry no per-table
-     * entries, so they enqueue as trivially-durable empty placeholders.
+     * Stash a wireSeq + per-table seqTxns from the current OK frame for
+     * later durable-ack confirmation. {@link #response} must hold the OK
+     * frame at call time. Only the OK path enqueues: rejections never
+     * advance the durable watermark -- handleServerRejection either latches
+     * a terminal or recycles the connection.
      */
     private void enqueuePendingOk(long wireSeq) {
         PendingDurableEntry e = acquirePendingEntry();
@@ -1064,19 +1534,97 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Surface a wire failure. With reconnect plumbing wired (factory +
-     * listener both non-null), enters the per-outage retry loop:
-     * exponential backoff with jitter, time-capped at
-     * {@code reconnectMaxDurationMillis}, terminal on auth/upgrade
-     * rejections (so the budget isn't burned on errors that won't fix
-     * themselves). On the first successful reconnect within the budget,
-     * the I/O loop resumes with reset wire state and replays from
+     * listener both non-null), enters the per-outage retry loop: capped
+     * exponential backoff with jitter, retried for as long as the loop is
+     * running -- there is NO wall-clock give-up (Invariant B: a store-and-
+     * forward drainer only terminates on SF exhaustion or a genuinely non-
+     * retriable auth/upgrade reject). On the first successful reconnect the
+     * I/O loop resumes with reset wire state and replays from
      * {@code engine.ackedFsn() + 1}.
      * <p>
      * Without reconnect plumbing, the failure is immediately terminal
      * (legacy behavior).
      */
     private void fail(Throwable initial) {
-        connectLoop(initial, "reconnect");
+        connectLoop(initial, "reconnect", 0L);
+    }
+
+    /**
+     * Same recycle machinery as {@link #fail}, but parks for a backoff dose
+     * (+jitter) BEFORE the first connect attempt. Used for server-active
+     * RETRIABLE rejections (NACKs): the server is reachable — it just
+     * answered — so the first reconnect attempt will almost always succeed
+     * and connectLoop's failed-connect backoff never engages. This park is
+     * what delivers the "capped backoff + jitter" promise of
+     * design/qwp-nack-policy-v2.md for the RETRIABLE policy against a
+     * healthy server; transport failures keep the unpaced {@link #fail}
+     * (an immediate first reconnect attempt is desirable there).
+     * <p>
+     * The dose escalates with consecutive poison strikes against the same
+     * frame — initial backoff, doubling per strike, capped at the max
+     * backoff. Escalation matters beyond politeness: a TRANSIENT same-frame
+     * rejection (e.g. sustained disk pressure NACKing the head batch) now
+     * accumulates strikes toward the poison terminal even in durable-ack
+     * mode, and the widening gaps between replays are what give a transient
+     * condition time to clear before the threshold fires. A NACK sequence
+     * that IS making progress (different frame each time) resets strikes to
+     * 1 and keeps the dose at the initial backoff.
+     */
+    private void failPaced(Throwable initial) {
+        long dose = reconnectInitialBackoffMillis;
+        if (dose > 0) {
+            int strikes = Math.max(poisonStrikes, 1);
+            dose <<= Math.min(strikes - 1, 6);
+            if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
+                dose = reconnectMaxBackoffMillis;
+            }
+        }
+        connectLoop(initial, "reconnect", dose);
+    }
+
+    /**
+     * Recycle path for strike-exempt wire events: orderly closes
+     * (NORMAL_CLOSURE / GOING_AWAY), non-orderly closes before any send on
+     * the connection, and RETRIABLE_OTHER rejections (pre- and post-send:
+     * NOT_WRITABLE is a node-state verdict, not a frame verdict). None of
+     * these implicate the head frame, so they carry no poison strike -- but that
+     * also means neither existing pacer can bound them: {@link #failPaced}
+     * keys its dose on poisonStrikes, and connectLoop's backoff engages only
+     * on FAILED connect attempts, while a peer that completes the upgrade
+     * before closing makes every attempt succeed. A load balancer draining
+     * with GOING_AWAY, a health-checking middlebox that upgrades then drops,
+     * or an all-replica window answering NOT_WRITABLE would
+     * otherwise drive full recycles -- fresh WebSocketClient, SSLContext,
+     * trust-store read -- at handshake RTT rate, forever (Invariant B
+     * deliberately removed the wall-clock cap).
+     * <p>
+     * The first recycle after any acceptance progress stays IMMEDIATE: a
+     * one-off orderly handoff must rotate endpoints without delay (failover
+     * latency). Consecutive recycles with no OK-level progress in between
+     * park for the same doubling, capped dose failPaced applies. Pacing
+     * only, never a terminal: unlike the poison detector these events are
+     * not a verdict on the bytes, so under Invariant B they retry forever --
+     * just not at wire speed.
+     */
+    private void failExemptPaced(Throwable cause) {
+        long progress = Math.max(engine.ackedFsn(), highestOkFsn);
+        if (progress > progressAtLastExemptRecycle) {
+            zeroProgressRecycles = 0;
+        }
+        progressAtLastExemptRecycle = progress;
+        int level = zeroProgressRecycles++;
+        if (level == 0) {
+            fail(cause);
+            return;
+        }
+        long dose = reconnectInitialBackoffMillis;
+        if (dose > 0) {
+            dose <<= Math.min(level - 1, 6);
+            if (reconnectMaxBackoffMillis > 0 && dose > reconnectMaxBackoffMillis) {
+                dose = reconnectMaxBackoffMillis;
+            }
+        }
+        connectLoop(cause, "reconnect", dose);
     }
 
     /**
@@ -1097,9 +1645,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // a reconnect factory is wired. Drive the very first connect on
             // this thread so the producer thread never blocks on it.
             // attemptInitialConnect either sets `client` (success) or records
-            // a terminal failure and clears `running` (auth/upgrade reject or
-            // budget exhaustion). Either way, the main loop below sees the
-            // outcome via the `running` and `client` fields.
+            // a terminal failure and clears `running` (auth/upgrade reject;
+            // plain connect failures retry indefinitely under Invariant B).
+            // Either way, the main loop below sees the outcome via the
+            // `running` and `client` fields.
             if (client == null && running) {
                 attemptInitialConnect();
             }
@@ -1127,9 +1676,72 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
         } catch (Throwable t) {
-            fail(t);
+            if (t instanceof Error) {
+                // Never funnel a JVM Error into the reconnect loop: latch it
+                // as terminal so checkError() surfaces it to the producer,
+                // then rethrow so the thread dies loudly. The finally still
+                // counts down the shutdown latch, so close() cannot hang.
+                recordFatal(t);
+                throw (Error) t;
+            }
+            try {
+                fail(t);
+            } catch (Throwable secondary) {
+                // fail()/connectLoop itself threw. Without this guard the
+                // secondary failure escapes ioLoop's catch and kills the I/O
+                // thread with `running` still true and no terminal latched:
+                // checkError() stays clean and the producer keeps buffering
+                // into SF against a dead loop -- the exact silent stall
+                // Invariant B exists to prevent. Latch-and-die like the Error
+                // arm above instead; the finally still counts down the
+                // shutdown latch, so close() cannot hang. recordFatal is
+                // first-writer-wins, so a terminal already latched inside
+                // connectLoop (e.g. a throw from dispatchError after
+                // recordFatal) is preserved.
+                if (secondary != t) {
+                    secondary.addSuppressed(t);
+                }
+                recordFatal(secondary);
+                if (secondary instanceof Error) {
+                    throw (Error) secondary;
+                }
+            }
         } finally {
+            // Last act of the I/O thread: dispose of whatever client it
+            // holds. This is the airtight half of the close()-vs-reconnect
+            // race — when close()'s latch await is interrupted (drainer pool
+            // shutdownNow), close() returns before this thread has exited,
+            // and its own client close saw the pre-reconnect field. A client
+            // swapped in by the tail of an in-flight connect attempt (running
+            // flipped false between connectLoop's check and swapClient) would
+            // be abandoned live without this. Runs BEFORE the latch countdown
+            // so a non-interrupted close() observes a fully disposed loop.
+            // Duplicate closes — loop.close()'s own, owners' stale references
+            // — stay safe: WebSocketClient.close() is idempotent.
+            WebSocketClient c = client;
+            if (c != null) {
+                try {
+                    c.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
             shutdownLatch.countDown();
+            // Failed-stop hand-off (see delegateEngineClose): the owner could
+            // not free the engine safely while this thread was alive, so the
+            // engine close — and with it the slot-lock release — happens
+            // here, strictly after this thread's last engine access. The flag
+            // is read only after the countDown: the store/load pairing with
+            // delegateEngineClose's flag-write-then-latch-read guarantees
+            // either this branch or the owner's fallback runs (or both —
+            // engine.close() is idempotent).
+            if (engineCloseDelegated) {
+                try {
+                    engine.close();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+            }
         }
     }
 
@@ -1192,7 +1804,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
      * Mark the loop as fatally failed. Caller has decided no reconnect
-     * is possible (or it ran out of budget) — latch the error so
+     * is possible — latch the error so
      * {@link #checkError} can surface it to the producer thread, then
      * stop the loop. First-writer-wins: only the first failure latches.
      * The check-then-latch is unsynchronized and is safe ONLY because
@@ -1279,7 +1891,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.client = newClient;
         // Sticky: once the wire is up, we've reached the server at least
         // once for this sender's lifetime. Used downstream to classify a
-        // subsequent budget exhaustion as transient vs config-likely.
+        // subsequent terminal failure as transient vs config-likely.
         this.hasEverConnected = true;
         if (old != null) {
             try {
@@ -1288,6 +1900,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // best-effort
             }
         }
+        // A recovered orphaned deferred tail may be retirable now (e.g. the
+        // acks covering everything below it arrived just before the drop).
+        // Retiring before computing replayStart anchors the new connection
+        // past the tail instead of replaying into it.
+        tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
@@ -1323,6 +1940,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * scheduling fairness.
      */
     private boolean trySendOne() {
+        if (orphanSkipTipFsn >= 0 && fsnAtZero + nextWireSeq >= orphanSkipStartFsn) {
+            // The send cursor reached the orphaned deferred tail. Its frames
+            // belong to an aborted transaction and must never be transmitted
+            // (a commit-bearing frame from this session would commit them --
+            // partial-transaction resurrection).
+            if (!tryRetireOrphanTail()) {
+                // Frames below the tail still await server acks; keep ticking
+                // (tryReceiveAcks runs every loop iteration) until the ack
+                // watermark reaches the tail's lower edge.
+                return false;
+            }
+            if (nextWireSeq == 0) {
+                // Nothing sent on this connection yet: re-anchor in place past
+                // the retired tail. The wireSeq<->FSN mapping is untouched
+                // because no wire sequence has been consumed.
+                positionCursorForStart();
+                return true;
+            }
+            // Frames were already sent on this connection: the linear
+            // fsnAtZero + wireSeq mapping cannot express the gap the retired
+            // tail leaves behind. Recycle; swapClient re-anchors the mapping
+            // at ackedFsn + 1 = the first frame past the tail. One reconnect,
+            // once per recovery -- and only on the slow path (unacked
+            // committed frames existed below the tail).
+            fail(new LineSenderException(
+                    "recycling connection after retiring orphaned deferred tail (wire-seq realignment)"));
+            return false;
+        }
         long pub = sendingSegment.publishedOffset();
         if (sendOffset >= pub) {
             // Nothing more in the current segment. If it's a sealed segment
@@ -1388,10 +2033,51 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * real I/O thread + WebSocket.
      */
     void positionCursorForStart() {
+        // Fast path for a recovered orphaned deferred tail: when everything
+        // below the tail is already acked (the common crash profile -- acks
+        // were flowing until the crash, only the in-flight transaction is
+        // unacked; and trivially when the WHOLE recovered log is the tail),
+        // the tail retires before any connection exists and the cursor
+        // starts past it. Zero wire cost, no recycle.
+        tryRetireOrphanTail();
         long replayStart = engine.ackedFsn() + 1L;
         this.fsnAtZero = replayStart;
         this.nextWireSeq = 0L;
         positionCursorAt(replayStart);
+    }
+
+    /**
+     * Retires the recovered orphaned deferred tail once retirable.
+     * <p>
+     * The tail's frames all carry FLAG_DEFER_COMMIT with no covering commit
+     * frame: the producer died (or closed) mid-transaction, so the
+     * transaction is aborted by definition. Retirement is a cumulative
+     * self-acknowledge of the tail's top FSN -- legal once every frame BELOW
+     * the tail is server-acked, because the tail frames were never
+     * transmitted and no wire sequence references them. The freed slots are
+     * trimmed by the normal ack-driven machinery.
+     * <p>
+     * Crash-safe: dying before the self-ack leaves the tail in place; the
+     * next recovery re-detects the same range and retries. Idempotent once
+     * retired.
+     *
+     * @return true when no orphan tail remains (retired now, previously, or
+     *         never existed); false while frames below the tail are unacked
+     */
+    private boolean tryRetireOrphanTail() {
+        if (orphanSkipTipFsn < 0) {
+            return true;
+        }
+        if (engine.ackedFsn() < orphanSkipStartFsn - 1L) {
+            return false;
+        }
+        LOG.warn("retiring orphaned deferred tail: {} frame(s) [fsn {}..{}] belong to a transaction "
+                        + "whose commit was never published; aborting them (never transmitted, slots trimmed)",
+                orphanSkipTipFsn - orphanSkipStartFsn + 1, orphanSkipStartFsn, orphanSkipTipFsn);
+        engine.acknowledge(orphanSkipTipFsn);
+        orphanSkipStartFsn = -1L;
+        orphanSkipTipFsn = -1L;
+        return true;
     }
 
     /**
@@ -1467,6 +2153,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
+                long okFsn = fsnAtZero + capped;
+                if (okFsn > highestOkFsn) {
+                    highestOkFsn = okFsn;
+                }
+                // Clear poison-frame suspicion only when OK-level progress
+                // reaches the suspected frame itself: acceptance at or beyond
+                // poisonFsn proves the earlier rejections were not
+                // deterministic. Re-OKs of frames BEHIND the suspect -- the
+                // norm in durable-ack mode, where every recycle replays from
+                // the durable trim watermark, which lags the OK level -- say
+                // nothing about the poisoned bytes and must not reset the
+                // count, or a deterministically-NACKing frame recycles the
+                // connection indefinitely.
+                if (poisonFsn != -1L && okFsn >= poisonFsn) {
+                    poisonFsn = -1L;
+                    poisonStrikes = 0;
+                }
                 if (durableAckMode) {
                     // Durable mode: stash the (wireSeq, table_seqTxns) tuple
                     // and wait for STATUS_DURABLE_ACK to release it. Empty
@@ -1510,38 +2213,58 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
 
         @Override
         public void onClose(int code, String reason) {
-            // Terminal close codes signal the server has rejected the wire
-            // bytes themselves — reconnecting and replaying the same bytes
-            // produces the same close. Stash a typed PROTOCOL_VIOLATION
-            // SenderError and halt directly. Reconnect-eligible codes
-            // (NORMAL_CLOSURE, GOING_AWAY, ABNORMAL_CLOSURE, etc.) still go
-            // through fail() so the reconnect retry loop can handle them.
-            if (isTerminalCloseCode(code)) {
-                long fromFsn = engine.ackedFsn() + 1L;
-                long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                String msg = "ws-close[" + code + " " + WebSocketCloseCode.describe(code)
-                        + "]: " + reason;
-                SenderError err = new SenderError(
-                        SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.HALT,
-                        SenderError.NO_STATUS_BYTE,
-                        msg,
-                        SenderError.NO_MESSAGE_SEQUENCE,
-                        fromFsn,
-                        toFsn,
-                        null,
-                        System.nanoTime()
-                );
-                totalServerErrors.incrementAndGet();
-                // recordFatal MUST run before dispatchError so the producer-
-                // observable terminal error is latched before the handler is
-                // invoked.
-                recordFatal(new LineSenderServerException(err));
-                dispatchError(err);
+            // WS close codes carry no policy semantics: policy travels only in
+            // QWP NACK frames (a server rejecting bytes NACKs before it closes).
+            // Every close is therefore a transport event and reconnect-eligible:
+            // fail() enters the retry loop and replays from ackedFsn+1. The one
+            // guarded case is a frame that deterministically kills the connection
+            // without a NACK (e.g. an intermediary's frame-size limit). That is
+            // caught behaviorally, not by code list: a non-orderly close arriving
+            // after this connection already sent the head frame counts a poison
+            // strike; maxHeadFrameRejections consecutive strikes at the same
+            // head FSN with no ack progress escalate to a typed terminal. Orderly
+            // closes (NORMAL_CLOSURE role-change handoff, GOING_AWAY restart
+            // drain) never count strikes — they are the server asking us to go
+            // elsewhere, not a verdict on the bytes.
+            boolean orderly = code == WebSocketCloseCode.NORMAL_CLOSURE
+                    || code == WebSocketCloseCode.GOING_AWAY;
+            LineSenderException cause = new LineSenderException(
+                    "WebSocket closed by server: code=" + code + " reason=" + reason);
+            if (!orderly && nextWireSeq > 0) {
+                if (recordHeadRejectionStrike(Math.max(engine.ackedFsn(), highestOkFsn) + 1L)) {
+                    haltOnPoisonedFrame("ws-close[" + code + ' '
+                                    + WebSocketCloseCode.describe(code) + "]: " + reason,
+                            engine.publishedFsn());
+                    return;
+                }
+                // Strike recorded but below threshold: pace the recycle exactly
+                // like the below-threshold RETRIABLE NACK path. A middlebox/LB
+                // that completes the WS upgrade, accepts the head frame, then
+                // non-orderly-closes while its backend is down succeeds at
+                // connect every cycle, so connectLoop's failed-connect backoff
+                // never engages -- an unpaced fail() here would burn through
+                // maxHeadFrameRejections strikes at a never-advancing head FSN
+                // in well under a second and latch a PROTOCOL_VIOLATION terminal
+                // on a TRANSIENT outage (Invariant B / qwp-nack-policy-v2.md:
+                // "never false-positives on outages"). failPaced parks before
+                // the first reconnect, and its dose escalates with poisonStrikes
+                // (already incremented above), so the widening replay gaps give
+                // the outage time to clear before the threshold fires.
+                failPaced(cause);
                 return;
             }
-            fail(new LineSenderException(
-                    "WebSocket closed by server: code=" + code + " reason=" + reason));
+            // No strike (orderly close, or a close before any send on this
+            // connection): not a verdict on the bytes. But strike-exempt must
+            // not mean pace-exempt: a peer that completes the upgrade then
+            // closes (LB drain window, GOING_AWAY rolling restart, health-
+            // checking middlebox in front of a dead backend) succeeds at
+            // connect every cycle, so connectLoop's failed-connect backoff
+            // never engages, and with no strikes there is no poison-terminal
+            // bound either -- an unpaced fail() here churns full recycles at
+            // handshake RTT rate, forever. failExemptPaced keeps the first
+            // recycle immediate (failover latency) and paces consecutive
+            // zero-progress repeats with the escalating reconnect backoff.
+            failExemptPaced(cause);
         }
 
         private void handlePreSendRejection(long wireSeq, byte status,
@@ -1570,17 +2293,39 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     System.nanoTime()
             );
             totalServerErrors.incrementAndGet();
-            if (policy == SenderError.Policy.HALT) {
+            if (policy == SenderError.Policy.TERMINAL) {
                 // Latch the typed terminal error before invoking the handler
                 // so a synchronous probe of getLastTerminalError() / flush()
                 // from inside the handler observes the typed error. Mirrors
-                // the ordering in the post-send HALT path below.
+                // the ordering in the post-send TERMINAL path below.
                 recordFatal(new LineSenderServerException(err));
+                dispatchError(err);
+                return;
             }
-            // DROP_AND_CONTINUE: no watermark advance -- there is nothing
-            // sent on this connection to drop. The dispatch is the user's
-            // only handle to the server's complaint.
+            // RETRIABLE / RETRIABLE_OTHER: nothing was sent on this connection,
+            // so the rejection cannot implicate the head frame -- no poison
+            // strike. Surface for observability, then recycle the wire; the
+            // reconnect path replays from ackedFsn+1. No watermark advance --
+            // nothing is dropped. RETRIABLE is paced for the same reason as
+            // the post-send path: the server is reachable, so the recycle
+            // would otherwise run at its rejection rate.
             dispatchError(err);
+            LineSenderException recycleCause = new LineSenderException(
+                    "pre-send server rejection (" + category + "): "
+                            + response.getErrorMessage());
+            if (policy == SenderError.Policy.RETRIABLE) {
+                failPaced(recycleCause);
+            } else {
+                // RETRIABLE_OTHER pre-send (NOT_WRITABLE before we sent
+                // anything): rotate endpoints -- but through the zero-
+                // progress pacer, not raw fail(). An all-replica window
+                // answers NOT_WRITABLE on every fresh connection, each
+                // connect attempt "succeeds", and pre-send rejections record
+                // no strike, so nothing else bounds the churn. The first
+                // recycle stays immediate so a genuine failover rotates
+                // without delay.
+                failExemptPaced(recycleCause);
+            }
         }
 
         private void handleServerRejection(long wireSeq) {
@@ -1588,10 +2333,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             SenderError.Category category = classify(status);
             SenderError.Policy policy = defaultPolicyFor(category);
             // Same sanity clamp as the success branch above: do not trust a
-            // rejection wireSeq beyond what we've actually sent. Without this
-            // clamp the DROP path advances ackedFsn past publishedFsn, which
-            // makes the segment manager trim sealed segments the I/O thread
-            // is still reading — and the next Unsafe.getInt SEGVs the JVM.
+            // rejection wireSeq beyond what we've actually sent. The clamped
+            // value is only used to attribute an FSN to the error report --
+            // a rejection never advances the watermark.
             long highestSent = nextWireSeq - 1L;
             if (highestSent < 0L) {
                 // Pre-send rejection: server emitted an error frame before
@@ -1633,39 +2377,62 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             );
             totalServerErrors.incrementAndGet();
 
-            if (policy == SenderError.Policy.HALT) {
+            if (policy == SenderError.Policy.TERMINAL) {
                 // Terminal: stash the typed payload BEFORE dispatching to the
                 // handler. The spec requires signal.terminalError to be latched
                 // before the handler is invoked so a handler that synchronously
                 // probes getLastTerminalError() (or calls flush()) sees the
                 // typed error rather than null. Bytes on disk are the bytes
-                // the server rejected; reconnect/replay cannot fix them.
+                // the server rejected; reconnect/replay cannot fix them. The
+                // bytes stay in the SF log -- nothing is silently discarded.
                 recordFatal(new LineSenderServerException(err));
                 dispatchError(err);
-            } else {
-                // DROP_AND_CONTINUE: advance ackedFsn past the rejected span
-                // so the loop drains subsequent batches. The data is dropped
-                // from the SF disk store via the existing trim path; the
-                // dispatch is the user's only handle to dead-letter.
-                LOG.warn("server rejected wire seq {} (category={}, status=0x{}) -- dropping batch and continuing",
-                        wireSeq, category, Integer.toHexString(status & 0xFF));
-                totalAcks.incrementAndGet();
-                if (durableAckMode) {
-                    // A rejected batch never reaches the WAL, so the server
-                    // will not emit a durable-ack for it. Stash an empty
-                    // entry so the queue still advances past it, but only
-                    // after every preceding OK'd batch is durable -- trimming
-                    // past unfilled durable slots would corrupt SF semantics.
-                    enqueuePendingOk(cappedSeq);
-                    drainPendingDurable();
-                } else if (engine.acknowledge(fsn)) {
-                    // DROP_AND_CONTINUE on the non-durable path advanced the
-                    // watermark past the rejected FSN; observers waiting on
-                    // a target FSN should see that advance, even though it
-                    // represents a drop rather than a successful commit.
-                    dispatchProgress(fsn);
+                return;
+            }
+            // RETRIABLE / RETRIABLE_OTHER: never drop, never latch. The bytes
+            // stay in the SF log; recycle the wire and replay from ackedFsn+1
+            // through the same reconnect machinery a transport failure uses
+            // (capped backoff + jitter, endpoint rotation via the reconnect
+            // factory, no wall-clock give-up -- Invariant B). The dispatch is
+            // informational. A RETRIABLE frame the server keeps rejecting with
+            // no ack progress escalates to a poisoned-frame terminal instead
+            // of reconnect-looping forever.
+            LOG.warn("server rejected wire seq {} (category={}, policy={}, status=0x{}) -- recycling connection, will replay from fsn {}",
+                    wireSeq, category, policy, Integer.toHexString(status & 0xFF), engine.ackedFsn() + 1L);
+            dispatchError(err);
+            LineSenderException recycleCause = new LineSenderException(
+                    "server NACK (" + category + ", " + policy + "): "
+                            + response.getErrorMessage());
+            if (policy == SenderError.Policy.RETRIABLE) {
+                // Only RETRIABLE rejections implicate the head frame: the node
+                // accepted the stream and judged the bytes, so a deterministic
+                // repeat counts toward the poison terminal.
+                if (recordHeadRejectionStrike(fsn)) {
+                    haltOnPoisonedFrame("server NACK status=0x"
+                                    + Integer.toHexString(status & 0xFF) + " (" + category + "): "
+                                    + response.getErrorMessage(),
+                            fsn);
+                    return;
                 }
-                dispatchError(err);
+                // RETRIABLE recycles are paced: the server is reachable and
+                // healthy (it just NACK'd a frame), so the reconnect will
+                // succeed immediately and connectLoop's failed-connect backoff
+                // never engages -- without pacing, a repeatedly-NACKing server
+                // drives full recycle cycles at its NACK rate.
+                failPaced(recycleCause);
+            } else {
+                // RETRIABLE_OTHER (NOT_WRITABLE): a node-state verdict, not a
+                // frame verdict -- the node cannot serve writes at all, so the
+                // rejection says nothing about the bytes and must never count
+                // a poison strike (a transient all-replica window would
+                // otherwise escalate to a producer-fatal terminal, violating
+                // Invariant B). Mirror the pre-send path: rotate endpoints
+                // through the zero-progress pacer -- the first recycle stays
+                // immediate so a genuine failover rotates without delay, but
+                // consecutive recycles with no OK progress park for the capped
+                // dose instead of churning full TLS reconnects at handshake
+                // RTT rate for the whole window.
+                failExemptPaced(recycleCause);
             }
         }
     }

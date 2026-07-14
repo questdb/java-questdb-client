@@ -9,9 +9,10 @@ downloaded="core/target/downloaded-native-artifacts"
 staged="core/target/native-libs/io/questdb/client/bin"
 
 # platform -> library filename
+# darwin-x86-64 is intentionally not shipped: no CI runs the test suite on x64
+# macOS, so the release does not build or bundle a binary it cannot test.
 declare -A libs=(
   [darwin-aarch64]=libquestdb.dylib
-  [darwin-x86-64]=libquestdb.dylib
   [linux-aarch64]=libquestdb.so
   [linux-x86-64]=libquestdb.so
   [windows-x86-64]=libquestdb.dll

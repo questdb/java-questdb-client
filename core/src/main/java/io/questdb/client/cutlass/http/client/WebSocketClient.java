@@ -47,6 +47,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
@@ -99,8 +100,15 @@ public abstract class WebSocketClient implements QuietCloseable {
     private final int maxRecvBufSize;
     private final SecureRnd rnd;
     private final WebSocketSendBuffer sendBuffer;
-    // volatile: written by user thread in close(), read by I/O thread in checkConnected()/sendFrame()/receiveFrame()
-    private volatile boolean closed;
+    // Written by whichever closer wins the CAS in close(); read by the I/O
+    // thread in checkConnected()/sendFrame()/receiveFrame(). An AtomicBoolean
+    // (not a bare volatile check-then-act) so concurrent closers cannot both
+    // enter close() and double-run disconnect()/Unsafe.free.
+    private final AtomicBoolean closed = new AtomicBoolean();
+    // Upper bound (ms) on the TCP connect. <= 0 disables the application-level
+    // timeout and falls back to the OS connect timeout. Seeded from the
+    // configuration; the QWP sender may override it via setConnectTimeout().
+    private int connectTimeoutMillis;
     private int fragmentBufPos;
     private long fragmentBufPtr;       // native buffer for accumulating fragment payloads
     private int fragmentBufSize;
@@ -168,6 +176,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         this.nf = configuration.getNetworkFacade();
         this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
+        this.connectTimeoutMillis = configuration.getConnectTimeout();
 
         int sendBufSize = Math.max(configuration.getInitialRequestBufferSize(), DEFAULT_SEND_BUFFER_SIZE);
         int maxSendBufSize = Math.max(configuration.getMaximumRequestBufferSize(), sendBufSize);
@@ -192,7 +201,7 @@ public abstract class WebSocketClient implements QuietCloseable {
             this.frameParser = new WebSocketFrameParser();
             this.rnd = new SecureRnd();
             this.upgraded = false;
-            this.closed = false;
+            this.closed.set(false);
         } catch (Throwable t) {
             if (recvBufPtr != 0) {
                 Unsafe.free(recvBufPtr, recvBufSize, MemoryTag.NATIVE_DEFAULT);
@@ -207,8 +216,12 @@ public abstract class WebSocketClient implements QuietCloseable {
 
     @Override
     public void close() {
-        if (!closed) {
-            closed = true;
+        // CAS gate: exactly one closer runs the teardown below. Closers can be
+        // the owner thread, the I/O thread's exit path, or a stale duplicate
+        // reference (see CursorWebSocketSendLoop) -- a bare volatile
+        // check-then-act here would let two concurrent closers both enter and
+        // double-run disconnect()/Unsafe.free (native double-free).
+        if (closed.compareAndSet(false, true)) {
 
             // Try to send close frame
             if (upgraded && !socket.isClosed()) {
@@ -242,7 +255,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * @param port the server port
      */
     public void connect(CharSequence host, int port) {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
 
@@ -375,7 +388,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * Returns whether the WebSocket is connected and upgraded.
      */
     public boolean isConnected() {
-        return upgraded && !closed && !socket.isClosed();
+        return upgraded && !closed.get() && !socket.isClosed();
     }
 
     /**
@@ -482,6 +495,16 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Overrides the TCP connect timeout (milliseconds) for subsequent
+     * {@link #connect} calls. {@code <= 0} disables the application-level
+     * timeout and falls back to the OS connect timeout. Must be called before
+     * {@link #connect}.
+     */
+    public void setConnectTimeout(int connectTimeoutMillis) {
+        this.connectTimeoutMillis = connectTimeoutMillis;
+    }
+
+    /**
      * Sets the value sent as the {@code X-QWP-Accept-Encoding} upgrade header,
      * e.g. {@code "zstd;level=1,raw"}. Pass {@code null} to omit the header
      * entirely (server ships uncompressed batches). Must be called before
@@ -570,7 +593,7 @@ public abstract class WebSocketClient implements QuietCloseable {
      * @param authorizationHeader the Authorization header value (e.g., "Basic ..."), or null
      */
     public void upgrade(CharSequence path, int timeout, CharSequence authorizationHeader) {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
         if (socket.isClosed()) {
@@ -877,7 +900,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     private void checkConnected() {
-        if (closed) {
+        if (closed.get()) {
             throw new HttpClientException("WebSocket client is closed");
         }
         if (!upgraded) {
@@ -888,6 +911,12 @@ public abstract class WebSocketClient implements QuietCloseable {
     private void compactRecvBuffer() {
         if (recvReadPos > 0) {
             int remaining = recvPos - recvReadPos;
+            // recvPos >= recvReadPos always holds here: a handler-initiated
+            // close() (which zeroes recvPos under our feet) is caught in
+            // tryParseFrame's tail before this method is reached. If this
+            // assert fires, someone reintroduced a post-callback touch of
+            // recv state on a closed/disconnected client.
+            assert remaining >= 0 : "recv buffer positions out of order [recvPos=" + recvPos + ", recvReadPos=" + recvReadPos + ']';
             if (remaining > 0) {
                 Vect.memmove(recvBufPtr, recvBufPtr + recvReadPos, remaining);
             }
@@ -922,10 +951,18 @@ public abstract class WebSocketClient implements QuietCloseable {
             throw new HttpClientException("could not resolve host [host=").put(host).put(']');
         }
 
-        if (nf.connectAddrInfo(fd, addrInfo) != 0) {
+        final int connectResult = connectTimeoutMillis > 0
+                ? nf.connectAddrInfoTimeout(fd, addrInfo, connectTimeoutMillis)
+                : nf.connectAddrInfo(fd, addrInfo);
+        if (connectResult != 0) {
             int errno = nf.errno();
             nf.freeAddrInfo(addrInfo);
             disconnect();
+            if (connectResult == NetworkFacade.CONNECT_TIMEOUT) {
+                throw new HttpClientException("connect timed out [host=").put(host)
+                        .put(", port=").put(port)
+                        .put(", timeout=").put(connectTimeoutMillis).put(']').flagAsTimeout();
+            }
             throw new HttpClientException("could not connect [host=").put(host)
                     .put(", port=").put(port)
                     .put(", errno=").put(errno).put(']');
@@ -939,19 +976,35 @@ public abstract class WebSocketClient implements QuietCloseable {
                     .put(", errno=").put(errno).put(']');
         }
 
+        // Register the fd with the event loop before the TLS handshake so the
+        // handshake can park on socket readiness via ioWait() instead of
+        // busy-spinning on the non-blocking socket.
+        setupIoWait();
+
         if (socket.supportsTls()) {
+            // Bound the TLS handshake by the connect budget (falling back to the
+            // request timeout when connect_timeout is unset), so a peer that
+            // completes TCP but stalls mid-handshake cannot hang or pin a CPU.
+            final long tlsHandshakeStartNanos = System.nanoTime();
+            final int tlsHandshakeBudgetMillis = connectTimeoutMillis > 0 ? connectTimeoutMillis : defaultTimeout;
             try {
-                socket.startTlsSession(host);
+                socket.startTlsSession(host, op -> ioWait(getRemainingTimeOrThrow(tlsHandshakeBudgetMillis, tlsHandshakeStartNanos), op));
             } catch (TlsSessionInitFailedException e) {
                 int errno = nf.errno();
                 disconnect();
                 throw new HttpClientException("could not start TLS session [fd=").put(fd)
                         .put(", error=").put(e.getFlyweightMessage())
                         .put(", errno=").put(errno).put(']');
+            } catch (Throwable t) {
+                // ioWait() throws a timeout-flagged HttpClientException when the
+                // handshake budget is exhausted; any other error can also surface
+                // mid-handshake. Disconnect so the fd and native buffers do not
+                // leak, then propagate.
+                disconnect();
+                throw t;
             }
         }
 
-        setupIoWait();
         if (LOG.isDebugEnabled()) {
             LOG.debug("Connected to [host={}, port={}]", host, port);
         }
@@ -1209,6 +1262,20 @@ public abstract class WebSocketClient implements QuietCloseable {
                         resetFragmentState();
                     }
                     break;
+            }
+
+            // A handler callback above may have close()d this client:
+            // CursorWebSocketSendLoop's NACK/close recycle swaps in a new
+            // client and synchronously closes this one (swapClient), then
+            // control unwinds back here. close() -> disconnect() has already
+            // zeroed recvPos/recvReadPos and freed recvBufPtr -- advancing
+            // the read position or compacting would corrupt that state
+            // (negative recvPos today; a memmove on freed memory if the
+            // zeroing ever moved). The frame was fully dispatched, so
+            // in-callback close is a supported contract: report success
+            // and touch nothing. Same-thread, so the closed read is exact.
+            if (closed.get()) {
+                return PARSE_OK;
             }
 
             // Advance read position

@@ -166,6 +166,9 @@ public class QwpQueryClient implements QuietCloseable {
     private final Random failoverRandom = new Random();
     private long authTimeoutMs = DEFAULT_AUTH_TIMEOUT_MS;
     private String authorizationHeader;
+    // Upper bound (ms) on each TCP connect attempt. 0 (default) falls back to
+    // the OS connect timeout.
+    private int connectTimeoutMs = 0;
     private int bufferPoolSize = DEFAULT_IO_BUFFER_POOL_SIZE;
     private String clientId;
     // Client-configured zone (failover.md §1.1), opaque case-insensitive
@@ -393,6 +396,9 @@ public class QwpQueryClient implements QuietCloseable {
         Long failoverMaxDurationMs = view.has("failover_max_duration_ms")
                 ? view.getLong("failover_max_duration_ms", 0) : null;
         Long authTimeoutMs = view.has("auth_timeout_ms") ? view.getLong("auth_timeout_ms", 0) : null;
+        // getInt (not getLong + cast): withConnectTimeout takes an int, and an
+        // over-int value must reject, not wrap.
+        Integer connectTimeout = view.has("connect_timeout") ? view.getInt("connect_timeout", 0) : null;
         Long initialCredit = view.has("initial_credit") ? view.getLong("initial_credit", 0) : null;
         int poolSize = view.getInt("buffer_pool_size", DEFAULT_IO_BUFFER_POOL_SIZE);
         String compression = view.getEnum("compression");
@@ -447,6 +453,9 @@ public class QwpQueryClient implements QuietCloseable {
             }
             if (authTimeoutMs != null) {
                 client.withAuthTimeout(authTimeoutMs);
+            }
+            if (connectTimeout != null) {
+                client.withConnectTimeout(connectTimeout);
             }
             if (initialCredit != null) {
                 client.withInitialCredit(initialCredit);
@@ -503,6 +512,9 @@ public class QwpQueryClient implements QuietCloseable {
         view.getLong("failover_max_duration_ms", -1);
         view.getLong("initial_credit", -1);
         view.getLong("auth_timeout_ms", -1);
+        // getInt: connect_timeout feeds an int API, so validation must also
+        // reject values that fit a long but not an int.
+        view.getInt("connect_timeout", -1);
         String username = view.getStr("username");
         String password = view.getStr("password");
         String token = view.getStr("token");
@@ -806,7 +818,18 @@ public class QwpQueryClient implements QuietCloseable {
      * before the reset should be discarded by the handler.
      */
     public void execute(CharSequence sql, QwpColumnBatchHandler handler) {
-        execute(sql, null, handler);
+        execute(sql, null, handler, false);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpColumnBatchHandler)}, but when
+     * {@code resetSymbolDict} is set the server resets the connection-scoped
+     * SYMBOL dict before this query, scoping the dict to this query's symbols.
+     * The flag reaches the wire only when the server advertised
+     * {@link QwpEgressMsgKind#CAP_QUERY_FLAGS}; otherwise it is silently ignored.
+     */
+    public void execute(CharSequence sql, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
+        execute(sql, null, handler, resetSymbolDict);
     }
 
     /**
@@ -821,6 +844,17 @@ public class QwpQueryClient implements QuietCloseable {
      * defeats this reuse.
      */
     public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+        execute(sql, binds, handler, false);
+    }
+
+    /**
+     * As {@link #execute(CharSequence, QwpBindSetter, QwpColumnBatchHandler)},
+     * but when {@code resetSymbolDict} is set the server resets the
+     * connection-scoped SYMBOL dict before this query, scoping the dict to this
+     * query's symbols. The flag reaches the wire only when the server advertised
+     * {@link QwpEgressMsgKind#CAP_QUERY_FLAGS}; otherwise it is silently ignored.
+     */
+    public void execute(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
         if (!executing.compareAndSet(false, true)) {
             throw new IllegalStateException(
                     "QwpQueryClient.execute called while another execute is in flight; one query at a time per client");
@@ -832,7 +866,7 @@ public class QwpQueryClient implements QuietCloseable {
         // is intentionally NOT cleared inside executeOnce().
         pendingCancel = false;
         try {
-            executeImpl(sql, binds, handler);
+            executeImpl(sql, binds, handler, resetSymbolDict);
         } finally {
             executing.set(false);
         }
@@ -885,6 +919,7 @@ public class QwpQueryClient implements QuietCloseable {
         m.put("client_id", clientId);
         m.put("zone", clientZone);
         m.put("auth_timeout_ms", authTimeoutMs);
+        m.put("connect_timeout", connectTimeoutMs);
         m.put("authorization_header", authorizationHeader);
         m.put("tls_verify", tlsValidationMode);
         m.put("tls_roots", trustStorePath);
@@ -1009,6 +1044,22 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException("authTimeoutMs must be > 0");
         }
         this.authTimeoutMs = authTimeoutMs;
+        return this;
+    }
+
+    /**
+     * Upper bound, in milliseconds, on establishing the TCP connection to an
+     * endpoint. Unlike {@link #withAuthTimeout(long)} this DOES bound the TCP
+     * connect itself (via a non-blocking connect), so a routing blackhole that
+     * never returns SYN-ACK is aborted within this budget instead of riding the
+     * OS connect timeout. {@code 0} (default) keeps the OS connect timeout.
+     */
+    public QwpQueryClient withConnectTimeout(int connectTimeoutMs) {
+        checkPreConnect("withConnectTimeout");
+        if (connectTimeoutMs <= 0) {
+            throw new IllegalArgumentException("connectTimeoutMs must be > 0");
+        }
+        this.connectTimeoutMs = connectTimeoutMs;
         return this;
     }
 
@@ -1423,6 +1474,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpClientId(clientId != null ? clientId : defaultClientId());
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
+        webSocketClient.setConnectTimeout(connectTimeoutMs);
         runUpgradeWithTimeout(ep, authHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
@@ -1446,7 +1498,7 @@ public class QwpQueryClient implements QuietCloseable {
         }
     }
 
-    private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler) {
+    private void executeImpl(CharSequence sql, QwpBindSetter binds, QwpColumnBatchHandler handler, boolean resetSymbolDict) {
         if (closedFlag.get()) {
             throw new IllegalStateException("QwpQueryClient is closed");
         }
@@ -1470,7 +1522,7 @@ public class QwpQueryClient implements QuietCloseable {
         while (true) {
             attempt++;
             FailoverProbeHandler probe = new FailoverProbeHandler(handler);
-            executeOnce(sql, binds, probe);
+            executeOnce(sql, binds, probe, resetSymbolDict);
             if (!probe.transportFailureIntercepted) {
                 return;
             }
@@ -1563,7 +1615,7 @@ public class QwpQueryClient implements QuietCloseable {
      * the user's handler in a {@link FailoverProbeHandler} so that the outer
      * loop can intercept transport failures before they reach the user.
      */
-    private void executeOnce(CharSequence sql, QwpBindSetter binds, FailoverProbeHandler probe) {
+    private void executeOnce(CharSequence sql, QwpBindSetter binds, FailoverProbeHandler probe, boolean resetSymbolDict) {
         // Cache the I/O thread reference at entry: close() may null the field while
         // we are inside this loop, so reading the field per-iteration would NPE
         // exactly when the user is mid-execute() and close() races. The queue and
@@ -1607,7 +1659,8 @@ public class QwpQueryClient implements QuietCloseable {
             io.requestCancel(requestId);
         }
         try {
-            io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen());
+            io.submitQuery(sql, requestId, initialCreditBytes, bindValues.count(), bindValues.bufferPtr(), bindValues.bufferLen(),
+                    resolveQueryFlags(resetSymbolDict));
             while (true) {
                 QueryEvent ev = io.takeEvent();
                 try {
@@ -1816,13 +1869,32 @@ public class QwpQueryClient implements QuietCloseable {
         return authorizationHeader;
     }
 
+    private long resolveQueryFlags(boolean resetSymbolDict) {
+        if (!resetSymbolDict) {
+            return 0L;
+        }
+        QwpServerInfo info = serverInfo;
+        return info != null && (info.getCapabilities() & QwpEgressMsgKind.CAP_QUERY_FLAGS) != 0
+                ? QwpEgressMsgKind.QUERY_FLAG_RESET_DICT
+                : 0L;
+    }
+
     private void runUpgradeWithTimeout(Endpoint ep, String authHeader) {
+        // Connect first, OUTSIDE the upgrade try. A connect-phase failure --
+        // including a connect_timeout overage flagged via flagAsTimeout() -- must
+        // keep its own message ("connect timed out ...") and must NOT be relabeled
+        // as an auth_timeout overage below. doConnect() tears down its own socket
+        // on failure; the failover walker treats the propagated HttpClientException
+        // as a transport error and moves on to the next endpoint.
+        webSocketClient.connect(ep.host, ep.port);
+
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
         try {
-            webSocketClient.connect(ep.host, ep.port);
             webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
+                // Reachable only for an upgrade/auth-phase timeout now, so the
+                // auth_timeout attribution is accurate.
                 HttpClientException timeout = new HttpClientException("WebSocket upgrade to ")
                         .put(ep.host).put(':').put(ep.port)
                         .put(" exceeded auth_timeout=").put(authTimeoutMs).put("ms");

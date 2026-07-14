@@ -212,7 +212,7 @@ public class CursorWebSocketSendLoopErrorLatchTest {
     private static SenderError newSenderError() {
         return new SenderError(
                 SenderError.Category.SCHEMA_MISMATCH,
-                SenderError.Policy.HALT,
+                SenderError.Policy.TERMINAL,
                 0x03,
                 "test-msg",
                 7L,

@@ -51,8 +51,17 @@ Capture the PR identifier in `$PR` (the part of `$ARGUMENTS` left after strippin
 PR='<PR number or URL from $ARGUMENTS, with any --level=N / -lN / bare-digit level token removed>'
 gh pr view "$PR" --json number,title,body,labels,state
 gh pr diff "$PR"
+gh pr diff "$PR" --numstat   # binary files show as `-<TAB>-<TAB><path>`
 gh pr view "$PR" --comments
 ```
+
+**Committed-binary gate (runs at every level).** Scan the `--numstat` output for
+any added/modified file git reports as binary (`-`/`-` in the added/deleted
+columns). This repo builds its native/C libraries from source in CI and does not
+commit build outputs, so any such file is a **Critical** finding regardless of
+review level — report it even at level 0. See the "Committed build artifacts"
+checklist for the rationale and the acceptable-exception (genuine test-input
+fixtures only).
 
 ## Step 2: PR title and description
 
@@ -144,7 +153,7 @@ Every agent receives:
 
 Launch the following agents in parallel.
 
-**Agent 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite.
+**Agent 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the store-and-forward sender, the async drainer / send loop, primary reconnect/failover, or pool startup (`lazy_connect` / `initial_connect_retry` / `SenderPool` / `QueryClientPool`), also verify the "Store-and-forward & pool startup invariants" checklist — a running drainer that propagates a transport error to the caller, imposes a reconnect time budget, or hard-fails on a transient outage is a Critical (data-loss) finding.
 
 **Agent 2 — Concurrency:** Race conditions, shared mutable state, missing volatile, lock ordering, thread-safety of data structures. Use the implicit contract list (lock order, thread-affinity) and check every callsite from 2.5b for violations of the new contract.
 
@@ -154,7 +163,7 @@ Launch the following agents in parallel.
 
 **Agent 5 — Test coverage:** Coverage gaps, error path tests, NULL tests, boundary conditions, regression tests exist, `assertMemoryLeak()` usage. Cross-reference 2.5d: every cross-context exposure should have a test that exercises the changed symbol from that context. Missing tests for cross-context callsites is a high-priority finding. Test *efficacy* (whether those tests actually exercise the change and could fail) and test-*code* quality are handled by Agents 11-13 — here focus only on whether coverage exists for every new or changed path.
 
-**Agent 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies.
+**Agent 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies. Also scan the diff for any committed compiled binary / build artifact (run `git diff --numstat`/`--stat` and flag files git reports as binary) — the native/C libraries are built from source in CI, so a committed binary is a **Critical** finding (see the "Committed build artifacts" checklist).
 
 **Agent 7 — PR metadata & conventions:** Title format, description quality, commit messages, labels, SQL style in tests.
 
@@ -278,6 +287,26 @@ Review the diff for:
 - Code smell: overly complex methods, deep nesting, unclear intent, dead code
 - No third-party Java dependencies on data paths
 
+### Committed build artifacts
+- **A newly committed compiled binary is always Critical.** This repo builds its
+  native/C libraries from source in CI (`rebuild_native_libs.yml`,
+  `build_native.yaml`, guarded by `check-glibc-floor.sh`) and does not commit
+  build outputs. A binary added or modified in the diff cannot be reviewed,
+  audited, or reproduced from source, can smuggle in unaudited or malicious
+  code, and bloats the repo history irreversibly — so it blocks the merge.
+- Detect it structurally, not by extension alone: run `git diff --stat` /
+  `git diff --numstat` on the PR and flag every added/modified file git reports
+  as binary (`numstat` shows `-`/`-` for added/deleted lines; `--stat` shows a
+  `Bin … -> … bytes` marker). Typical offenders: `.so`, `.dylib`, `.dll`, `.a`,
+  `.o`, `.lib`, `.exe`, `.class`, `.jar`, `.war`, `.wasm`, `.node`, `.bin`.
+- The finding stands even when the binary "looks" legitimate (e.g. a rebuilt
+  `libquestdb.*`): the correct source of these artifacts is the CI native-build
+  pipeline plus release packaging, never a PR diff. The only acceptable binaries
+  are genuine test-input fixtures/resources (data a test reads), not build
+  outputs — and even those must be justified.
+- Suggested fix: drop the binary from the PR, confirm a `.gitignore` entry
+  covers it, and let CI native-build + release packaging produce it.
+
 ### QuestDB coding standards
 - Class members grouped by kind (static vs instance) and visibility, sorted alphabetically
 - Boolean names use `is...` / `has...` prefix
@@ -287,6 +316,82 @@ Review the diff for:
 - Resources properly closed in all code paths (especially error paths)
 - try-with-resources used where applicable
 - Native memory freed correctly
+
+### Store-and-forward & pool startup invariants (QWP facade)
+Apply this whenever the diff touches the SF sender, the async drainer / send
+loop, primary reconnect/failover, `SenderPool` / `QueryClientPool` startup,
+`lazy_connect`, or `initial_connect_retry`. A violation here is a **Critical**
+finding: the whole point of store-and-forward is that a running producer never
+loses data and never hard-fails on a transient outage.
+
+**Drainer (steady state — once the pool is running).**
+- Once the pool is running, an async drainer thread ships buffered SF data to
+  the server. It MUST NOT propagate server / transport errors back to the
+  client (`Sender` producer calls, `flush()`, the pooled handle). The ONLY
+  error a running drainer may surface to the caller is **SF out of space** (the
+  on-disk / backing buffer is full and can accept no more rows). Flag any other
+  failure class (connect-refused, DNS, unreachable/black-hole, TLS/cert, auth,
+  role-reject, upgrade/protocol timeout, reset) that can escape the drainer
+  onto a producer or borrow call.
+- Primary reconnect MUST be fully contained inside the drainer thread and MUST
+  have **no time limit** — no `reconnect_max_duration_millis`-style budget, no
+  deadline, no "give up and latch terminal after N ms". A budget that latches
+  the sender terminal on a long outage is a Critical violation: it drops a
+  producer that store-and-forward promised to keep alive. Flag any bounded
+  reconnect loop, `deadlineNanos` / `while (now < deadline)`, or terminal
+  `SenderError` reachable from the running drainer's reconnect path.
+- The drainer must retry with **exponential backoff** and handle every connect
+  failure class gracefully, without a hard fail — it keeps buffering and keeps
+  retrying until the wire is back. The per-attempt backoff may be capped (a max
+  delay between attempts), but the RETRY LOOP ITSELF must be unbounded. Flag a
+  capped total retry duration or an attempt-count cap on the steady-state
+  drainer.
+- **Sanctioned terminals (orphan-slot drainer only).** The orphan drainer
+  (`BackgroundDrainer`) MAY quarantine its slot (`.failed` sentinel,
+  human-in-the-loop) on conditions that are terminal by design: auth failure,
+  a non-421 upgrade reject, and a genuine cluster-wide durable-ack capability
+  gap that exhausted its documented settle budget (16 consecutive
+  capability-gap sweeps, or a wall-clock budget anchored at the FIRST
+  capability-gap error of the episode — whichever is hit first). These are
+  NOT violations of the no-budget rule above. The settle budget applies ONLY
+  to consecutive capability-gap attempts: transient classes (role reject,
+  transport error) must never increment it or burn its wall clock — a
+  transient state consuming the terminal budget (shared attempt counter,
+  entry-anchored deadline) IS a Critical violation of this checklist.
+- **Mid-stream server NACKs (no drop policy).** The NACK policy must mirror
+  the connect-time tiering. A rejection category that a transient cluster
+  state can produce (`WRITE_ERROR`, `INTERNAL_ERROR`, `UNKNOWN` — and any
+  future status byte) is RETRIABLE: recycle the wire and replay from
+  `ackedFsn+1`. It must NEVER drop the batch and NEVER latch a terminal /
+  quarantine a slot on first sight. Only rejections deterministic under
+  byte-identical replay (`SCHEMA_MISMATCH`, `PARSE_ERROR`, `SECURITY_ERROR`
+  on a writable node) may go TERMINAL. A client that advances the ack
+  watermark past a NACKed frame is silently losing data — Critical. A frame
+  repeatedly rejected with no ack progress must escalate through the
+  poison-frame detector (bounded consecutive strikes at the same head FSN),
+  not through a WS close-code list — close codes carry no policy semantics.
+  `UNKNOWN` must fail OPEN (retry), never closed (terminal): a status byte
+  from a newer server must degrade to retry, not to a dead sender.
+
+**Pool startup — two modes; the mode decides who sees connectivity errors.**
+- `lazy_connect=true`: `build()` MUST succeed with **no server present**. The
+  producing `Sender` must work immediately (writes buffer via SF), and once the
+  server comes up the read side must also connect and read (reads are deferred,
+  not disabled). Verify `build()` does not fail-fast, the sender does not throw
+  on the first write while the server is down, and a later `borrowQuery()`
+  succeeds once the server is up.
+- `lazy_connect=false` (default): `build()` / the initial connect MUST expose
+  connectivity problems to the caller — DNS errors, connect-refused /
+  unreachable, TLS/cert, authentication/authorization, and connect/upgrade
+  timeouts must all surface as a thrown exception at startup, not be swallowed.
+  Verify each of those failure classes reaches the user during initialization.
+- **In BOTH modes the boundary is the same:** connectivity errors are only
+  ever the caller's problem DURING initialization. Once the client has
+  connected and is past initialization, the running drainer reverts to the
+  steady-state contract above — it must NEVER expose transport problems, NEVER
+  impose a reconnect time budget, and NEVER hard-fail on a transient outage.
+  Anything that undermines the store-and-forward guarantee past init is
+  Critical.
 
 ### SQL conventions (if tests or SQL involved)
 - Keywords in UPPERCASE
@@ -340,7 +445,10 @@ Review the diff for:
 Present ONLY verified findings (false positives are excluded). Structure as:
 
 ### Critical
-Issues that must be fixed before merge. Each must include:
+Issues that must be fixed before merge. **A newly committed compiled binary or
+other build artifact (see the "Committed build artifacts" checklist) is always
+Critical, no matter how legitimate it looks — native/C libraries are built from
+source in CI, so a binary in the diff is never acceptable.** Each must include:
 - Exact file path and line numbers (including out-of-diff files)
 - Whether the finding is **in-diff** or **out-of-diff**
 - Code path trace showing why the bug is real

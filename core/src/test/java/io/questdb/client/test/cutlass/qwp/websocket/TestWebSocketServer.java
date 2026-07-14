@@ -88,12 +88,26 @@ public class TestWebSocketServer implements Closeable {
     // QwpQueryClient tests enable this; ingress sender tests leave it off so their
     // connections carry only ACK frames.
     private volatile boolean sendServerInfo;
+    private volatile int capabilities;
+    // When true, the server fails the WebSocket upgrade on the egress read path
+    // (/read...) by dropping the connection before the 101, while still serving
+    // the ingest write path (/write...) normally. Lets one server + one cluster
+    // config drive a build where the sender pool connects but the query pool
+    // cannot. Set via setRejectReadUpgrade().
+    private volatile boolean rejectReadUpgrade;
     // When non-null the next handshake responds with HTTP 421 Misdirected
     // Request + X-QuestDB-Role: <rejectingRole>, mimicking a server whose
     // QwpServerInfoProvider reports REPLICA / PRIMARY_CATCHUP. Set after
     // construction via setRejectWithRole().
     private volatile String rejectingRole;
     private volatile int rejectingStatusCode;
+    // When true, 101 upgrade responses omit the X-QWP-Durable-Ack header even
+    // though the server was constructed with emitDurableAckHeader=true --
+    // simulating a rolling-upgrade window where an endpoint upgrades but does
+    // not advertise durable ack (the drainer's capability-gap condition).
+    // Live-updatable via setSuppressDurableAckHeader(), so a test can start
+    // in the gap and later let the cluster "settle".
+    private volatile boolean suppressDurableAckHeader;
     // When > 0, the next handshake responds with this status code + the
     // reason phrase from {@link #rejectingStatusReason}. Used to simulate
     // 401, 403, 404, 426, 503, etc. that the failover loop should
@@ -125,6 +139,23 @@ public class TestWebSocketServer implements Closeable {
      */
     public TestWebSocketServer(WebSocketServerHandler handler,
                                boolean emitDurableAckHeader, String advertisedRole) throws IOException {
+        this(handler, emitDurableAckHeader, advertisedRole, 0);
+    }
+
+    /**
+     * @param requestedPort loopback port to bind, or {@code 0} for an
+     *                      OS-assigned ephemeral port. A caller-chosen port
+     *                      lets a test model a server that goes DOWN and later
+     *                      comes back UP on the SAME endpoint (down-then-up
+     *                      outage realism): allocate via
+     *                      {@code TestPorts.findUnusedPort()}, let the client
+     *                      bang on the refused port, then bind here. Carries
+     *                      the standard bind-close-reuse exposure every
+     *                      pre-selected-port test in this suite accepts.
+     */
+    public TestWebSocketServer(WebSocketServerHandler handler,
+                               boolean emitDurableAckHeader, String advertisedRole,
+                               int requestedPort) throws IOException {
         this.handler = handler;
         this.emitDurableAckHeader = emitDurableAckHeader;
         this.advertisedRole = advertisedRole;
@@ -134,7 +165,7 @@ public class TestWebSocketServer implements Closeable {
         // which another process could grab a pre-selected port before start()
         // binds it. Pinning to loopback keeps client "localhost" connections
         // routed here rather than to a wildcard listener on the same port.
-        serverSocket = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+        serverSocket = new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
         this.port = serverSocket.getLocalPort();
     }
@@ -222,6 +253,18 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * When enabled, the server fails the WebSocket upgrade on the egress read
+     * path ({@code /read/...}) while still serving the ingest write path
+     * ({@code /write/...}) normally. This lets a single server, addressed by a
+     * single cluster config, accept ingest senders but reject query clients --
+     * e.g. to exercise build()'s unwind of an already-built sender pool when the
+     * query pool fails.
+     */
+    public void setRejectReadUpgrade(boolean rejectReadUpgrade) {
+        this.rejectReadUpgrade = rejectReadUpgrade;
+    }
+
+    /**
      * Configure the server to reject the next handshake with an arbitrary
      * HTTP status code (e.g. 401, 403, 404, 426, 503). Pass {@code 0} to
      * clear and resume normal 101 upgrades. Tests use this to drive the
@@ -233,16 +276,37 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * When enabled, 101 upgrade responses omit the {@code X-QWP-Durable-Ack}
+     * header even on a server constructed with {@code emitDurableAckHeader} —
+     * the next opted-in connect ({@code request_durable_ack=on}) observes a
+     * durable-ack capability gap. Pass {@code false} to clear and resume
+     * advertising, the way a rolling upgrade eventually settles. The setting
+     * applies to every new handshake until cleared.
+     */
+    public void setSuppressDurableAckHeader(boolean suppressDurableAckHeader) {
+        this.suppressDurableAckHeader = suppressDurableAckHeader;
+    }
+
+    /**
      * When enabled, the server sends a {@code SERVER_INFO} frame immediately
-     * after a successful 101 upgrade, the way a real egress endpoint does. The
-     * advertised role follows {@link #setAdvertisedRole}, defaulting to
-     * {@code STANDALONE}. Leave disabled for ingress (Sender) tests.
+     * after a successful 101 upgrade on the egress read path ({@code /read/...}),
+     * the way a real egress endpoint does. Ingest write-path ({@code /write/...})
+     * connections never receive it -- their ACK-only response stream would choke
+     * on an unexpected frame -- so one server can serve both an ingest and a
+     * query pool from a single cluster config. The advertised role follows
+     * {@link #setAdvertisedRole}, defaulting to {@code STANDALONE}.
      */
     public void setSendServerInfo(boolean sendServerInfo) {
         this.sendServerInfo = sendServerInfo;
     }
 
-    private static byte[] buildServerInfoFrame(byte role) {
+    // Advertised SERVER_INFO capabilities. CAP_ZONE is unsupported here: the
+    // frame builder emits no zone_id trailer.
+    public void setCapabilities(int capabilities) {
+        this.capabilities = capabilities;
+    }
+
+    private static byte[] buildServerInfoFrame(byte role, int capabilities) {
         byte[] clusterId = "questdb".getBytes(StandardCharsets.UTF_8);
         byte[] nodeId = "test-node".getBytes(StandardCharsets.UTF_8);
         int bodyLen = 1 + 1 + 8 + 4 + 8 + 2 + clusterId.length + 2 + nodeId.length;
@@ -255,13 +319,17 @@ public class TestWebSocketServer implements Closeable {
         bb.put((byte) 0x18);    // SERVER_INFO msg_kind
         bb.put(role);
         bb.putLong(0L);         // epoch
-        bb.putInt(0);           // capabilities (no CAP_ZONE -> no zone_id trailer)
+        bb.putInt(capabilities); // CAP_ZONE unsupported here -> no zone_id trailer
         bb.putLong(1L);         // server_wall_ns (positive)
         bb.putShort((short) clusterId.length);
         bb.put(clusterId);
         bb.putShort((short) nodeId.length);
         bb.put(nodeId);
         return bb.array();
+    }
+
+    private static boolean isReadPath(String path) {
+        return path != null && path.startsWith("/read");
     }
 
     private static byte roleByte(String role) {
@@ -326,6 +394,10 @@ public class TestWebSocketServer implements Closeable {
         private boolean isClosed;
         private OutputStream out;
         private Thread readThread;
+        // Request path from the WebSocket upgrade GET line (e.g. /write/v4,
+        // /read/v1). Captured during the handshake so the post-upgrade logic can
+        // distinguish ingest from egress connections.
+        private String requestPath = "";
 
         ClientHandler(Socket socket) {
             this.socket = socket;
@@ -473,7 +545,15 @@ public class TestWebSocketServer implements Closeable {
 
             String key = null;
             String authorization = "";
-            for (String line : request.toString().split("\r\n")) {
+            String[] lines = request.toString().split("\r\n");
+            if (lines.length > 0) {
+                // GET <path> HTTP/1.1
+                String[] parts = lines[0].split(" ");
+                if (parts.length >= 2) {
+                    requestPath = parts[1];
+                }
+            }
+            for (String line : lines) {
                 String lower = line.toLowerCase();
                 if (lower.startsWith("sec-websocket-key:")) {
                     key = line.substring(18).trim();
@@ -486,6 +566,13 @@ public class TestWebSocketServer implements Closeable {
                 return false;
             }
             capturedAuthHeaders.add(authorization);
+
+            // Read-path reject: drop the egress upgrade before the 101 so the
+            // query pool's connect fails fast, while ingest write-path upgrades
+            // still complete on this same server.
+            if (rejectReadUpgrade && isReadPath(requestPath)) {
+                return false;
+            }
 
             // Arbitrary-status reject path: tests use setRejectWithStatus
             // to drive the failover loop's terminal-vs-transient
@@ -526,7 +613,7 @@ public class TestWebSocketServer implements Closeable {
                     .append("Upgrade: websocket\r\n")
                     .append("Connection: Upgrade\r\n")
                     .append("Sec-WebSocket-Accept: ").append(acceptKey).append("\r\n");
-            if (emitDurableAckHeader) {
+            if (emitDurableAckHeader && !suppressDurableAckHeader) {
                 sb.append("X-QWP-Durable-Ack: enabled\r\n");
             }
             String role = advertisedRole;
@@ -583,8 +670,12 @@ public class TestWebSocketServer implements Closeable {
                     liveConnections.incrementAndGet();
 
                     try {
-                        if (sendServerInfo) {
-                            sendBinary(buildServerInfoFrame(roleByte(advertisedRole)));
+                        // SERVER_INFO is an egress-only frame: send it only on a
+                        // read-path (query) connection. An ingest write-path
+                        // connection parses every inbound frame as an ACK and
+                        // would fail on it.
+                        if (sendServerInfo && isReadPath(requestPath)) {
+                            sendBinary(buildServerInfoFrame(roleByte(advertisedRole), capabilities));
                         }
 
                         byte[] readBuf = new byte[8192];

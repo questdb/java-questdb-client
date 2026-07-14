@@ -46,10 +46,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * (no orphans submitted) costs one core thread; submitted-and-finished
  * drainers are GC'd after they complete.
  * <p>
- * Closing the pool requests every still-running drainer to stop and
- * waits up to a few seconds for them to exit cleanly. Drainers that
- * don't exit in time are left to finish on their own — the pool's
- * underlying executor uses daemon threads so they don't block JVM exit.
+ * Closing the pool uses a split stop policy: drainers that never started
+ * draining (still inside their connect-retry loop — e.g. the cluster is
+ * unreachable) are stop-signaled immediately, because no grace window can
+ * help them finish; drainers actively replaying frames get a graceful
+ * window to reach {@code acked >= target} before being signaled. Drainers
+ * that don't exit in time (typically parked in a blocking native connect
+ * that neither unpark nor interrupt cancels) are left to finish on their
+ * own — the pool's underlying executor uses daemon threads so they don't
+ * block JVM exit. An interrupted {@code close()} skips the graceful
+ * window: every active drainer is stop-signaled immediately, then the
+ * executor is shut down hard. A drainer cut down mid-drain exits STOPPED
+ * with its unacked rows still in SF — re-adopted by the next orphan scan,
+ * never dropped.
  */
 public final class BackgroundDrainerPool implements QuietCloseable {
 
@@ -66,9 +75,12 @@ public final class BackgroundDrainerPool implements QuietCloseable {
     // either lands before close (and close waits for it to finish) or
     // sees the closed bit and throws.
     private static final int CLOSED_BIT = Integer.MIN_VALUE;
-    // Time we let drainers finish their drain naturally before signaling
-    // stop. awaitTermination returns as soon as the last drainer exits,
-    // so this only matters when something is genuinely stuck.
+    // Time we let ACTIVELY DRAINING drainers finish naturally before
+    // signaling stop. Connect-phase drainers are stop-signaled before this
+    // window even starts (see close()), so during an outage — when no
+    // drainer can be draining — close() does not pay this in full.
+    // awaitTermination returns as soon as the last drainer exits, so this
+    // only matters when something is genuinely stuck.
     private static final long GRACEFUL_DRAIN_MILLIS = 2_500L;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainerPool.class);
     // After signaling stop, give drainers a brief window to unwind cleanly
@@ -125,11 +137,33 @@ public final class BackgroundDrainerPool implements QuietCloseable {
         while (state.get() != CLOSED_BIT) {
             Compat.onSpinWait();
         }
-        // Reject new tasks but let in-flight drainers finish their drain
-        // naturally. Without this grace window a drainer that's seconds
-        // away from acked >= target gets requestStop()'d and exits as
-        // STOPPED — its engine.close() then sees fullyDrained=false and
-        // leaves the slot's .sfa files behind, defeating drain_orphans.
+        // Split stop policy. The graceful window below exists so a drainer
+        // that is seconds away from acked >= target is not cut down
+        // mid-drain (its engine.close() would see fullyDrained=false and
+        // leave the slot's .sfa files behind, defeating drain_orphans). A
+        // drainer that never started draining — still inside its
+        // connect-retry loop, e.g. the cluster is unreachable and
+        // Invariant B retries forever — cannot possibly use that window
+        // productively, so stop it NOW: it wakes from its backoff park
+        // within ~50ms (STOP_CHECK_PARK_CHUNK_NANOS) and exits as STOPPED,
+        // cutting close() latency during an outage from
+        // GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS (~3s) to roughly one
+        // stop-check park chunk. ackedFsn stays -1 until the drain loop's
+        // first poll, so `< 0` discriminates "never connected/started
+        // draining" from "actively draining"; the moments-wide race with a
+        // just-connected drainer is benign — it exits as STOPPED and the
+        // slot is re-adopted by the next scan. A drainer parked inside a
+        // blocking native connect ignores the stop until its background
+        // connect deadline resolves; that one still burns the full grace +
+        // stop windows below and is then abandoned to exit on its own
+        // (daemon thread).
+        for (BackgroundDrainer d : active) {
+            if (d.outcome() == BackgroundDrainer.DrainOutcome.PENDING && d.getAckedFsn() < 0) {
+                d.requestStop();
+            }
+        }
+        // Reject new tasks but let actively-draining drainers finish
+        // naturally.
         executor.shutdown();
         try {
             if (!executor.awaitTermination(GRACEFUL_DRAIN_MILLIS, TimeUnit.MILLISECONDS)) {
@@ -147,6 +181,22 @@ public final class BackgroundDrainerPool implements QuietCloseable {
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            // Signal stop BEFORE shutdownNow's interrupts land. Actively-
+            // draining drainers were spared by the split-stop above, and the
+            // graceful-timeout sweep never runs on this path -- without this
+            // sweep they would rely solely on the drainer-side fallback that
+            // folds a pending interrupt into stopRequested
+            // (BackgroundDrainer.stopRequestedOrInterrupted). This sweep is
+            // the authoritative signal: it is synchronous with close() (the
+            // caller observes fully stop-signaled drainers on return) and
+            // covers a drainer that is between park-loop checks when the
+            // interrupt lands. Cutting a mid-drain drainer short here is
+            // deliberate -- an interrupted close() means "leave now", and
+            // its unacked rows stay in SF for the next orphan scan (no data
+            // loss), exactly like the graceful-timeout sweep.
+            for (BackgroundDrainer d : active) {
+                d.requestStop();
+            }
             executor.shutdownNow();
         }
     }

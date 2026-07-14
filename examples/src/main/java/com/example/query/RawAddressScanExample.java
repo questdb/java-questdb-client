@@ -1,13 +1,21 @@
 package com.example.query;
 
+import io.questdb.client.Query;
+import io.questdb.client.QueryException;
+import io.questdb.client.QuestDB;
 import io.questdb.client.cutlass.qwp.client.ColumnView;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
-import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.std.Unsafe;
 
 /**
  * Raw-address (SIMD-friendly) scan over a fixed-width column.
+ * <p>
+ * Runs through the pooled {@link QuestDB} facade like the other query examples;
+ * the raw {@link ColumnView} pointer surface used here lives on the
+ * {@link QwpColumnBatch} and is available regardless of how the query was
+ * submitted. For the low-level {@link io.questdb.client.cutlass.qwp.client.QwpQueryClient}
+ * primitive itself, see {@link QwpQueryClientExample}.
  * <p>
  * For consumers who want to vectorise -- via the JDK Vector API, JNI to a
  * native kernel, or hand-rolled {@code Unsafe} loops -- {@link ColumnView}
@@ -32,65 +40,67 @@ import io.questdb.client.std.Unsafe;
  * accessor. In a real SIMD consumer you'd hand {@code valuesAddr} and
  * {@code nonNullCount} to a vector kernel instead.
  * <p>
- * Assumes a table exists:
+ * Assumes the {@code trades} table the ingest examples write:
  * <pre>
- *   CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE, qty LONG)
- *       TIMESTAMP(ts) PARTITION BY DAY WAL;
+ *   CREATE TABLE trades (
+ *       symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP
+ *   ) TIMESTAMP(timestamp) PARTITION BY DAY WAL;
  * </pre>
  */
 public class RawAddressScanExample {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws InterruptedException {
         final double[] rawSum = {0.0};
         final double[] typedSum = {0.0};
         final long[] rawCount = {0};
 
-        try (QwpQueryClient client = QwpQueryClient.newPlainText("localhost", 9000)) {
-            client.connect();
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:9000;")) {
+            try (Query q = db.borrowQuery()) {
+                q.sql(
+                        "SELECT price FROM trades WHERE symbol = 'ETH-USD'")
+                        .handler(new QwpColumnBatchHandler() {
+                            @Override
+                            public void onBatch(QwpColumnBatch batch) {
+                                ColumnView prices = batch.column(0);
 
-            client.execute(
-                    "SELECT price FROM trades WHERE sym = 'AAPL'",
-                    new QwpColumnBatchHandler() {
-                        @Override
-                        public void onBatch(QwpColumnBatch batch) {
-                            ColumnView prices = batch.column(0);
+                                long base = prices.valuesAddr();
+                                int stride = prices.bytesPerValue();   // 8 for DOUBLE
+                                int dense = prices.nonNullCount();
 
-                            long base = prices.valuesAddr();
-                            int stride = prices.bytesPerValue();   // 8 for DOUBLE
-                            int dense = prices.nonNullCount();
+                                // Raw inner loop: pure pointer arithmetic, no per-row
+                                // ObjList lookup or null check. The dense values array
+                                // skips NULL rows entirely, so the loop trip count is
+                                // nonNullCount, not rowCount.
+                                for (int i = 0; i < dense; i++) {
+                                    rawSum[0] += Unsafe.getUnsafe().getDouble(base + (long) stride * i);
+                                }
+                                rawCount[0] += dense;
 
-                            // Raw inner loop: pure pointer arithmetic, no per-row
-                            // ObjList lookup or null check. The dense values array
-                            // skips NULL rows entirely, so the loop trip count is
-                            // nonNullCount, not rowCount.
-                            for (int i = 0; i < dense; i++) {
-                                rawSum[0] += Unsafe.getUnsafe().getDouble(base + (long) stride * i);
-                            }
-                            rawCount[0] += dense;
-
-                            // Cross-check: same result via the typed accessor.
-                            int rows = batch.getRowCount();
-                            for (int r = 0; r < rows; r++) {
-                                if (!prices.isNull(r)) {
-                                    typedSum[0] += prices.getDoubleValue(r);
+                                // Cross-check: same result via the typed accessor.
+                                int rows = batch.getRowCount();
+                                for (int r = 0; r < rows; r++) {
+                                    if (!prices.isNull(r)) {
+                                        typedSum[0] += prices.getDoubleValue(r);
+                                    }
                                 }
                             }
-                        }
 
-                        @Override
-                        public void onEnd(long totalRows) {
-                            System.out.printf(
-                                    "rawCount=%d rawSum=%.6f typedSum=%.6f match=%b%n",
-                                    rawCount[0], rawSum[0], typedSum[0], rawSum[0] == typedSum[0]
-                            );
-                        }
+                            @Override
+                            public void onEnd(long totalRows) {
+                                System.out.printf(
+                                        "rawCount=%d rawSum=%.6f typedSum=%.6f match=%b%n",
+                                        rawCount[0], rawSum[0], typedSum[0], rawSum[0] == typedSum[0]
+                                );
+                            }
 
-                        @Override
-                        public void onError(byte status, String message) {
-                            System.err.println("query failed: status=" + status + " msg=" + message);
+                            @Override
+                            public void onError(byte status, String message) {
+                            }
                         }
-                    }
-            );
+                ).submit().await();
+            } catch (QueryException e) {
+                System.err.printf("query failed: status=0x%02X %s%n", e.getStatus() & 0xFF, e.getMessage());
+            }
         }
     }
 }

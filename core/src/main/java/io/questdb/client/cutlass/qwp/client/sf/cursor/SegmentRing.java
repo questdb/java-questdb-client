@@ -265,8 +265,12 @@ public final class SegmentRing implements QuietCloseable {
             // pivot would degrade back to O(N²) on exactly that common case.
             sortByBaseSeq(opened, 0, opened.size());
             // Sanity: the recovered segments must form a contiguous FSN range.
-            // Detect gaps so a partial-write/manual-deletion mishap doesn't
-            // silently produce duplicate or missing FSNs after recovery.
+            // Detect gaps so they don't silently produce duplicate or missing
+            // FSNs after recovery. A gap means a segment went missing (a
+            // manual deletion) or a sealed segment under-recovered -- its tail
+            // was cut short by a sparse/unbacked page or a mid-file media error
+            // (bad sector), the same class of fault scanFrames tolerates on the
+            // active segment but which corrupts the range on a sealed one.
             for (int i = 1, n = opened.size(); i < n; i++) {
                 MmapSegment prev = opened.get(i - 1);
                 MmapSegment curr = opened.get(i);
@@ -276,7 +280,10 @@ public final class SegmentRing implements QuietCloseable {
                             "FSN gap in recovered segments: prev baseSeq=" + prev.baseSeq()
                                     + " frameCount=" + prev.frameCount()
                                     + " expected next baseSeq=" + expected
-                                    + " but got " + curr.baseSeq());
+                                    + " but got " + curr.baseSeq()
+                                    + " -- a segment was deleted, or a sealed segment's tail was"
+                                    + " truncated (sparse/unbacked page or disk media error);"
+                                    + " check disk health");
                 }
             }
             // The newest segment becomes the active. Even if it's full, that's OK:
@@ -510,6 +517,35 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /** Active segment -- exposed for the I/O thread's "send next batch" path. */
+    /**
+     * Walks every published frame in the ring (sealed segments plus the active
+     * segment) and returns the FSN of the LAST frame whose payload does NOT
+     * carry the given flag bit, or {@code -1} when every published frame
+     * carries it (or the ring is empty). All frames above the returned FSN
+     * carry the flag.
+     * <p>
+     * Recovery-time helper: locates the last commit-bearing QWP frame below a
+     * potentially orphaned FLAG_DEFER_COMMIT tail left behind by a producer
+     * that crashed (or closed) mid-transaction. Call before the I/O loop and
+     * producer start appending; the walk is not synchronized against appends
+     * into the active segment. See
+     * {@link MmapSegment#findLastFrameFsnWithoutPayloadFlag} for the
+     * positive-identification contract: frames that do not parse as protocol
+     * messages count as commit-bearing (retirement barriers), never as
+     * trimmable.
+     */
+    public synchronized long findLastFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
+        long best = -1L;
+        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            long fsn = sealedSegments.get(i).findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
+            if (fsn > best) {
+                best = fsn;
+            }
+        }
+        long fsn = active.findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
+        return Math.max(best, fsn);
+    }
+
     public MmapSegment getActive() {
         return active;
     }

@@ -31,10 +31,11 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
  * {@code X-QWP-Version} outside the client's supported range. Treated as
  * transient at every layer per sf-client.md section 13.3: the per-endpoint
  * round walks to the next host (rolling upgrade can leave one node ahead of
- * or behind its peers), and a full round of mismatches consumes the per-outage
- * reconnect budget. Only after the budget exhausts does the connect loop
- * surface a terminal error -- as {@code PROTOCOL_VIOLATION} via the natural
- * giveup path, not {@code SECURITY_ERROR}.
+ * or behind its peers). The background reconnect loop retries a full round
+ * of mismatches indefinitely (Invariant B: no wall-clock give-up); the
+ * blocking (sync) initial connect consumes its retry budget and surfaces a
+ * {@code LineSenderException} from {@code fromConfig} on exhaustion. Never
+ * classified as {@code SECURITY_ERROR}.
  */
 public final class QwpVersionMismatchException extends HttpClientException {
     public QwpVersionMismatchException(int serverVersion, int clientMaxVersion) {

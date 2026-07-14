@@ -48,6 +48,7 @@ set(
         src/main/c/share/files.h
         src/main/c/share/net.h
         src/main/c/share/os.h
+        src/main/c/share/glibc_compat.h
         src/main/c/share/ooo.cpp
         src/main/c/share/cpprt_overrides.h
         src/main/c/share/cpprt_overrides.cpp

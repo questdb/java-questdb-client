@@ -384,7 +384,8 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
             long initialCredit,
             int bindCount,
             long bindPayloadPtr,
-            long bindPayloadLen
+            long bindPayloadLen,
+            long queryFlags
     ) throws InterruptedException {
         pendingRequest.sql = sql;
         pendingRequest.requestId = requestId;
@@ -392,6 +393,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         pendingRequest.bindCount = bindCount;
         pendingRequest.bindPayloadPtr = bindPayloadPtr;
         pendingRequest.bindPayloadLen = bindPayloadLen;
+        pendingRequest.queryFlags = queryFlags;
         requests.put(pendingRequest);
     }
 
@@ -715,6 +717,11 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         if (req.bindCount > 0 && req.bindPayloadLen > 0) {
             sendScratch.putBlockOfBytes(req.bindPayloadPtr, req.bindPayloadLen);
         }
+        // Optional query_flags trailer; omitted when zero so a baseline frame
+        // stays byte-identical and the server defaults the flags to 0.
+        if (req.queryFlags != 0) {
+            sendScratch.putVarint(req.queryFlags);
+        }
         wsClient.sendBinary(sendScratch.getBufferPtr(), sendScratch.getPosition());
         sendScratch.reset();
     }
@@ -773,6 +780,7 @@ public class QwpEgressIoThread implements Runnable, WebSocketFrameHandler {
         long bindPayloadLen;
         long bindPayloadPtr;
         long initialCredit;
+        long queryFlags;
         long requestId;
         CharSequence sql;
     }

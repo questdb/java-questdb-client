@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.tools;
 
+import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Rnd;
@@ -139,6 +140,18 @@ public final class TestUtils {
         return Long.parseLong(reverseBeHex(hex), 16);
     }
 
+    /**
+     * Creates a unique temp directory under {@code java.io.tmpdir}, named
+     * {@code prefix + <nanoTime>}, and returns its path. Pair with
+     * {@link #removeTmpDir(String)} in {@code tearDown}.
+     */
+    public static String createTmpDir(String prefix) {
+        String dir = Paths.get(System.getProperty("java.io.tmpdir"),
+                prefix + System.nanoTime()).toString();
+        Assert.assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
+        return dir;
+    }
+
     @NotNull
     public static Rnd generateRandom(Logger log) {
         return generateRandom(log, System.nanoTime(), System.currentTimeMillis());
@@ -170,6 +183,36 @@ public final class TestUtils {
 
     public static String ipv4ToString(int ip) {
         return ((ip >> 24) & 0xff) + "." + ((ip >> 16) & 0xff) + "." + ((ip >> 8) & 0xff) + "." + (ip & 0xff);
+    }
+
+    /**
+     * Flat (non-recursive) cleanup for a directory created by
+     * {@link #createTmpDir(String)}: removes every entry in {@code tmpDir}
+     * (the SF cursor tests only write flat {@code .sfa}/{@code .corrupt}
+     * files) and then the directory itself. A {@code null} argument is a
+     * no-op, so it is safe to call from {@code tearDown} before {@code setUp}
+     * ran.
+     */
+    public static void removeTmpDir(String tmpDir) {
+        if (tmpDir == null) {
+            return;
+        }
+        long find = Files.findFirst(tmpDir);
+        if (find > 0) {
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && !".".equals(name) && !"..".equals(name)) {
+                        Files.remove(tmpDir + "/" + name);
+                    }
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+        }
+        Files.remove(tmpDir);
     }
 
     /**
@@ -266,20 +309,23 @@ public final class TestUtils {
                 return;
             }
 
-            // Checks that the same tag used for allocation and freeing native memory
+            // Every tag must return to its baseline. The previous shape
+            // (ported from upstream, which exempts NATIVE_SQL_COMPILER only)
+            // absorbed any growth confined to a single tag into a tolerated
+            // diff, so a lone-tag leak (e.g. NATIVE_DEFAULT) passed the check.
+            // This client has no SQL-compiler tag, so no exemption applies:
+            // assert strict per-tag equality, then total equality.
             long memAfter = Unsafe.getMemUsed();
-            long memNativeSqlCompilerDiff = 0;
             Assert.assertTrue(memAfter > -1);
-            if (mem != memAfter) {
-                for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-                    long actualMemByTag = Unsafe.getMemUsedByTag(i);
-                    if (memoryUsageByTag[i] != actualMemByTag) {
-                        Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
-                        memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
-                    }
+            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                long actualMemByTag = Unsafe.getMemUsedByTag(i);
+                if (memoryUsageByTag[i] != actualMemByTag) {
+                    Assert.assertEquals(
+                            "native memory leaked or over-freed under tag " + MemoryTag.nameOf(i),
+                            memoryUsageByTag[i], actualMemByTag);
                 }
-                Assert.assertEquals(mem + memNativeSqlCompilerDiff, memAfter);
             }
+            Assert.assertEquals("total native memory", mem, memAfter);
         }
 
         public void skipChecks() {

@@ -74,7 +74,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     // Sentinel pushed during close() to nudge the dispatcher out of take().
     // Identity-compared in the loop body; never delivered to the handler.
     private static final SenderError POISON = new SenderError(
-            SenderError.Category.UNKNOWN, SenderError.Policy.HALT,
+            SenderError.Category.UNKNOWN, SenderError.Policy.TERMINAL,
             SenderError.NO_STATUS_BYTE, null, SenderError.NO_MESSAGE_SEQUENCE,
             -1L, -1L, null, 0L);
     // Set the first time the dispatcher delivers an error to a non-default
@@ -88,8 +88,8 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     // SenderError the I/O loop latched via recordFatal, marked here through
     // markTerminal) to a non-default handler. This -- not
     // deliveredToCustomHandler -- is what close() consults: a routine
-    // DROP_AND_CONTINUE rejection delivered earlier must NOT suppress the
-    // close() safety net for a later, genuinely-unsurfaced HALT terminal.
+    // RETRIABLE rejection delivered earlier must NOT suppress the
+    // close() safety net for a later, genuinely-unsurfaced TERMINAL error.
     private final AtomicBoolean deliveredTerminalToCustomHandler = new AtomicBoolean();
     private final AtomicLong dropped = new AtomicLong();
     // volatile so the user can swap the handler post-connect, mirroring
@@ -112,7 +112,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     // once via markTerminal (first-writer-wins, mirroring recordFatal's
     // latch). The dispatch loop identity-compares delivered errors against
     // it so only delivery of THIS terminal -- not an earlier
-    // DROP_AND_CONTINUE -- flips deliveredTerminalToCustomHandler. volatile:
+    // RETRIABLE rejection -- flips deliveredTerminalToCustomHandler. volatile:
     // written on the I/O thread, read on the dispatcher thread.
     private volatile SenderError terminalServerError;
     private final AtomicLong totalDelivered = new AtomicLong();
@@ -230,7 +230,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
      * whether its safety-net rethrow is still needed. Unlike
      * {@link #hasDeliveredToCustomHandler()} ("any error ever"), this stays
      * {@code false} when the only thing the custom handler saw was an earlier
-     * {@code DROP_AND_CONTINUE} rejection, or when the terminal reached only
+     * {@code RETRIABLE} rejection, or when the terminal reached only
      * the default handler after a {@code setErrorHandler(null)} revert, or when
      * the terminal is still queued/abandoned because the handler is slow. In
      * all those cases close() must still surface the terminal loudly.
@@ -245,7 +245,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
      * Called by {@code CursorWebSocketSendLoop.recordFatal} on the I/O thread
      * before the matching {@link #offer}, so the marker is visible by the time
      * the dispatcher delivers it. First-writer-wins, mirroring recordFatal's
-     * own write-once latch -- a stray later HALT cannot re-point the marker at
+     * own write-once latch -- a stray later TERMINAL cannot re-point the marker at
      * an error that is not the latched terminal.
      */
     public void markTerminal(SenderError err) {
@@ -328,7 +328,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
                 deliveredToCustomHandler.set(true);
                 // Identity match: only THIS delivery of the latched terminal
                 // counts as the custom handler owning the terminal. An earlier
-                // DROP_AND_CONTINUE (err != terminalServerError) does not, so
+                // RETRIABLE rejection (err != terminalServerError) does not, so
                 // close() will not suppress a later genuine terminal.
                 if (err == terminalServerError) {
                     deliveredTerminalToCustomHandler.set(true);

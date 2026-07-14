@@ -67,6 +67,7 @@ public final class SegmentManager implements QuietCloseable {
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
+    private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
     private final AtomicLong fileGeneration = new AtomicLong();
     private final Object lock = new Object();
@@ -107,6 +108,7 @@ public final class SegmentManager implements QuietCloseable {
     // {@link #lock}; the lock covers both paths so the counter stays
     // consistent across registration boundaries.
     private long totalBytes;
+    private long workerJoinTimeoutMillis = WORKER_JOIN_TIMEOUT_MILLIS;
     // volatile because wakeWorker() reads workerThread without holding the
     // monitor; the synchronized start()/close() pair handles the
     // start-vs-close ordering.
@@ -143,10 +145,16 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
+        // The pathScratch field initializer has already allocated its native
+        // buffer by the time this body runs, so a validation throw must free
+        // it or every failed construction leaks 256 bytes of native memory
+        // (e.g. a drainer retry loop hitting the same bad config).
         if (segmentSizeBytes < MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1) {
+            pathScratch.close();
             throw new IllegalArgumentException("segmentSizeBytes too small: " + segmentSizeBytes);
         }
         if (maxTotalBytes < segmentSizeBytes) {
+            pathScratch.close();
             throw new IllegalArgumentException(
                     "maxTotalBytes (" + maxTotalBytes + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");
@@ -162,10 +170,28 @@ public final class SegmentManager implements QuietCloseable {
         Thread t = workerThread;
         if (t != null) {
             LockSupport.unpark(t);
+            // A pending interrupt on the caller makes Thread.join() throw at
+            // once; clear it so the join actually reaps the worker (which
+            // still owns segment files), then restore it for the rest of the
+            // interrupted-teardown protocol.
+            boolean interrupted = Thread.interrupted();
+            long deadlineNanos = System.nanoTime() + workerJoinTimeoutMillis * 1_000_000L;
             try {
-                t.join(5_000);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+                while (t.isAlive()) {
+                    long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+                    if (remainingMillis <= 0) {
+                        break;
+                    }
+                    try {
+                        t.join(remainingMillis);
+                    } catch (InterruptedException ignored) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
             if (t.isAlive()) {
                 LOG.warn("SegmentManager worker did not stop before close wait completed; "
@@ -279,6 +305,11 @@ public final class SegmentManager implements QuietCloseable {
     @TestOnly
     public void setBeforeTrimSyncHook(Runnable hook) {
         this.beforeTrimSyncHook = hook;
+    }
+
+    @TestOnly
+    public void setWorkerJoinTimeoutMillis(long millis) {
+        this.workerJoinTimeoutMillis = millis;
     }
 
     public synchronized void start() {

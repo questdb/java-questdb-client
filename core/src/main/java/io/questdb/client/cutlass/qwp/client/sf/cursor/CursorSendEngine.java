@@ -88,6 +88,22 @@ public final class CursorSendEngine implements QuietCloseable {
     // full symbol-dict delta), so producer-side schema reset on recovery
     // is not required.
     private final boolean wasRecoveredFromDisk;
+    // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame found in a
+    // ring recovered from disk, or -1 for fresh/memory rings and recovered
+    // rings whose every frame is deferred. Frames above this FSN in the
+    // recovered ring belong to a transaction whose commit frame was never
+    // published; the server will never ack them until some later commit
+    // covers them. Read by the sender's close-time drain to avoid waiting on
+    // acks that cannot arrive.
+    private long recoveredCommitBoundaryFsn = -1L;
+    // FSN of the last frame of a recovered orphaned deferred tail, or -1 when
+    // the recovered ring has no such tail. When >= 0, frames
+    // [recoveredCommitBoundaryFsn + 1 .. recoveredOrphanTipFsn] all carry
+    // FLAG_DEFER_COMMIT with no covering commit frame -- an aborted
+    // transaction. The send loop must never transmit them; it retires the
+    // range with a cumulative self-acknowledge once everything below is
+    // server-acked (CursorWebSocketSendLoop.tryRetireOrphanTail).
+    private long recoveredOrphanTipFsn = -1L;
     // Engine-owned mmap'd watermark file. {@code null} in memory mode and
     // in disk mode if open() failed (we proceed without it; recovery just
     // falls back to lowestBase - 1). Lifetime tied to the engine: opened
@@ -145,15 +161,30 @@ public final class CursorSendEngine implements QuietCloseable {
         boolean memoryMode = sfDir == null;
         SlotLock acquiredLock = null;
         if (!memoryMode) {
-            if (sfDir.isEmpty()) {
-                throw new IllegalArgumentException("sfDir must not be empty");
+            try {
+                if (sfDir.isEmpty()) {
+                    throw new IllegalArgumentException("sfDir must not be empty");
+                }
+                // Acquire the slot lock BEFORE we touch any *.sfa files. Two
+                // engines pointed at the same slot would otherwise race on
+                // recovery and create overlapping FSN ranges. SlotLock.acquire
+                // also creates the slot dir if it doesn't exist yet — no
+                // separate mkdir step needed here.
+                acquiredLock = SlotLock.acquire(sfDir);
+            } catch (Throwable t) {
+                // The delegating constructors evaluate `new SegmentManager(...)`
+                // BEFORE this body runs, so on a pre-try throw (e.g. slot lock
+                // collision) an owned manager is already alive and would leak
+                // its native path-scratch sink -- 256 bytes per failed
+                // construction attempt. Close it before propagating.
+                if (ownsManager) {
+                    try {
+                        manager.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                throw t;
             }
-            // Acquire the slot lock BEFORE we touch any *.sfa files. Two
-            // engines pointed at the same slot would otherwise race on
-            // recovery and create overlapping FSN ranges. SlotLock.acquire
-            // also creates the slot dir if it doesn't exist yet — no
-            // separate mkdir step needed here.
-            acquiredLock = SlotLock.acquire(sfDir);
         }
         this.slotLock = acquiredLock;
         this.sfDir = sfDir;
@@ -168,7 +199,6 @@ public final class CursorSendEngine implements QuietCloseable {
         // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
-        boolean managerStarted = false;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -246,6 +276,30 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
                 }
+                // Locate the last commit-bearing frame below a potentially
+                // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
+                // closed) mid-transaction leaves deferred frames with no
+                // covering commit frame at the top of the ring. The server
+                // never acks uncommitted deferred frames, so (a) close-time
+                // drains must not wait for them (see the sender's
+                // drainOnClose), and (b) replaying them into a NEW session's
+                // commit would resurrect half a transaction -- see the WARN
+                // below. Computed before the I/O loop or producer append.
+                this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
+                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE
+                );
+                if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
+                    this.recoveredOrphanTipFsn = publishedFsn;
+                    LOG.warn("recovered SF log ends with {} deferred frame(s) whose transaction was never "
+                                    + "committed [commitBoundaryFsn={}, publishedFsn={}]. The tail belongs to an "
+                                    + "aborted transaction: it will never be transmitted and its slots are "
+                                    + "retired (trimmed) once every frame below it is server-acked.",
+                            publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
+                            recoveredCommitBoundaryFsn, publishedFsn);
+                }
             } else {
                 // Fresh start with no recovered segments. Any stale
                 // watermark from a prior fully-drained session refers
@@ -277,7 +331,6 @@ public final class CursorSendEngine implements QuietCloseable {
 
             if (ownsManager) {
                 manager.start();
-                managerStarted = true;
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress);
             // All construction succeeded — commit the ring and
@@ -288,7 +341,10 @@ public final class CursorSendEngine implements QuietCloseable {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
             // try/catch so a single failure doesn't strand later cleanups.
-            if (ownsManager && managerStarted) {
+            // Closing an owned-but-never-started manager is safe (no worker to
+            // join) and required: skipping it leaked the manager's native
+            // path-scratch sink whenever construction failed before start().
+            if (ownsManager) {
                 try {
                     manager.close();
                 } catch (Throwable ignored) {
@@ -582,6 +638,25 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public boolean wasRecoveredFromDisk() {
         return wasRecoveredFromDisk;
+    }
+
+    /**
+     * FSN of the last commit-bearing frame in a disk-recovered ring, or
+     * {@code -1} for fresh/memory rings. Frames above it are an orphaned
+     * deferred tail (transaction never committed) that the server will not
+     * ack until a later commit-bearing frame covers them.
+     */
+    public long recoveredCommitBoundaryFsn() {
+        return recoveredCommitBoundaryFsn;
+    }
+
+    /**
+     * FSN of the last frame of a recovered orphaned deferred tail, or
+     * {@code -1} when none. See {@link #recoveredCommitBoundaryFsn()}: the
+     * orphan range is {@code [recoveredCommitBoundaryFsn() + 1 .. this]}.
+     */
+    public long recoveredOrphanTipFsn() {
+        return recoveredOrphanTipFsn;
     }
 
     /**

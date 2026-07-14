@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -42,6 +44,7 @@ import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * Unit tests for the durable-ack-driven trim path in {@link CursorWebSocketSendLoop}.
@@ -289,10 +292,11 @@ public class CursorWebSocketSendLoopDurableAckTest {
     }
 
     @Test
-    public void testNackInDurableModeIsTriviallyDurableAfterPredecessors() throws Exception {
-        // A NACK with DROP_AND_CONTINUE policy in durable mode enqueues an empty
-        // entry so trim only crosses the rejected wireSeq once any OK'd entries
-        // ahead of it have been durable-acked.
+    public void testNackInDurableModeIsTerminalAndDoesNotAdvanceTrim() throws Exception {
+        // A SCHEMA_MISMATCH NACK is TERMINAL: it latches the typed error and
+        // never enqueues a placeholder or advances trim. OK'd entries ahead of
+        // it keep their durable-ack lifecycle; the rejected frame stays on
+        // disk -- nothing is silently discarded.
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
                 appendFrames(engine, 3);
@@ -300,36 +304,46 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 setSentCount(loop, 3);
 
                 deliverOk(loop, 0, names("trades"), txns(7L));
-                // Inject a SCHEMA_MISMATCH NACK for wireSeq=1 (DROP_AND_CONTINUE).
+                // Inject a SCHEMA_MISMATCH NACK for wireSeq=1 (TERMINAL).
                 deliverNack(loop, 1, "bad column");
-                deliverOk(loop, 2, names("trades"), txns(9L));
 
-                // No durable-ack yet -> head entry blocks both followers.
+                // Terminal latched, typed, loud on the next producer call.
+                try {
+                    loop.checkError();
+                    fail("SCHEMA_MISMATCH NACK must latch a terminal error");
+                } catch (LineSenderServerException e) {
+                    assertEquals(SenderError.Category.SCHEMA_MISMATCH,
+                            e.getServerError().getCategory());
+                    assertEquals(SenderError.Policy.TERMINAL,
+                            e.getServerError().getAppliedPolicy());
+                }
+
+                // No placeholder was enqueued for the NACK and trim never
+                // crossed the rejected frame: only the OK'd head is pending.
+                assertEquals(1, pendingSize(loop));
                 assertEquals(-1L, engine.ackedFsn());
-                assertEquals(3, pendingSize(loop));
-
-                deliverDurableAck(loop, names("trades"), txns(9L));
-                // Head pops (covered), NACK pops (trivially durable), tail pops (covered).
-                assertEquals(2L, engine.ackedFsn());
-                assertEquals(0, pendingSize(loop));
             }
         });
     }
 
     @Test
-    public void testNackInDurableModeStandaloneIsImmediatelyDurable() throws Exception {
-        // First in-flight batch is rejected: nothing precedes it, so the empty
-        // entry is at the head and a single durable-ack (or any drain trigger)
-        // pops it. Here we explicitly drain via an empty durable-ack.
+    public void testStandaloneNackInDurableModeIsTerminal() throws Exception {
+        // First in-flight batch is rejected: TERMINAL latches immediately,
+        // nothing enqueues, trim stays untouched -- the frame is preserved
+        // on disk for operator action.
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
                 appendFrames(engine, 1);
                 CursorWebSocketSendLoop loop = newDurableLoop(engine);
                 setSentCount(loop, 1);
                 deliverNack(loop, 0, "bad column");
-                // NACK in durable mode calls drainPendingDurable directly because
-                // a head NACK is trivially durable with nothing else preceding.
-                assertEquals(0L, engine.ackedFsn());
+                assertEquals(-1L, engine.ackedFsn());
+                assertEquals(0, pendingSize(loop));
+                try {
+                    loop.checkError();
+                    fail("NACK must latch a terminal error");
+                } catch (LineSenderServerException expected) {
+                }
             }
         });
     }

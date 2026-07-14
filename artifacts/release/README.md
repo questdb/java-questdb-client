@@ -58,9 +58,10 @@ The workflow runs as a pipeline:
 
 1. **resolve** -- derives the release and next-development versions from the current `-SNAPSHOT` POM, and fails fast if
    the tag already exists or the version is already on Maven Central.
-2. **build (5 jobs)** -- builds the native library for each platform (darwin-aarch64, darwin-x86-64, linux-x86-64,
-   linux-aarch64, windows-x86-64) from the resolved source commit, and smoke-loads each one.
-3. **verify** -- bundles all five native libraries and runs the full test suite with the release version applied. The
+2. **build (4 jobs)** -- builds the native library for each shipped platform (darwin-aarch64, linux-x86-64,
+   linux-aarch64, windows-x86-64) from the resolved source commit, and smoke-loads each one. darwin-x86-64 is not
+   shipped: no CI runs the test suite on x64 macOS, so we do not publish a binary we cannot test.
+3. **verify** -- bundles all four native libraries and runs the full test suite with the release version applied. The
    suite runs on a Linux runner, so it exercises the Linux x86-64 library directly. The macOS and Linux aarch64
    libraries are load-tested in their own build jobs; the Windows DLL is cross-compiled on Linux and so is only checked
    for unwanted runtime dependencies (`objdump`), not loaded. This is the quality gate; it requires no credentials.

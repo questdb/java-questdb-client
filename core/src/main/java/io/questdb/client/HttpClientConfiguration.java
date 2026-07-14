@@ -38,6 +38,15 @@ public interface HttpClientConfiguration {
         return true;
     }
 
+    /**
+     * Upper bound, in milliseconds, on establishing the TCP connection. When
+     * {@code <= 0} (the default) no application-level connect timeout is applied
+     * and the connect falls back to the OS-level TCP connect timeout.
+     */
+    default int getConnectTimeout() {
+        return 0;
+    }
+
     default EpollFacade getEpollFacade() {
         return EpollFacadeImpl.INSTANCE;
     }

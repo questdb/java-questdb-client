@@ -25,11 +25,15 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -92,10 +96,22 @@ public final class SenderPool implements AutoCloseable {
     // -- the residual window documented on recoverOneSlotStep -- because the
     // transport has no application-level connect timeout to clamp it.
     private static final long RECOVERY_DRAIN_BUDGET_MILLIS = 1_000;
+    // Hard cap on close()'s outstanding-lease wait. The acquire timeout is a
+    // BORROW policy -- Long.MAX_VALUE legitimately means "block until a slot
+    // frees" -- and must never unbound SHUTDOWN: without this cap a forgotten
+    // lease would hang close() forever. Mirrors the egress twin, whose
+    // shutdown join is capped at QueryWorker.SHUTDOWN_JOIN_MILLIS (same value)
+    // regardless of user config.
+    static final long MAX_CLOSE_LEASE_WAIT_MILLIS = 5_000;
     private final long acquireTimeoutMillis;
-    private final ArrayList<PooledSender> all;
-    private final ArrayDeque<PooledSender> available;
+    private final ArrayList<SenderSlot> all;
+    private final ArrayDeque<SenderSlot> available;
     private final String configurationString;
+    // User-supplied ingest callbacks, shared across every pooled Sender this
+    // pool builds. Null -> each sender keeps its loud-not-silent default.
+    private final SenderConnectionListener connectionListener;
+    private final BackgroundDrainerListener drainerListener;
+    private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
     // Test seam. Production builds delegates via defaultSender(); white-box
     // tests in io.questdb.client.test.impl reach the package-private
@@ -132,7 +148,6 @@ public final class SenderPool implements AutoCloseable {
     private final Condition slotReleased;
     // True iff the configuration enables store-and-forward (sf_dir set).
     private final boolean storeAndForward;
-    private final ThreadLocal<PooledSender> threadAffine = new ThreadLocal<>();
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -150,6 +165,11 @@ public final class SenderPool implements AutoCloseable {
     // teardown. Guarded by lock.
     private boolean closeStarted;
     private int inFlightCreations;
+    // Lease teardowns currently running on borrower threads (retireLease's
+    // delegate-close section, outside the lock). close() counts these as
+    // outstanding so it does not return while a delegate is still being torn
+    // down on another thread. Guarded by lock.
+    private int pendingLeaseTeardowns;
     // Slots whose delegate close() returned with the SF flock still held
     // (the I/O thread refused to stop). Permanently consumed: the index is
     // never freed and never reused, so no borrow ever hands out a still-
@@ -189,16 +209,17 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null);
     }
 
-    // Package-private constructor exposing the senderFactory test seam:
-    // production passes null (-> the real defaultSender()). White-box tests in
-    // io.questdb.client.test.impl reach this by reflection to inject a factory
-    // that throws a non-RuntimeException Throwable mid-prewarm. Recovery runs
-    // inline here (deferStartupRecovery=false); the pooled QuestDB handle uses
-    // the 8-arg overload to defer it to the housekeeper thread.
-    SenderPool(
+    // Test-only constructor exposing the senderFactory seam: production builds
+    // via the full constructor below (senderFactory null -> the real
+    // defaultSender()). White-box tests inject a factory that throws a
+    // non-RuntimeException Throwable mid-prewarm. Recovery runs inline here
+    // (deferStartupRecovery=false); the pooled QuestDB handle uses the 8-arg
+    // overload to defer it to the housekeeper thread.
+    @TestOnly
+    public SenderPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -211,14 +232,16 @@ public final class SenderPool implements AutoCloseable {
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory, false);
     }
 
-    // Full constructor. deferStartupRecovery=true skips the inline,
-    // construction-time SF recovery (recoverOneSlotStep) so
-    // QuestDB.build() never blocks on a slow or reachable-but-not-acking
-    // server; the owner (QuestDBImpl) then drives recovery one slot per tick on
-    // the PoolHousekeeper thread via runStartupRecoveryStep(). The in-range
-    // recovery pass is concurrency-safe against borrow()/return on that
+    // Test-only constructor adding the deferStartupRecovery toggle.
+    // deferStartupRecovery=true skips the inline, construction-time SF recovery
+    // (recoverOneSlotStep) so QuestDB.build() never blocks on a slow or
+    // reachable-but-not-acking server; the owner (QuestDBImpl) then drives
+    // recovery one slot per tick on the PoolHousekeeper thread via
+    // runStartupRecoveryStep(). White-box SF tests call this directly; the
+    // in-range recovery pass is concurrency-safe against borrow()/return on the
     // deferred path -- see recoverOneSlotStep().
-    SenderPool(
+    @TestOnly
+    public SenderPool(
             String configurationString,
             int minSize,
             int maxSize,
@@ -228,9 +251,35 @@ public final class SenderPool implements AutoCloseable {
             IntFunction<Sender> senderFactory,
             boolean deferStartupRecovery
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, null, null, null);
+    }
+
+    // Full constructor adding the user-supplied ingest callbacks (error
+    // handler, connection listener and background-drainer listener), applied
+    // to every Sender the pool builds (see buildManagedSlotSender). The public
+    // 6-arg ctor and the test-only senderFactory overloads above both delegate
+    // here with null callbacks; the pooled QuestDB handle calls this directly.
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
+        this.errorHandler = errorHandler;
+        this.connectionListener = connectionListener;
+        this.drainerListener = drainerListener;
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         // An injected factory (tests) drives recovery too, preserving the
         // white-box recovery seam; production recovery forces OFF-mode connects
@@ -262,7 +311,7 @@ public final class SenderPool implements AutoCloseable {
                 if (storeAndForward) {
                     slotInUse[i] = true;
                 }
-                PooledSender ps = createUnlocked(storeAndForward ? i : -1);
+                SenderSlot ps = createUnlocked(storeAndForward ? i : -1);
                 all.add(ps);
                 available.add(ps);
                 built++;
@@ -571,7 +620,7 @@ public final class SenderPool implements AutoCloseable {
         // createRecoverer() takes the slot flock on <base>-slotIndex, and
         // delegate().close() can early-return with the I/O thread still running
         // (flock still held).
-        PooledSender recoverer = null;
+        SenderSlot recoverer = null;
         boolean stopScan = false;
         try {
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
@@ -597,7 +646,7 @@ public final class SenderPool implements AutoCloseable {
                 // on a timeout: a server that fails to ack within the budget
                 // will very likely do the same for every remaining slot -- the
                 // same reasoning as the build-failure case above.
-                if (!recoverer.drain(remainingMillis)) {
+                if (!recoverer.delegate().drain(remainingMillis)) {
                     LOG.warn("startup SF recovery: drain did not ack slot {} "
                             + "within {}ms; skipping remaining slots",
                             slotPath, remainingMillis);
@@ -636,9 +685,12 @@ public final class SenderPool implements AutoCloseable {
                     throw new LineSenderException("QuestDB handle is closed");
                 }
                 if (!available.isEmpty()) {
-                    PooledSender s = available.pollFirst();
-                    s.markInUse();
-                    return s;
+                    SenderSlot s = available.pollFirst();
+                    // Stamp a fresh lease id under the lock so the PooledSender
+                    // wrapper handed out can be told apart from any prior,
+                    // now-stale borrow of the same slot.
+                    s.bumpGeneration();
+                    return new PooledSender(s, s.generation());
                 }
                 if (all.size() + inFlightCreations + closingSlots + leakedSlots + recoveringSlots < maxSize) {
                     inFlightCreations++;
@@ -647,7 +699,7 @@ public final class SenderPool implements AutoCloseable {
                     // SF is off (no per-slot identity needed).
                     int slotIndex = storeAndForward ? allocateSlotIndex() : -1;
                     lock.unlock();
-                    PooledSender created;
+                    SenderSlot created;
                     try {
                         created = createUnlocked(slotIndex);
                     } catch (Throwable e) {
@@ -674,19 +726,47 @@ public final class SenderPool implements AutoCloseable {
                     if (closed) {
                         // Pool was closed mid-creation -- destroy the new connection
                         // rather than leaking it. Other waiters have been signaled
-                        // by close() already.
-                        freeSlotIndex(slotIndex);
+                        // by close() already. The delegate is closed OUTSIDE the
+                        // lock (mirroring retireLease): its close() can block for
+                        // seconds (bounded ack drain, drainer-pool wind-down) or
+                        // longer (unbounded I/O-thread latch await behind an
+                        // OS-level connect), which held here would stall close(),
+                        // giveBack/retireLease and reapIdle behind the pool lock.
+                        // Accounting first, under the lock: for an SF slot the
+                        // index reservation moves from inFlightCreations to
+                        // closingSlots until the close below releases the flock,
+                        // and pendingLeaseTeardowns keeps the out-of-lock close
+                        // visible to close()'s outstanding-teardown wait.
+                        boolean reserved = created.slotIndex() >= 0;
+                        if (reserved) {
+                            closingSlots++;
+                        }
+                        pendingLeaseTeardowns++;
+                        lock.unlock();
                         try {
                             created.delegate().close();
                         } catch (Throwable ignored) {
                             // Best-effort: an Error (e.g. -ea AssertionError)
                             // from teardown must not mask the closed-pool signal.
+                        } finally {
+                            // Re-lock to reclaim the SF slot index and signal a
+                            // close() waiting on this teardown. MUST run even if
+                            // the delegate close threw, otherwise the slot stays
+                            // reserved forever and close() waits out its full
+                            // budget on a teardown that already happened.
+                            lock.lock();
+                            pendingLeaseTeardowns--;
+                            if (reserved) {
+                                reclaimSlot(created, " after closed-mid-creation teardown");
+                            }
+                            slotReleased.signalAll();
+                            lock.unlock();
                         }
                         throw new LineSenderException("QuestDB handle is closed");
                     }
                     all.add(created);
-                    created.markInUse();
-                    return created;
+                    created.bumpGeneration();
+                    return new PooledSender(created, created.generation());
                 }
                 if (remainingNanos <= 0) {
                     throw new LineSenderException(
@@ -711,17 +791,39 @@ public final class SenderPool implements AutoCloseable {
      * so an in-flight startup-recovery step driven on the {@link PoolHousekeeper}
      * thread stops promptly between slots. {@link QuestDBImpl#close()} calls this
      * BEFORE stopping the housekeeper, so the housekeeper join cannot time out
-     * waiting on a fresh slot's recovery drain. Full delegate teardown still
-     * happens in {@link #close()} (guarded by {@code closeStarted}, so this early
-     * signal never short-circuits it). Idempotent; safe to call repeatedly.
+     * waiting on a fresh slot's recovery drain. Idle-delegate teardown and the
+     * outstanding-lease wait still happen in {@link #close()} (guarded by
+     * {@code closeStarted}, so this early signal never short-circuits them);
+     * borrowed delegates returned after this signal are torn down on the
+     * returning thread via {@link #retireLease}. Idempotent; safe to call
+     * repeatedly.
      */
     void markClosing() {
         closed = true;
     }
 
+    /**
+     * Shuts the pool down. NEVER tears down a borrowed delegate: a producer
+     * thread may be inside one right now (mid-append, mid-flush), and closing
+     * it from here would flush table buffers that thread is mutating and then
+     * free their native memory under its feet -- a use-after-free / SEGV, not
+     * an exception (C1). Instead:
+     * <ol>
+     * <li>waits boundedly (up to {@code acquireTimeoutMillis}, hard-capped at
+     * {@link #MAX_CLOSE_LEASE_WAIT_MILLIS}) for outstanding leases to come home -- {@link #giveBack} and {@link #discardBroken}
+     * observe {@code closed} and tear each delegate down on the returning
+     * borrower's own thread, its exclusive user at that point
+     * ({@link #retireLease}); then</li>
+     * <li>closes the delegates of idle slots only, outside the lock.</li>
+     * </ol>
+     * A lease that never returns leaks its delegate (logged): a logged leak is
+     * recoverable, a freed buffer under a live producer is a JVM crash. This
+     * mirrors the egress twin, {@code QueryWorker.shutdown()}'s bounded
+     * interrupt+join before {@code client.close()}. Idempotent.
+     */
     @Override
     public void close() {
-        PooledSender[] snapshot;
+        SenderSlot[] idleSnapshot;
         lock.lock();
         try {
             if (closeStarted) {
@@ -731,31 +833,50 @@ public final class SenderPool implements AutoCloseable {
             // Raise the shutdown signal too (a direct, non-pooled caller may
             // close() without a prior markClosing()); harmless if already set.
             closed = true;
-            // Mark every pooled wrapper invalidated so pinToCurrentThread()
-            // on other threads -- which never takes this lock -- can detect
-            // that its cached entry no longer wraps a live delegate. Removing
-            // the calling thread's ThreadLocal only clears one slot; other
-            // threads' slots survive until they read the flag.
-            for (int i = 0; i < all.size(); i++) {
-                all.get(i).markInvalidated();
-            }
-            // Snapshot under the lock so the delegate-close loop below is
-            // immune to concurrent mutation of `all`. discardBroken running
-            // on another thread can still bail thanks to the `closed` check
-            // it now performs; the snapshot is belt-and-braces for any
-            // future code path that mutates `all` outside this lock's
-            // happens-before chain.
-            snapshot = all.toArray(new PooledSender[0]);
-            threadAffine.remove();
+            // Wake parked borrowers so they observe the shutdown and throw.
             slotReleased.signalAll();
+            // Bounded graceful wait for outstanding leases. A slot is borrowed
+            // iff it is in `all` but not in `available`; retireLease's
+            // delegate-close section (running outside the lock on a returning
+            // borrower's thread) is tracked by pendingLeaseTeardowns so this
+            // method does not return while a teardown is still in flight.
+            // The budget is the acquire timeout hard-capped at
+            // MAX_CLOSE_LEASE_WAIT_MILLIS: a huge/infinite acquire timeout is
+            // a borrow policy, not a licence for close() to hang forever on a
+            // lease that never comes home.
+            final long waitMillis = Math.min(acquireTimeoutMillis, MAX_CLOSE_LEASE_WAIT_MILLIS);
+            long remainingNanos = TimeUnit.MILLISECONDS.toNanos(waitMillis);
+            while ((all.size() > available.size() || pendingLeaseTeardowns > 0) && remainingNanos > 0) {
+                try {
+                    remainingNanos = slotReleased.awaitNanos(remainingNanos);
+                } catch (InterruptedException e) {
+                    // Preserve the interrupt and stop waiting: idle delegates
+                    // are still torn down below, and stragglers take the
+                    // delegated-teardown path whenever they return.
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            int outstanding = all.size() - available.size() + pendingLeaseTeardowns;
+            if (outstanding > 0) {
+                LOG.warn("SenderPool.close(): {} borrowed sender lease(s) still outstanding after {}ms; "
+                                + "each connection is torn down when its lease is closed, or leaks if it never is",
+                        outstanding, waitMillis);
+            }
+            // Only idle slots are safe to close from this thread: no lease
+            // means no user thread inside the delegate. `available` cannot
+            // grow after this point -- borrow() throws on `closed` and
+            // giveBack() retires instead of requeueing -- so the snapshot is
+            // complete.
+            idleSnapshot = available.toArray(new SenderSlot[0]);
         } finally {
             lock.unlock();
         }
-        // Close each delegate from the snapshot, outside the lock so a slow
-        // real-close() doesn't keep the pool latched.
-        for (int i = 0; i < snapshot.length; i++) {
+        // Close each idle delegate outside the lock so a slow real-close()
+        // doesn't keep the pool latched.
+        for (int i = 0; i < idleSnapshot.length; i++) {
             try {
-                snapshot[i].delegate().close();
+                idleSnapshot[i].delegate().close();
             } catch (Throwable ignored) {
                 // Best-effort: an Error from one delegate's teardown must not
                 // abort the loop and strand the remaining delegates unclosed.
@@ -764,42 +885,87 @@ public final class SenderPool implements AutoCloseable {
     }
 
     /**
-     * Clears the current thread's pin if it currently references {@code s}.
-     * Invoked from {@link PooledSender#close()} before the wrapper is
-     * returned to the pool, so a subsequent {@link #pinToCurrentThread()}
-     * on this thread cannot hand the wrapper back after another consumer
-     * has borrowed the slot. No-op when the caller never pinned, or pinned
-     * a different wrapper.
+     * Evicts a slot whose delegate has failed (typically a {@code flush()}
+     * failure observed in {@link PooledSender#close()}). The slot is removed
+     * from {@code all} so the pool can grow back into a fresh slot on demand.
+     * The underlying delegate is closed outside the lock so a slow real-close
+     * does not stall other borrowers.
+     * <p>
+     * Safe during shutdown too: {@link #close()} never touches borrowed
+     * delegates, so the calling (borrower's) thread is the delegate's
+     * exclusive user and {@link #retireLease} can tear it down without racing
+     * the close() loop.
      */
-    void clearPinIfCurrent(PooledSender s) {
-        if (threadAffine.get() == s) {
-            threadAffine.remove();
+    void discardBroken(PooledSender ps) {
+        retireLease(ps, "");
+    }
+
+    public void giveBack(PooledSender ps) {
+        SenderSlot s = ps.slot();
+        long gen = ps.generation();
+        lock.lock();
+        try {
+            if (!closed) {
+                if (s.generation() != gen) {
+                    // Stale return: this lease was already given back and the slot
+                    // possibly re-borrowed (or this is a duplicate close). Dropping
+                    // it keeps Sender.close() idempotent under a concurrent
+                    // re-borrow -- without it a double close would enqueue the slot
+                    // twice and hand it to two borrowers writing into one delegate.
+                    return;
+                }
+                s.bumpGeneration();
+                s.markIdleAt(System.currentTimeMillis());
+                assert !available.contains(s) : "slot already present in available deque on giveBack";
+                available.addLast(s);
+                slotReleased.signal();
+                return;
+            }
+        } finally {
+            lock.unlock();
         }
+        // Pool is shutting down: never requeue. close() deliberately does not
+        // close borrowed delegates -- a producer thread could still be inside
+        // one, and freeing its native buffers mid-append is a use-after-free /
+        // SEGV (C1) -- so teardown is delegated HERE, to the returning
+        // borrower's thread, the delegate's exclusive user at this point.
+        // retireLease re-validates the lease generation under the lock and
+        // signals the close() thread waiting for outstanding leases.
+        retireLease(ps, " during pool shutdown");
     }
 
     /**
-     * Evicts a slot whose delegate has failed (typically a {@code flush()}
-     * failure observed in {@link PooledSender#close()}). The wrapper is
-     * marked invalidated so any thread-pinned reference gets rejected on the
-     * next {@link #pinToCurrentThread()} call; the slot is removed from
-     * {@code all} so the pool can grow back into a fresh slot on demand. The
-     * underlying delegate is closed outside the lock so a slow real-close
-     * does not stall other borrowers.
+     * Retires one lease on the calling (borrower's) thread: validates the
+     * lease generation under the lock, removes the slot from {@code all},
+     * closes the delegate OUTSIDE the lock, and reclaims the SF slot index.
+     * Shared by {@link #discardBroken} (broken delegate) and by
+     * {@link #giveBack} when the pool is shutting down (delegated teardown --
+     * see {@link #close()}).
      * <p>
-     * Bails when the pool is already closed: {@link #close()} owns the
-     * teardown of every delegate via its snapshot loop, so mutating
-     * {@code all} here would race that iteration on a non-thread-safe
-     * {@code ArrayList} and the {@code delegate.close()} below would be a
-     * double-close on a delegate {@code close()} has already shut down.
+     * Single-owner teardown: the caller holds the only live lease on this
+     * slot and {@link #close()} never touches borrowed delegates, so no other
+     * thread can be inside the delegate when it is closed here.
+     * {@code pendingLeaseTeardowns} keeps the out-of-lock close visible to
+     * close()'s outstanding-lease wait, so the pool does not report itself
+     * closed while a delegate is still being torn down.
+     *
+     * @param ps      the lease being retired
+     * @param context phrase woven into the SF retire WARN naming the reclaim
+     *                path (e.g. {@code ""} or {@code " during pool shutdown"})
      */
-    void discardBroken(PooledSender s) {
-        s.markInvalidated();
+    private void retireLease(PooledSender ps, String context) {
+        SenderSlot s = ps.slot();
+        long gen = ps.generation();
         boolean reserved = false;
         lock.lock();
         try {
-            if (closed) {
+            if (s.generation() != gen) {
+                // Stale retire: the slot was already returned/discarded and
+                // possibly re-borrowed. Dropping it avoids evicting a slot a
+                // different borrower now owns and double-closing its delegate.
                 return;
             }
+            s.bumpGeneration();
             boolean removed = all.remove(s);
             // For an SF slot, keep its index reserved (move the reservation
             // from `all` to `closingSlots`) until the delegate below releases
@@ -809,9 +975,11 @@ public final class SenderPool implements AutoCloseable {
                 closingSlots++;
                 reserved = true;
             }
-            // Wake one waiter -- the cap check in borrow() may now admit a
-            // creation attempt (on a *different* slot).
-            slotReleased.signal();
+            pendingLeaseTeardowns++;
+            // Wake all waiters: the cap check in borrow() may now admit a
+            // creation attempt (on a *different* slot), and a close() in
+            // progress must re-check its outstanding-lease count.
+            slotReleased.signalAll();
         } finally {
             lock.unlock();
         }
@@ -823,54 +991,25 @@ public final class SenderPool implements AutoCloseable {
         } catch (Throwable ignored) {
             // Best-effort teardown: a delegate close() can throw an Error
             // (e.g. an -ea AssertionError) as well as a RuntimeException.
-            // Either way the slot accounting in the finally below MUST run,
+            // Either way the accounting in the finally below MUST run,
             // otherwise an SF slot stays reserved forever (slotInUse stuck
-            // true, closingSlots over-counted) and the pool leaks capacity
-            // until borrow() can only ever time out.
+            // true, closingSlots over-counted), the pool leaks capacity until
+            // borrow() can only ever time out, and a concurrent close() would
+            // wait out its full budget on a teardown that already happened.
         } finally {
-            if (reserved) {
-                lock.lock();
-                try {
+            lock.lock();
+            try {
+                pendingLeaseTeardowns--;
+                if (reserved) {
                     // Free the index only when the flock was released; a slot
-                    // left locked is retired permanently. Signal a waiter only
-                    // on the free path, where a new creation can now be admitted.
-                    if (reclaimSlot(s, "")) {
-                        slotReleased.signal();
-                    }
-                } finally {
-                    lock.unlock();
+                    // left locked is retired permanently.
+                    reclaimSlot(s, context);
                 }
+                slotReleased.signalAll();
+            } finally {
+                lock.unlock();
             }
         }
-    }
-
-    public void giveBack(PooledSender s) {
-        long now = System.currentTimeMillis();
-        s.markIdleAt(now);
-        lock.lock();
-        try {
-            if (closed) {
-                // Pool already shut down: don't requeue; let close() finish destroying.
-                return;
-            }
-            available.addLast(s);
-            slotReleased.signal();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    public PooledSender pinToCurrentThread() {
-        PooledSender pinned = threadAffine.get();
-        if (pinned != null && !pinned.isInvalidated()) {
-            return pinned;
-        }
-        if (pinned != null) {
-            threadAffine.remove();
-        }
-        PooledSender s = borrow();
-        threadAffine.set(s);
-        return s;
     }
 
     /**
@@ -883,15 +1022,15 @@ public final class SenderPool implements AutoCloseable {
             return;
         }
         long now = System.currentTimeMillis();
-        ArrayList<PooledSender> toClose = null;
+        ArrayList<SenderSlot> toClose = null;
         lock.lock();
         try {
             if (closed) {
                 return;
             }
-            Iterator<PooledSender> it = available.iterator();
+            Iterator<SenderSlot> it = available.iterator();
             while (it.hasNext() && all.size() > minSize) {
-                PooledSender s = it.next();
+                SenderSlot s = it.next();
                 boolean idleExpired = idleTimeoutMillis < Long.MAX_VALUE
                         && (now - s.idleSinceMillis()) >= idleTimeoutMillis;
                 boolean overAge = maxLifetimeMillis < Long.MAX_VALUE
@@ -933,7 +1072,7 @@ public final class SenderPool implements AutoCloseable {
                 lock.lock();
                 try {
                     for (int i = 0, n = toClose.size(); i < n; i++) {
-                        PooledSender s = toClose.get(i);
+                        SenderSlot s = toClose.get(i);
                         if (s.slotIndex() >= 0) {
                             reclaimSlot(s, " during idle reaping");
                         }
@@ -983,32 +1122,19 @@ public final class SenderPool implements AutoCloseable {
         }
     }
 
-    public void releaseCurrentThread() {
-        PooledSender pinned = threadAffine.get();
-        if (pinned == null) {
-            return;
-        }
-        threadAffine.remove();
-        if (pinned.isInvalidated()) {
-            // Pool was closed: delegate is already closed, skip flush/giveBack.
-            return;
-        }
-        pinned.close();
-    }
-
-    private PooledSender createUnlocked(int slotIndex) {
-        return new PooledSender(senderFactory.apply(slotIndex), this, slotIndex);
+    private SenderSlot createUnlocked(int slotIndex) {
+        return new SenderSlot(senderFactory.apply(slotIndex), this, slotIndex);
     }
 
     /**
-     * Builds a {@link PooledSender} for startup recovery of one stranded slot.
+     * Builds a {@link SenderSlot} for startup recovery of one stranded slot.
      * Routes through {@link #recoverySenderFactory}, which in production forces
      * a non-blocking initial connect ({@link #defaultRecoverySender}) so a
      * single recovery step stays bounded -- see that method and
      * {@link #drainCandidateSlotForRecovery}.
      */
-    private PooledSender createRecoverer(int slotIndex) {
-        return new PooledSender(recoverySenderFactory.apply(slotIndex), this, slotIndex);
+    private SenderSlot createRecoverer(int slotIndex) {
+        return new SenderSlot(recoverySenderFactory.apply(slotIndex), this, slotIndex);
     }
 
     private Sender defaultSender(int slotIndex) {
@@ -1035,9 +1161,24 @@ public final class SenderPool implements AutoCloseable {
         return buildManagedSlotSender(slotIndex, true);
     }
 
+    // Applies the user-supplied ingest callbacks to a sender builder. Null
+    // callbacks are skipped so the sender keeps its loud-not-silent default.
+    private Sender.LineSenderBuilder applyUserCallbacks(Sender.LineSenderBuilder builder) {
+        if (errorHandler != null) {
+            builder.errorHandler(errorHandler);
+        }
+        if (connectionListener != null) {
+            builder.connectionListener(connectionListener);
+        }
+        if (drainerListener != null) {
+            builder.drainerListener(drainerListener);
+        }
+        return builder;
+    }
+
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
         if (!storeAndForward) {
-            return Sender.fromConfig(configurationString);
+            return applyUserCallbacks(Sender.builder(configurationString)).build();
         }
         // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
         // so concurrent SF senders sharing one sf_dir never collide on
@@ -1091,7 +1232,9 @@ public final class SenderPool implements AutoCloseable {
             // returns).
             builder.drainOrphans(false);
         }
-        return builder.build();
+        // Recovery delegates are internal, short-lived, OFF-mode drain senders;
+        // don't surface their connect/error events to the user's callbacks.
+        return (forRecovery ? builder : applyUserCallbacks(builder)).build();
     }
 
     /**
@@ -1130,7 +1273,7 @@ public final class SenderPool implements AutoCloseable {
      * {@link QwpWebSocketSender#isSlotLockReleased()} -- false means close()
      * bailed early with the I/O thread still running and the flock still held.
      */
-    private static boolean flockReleased(PooledSender s) {
+    private static boolean flockReleased(SenderSlot s) {
         Sender d = s.delegate();
         return !(d instanceof QwpWebSocketSender) || ((QwpWebSocketSender) d).isSlotLockReleased();
     }
@@ -1153,7 +1296,7 @@ public final class SenderPool implements AutoCloseable {
      *                path (e.g. {@code ""} or {@code " during idle reaping"})
      * @return {@code true} if the index was freed, {@code false} if retired
      */
-    private boolean reclaimSlot(PooledSender s, String context) {
+    private boolean reclaimSlot(SenderSlot s, String context) {
         closingSlots--;
         if (flockReleased(s)) {
             freeSlotIndex(s.slotIndex());

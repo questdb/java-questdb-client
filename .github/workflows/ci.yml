@@ -17,10 +17,10 @@ defaults:
 jobs:
   # JDK 8 is the source of truth: the client ships as a Java 8 artifact
   # (io.questdb:questdb-client) and is released from JDK 8, so on JDK 8 it must
-  # compile, the full test suite must pass against the committed native
-  # libraries, and the javadoc jar must build (-P javadoc attaches it at the
-  # package phase). The committed native .so/.dylib/.dll are enough -- the only
-  # git submodule (zstd) is needed solely for C++ native rebuilds, not here.
+  # compile, the full test suite must pass, and the javadoc jar must build
+  # (-P javadoc attaches it at the package phase). The native libraries are no
+  # longer committed, so this job compiles libquestdb.so from source (hence the
+  # zstd submodule + cmake/nasm/build-essential toolchain) before the tests run.
   build-jdk8:
     name: Build, test & javadoc (JDK 8)
     runs-on: ubuntu-latest
@@ -28,6 +28,9 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+        with:
+          # zstd is required to compile the native library.
+          submodules: recursive
 
       - name: Set up JDK 8
         uses: actions/setup-java@v4
@@ -35,6 +38,26 @@ jobs:
           distribution: temurin
           java-version: "8"
           cache: maven
+
+      - name: Install native build toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake nasm build-essential
+
+      - name: Build native libquestdb.so
+        # JAVA_HOME points at the JDK 8 above, so the lib is compiled against the
+        # Java 8 JNI headers -- the artifact's Java floor. Copy it into src
+        # resources (not target/) so it survives the `mvn clean` in the next step
+        # and gets packaged + loaded via the production bin/<platform> path.
+        # NOTE: this builds on ubuntu-latest for FUNCTIONAL testing only; the
+        # library's glibc runtime floor is validated separately by the
+        # `glibc-floor` job, which rebuilds in the release low-glibc container.
+        run: |
+          cd core
+          cmake -DCMAKE_BUILD_TYPE=Release -B cmake-build-release -S.
+          cmake --build cmake-build-release --config Release
+          test -f target/classes/io/questdb/client/bin-local/libquestdb.so
+          mkdir -p src/main/resources/io/questdb/client/bin/linux-x86-64
+          cp target/classes/io/questdb/client/bin-local/libquestdb.so \
+             src/main/resources/io/questdb/client/bin/linux-x86-64/libquestdb.so
 
       - name: Compile, test, and build javadoc
         run: mvn -B -ntp -P javadoc clean install
@@ -61,3 +84,80 @@ jobs:
 
       - name: Compile (main + test) and build javadoc (no tests run)
         run: mvn -B -ntp -P javadoc -DskipTests clean package
+
+  # GLIBC floor guard. The native libraries are built at release time in
+  # low-glibc manylinux containers (see maven_central_release.yml) and are NOT
+  # committed, so a floor regression is invisible to the functional test job
+  # above (it builds on ubuntu-latest, whose glibc is new enough to load almost
+  # anything). This job rebuilds the linux libraries in the SAME low-glibc
+  # environment as release and asserts the runtime floor with objdump, so a
+  # change that raises the floor (e.g. a new stat/fstat call pulling in
+  # stat@GLIBC_2.33 on a modern build host) fails the PR instead of silently
+  # shipping a library that cannot load on older distros.
+  #
+  #   * linux-x86-64  -> GLIBC_2.14 (the intended floor: memcpy@GLIBC_2.14).
+  #   * linux-aarch64 -> GLIBC_2.17 (the lowest floor glibc offers on aarch64).
+  #
+  # Uses manylinux_2_28 for both arches (stock Node 24, no glibc-2.17 shadow
+  # hack). The x86-64 floor is identical in manylinux2014 (2.17) and
+  # manylinux_2_28 (2.28) -- both resolve stat/fstat to the inline
+  # __xstat/__fxstat@GLIBC_2.2.5 wrappers -- so this validates the real shipped
+  # floor without the heavier manylinux2014 release toolchain.
+  glibc-floor:
+    name: GLIBC floor guard (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86-64
+            os: ubuntu-latest
+            image: quay.io/pypa/manylinux_2_28_x86_64
+            jdk_arch: x64
+            floor: "2.14"
+            cmake_args: ""
+            build_dir: cmake-build-release
+          - platform: linux-aarch64
+            os: ubuntu-22.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+            jdk_arch: aarch64
+            floor: "2.17"
+            cmake_args: "-DCMAKE_TOOLCHAIN_FILE=./src/main/c/toolchains/linux-arm64.cmake"
+            build_dir: cmake-build-release-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # zstd is required to compile the native library.
+          submodules: recursive
+
+      - name: Install tooling
+        # binutils provides objdump for the floor check; nasm/zstd are build deps.
+        run: |
+          yum update -y
+          yum install -y wget nasm zstd binutils
+
+      - name: Install Temurin JDK 8 (for jni.h)
+        # Build against the Java 8 JNI headers -- JDK 8 is the artifact's floor.
+        # The JDK version does not affect the glibc floor; it only supplies jni.h.
+        run: |
+          wget -v --timeout=180 -O jdk8.tar.gz \
+            "https://api.adoptium.net/v3/binary/latest/8/ga/linux/${{ matrix.jdk_arch }}/jdk/hotspot/normal/eclipse"
+          mkdir jdk8
+          tar xfz jdk8.tar.gz -C jdk8 --strip-components=1
+          echo "JAVA_HOME=$(pwd)/jdk8" >> "$GITHUB_ENV"
+
+      - name: Build native libquestdb.so
+        run: |
+          cd core
+          cmake ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release -B ${{ matrix.build_dir }} -S.
+          cmake --build ${{ matrix.build_dir }} --config Release
+
+      - name: Assert GLIBC floor
+        run: |
+          ./.github/scripts/check-glibc-floor.sh \
+            core/target/classes/io/questdb/client/bin-local/libquestdb.so \
+            "${{ matrix.floor }}"

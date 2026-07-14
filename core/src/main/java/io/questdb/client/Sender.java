@@ -602,8 +602,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Highest frame sequence number (FSN) the server has acknowledged, or that the sender
-     * has skipped past on a {@link SenderError.Policy#DROP_AND_CONTINUE} rejection.
+     * Highest frame sequence number (FSN) the server has acknowledged.
      * Returns {@code -1} when no batch has been published yet, and on transports that
      * do not track FSNs (HTTP, TCP, UDP).
      * <br>
@@ -792,11 +791,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. A connect-budget exhaustion or a
-     *       terminal upgrade failure is delivered to the async error inbox
-     *       as a {@link io.questdb.client.SenderError} (no synchronous
-     *       throw on the user call site). Wire {@code error_handler=...}
-     *       to observe these.</li>
+     *       engine until the wire is up. Connect failures are retried
+     *       indefinitely in the background; a terminal upgrade failure
+     *       (auth reject, capability mismatch) is delivered to the async
+     *       error inbox as a {@link io.questdb.client.SenderError} (no
+     *       synchronous throw on the user call site). Wire
+     *       {@code error_handler=...} to observe these.</li>
      * </ul>
      * <p>
      * Default resolution when the caller does not pick a value:
@@ -1012,6 +1012,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int autoFlushRows = PARAMETER_NOT_SET_EXPLICITLY;
         private int bufferCapacity = PARAMETER_NOT_SET_EXPLICITLY;
         private long closeFlushTimeoutMillis = CLOSE_FLUSH_TIMEOUT_NOT_SET;
+        // Upper bound (ms) on the TCP connect. PARAMETER_NOT_SET_EXPLICITLY ->
+        // 0 (no application-level connect timeout; OS connect timeout applies).
+        private int connectTimeoutMillis = PARAMETER_NOT_SET_EXPLICITLY;
         // Optional user-supplied async connection-event listener. When null,
         // the sender uses DefaultSenderConnectionListener.INSTANCE
         // (loud-not-silent log of every transition).
@@ -1019,6 +1022,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async connection-event dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (64).
         private int connectionListenerInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        // Optional user-supplied observer for background orphan-slot drainer
+        // events (durable-ack capability-gap retries, all-replica failover
+        // windows, persistent-failure escalation). When null, drainers run
+        // without a listener. Only meaningful with drainOrphans=true.
+        private io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener drainerListener;
         // Orphan adoption: when true, the foreground sender scans
         // <sf_dir>/*/ at startup for sibling slots that hold unacked data
         // and reports them. Default false. Spec calls for spawning
@@ -1042,6 +1050,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Bounded inbox capacity for the async error dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
+        private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
+        private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1079,6 +1089,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             @Override
             public int getTimeout() {
                 return httpTimeout == PARAMETER_NOT_SET_EXPLICITLY ? DEFAULT_HTTP_TIMEOUT : httpTimeout;
+            }
+
+            @Override
+            public int getConnectTimeout() {
+                return connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis;
             }
         };
         private long minRequestThroughput = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1199,6 +1214,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("TLS validation was already disabled");
             }
             return new AdvancedTlsSettings();
+        }
+
+        /**
+         * Upper bound, in milliseconds, on establishing the TCP connection to a
+         * QuestDB endpoint. When set, a connect that does not complete within
+         * this budget is aborted (instead of riding the much longer OS-level
+         * connect timeout). Applies to both HTTP/WebSocket transports. Default
+         * is unset (0), which falls back to the OS connect timeout.
+         *
+         * @param millis connect timeout in milliseconds; must be &gt; 0
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder connectTimeoutMillis(int millis) {
+            if (this.connectTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
+                throw new LineSenderException("connect timeout was already configured ")
+                        .put("[connect_timeout=").put(this.connectTimeoutMillis).put("]");
+            }
+            if (millis <= 0) {
+                throw new LineSenderException("connect_timeout must be > 0: ").put(millis);
+            }
+            this.connectTimeoutMillis = millis;
+            return this;
         }
 
         /**
@@ -1464,6 +1501,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         durableAckKeepaliveIntervalMillis == DURABLE_ACK_KEEPALIVE_NOT_SET
                                 ? CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS
                                 : durableAckKeepaliveIntervalMillis;
+                int actualMaxFrameRejections = maxFrameRejections != PARAMETER_NOT_SET_EXPLICITLY
+                        ? maxFrameRejections
+                        : CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS;
+                long actualPoisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        ? poisonMinEscalationWindowMillis
+                        : CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1533,8 +1576,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             actualErrorInboxCapacity,
                             actualDurableAckKeepaliveIntervalMillis,
                             authTimeoutMillis,
+                            connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
                             connectionListener,
-                            actualConnectionListenerInboxCapacity
+                            actualConnectionListenerInboxCapacity,
+                            actualMaxFrameRejections,
+                            actualPoisonMinEscalationWindowMillis
                     );
                 } catch (Throwable t) {
                     // connect() failed before ownership of cursorEngine
@@ -1555,6 +1601,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // WebSocketClient inside the abandoned `connected`.
                 connected.setTransactional(transactional);
                 try {
+                    // Install the drainer listener BEFORE startOrphanDrainers
+                    // below: drainers must see the listener at submit time so
+                    // no early drainer event is lost to a late installation.
+                    if (drainerListener != null) {
+                        connected.setDrainerListener(drainerListener);
+                    }
                     // Once the foreground sender is up, dispatch drainers
                     // for any sibling orphan slots. Scan AFTER we acquire
                     // our own slot lock so we never accidentally try to
@@ -1758,6 +1810,31 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Sets the async listener observing background orphan-slot drainer
+         * events: per-attempt durable-ack capability-gap retries
+         * ({@code onDurableAckUnavailable}), transient all-replica failover
+         * windows ({@code onPrimaryUnavailable}), and the eventual escalation
+         * to a {@code .failed} sentinel
+         * ({@code onDurableAckPersistentFailure}). The listener runs on the
+         * drainers' own threads, so it must be thread-safe and must not block
+         * — hand off to a queue or metrics sink and return. Only meaningful
+         * when {@link #drainOrphans(boolean)} is enabled.
+         *
+         * <p>WebSocket transport only; setting on other transports throws.
+         *
+         * @param listener the listener; {@code null} keeps the default (no listener)
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder drainerListener(
+                io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener listener) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("drainer_listener is only supported for WebSocket transport");
+            }
+            this.drainerListener = listener;
+            return this;
+        }
+
+        /**
          * Opt in to adopting sibling slots under {@code <sf_dir>/*} at
          * startup that hold unacked data left behind by a crashed sender or
          * a different sender_id. Default {@code false}. WebSocket only;
@@ -1774,6 +1851,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Slots flagged with the {@code .failed} sentinel are skipped
          * (manual reset required), and the foreground sender's own slot is
          * never adopted.
+         * <p>
+         * Close-latency note: {@code close()} stops adopted drainers. A
+         * drainer still connecting (e.g. during an outage) is stop-signaled
+         * immediately and exits within ~50ms; a drainer actively replaying
+         * frames is given a ~2.5s grace window to finish, plus a 0.5s stop
+         * window — so {@code close()} may take up to ~3s while orphan
+         * drainers are in flight (and a drainer parked in a blocking native
+         * connect is abandoned to exit on its own daemon thread).
+         * Un-drained slots stay on disk and are re-adopted by the next
+         * sender that enables {@code drain_orphans}.
          */
         public LineSenderBuilder drainOrphans(boolean enabled) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
@@ -2398,6 +2485,51 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Poison-frame detector threshold: consecutive server rejections
+         * (retriable NACK, or non-orderly close after a send) of the SAME
+         * head-of-line frame, with no ack progress in between, before the
+         * sender declares the frame poisoned and latches a typed terminal
+         * instead of reconnect-replaying forever. Retriable rejections below
+         * the threshold recycle the connection and replay from the
+         * store-and-forward log — no data is dropped either way.
+         * Default {@code 4}. WebSocket only.
+         */
+        public LineSenderBuilder maxFrameRejections(int rejections) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("max_frame_rejections is only supported for WebSocket transport");
+            }
+            if (rejections < 1) {
+                throw new LineSenderException("max_frame_rejections must be >= 1: ").put(rejections);
+            }
+            this.maxFrameRejections = rejections;
+            return this;
+        }
+
+        /**
+         * Minimum wall-clock dwell (millis) a suspected frame must stay
+         * poisoned before the poison detector escalates to a typed terminal,
+         * even once {@link #maxFrameRejections(int)} strikes have accrued.
+         * With paced recycles, strikes can accrue in well under a second (e.g.
+         * a middlebox/LB that accepts the connection then non-orderly-closes
+         * each cycle while its backend is briefly down), so a strike count
+         * alone can turn a transient outage into a producer-fatal terminal.
+         * This window guarantees a brief outage a chance to clear (an OK
+         * at/beyond the suspect resets the detector) first. {@code 0} disables
+         * the dwell (legacy immediate escalation at the strike threshold).
+         * Default {@code 5_000} (5 s). WebSocket only.
+         */
+        public LineSenderBuilder poisonMinEscalationWindowMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("poison_min_escalation_window_millis is only supported for WebSocket transport");
+            }
+            if (millis < 0) {
+                throw new LineSenderException("poison_min_escalation_window_millis must be >= 0: ").put(millis);
+            }
+            this.poisonMinEscalationWindowMillis = millis;
+            return this;
+        }
+
+        /**
          * Max reconnect backoff in millis. Caps the exponential growth so
          * a long outage doesn't end up sleeping minutes between attempts.
          * Default {@code 5_000} (5 s). WebSocket only.
@@ -2414,22 +2546,27 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Per-outage cap on the cursor I/O loop's reconnect retry budget.
-         * Once a wire failure occurs, the loop retries with exponential
-         * backoff until either reconnect succeeds (timer resets) or this
-         * many millis elapse since the first failure of this outage —
-         * whichever comes first. On budget exhaustion, the next user
-         * thread API call throws.
+         * Cap on the blocking initial-connect retry budget when
+         * {@code initial_connect_retry=sync}. {@code fromConfig} retries
+         * with exponential backoff until connect succeeds or this many
+         * millis elapse, then throws. The background reconnect loop
+         * (mid-stream outages and async initial connect) does NOT consult
+         * this value: it retries indefinitely and halts only on a terminal
+         * auth/upgrade error or {@code close()}.
          * <p>
-         * Default {@code 300_000} (5 minutes). Lower for fail-fast services;
-         * higher for tolerating long maintenance windows. WebSocket only.
+         * Default {@code 300_000} (5 minutes). Lower for fail-fast startup;
+         * higher for tolerating a slow server boot. Must be positive: a zero
+         * budget would make the SYNC initial connect throw without a single
+         * attempt (even against a healthy server) and would collapse the
+         * background drainer's durable-ack settle budget to its first sweep.
+         * WebSocket only.
          */
         public LineSenderBuilder reconnectMaxDurationMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("reconnect_max_duration_millis is only supported for WebSocket transport");
             }
-            if (millis < 0) {
-                throw new LineSenderException("reconnect_max_duration_millis must be >= 0: ").put(millis);
+            if (millis <= 0) {
+                throw new LineSenderException("reconnect_max_duration_millis must be > 0: ").put(millis);
             }
             this.reconnectMaxDurationMillis = millis;
             return this;
@@ -3237,6 +3374,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     pos = getValue(configurationString, pos, sink, "request_timeout");
                     int requestTimeout = parseIntValue(sink, "request_timeout");
                     httpTimeoutMillis(requestTimeout);
+                } else if (Chars.equals("connect_timeout", sink)) {
+                    pos = getValue(configurationString, pos, sink, "connect_timeout");
+                    connectTimeoutMillis(parseIntValue(sink, "connect_timeout"));
                 } else if (Chars.equals("request_min_throughput", sink)) {
                     pos = getValue(configurationString, pos, sink, "request_min_throughput");
                     int requestMinThroughput = parseIntValue(sink, "request_min_throughput");
@@ -3332,6 +3472,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "reconnect_initial_backoff_millis");
                     reconnectInitialBackoffMillis(parseLongValue(sink, "reconnect_initial_backoff_millis"));
+                } else if (Chars.equals("max_frame_rejections", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("max_frame_rejections is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "max_frame_rejections");
+                    maxFrameRejections(parseIntValue(sink, "max_frame_rejections"));
+                } else if (Chars.equals("poison_min_escalation_window_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("poison_min_escalation_window_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "poison_min_escalation_window_millis");
+                    poisonMinEscalationWindowMillis(parseLongValue(sink, "poison_min_escalation_window_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -3517,6 +3669,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("auth_timeout_ms")) {
                     authTimeoutMillis(view.getLong("auth_timeout_ms", 0));
                 }
+                if (view.has("connect_timeout")) {
+                    // getInt (not getLong + cast): connectTimeoutMillis takes an
+                    // int, and an over-int value must reject, not wrap.
+                    connectTimeoutMillis(view.getInt("connect_timeout", 0));
+                }
 
                 s = view.getStr("auto_flush_rows");
                 if (s != null) {
@@ -3593,6 +3750,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (view.has("reconnect_max_backoff_millis")) {
                     reconnectMaxBackoffMillis(wsLong(view, v, "reconnect_max_backoff_millis"));
+                }
+                if (view.has("max_frame_rejections")) {
+                    maxFrameRejections(wsInt(view, v, "max_frame_rejections"));
+                }
+                if (view.has("poison_min_escalation_window_millis")) {
+                    poisonMinEscalationWindowMillis(wsLong(view, v, "poison_min_escalation_window_millis"));
                 }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
@@ -3768,10 +3931,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("reconnect_max_backoff_millis", reconnectMaxBackoffMillis);
             m.put("drain_orphans", drainOrphans);
             m.put("max_background_drainers", maxBackgroundDrainers);
+            m.put("max_frame_rejections", maxFrameRejections);
+            m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);
             m.put("auth_timeout_ms", authTimeoutMillis);
+            m.put("connect_timeout", connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis);
             m.put("username", username);
             m.put("password", password);
             m.put("tls_verify", tlsValidationMode == null ? null : tlsValidationMode.name());
