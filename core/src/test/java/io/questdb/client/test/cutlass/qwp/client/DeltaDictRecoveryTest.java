@@ -288,6 +288,57 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testUnopenableDictSeedsTheProducerAboveTheRecoveredIds() throws Exception {
+        // The producer must resume ABOVE the ids the recovered frames already define, even when
+        // the dictionary could not be opened.
+        //
+        // seedGlobalDictionaryFromPersisted used to be gated on deltaDictEnabled, which is false
+        // exactly here -- so the producer restarted its id space at 0, on top of ids the
+        // surviving frames define. The send loop's mirror (rebuilt from those frames) still read
+        // id 0 as sym-0 while the producer meant something else by it: the two disagree about
+        // what an id MEANS, which is the whole failure mode the dictionary machinery exists to
+        // prevent.
+        //
+        // Visible on the wire: the new symbol must land ABOVE the recovered ones, not on top of
+        // sym-0.
+        assertMemoryLeak(() -> {
+            recordSixDeltaFrames();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            java.nio.file.Files.createDirectory(dict);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 6) {
+                        Thread.sleep(20);
+                    }
+                    // ...and now the resumed producer introduces a symbol of its own.
+                    s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
+                    s2.flush();
+                    deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 7) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertEquals(
+                        "the resumed producer must take the NEXT id, not reuse id 0 -- reusing it "
+                                + "puts two symbols on one id and silently misattributes values",
+                        Arrays.asList("sym-0", "sym-1", "sym-2", "sym-3", "sym-4", "sym-5",
+                                "after-recovery"),
+                        handler.dictSnapshot());
+            }
+        });
+    }
+
+    @Test
     public void testRecoveredSenderContinuesIngestingNewSymbols() throws Exception {
         // M2 regression: seedGlobalDictionaryFromPersisted resumes the producer's
         // dictionary and delta baseline from the persisted .symbol-dict, so a
