@@ -1509,13 +1509,15 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testGetTokenDoesNotBlockBehindSilentRefresh() throws Exception {
+    public void testGetTokenWaitsBehindSilentRefreshInsteadOfFailing() throws Exception {
         assertMemoryLeak(() -> {
-            // the flush-path contract also holds when the lock is held by another thread's SILENT REFRESH, not
-            // just an interactive sign-in: getToken() must fail fast rather than queue behind it. The
-            // cached token is forced expired so getToken() refreshes; the token endpoint blocks the
-            // refresh response until the test releases it, pinning the lock on the refresher thread while the
-            // second caller races for it
+            // When another thread's SILENT REFRESH (not an interactive sign-in) holds the lock, a second
+            // getToken() must WAIT for that bounded refresh and then serve the freshly refreshed token - NOT
+            // fail fast. Failing fast would make every concurrent caller sharing one OidcDeviceAuth (the
+            // documented shared-provider pattern) spuriously throw on each token refresh. The token endpoint
+            // blocks the refresh response until the test releases it, pinning the lock on the refresher thread
+            // while the second caller waits for it. (This is the fix for the old fail-fast-on-any-contention
+            // behaviour: the HttpTokenProvider contract permits a brief wait behind a silent refresh.)
             CountDownLatch refreshInFlight = new CountDownLatch(1);
             CountDownLatch releaseRefresh = new CountDownLatch(1);
             MockOidcServer.Handler handler = (method, path, body) -> {
@@ -1531,7 +1533,7 @@ public class OidcDeviceAuthTest {
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                    return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 1));
+                    return MockOidcServer.json(200, tokenJson("ACCESS-2", null, "REFRESH-2", 3600));
                 }
                 return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 1)); // initial device_code grant
             };
@@ -1554,23 +1556,37 @@ public class OidcDeviceAuthTest {
                 }, "oidc-silent-refresh");
                 refresher.setDaemon(true);
                 refresher.start();
-                try {
-                    Assert.assertTrue("the silent refresh did not start", refreshInFlight.await(10, TimeUnit.SECONDS));
-                    // a refresh holds the lock now; getToken() on this thread must fail fast, not block
-                    long startNanos = System.nanoTime();
+                Assert.assertTrue("the silent refresh did not start", refreshInFlight.await(10, TimeUnit.SECONDS));
+
+                // a refresh holds the lock now; a second getToken() must WAIT for it, not fail fast
+                AtomicReference<String> waiterResult = new AtomicReference<>();
+                AtomicReference<Throwable> waiterError = new AtomicReference<>();
+                Thread waiter = new Thread(() -> {
                     try {
-                        auth.getToken();
-                        Assert.fail("expected getToken() to fail fast while a refresh is in progress");
-                    } catch (OidcAuthException e) {
-                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
-                        Assert.assertTrue("getToken() blocked " + elapsedMillis + "ms behind the in-flight refresh",
-                                elapsedMillis < 2_000);
-                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("in progress"));
+                        waiterResult.set(auth.getToken());
+                    } catch (Throwable t) {
+                        waiterError.set(t);
                     }
+                }, "oidc-getToken-waiter");
+                waiter.setDaemon(true);
+                waiter.start();
+                try {
+                    // give the waiter time to (wrongly) fail fast if it were going to; while the refresh is
+                    // held it must instead still be blocked - no result and, crucially, no error yet
+                    Thread.sleep(500);
+                    Assert.assertNull("getToken() must not fail fast behind a silent refresh, but threw: " + waiterError.get(),
+                            waiterError.get());
+                    Assert.assertNull("getToken() must wait, not return, while the peer's refresh is still in flight",
+                            waiterResult.get());
                 } finally {
                     releaseRefresh.countDown();
+                    waiter.join(10_000);
                     refresher.join(10_000);
                 }
+                // once the peer's refresh completed and released the lock, the waiter served the fresh token
+                Assert.assertNull("getToken() must not throw when it waits out a peer's refresh: " + waiterError.get(),
+                        waiterError.get());
+                Assert.assertEquals("getToken() must serve the freshly refreshed token after waiting", "ACCESS-2", waiterResult.get());
             }
         });
     }
@@ -1621,6 +1637,31 @@ public class OidcDeviceAuthTest {
                 // the device flow ran exactly once (the initial signIn), and the user was prompted once
                 Assert.assertEquals(1, deviceCalls.get());
                 Assert.assertEquals(1, promptCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testBlankServedTokenFromWireIsNotServed() throws Exception {
+        assertMemoryLeak(() -> {
+            // a hostile or broken IdP returns a whitespace-only access token on the grant: it is non-empty and
+            // passes the control/non-ASCII char check vacuously (space is 0x20), but must NOT be cached and
+            // served as a blank "Bearer " header (which only draws a 401). storeTokens folds a blank served
+            // token to absent, so signIn() fails with the actionable "no access_token" rather than serving "   "
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("   ", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                try {
+                    auth.signIn();
+                    Assert.fail("expected signIn() to reject a blank served token from the wire");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no access_token"));
+                }
             }
         });
     }

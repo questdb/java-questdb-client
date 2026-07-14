@@ -177,6 +177,49 @@ public class WebSocketTokenProviderTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testThrowingProviderFailsFastInSyncInitialConnect() throws Exception {
+        assertMemoryLeak(() -> {
+            // Setting any reconnect_* knob promotes the initial connect to SYNC mode (Sender.build). In SYNC
+            // mode a token-provider failure (not signed in / a failed refresh) must STILL fail fast with the
+            // provider's own exception - exactly like OFF mode - not be treated as a transport outage and
+            // retried for the whole reconnect budget (which would block build() for up to that budget, then
+            // surface a transport-shaped wrapper). A deterministic "no token" can never recover by retrying.
+            AtomicInteger calls = new AtomicInteger();
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                long budgetMillis = 10_000; // if the fix regressed, build() would block ~this long before failing
+                long startNanos = System.nanoTime();
+                try {
+                    Sender.builder(Sender.Transport.WEBSOCKET)
+                            .address("localhost:" + port)
+                            .reconnectMaxDurationMillis(budgetMillis) // -> SYNC initial connect
+                            .httpTokenProvider(() -> {
+                                calls.incrementAndGet();
+                                throw new OidcAuthException("no token has been obtained yet; call signIn()");
+                            })
+                            .build();
+                    Assert.fail("expected build() to fail when the token provider throws");
+                } catch (OidcAuthException e) {
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // the provider's own error, surfaced fast - not a wrapped transport failure after the budget
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected the provider's message, got: " + msg,
+                            msg.contains("no token has been obtained yet"));
+                    Assert.assertTrue("build() must fail fast, not burn the reconnect budget; took " + elapsedMillis + "ms",
+                            elapsedMillis < budgetMillis / 2);
+                } catch (Exception e) {
+                    Assert.fail("SYNC-mode credential failure must surface the provider's OidcAuthException, got: " + e);
+                }
+                // one deterministic failure, not a budget's worth of retries
+                Assert.assertEquals(1, calls.get());
+            }
+        });
+    }
+
     @Test
     public void testThrowingProviderOnReconnectIsRetriedAndRecovers() throws Exception {
         assertMemoryLeak(() -> {

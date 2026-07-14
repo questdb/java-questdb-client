@@ -596,6 +596,34 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTamperedBlankServedTokenRejectedOnLoad() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // a tampered persisted entry with a BLANK (whitespace-only) served token is NOT isEmpty() and
+                // passes hasOnlyTokenChars vacuously (space is 0x20), yet is served as a blank "Bearer " header
+                // the server only answers with 401 - so adopt() must reject it (via Chars.isBlank, matching the
+                // sender's own HttpTokenProvider.validateToken) and fall back to the device flow, not wedge on it
+                fake.loadReturns = new PersistedToken("   ", null, "REFRESH-1", System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    String result = auth.signIn();
+                    Assert.assertEquals("ACCESS-FRESH", result);
+                    Assert.assertNotEquals("   ", result);
+                }
+                Assert.assertTrue("a rejected blank persisted token must fall back to the device flow", device.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTamperedEmptyServedTokenRejectedOnLoad() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

@@ -595,6 +595,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.error("{} hit terminal upgrade error, won't retry: {}",
                         contextLabel, e.getMessage());
                 throw e;
+            } catch (QwpCredentialUnavailableException e) {
+                // A credential the client cannot ACQUIRE (the configured token provider threw) is NOT a
+                // transport outage: retrying the connect cannot conjure a token the provider will not hand
+                // over, so fail fast with the provider's own exception rather than burn the whole connect
+                // budget treating it as a reachable-server problem (which would block build() for up to
+                // maxDurationMillis, default 5 min, and surface a transport-shaped wrapper). Mirrors the
+                // foreground OFF-mode connect (QwpWebSocketSender) and the background reconnect loop above,
+                // which both give credential acquisition its own terminal handling; only this SYNC
+                // initial-connect path lacked it. QwpCredentialUnavailableException is a LineSenderException,
+                // disjoint from the HttpClientException-based terminal set above, so it reaches here.
+                LOG.error("{} could not acquire a credential, won't retry: {}",
+                        contextLabel, e.getMessage());
+                throw e.providerFailure();
             } catch (Throwable e) {
                 if (e instanceof Error) {
                     // JVM/programming failure (OOM, LinkageError): not a

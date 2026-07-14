@@ -49,6 +49,7 @@ import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -120,6 +121,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int DEFAULT_TOKEN_TTL_SECONDS = 300;
     private static final String ERROR_AUTHORIZATION_PENDING = "authorization_pending";
     private static final String ERROR_SLOW_DOWN = "slow_down";
+    // getToken() polls for the instance lock in slices this small so it observes an interactive sign-in that
+    // starts while it waits (and close()) promptly, rather than blocking a whole refresh behind a single
+    // acquire; see acquireForGetToken()
+    private static final long GET_TOKEN_LOCK_POLL_SLICE_MILLIS = 50;
     // the grant_type values are constants, so url-encode them once at class load rather than on every
     // device-code poll and token refresh
     private static final String GRANT_TYPE_DEVICE_CODE_ENCODED = urlEncode(GRANT_TYPE_DEVICE_CODE);
@@ -189,6 +194,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     private volatile boolean closed;
     private long expiresAtMillis;
     private String idToken;
+    // set only while signIn() runs the interactive device flow (holding the lock for up to the device-code
+    // lifetime). getToken() reads it lock-free to fail fast behind an interactive sign-in while still waiting
+    // briefly behind a peer's quick silent refresh; volatile for that cross-thread read. See acquireForGetToken()
+    private volatile boolean interactiveSignInInProgress;
     private JsonLexer jsonLexer;
     private String lastPersistedRefreshToken;
     private HttpClient plainClient;
@@ -469,7 +478,11 @@ public class OidcDeviceAuth implements QuietCloseable {
      * <p>
      * It does not wait behind an interactive {@link #signIn()} running on another thread (which would stall
      * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
-     * caller should retry once the sign-in completes. It is not, however, instantaneous - when the cached
+     * caller should retry once the sign-in completes. It does, however, wait briefly behind another thread's
+     * quick cached read or silent refresh rather than fail every concurrent caller sharing this instance on
+     * each token refresh - the {@code HttpTokenProvider} contract permits that bounded wait, capped here by
+     * {@link Builder#httpTimeoutMillis(int)} and still failing fast the moment an interactive sign-in or
+     * {@link #close()} begins meanwhile. It is not, otherwise, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint (and, with a
      * coordinating {@link TokenStore}, may first wait briefly to acquire the store's per-identity lock - a few
      * seconds at most for {@link FileTokenStore}, then it proceeds without the lock - before that round-trip).
@@ -483,18 +496,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
-     *                           not be refreshed without an interactive sign-in, or if a sign-in or
-     *                           refresh is already in progress on another thread
+     *                           not be refreshed without an interactive sign-in, if an interactive sign-in is
+     *                           in progress on another thread, or if a concurrent refresh did not complete in time
      */
     public String getToken() {
         throwIfClosed();
-        // never wait on the flush path: signIn()'s sign-in holds the lock for the whole device-code
-        // lifetime (up to 30 minutes), so tryLock and fail fast if held. A sign-in in progress means there
-        // is no token to serve yet, so the caller gets a prompt exception to retry rather than a stalled
-        // flush
-        if (!lock.tryLock()) {
-            throw new OidcAuthException("a sign-in or token refresh is already in progress on another thread; no token is available without blocking - retry shortly");
-        }
+        acquireForGetToken();
         try {
             throwIfClosed();
             maybeLoadFromStore();
@@ -541,7 +548,14 @@ public class OidcDeviceAuth implements QuietCloseable {
                     return selectToken();
                 }
             }
-            runDeviceFlow();
+            // flag the interactive phase so a concurrent getToken() fails fast (rather than waiting behind this
+            // for the whole device-code lifetime); it still waits behind the cheap cache/refresh work above
+            interactiveSignInInProgress = true;
+            try {
+                runDeviceFlow();
+            } finally {
+                interactiveSignInInProgress = false;
+            }
             return selectToken();
         } finally {
             lock.unlock();
@@ -1000,7 +1014,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         // provider's response into a real control byte), and a non-ASCII char is silently truncated to one
         // byte by the ASCII header writer. A real OAuth token is printable ASCII, so reject anything else
         // rather than route a tampered or corrupt credential onto the wire. Token bytes are never embedded
-        // in the message: they are the secret this class protects.
+        // in the message: they are the secret this class protects. (A blank/whitespace-only served token is
+        // handled by storeTokens, which caches it as absent so it is never served, rather than rejected here -
+        // an EMPTY served kind is the legitimate "the grant returned the other kind" case selectToken handles.)
         if (!hasOnlyTokenChars(token)) {
             throw new OidcAuthException()
                     .put("the identity provider returned an ").put(tokenName)
@@ -1016,17 +1032,50 @@ public class OidcDeviceAuth implements QuietCloseable {
         return trimmed + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
     }
 
+    private void acquireForGetToken() {
+        // Never wait behind an interactive signIn(): it holds the lock for the whole device-code lifetime
+        // (up to 30 min) with no token to serve until it completes, so fail fast and let the caller retry. A
+        // peer holding the lock for a quick cached read or a silent refresh (bounded, usually well under a
+        // second) is different - the HttpTokenProvider contract permits a brief wait behind such a refresh - so
+        // poll for the lock in short slices rather than fail every concurrent caller sharing this instance on
+        // each token refresh (the old unconditional tryLock() did exactly that). Polling, not one blocking
+        // acquire, lets us still fail fast the moment an interactive sign-in - or close() - begins while we
+        // wait. Bound the total wait by httpTimeoutMillis so a stuck or pathologically slow holder degrades to
+        // a retryable failure instead of stalling the flush path without bound.
+        final long deadline = System.currentTimeMillis() + httpTimeoutMillis;
+        while (true) {
+            throwIfClosed();
+            if (interactiveSignInInProgress) {
+                throw new OidcAuthException("an interactive sign-in is in progress on another thread; no token is available without blocking - retry once it completes");
+            }
+            final long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                throw new OidcAuthException("a token refresh is already in progress on another thread and no token became available in time; retry shortly");
+            }
+            try {
+                if (lock.tryLock(Math.min(remaining, GET_TOKEN_LOCK_POLL_SLICE_MILLIS), TimeUnit.MILLISECONDS)) {
+                    return;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new OidcAuthException("interrupted while waiting to acquire the OIDC token");
+            }
+        }
+    }
+
     private boolean adopt(PersistedToken token) {
         if (token == null) {
             return false;
         }
         // the file is attacker-writable, so treat the served token (the one getToken() puts verbatim into an
         // Authorization header or a PG-wire password) as untrusted: reject a control/non-ASCII char - and the
-        // whole entry - rather than route a tampered credential onto the wire. A null OR empty served token is
-        // unusable: an empty string passes hasOnlyTokenChars vacuously but would be served as a blank
-        // "Bearer " header that only draws a 401, so reject it here and fall through to a refresh or sign-in.
+        // whole entry - rather than route a tampered credential onto the wire. A null, empty OR blank
+        // (whitespace-only) served token is unusable: it passes hasOnlyTokenChars vacuously (space is 0x20)
+        // but would be served as a blank "Bearer " header that only draws a 401 - and the sender's own
+        // HttpTokenProvider.validateToken (Chars.isBlank) rejects it downstream anyway - so reject it here on
+        // the same isBlank contract and fall through to a refresh or sign-in rather than wedge on it.
         String servedToken = groupsInToken ? token.getIdToken() : token.getAccessToken();
-        if (servedToken == null || servedToken.isEmpty() || !hasOnlyTokenChars(servedToken)) {
+        if (Chars.isBlank(servedToken) || !hasOnlyTokenChars(servedToken)) {
             return false;
         }
         accessToken = token.getAccessToken();
@@ -1456,8 +1505,14 @@ public class OidcDeviceAuth implements QuietCloseable {
         } else {
             validateTokenChars(parser.accessToken, "access_token");
         }
-        accessToken = parser.accessToken.length() > 0 ? parser.accessToken.toString() : null;
-        idToken = parser.idToken.length() > 0 ? parser.idToken.toString() : null;
+        // treat a blank (empty OR whitespace-only) token as absent (null), not as a usable credential: a
+        // whitespace-only served token passes the char check vacuously (space is 0x20) but would be served as
+        // a blank "Bearer " header the server only answers with 401, so cache it as null and let selectToken /
+        // the wrong-token-kind fallback handle a missing served kind rather than serve it. An empty string was
+        // already treated as absent here; this only additionally folds in whitespace-only, matching adopt() and
+        // the sender's own HttpTokenProvider.validateToken (Chars.isBlank).
+        accessToken = Chars.isBlank(parser.accessToken) ? null : parser.accessToken.toString();
+        idToken = Chars.isBlank(parser.idToken) ? null : parser.idToken.toString();
         // a refresh response usually omits a new refresh token; keep the current one in that case
         if (parser.refreshToken.length() > 0) {
             refreshToken = parser.refreshToken.toString();
