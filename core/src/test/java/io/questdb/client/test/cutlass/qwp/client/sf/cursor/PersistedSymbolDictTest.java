@@ -147,6 +147,78 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testAppendRawEntriesShortWriteThrowsWithoutAdvancingIsIdempotentOnRetry() throws Exception {
+        // The producer's FAST path persists a frame's already-encoded delta bytes
+        // via appendRawEntries. A short write (disk full / quota) mid-persist must
+        // throw WITHOUT advancing size()/appendOffset, so a retry keyed off size()
+        // re-writes the identical bytes at the same offset and recovers a gap-free,
+        // duplicate-free dictionary. The failed-PUBLISH regressions
+        // (DeltaDictRecoveryTest) exercise a persist that SUCCEEDED; only this pins
+        // the persist-FAILURE trigger, whose idempotency the write-ahead
+        // (persistNewSymbolsBeforePublish, resuming from pd.size()) relies on.
+        assertMemoryLeak(() -> {
+            Path src = Files.createTempDirectory("qwp-symdict-src");
+            Path dst = Files.createTempDirectory("qwp-symdict-dst");
+            try {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                dict.getOrAddSymbol("AAPL"); // id 0
+                dict.getOrAddSymbol("MSFT"); // id 1
+
+                // Encode the range once to obtain its on-disk [len][utf8]... bytes.
+                PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString());
+                encoded.appendSymbols(dict, 0, 1);
+                encoded.close();
+
+                PersistedSymbolDict source = PersistedSymbolDict.open(src.toString());
+                try {
+                    long addr = source.loadedEntriesAddr();
+                    int rawLen = source.loadedEntriesLen();
+                    int count = source.size();
+
+                    ShortWriteOnceFacade ff = new ShortWriteOnceFacade();
+                    PersistedSymbolDict d = PersistedSymbolDict.open(ff, dst.toString());
+                    Assert.assertNotNull(d);
+                    try {
+                        ff.armed = true; // the next entry append lands short
+                        try {
+                            d.appendRawEntries(addr, rawLen, count);
+                            Assert.fail("a short write must throw");
+                        } catch (IllegalStateException expected) {
+                            Assert.assertTrue("short-write error: " + expected.getMessage(),
+                                    expected.getMessage().contains("short write"));
+                        }
+                        // The throw preceded the size/offset advance: nothing persisted.
+                        Assert.assertEquals("short write must NOT advance size", 0, d.size());
+
+                        // Retry the SAME bytes (the facade auto-disarmed): the write
+                        // lands at the unchanged offset, overwriting the torn prefix.
+                        d.appendRawEntries(addr, rawLen, count);
+                        Assert.assertEquals(2, d.size());
+                    } finally {
+                        d.close();
+                    }
+                } finally {
+                    source.close();
+                }
+
+                // Recovery sees a gap-free, duplicate-free dictionary (size 2, not 3).
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(dst.toString());
+                try {
+                    Assert.assertEquals("retry must not duplicate or gap the dictionary", 2, reopened.size());
+                    ObjList<String> symbols = reopened.readLoadedSymbols();
+                    Assert.assertEquals("AAPL", symbols.getQuick(0));
+                    Assert.assertEquals("MSFT", symbols.getQuick(1));
+                } finally {
+                    reopened.close();
+                }
+            } finally {
+                rmDir(src);
+                rmDir(dst);
+            }
+        });
+    }
+
+    @Test
     public void testAppendSymbolsBatchWritesDenseRange() throws Exception {
         // appendSymbols persists a whole id range in one write (the hot-path
         // syscall reduction). It must produce the same dense, id-ordered file a
@@ -197,6 +269,60 @@ public class PersistedSymbolDictTest {
                     Assert.assertEquals("NVDA", third.readLoadedSymbols().getQuick(4));
                 } finally {
                     third.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testAppendSymbolsShortWriteThrowsWithoutAdvancingIsIdempotentOnRetry() throws Exception {
+        // The producer's SLOW path (re-encode the [pd.size()..batchMax] suffix after
+        // a prior partial persist) writes via appendSymbols. A short write (disk full
+        // / quota) must throw WITHOUT advancing size()/appendOffset, so a retry keyed
+        // off size() re-persists the SAME range at the SAME offset and recovers a
+        // gap-free, duplicate-free dictionary. A regression that advanced size before
+        // the written==len check would strand a torn/duplicated dictionary here.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                dict.getOrAddSymbol("AAPL"); // id 0
+                dict.getOrAddSymbol("GOOG"); // id 1
+
+                ShortWriteOnceFacade ff = new ShortWriteOnceFacade();
+                PersistedSymbolDict d = PersistedSymbolDict.open(ff, dir.toString());
+                Assert.assertNotNull(d);
+                try {
+                    ff.armed = true; // the next entry append lands short
+                    try {
+                        d.appendSymbols(dict, 0, 1);
+                        Assert.fail("a short write must throw");
+                    } catch (IllegalStateException expected) {
+                        Assert.assertTrue("short-write error: " + expected.getMessage(),
+                                expected.getMessage().contains("short write"));
+                    }
+                    // The throw preceded the size/offset advance: nothing persisted.
+                    Assert.assertEquals("short write must NOT advance size", 0, d.size());
+
+                    // Retry the SAME range (the facade auto-disarmed): re-writes at
+                    // the unchanged offset, overwriting the torn bytes.
+                    d.appendSymbols(dict, 0, 1);
+                    Assert.assertEquals(2, d.size());
+                } finally {
+                    d.close();
+                }
+
+                // Recovery sees a gap-free, duplicate-free dictionary (size 2, not 3).
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(dir.toString());
+                try {
+                    Assert.assertEquals("retry must not duplicate or gap the dictionary", 2, reopened.size());
+                    ObjList<String> symbols = reopened.readLoadedSymbols();
+                    Assert.assertEquals("AAPL", symbols.getQuick(0));
+                    Assert.assertEquals("GOOG", symbols.getQuick(1));
+                } finally {
+                    reopened.close();
                 }
             } finally {
                 rmDir(dir);
@@ -774,6 +900,26 @@ public class PersistedSymbolDictTest {
         @Override
         public long length(String path) {
             return (long) Integer.MAX_VALUE + 1L;
+        }
+    }
+
+    /**
+     * Lands ONE armed entry append short -- writes {@code len-1} of the {@code len}
+     * requested bytes and reports {@code len-1} -- reproducing a disk-full / quota
+     * short write mid-persist. Fires only on an entry append (offset past the
+     * 8-byte header), never the header write, and disarms after firing so the retry
+     * writes cleanly.
+     */
+    private static final class ShortWriteOnceFacade extends DelegatingFilesFacade {
+        boolean armed;
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            if (armed && offset > 0 && len > 1) {
+                armed = false;
+                return INSTANCE.write(fd, addr, len - 1, offset);
+            }
+            return INSTANCE.write(fd, addr, len, offset);
         }
     }
 }
