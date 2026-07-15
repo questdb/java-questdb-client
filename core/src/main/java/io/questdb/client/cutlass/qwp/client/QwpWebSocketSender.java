@@ -172,9 +172,9 @@ public class QwpWebSocketSender implements Sender {
     private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
     // Per-table encoded body byte counts captured during flushPendingRows' combined
-    // encode, reused by flushPendingRowsSplit to size each split frame arithmetically
-    // instead of re-encoding the batch a second time. Cleared and repopulated on every
-    // flush; only consumed on the (exceptional) split path. Reused to stay zero-GC.
+    // encode. flushPendingRowsSplit uses them both for preflight sizing and to walk
+    // the staged body slices without encoding the batch a second time. Cleared and
+    // repopulated on every flush; reused to stay zero-GC.
     private final IntList splitFrameBodyBytes = new IntList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -3497,15 +3497,13 @@ public class QwpWebSocketSender implements Sender {
         encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
                 symbolDeltaBaseline(), currentBatchMaxSymbolId);
-        // Record each table's encoded body size (position delta across addTable) so
-        // the split path can size its per-table frames arithmetically rather than
-        // re-encoding the whole batch. Body encoding is context-free (a table's bytes
-        // don't depend on its siblings or the delta section), so the size a table
-        // takes here equals the size it takes in its own split frame. Only consumed
-        // when the batch overflows the cap; the capture is a couple of int ops per
-        // table on the common path.
+        // Record each table's encoded body size (position delta across addTable).
+        // When the batch needs splitting, these lengths delimit immutable body
+        // slices in the combined encoder buffer for direct frame assembly. The
+        // capture is a couple of int ops per table on the common path.
         splitFrameBodyBytes.clear();
-        int bodyStart = encoder.getBuffer().getPosition();
+        int combinedBodyStart = encoder.getBuffer().getPosition();
+        int bodyStart = combinedBodyStart;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3538,10 +3536,9 @@ public class QwpWebSocketSender implements Sender {
         // the next flush picks up the new cap.
         int cap = serverMaxBatchSize;
         if (cap > 0 && messageSize > cap) {
-            // The combined frame's delta-entry bytes are byte-identical to the first
-            // split frame's (same baseline + batch max), so capture the length now
-            // for the arithmetic frame-sizing in flushPendingRowsSplit.
-            flushPendingRowsSplit(keys, deferCommit, encoder.getDeltaEntriesLen(), cap);
+            // Keep the completed combined frame staged in the encoder while the
+            // split path copies its delta entries and table-body slices.
+            flushPendingRowsSplit(keys, deferCommit, combinedBodyStart, cap);
             return;
         }
 
@@ -3593,7 +3590,12 @@ public class QwpWebSocketSender implements Sender {
      *                    carry FLAG_DEFER_COMMIT. When false, only the
      *                    last message omits the flag.
      */
-    private void flushPendingRowsSplit(ObjList<CharSequence> keys, boolean deferCommit, int combinedDeltaEntriesLen, int cap) {
+    private void flushPendingRowsSplit(
+            ObjList<CharSequence> keys,
+            boolean deferCommit,
+            int combinedBodyStart,
+            int cap
+    ) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", cap, deferCommit);
         }
@@ -3609,14 +3611,10 @@ public class QwpWebSocketSender implements Sender {
         // front makes the split all-or-nothing: either every frame fits and all
         // publish, or none publish and we throw with nothing stranded.
         //
-        // Each split frame's size is derived ARITHMETICALLY from the combined encode
-        // flushPendingRows already performed -- header + the two delta-section varints
-        // + the delta entries (byte-identical to the combined frame's when this frame
-        // carries them) + the table's own body bytes (captured in splitFrameBodyBytes,
-        // context-free so identical here and in its solo frame) -- rather than
-        // re-encoding every table a second time. simBaseline mirrors the publish loop's
-        // baseline advance (advanceSentMaxSymbolId), so each size equals the frame the
-        // publish loop will build; this pass mutates no delta/persist state.
+        // Each split frame's size is derived from the combined encode flushPendingRows
+        // already performed. simBaseline mirrors the publish loop's baseline advance
+        // (advanceSentMaxSymbolId), so each size equals the frame the staged-slice
+        // assembler will build; this pass mutates no delta/persist state.
         int nonEmptyCount = 0;
         int simBaseline = symbolDeltaBaseline();
         int bodyIdx = 0;
@@ -3630,13 +3628,8 @@ public class QwpWebSocketSender implements Sender {
                 continue;
             }
             nonEmptyCount++;
-            int deltaStart = simBaseline + 1;
-            int deltaCount = Math.max(0, currentBatchMaxSymbolId - simBaseline);
-            int messageSize = QwpConstants.HEADER_SIZE
-                    + NativeBufferWriter.varintSize(deltaStart)
-                    + NativeBufferWriter.varintSize(deltaCount)
-                    + (deltaCount > 0 ? combinedDeltaEntriesLen : 0)
-                    + splitFrameBodyBytes.getQuick(bodyIdx);
+            int messageSize = encoder.getSplitMessageSize(
+                    splitFrameBodyBytes.getQuick(bodyIdx), simBaseline, currentBatchMaxSymbolId);
             bodyIdx++;
             if (messageSize > cap) {
                 resetTableBuffersAfterFlush(keys);
@@ -3653,6 +3646,8 @@ public class QwpWebSocketSender implements Sender {
         }
 
         int sent = 0;
+        bodyIdx = 0;
+        int tableBodyOffset = combinedBodyStart;
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3667,35 +3662,38 @@ public class QwpWebSocketSender implements Sender {
             boolean isLast = (sent == nonEmptyCount);
             boolean deferThis = deferCommit || !isLast;
 
-            encoder.setDeferCommit(deferThis);
-            // Each split frame emits the delta above sentMaxSymbolId; the first
-            // frame ships the whole batch's new ids and advances the baseline, so
-            // the remaining frames carry an empty delta and just reference ids the
-            // first frame already registered.
-            encoder.beginMessage(1, globalSymbolDictionary,
-                    symbolDeltaBaseline(), currentBatchMaxSymbolId);
-            encoder.addTable(tableBuffer);
-            int messageSize = encoder.finishMessage();
-            QwpBufferWriter buffer = encoder.getBuffer();
+            int tableBodyLength = splitFrameBodyBytes.getQuick(bodyIdx++);
+            // Persist before touching activeBuffer. If the write-ahead fails, the
+            // caller can retry with both the source rows and active microbatch
+            // unchanged. The first frame carries the batch's new symbols; later
+            // frames are no-ops once the baseline has advanced.
+            persistNewSymbolsBeforePublish();
+            ensureActiveBufferReady();
+            // The combined encoder buffer remains immutable for the whole split.
+            // Assemble this frame directly into the active microbatch: patched
+            // header + staged delta bytes + the staged table-body slice. No row or
+            // column is encoded a second time.
+            int messageSize = encoder.copySplitMessage(
+                    activeBuffer,
+                    tableBodyOffset,
+                    tableBodyLength,
+                    deferThis,
+                    symbolDeltaBaseline(),
+                    currentBatchMaxSymbolId
+            );
+            tableBodyOffset += tableBodyLength;
             // The pre-flight pass above already verified every split frame fits the
             // cap, so none can be found oversized here -- which is what keeps this
             // loop from publishing (and stranding) a deferred prefix before an
             // oversized table. Both passes size against the SAME snapshot cap, so a
             // mid-flush failover cannot make them disagree; the assert therefore only
             // catches a genuine divergence between the pre-flight arithmetic and the
-            // real encode (a future bug), not a cap race. It deliberately does NOT
+            // staged assembler (a future bug), not a cap race. It deliberately does NOT
             // reset+throw here, because by this point a prefix may already be on the ring.
             assert messageSize <= cap
                     : "split frame exceeded serverMaxBatchSize after pre-flight [table=" + tableName
                     + ", messageSize=" + messageSize + ", serverMaxBatchSize=" + cap + ']';
 
-            // Write-ahead persist before publish (see flushPendingRows). The
-            // first split frame carries the batch's new symbols; the rest are
-            // no-ops once the baseline has advanced past them.
-            persistNewSymbolsBeforePublish();
-            ensureActiveBufferReady();
-            activeBuffer.ensureCapacity(messageSize);
-            activeBuffer.write(buffer.getBufferPtr(), messageSize);
             activeBuffer.incrementRowCount();
             sealAndSwapBuffer();
             // Frame queued: advance so the next split frame's delta starts above
