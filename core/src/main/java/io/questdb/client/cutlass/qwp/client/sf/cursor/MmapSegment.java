@@ -640,6 +640,20 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * Feeds every recovered frame in this segment to the engine's single-pass
+     * recovery fold. Segments are visited oldest-first by {@link SegmentRing}.
+     */
+    void scanRecovery(RecoveredFrameAnalysis analysis) {
+        long off = HEADER_SIZE;
+        long frames = frameCount;
+        for (long i = 0; i < frames; i++) {
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
+            analysis.accept(baseSeq + i, mmapAddress + off + FRAME_HEADER_SIZE, payloadLen);
+            off += FRAME_HEADER_SIZE + payloadLen;
+        }
+    }
+
+    /**
      * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) any
      * delta-flagged frame in this segment carries, or {@code 0} only when NO
      * delta-flagged frame is present. A frame with {@code deltaCount == 0} (a commit

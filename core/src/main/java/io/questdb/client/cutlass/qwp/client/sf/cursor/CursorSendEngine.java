@@ -137,6 +137,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // constructor, closed by {@link #close()}. When null in disk mode the engine
     // reports delta encoding as unavailable and the sender keeps full-dict frames.
     private final PersistedSymbolDict persistedSymbolDict;
+    // Engine-owned output of the single ordered recovery walk. It is retained
+    // because both producer seeding and every recycled send loop need the same
+    // frame-rebuilt symbol suffix. Null for fresh and memory-only engines.
+    private final RecoveredFrameAnalysis recoveredFrameAnalysis;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
@@ -248,6 +252,7 @@ public final class CursorSendEngine implements QuietCloseable {
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
         PersistedSymbolDict persistedDictInProgress = null;
+        RecoveredFrameAnalysis recoveredFrameAnalysisInProgress = null;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -329,6 +334,12 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
                 }
+                // Fold the whole recovered ring once. The result checkpoints all
+                // running metadata and raw symbol bytes at each commit-bearing
+                // frame, so its final snapshot excludes an orphan deferred tail
+                // without requiring a second bounded scan.
+                recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(
+                        persistedDictInProgress == null ? 0 : persistedDictInProgress.size());
                 // Locate the last commit-bearing frame below a potentially
                 // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
                 // closed) mid-transaction leaves deferred frames with no
@@ -338,12 +349,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // drainOnClose), and (b) replaying them into a NEW session's
                 // commit would resurrect half a transaction -- see the WARN
                 // below. Computed before the I/O loop or producer append.
-                this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
-                        QwpConstants.HEADER_OFFSET_FLAGS,
-                        QwpConstants.FLAG_DEFER_COMMIT,
-                        QwpConstants.MAGIC_MESSAGE,
-                        QwpConstants.HEADER_SIZE
-                );
+                this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
                 if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
                     this.recoveredOrphanTipFsn = publishedFsn;
                     LOG.warn("recovered SF log ends with {} deferred frame(s) whose transaction was never "
@@ -363,12 +369,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // this and over-reject an otherwise-recoverable slot. maxSymbolDeltaEnd
                 // returns 0 when no such frame carries a symbol, yielding -1 here.
                 // Computed before the I/O loop or producer append; single-threaded.
-                this.recoveredMaxSymbolId = recovered.maxSymbolDeltaEnd(
-                        QwpConstants.MAGIC_MESSAGE,
-                        QwpConstants.HEADER_OFFSET_FLAGS,
-                        QwpConstants.FLAG_DELTA_SYMBOL_DICT,
-                        QwpConstants.HEADER_SIZE,
-                        recoveredCommitBoundaryFsn) - 1L;
+                this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
                 // Full-dict-fallback recovery. When the persisted .symbol-dict is a
                 // SUBSET of the ids the surviving frames reference
                 // (recoveredMaxSymbolId >= its size) YET every such frame is
@@ -388,12 +389,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // dictionary. The recoveredMaxSymbolId >= size guard means this never
                 // fires for a slot whose dictionary is intact, nor for an empty slot
                 // (recoveredMaxSymbolId == -1). Single-threaded; before the I/O loop.
-                this.recoveredMaxSymbolDeltaStart = recovered.maxSymbolDeltaStart(
-                        QwpConstants.MAGIC_MESSAGE,
-                        QwpConstants.HEADER_OFFSET_FLAGS,
-                        QwpConstants.FLAG_DELTA_SYMBOL_DICT,
-                        QwpConstants.HEADER_SIZE,
-                        recoveredCommitBoundaryFsn);
+                this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
                 if (persistedDictInProgress != null
                         && recoveredMaxSymbolId >= persistedDictInProgress.size()
                         && recoveredMaxSymbolDeltaStart == 0L) {
@@ -451,6 +447,7 @@ public final class CursorSendEngine implements QuietCloseable {
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
             this.persistedSymbolDict = persistedDictInProgress;
+            this.recoveredFrameAnalysis = recoveredFrameAnalysisInProgress;
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
@@ -479,6 +476,12 @@ public final class CursorSendEngine implements QuietCloseable {
             if (persistedDictInProgress != null) {
                 try {
                     persistedDictInProgress.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (recoveredFrameAnalysisInProgress != null) {
+                try {
+                    recoveredFrameAnalysisInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }
@@ -667,6 +670,12 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
+            if (recoveredFrameAnalysis != null) {
+                try {
+                    recoveredFrameAnalysis.close();
+                } catch (Throwable ignored) {
+                }
+            }
             if (fullyDrained) {
                 try {
                     unlinkAllSegmentFiles(sfDir);
@@ -716,6 +725,11 @@ public final class CursorSendEngine implements QuietCloseable {
      * transmitted, so their ids never reach a server and must not inflate the baseline.
      */
     public long collectReplaySymbolsAbove(int baseline, ObjList<String> out) {
+        if (recoveredFrameAnalysis != null
+                && recoveredFrameAnalysis.baseline() == baseline) {
+            recoveredFrameAnalysis.appendDecodedSymbols(out);
+            return recoveredFrameAnalysis.coverage();
+        }
         if (ring == null) {
             return baseline;
         }
@@ -736,6 +750,40 @@ public final class CursorSendEngine implements QuietCloseable {
                 baseline,
                 out
         );
+    }
+
+    long recoveredSymbolCoverage(int baseline) {
+        return checkedRecoveryAnalysis(baseline).coverage();
+    }
+
+    int recoveredSymbolSuffixCount(int baseline) {
+        return checkedRecoveryAnalysis(baseline).rawCount();
+    }
+
+    int recoveredSymbolSuffixLen(int baseline) {
+        return checkedRecoveryAnalysis(baseline).rawLen();
+    }
+
+    void copyRecoveredSymbolSuffix(int baseline, long target) {
+        RecoveredFrameAnalysis analysis = checkedRecoveryAnalysis(baseline);
+        int len = analysis.rawLen();
+        if (len > 0) {
+            io.questdb.client.std.Unsafe.getUnsafe().copyMemory(analysis.rawAddr(), target, len);
+        }
+    }
+
+    @TestOnly
+    public long recoveryFramesVisited() {
+        return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.framesVisited();
+    }
+
+    private RecoveredFrameAnalysis checkedRecoveryAnalysis(int baseline) {
+        if (recoveredFrameAnalysis == null || recoveredFrameAnalysis.baseline() != baseline) {
+            throw new IllegalStateException("recovery symbol baseline mismatch [expected="
+                    + (recoveredFrameAnalysis == null ? "none" : recoveredFrameAnalysis.baseline())
+                    + ", actual=" + baseline + ']');
+        }
+        return recoveredFrameAnalysis;
     }
 
     /**

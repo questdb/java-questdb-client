@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -365,6 +366,38 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    @Test
+    public void testRecoveryScansFramesOnceAndReusesCachedSymbolSuffix() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaSymbolFrame(engine, 0, 'a');
+                appendDeltaSymbolFrame(engine, 1, 'b');
+                appendDeltaSymbolFrame(engine, 2, 'c');
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals("one recovery visit per frame", 3L, engine.recoveryFramesVisited());
+
+                ObjList<String> first = new ObjList<>();
+                ObjList<String> second = new ObjList<>();
+                assertEquals(3L, engine.collectReplaySymbolsAbove(0, first));
+                assertEquals(3L, engine.collectReplaySymbolsAbove(0, second));
+                assertEquals("a", first.getQuick(0));
+                assertEquals("c", second.getQuick(2));
+                assertEquals("producer seed reads must reuse the recovery result",
+                        3L, engine.recoveryFramesVisited());
+
+                CursorWebSocketSendLoop loop = newLoop(engine, new ArrayList<>());
+                try {
+                    assertEquals("send-loop construction must copy the cached native suffix",
+                            3L, engine.recoveryFramesVisited());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     // ---------------------------------------------------------------------
     // harness
     // ---------------------------------------------------------------------
@@ -450,6 +483,25 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                     (byte) (FLAG_DELTA_SYMBOL_DICT | (defer ? FLAG_DEFER_COMMIT : 0)));
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE, (byte) deltaStart);
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) deltaCount);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void appendDeltaSymbolFrame(CursorSendEngine engine, int deltaStart, char symbol) {
+        int size = HEADER_SIZE + 4; // start, count=1, symbolLen=1, symbol byte
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + HEADER_OFFSET_FLAGS, (byte) FLAG_DELTA_SYMBOL_DICT);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE, (byte) deltaStart);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) 1);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 2, (byte) 1);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 3, (byte) symbol);
             engine.appendBlocking(buf, size);
         } finally {
             Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);

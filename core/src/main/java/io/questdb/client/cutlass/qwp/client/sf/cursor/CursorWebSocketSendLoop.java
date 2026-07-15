@@ -44,7 +44,6 @@ import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.Utf8s;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
@@ -195,7 +194,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
-    // Test seam: when true, appendSymbolToMirror throws instead of appending,
+    // Test seam: when true, recovery mirror seeding throws before growing,
     // simulating the native realloc OOM (or MAX_SENT_DICT_BYTES ceiling) that
     // ensureSentDictCapacity can raise while the constructor seeds the recovery
     // mirror. Lets a test prove the constructor frees the already-malloc'd mirror on
@@ -300,6 +299,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private int sentDictBytesCapacity;
     private int sentDictBytesLen;
     private int sentDictCount;
+    // Reusable staging frame for dictionary catch-up chunks. A reconnect may split a
+    // large dictionary into many chunks, and every later reconnect repeats that split;
+    // retaining one growable loop-owned buffer turns the old malloc/free-per-chunk path
+    // into amortized growth only. I/O-thread-owned, freed beside sentDictBytesAddr.
+    private long catchUpFrameAddr;
+    private int catchUpFrameCapacity;
+    private int catchUpFrameGrowthCount;
     // Orphan-policy cap-gap attempts -- catch-ups that reached a node and found an entry
     // too large for its batch cap -- with no intervening successful catch-up or unrelated
     // reconnect state (see MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting).
@@ -750,18 +756,28 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // catch-up-free.
         if (engine.recoveredMaxSymbolDeltaStart() > 0L) {
             // The prefix seed above may already have malloc'd the mirror, and
-            // appendSymbolToMirror -> ensureSentDictCapacity can still throw here (a
-            // native realloc OOM, or the MAX_SENT_DICT_BYTES ceiling). Such a throw
+            // ensureSentDictCapacity can still throw here (a native realloc OOM, or
+            // the MAX_SENT_DICT_BYTES ceiling). Such a throw
             // propagates out of the constructor, so the half-built loop is never
             // assigned to a reference -- neither ensureConnected's catch nor
             // BackgroundDrainer's finally can close() it -- and the mirror would leak.
             // Free it on any throw so the constructor leaves nothing behind, mirroring
             // the loopNeverRan free in close() / ioLoop's exit.
             try {
-                ObjList<String> fromFrames = new ObjList<>();
-                if (engine.collectReplaySymbolsAbove(sentDictCount, fromFrames) >= 0) {
-                    for (int i = 0, n = fromFrames.size(); i < n; i++) {
-                        appendSymbolToMirror(fromFrames.getQuick(i));
+                int baseline = sentDictCount;
+                if (engine.recoveredSymbolCoverage(baseline) >= 0L) {
+                    int suffixLen = engine.recoveredSymbolSuffixLen(baseline);
+                    int suffixCount = engine.recoveredSymbolSuffixCount(baseline);
+                    if (suffixLen > 0) {
+                        if (forceMirrorSeedFailureForTest) {
+                            throw new LineSenderException(
+                                    "simulated mirror seed allocation failure (test only)");
+                        }
+                        ensureSentDictCapacity((long) sentDictBytesLen + suffixLen);
+                        engine.copyRecoveredSymbolSuffix(
+                                baseline, sentDictBytesAddr + sentDictBytesLen);
+                        sentDictBytesLen += suffixLen;
+                        sentDictCount += suffixCount;
                     }
                 }
             } catch (Throwable t) {
@@ -1119,6 +1135,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // guard) must not observe a non-zero sentDictCount against a freed
             // buffer and drive setWireBaselineWithCatchUp into a null-mirror catch-up.
             sentDictCount = 0;
+        }
+        if (loopNeverRan) {
+            freeCatchUpFrameBuffer();
         }
     }
 
@@ -2030,6 +2049,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesLen = 0;
                 sentDictCount = 0; // keep the mirror all-or-nothing (see close())
             }
+            freeCatchUpFrameBuffer();
             shutdownLatch.countDown();
             // Failed-stop hand-off (see delegateEngineClose): the owner could
             // not free the engine safely while this thread was alive, so the
@@ -2613,7 +2633,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         int payloadLen = (int) payloadLenL;
         int frameLen = (int) frameLenL;
-        long frame = Unsafe.malloc(frameLen, MemoryTag.NATIVE_DEFAULT);
+        ensureCatchUpFrameCapacity(frameLen);
+        long frame = catchUpFrameAddr;
         try {
             Unsafe.getUnsafe().putByte(frame, (byte) 'Q');
             Unsafe.getUnsafe().putByte(frame + 1, (byte) 'W');
@@ -2647,12 +2668,40 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 throw (Error) t;
             }
             throw new CatchUpSendException(t);
-        } finally {
-            Unsafe.free(frame, frameLen, MemoryTag.NATIVE_DEFAULT);
         }
         nextWireSeq++; // this catch-up chunk consumed a wire sequence
         lastFrameOrPingNanos = System.nanoTime();
         totalFramesSent.incrementAndGet();
+    }
+
+    @TestOnly
+    public int catchUpFrameGrowthCount() {
+        return catchUpFrameGrowthCount;
+    }
+
+    private void ensureCatchUpFrameCapacity(int required) {
+        if (catchUpFrameCapacity >= required) {
+            return;
+        }
+        long newCapacity = Math.max(required, Math.max(4096L, (long) catchUpFrameCapacity * 2L));
+        if (newCapacity > MAX_SENT_DICT_BYTES) {
+            newCapacity = MAX_SENT_DICT_BYTES;
+        }
+        catchUpFrameAddr = Unsafe.realloc(
+                catchUpFrameAddr,
+                catchUpFrameCapacity,
+                (int) newCapacity,
+                MemoryTag.NATIVE_DEFAULT);
+        catchUpFrameCapacity = (int) newCapacity;
+        catchUpFrameGrowthCount++;
+    }
+
+    private void freeCatchUpFrameBuffer() {
+        if (catchUpFrameAddr != 0L) {
+            Unsafe.free(catchUpFrameAddr, catchUpFrameCapacity, MemoryTag.NATIVE_DEFAULT);
+            catchUpFrameAddr = 0L;
+            catchUpFrameCapacity = 0;
+        }
     }
 
     private boolean tryReceiveAcks() {

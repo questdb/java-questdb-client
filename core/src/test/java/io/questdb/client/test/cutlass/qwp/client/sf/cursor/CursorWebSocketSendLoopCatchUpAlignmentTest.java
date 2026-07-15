@@ -163,6 +163,38 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testSplitCatchUpReusesOneFrameBufferAcrossReconnects() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(3_100);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 3_000), TestUtils.repeat("y", 3_000));
+
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                    assertEquals("the small cap must split the dictionary", 2, client.framesSent);
+                    assertEquals("the split chunks fit the initial native buffer",
+                            1, loop.catchUpFrameGrowthCount());
+
+                    client.cap = 7_000;
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                    assertEquals("the larger cap must combine the dictionary", 3, client.framesSent);
+                    assertEquals("the combined frame must grow the retained native buffer once",
+                            2, loop.catchUpFrameGrowthCount());
+
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                    assertEquals("the next reconnect sends one combined frame", 4, client.framesSent);
+                    assertEquals("the grown native frame buffer must be reused across reconnects",
+                            2, loop.catchUpFrameGrowthCount());
+                } finally {
+                    // assertMemoryLeak verifies that close releases the retained buffer.
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testTransientCatchUpSendFailureIsRetriableNotTerminal() throws Exception {
         // A transient wire failure WHILE shipping the catch-up (the fresh
         // connection drops mid-handshake) must surface as a retriable

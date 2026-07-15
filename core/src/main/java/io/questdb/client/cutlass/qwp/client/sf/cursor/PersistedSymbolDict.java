@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Crc32c;
+import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -130,9 +131,9 @@ import org.slf4j.LoggerFactory;
  * owner (the engine) closes it, and {@code close()} is callable from any thread
  * (a shutdown hook, test cleanup). {@code close()} and the append methods are
  * therefore {@code synchronized}: without that, a close racing an in-flight append
- * could free the scratch buffer or close the fd mid-write and let the write land
- * on a descriptor the OS has reused for another file (silent cross-file
- * corruption). Not thread-safe for concurrent writers.
+ * could unmap the production append region (or free the fault-test scratch buffer),
+ * close the fd, and let an in-flight write corrupt memory or land on a descriptor
+ * the OS has reused for another file. Not thread-safe for concurrent writers.
  */
 public final class PersistedSymbolDict implements QuietCloseable {
 
@@ -145,6 +146,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
     static final int CRC_SIZE = 4; // u32 CRC-32C trailing every chunk
     static final int FILE_MAGIC = 0x31445953; // 'SYD1' little-endian
     static final int HEADER_SIZE = 8;
+    static final int INITIAL_APPEND_MAP_CAPACITY = 64 * 1024;
     /**
      * Upper bound on a chunk's two header varints ({@code entryCount} and
      * {@code entryBytes}): each is at most 5 bytes for a 32-bit value. The
@@ -167,7 +169,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
     // tests inject a fault facade to exercise recovery I/O failures (a truncate
     // that cannot drop a torn tail, a short write) without a real broken disk.
     private final FilesFacade ff;
+    // Production writes directly into segmented append mappings. Custom facades retain the
+    // positioned-write path so fault tests can inject short writes through ff.write.
+    private final boolean mappedAppend;
+    private long appendMapAddr;
+    private long appendMapCapacity;
+    private long appendMapOffset;
+    private int appendMapGrowthCount;
     private long appendOffset;
+    private long appendWriteCount;
     private boolean closed;
     // In-memory copy of the WIRE entry region [len][utf8]... -- chunk headers and
     // CRCs stripped -- populated only when open() recovered existing chunks
@@ -186,6 +196,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private PersistedSymbolDict(FilesFacade ff, int fd, long appendOffset, int size, long loadedEntriesAddr, int loadedEntriesLen) {
         this.ff = ff;
         this.fd = fd;
+        this.mappedAppend = ff == FilesFacade.INSTANCE;
         this.appendOffset = appendOffset;
         this.size = size;
         this.loadedEntriesAddr = loadedEntriesAddr;
@@ -332,6 +343,16 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // production.
         assert validateRawEntries(addr, len, count);
         int hdrLen = NativeBufferWriter.varintSize(count) + NativeBufferWriter.varintSize(len);
+        if (mappedAppend) {
+            long recLen = (long) hdrLen + len + CRC_SIZE;
+            ensureAppendMap(checkedRequiredOffset(recLen));
+            long recStart = appendMapAddr + appendOffset - appendMapOffset;
+            long p = NativeBufferWriter.writeVarint(recStart, count);
+            NativeBufferWriter.writeVarint(p, len);
+            Unsafe.getUnsafe().copyMemory(addr, recStart + hdrLen, len);
+            commitMappedChunk(recStart, hdrLen, len, count);
+            return;
+        }
         ensureScratch((long) hdrLen + len + CRC_SIZE);
         long p = NativeBufferWriter.writeVarint(scratchAddr, count);
         NativeBufferWriter.writeVarint(p, len);
@@ -357,6 +378,20 @@ public final class PersistedSymbolDict implements QuietCloseable {
         }
         int utf8Len = Utf8s.utf8Bytes(symbol);
         int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len; // [len][utf8]
+        if (mappedAppend) {
+            int hdrLen = NativeBufferWriter.varintSize(1) + NativeBufferWriter.varintSize(wireLen);
+            long recLen = (long) hdrLen + wireLen + CRC_SIZE;
+            ensureAppendMap(checkedRequiredOffset(recLen));
+            long recStart = appendMapAddr + appendOffset - appendMapOffset;
+            long p = NativeBufferWriter.writeVarint(recStart, 1);
+            p = NativeBufferWriter.writeVarint(p, wireLen);
+            p = NativeBufferWriter.writeVarint(p, utf8Len);
+            if (utf8Len > 0) {
+                Utf8s.strCpyUtf8(symbol, p, utf8Len);
+            }
+            commitMappedChunk(recStart, hdrLen, wireLen, 1);
+            return;
+        }
         ensureScratch((long) MAX_CHUNK_HEADER_SIZE + wireLen + CRC_SIZE);
         long entryStart = scratchAddr + MAX_CHUNK_HEADER_SIZE;
         long p = NativeBufferWriter.writeVarint(entryStart, utf8Len);
@@ -367,13 +402,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Appends the dense id range {@code [from .. to]} as ONE chunk, in a SINGLE
-     * write with a SINGLE checksum. Encodes the whole entry region into scratch
-     * first -- versus one {@code pwrite(2)} and one native CRC call per symbol.
-     * That per-symbol syscall and JNI count is the hot-path cost on a
-     * high-cardinality batch (one new symbol per row), which is exactly the
-     * store-and-forward workload delta encoding targets. Callers pass the dictionary
-     * and the range so the ids resolve to their symbol strings.
+     * Appends the dense id range {@code [from .. to]} as one chunk with one
+     * checksum. Production encodes directly into a segmented append mapping, avoiding
+     * both the staging copy and a positioned-write syscall on every flush. The
+     * scratch/positioned-write fallback exists only behind an injected filesystem
+     * facade so short-write recovery tests retain their fault seam. Callers pass the
+     * dictionary and the range so the ids resolve to their symbol strings.
      * <p>
      * Same durability and idempotency contract as {@link #appendSymbol}: no fsync,
      * and a short write throws WITHOUT advancing {@code size}/{@code appendOffset},
@@ -385,6 +419,37 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return;
         }
         int count = to - from + 1;
+        if (mappedAppend) {
+            long entriesLenLong = 0L;
+            for (int id = from; id <= to; id++) {
+                int utf8Len = Utf8s.utf8Bytes(dict.getSymbol(id));
+                entriesLenLong += NativeBufferWriter.varintSize(utf8Len) + (long) utf8Len;
+                if (entriesLenLong > MAX_SCRATCH_BYTES) {
+                    throw new IllegalStateException("symbol dict chunk exceeds the maximum size to "
+                            + FILE_NAME + " [required=" + entriesLenLong + ", max="
+                            + MAX_SCRATCH_BYTES + ']');
+                }
+            }
+            int entriesLen = (int) entriesLenLong;
+            int hdrLen = NativeBufferWriter.varintSize(count)
+                    + NativeBufferWriter.varintSize(entriesLen);
+            long recLen = (long) hdrLen + entriesLen + CRC_SIZE;
+            ensureAppendMap(checkedRequiredOffset(recLen));
+            long recStart = appendMapAddr + appendOffset - appendMapOffset;
+            long p = NativeBufferWriter.writeVarint(recStart, count);
+            p = NativeBufferWriter.writeVarint(p, entriesLen);
+            for (int id = from; id <= to; id++) {
+                CharSequence symbol = dict.getSymbol(id);
+                int utf8Len = Utf8s.utf8Bytes(symbol);
+                p = NativeBufferWriter.writeVarint(p, utf8Len);
+                if (utf8Len > 0) {
+                    Utf8s.strCpyUtf8(symbol, p, utf8Len);
+                    p += utf8Len;
+                }
+            }
+            commitMappedChunk(recStart, hdrLen, entriesLen, count);
+            return;
+        }
         int entriesLen = 0;
         for (int id = from; id <= to; id++) {
             CharSequence symbol = dict.getSymbol(id);
@@ -415,6 +480,20 @@ public final class PersistedSymbolDict implements QuietCloseable {
             loadedEntriesAddr = 0L;
             loadedEntriesLen = 0;
         }
+        if (appendMapAddr != 0L) {
+            Files.munmap(appendMapAddr, appendMapCapacity, MemoryTag.MMAP_DEFAULT);
+            appendMapAddr = 0L;
+            appendMapCapacity = 0L;
+            appendMapOffset = 0L;
+            // The active window reserves space past the logical end. Return that tail on
+            // orderly close; after a crash open() treats the zero-filled reserve as
+            // a torn trailing chunk and truncates it to the same appendOffset.
+            if (!ff.truncate(fd, appendOffset)) {
+                LOG.warn("symbol dict {} could not trim mmap reserve to {}; recovery will "
+                                + "discard the zero-filled tail on the next open",
+                        FILE_NAME, appendOffset);
+            }
+        }
         if (scratchAddr != 0L) {
             Unsafe.free(scratchAddr, scratchCap, MemoryTag.NATIVE_DEFAULT);
             scratchAddr = 0L;
@@ -423,6 +502,16 @@ public final class PersistedSymbolDict implements QuietCloseable {
         if (fd >= 0) {
             ff.close(fd);
         }
+    }
+
+    @TestOnly
+    public synchronized int appendMapGrowthCount() {
+        return appendMapGrowthCount;
+    }
+
+    @TestOnly
+    public synchronized long appendWriteCount() {
+        return appendWriteCount;
     }
 
     /**
@@ -726,6 +815,85 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return true;
     }
 
+    private long checkedRequiredOffset(long recordLen) {
+        long required = appendOffset + recordLen;
+        if (recordLen < 0L || required < appendOffset) {
+            throw new IllegalStateException("symbol dict append offset overflow to "
+                    + FILE_NAME + " [offset=" + appendOffset + ", recordLen=" + recordLen + ']');
+        }
+        return required;
+    }
+
+    /**
+     * Commits a chunk already assembled directly in the append mmap. The logical
+     * offset and symbol count advance last, after the CRC and a store fence, so an
+     * interrupted process leaves either a complete chunk or a tail that open()
+     * rejects and truncates.
+     */
+    private void commitMappedChunk(long recStart, int hdrLen, int entriesLen, int count) {
+        long bodyLen = (long) hdrLen + entriesLen;
+        long recLen = bodyLen + CRC_SIZE;
+        Unsafe.getUnsafe().putInt(
+                recStart + bodyLen,
+                Crc32c.update(Crc32c.INIT, recStart, bodyLen));
+        Unsafe.getUnsafe().storeFence();
+        appendOffset += recLen;
+        size += count;
+    }
+
+    /**
+     * Ensures the production append mmap covers the absolute file offset
+     * {@code required}. The log is mapped in 64 KiB-aligned windows: small flushes
+     * share a window, while a large existing dictionary does not force the process
+     * to reserve and remap its whole prefix (or geometrically over-allocate it).
+     */
+    private void ensureAppendMap(long required) {
+        if (appendMapAddr != 0L
+                && required >= appendMapOffset
+                && required <= appendMapOffset + appendMapCapacity) {
+            return;
+        }
+        long newOffset = appendOffset - appendOffset % INITIAL_APPEND_MAP_CAPACITY;
+        long needed = required - newOffset;
+        long newCapacity = Math.max(INITIAL_APPEND_MAP_CAPACITY, needed);
+        long remainder = newCapacity % INITIAL_APPEND_MAP_CAPACITY;
+        if (remainder != 0L) {
+            long padding = INITIAL_APPEND_MAP_CAPACITY - remainder;
+            if (newCapacity > Long.MAX_VALUE - padding) {
+                throw new IllegalStateException("symbol dict mmap capacity overflow to "
+                        + FILE_NAME + " [required=" + required + ']');
+            }
+            newCapacity += padding;
+        }
+        if (newOffset > Long.MAX_VALUE - newCapacity) {
+            throw new IllegalStateException("symbol dict mmap file offset overflow to "
+                    + FILE_NAME + " [offset=" + newOffset + ", capacity=" + newCapacity + ']');
+        }
+        long newFileSize = newOffset + newCapacity;
+        if (!ff.allocate(fd, newFileSize)) {
+            throw new IllegalStateException("could not grow mmap append region for "
+                    + FILE_NAME + " [required=" + required + ", fileSize=" + newFileSize + ']');
+        }
+        if (appendMapAddr != 0L) {
+            long oldAddr = appendMapAddr;
+            long oldCapacity = appendMapCapacity;
+            appendMapAddr = 0L;
+            appendMapCapacity = 0L;
+            appendMapOffset = 0L;
+            Files.munmap(oldAddr, oldCapacity, MemoryTag.MMAP_DEFAULT);
+        }
+        long newAddr = Files.mmap(
+                fd, newCapacity, newOffset, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+        if (newAddr == Files.FAILED_MMAP_ADDRESS) {
+            throw new IllegalStateException("could not mmap append region for "
+                    + FILE_NAME + " [offset=" + newOffset + ", capacity=" + newCapacity + ']');
+        }
+        appendMapAddr = newAddr;
+        appendMapCapacity = newCapacity;
+        appendMapOffset = newOffset;
+        appendMapGrowthCount++;
+    }
+
     /**
      * Grows the append scratch buffer to hold at least {@code required} bytes.
      * <p>
@@ -769,6 +937,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         int bodyLen = hdrLen + entriesLen;
         int recLen = bodyLen + CRC_SIZE;
         Unsafe.getUnsafe().putInt(recStart + bodyLen, Crc32c.update(Crc32c.INIT, recStart, bodyLen));
+        appendWriteCount++;
         long written = ff.write(fd, recStart, recLen, appendOffset);
         if (written != recLen) {
             throw new IllegalStateException("short write to " + FILE_NAME

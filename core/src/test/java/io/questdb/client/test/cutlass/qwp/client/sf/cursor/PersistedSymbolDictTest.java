@@ -446,6 +446,40 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    @Test
+    public void testMappedAppendAmortizesFlushesWithoutPositionedWrites() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(d);
+                try {
+                    for (int i = 0; i < 10_000; i++) {
+                        d.appendSymbol("sym-" + i);
+                    }
+                    Assert.assertEquals(10_000, d.size());
+                    Assert.assertEquals("production appends must write directly into the mmap",
+                            0L, d.appendWriteCount());
+                    Assert.assertEquals("ten thousand flushes must require only three mapped windows",
+                            3, d.appendMapGrowthCount());
+                } finally {
+                    d.close();
+                }
+
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(re);
+                try {
+                    Assert.assertEquals(10_000, re.size());
+                    Assert.assertEquals("sym-9999", re.readLoadedSymbols().getQuick(9_999));
+                } finally {
+                    re.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
     private static int varintSize(int v) {
         int n = 1;
         while ((v >>>= 7) != 0) {

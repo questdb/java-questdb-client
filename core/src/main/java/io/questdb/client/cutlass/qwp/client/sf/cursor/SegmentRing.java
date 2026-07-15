@@ -582,6 +582,24 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Performs the one ordered recovery fold across sealed segments and the
+     * active segment. The returned native suffix remains owned by the caller.
+     */
+    synchronized RecoveredFrameAnalysis analyzeRecovery(int symbolBaseline) {
+        RecoveredFrameAnalysis analysis = new RecoveredFrameAnalysis(symbolBaseline);
+        try {
+            for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+                sealedSegments.get(i).scanRecovery(analysis);
+            }
+            active.scanRecovery(analysis);
+            return analysis;
+        } catch (Throwable t) {
+            analysis.close();
+            throw t;
+        }
+    }
+
+    /**
      * Highest {@code deltaStart + deltaCount} any symbol-dict delta frame at or below
      * {@code maxFsnInclusive} references (0 when none). See
      * {@link MmapSegment#maxSymbolDeltaEnd}; used once at recovery to detect a
