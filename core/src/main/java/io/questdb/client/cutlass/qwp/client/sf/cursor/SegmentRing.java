@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
@@ -155,6 +156,27 @@ public final class SegmentRing implements QuietCloseable {
      * depends on every segment being readable.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
+        return openExisting(FilesFacade.INSTANCE, sfDir, maxBytesPerSegment);
+    }
+
+    /**
+     * Facade-aware variant of {@link #openExisting(String, long)} that opens
+     * each recovered segment through the given {@link FilesFacade} -- via
+     * {@link MmapSegment#openExisting(FilesFacade, String)} -- instead of
+     * {@link FilesFacade#INSTANCE}. Production calls the {@code INSTANCE}
+     * overload above; this seam exists so recovery's mmap-fault handling can be
+     * regression-tested end to end on any filesystem. A facade that reports an
+     * inflated length maps a segment past real end-of-file, so the recovery
+     * read faults deterministically -- the same catchable {@code InternalError}
+     * an unbacked/sparse page raises on ZFS, but reproduced on ext4/xfs where a
+     * within-EOF hole would instead zero-fill and never exercise the guard.
+     * <p>
+     * Only the per-segment open is routed through {@code ff}; directory
+     * enumeration and the empty-orphan unlink/quarantine stay on {@link Files},
+     * mirroring {@code MmapSegment.openExisting}'s own partial seam (which keeps
+     * {@code mmap} on {@code Files}).
+     */
+    public static SegmentRing openExisting(FilesFacade ff, String sfDir, long maxBytesPerSegment) {
         if (!Files.exists(sfDir)) {
             return null;
         }
@@ -182,7 +204,7 @@ public final class SegmentRing implements QuietCloseable {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
                         try {
-                            seg = MmapSegment.openExisting(path);
+                            seg = MmapSegment.openExisting(ff, path);
                             // Filter out empty leftovers -- typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
