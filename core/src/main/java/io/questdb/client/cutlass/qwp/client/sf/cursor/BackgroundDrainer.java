@@ -133,9 +133,9 @@ public final class BackgroundDrainer implements Runnable {
     // drain loop; mirrors the owner sender's poison_min_escalation_window_millis.
     private final long poisonMinEscalationWindowMillis;
     // Minimum wall-clock dwell a symbol-dict catch-up cap gap must persist before this
-    // drainer's send loop latches a terminal. Same knob the foreground sender uses; the
-    // orphan drainer honours it too so a rolling restart cannot quarantine an otherwise
-    // drainable slot on a strike count alone.
+    // orphan drainer's send loop latches a terminal. Foreground senders retry forever;
+    // this bounded policy is permitted only so a persistent orphan slot can be
+    // quarantined for operator intervention.
     private final long catchUpCapGapMinEscalationWindowMillis;
 
     public BackgroundDrainer(
@@ -584,7 +584,8 @@ public final class BackgroundDrainer implements Runnable {
                         durableAckKeepaliveIntervalMillis,
                         maxHeadFrameRejections,
                         poisonMinEscalationWindowMillis,
-                        catchUpCapGapMinEscalationWindowMillis);
+                        catchUpCapGapMinEscalationWindowMillis,
+                        CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {

@@ -268,16 +268,50 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testForegroundCatchUpCapGapRetriesPastOrphanBudget() throws Exception {
+        // The foreground policy must never accrue or exhaust the orphan drainer's
+        // quarantine budget. Drive more cap gaps than that entire budget and assert every
+        // failure remains retriable to the I/O loop and invisible to the producer.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newForegroundLoop(engine, client);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    for (int i = 1; i <= maxAttempts + 4; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (InvocationTargetException e) {
+                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        }
+                        loop.checkError();
+                    }
+                    assertEquals("foreground retries must not burn the orphan attempt budget",
+                            0, readInt(loop, "catchUpCapGapAttempts"));
+                    assertEquals("foreground retries must not anchor an orphan cap-gap episode",
+                            -1L, readLong(loop, "catchUpCapGapFirstNanos"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCatchUpCapGapStrikesAloneDoNotLatchWithinTheEscalationWindow() throws Exception {
         // The strike count alone must NOT latch a terminal: escalation also requires the
         // cap-gap episode to have persisted for catchUpCapGapMinEscalationWindowMillis.
         //
-        // This is what keeps a routine rolling restart from killing a live producer.
+        // This keeps a routine rolling restart from quarantining a drainable orphan slot.
         // MAX_CATCHUP_CAP_GAP_ATTEMPTS strikes accrue in ~2 minutes at the capped
         // reconnect backoff -- less than the time the larger-cap node is away -- so a
-        // count-only budget would hard-fail the sender on the very transient the budget
+        // count-only budget would quarantine the slot on the very transient the budget
         // exists to ride out. Here we drive far MORE than the budget's strikes inside a
-        // (deliberately huge) window and assert the sender stays alive.
+        // deliberately huge window and assert the orphan loop stays retriable.
         TestUtils.assertMemoryLeak(() -> {
             Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
             maxField.setAccessible(true);
@@ -446,7 +480,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // the reconnect loop rides it out -- a larger-cap node may return -- and only
         // after MAX_CATCHUP_CAP_GAP_ATTEMPTS consecutive cap gaps does it recordFatal.
         // Pre-fix the first cap gap latched a terminal, so one transient failover to a
-        // smaller-cap node killed the sender. (A successful catch-up resets the budget;
+        // smaller-cap node quarantined the orphan slot. (A successful catch-up resets the budget;
         // the other catch-up tests, which use a fitting cap, never trip it.)
         TestUtils.assertMemoryLeak(() -> {
             Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
@@ -456,13 +490,13 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             // retriable loop below is bounded by maxAttempts, so keying this test purely
             // off the constant under test makes it TAUTOLOGICAL: a regression of
             // MAX_CATCHUP_CAP_GAP_ATTEMPTS to 1 -- which is precisely the pre-fix bug this
-            // test names, a single cap gap killing the sender -- would run the loop ZERO
+            // test names, a single cap gap quarantining the slot -- would run the loop ZERO
             // times, the "exhausting" attempt would become the FIRST attempt, and the test
             // would still pass green. Requiring > 1 makes that regression fail here, and it
             // also guarantees the loop runs at least once, so the first cap gap is genuinely
             // asserted retriable rather than vacuously skipped.
             assertTrue("the cap-gap settle budget must tolerate MORE THAN ONE gap, else a single "
-                            + "transient failover to a smaller-cap node kills the sender "
+                            + "transient failover to a smaller-cap node quarantines the slot "
                             + "[MAX_CATCHUP_CAP_GAP_ATTEMPTS=" + maxAttempts + ']',
                     maxAttempts > 1);
             // cap 160 => catch-up budget is below a ~216-byte solo frame for a 200-char symbol.
@@ -512,7 +546,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // gaps across reconnects; a successful catch-up ends the episode and MUST reset
         // it to 0 (sendDictCatchUp's final line). Otherwise cap gaps interspersed with
         // successful catch-ups -- a rolling-cap cluster where a larger-cap node comes
-        // and goes -- would accumulate to a spurious terminal over a long-lived sender.
+        // and goes -- would accumulate to a spurious terminal over a long-lived orphan drainer.
         // testCatchUpCapGapRetriesUntilBudgetThenLatches only accrues gaps under one
         // fixed cap with no success interleaved, so it cannot pin the reset.
         TestUtils.assertMemoryLeak(() -> {
@@ -552,7 +586,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
 
                     // Behavioural proof the budget is genuinely fresh: max-1 more cap
                     // gaps still latch NO terminal (they would if the counter had stayed
-                    // at max-1 -- one more gap would have hit the cap and killed the sender).
+                    // at max-1 -- one more gap would have quarantined the slot).
                     client.cap = 160;
                     for (int i = 1; i < maxAttempts; i++) {
                         try {
@@ -716,9 +750,8 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
 
     /**
      * As {@link #newLoop(CursorSendEngine, WebSocketClient)} but with an explicit
-     * cap-gap escalation dwell. {@code 0} (the default here) means count-only
-     * escalation, which is what the raw constructor gives and what the strike-count
-     * tests want; the user-facing 5-minute default is applied at the config layer.
+     * cap-gap escalation dwell. These white-box tests model an orphan drainer, where
+     * {@code 0} means count-only quarantine; foreground loops retry indefinitely.
      */
     private CursorWebSocketSendLoop newLoop(
             CursorSendEngine engine, WebSocketClient client, long capGapWindowMillis
@@ -731,7 +764,24 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 5_000L, 100L, 5_000L, false,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
-                0L, capGapWindowMillis);
+                0L, capGapWindowMillis,
+                CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
+    }
+
+    private CursorWebSocketSendLoop newForegroundLoop(
+            CursorSendEngine engine, WebSocketClient client
+    ) {
+        // Deliberately use the compatibility overload: its safe default must remain the
+        // foreground RETRY_FOREVER policy for external callers.
+        return new CursorWebSocketSendLoop(
+                client, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                () -> {
+                    throw new UnsupportedOperationException("test loop is never started");
+                },
+                5_000L, 100L, 5_000L, false,
+                CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                0L, 0L);
     }
 
     private CursorSendEngine newEngine() {

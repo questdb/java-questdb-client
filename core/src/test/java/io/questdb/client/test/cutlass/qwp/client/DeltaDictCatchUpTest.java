@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -210,17 +209,11 @@ public class DeltaDictCatchUpTest {
     }
 
     @Test
-    public void testCatchUpEntryTooLargeForCapFailsTerminally() throws Exception {
+    public void testForegroundCatchUpCapGapRetriesPastOrphanBudgetAndRecovers() throws Exception {
         // A dictionary entry that exceeds the reconnect server's per-chunk budget
-        // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk. Every
-        // reachable node re-advertises the same small cap here, so the gap never
-        // resolves: sendDictCatchUp must retry across the settle budget and then
-        // latch a clean terminal ("... during catch-up") rather than call fail()
-        // (which from inside the catch-up re-enters connectLoop). Pre-fix it latched
-        // on the FIRST cap gap; the settle budget (MAX_CATCHUP_CAP_GAP_ATTEMPTS)
-        // rides out a transient smaller-cap window first (see the retry sibling in
-        // CursorWebSocketSendLoopCatchUpAlignmentTest), and only a persistent gap
-        // exhausts it. Small reconnect backoffs keep the budgeted attempts fast.
+        // (cap - HEADER_SIZE - 16) cannot be shipped as a catch-up chunk. A live
+        // foreground sender must keep retrying without surfacing that cluster state to
+        // the producer, even after the orphan drainer's 16-attempt quarantine budget.
         //
         // Connection 1 advertises no cap, so the ~202-byte symbol registers and
         // enters the sent-dictionary mirror. The handler then shrinks the
@@ -237,49 +230,27 @@ public class DeltaDictCatchUpTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String bigSymbol = TestUtils.repeat("x", 200); // ~202-byte dict entry
-                LineSenderException terminal = null;
-                // catchup_cap_gap_min_escalation_window_millis=0 restores count-only
-                // escalation, so the terminal latches as soon as the settle budget's
-                // strikes are exhausted. The DEFAULT is a 5-minute wall-clock dwell on
-                // top of the strike count, precisely so a cap gap that lasts only as
-                // long as a rolling restart cannot hard-fail a live producer -- and a
-                // test cannot wait that out. Zeroing it here is what makes the terminal
-                // observable; the dwell itself is covered by
-                // CursorWebSocketSendLoopCatchUpAlignmentTest.
-                Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                // Zeroing the dwell makes the old faulty foreground policy terminal at
+                // its 16th cap gap. Reaching 20 handshakes therefore proves the live loop
+                // is no longer governed by the orphan budget.
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50"
-                        + ";catchup_cap_gap_min_escalation_window_millis=0;");
-                try {
+                        + ";catchup_cap_gap_min_escalation_window_millis=0;")) {
                     sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
                     sender.flush();
-                    // The terminal latches on the I/O thread once the reconnect's
-                    // catch-up hits the oversized entry; it surfaces to the producer
-                    // on a subsequent flush. Poll a bounded time for it. The polling
-                    // rows use a small symbol that fits the shrunk cap, so the
-                    // producer-side cap check never fires and flush() surfaces the
-                    // I/O thread's catch-up terminal via checkError.
-                    long deadline = System.currentTimeMillis() + 10_000;
-                    while (System.currentTimeMillis() < deadline && terminal == null) {
-                        try {
-                            sender.table("t").symbol("s", "y").longColumn("v", 2L).atNow();
-                            sender.flush();
-                            Thread.sleep(20);
-                        } catch (LineSenderException e) {
-                            terminal = e;
-                        }
-                    }
-                } finally {
-                    try {
-                        sender.close();
-                    } catch (LineSenderException e) {
-                        if (terminal == null) {
-                            terminal = e;
-                        }
-                    }
+                    waitFor(() -> server.handshakeCount() >= 20, 10_000);
+
+                    // Producer calls remain usable while the wire is stuck in the cap
+                    // gap. Then restore the larger-cap node and prove the buffered row is
+                    // actually acknowledged, not merely accepted into the local SF ring.
+                    sender.table("t").symbol("s", "y").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    server.setAdvertisedMaxBatchSize(0);
+                    sender.table("t").symbol("s", "z").longColumn("v", 3L).atNow();
+                    long targetFsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("foreground sender must recover and drain after the cap is restored",
+                            sender.awaitAckedFsn(targetFsn, 5_000));
                 }
-                Assert.assertNotNull("an oversized catch-up entry must surface a terminal", terminal);
-                Assert.assertTrue("terminal must come from the catch-up path, got: " + terminal.getMessage(),
-                        terminal.getMessage().contains("during catch-up"));
             }
         });
     }
@@ -499,7 +470,7 @@ public class DeltaDictCatchUpTest {
      * registers), then -- once connection 1 has sent something -- shrinks the
      * advertised batch cap and drops the socket. The reconnect (connection 2)
      * therefore advertises a cap whose catch-up budget is too small for the
-     * symbol, exercising the oversized-entry terminal in sendDictCatchUp.
+     * symbol, exercising the foreground retry path in sendDictCatchUp.
      */
     private static class CapShrinkHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger connectionsAccepted = new AtomicInteger();
@@ -516,6 +487,7 @@ public class DeltaDictCatchUpTest {
             if (currentClient != client) {
                 currentClient = client;
                 connectionsAccepted.incrementAndGet();
+                nextSeq.set(0);
             }
             try {
                 client.sendBinary(CatchUpHandler.buildAck(nextSeq.getAndIncrement()));

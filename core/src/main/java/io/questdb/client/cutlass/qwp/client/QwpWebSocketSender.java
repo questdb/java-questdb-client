@@ -314,9 +314,9 @@ public class QwpWebSocketSender implements Sender {
     // maxFrameRejections (connect-string key poison_min_escalation_window_millis).
     private long poisonMinEscalationWindowMillis =
             CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
-    // Minimum wall-clock dwell a symbol-dict catch-up cap gap must persist before the
-    // send loop latches a terminal (connect-string key
-    // catchup_cap_gap_min_escalation_window_millis). See
+    // Minimum wall-clock dwell a symbol-dict catch-up cap gap must persist before an
+    // orphan drainer may quarantine its slot (connect-string key
+    // catchup_cap_gap_min_escalation_window_millis). Foreground senders retry forever. See
     // CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS.
     private long catchUpCapGapMinEscalationWindowMillis =
             CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
@@ -3358,7 +3358,8 @@ public class QwpWebSocketSender implements Sender {
                     durableAckKeepaliveIntervalMillis,
                     maxFrameRejections,
                     poisonMinEscalationWindowMillis,
-                    catchUpCapGapMinEscalationWindowMillis);
+                    catchUpCapGapMinEscalationWindowMillis,
+                    CursorWebSocketSendLoop.CatchUpCapGapPolicy.RETRY_FOREVER);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles

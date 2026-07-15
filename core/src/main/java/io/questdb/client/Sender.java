@@ -1760,7 +1760,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Minimum wall-clock time (millis) a symbol-dictionary catch-up CAP GAP must
-         * persist before the sender gives up on it and fails.
+         * persist before an orphan store-and-forward drainer quarantines its slot.
          * <p>
          * A cap gap means a symbol already accepted by one node is too large to
          * re-register on the node the sender just failed over to, because that node
@@ -1768,13 +1768,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * happen; it takes a heterogeneous or mid-roll cluster, or an operator lowering
          * the cap below existing data.
          * <p>
-         * The sender retries such a gap across reconnects rather than failing on sight,
-         * because the larger-cap node may simply be away -- a rolling restart is the most
-         * likely reason a failover happened at all. It gives up only once the gap has BOTH
-         * recurred many times AND persisted for this long, so an ordinary cluster
-         * operation cannot bring down a live producer. Raise it for a cluster whose
+         * A foreground sender retries such a gap indefinitely because the larger-cap node
+         * may simply be away. An orphan drainer may quarantine only once the gap has BOTH
+         * recurred many times AND persisted for this long. Raise it for a cluster whose
          * rolling restarts take longer than the 5-minute default; set it to {@code 0} to
-         * fail as soon as the retry count is exhausted.
+         * quarantine an orphan slot as soon as the retry count is exhausted.
          * <p>
          * WebSocket transport only.
          */
