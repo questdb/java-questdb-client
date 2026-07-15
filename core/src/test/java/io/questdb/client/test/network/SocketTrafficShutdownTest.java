@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.network;
 
+import io.questdb.client.network.JavaTlsClientSocket;
 import io.questdb.client.network.JavaTlsClientSocketFactory;
 import io.questdb.client.network.Kqueue;
 import io.questdb.client.network.KqueueFacade;
@@ -43,7 +44,6 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLContext;
-import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -454,31 +454,22 @@ public class SocketTrafficShutdownTest {
                     return null;
                 }
         );
-        Socket socket = JavaTlsClientSocketFactory.INSECURE_NO_VALIDATION.newInstance(
-                facade,
-                LoggerFactory.getLogger(SocketTrafficShutdownTest.class)
-        );
+        JavaTlsClientSocket socket = (JavaTlsClientSocket) JavaTlsClientSocketFactory
+                .INSECURE_NO_VALIDATION.newInstance(
+                        facade,
+                        LoggerFactory.getLogger(SocketTrafficShutdownTest.class)
+                );
         socket.of(42);
-        Field sslEngineField = socket.getClass().getDeclaredField("sslEngine");
-        Field stateField = socket.getClass().getDeclaredField("state");
-        sslEngineField.setAccessible(true);
-        stateField.setAccessible(true);
-        sslEngineField.set(socket, SSLContext.getDefault().createSSLEngine());
-        stateField.setInt(socket, 2); // JavaTlsClientSocket.STATE_TLS
-        Object[] tlsState = snapshotTlsState(socket);
+        socket.setTlsStateForTesting(SSLContext.getDefault().createSSLEngine());
+        JavaTlsClientSocket.TlsStateForTesting tlsState = socket.snapshotTlsStateForTesting();
 
         try {
             socket.closeTraffic();
 
-            Object[] stateAfterTrafficClose = snapshotTlsState(socket);
-            for (int i = 0; i < tlsState.length; i++) {
-                if (i == 2) {
-                    Assert.assertEquals("traffic cancellation must preserve TLS state", tlsState[i], stateAfterTrafficClose[i]);
-                } else {
-                    Assert.assertSame("traffic cancellation must preserve SSLEngine/buffer references",
-                            tlsState[i], stateAfterTrafficClose[i]);
-                }
-            }
+            JavaTlsClientSocket.TlsStateForTesting stateAfterTrafficClose =
+                    socket.snapshotTlsStateForTesting();
+            Assert.assertTrue("traffic cancellation must preserve TLS state and buffer references",
+                    tlsState.hasSameStateForTesting(stateAfterTrafficClose));
             Assert.assertEquals(1, shutdownCount.get());
             Assert.assertEquals("traffic cancellation must not release the delegate fd", 0, closeCount.get());
             Assert.assertEquals(42, socket.getFd());
@@ -486,8 +477,7 @@ public class SocketTrafficShutdownTest {
         } finally {
             // Restore a valid plaintext state so full close does not attempt a
             // synthetic TLS close_notify with uninitialised session buffers.
-            sslEngineField.set(socket, null);
-            stateField.setInt(socket, 1); // JavaTlsClientSocket.STATE_PLAINTEXT
+            socket.setPlaintextStateForTesting();
             socket.close();
         }
         Assert.assertEquals(1, closeCount.get());
@@ -606,22 +596,4 @@ public class SocketTrafficShutdownTest {
         }
     }
 
-    private static Object[] snapshotTlsState(Socket socket) throws Exception {
-        String[] fieldNames = {
-                "callerOutputBuffer",
-                "sslEngine",
-                "state",
-                "unwrapInputBuffer",
-                "unwrapOutputBuffer",
-                "wrapInputBuffer",
-                "wrapOutputBuffer"
-        };
-        Object[] state = new Object[fieldNames.length];
-        for (int i = 0; i < fieldNames.length; i++) {
-            Field field = socket.getClass().getDeclaredField(fieldNames[i]);
-            field.setAccessible(true);
-            state[i] = field.get(socket);
-        }
-        return state;
-    }
 }

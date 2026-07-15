@@ -29,6 +29,7 @@ import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
 
@@ -56,6 +57,7 @@ import java.nio.charset.StandardCharsets;
  */
 public final class SlotLock implements QuietCloseable {
 
+    private static final int DEAD_FD_FOR_TESTING = 1_000_000_000;
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
     private final String slotDir;
@@ -109,6 +111,26 @@ public final class SlotLock implements QuietCloseable {
                 Files.close(fd);
             }
         }
+    }
+
+    /**
+     * Replaces the live descriptor with a known-dead value until the returned
+     * guard closes. Test-only: exercises release retry paths without exposing
+     * mutable descriptor state.
+     */
+    @TestOnly
+    public synchronized ReleaseFailureForTesting injectReleaseFailureForTesting() {
+        if (fd < 0 || fd == DEAD_FD_FOR_TESTING) {
+            throw new IllegalStateException("slot lock is not held by a live descriptor");
+        }
+        ReleaseFailureForTesting releaseFailure = new ReleaseFailureForTesting(fd);
+        fd = DEAD_FD_FOR_TESTING;
+        return releaseFailure;
+    }
+
+    @TestOnly
+    public synchronized boolean isReleaseFailureInjectedForTesting() {
+        return fd == DEAD_FD_FOR_TESTING;
     }
 
     /** Slot dir this lock guards. */
@@ -183,6 +205,13 @@ public final class SlotLock implements QuietCloseable {
 
     private static native int release0(int fd);
 
+    private synchronized void restoreFdForTesting(int savedFd) {
+        if (fd != DEAD_FD_FOR_TESTING) {
+            throw new IllegalStateException("slot lock release failure is not injected");
+        }
+        fd = savedFd;
+    }
+
     private static void writePid(String pidPath) {
         long pid;
         try {
@@ -210,6 +239,24 @@ public final class SlotLock implements QuietCloseable {
             }
         } finally {
             Files.close(wfd);
+        }
+    }
+
+    @TestOnly
+    public final class ReleaseFailureForTesting implements QuietCloseable {
+        private final int savedFd;
+        private boolean isRestored;
+
+        private ReleaseFailureForTesting(int savedFd) {
+            this.savedFd = savedFd;
+        }
+
+        @Override
+        public synchronized void close() {
+            if (!isRestored) {
+                restoreFdForTesting(savedFd);
+                isRestored = true;
+            }
         }
     }
 }

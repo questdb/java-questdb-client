@@ -900,6 +900,16 @@ public final class CursorSendEngine implements QuietCloseable {
         }
     }
 
+    @TestOnly
+    public SegmentManager getManagerForTesting() {
+        return manager;
+    }
+
+    @TestOnly
+    public SlotLock getSlotLockForTesting() {
+        return slotLock;
+    }
+
     /**
      * Installs a hook invoked after each failed shared-driver flock release.
      * Test-only: makes persistent retry progress observable without sleeps.

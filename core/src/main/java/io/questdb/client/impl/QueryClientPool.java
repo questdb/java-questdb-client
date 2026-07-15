@@ -528,6 +528,16 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
+    @TestOnly
+    public boolean hasCreationWaiterForTesting() {
+        lock.lock();
+        try {
+            return lock.hasWaiters(creationFinished);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // White-box accessor for tests: reports the current in-flight creation count
     // under the pool lock. A non-zero value after a failed acquire() means the
     // slot reservation was never released -- the capacity-shrink bug this guards
@@ -540,6 +550,11 @@ public final class QueryClientPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    @TestOnly
+    public boolean isClosedForTesting() {
+        return closed;
     }
 
     private QueryWorker createUnlocked() {

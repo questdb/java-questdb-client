@@ -137,29 +137,19 @@ public class SlotLockTest {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/failed-release";
             SlotLock lock = SlotLock.acquire(slot);
-            java.lang.reflect.Field fdField = SlotLock.class.getDeclaredField("fd");
-            fdField.setAccessible(true);
-            int realFd = fdField.getInt(lock);
-            assertTrue("precondition: acquire must hold a live fd", realFd >= 0);
-            try {
-                // A non-negative descriptor no process has open makes the
-                // explicit flock/UnlockFileEx operation fail without consuming
-                // the real descriptor that continues to hold the slot lock.
-                fdField.setInt(lock, 1_000_000_000);
+            try (SlotLock.ReleaseFailureForTesting ignored = lock.injectReleaseFailureForTesting()) {
                 assertFalse("release must report false when explicit unlock fails",
                         lock.release());
-                assertEquals("failed unlock must retain the fd for a safe retry",
-                        1_000_000_000, fdField.getInt(lock));
+                assertTrue("failed unlock must retain the injected fd for a safe retry",
+                        lock.isReleaseFailureInjectedForTesting());
                 assertFalse("repeat release must stay false while unlock keeps failing",
                         lock.release());
                 // While the release is unconfirmed the real flock remains held.
-                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                try (SlotLock ignoredLock = SlotLock.acquire(slot)) {
                     fail("slot must not be acquirable while the original flock fd is still open");
                 } catch (IllegalStateException expected) {
                     // good - unconfirmed release really means "still locked".
                 }
-            } finally {
-                fdField.setInt(lock, realFd);
             }
             assertTrue("release must confirm once explicit unlock succeeds", lock.release());
             assertTrue("confirmed release must stay confirmed", lock.release());

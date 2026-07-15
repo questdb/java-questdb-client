@@ -31,6 +31,7 @@ import io.questdb.client.std.Chars;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.Vect;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 
 import javax.net.ssl.SSLContext;
@@ -172,6 +173,26 @@ public final class JavaTlsClientSocket implements Socket {
         assert state == STATE_EMPTY;
         delegate.of(fd);
         state = STATE_PLAINTEXT;
+    }
+
+    @TestOnly
+    public void setPlaintextStateForTesting() {
+        sslEngine = null;
+        state = STATE_PLAINTEXT;
+    }
+
+    @TestOnly
+    public void setTlsStateForTesting(SSLEngine engine) {
+        if (state != STATE_PLAINTEXT) {
+            throw new IllegalStateException("socket must be in plaintext state");
+        }
+        sslEngine = engine;
+        state = STATE_TLS;
+    }
+
+    @TestOnly
+    public TlsStateForTesting snapshotTlsStateForTesting() {
+        return new TlsStateForTesting(this);
     }
 
     @Override
@@ -650,5 +671,36 @@ public final class JavaTlsClientSocket implements Socket {
         ADDRESS_FIELD_OFFSET = Unsafe.getUnsafe().objectFieldOffset(addressField);
         LIMIT_FIELD_OFFSET = Unsafe.getUnsafe().objectFieldOffset(limitField);
         CAPACITY_FIELD_OFFSET = Unsafe.getUnsafe().objectFieldOffset(capacityField);
+    }
+
+    @TestOnly
+    public static final class TlsStateForTesting {
+        private final ByteBuffer callerOutputBuffer;
+        private final SSLEngine sslEngine;
+        private final int state;
+        private final ByteBuffer unwrapInputBuffer;
+        private final ByteBuffer unwrapOutputBuffer;
+        private final ByteBuffer wrapInputBuffer;
+        private final ByteBuffer wrapOutputBuffer;
+
+        private TlsStateForTesting(JavaTlsClientSocket socket) {
+            callerOutputBuffer = socket.callerOutputBuffer;
+            sslEngine = socket.sslEngine;
+            state = socket.state;
+            unwrapInputBuffer = socket.unwrapInputBuffer;
+            unwrapOutputBuffer = socket.unwrapOutputBuffer;
+            wrapInputBuffer = socket.wrapInputBuffer;
+            wrapOutputBuffer = socket.wrapOutputBuffer;
+        }
+
+        public boolean hasSameStateForTesting(TlsStateForTesting that) {
+            return callerOutputBuffer == that.callerOutputBuffer
+                    && sslEngine == that.sslEngine
+                    && state == that.state
+                    && unwrapInputBuffer == that.unwrapInputBuffer
+                    && unwrapOutputBuffer == that.unwrapOutputBuffer
+                    && wrapInputBuffer == that.wrapInputBuffer
+                    && wrapOutputBuffer == that.wrapOutputBuffer;
+        }
     }
 }

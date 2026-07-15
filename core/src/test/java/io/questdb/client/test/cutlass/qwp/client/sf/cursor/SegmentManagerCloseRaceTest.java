@@ -27,16 +27,13 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
-import io.questdb.client.std.bytes.DirectByteSink;
 import io.questdb.client.std.Files;
-import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -116,12 +113,9 @@ public class SegmentManagerCloseRaceTest {
                 manager.close();
             }
 
-            Field hotSpareField = SegmentRing.class.getDeclaredField("hotSpare");
-            hotSpareField.setAccessible(true);
-
             int leaked = 0;
             for (int i = 0; i < ITERATIONS; i++) {
-                Object hs = hotSpareField.get(rings[i]);
+                Object hs = rings[i].getHotSpareForTesting();
                 if (hs != null) {
                     leaked++;
                     // Don't leak in the test: close the survivor.
@@ -691,39 +685,19 @@ public class SegmentManagerCloseRaceTest {
         }
     }
 
-    private static Object readHotSpare(SegmentRing ring) throws Exception {
-        Field f = SegmentRing.class.getDeclaredField("hotSpare");
-        f.setAccessible(true);
-        return f.get(ring);
+    private static Object readHotSpare(SegmentRing ring) {
+        return ring.getHotSpareForTesting();
     }
 
-    private static Object readInServiceRing(SegmentManager manager) throws Exception {
-        Field inServiceF = SegmentManager.class.getDeclaredField("inService");
-        inServiceF.setAccessible(true);
-        Object entry = inServiceF.get(manager);
-        if (entry == null) {
-            return null;
-        }
-        Field ringF = entry.getClass().getDeclaredField("ring");
-        ringF.setAccessible(true);
-        return ringF.get(entry);
+    private static Object readInServiceRing(SegmentManager manager) {
+        return manager.getInServiceRingForTesting();
     }
 
-    private static long readPathScratchImpl(SegmentManager manager) throws Exception {
-        Field pathScratchF = SegmentManager.class.getDeclaredField("pathScratch");
-        pathScratchF.setAccessible(true);
-        DirectUtf8Sink pathScratch = (DirectUtf8Sink) pathScratchF.get(manager);
-        Field sinkF = DirectUtf8Sink.class.getDeclaredField("sink");
-        sinkF.setAccessible(true);
-        DirectByteSink sink = (DirectByteSink) sinkF.get(pathScratch);
-        Field implF = DirectByteSink.class.getDeclaredField("impl");
-        implF.setAccessible(true);
-        return implF.getLong(sink);
+    private static long readPathScratchImpl(SegmentManager manager) {
+        return manager.isPathScratchAllocatedForTesting() ? 1L : 0L;
     }
 
-    private static Thread readWorkerThread(SegmentManager manager) throws Exception {
-        Field workerThreadF = SegmentManager.class.getDeclaredField("workerThread");
-        workerThreadF.setAccessible(true);
-        return (Thread) workerThreadF.get(manager);
+    private static Thread readWorkerThread(SegmentManager manager) {
+        return manager.getWorkerThreadForTesting();
     }
 }

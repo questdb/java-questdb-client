@@ -47,10 +47,7 @@ import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -122,8 +119,8 @@ public class SenderPoolSfTest {
                         // call, so comparing the wrappers is vacuously true.
                         // Distinctness of the two borrowed senders lives in the
                         // underlying slots (mirrors SenderPoolTest.slotOf usage).
-                        Assert.assertNotSame("two borrows must hold distinct slots",
-                                slotOf(a), slotOf(b));
+                        Assert.assertFalse("two borrows must hold distinct slots",
+                                a.hasSameSlotForTesting(b));
                         Assert.assertTrue("slot default-0 must exist", Files.exists(slot("default-0")));
                         Assert.assertTrue("slot default-1 must exist", Files.exists(slot("default-1")));
                         Assert.assertEquals("exactly two slot dirs", 2, countSlotDirs());
@@ -223,8 +220,8 @@ public class SenderPoolSfTest {
                     try {
                         // borrow() now returns a fresh wrapper each time; the
                         // recycled thing is the underlying slot.
-                        Assert.assertSame("returned slot must be recycled",
-                                getField(first, "slot"), getField(second, "slot"));
+                        Assert.assertTrue("returned slot must be recycled",
+                                first.hasSameSlotForTesting(second));
                         Assert.assertEquals("no new slot dir on recycle", 1, countSlotDirs());
                         Assert.assertTrue(Files.exists(slot("default-0")));
                     } finally {
@@ -492,17 +489,17 @@ public class SenderPoolSfTest {
                     // below is a no-op and leaves the forged flag in place.
                     Sender delegate = getDelegate(a);
                     delegate.close();
-                    setBooleanField(delegate, "slotLockReleased", false);
+                    ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(false);
 
                     // Route the wrapper through the pool's broken-eviction path.
-                    invokeDiscardBroken(pool, a);
+                    pool.discardBrokenForTesting(a);
 
                     // The leaked index must NOT be returned to the free set,
                     // and capacity must be accounted as permanently consumed.
                     Assert.assertEquals("one slot must be retired as leaked",
-                            1, getIntField(pool, "leakedSlots"));
-                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
-                    Assert.assertTrue("leaked slot index 0 must stay reserved", slotInUse[0]);
+                            1, pool.leakedSlotCount());
+                    Assert.assertTrue("leaked slot index 0 must stay reserved",
+                            pool.isSlotInUseForTesting(0));
 
                     // The next borrow must take a fresh index -- never reuse the
                     // still-locked default-0 dir.
@@ -565,12 +562,12 @@ public class SenderPoolSfTest {
                         // discardBroken's re-close leaves the forged flag set.
                         Sender delegate = getDelegate(a);
                         delegate.close();
-                        setBooleanField(delegate, "slotLockReleased", false);
-                        invokeDiscardBroken(pool, a);
+                        ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(false);
+                        pool.discardBrokenForTesting(a);
 
                         // Sanity: the slot really was retired as leaked.
                         Assert.assertEquals("precondition: one slot must leak",
-                                1, getIntField(pool, "leakedSlots"));
+                                1, pool.leakedSlotCount());
                         // The leak must be observable via public API (metric).
                         Assert.assertEquals("leaked slot must be observable via leakedSlotCount()",
                                 1, pool.leakedSlotCount());
@@ -629,7 +626,7 @@ public class SenderPoolSfTest {
                     pool.giveBack(a);
                     Sender delegate = getDelegate(a);
                     delegate.close();
-                    setBooleanField(delegate, "slotLockReleased", false);
+                    ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(false);
 
                     // Drive the sweep: the idle timeout has elapsed.
                     Thread.sleep(10);
@@ -637,9 +634,9 @@ public class SenderPoolSfTest {
 
                     // The reap leaked branch must have fired.
                     Assert.assertEquals("reapIdle must retire the still-locked slot as leaked",
-                            1, getIntField(pool, "leakedSlots"));
-                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
-                    Assert.assertTrue("leaked slot index 0 must stay reserved", slotInUse[0]);
+                            1, pool.leakedSlotCount());
+                    Assert.assertTrue("leaked slot index 0 must stay reserved",
+                            pool.isSlotInUseForTesting(0));
                     Assert.assertEquals("leaked slot must be observable via leakedSlotCount()",
                             1, pool.leakedSlotCount());
 
@@ -694,8 +691,8 @@ public class SenderPoolSfTest {
                     // slot as leaked.
                     Sender delegate = getDelegate(a);
                     delegate.close();
-                    setBooleanField(delegate, "slotLockReleased", false);
-                    invokeDiscardBroken(pool, a);
+                    ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(false);
+                    pool.discardBrokenForTesting(a);
                     Assert.assertEquals("precondition: one slot must be retired",
                             1, pool.leakedSlotCount());
 
@@ -703,16 +700,15 @@ public class SenderPoolSfTest {
                     // the delegate now reports the flock dropped (in production
                     // this flip comes from isSlotLockReleased() re-probing the
                     // retained engine after the manager worker exited).
-                    setBooleanField(delegate, "slotLockReleased", true);
+                    ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(true);
 
                     // The housekeeper tick is the recovery driver.
                     pool.reapIdle();
 
                     Assert.assertEquals("recovered slot must leave the leaked count",
                             0, pool.leakedSlotCount());
-                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
                     Assert.assertFalse("recovered slot index 0 must return to the free set",
-                            slotInUse[0]);
+                            pool.isSlotInUseForTesting(0));
 
                     // Full capacity restored: with maxSize=2, two concurrent
                     // borrows must succeed again (index 0 is reusable — its
@@ -751,8 +747,8 @@ public class SenderPoolSfTest {
 
                     Sender delegate = getDelegate(a);
                     delegate.close();
-                    setBooleanField(delegate, "slotLockReleased", false);
-                    invokeDiscardBroken(pool, a);
+                    ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(false);
+                    pool.discardBrokenForTesting(a);
                     Assert.assertEquals("precondition: one slot must be retired",
                             1, pool.leakedSlotCount());
 
@@ -761,7 +757,7 @@ public class SenderPoolSfTest {
                     Assert.assertTrue(Files.exists(slot("default-1")));
                     try {
                         // Late release lands while the pool is capacity-starved.
-                        setBooleanField(delegate, "slotLockReleased", true);
+                        ((QwpWebSocketSender) delegate).setSlotLockReleasedForTesting(true);
 
                         // The next borrow hits the cap check, re-probes, frees
                         // index 0, and must create on it instead of timing out.
@@ -794,13 +790,8 @@ public class SenderPoolSfTest {
                         config, 1, 1, 60_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
                     PooledSender lease = pool.borrow();
                     Sender delegate = getDelegate(lease);
-                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
-                    SlotLock slotLock = (SlotLock) getField(engine, "slotLock");
-                    Field fdField = SlotLock.class.getDeclaredField("fd");
-                    fdField.setAccessible(true);
-                    int realFd = fdField.getInt(slotLock);
-                    Assert.assertTrue("precondition: live flock fd", realFd >= 0);
-
+                    CursorSendEngine engine = ((QwpWebSocketSender) delegate).getCursorEngineForTesting();
+                    SlotLock slotLock = engine.getSlotLockForTesting();
                     CountDownLatch borrowerAcquired = new CountDownLatch(1);
                     CountDownLatch borrowerParked = new CountDownLatch(1);
                     CountDownLatch releaseBorrower = new CountDownLatch(1);
@@ -823,11 +814,10 @@ public class SenderPoolSfTest {
                         }
                     }, "sender-pool-deferred-release-waiter");
 
+                    SlotLock.ReleaseFailureForTesting releaseFailure =
+                            slotLock.injectReleaseFailureForTesting();
                     try {
-                        synchronized (slotLock) {
-                            fdField.setInt(slotLock, 1_000_000_000);
-                        }
-                        invokeDiscardBroken(pool, lease);
+                        pool.discardBrokenForTesting(lease);
                         Assert.assertEquals("failed release must retire the only slot",
                                 1, pool.leakedSlotCount());
                         Assert.assertFalse(engine.isCloseCompleted());
@@ -844,9 +834,7 @@ public class SenderPoolSfTest {
 
                         // This restored fd is the only source of progress: the retry driver
                         // confirms the release. There is no housekeeper or pool mutation.
-                        synchronized (slotLock) {
-                            fdField.setInt(slotLock, realFd);
-                        }
+                        releaseFailure.close();
                         Assert.assertTrue("deferred flock release must wake the parked borrower",
                                 borrowerAcquired.await(5, TimeUnit.SECONDS));
                         Assert.assertNull("borrower must not fail", borrowerFailure.get());
@@ -856,9 +844,7 @@ public class SenderPoolSfTest {
                         pool.setBeforeBorrowWaitHook(null);
                         releaseBorrower.countDown();
                         if (!engine.isCloseCompleted()) {
-                            synchronized (slotLock) {
-                                fdField.setInt(slotLock, realFd);
-                            }
+                            releaseFailure.close();
                         }
                         borrower.join(TimeUnit.SECONDS.toMillis(1));
                         if (borrower.isAlive()) {
@@ -892,30 +878,30 @@ public class SenderPoolSfTest {
                     for (int i = 0; i < slotCount; i++) {
                         leases[i] = pool.borrow();
                         delegates[i] = getDelegate(leases[i]);
-                        callbacks[i] = (Runnable) getField(delegates[i], "slotLockReleaseListener");
+                        callbacks[i] = ((QwpWebSocketSender) delegates[i]).getSlotLockReleaseListenerForTesting();
                         Assert.assertNotNull(callbacks[i]);
                     }
                     for (int i = 0; i < slotCount; i++) {
                         delegates[i].close();
-                        setBooleanField(delegates[i], "slotLockReleased", false);
-                        invokeDiscardBroken(pool, leases[i]);
+                        ((QwpWebSocketSender) delegates[i]).setSlotLockReleasedForTesting(false);
+                        pool.discardBrokenForTesting(leases[i]);
                     }
                     Assert.assertEquals(slotCount, pool.leakedSlotCount());
-                    setLongField(pool, "retiredSlotProbeCount", 0);
+                    pool.setRetiredSlotProbeCountForTesting(0);
 
                     int[] geometricCheckpoints = {4, 8, 16, 32};
                     int checkpoint = 0;
                     for (int i = 0; i < slotCount; i++) {
-                        setBooleanField(delegates[i], "slotLockReleased", true);
+                        ((QwpWebSocketSender) delegates[i]).setSlotLockReleasedForTesting(true);
                         callbacks[i].run();
                         if (i + 1 == geometricCheckpoints[checkpoint]) {
                             Assert.assertEquals("direct release probes must grow linearly",
-                                    i + 1, getLongField(pool, "retiredSlotProbeCount"));
+                                    i + 1, pool.getRetiredSlotProbeCountForTesting());
                             checkpoint++;
                         }
                     }
                     Assert.assertEquals(0, pool.leakedSlotCount());
-                    Assert.assertTrue(((List<?>) getField(pool, "retiredSlots")).isEmpty());
+                    Assert.assertTrue(pool.getRetiredSlotCountForTesting() == 0);
                 }
             }
         });
@@ -936,39 +922,39 @@ public class SenderPoolSfTest {
                     for (int i = 0; i < 3; i++) {
                         leases[i] = pool.borrow();
                         delegates[i] = getDelegate(leases[i]);
-                        callbacks[i] = (Runnable) getField(delegates[i], "slotLockReleaseListener");
+                        callbacks[i] = ((QwpWebSocketSender) delegates[i]).getSlotLockReleaseListenerForTesting();
                         delegates[i].close();
-                        setBooleanField(delegates[i], "slotLockReleased", false);
-                        invokeDiscardBroken(pool, leases[i]);
+                        ((QwpWebSocketSender) delegates[i]).setSlotLockReleasedForTesting(false);
+                        pool.discardBrokenForTesting(leases[i]);
                     }
                     Assert.assertEquals(3, pool.leakedSlotCount());
-                    setLongField(pool, "retiredSlotProbeCount", 0);
+                    pool.setRetiredSlotProbeCountForTesting(0);
 
                     // Simulate callback registration becoming unavailable. The
                     // periodic housekeeper scan must remain a complete fallback.
                     ((QwpWebSocketSender) delegates[0]).setSlotLockReleaseListener(null);
-                    setBooleanField(delegates[0], "slotLockReleased", true);
+                    ((QwpWebSocketSender) delegates[0]).setSlotLockReleasedForTesting(true);
                     pool.reapIdle();
                     Assert.assertEquals(2, pool.leakedSlotCount());
 
                     // A premature callback must not remove an unreleased slot.
                     callbacks[1].run();
                     Assert.assertEquals(2, pool.leakedSlotCount());
-                    setBooleanField(delegates[1], "slotLockReleased", true);
+                    ((QwpWebSocketSender) delegates[1]).setSlotLockReleasedForTesting(true);
                     callbacks[1].run();
                     Assert.assertEquals(1, pool.leakedSlotCount());
 
                     // Duplicate and stale callbacks are idempotent and do not
                     // probe or mutate the slot after its direct removal.
-                    setBooleanField(delegates[2], "slotLockReleased", true);
+                    ((QwpWebSocketSender) delegates[2]).setSlotLockReleasedForTesting(true);
                     callbacks[2].run();
-                    long probesAfterRecovery = getLongField(pool, "retiredSlotProbeCount");
+                    long probesAfterRecovery = pool.getRetiredSlotProbeCountForTesting();
                     callbacks[2].run();
                     callbacks[1].run();
                     Assert.assertEquals(probesAfterRecovery,
-                            getLongField(pool, "retiredSlotProbeCount"));
+                            pool.getRetiredSlotProbeCountForTesting());
                     Assert.assertEquals(0, pool.leakedSlotCount());
-                    Assert.assertTrue(((List<?>) getField(pool, "retiredSlots")).isEmpty());
+                    Assert.assertTrue(pool.getRetiredSlotCountForTesting() == 0);
                 }
             }
         });
@@ -998,8 +984,8 @@ public class SenderPoolSfTest {
                         // slot. The idempotent second close in discardBroken()
                         // leaves the forged state unchanged.
                         delegates[i].close();
-                        setBooleanField(delegates[i], "slotLockReleased", false);
-                        invokeDiscardBroken(pool, leases[i]);
+                        ((QwpWebSocketSender) delegates[i]).setSlotLockReleasedForTesting(false);
+                        pool.discardBrokenForTesting(leases[i]);
                     }
                     Assert.assertEquals(8, pool.leakedSlotCount());
 
@@ -1009,17 +995,16 @@ public class SenderPoolSfTest {
                     // bitmap/count relationship.
                     int[] released = {0, 2, 5, 7};
                     for (int i = 0; i < released.length; i++) {
-                        setBooleanField(delegates[released[i]], "slotLockReleased", true);
+                        ((QwpWebSocketSender) delegates[released[i]]).setSlotLockReleasedForTesting(true);
                     }
                     pool.reapIdle();
 
                     Assert.assertEquals(4, pool.leakedSlotCount());
-                    Assert.assertEquals(4, ((List<?>) getField(pool, "retiredSlots")).size());
-                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
-                    for (int i = 0; i < slotInUse.length; i++) {
+                    Assert.assertEquals(4, pool.getRetiredSlotCountForTesting());
+                    for (int i = 0; i < delegates.length; i++) {
                         boolean mustRemainRetired = i == 1 || i == 3 || i == 4 || i == 6;
                         Assert.assertEquals("slot reservation mismatch at index " + i,
-                                mustRemainRetired, slotInUse[i]);
+                                mustRemainRetired, pool.isSlotInUseForTesting(i));
                     }
 
                     // Exactly the four restored reservations are reusable.
@@ -1062,8 +1047,8 @@ public class SenderPoolSfTest {
                     }
                     for (int i = 0; i < leases.length; i++) {
                         delegates[i].close();
-                        setBooleanField(delegates[i], "slotLockReleased", false);
-                        invokeDiscardBroken(pool, leases[i]);
+                        ((QwpWebSocketSender) delegates[i]).setSlotLockReleasedForTesting(false);
+                        pool.discardBrokenForTesting(leases[i]);
                     }
                     Assert.assertEquals("all capacity must start retired",
                             6, pool.leakedSlotCount());
@@ -1127,7 +1112,7 @@ public class SenderPoolSfTest {
                                 reparkedWaiters.countDown();
                             }
                         });
-                        setBooleanField(delegates[2], "slotLockReleased", true);
+                        ((QwpWebSocketSender) delegates[2]).setSlotLockReleasedForTesting(true);
                         pool.reapIdle();
 
                         // One restored index admits exactly one borrower. The
@@ -1147,8 +1132,8 @@ public class SenderPoolSfTest {
                         // only one of the two proven waiters; signalAll() must
                         // wake both and let them claim the two restored indices.
                         pool.setBeforeBorrowWaitHook(null);
-                        setBooleanField(delegates[0], "slotLockReleased", true);
-                        setBooleanField(delegates[5], "slotLockReleased", true);
+                        ((QwpWebSocketSender) delegates[0]).setSlotLockReleasedForTesting(true);
+                        ((QwpWebSocketSender) delegates[5]).setSlotLockReleasedForTesting(true);
                         pool.reapIdle();
                         Assert.assertTrue("all waiting borrowers must receive restored capacity",
                                 allAcquired.await(5, TimeUnit.SECONDS));
@@ -1157,7 +1142,7 @@ public class SenderPoolSfTest {
 
                         boolean[] seen = new boolean[6];
                         for (int i = 0; i < recovered.length; i++) {
-                            int slotIndex = getIntField(slotOf(recovered[i]), "slotIndex");
+                            int slotIndex = recovered[i].getSlotIndexForTesting();
                             Assert.assertFalse("borrowers must receive distinct restored indices",
                                     seen[slotIndex]);
                             seen[slotIndex] = true;
@@ -1196,20 +1181,15 @@ public class SenderPoolSfTest {
                         Long.MAX_VALUE, Long.MAX_VALUE)) {
                     PooledSender a = pool.borrow();
                     Sender delegate = getDelegate(a);
-                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
-                    SlotLock slotLock = (SlotLock) getField(engine, "slotLock");
-                    Field fdField = SlotLock.class.getDeclaredField("fd");
-                    fdField.setAccessible(true);
-                    int realFd = fdField.getInt(slotLock);
-                    Assert.assertTrue("precondition: live flock fd", realFd >= 0);
+                    CursorSendEngine engine = ((QwpWebSocketSender) delegate).getCursorEngineForTesting();
+                    SlotLock slotLock = engine.getSlotLockForTesting();
+                    SlotLock.ReleaseFailureForTesting releaseFailure =
+                            slotLock.injectReleaseFailureForTesting();
                     try {
                         // Inject one persistent explicit-unlock failure.
                         // Delegate close must retire the only pool slot rather
                         // than publish a release while the real flock remains held.
-                        synchronized (slotLock) {
-                            fdField.setInt(slotLock, 1_000_000_000);
-                        }
-                        invokeDiscardBroken(pool, a);
+                        pool.discardBrokenForTesting(a);
                         Assert.assertEquals("failed release must retire pool capacity",
                                 1, pool.leakedSlotCount());
                         Assert.assertFalse(engine.isCloseCompleted());
@@ -1217,9 +1197,7 @@ public class SenderPoolSfTest {
                         // Remove the fault without calling close again: the
                         // engine's error-path retry driver runs outside the
                         // pool lock and must eventually publish completion.
-                        synchronized (slotLock) {
-                            fdField.setInt(slotLock, realFd);
-                        }
+                        releaseFailure.close();
                         long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                         while (!engine.isCloseCompleted()) {
                             if (System.nanoTime() > deadlineNs) {
@@ -1241,11 +1219,9 @@ public class SenderPoolSfTest {
                         }
                     } finally {
                         if (!engine.isCloseCompleted()) {
-                            synchronized (slotLock) {
-                                fdField.setInt(slotLock, realFd);
-                                Assert.assertTrue("restored fd must release cleanly",
-                                        slotLock.release());
-                            }
+                            releaseFailure.close();
+                            Assert.assertTrue("restored fd must release cleanly",
+                                    slotLock.release());
                         }
                     }
                 }
@@ -1278,9 +1254,9 @@ public class SenderPoolSfTest {
                     Assert.assertTrue(Files.exists(slot("default-0")));
 
                     Sender delegate = getDelegate(a);
-                    CursorSendEngine engine = (CursorSendEngine) getField(delegate, "cursorEngine");
+                    CursorSendEngine engine = ((QwpWebSocketSender) delegate).getCursorEngineForTesting();
                     Assert.assertNotNull("SF delegate must own a cursor engine", engine);
-                    SegmentManager manager = (SegmentManager) getField(engine, "manager");
+                    SegmentManager manager = engine.getManagerForTesting();
 
                     CountDownLatch workerBlocked = new CountDownLatch(1);
                     CountDownLatch releaseWorker = new CountDownLatch(1);
@@ -1317,7 +1293,7 @@ public class SenderPoolSfTest {
                             throw new OutOfMemoryError("simulated callback allocation failure");
                         });
                         manager.setWorkerJoinTimeoutMillis(50L);
-                        invokeDiscardBroken(pool, a);
+                        pool.discardBrokenForTesting(a);
                         Assert.assertEquals(
                                 "pool must retire the slot while the delegate's manager "
                                         + "worker holds the deferred cleanup",
@@ -1339,9 +1315,8 @@ public class SenderPoolSfTest {
                         pool.reapIdle();
                         Assert.assertEquals("recovered slot must leave the leaked count",
                                 0, pool.leakedSlotCount());
-                        boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
                         Assert.assertFalse("recovered slot index 0 must return to the free set",
-                                slotInUse[0]);
+                                pool.isSlotInUseForTesting(0));
 
                         // The proof a forged flag cannot fake: both indices —
                         // including the recovered one, whose flock was really
@@ -1455,20 +1430,20 @@ public class SenderPoolSfTest {
                 // min=0 (no prewarm connect), no stranded data (recovery no-op).
                 try (SenderPool pool = new SenderPool(cfg, 0, 2, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
                     // Normal managed-slot delegate: inherits the promoted SYNC.
-                    Sender normal = invokeBuildSlotDelegate(pool, "defaultSender", 0);
+                    Sender normal = pool.buildSenderForTesting(0);
                     try {
                         Assert.assertEquals(
                                 "ordinary pooled sender must honour the user's promoted SYNC mode",
-                                Sender.InitialConnectMode.SYNC, readInitialConnectMode(normal));
+                                Sender.InitialConnectMode.SYNC, ((QwpWebSocketSender) normal).getInitialConnectModeForTesting());
                     } finally {
                         normal.close();
                     }
                     // Recovery delegate on a different slot: forced OFF.
-                    Sender recoverer = invokeBuildSlotDelegate(pool, "defaultRecoverySender", 1);
+                    Sender recoverer = pool.buildRecoverySenderForTesting(1);
                     try {
                         Assert.assertEquals(
                                 "recovery delegate must force OFF so build() makes at most one connect attempt",
-                                Sender.InitialConnectMode.OFF, readInitialConnectMode(recoverer));
+                                Sender.InitialConnectMode.OFF, ((QwpWebSocketSender) recoverer).getInitialConnectModeForTesting());
                     } finally {
                         recoverer.close();
                     }
@@ -1614,7 +1589,7 @@ public class SenderPoolSfTest {
                     Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
                     if (idx == 0) {
                         try {
-                            setBooleanField(real, "closed", true);
+                            ((QwpWebSocketSender) real).setClosedForTesting(true);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -1632,10 +1607,11 @@ public class SenderPoolSfTest {
                     Assert.assertNotNull("recovery must have built slot 0", forged.get());
                     // The retire branch must have fired during construction.
                     Assert.assertEquals("recovery must retire the still-locked slot as leaked",
-                            1, getIntField(pool, "leakedSlots"));
-                    boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
-                    Assert.assertTrue("retired slot 0 must stay reserved", slotInUse[0]);
-                    Assert.assertFalse("slot 1 must remain free", slotInUse[1]);
+                            1, pool.leakedSlotCount());
+                    Assert.assertTrue("retired slot 0 must stay reserved",
+                            pool.isSlotInUseForTesting(0));
+                    Assert.assertFalse("slot 1 must remain free",
+                            pool.isSlotInUseForTesting(1));
 
                     // A later borrow must take the fresh slot 1, never re-pick
                     // the still-locked default-0 (which would throw "sf slot
@@ -1664,7 +1640,7 @@ public class SenderPoolSfTest {
                     // close it for real, otherwise assertMemoryLeak trips.
                     Sender leaked = forged.get();
                     if (leaked != null) {
-                        setBooleanField(leaked, "closed", false);
+                        ((QwpWebSocketSender) leaked).setClosedForTesting(false);
                         leaked.close();
                     }
                 }
@@ -1725,7 +1701,7 @@ public class SenderPoolSfTest {
                     Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
                     if (idx == 0 && forged.compareAndSet(null, real)) {
                         try {
-                            setBooleanField(real, "closed", true);
+                            ((QwpWebSocketSender) real).setClosedForTesting(true);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -1753,7 +1729,7 @@ public class SenderPoolSfTest {
                     // isSlotLockReleased() re-probing the retained engine after
                     // the worker exited).
                     Sender recoverer = forged.get();
-                    setBooleanField(recoverer, "closed", false);
+                    ((QwpWebSocketSender) recoverer).setClosedForTesting(false);
                     recoverer.close();
 
                     // The capacity-starved borrow must re-probe the startup-
@@ -1763,8 +1739,8 @@ public class SenderPoolSfTest {
                     try {
                         Assert.assertEquals("borrow must recover the startup-retired slot's capacity",
                                 0, pool.leakedSlotCount());
-                        boolean[] slotInUse = (boolean[]) getField(pool, "slotInUse");
-                        Assert.assertTrue("recovered index 0 must carry the new borrow", slotInUse[0]);
+                        Assert.assertTrue("recovered index 0 must carry the new borrow",
+                                pool.isSlotInUseForTesting(0));
                         Assert.assertEquals(1, countSlotDirs());
                     } finally {
                         b.close();
@@ -1828,7 +1804,7 @@ public class SenderPoolSfTest {
                     Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
                     if (idx == 0 && forged.compareAndSet(null, real)) {
                         try {
-                            setBooleanField(real, "closed", true);
+                            ((QwpWebSocketSender) real).setClosedForTesting(true);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -1838,7 +1814,7 @@ public class SenderPoolSfTest {
 
                 try (SenderPool pool = newDeferredPoolWithFactory(cfg2, 0, 1, 0, factory)) {
                     //noinspection StatementWithEmptyBody
-                    while (invokeRunStartupRecoveryStep(pool)) {
+                    while (pool.runStartupRecoveryStepForTesting()) {
                         // drive the whole backlog, one housekeeper-tick unit at a time
                     }
                     Assert.assertNotNull("recovery must have built slot 0", forged.get());
@@ -1850,7 +1826,7 @@ public class SenderPoolSfTest {
                     // pool -- the release happens in the delegate, volatile
                     // writes only.
                     Sender recoverer = forged.get();
-                    setBooleanField(recoverer, "closed", false);
+                    ((QwpWebSocketSender) recoverer).setClosedForTesting(false);
                     recoverer.close();
 
                     // Try-once borrow: its single pass must probe, recover the
@@ -1912,7 +1888,7 @@ public class SenderPoolSfTest {
                     Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
                     if (idx == 0 && forged.compareAndSet(null, real)) {
                         try {
-                            setBooleanField(real, "closed", true);
+                            ((QwpWebSocketSender) real).setClosedForTesting(true);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -1931,7 +1907,7 @@ public class SenderPoolSfTest {
                                 waitExpired.compareAndSet(false, true));
                         Sender recoverer = forged.get();
                         try {
-                            setBooleanField(recoverer, "closed", false);
+                            ((QwpWebSocketSender) recoverer).setClosedForTesting(false);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         }
@@ -2437,10 +2413,9 @@ public class SenderPoolSfTest {
 
                 try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 5_000, factory)) {
                     PooledSender primary = pool.borrow();
-                    Object primarySlot = slotOf(primary);
 
                     Assert.assertFalse("first recovery attempt must stop at the transient failure",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertEquals("exactly one out-of-range recovery attempt", 1,
                             recoveryAttempts.get());
                     Assert.assertTrue("failed recovery must preserve the candidate",
@@ -2448,11 +2423,11 @@ public class SenderPoolSfTest {
                     Assert.assertEquals("out-of-range failure must not consume in-range capacity",
                             0, pool.leakedSlotCount());
                     Assert.assertTrue("out-of-range recoverer must not enter retired-slot bookkeeping",
-                            ((List<?>) getField(pool, "retiredSlots")).isEmpty());
+                            pool.getRetiredSlotCountForTesting() == 0);
 
                     primary.close();
                     primaryReturned.set(true);
-                    invokeRunStartupRecoveryOnce(pool);
+                    pool.runStartupRecoveryToCompletionForTesting();
 
                     Assert.assertEquals("same live pool must retry the out-of-range candidate", 2,
                             recoveryAttempts.get());
@@ -2462,12 +2437,12 @@ public class SenderPoolSfTest {
                     Assert.assertEquals("successful out-of-range retry must not consume capacity",
                             0, pool.leakedSlotCount());
                     Assert.assertTrue("out-of-range retry must leave retired slots untouched",
-                            ((List<?>) getField(pool, "retiredSlots")).isEmpty());
+                            pool.getRetiredSlotCountForTesting() == 0);
 
                     PooledSender next = pool.borrow();
                     try {
-                        Assert.assertSame("normal borrow must reuse the returned primary slot",
-                                primarySlot, slotOf(next));
+                        Assert.assertTrue("normal borrow must reuse the returned primary slot",
+                                primary.hasSameSlotForTesting(next));
                     } finally {
                         next.close();
                     }
@@ -2522,33 +2497,33 @@ public class SenderPoolSfTest {
 
                 try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 5_000, factory)) {
                     Assert.assertFalse("failed in-range drain must defer the same candidate",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertEquals(1, attempts[0].get());
                     Assert.assertEquals(0, attempts[1].get());
                     Assert.assertTrue("failed in-range drain must preserve durable data",
                             hasSegmentFile(slot("default-0")));
 
                     Assert.assertTrue("successful in-range retry may continue scanning",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertEquals("same live pool must retry the in-range candidate",
                             2, attempts[0].get());
                     Assert.assertFalse("in-range retry must drain the preserved data",
                             hasSegmentFile(slot("default-0")));
 
                     Assert.assertFalse("failed out-of-range drain must defer the same candidate",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertEquals(1, attempts[1].get());
                     Assert.assertTrue("failed out-of-range drain must preserve durable data",
                             hasSegmentFile(slot("default-1")));
 
                     Assert.assertTrue("successful out-of-range retry may finish the candidate",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertEquals("same live pool must retry the out-of-range candidate",
                             2, attempts[1].get());
                     Assert.assertFalse("out-of-range retry must drain the preserved data",
                             hasSegmentFile(slot("default-1")));
                     Assert.assertFalse("final scan step must mark recovery complete",
-                            invokeRunStartupRecoveryStep(pool));
+                            pool.runStartupRecoveryStepForTesting());
                     Assert.assertTrue("both recovered frames must be delivered", handler.frames.get() >= 2);
                 }
             }
@@ -2679,9 +2654,9 @@ public class SenderPoolSfTest {
         SenderPool pool = newPoolWithFactory(
                 "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
                 0, 2, 0, senderFactory);
-        Thread recoveryThread = (Thread) getField(pool, "startupRecoveryThread");
-        invokeSetStartupRecoveryJoinHooks(
-                pool, beforeJoin::countDown,
+        Thread recoveryThread = pool.getStartupRecoveryThreadForTesting();
+        pool.setStartupRecoveryJoinHooksForTesting(
+                beforeJoin::countDown,
                 () -> {
                     driverAliveAfterJoin.set(recoveryThread.isAlive());
                     afterJoin.countDown();
@@ -2704,7 +2679,7 @@ public class SenderPoolSfTest {
             Assert.assertTrue("close must enter its direct-driver join operation",
                     beforeJoin.await(10, TimeUnit.SECONDS));
             Assert.assertTrue("close itself must raise the shutdown signal before joining",
-                    (Boolean) getField(pool, "closed"));
+                    pool.isClosedForTesting());
 
             releaseDrain.countDown();
             Assert.assertTrue("driver must remain deliberately held before termination",
@@ -2763,7 +2738,7 @@ public class SenderPoolSfTest {
         SenderPool pool = newPoolWithRecoveryControls(
                 "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
                 0, 1, 0, senderFactory, null, recoveryWaiter, null);
-        invokeSetStartupRecoveryJoinHooks(pool, beforeJoin::countDown, null);
+        pool.setStartupRecoveryJoinHooksForTesting(beforeJoin::countDown, null);
         Thread closeThread = new Thread(() -> {
             try {
                 pool.close();
@@ -2981,7 +2956,7 @@ public class SenderPoolSfTest {
         try (SenderPool pool = newPoolWithFactory(config, 0, 1, Long.MAX_VALUE, factory)) {
             Assert.assertEquals("Long.MAX_VALUE must leave a positive inline recovery budget",
                     1, attempts.get());
-            Assert.assertTrue("the inline scan must complete", (Boolean) getField(pool, "recoveryComplete"));
+            Assert.assertTrue("the inline scan must complete", pool.isRecoveryCompleteForTesting());
         }
     }
 
@@ -3139,7 +3114,7 @@ public class SenderPoolSfTest {
                 SenderPool pool = newDeferredPool(cfg, 0, maxSize, acquireTimeoutMillis);
                 try {
                     long startNanos = System.nanoTime();
-                    invokeRunStartupRecoveryStep(pool);
+                    pool.runStartupRecoveryStepForTesting();
                     long stepMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
 
                     // Headline guarantee: a recovery delegate must not stand up a
@@ -3242,7 +3217,7 @@ public class SenderPoolSfTest {
                     // lost) for a later attempt -- exercising the deferred path's
                     // concurrency-safe slot reservation too.
                     long recoverStart = System.nanoTime();
-                    invokeRunStartupRecoveryOnce(pool);
+                    pool.runStartupRecoveryToCompletionForTesting();
                     long recoverMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - recoverStart);
                     Assert.assertTrue(
                             "driven recovery must be bounded by the shared budget: took " + recoverMillis
@@ -3297,7 +3272,7 @@ public class SenderPoolSfTest {
                             hasSegmentFile(slot("default-0")));
 
                     // Drive it (what the housekeeper does on its first tick).
-                    invokeRunStartupRecoveryOnce(pool);
+                    pool.runStartupRecoveryToCompletionForTesting();
                     Assert.assertTrue("driven recovery must empty default-0",
                             awaitNoSegmentFile(slot("default-0"), 15_000));
                     Assert.assertTrue("recovered frames must reach the server",
@@ -3306,7 +3281,7 @@ public class SenderPoolSfTest {
                             Files.exists(slot("default-0") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
 
                     // Idempotent: a second drive is a no-op and must not throw.
-                    invokeRunStartupRecoveryOnce(pool);
+                    pool.runStartupRecoveryToCompletionForTesting();
                     Assert.assertFalse("default-0 stays recovered", hasSegmentFile(slot("default-0")));
 
                     // Pool still usable for normal borrows.
@@ -3367,7 +3342,7 @@ public class SenderPoolSfTest {
             // Mimic the housekeeper: drive steps back-to-back until done/closing.
             Thread recovery = new Thread(() -> {
                 try {
-                    while (invokeRunStartupRecoveryStep(pool)) {
+                    while (pool.runStartupRecoveryStepForTesting()) {
                         // keep stepping
                     }
                 } catch (Exception ignored) {
@@ -3380,7 +3355,7 @@ public class SenderPoolSfTest {
 
             // Raise the shutdown signal mid-drain, exactly as QuestDBImpl.close()
             // does before stopping the housekeeper.
-            invokeMarkClosing(pool);
+            pool.markClosingForTesting();
             releaseSlot0Drain.countDown();
             recovery.join(TimeUnit.SECONDS.toMillis(10));
             Assert.assertFalse("recovery thread must finish", recovery.isAlive());
@@ -3527,8 +3502,8 @@ public class SenderPoolSfTest {
                     Sender sender = Sender.builder(config).senderId("default-" + idx).build();
                     if (idx == strandedIndex && instrumented.compareAndSet(false, true)) {
                         try {
-                            CursorSendEngine engine = (CursorSendEngine) getField(sender, "cursorEngine");
-                            SegmentManager manager = (SegmentManager) getField(engine, "manager");
+                            CursorSendEngine engine = ((QwpWebSocketSender) sender).getCursorEngineForTesting();
+                            SegmentManager manager = engine.getManagerForTesting();
                             CountDownLatch workerBlocked = new CountDownLatch(1);
                             AtomicBoolean fired = new AtomicBoolean();
                             manager.setBeforeTrimSyncHook(() -> {
@@ -3719,78 +3694,8 @@ public class SenderPoolSfTest {
         Files.remove(dir);
     }
 
-    private static Sender getDelegate(PooledSender ps) throws Exception {
-        Field slotF = PooledSender.class.getDeclaredField("slot");
-        slotF.setAccessible(true);
-        Object slot = slotF.get(ps);
-        Field f = slot.getClass().getDeclaredField("delegate");
-        f.setAccessible(true);
-        return (Sender) f.get(slot);
-    }
-
-    // Invokes one of the pool's private managed-slot delegate factories
-    // (defaultSender / defaultRecoverySender) so a test can inspect the raw
-    // delegate it would build for a given slot index.
-    private static Sender invokeBuildSlotDelegate(SenderPool pool, String methodName, int slotIndex)
-            throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod(methodName, int.class);
-        m.setAccessible(true);
-        return (Sender) m.invoke(pool, slotIndex);
-    }
-
-    // Reads the resolved initial-connect mode a built QwpWebSocketSender delegate
-    // is using (the value after the builder's SYNC auto-promotion / explicit
-    // override has been applied).
-    private static Sender.InitialConnectMode readInitialConnectMode(Sender delegate) throws Exception {
-        Field f = delegate.getClass().getDeclaredField("initialConnectMode");
-        f.setAccessible(true);
-        return (Sender.InitialConnectMode) f.get(delegate);
-    }
-
-    private static void setBooleanField(Object target, String name, boolean value) throws Exception {
-        Field f = target.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        f.setBoolean(target, value);
-    }
-
-    private static void setLongField(Object target, String name, long value) throws Exception {
-        Field f = target.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        f.setLong(target, value);
-    }
-
-    private static int getIntField(Object target, String name) throws Exception {
-        Field f = target.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getInt(target);
-    }
-
-    private static long getLongField(Object target, String name) throws Exception {
-        Field f = target.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getLong(target);
-    }
-
-    private static Object getField(Object target, String name) throws Exception {
-        Field f = target.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        return f.get(target);
-    }
-
-    // Reads the package-private PooledSender.slot -- the identity that the pool
-    // actually recycles. Wrapper identity is useless for aliasing checks because
-    // borrow() allocates a fresh wrapper every call (mirrors SenderPoolTest and
-    // SenderPoolErrorSafetyTest).
-    private static Object slotOf(PooledSender pooledWrapper) throws Exception {
-        Field f = PooledSender.class.getDeclaredField("slot");
-        f.setAccessible(true);
-        return f.get(pooledWrapper);
-    }
-
-    private static void invokeDiscardBroken(SenderPool pool, PooledSender ps) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod("discardBroken", PooledSender.class);
-        m.setAccessible(true);
-        m.invoke(pool, ps);
+    private static Sender getDelegate(PooledSender ps) {
+        return ps.getDelegateForTesting();
     }
 
     // Uses the @TestOnly senderFactory seam so a test can inject a fake/forged
@@ -3810,23 +3715,10 @@ public class SenderPoolSfTest {
             ThreadFactory threadFactory,
             Runnable recoveryWaiter,
             Runnable beforeFailedRecoveryJoinHook
-    ) throws Throwable {
-        Constructor<SenderPool> constructor = SenderPool.class.getDeclaredConstructor(
-                String.class, int.class, int.class, long.class, long.class, long.class,
-                IntFunction.class, boolean.class,
-                io.questdb.client.SenderErrorHandler.class,
-                io.questdb.client.SenderConnectionListener.class,
-                io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener.class,
-                Runnable.class, ThreadFactory.class, Runnable.class, Runnable.class);
-        constructor.setAccessible(true);
-        try {
-            return constructor.newInstance(
-                    cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE,
-                    senderFactory, false, null, null, null, null, threadFactory,
-                    recoveryWaiter, beforeFailedRecoveryJoinHook);
-        } catch (InvocationTargetException e) {
-            throw e.getCause();
-        }
+    ) {
+        return SenderPool.createWithRecoveryControlsForTesting(
+                cfg, min, max, acquireMs, senderFactory, threadFactory,
+                recoveryWaiter, beforeFailedRecoveryJoinHook);
     }
 
     private static SenderPool newPoolWithRecoveryThreadFactory(
@@ -3847,39 +3739,6 @@ public class SenderPoolSfTest {
     // senderFactory=null -> the real defaultSender().
     private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) {
         return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);
-    }
-
-    // Drives a deferred pool's startup recovery to completion (the housekeeper
-    // drives it one slot per tick; tests drive the whole backlog in one call).
-    private static void invokeRunStartupRecoveryOnce(SenderPool pool) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryToCompletion");
-        m.setAccessible(true);
-        m.invoke(pool);
-    }
-
-    // Drives a SINGLE recovery step (the housekeeper's per-tick unit); returns
-    // whether more stranded slots remain.
-    private static boolean invokeRunStartupRecoveryStep(SenderPool pool) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod("runStartupRecoveryStep");
-        m.setAccessible(true);
-        return (Boolean) m.invoke(pool);
-    }
-
-    // Raises the pool's shutdown signal early, exactly as QuestDBImpl.close()
-    // does before stopping the housekeeper.
-    private static void invokeMarkClosing(SenderPool pool) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod("markClosing");
-        m.setAccessible(true);
-        m.invoke(pool);
-    }
-
-    private static void invokeSetStartupRecoveryJoinHooks(
-            SenderPool pool, Runnable beforeJoinHook, Runnable afterJoinHook
-    ) throws Exception {
-        Method m = SenderPool.class.getDeclaredMethod(
-                "setStartupRecoveryJoinHooks", Runnable.class, Runnable.class);
-        m.setAccessible(true);
-        m.invoke(pool, beforeJoinHook, afterJoinHook);
     }
 
     // Deferred pool (deferStartupRecovery=true) WITH an injected factory, so a

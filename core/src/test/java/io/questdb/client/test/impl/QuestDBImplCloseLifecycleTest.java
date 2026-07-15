@@ -37,15 +37,12 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Proxy;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
 
@@ -67,7 +64,7 @@ public class QuestDBImplCloseLifecycleTest {
             };
             QuestDBImpl db = newQuestDB(
                     SENDER_CFG, 0, 0, 0, slotIndex -> fakeSender(null, null, null), connectHook);
-            QueryClientPool pool = (QueryClientPool) getField(db, "queryPool");
+            QueryClientPool pool = db.getQueryPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             Thread borrower = new Thread(() -> {
                 try {
@@ -128,7 +125,7 @@ public class QuestDBImplCloseLifecycleTest {
                     + System.getProperty("java.io.tmpdir") + "/qdb-bounded-pool-" + System.nanoTime() + ";";
             QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 0, senderFactory, client -> {
             });
-            SenderPool pool = (SenderPool) getField(db, "senderPool");
+            SenderPool pool = db.getSenderPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             Thread borrower = new Thread(() -> {
                 try {
@@ -142,9 +139,9 @@ public class QuestDBImplCloseLifecycleTest {
                 borrower.start();
                 Assert.assertTrue("sender borrow never reached construction",
                         inCreation.await(10, TimeUnit.SECONDS));
-                Assert.assertEquals(1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertEquals(1, pool.getInFlightCreationsForTesting());
                 Assert.assertTrue("SF slot must stay reserved during creation",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
 
                 closer.start();
                 closer.join(TimeUnit.SECONDS.toMillis(5));
@@ -153,18 +150,18 @@ public class QuestDBImplCloseLifecycleTest {
                         closer.isAlive());
                 Assert.assertEquals(
                         "close must retain late-completion cleanup ownership",
-                        1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                        1, pool.getInFlightCreationsForTesting());
                 Assert.assertTrue("close must not abandon the reserved SF slot",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
 
                 releaseCreation.countDown();
                 borrower.join(TimeUnit.SECONDS.toMillis(10));
                 Assert.assertFalse("sender borrower did not finish", borrower.isAlive());
                 Assert.assertEquals("late sender creation must be torn down exactly once", 1, teardownCount.get());
                 Assert.assertEquals("late sender creation reservation must be released",
-                        0, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                        0, pool.getInFlightCreationsForTesting());
                 Assert.assertFalse("late sender cleanup must release the SF slot",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
                 Assert.assertTrue("borrowSender() must report facade closure, got: " + borrowOutcome.get(),
                         borrowOutcome.get() instanceof LineSenderException
                                 && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
@@ -190,7 +187,7 @@ public class QuestDBImplCloseLifecycleTest {
             };
             QuestDBImpl db = newQuestDB(
                     SENDER_CFG, 0, 0, 100, slotIndex -> fakeSender(null, null, null), connectHook);
-            QueryClientPool pool = (QueryClientPool) getField(db, "queryPool");
+            QueryClientPool pool = db.getQueryPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
             AtomicBoolean keepInterrupting = new AtomicBoolean(true);
@@ -272,7 +269,7 @@ public class QuestDBImplCloseLifecycleTest {
                     + System.getProperty("java.io.tmpdir") + "/qdb-interrupted-pool-" + System.nanoTime() + ";";
             QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 100, senderFactory, client -> {
             });
-            SenderPool pool = (SenderPool) getField(db, "senderPool");
+            SenderPool pool = db.getSenderPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
             AtomicBoolean keepInterrupting = new AtomicBoolean(true);
@@ -299,9 +296,9 @@ public class QuestDBImplCloseLifecycleTest {
                 borrower.start();
                 Assert.assertTrue("sender borrow never reached construction",
                         inCreation.await(10, TimeUnit.SECONDS));
-                Assert.assertEquals(1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                Assert.assertEquals(1, pool.getInFlightCreationsForTesting());
                 Assert.assertTrue("SF slot must stay reserved during creation",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
 
                 closer.start();
                 awaitCreationWaiter(pool,
@@ -316,18 +313,18 @@ public class QuestDBImplCloseLifecycleTest {
                         closeReturnedInterrupted.get());
                 Assert.assertEquals(
                         "close must retain late-completion cleanup ownership",
-                        1, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                        1, pool.getInFlightCreationsForTesting());
                 Assert.assertTrue("close must not abandon the reserved SF slot",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
 
                 releaseCreation.countDown();
                 borrower.join(TimeUnit.SECONDS.toMillis(10));
                 Assert.assertFalse("sender borrower did not finish", borrower.isAlive());
                 Assert.assertEquals("late sender creation must be torn down exactly once", 1, teardownCount.get());
                 Assert.assertEquals("late sender creation reservation must be released",
-                        0, ((Integer) getField(pool, "inFlightCreations")).intValue());
+                        0, pool.getInFlightCreationsForTesting());
                 Assert.assertFalse("late sender cleanup must release the SF slot",
-                        ((boolean[]) getField(pool, "slotInUse"))[0]);
+                        pool.isSlotInUseForTesting(0));
                 Assert.assertTrue("borrowSender() must report facade closure, got: " + borrowOutcome.get(),
                         borrowOutcome.get() instanceof LineSenderException
                                 && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
@@ -379,8 +376,8 @@ public class QuestDBImplCloseLifecycleTest {
                         inCreation.await(10, TimeUnit.SECONDS));
 
                 closer.start();
-                QueryClientPool pool = (QueryClientPool) getField(db, "queryPool");
-                awaitBooleanField(pool, "closed");
+                QueryClientPool pool = db.getQueryPoolForTesting();
+                awaitClosed(pool);
                 awaitCreationWaiter(pool,
                         "facade close did not wait while query construction was internally owned");
                 closer.interrupt();
@@ -445,8 +442,8 @@ public class QuestDBImplCloseLifecycleTest {
                         inCreation.await(10, TimeUnit.SECONDS));
 
                 closer.start();
-                SenderPool pool = (SenderPool) getField(db, "senderPool");
-                awaitBooleanField(pool, "closeStarted");
+                SenderPool pool = db.getSenderPoolForTesting();
+                awaitCloseStarted(pool);
                 awaitCreationWaiter(pool,
                         "facade close did not wait while sender construction was internally owned");
 
@@ -476,31 +473,44 @@ public class QuestDBImplCloseLifecycleTest {
         });
     }
 
-    private static void awaitBooleanField(Object target, String fieldName) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
+    private static void awaitCloseStarted(SenderPool pool) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (System.nanoTime() < deadline) {
-            if (field.getBoolean(target)) {
+            if (pool.isCloseStartedForTesting()) {
                 return;
             }
             Thread.yield();
         }
-        Assert.fail("field did not become true: " + fieldName);
+        Assert.fail("sender pool close did not start");
     }
 
-    private static void awaitCreationWaiter(Object pool, String message) throws Exception {
-        ReentrantLock lock = (ReentrantLock) getField(pool, "lock");
-        Condition creationFinished = (Condition) getField(pool, "creationFinished");
+    private static void awaitClosed(QueryClientPool pool) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (System.nanoTime() < deadline) {
-            lock.lock();
-            try {
-                if (lock.hasWaiters(creationFinished)) {
-                    return;
-                }
-            } finally {
-                lock.unlock();
+            if (pool.isClosedForTesting()) {
+                return;
+            }
+            Thread.yield();
+        }
+        Assert.fail("query pool did not close");
+    }
+
+    private static void awaitCreationWaiter(QueryClientPool pool, String message) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            if (pool.hasCreationWaiterForTesting()) {
+                return;
+            }
+            Thread.yield();
+        }
+        Assert.fail(message);
+    }
+
+    private static void awaitCreationWaiter(SenderPool pool, String message) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            if (pool.hasCreationWaiterForTesting()) {
+                return;
             }
             Thread.yield();
         }
@@ -558,12 +568,6 @@ public class QuestDBImplCloseLifecycleTest {
                             return null;
                     }
                 });
-    }
-
-    private static Object getField(Object target, String fieldName) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return field.get(target);
     }
 
     private static QuestDBImpl newQuestDB(

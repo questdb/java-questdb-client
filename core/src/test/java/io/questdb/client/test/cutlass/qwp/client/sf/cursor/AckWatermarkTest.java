@@ -144,6 +144,35 @@ public class AckWatermarkTest {
     }
 
     @Test
+    public void testPhysicalReleaseIsIdempotentAcrossTestingSeamAndClose() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AckWatermark watermark = AckWatermark.open(slotDir);
+            assertNotNull(watermark);
+            try {
+                assertTrue("first test release must relinquish physical storage",
+                        watermark.releaseStorageButKeepWritableForTesting());
+                assertFalse("repeated test release must not touch physical storage again",
+                        watermark.releaseStorageButKeepWritableForTesting());
+                watermark.close();
+                assertFalse("close after test release must keep physical cleanup idempotent",
+                        watermark.releaseStorageButKeepWritableForTesting());
+            } finally {
+                watermark.close();
+            }
+
+            AckWatermark normallyClosed = AckWatermark.open(slotDir);
+            assertNotNull(normallyClosed);
+            try {
+                normallyClosed.close();
+                assertFalse("ordinary close must record physical relinquishment",
+                        normallyClosed.releaseStorageButKeepWritableForTesting());
+            } finally {
+                normallyClosed.close();
+            }
+        });
+    }
+
+    @Test
     public void testRemoveOrphanDeletesFile() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (AckWatermark w = AckWatermark.open(slotDir)) {

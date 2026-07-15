@@ -1292,6 +1292,11 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    @TestOnly
+    public void setSlotLockReleasedForTesting(boolean isReleased) {
+        slotLockReleased = isReleased;
+    }
+
     @Override
     public Sender decimalColumn(CharSequence name, Decimal64 value) {
         checkNotClosed();
@@ -1711,13 +1716,28 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @TestOnly
+    public CursorSendEngine getCursorEngineForTesting() {
+        return cursorEngine;
+    }
+
+    @TestOnly
     public SenderErrorDispatcher getErrorDispatcherForTesting() {
         return errorDispatcher;
     }
 
     @TestOnly
+    public Sender.InitialConnectMode getInitialConnectModeForTesting() {
+        return initialConnectMode;
+    }
+
+    @TestOnly
     public SenderProgressDispatcher getProgressDispatcherForTesting() {
         return progressDispatcher;
+    }
+
+    @TestOnly
+    public Runnable getSlotLockReleaseListenerForTesting() {
+        return slotLockReleaseListener;
     }
 
     /**
@@ -2149,6 +2169,11 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setClientForTesting(WebSocketClient client) {
         this.client = client;
+    }
+
+    @TestOnly
+    public void setClosedForTesting(boolean isClosed) {
+        this.closed = isClosed;
     }
 
     /**

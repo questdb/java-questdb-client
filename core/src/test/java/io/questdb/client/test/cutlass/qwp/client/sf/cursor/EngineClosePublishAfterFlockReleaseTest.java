@@ -32,7 +32,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -192,14 +191,8 @@ public class EngineClosePublishAfterFlockReleaseTest {
     public void testUnconfirmedFlockReleaseKeepsCloseIncompleteUntilRetry() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CursorSendEngine engine = new CursorSendEngine(sfDir, 4L * 1024 * 1024);
-            Field slotLockField = CursorSendEngine.class.getDeclaredField("slotLock");
-            slotLockField.setAccessible(true);
-            SlotLock slotLock = (SlotLock) slotLockField.get(engine);
+            SlotLock slotLock = engine.getSlotLockForTesting();
             assertNotNull("disk-mode engine must hold a slot lock", slotLock);
-            Field fdField = SlotLock.class.getDeclaredField("fd");
-            fdField.setAccessible(true);
-            int realFd = fdField.getInt(slotLock);
-            assertTrue("precondition: live flock fd", realFd >= 0);
 
             // This test owns the explicit close() retry. Prevent the shared
             // asynchronous retry driver from racing it and from surviving into
@@ -210,40 +203,39 @@ public class EngineClosePublishAfterFlockReleaseTest {
                 throw new IllegalStateException("retry driver disabled for explicit close retry test");
             });
             try {
-                // A non-negative fd no process has open: close(2) fails EBADF,
-                // so finishClose's release() confirmation fails.
-                fdField.setInt(slotLock, 1_000_000_000);
-                engine.close();
-                assertFalse(
-                        "closeCompleted was published despite an unconfirmed flock release; "
-                                + "a pool observing this would free the slot index while the "
-                                + "flock fd is still open",
-                        engine.isCloseCompleted());
-                // The REAL flock is still held — the incomplete report is true.
-                try {
-                    SlotLock probe = SlotLock.acquire(sfDir);
-                    probe.close();
-                    fail("slot must not be acquirable while the original flock fd is still open");
-                } catch (IllegalStateException expected) {
-                    // good — incomplete close really means "still locked".
-                }
+                try (SlotLock.ReleaseFailureForTesting releaseFailure =
+                             slotLock.injectReleaseFailureForTesting()) {
+                    engine.close();
+                    assertFalse(
+                            "closeCompleted was published despite an unconfirmed flock release; "
+                                    + "a pool observing this would free the slot index while the "
+                                    + "flock fd is still open",
+                            engine.isCloseCompleted());
+                    // The REAL flock is still held — the incomplete report is true.
+                    try {
+                        SlotLock probe = SlotLock.acquire(sfDir);
+                        probe.close();
+                        fail("slot must not be acquirable while the original flock fd is still open");
+                    } catch (IllegalStateException expected) {
+                        // good — incomplete close really means "still locked".
+                    }
 
-                // Remove the injected fault. The retry must only re-attempt
-                // the retained fd release: ring/watermark cleanup stays
-                // exactly-once, while completion and slot reusability recover.
-                fdField.setInt(slotLock, realFd);
-                engine.close();
-                assertTrue("retried close() must complete after the flock release succeeds",
-                        engine.isCloseCompleted());
-                try (SlotLock ignored = SlotLock.acquire(sfDir)) {
-                    // good — eventual completion implies reusable capacity.
+                    // Remove the injected fault. The retry must only re-attempt
+                    // the retained fd release: ring/watermark cleanup stays
+                    // exactly-once, while completion and slot reusability recover.
+                    releaseFailure.close();
+                    engine.close();
+                    assertTrue("retried close() must complete after the flock release succeeds",
+                            engine.isCloseCompleted());
+                    try (SlotLock ignored = SlotLock.acquire(sfDir)) {
+                        // good — eventual completion implies reusable capacity.
+                    }
                 }
             } finally {
                 try {
-                    // If an assertion failed before the successful retry, restore
-                    // and release the real fd so the test never leaks a flock.
+                    // The guard has restored the real fd on every exit. Release
+                    // it if an assertion failed before the successful retry.
                     if (!engine.isCloseCompleted()) {
-                        fdField.setInt(slotLock, realFd);
                         assertTrue("restored fd must release cleanly", slotLock.release());
                     }
                 } finally {

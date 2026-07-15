@@ -584,6 +584,31 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
+    public SegmentRing getInServiceRingForTesting() {
+        RingEntry entry = inService;
+        return entry == null ? null : entry.ring;
+    }
+
+    @TestOnly
+    public long getTotalBytesForTesting() {
+        synchronized (lock) {
+            return totalBytes;
+        }
+    }
+
+    @TestOnly
+    public Thread getWorkerThreadForTesting() {
+        return workerThread;
+    }
+
+    @TestOnly
+    public boolean isPathScratchAllocatedForTesting() {
+        synchronized (lock) {
+            return !scratchFreed;
+        }
+    }
+
+    @TestOnly
     public void setAfterRingCleanupHook(Runnable hook) {
         this.afterRingCleanupHook = hook;
     }

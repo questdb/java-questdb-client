@@ -30,6 +30,7 @@ import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,6 +103,7 @@ public final class AckWatermark implements QuietCloseable {
     private boolean closed;
     private long fsn;
     private long generation;
+    private boolean isStorageReleased;
 
     private AckWatermark(FilesFacade filesFacade, int fd, long mmapAddress,
                          long generation, long fsn) {
@@ -116,12 +118,7 @@ public final class AckWatermark implements QuietCloseable {
     public void close() {
         if (closed) return;
         closed = true;
-        if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
-            Files.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
-        }
-        if (fd >= 0) {
-            filesFacade.close(fd);
-        }
+        releaseStorage();
     }
 
     /**
@@ -169,6 +166,16 @@ public final class AckWatermark implements QuietCloseable {
         return selected == null
                 ? new AckWatermark(filesFacade, fd, addr, 0L, INVALID)
                 : new AckWatermark(filesFacade, fd, addr, selected.generation, selected.fsn);
+    }
+
+    /**
+     * Releases the native storage while deliberately leaving the logical
+     * closed flag clear. Test-only: recreates a stale racing writer without
+     * reflective access to descriptor and mapping internals.
+     */
+    @TestOnly
+    public boolean releaseStorageButKeepWritableForTesting() {
+        return releaseStorage();
     }
 
     /**
@@ -238,6 +245,20 @@ public final class AckWatermark implements QuietCloseable {
         Unsafe.getUnsafe().putInt(recordAddress + CRC_OFFSET, crc);
         generation = nextGeneration;
         this.fsn = fsn;
+    }
+
+    private boolean releaseStorage() {
+        if (isStorageReleased) {
+            return false;
+        }
+        isStorageReleased = true;
+        if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
+            Files.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
+        }
+        if (fd >= 0) {
+            filesFacade.close(fd);
+        }
+        return true;
     }
 
     private static Record readRecord(long address) {

@@ -347,6 +347,23 @@ public final class SenderPool implements AutoCloseable {
                 deferStartupRecovery, null, null, null, postFactoryHook, null, null, null);
     }
 
+    @TestOnly
+    public static SenderPool createWithRecoveryControlsForTesting(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            IntFunction<Sender> senderFactory,
+            ThreadFactory recoveryThreadFactory,
+            Runnable recoveryWaiter,
+            Runnable beforeFailedRecoveryJoinHook
+    ) {
+        return new SenderPool(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                Long.MAX_VALUE, Long.MAX_VALUE, senderFactory, false,
+                null, null, null, null, recoveryThreadFactory, recoveryWaiter,
+                beforeFailedRecoveryJoinHook);
+    }
+
     // Full constructor adding the user-supplied ingest callbacks (error
     // handler, connection listener and background-drainer listener), applied
     // to every Sender the pool builds (see buildManagedSlotSender). The public
@@ -1008,6 +1025,111 @@ public final class SenderPool implements AutoCloseable {
     }
 
     @TestOnly
+    public Sender buildRecoverySenderForTesting(int slotIndex) {
+        return defaultRecoverySender(slotIndex);
+    }
+
+    @TestOnly
+    public Sender buildSenderForTesting(int slotIndex) {
+        return defaultSender(slotIndex);
+    }
+
+    @TestOnly
+    public void discardBrokenForTesting(PooledSender sender) {
+        discardBroken(sender);
+    }
+
+    @TestOnly
+    public int getInFlightCreationsForTesting() {
+        lock.lock();
+        try {
+            return inFlightCreations;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public int getRetiredSlotCountForTesting() {
+        lock.lock();
+        try {
+            return retiredSlots.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public long getRetiredSlotProbeCountForTesting() {
+        lock.lock();
+        try {
+            return retiredSlotProbeCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public Thread getStartupRecoveryThreadForTesting() {
+        return startupRecoveryThread;
+    }
+
+    @TestOnly
+    public boolean hasCreationWaiterForTesting() {
+        lock.lock();
+        try {
+            return lock.hasWaiters(creationFinished);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public boolean isCloseStartedForTesting() {
+        lock.lock();
+        try {
+            return closeStarted;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public boolean isClosedForTesting() {
+        return closed;
+    }
+
+    @TestOnly
+    public boolean isRecoveryCompleteForTesting() {
+        return recoveryComplete;
+    }
+
+    @TestOnly
+    public boolean isSlotInUseForTesting(int slotIndex) {
+        lock.lock();
+        try {
+            return slotInUse[slotIndex];
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public void markClosingForTesting() {
+        markClosing();
+    }
+
+    @TestOnly
+    public void runStartupRecoveryToCompletionForTesting() {
+        runStartupRecoveryToCompletion();
+    }
+
+    @TestOnly
+    public boolean runStartupRecoveryStepForTesting() {
+        return runStartupRecoveryStep();
+    }
+
+    @TestOnly
     public void setBeforeBorrowWaitHook(Runnable hook) {
         this.beforeBorrowWaitHook = hook;
     }
@@ -1206,7 +1328,17 @@ public final class SenderPool implements AutoCloseable {
     }
 
     @TestOnly
-    private void setStartupRecoveryJoinHooks(Runnable beforeJoinHook, Runnable afterJoinHook) {
+    public void setRetiredSlotProbeCountForTesting(long count) {
+        lock.lock();
+        try {
+            retiredSlotProbeCount = count;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @TestOnly
+    public void setStartupRecoveryJoinHooksForTesting(Runnable beforeJoinHook, Runnable afterJoinHook) {
         this.beforeStartupRecoveryJoinHook = beforeJoinHook;
         this.afterStartupRecoveryJoinHook = afterJoinHook;
     }

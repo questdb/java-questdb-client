@@ -1230,6 +1230,11 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     @TestOnly
+    public synchronized MmapSegment getHotSpareForTesting() {
+        return hotSpare;
+    }
+
+    @TestOnly
     public synchronized int getPendingTrimCount() {
         return pendingTrims.size();
     }

@@ -215,6 +215,16 @@ public final class QuestDBImpl implements QuestDB {
         closeQuietly(senderPool);
     }
 
+    @TestOnly
+    public QueryClientPool getQueryPoolForTesting() {
+        return queryPool;
+    }
+
+    @TestOnly
+    public SenderPool getSenderPoolForTesting() {
+        return senderPool;
+    }
+
     private static void closeQuietly(PoolHousekeeper housekeeper) {
         if (housekeeper == null) {
             return;
