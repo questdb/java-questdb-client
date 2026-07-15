@@ -97,6 +97,7 @@ public class DeltaDictCatchUpTest {
                 Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
                 Assert.assertEquals("alpha", conn2.get(0));
                 Assert.assertEquals("beta", conn2.get(1));
+                assertAckSequencesStartAtZero(handler.ackSequenceStarts());
             }
         });
     }
@@ -143,6 +144,7 @@ public class DeltaDictCatchUpTest {
                                 + "baseline (deltaStart >= 1); a reset baseline re-ships the whole "
                                 + "dictionary from deltaStart 0",
                         handler.conn2SawDeltaAboveBaseline);
+                assertAckSequencesStartAtZero(handler.ackSequenceStarts());
             }
         });
     }
@@ -204,6 +206,7 @@ public class DeltaDictCatchUpTest {
                 Assert.assertEquals("2nd connection dictionary size", 2, conn2.size());
                 Assert.assertEquals(nearCapSymbol, conn2.get(0));
                 Assert.assertEquals("beta", conn2.get(1));
+                assertAckSequencesStartAtZero(handler.ackSequenceStarts());
             }
         });
     }
@@ -251,6 +254,7 @@ public class DeltaDictCatchUpTest {
                     Assert.assertTrue("foreground sender must recover and drain after the cap is restored",
                             sender.awaitAckedFsn(targetFsn, 5_000));
                 }
+                assertAckSequencesStartAtZero(handler.ackSequenceStarts());
             }
         });
     }
@@ -307,8 +311,17 @@ public class DeltaDictCatchUpTest {
                 Assert.assertTrue("catch-up split into multiple frames (saw "
                                 + handler.zeroTableFramesOnConn2 + ")",
                         handler.zeroTableFramesOnConn2 >= 2);
+                assertAckSequencesStartAtZero(handler.ackSequenceStarts());
             }
         });
+    }
+
+    private static void assertAckSequencesStartAtZero(List<Long> ackSequenceStarts) {
+        Assert.assertFalse("the fixture must ACK at least one connection", ackSequenceStarts.isEmpty());
+        for (int i = 0; i < ackSequenceStarts.size(); i++) {
+            Assert.assertEquals("connection " + (i + 1) + " must begin ACK sequencing at zero",
+                    0L, ackSequenceStarts.get(i).longValue());
+        }
     }
 
     private static String symbolName(int i) {
@@ -371,9 +384,14 @@ public class DeltaDictCatchUpTest {
         // post-reconnect frame trips it.
         volatile boolean conn2SawDeltaAboveBaseline;
         volatile boolean sawZeroTableFrameOnConn2;
+        private final List<Long> ackSequenceStarts = new CopyOnWriteArrayList<>();
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
         private final AtomicLong nextSeq = new AtomicLong(0);
+
+        List<Long> ackSequenceStarts() {
+            return new ArrayList<>(ackSequenceStarts);
+        }
 
         synchronized List<String> dictFor(int connNumber) {
             return connNumber <= dictsByConn.size()
@@ -390,6 +408,7 @@ public class DeltaDictCatchUpTest {
                 currentClient = client;
                 connectionsAccepted.incrementAndGet();
                 dictsByConn.add(new ArrayList<>()); // fresh dictionary per connection
+                nextSeq.set(0);
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
@@ -414,7 +433,11 @@ public class DeltaDictCatchUpTest {
                 }
             }
             try {
-                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+                long ackSequence = nextSeq.getAndIncrement();
+                if (newConnection) {
+                    ackSequenceStarts.add(ackSequence);
+                }
+                client.sendBinary(buildAck(ackSequence));
                 // Drop the first connection right after ACKing its only frame,
                 // forcing the sender to reconnect onto a fresh dictionary.
                 if (connNumber == 1) {
@@ -474,9 +497,14 @@ public class DeltaDictCatchUpTest {
      */
     private static class CapShrinkHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger connectionsAccepted = new AtomicInteger();
+        private final List<Long> ackSequenceStarts = new CopyOnWriteArrayList<>();
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
         private volatile TestWebSocketServer server;
+
+        List<Long> ackSequenceStarts() {
+            return new ArrayList<>(ackSequenceStarts);
+        }
 
         void setServer(TestWebSocketServer server) {
             this.server = server;
@@ -484,13 +512,18 @@ public class DeltaDictCatchUpTest {
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            if (currentClient != client) {
+            boolean newConnection = currentClient != client;
+            if (newConnection) {
                 currentClient = client;
                 connectionsAccepted.incrementAndGet();
                 nextSeq.set(0);
             }
             try {
-                client.sendBinary(CatchUpHandler.buildAck(nextSeq.getAndIncrement()));
+                long ackSequence = nextSeq.getAndIncrement();
+                if (newConnection) {
+                    ackSequenceStarts.add(ackSequence);
+                }
+                client.sendBinary(CatchUpHandler.buildAck(ackSequence));
                 if (connectionsAccepted.get() == 1) {
                     // Connection 1 registered the big symbol. Shrink the cap so the
                     // reconnect's catch-up budget can't fit it, then drop to force
@@ -518,6 +551,7 @@ public class DeltaDictCatchUpTest {
         // Set once the server has closed connection 1 (see CatchUpHandler.conn1Closed).
         volatile boolean conn1Closed;
         volatile int zeroTableFramesOnConn2;
+        private final List<Long> ackSequenceStarts = new CopyOnWriteArrayList<>();
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private final int dropConn1AtDictSize;
         private final AtomicLong nextSeq = new AtomicLong(0);
@@ -526,6 +560,10 @@ public class DeltaDictCatchUpTest {
 
         SplitCatchUpHandler(int dropConn1AtDictSize) {
             this.dropConn1AtDictSize = dropConn1AtDictSize;
+        }
+
+        List<Long> ackSequenceStarts() {
+            return new ArrayList<>(ackSequenceStarts);
         }
 
         synchronized List<String> dictFor(int connNumber) {
@@ -543,6 +581,7 @@ public class DeltaDictCatchUpTest {
                 currentClient = client;
                 connectionsAccepted.incrementAndGet();
                 dictsByConn.add(new ArrayList<>()); // fresh dictionary per connection
+                nextSeq.set(0);
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
@@ -551,7 +590,11 @@ public class DeltaDictCatchUpTest {
                 zeroTableFramesOnConn2++;
             }
             try {
-                client.sendBinary(CatchUpHandler.buildAck(nextSeq.getAndIncrement()));
+                long ackSequence = nextSeq.getAndIncrement();
+                if (newConnection) {
+                    ackSequenceStarts.add(ackSequence);
+                }
+                client.sendBinary(CatchUpHandler.buildAck(ackSequence));
                 // Drop connection 1 only once it has learned the entire batch, so
                 // the sender's sent-dictionary mirror is complete and the reconnect
                 // catch-up must replay a dictionary larger than the batch cap.

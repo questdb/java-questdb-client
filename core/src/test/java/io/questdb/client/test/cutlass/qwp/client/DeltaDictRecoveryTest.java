@@ -789,8 +789,9 @@ public class DeltaDictRecoveryTest {
                 CursorSendEngine engine = new CursorSendEngine(
                         slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
-                try (Sender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine)) {
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                try {
                     ff.armed = true; // the next dictionary append short-writes
                     sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
                     try {
@@ -801,10 +802,38 @@ public class DeltaDictRecoveryTest {
                                         + "not leak a raw IllegalStateException: " + expected.getMessage(),
                                 expected.getMessage().contains("failed to persist symbol dictionary before publish"));
                     }
-                } catch (LineSenderException ignored) {
-                    // close() re-flushes the still-buffered row; the facade has disarmed, so
-                    // this normally succeeds. Either way it is not what we assert.
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered row; the facade has disarmed, so
+                        // this normally succeeds. Either way it is not what we assert.
+                    }
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testReconstructingFixtureResetsAckSequencePerConnection() throws Exception {
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                for (int i = 0; i < 2; i++) {
+                    try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                        sender.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        long fsn = sender.flushAndGetSequence();
+                        Assert.assertTrue("connection " + (i + 1) + " must receive ACK zero",
+                                sender.awaitAckedFsn(fsn, 5_000));
+                    }
+                }
+
+                Assert.assertEquals("each fresh connection must restart wire ACK sequencing",
+                        Arrays.asList(0L, 0L), handler.ackSequenceStarts());
             }
         });
     }
@@ -1385,9 +1414,14 @@ public class DeltaDictRecoveryTest {
      */
     private static class DictReconstructingHandler implements TestWebSocketServer.WebSocketServerHandler {
         volatile boolean sawCatchUpFrame;
+        private final List<Long> ackSequenceStarts = new ArrayList<>();
         private final List<String> dict = new ArrayList<>();
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
+
+        synchronized List<Long> ackSequenceStarts() {
+            return new ArrayList<>(ackSequenceStarts);
+        }
 
         synchronized List<String> dictSnapshot() {
             return new ArrayList<>(dict);
@@ -1399,16 +1433,22 @@ public class DeltaDictRecoveryTest {
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            if (currentClient != client) {
+            boolean newConnection = currentClient != client;
+            if (newConnection) {
                 currentClient = client;
                 dict.clear(); // fresh server dictionary per connection
+                nextSeq.set(0);
             }
             accumulate(data);
             if (tableCount(data) == 0 && hasDelta(data)) {
                 sawCatchUpFrame = true;
             }
             try {
-                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+                long ackSequence = nextSeq.getAndIncrement();
+                if (newConnection) {
+                    ackSequenceStarts.add(ackSequence);
+                }
+                client.sendBinary(buildAck(ackSequence));
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
