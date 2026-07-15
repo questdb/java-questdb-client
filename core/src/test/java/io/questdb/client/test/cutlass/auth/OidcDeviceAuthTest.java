@@ -1542,6 +1542,38 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testGetTokenSucceedsWhenCallingThreadIsInterrupted() throws Exception {
+        assertMemoryLeak(() -> {
+            // getToken()'s uncontended lock acquire must NOT fail merely because the calling thread carries a
+            // set interrupt flag. An ILP producer on a pooled/managed thread commonly does (interrupt is the
+            // standard cancellation signal), and the old timed tryLock threw InterruptedException even on a FREE
+            // lock and then re-armed the flag, so every getToken() on that thread failed with a valid token
+            // sitting in the cache. The untimed fast-path acquire fixes it.
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn()); // seed a valid cached token
+
+                Thread.currentThread().interrupt(); // the calling (producer) thread carries a pending interrupt
+                try {
+                    // uncontended lock, valid cached token: getToken() must return it, not throw on the interrupt
+                    Assert.assertEquals("ACCESS-1", auth.getToken());
+                    // and it must not silently swallow the caller's interrupt (the untimed acquire preserves it)
+                    Assert.assertTrue("getToken() must not clear the caller's interrupt flag",
+                            Thread.currentThread().isInterrupted());
+                } finally {
+                    Thread.interrupted(); // clear so the flag does not leak into later tests sharing this fork
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGetTokenWaitsBehindSilentRefreshInsteadOfFailing() throws Exception {
         assertMemoryLeak(() -> {
             // When another thread's SILENT REFRESH (not an interactive sign-in) holds the lock, a second
@@ -1964,6 +1996,34 @@ public class OidcDeviceAuthTest {
                 serverRef.set(server);
                 try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
                     Assert.fail("expected the encoded ..-traversal device endpoint to be rejected");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("not under the pinned issuer"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testIssuerPathScopingRejectsMatrixParamTraversal() throws Exception {
+        assertMemoryLeak(() -> {
+            // the device endpoint hides a parent traversal as an RFC 3986 ";matrix" segment (..;): a server or
+            // proxy that strips matrix params resolves /realms/acme/..;/evil to /realms/evil, a DIFFERENT realm.
+            // The plain "." / ".." dot-segment check does not match "..;", so the check must strip the ";suffix"
+            // first and reject it - the origin pin alone cannot stop a sibling-tenant redirect on one host.
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                return MockOidcServer.json(200, "{\"config\":{"
+                        + "\"acl.oidc.enabled\":true,"
+                        + "\"acl.oidc.client.id\":\"questdb\","
+                        + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/acme/token") + "\","
+                        + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl("/realms/acme/..;/evil/device") + "\""
+                        + "}}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(server.httpUrl("/realms/acme")))) {
+                    Assert.fail("expected the ..;-matrix-param traversal device endpoint to be rejected");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("not under the pinned issuer"));
                 }

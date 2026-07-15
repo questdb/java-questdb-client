@@ -797,7 +797,16 @@ public class OidcDeviceAuth implements QuietCloseable {
         // a "." or ".." segment is rejected outright: the server normalizes it away, so a naive prefix test
         // would pass /realms/acme/../evil/token yet it resolves to a different realm
         for (int i = 0; i < endpointSegs.length; i++) {
-            if (".".equals(endpointSegs[i]) || "..".equals(endpointSegs[i])) {
+            // strip an RFC 3986 ";matrix" parameter suffix before the dot-segment test: a server or proxy that
+            // drops matrix params resolves "..;" (or "..;x") to "..", so /realms/acme/..;/evil/token would
+            // otherwise slip the issuer-path pin to a sibling realm. decodePathSegments already percent-decoded,
+            // so a "%3b"-encoded ";" is a literal ";" here too.
+            String seg = endpointSegs[i];
+            int semi = seg.indexOf(';');
+            if (semi >= 0) {
+                seg = seg.substring(0, semi);
+            }
+            if (".".equals(seg) || "..".equals(seg)) {
                 return false;
             }
         }
@@ -1036,15 +1045,25 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void acquireForGetToken() {
-        // Never wait behind an interactive signIn(): it holds the lock for the whole device-code lifetime
-        // (up to 30 min) with no token to serve until it completes, so fail fast and let the caller retry. A
-        // peer holding the lock for a quick cached read or a silent refresh (bounded, usually well under a
-        // second) is different - the HttpTokenProvider contract permits a brief wait behind such a refresh - so
-        // poll for the lock in short slices rather than fail every concurrent caller sharing this instance on
-        // each token refresh (the old unconditional tryLock() did exactly that). Polling, not one blocking
-        // acquire, lets us still fail fast the moment an interactive sign-in - or close() - begins while we
-        // wait. Bound the total wait by httpTimeoutMillis so a stuck or pathologically slow holder degrades to
-        // a retryable failure instead of stalling the flush path without bound.
+        throwIfClosed();
+        // Uncontended fast path: a plain CAS. It deliberately bypasses the interruptible timed tryLock in the
+        // loop below, which throws InterruptedException the moment the calling thread merely carries a set
+        // interrupt flag - even on a FREE lock - and then re-arms that flag, so every later getToken() on the
+        // same thread would fail with a valid token sitting in the cache. An ILP producer on a pooled or
+        // managed thread, where interrupt is the standard cancellation signal, is the common case. An
+        // uncontended acquire cannot be behind an interactive sign-in (which holds the lock), so it is correct.
+        if (lock.tryLock()) {
+            return;
+        }
+        // Contended - a peer holds the lock. Never wait behind an interactive signIn(): it holds the lock for
+        // the whole device-code lifetime (up to 30 min) with no token to serve until it completes, so fail fast
+        // and let the caller retry. A peer holding the lock for a quick cached read or a silent refresh
+        // (bounded, usually well under a second) is different - the HttpTokenProvider contract permits a brief
+        // wait behind such a refresh - so poll for the lock in short slices rather than fail every concurrent
+        // caller sharing this instance on each token refresh (the old unconditional tryLock() did exactly that).
+        // Polling, not one blocking acquire, lets us still fail fast the moment an interactive sign-in - or
+        // close() - begins while we wait. Bound the total wait by httpTimeoutMillis so a stuck or pathologically
+        // slow holder degrades to a retryable failure instead of stalling the flush path without bound.
         final long deadline = System.currentTimeMillis() + httpTimeoutMillis;
         while (true) {
             throwIfClosed();

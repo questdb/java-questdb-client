@@ -133,10 +133,10 @@ public class LineHttpSenderTokenProviderTest {
     @Test(timeout = 30_000)
     public void testChangedProviderTokenIsRevalidated() throws Exception {
         assertMemoryLeak(() -> {
-            // the per-flush token validation is skipped only for the SAME instance already validated, so a
-            // token that CHANGES to a bad one must still be re-validated and rejected - the identity guard must
-            // not cache a previously-valid result past a token change. First flush a valid token, then return a
-            // CR/LF token and require the next flush to reject it rather than splice it onto the wire.
+            // every pulled token is validated per flush, so a token that CHANGES to a bad one must be rejected.
+            // First flush a valid token, then return a distinct CR/LF token and require the next flush to reject
+            // it rather than splice it onto the wire. (The same-instance-mutated case - a reused buffer whose
+            // content changes - is covered by testMutatedSameInstanceProviderTokenIsRevalidated.)
             AtomicInteger calls = new AtomicInteger();
             try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
                 HttpTokenProvider provider = () -> calls.incrementAndGet() == 1
@@ -207,6 +207,44 @@ public class LineHttpSenderTokenProviderTest {
                 Assert.assertEquals("the failed send plus its retry must be two requests", 2, auth.size());
                 Assert.assertEquals("the first send carries the pulled token", "Bearer TOKEN-1", auth.get(0));
                 Assert.assertEquals("the retry must re-send the same baked token", "Bearer TOKEN-1", auth.get(1));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testMutatedSameInstanceProviderTokenIsRevalidated() throws Exception {
+        assertMemoryLeak(() -> {
+            // A provider may reuse one CharSequence buffer (the idiomatic zero-alloc style) and return the SAME
+            // instance every call. HttpTokenProvider.getToken() makes no immutability promise, so the sender
+            // must re-validate EVERY pulled token, not trust instance identity: a token mutated in place to
+            // carry a CR/LF between flushes must be rejected, not spliced verbatim into the "Authorization:
+            // Bearer" header (authToken writes it with no CR/LF filtering). This pins the fix that dropped the
+            // identity-cache skip; before it, the second flush injected a header past the auth line.
+            StringBuilder token = new StringBuilder("GOODTOKEN"); // one instance, mutated in place below
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(() -> token) // always the SAME instance
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush(); // first flush: GOODTOKEN validated and sent
+                    // mutate the SAME instance to inject a CR/LF header break
+                    token.setLength(0);
+                    token.append("abc").append((char) 0x0d).append((char) 0x0a).append("X-Injected: pwned");
+                    try {
+                        sender.table("t").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        Assert.fail("a mutated same-instance token carrying CR/LF must be re-validated and rejected");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("control or non-ASCII character"));
+                    }
+                }
+                // only the first (valid) flush reached the wire; the injected token was rejected before any send
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals("only the valid first flush must reach the server", 1, auth.size());
+                Assert.assertEquals("Bearer GOODTOKEN", auth.get(0));
             }
         });
     }

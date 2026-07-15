@@ -94,9 +94,6 @@ public abstract class AbstractLineHttpSender implements Sender {
     private boolean isTokenPending;
     private JsonErrorParser jsonErrorParser;
     private boolean lastFlushFailed;
-    // the last provider token instance validated in stampTokenIfPending(); lets an unchanged multi-KB token
-    // skip re-validation (a full scan) on every flush. Identity only, never dereferenced for content.
-    private CharSequence lastValidatedToken;
     private long pendingRows;
     private int rowBookmark;
     private RequestState state = RequestState.EMPTY;
@@ -835,19 +832,14 @@ public abstract class AbstractLineHttpSender implements Sender {
             // The throwing operations run BEFORE the request is mutated: a getToken()/validateToken() throw
             // (not signed in yet, a failed refresh, or a rejected token) leaves isTokenPending set and the
             // request untouched at the header stage, so the next row retries cleanly - the sender is never left
-            // corrupted. validateToken (which scans the whole token) is skipped when the provider returned the
-            // same instance already validated: an unchanged multi-KB id token is otherwise re-scanned every
-            // flush. A provider returning the same instance must not mutate its content (HttpTokenProvider
-            // contract), so the skip cannot let a changed token bypass validation.
+            // corrupted. Validate EVERY pulled token, not just a changed instance: HttpTokenProvider.getToken()
+            // makes no immutability promise, so a provider that reuses one CharSequence buffer (the idiomatic
+            // zero-alloc style) and mutates its content between flushes must be re-checked, or a mutated token
+            // could splice a CR/LF into the "Authorization: Bearer" header (request.authToken writes it verbatim,
+            // with no CR/LF filtering). The scan is O(token length) and is dwarfed by the flush's network
+            // round-trip; the WebSocket auth path validates on every pull for the same reason.
             CharSequence token = httpTokenProvider.getToken();
-            // always validate a null token (it must be rejected, and null is the initial lastValidatedToken
-            // value); otherwise skip re-validation only for the exact same instance already validated.
-            // lastValidatedToken is assigned only after a successful validation, so it never holds a rejected
-            // (null/blank/bad-char) token - a re-returned bad token is therefore re-validated and re-rejected.
-            if (token == null || token != lastValidatedToken) {
-                HttpTokenProvider.validateToken(token);
-                lastValidatedToken = token;
-            }
+            HttpTokenProvider.validateToken(token);
             request.authToken(token);
             request.withContent();
             rowBookmark = request.getContentLength();
