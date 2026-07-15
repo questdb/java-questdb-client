@@ -31,9 +31,6 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -329,19 +326,6 @@ public class DeltaDictCatchUpTest {
         return "symbol" + (1000 + i);
     }
 
-    private static int readVarint(byte[] buf, int[] pos) {
-        int result = 0;
-        int shift = 0;
-        while (pos[0] < buf.length) {
-            int b = buf[pos[0]++] & 0xFF;
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-            if (shift > 28) throw new IllegalStateException("varint too long");
-        }
-        throw new IllegalStateException("varint truncated");
-    }
-
     private static void waitFor(BoolCondition cond, long timeoutMillis) {
         long deadline = System.currentTimeMillis() + timeoutMillis;
         while (System.currentTimeMillis() < deadline) {
@@ -412,9 +396,9 @@ public class DeltaDictCatchUpTest {
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
-            accumulate(data, dict);
+            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
             if (connNumber == 2) {
-                if (tableCount(data) == 0) {
+                if (QwpWireTestUtils.tableCount(data) == 0) {
                     sawZeroTableFrameOnConn2 = true;
                     // FLAG_DEFER_COMMIT is bit 0x01 of the flags byte (offset 5).
                     catchUpDeferredOnConn2 = (data[5] & 0x01) != 0;
@@ -427,7 +411,7 @@ public class DeltaDictCatchUpTest {
                     // frame arriving ahead of the new one -- that replay carries its
                     // original deltaStart 0 and does not trip the flag.
                     int[] pos = {12};
-                    if (readVarint(data, pos) >= 1) {
+                    if (QwpWireTestUtils.readVarint(data, pos) >= 1) {
                         conn2SawDeltaAboveBaseline = true;
                     }
                 }
@@ -437,7 +421,7 @@ public class DeltaDictCatchUpTest {
                 if (newConnection) {
                     ackSequenceStarts.add(ackSequence);
                 }
-                client.sendBinary(buildAck(ackSequence));
+                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence));
                 // Drop the first connection right after ACKing its only frame,
                 // forcing the sender to reconnect onto a fresh dictionary.
                 if (connNumber == 1) {
@@ -451,41 +435,6 @@ public class DeltaDictCatchUpTest {
             }
         }
 
-        private static void accumulate(byte[] frame, List<String> dict) {
-            final byte FLAG_DELTA_SYMBOL_DICT = 0x08;
-            if (frame.length < 12 || (frame[5] & FLAG_DELTA_SYMBOL_DICT) == 0) {
-                return;
-            }
-            int[] pos = {12}; // just past the 12-byte QWP header
-            int deltaStart = readVarint(frame, pos);
-            int deltaCount = readVarint(frame, pos);
-            while (dict.size() < deltaStart) {
-                dict.add(null); // null-pad, mirroring the server
-            }
-            for (int i = 0; i < deltaCount; i++) {
-                int len = readVarint(frame, pos);
-                String symbol = new String(frame, pos[0], len, StandardCharsets.UTF_8);
-                pos[0] += len;
-                int idx = deltaStart + i;
-                while (dict.size() <= idx) {
-                    dict.add(null);
-                }
-                dict.set(idx, symbol);
-            }
-        }
-
-        private static byte[] buildAck(long seq) {
-            byte[] buf = new byte[1 + 8 + 2];
-            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
-            bb.put((byte) 0x00);
-            bb.putLong(seq);
-            bb.putShort((short) 0);
-            return buf;
-        }
-
-        private static int tableCount(byte[] frame) {
-            return (frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8);
-        }
     }
 
     /**
@@ -523,7 +472,7 @@ public class DeltaDictCatchUpTest {
                 if (newConnection) {
                     ackSequenceStarts.add(ackSequence);
                 }
-                client.sendBinary(CatchUpHandler.buildAck(ackSequence));
+                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence));
                 if (connectionsAccepted.get() == 1) {
                     // Connection 1 registered the big symbol. Shrink the cap so the
                     // reconnect's catch-up budget can't fit it, then drop to force
@@ -585,8 +534,8 @@ public class DeltaDictCatchUpTest {
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
-            CatchUpHandler.accumulate(data, dict);
-            if (connNumber == 2 && CatchUpHandler.tableCount(data) == 0) {
+            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            if (connNumber == 2 && QwpWireTestUtils.tableCount(data) == 0) {
                 zeroTableFramesOnConn2++;
             }
             try {
@@ -594,7 +543,7 @@ public class DeltaDictCatchUpTest {
                 if (newConnection) {
                     ackSequenceStarts.add(ackSequence);
                 }
-                client.sendBinary(CatchUpHandler.buildAck(ackSequence));
+                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence));
                 // Drop connection 1 only once it has learned the entire batch, so
                 // the sender's sent-dictionary mirror is complete and the reconnect
                 // catch-up must replay a dictionary larger than the batch cap.

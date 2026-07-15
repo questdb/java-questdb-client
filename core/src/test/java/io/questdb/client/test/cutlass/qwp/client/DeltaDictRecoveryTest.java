@@ -41,10 +41,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -1099,7 +1097,8 @@ public class DeltaDictRecoveryTest {
             }
             Assert.assertEquals("two colliding symbols must persist as two entries", 2, persistedSize);
 
-            // Phase 2: recover. The seeded producer id space must match pd.size().
+            // Phase 2: recover, then introduce a third symbol. The wire must extend
+            // the two recovered ids at id 2 rather than overwrite id 1.
             DictReconstructingHandler handler = new DictReconstructingHandler();
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
@@ -1107,12 +1106,16 @@ public class DeltaDictRecoveryTest {
                 Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
                 String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
                 try (Sender s2 = Sender.fromConfig(cfg)) {
-                    Assert.assertEquals("recovered producer dictionary must match the persisted "
-                                    + "entry count (not de-duped), else the delta baseline desyncs from the mirror",
-                            persistedSize, globalDictSize(s2));
-                    Assert.assertEquals("delta baseline must resume at the persisted tip",
-                            persistedSize - 1, intField(s2, "sentMaxSymbolId"));
+                    s2.table("m").symbol("s", "tail").longColumn("v", 3L).atNow();
+                    long fsn = s2.flushAndGetSequence();
+                    Assert.assertTrue("the post-recovery frame must be acknowledged",
+                            s2.awaitAckedFsn(fsn, 5_000));
                 }
+                Assert.assertEquals("the new symbol delta must continue after both recovered entries",
+                        persistedSize, handler.lastDataDeltaStart());
+                Assert.assertEquals("the reconstructed dictionary must retain both colliding entries "
+                                + "and append the new symbol at id 2",
+                        Arrays.asList("?", "?", "tail"), handler.dictSnapshot());
             }
         });
     }
@@ -1369,19 +1372,6 @@ public class DeltaDictRecoveryTest {
         });
     }
 
-    private static int globalDictSize(Sender sender) throws Exception {
-        Field f = sender.getClass().getDeclaredField("globalSymbolDictionary");
-        f.setAccessible(true);
-        Object dict = f.get(sender);
-        return (int) dict.getClass().getMethod("size").invoke(dict);
-    }
-
-    private static int intField(Sender sender, String name) throws Exception {
-        Field f = sender.getClass().getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getInt(sender);
-    }
-
     private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {
         byte[] buf = new byte[16];
         ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
@@ -1389,23 +1379,6 @@ public class DeltaDictRecoveryTest {
         bb.putInt(0);          // reserved
         bb.putLong(fsn);
         java.nio.file.Files.write(path, buf);
-    }
-
-    private static int readVarint(byte[] buf, int[] pos) {
-        int result = 0;
-        int shift = 0;
-        while (pos[0] < buf.length) {
-            int b = buf[pos[0]++] & 0xFF;
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) {
-                return result;
-            }
-            shift += 7;
-            if (shift > 28) {
-                throw new IllegalStateException("varint too long");
-            }
-        }
-        throw new IllegalStateException("varint truncated");
     }
 
     /**
@@ -1418,6 +1391,7 @@ public class DeltaDictRecoveryTest {
         private final List<String> dict = new ArrayList<>();
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
+        private volatile int lastDataDeltaStart = -1;
 
         synchronized List<Long> ackSequenceStarts() {
             return new ArrayList<>(ackSequenceStarts);
@@ -1431,6 +1405,10 @@ public class DeltaDictRecoveryTest {
             return dict.size();
         }
 
+        int lastDataDeltaStart() {
+            return lastDataDeltaStart;
+        }
+
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             boolean newConnection = currentClient != client;
@@ -1439,57 +1417,21 @@ public class DeltaDictRecoveryTest {
                 dict.clear(); // fresh server dictionary per connection
                 nextSeq.set(0);
             }
-            accumulate(data);
-            if (tableCount(data) == 0 && hasDelta(data)) {
+            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            int tableCount = QwpWireTestUtils.tableCount(data);
+            if (tableCount == 0 && QwpWireTestUtils.hasDelta(data)) {
                 sawCatchUpFrame = true;
+            } else if (tableCount > 0 && QwpWireTestUtils.hasDelta(data)) {
+                lastDataDeltaStart = QwpWireTestUtils.readVarint(data, new int[]{12});
             }
             try {
                 long ackSequence = nextSeq.getAndIncrement();
                 if (newConnection) {
                     ackSequenceStarts.add(ackSequence);
                 }
-                client.sendBinary(buildAck(ackSequence));
+                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence));
             } catch (IOException e) {
                 throw new RuntimeException(e);
-            }
-        }
-
-        private static byte[] buildAck(long seq) {
-            byte[] buf = new byte[1 + 8 + 2];
-            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
-            bb.put((byte) 0x00);
-            bb.putLong(seq);
-            bb.putShort((short) 0);
-            return buf;
-        }
-
-        private static boolean hasDelta(byte[] frame) {
-            return frame.length >= 12 && (frame[5] & 0x08) != 0;
-        }
-
-        private static int tableCount(byte[] frame) {
-            return (frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8);
-        }
-
-        private void accumulate(byte[] frame) {
-            if (!hasDelta(frame)) {
-                return;
-            }
-            int[] pos = {12};
-            int deltaStart = readVarint(frame, pos);
-            int deltaCount = readVarint(frame, pos);
-            while (dict.size() < deltaStart) {
-                dict.add(null);
-            }
-            for (int i = 0; i < deltaCount; i++) {
-                int len = readVarint(frame, pos);
-                String sym = new String(frame, pos[0], len, StandardCharsets.UTF_8);
-                pos[0] += len;
-                int idx = deltaStart + i;
-                while (dict.size() <= idx) {
-                    dict.add(null);
-                }
-                dict.set(idx, sym);
             }
         }
     }
@@ -1510,19 +1452,10 @@ public class DeltaDictRecoveryTest {
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             frames.incrementAndGet();
             try {
-                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
-        }
-
-        private static byte[] buildAck(long seq) {
-            byte[] buf = new byte[1 + 8 + 2];
-            ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
-            bb.put((byte) 0x00);
-            bb.putLong(seq);
-            bb.putShort((short) 0);
-            return buf;
         }
     }
     /**
