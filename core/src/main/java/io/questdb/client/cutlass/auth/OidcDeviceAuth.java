@@ -45,6 +45,9 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.str.DirectUtf8Sequence;
 import io.questdb.client.std.str.StringSink;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.util.Locale;
@@ -145,6 +148,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     // connect instead). build() requires the FileTokenStore staleness window to exceed this multiple as a floor;
     // the default window adds ample headroom for a typical connection stall on top of it (see build())
     private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 4;
+    private static final Logger LOG = LoggerFactory.getLogger(OidcDeviceAuth.class);
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
     private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
@@ -436,8 +440,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * {@link OidcAuthException} instead of polling until the device code expires. The signal is observed
      * between polls (within ~100ms while waiting out a poll interval); a poll request already in flight
      * is not interrupted, so {@code close()} acquires the lock - and returns - only once that request
-     * finishes or times out, i.e. after at most one HTTP request timeout
-     * (see {@link Builder#httpTimeoutMillis(int)}), not the full device-code lifetime. The exception is a
+     * finishes or times out, not the full device-code lifetime. That bound is the in-flight operation's own
+     * worst case, which is NOT a single HTTP request timeout: a silent refresh under the lock runs a send, an
+     * await and a body parse (each bounded by {@link Builder#httpTimeoutMillis(int)}), and its connection phase -
+     * DNS, TCP connect, TLS handshake - is bounded by the OS, not by that timeout, so a black-holed token
+     * endpoint can hold the lock, and this {@code close()}, for the OS connect timeout (commonly ~2 minutes on
+     * Linux) rather than a single httpTimeoutMillis. The exception is a
      * {@link DeviceCodePrompt} that blocks in {@code promptUser} - for example the default
      * {@link DeviceCodePrompt#openBrowser()} prompt while it hands the verification URL to the OS browser,
      * which is not bounded by the HTTP timeout: the flow holds the lock across that one-off prompt, so a
@@ -509,13 +517,17 @@ public class OidcDeviceAuth implements QuietCloseable {
             throwIfClosed();
             maybeLoadFromStore();
             final String cachedToken = groupsInToken ? idToken : accessToken;
+            if (cachedToken != null && System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
+                return cachedToken;
+            }
+            // The served-kind token is absent or expired. Try a silent refresh whenever a refresh token is
+            // available - including the case where a prior grant returned only the OTHER kind, leaving the served
+            // kind null: a refresh may yield the served kind and avoid forcing an interactive sign-in. selectToken()
+            // reports a clear error if the refresh still did not produce the kind the server expects.
+            if (refreshToken != null && tryRefreshCoordinated()) {
+                return selectToken();
+            }
             if (cachedToken != null) {
-                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
-                    return cachedToken;
-                }
-                if (refreshToken != null && tryRefreshCoordinated()) {
-                    return selectToken();
-                }
                 throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call signIn() to sign in again");
             }
             throw new OidcAuthException("no token has been obtained yet; call signIn() to sign in before using getToken()");
@@ -1062,9 +1074,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         // wait behind such a refresh - so poll for the lock in short slices rather than fail every concurrent
         // caller sharing this instance on each token refresh (the old unconditional tryLock() did exactly that).
         // Polling, not one blocking acquire, lets us still fail fast the moment an interactive sign-in - or
-        // close() - begins while we wait. Bound the total wait by httpTimeoutMillis so a stuck or pathologically
-        // slow holder degrades to a retryable failure instead of stalling the flush path without bound.
-        final long deadline = System.currentTimeMillis() + httpTimeoutMillis;
+        // close() - begins while we wait. Bound the total wait so a stuck or pathologically slow holder degrades
+        // to a retryable failure instead of stalling the flush path without bound - but size the bound to the
+        // holder's OWN worst-case hold, not a single httpTimeoutMillis. A legitimate silent refresh under the
+        // lock runs a send, an await and a body parse, each bounded by httpTimeoutMillis
+        // (LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x in total, the same figure the FileTokenStore lock-stale floor is
+        // derived from), so a peer that waited only one httpTimeoutMillis would fail every concurrent caller
+        // behind a refresh that is going to succeed.
+        final long deadline = System.currentTimeMillis()
+                + (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
         while (true) {
             throwIfClosed();
             if (interactiveSignInInProgress) {
@@ -1625,8 +1643,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         // could itself hold terminal-spoofing characters - sanitize the detail before printing, as every other
         // untrusted display string is sanitized (sanitizeForDisplay is null-safe).
         String detail = sanitizeForDisplay(cause.getMessage());
-        System.err.println("questdb client: OIDC token store " + operation
-                + " failed; continuing without persistence" + (detail != null ? " [" + detail + ']' : ""));
+        LOG.warn("OIDC token store {} failed; continuing without persistence{}",
+                operation, detail != null ? " [" + detail + ']' : "");
     }
 
     /**

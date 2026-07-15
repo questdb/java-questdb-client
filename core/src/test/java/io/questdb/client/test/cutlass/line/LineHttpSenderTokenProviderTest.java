@@ -27,6 +27,8 @@ package io.questdb.client.test.cutlass.line;
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
+import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -283,6 +285,31 @@ public class LineHttpSenderTokenProviderTest {
                 // a second row in the same un-flushed batch reuses the same request, so it does not re-pull
                 sender.table("t").longColumn("v", 2L).atNow();
                 Assert.assertEquals("provider must not be re-queried within the same batch", 1, calls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testPutRawMessageStampsPendingToken() throws Exception {
+        assertMemoryLeak(() -> {
+            // putRawMessage() sends a pre-formatted ILP line as the first row; it must stamp the deferred provider
+            // token first, or the raw message would ship with no Authorization header. F7: covers the
+            // stampTokenIfPending() call that putRawMessage() gained.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                AtomicInteger calls = new AtomicInteger();
+                HttpTokenProvider provider = () -> "TOKEN-" + calls.incrementAndGet();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    ((AbstractLineHttpSender) sender).putRawMessage(new Utf8String("t v=1i\n"));
+                    sender.flush();
+                }
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals("the raw-message flush must reach the server", 1, auth.size());
+                Assert.assertEquals("putRawMessage must carry the provider token", "Bearer TOKEN-1", auth.get(0));
             }
         });
     }

@@ -306,7 +306,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                         } else {
                             lastErrorSink.clear();
                         }
-                        chunkedResponseToSink(response, lastErrorSink);
+                        // the construct-time probe retries on any read abort (caught below), so its own
+                        // configured request timeout is the right bound here
+                        chunkedResponseToSink(response, lastErrorSink, clientConfiguration.getTimeout());
                     } catch (HttpClientException e) {
                         if (lastErrorSink == null) {
                             lastErrorSink = new StringSink();
@@ -595,13 +597,13 @@ public abstract class AbstractLineHttpSender implements Sender {
         return Math.min(retryMaxBackoffMs, backoff * RETRY_BACKOFF_MULTIPLIER);
     }
 
-    private static void chunkedResponseToSink(HttpClient.ResponseHeaders response, StringSink sink) {
+    private static void chunkedResponseToSink(HttpClient.ResponseHeaders response, StringSink sink, int timeoutMillis) {
         if (!response.isChunked()) {
             return;
         }
         Response chunkedRsp = response.getResponse();
         Fragment fragment;
-        while ((fragment = chunkedRsp.recv()) != null) {
+        while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
             sink.putNonAscii(fragment.lo(), fragment.hi());
         }
     }
@@ -642,13 +644,13 @@ public abstract class AbstractLineHttpSender implements Sender {
         return HttpKeywords.isClose(connectionHeader);
     }
 
-    private void consumeChunkedResponse(HttpClient.ResponseHeaders response) {
+    private void consumeChunkedResponse(HttpClient.ResponseHeaders response, int timeoutMillis) {
         if (!response.isChunked()) {
             return;
         }
         Response chunkedRsp = response.getResponse();
         //noinspection StatementWithEmptyBody
-        while ((chunkedRsp.recv()) != null) {
+        while ((chunkedRsp.recv(timeoutMillis)) != null) {
             // we don't care about the response, just consume it, so it won't stay in the socket receive buffer
         }
     }
@@ -713,7 +715,10 @@ public abstract class AbstractLineHttpSender implements Sender {
                 response.await(remainingMillis);
                 DirectUtf8Sequence statusCode = response.getStatusCode();
                 if (isSuccessResponse(statusCode)) {
-                    consumeChunkedResponse(response); // if any
+                    // bound the body drain by the whole per-flush budget (base + throughput extension), NOT the
+                    // raw request_timeout: recv() otherwise inherits defaultTimeout, so a tuned-low request_timeout
+                    // paired with request_min_throughput would abort a large, still-progressing chunked body
+                    consumeChunkedResponse(response, actualTimeoutMillis); // if any
                     if (keepAliveDisabled(response)) {
                         // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
                         client.disconnect();
@@ -734,13 +739,13 @@ public abstract class AbstractLineHttpSender implements Sender {
                             : retryingDeadlineNanos;
                     if (nowNanos >= retryingDeadlineNanos) {
                         // throw, but do not reset - a caller can try to flush later
-                        throwOnHttpErrorResponse(statusCode, response, true);
+                        throwOnHttpErrorResponse(statusCode, response, true, actualTimeoutMillis);
                     }
                     client.disconnect(); // forces reconnect, just in case
                     retryBackoff = backoff(rnd, retryBackoff, maxBackoffMillis);
                     continue;
                 }
-                throwOnHttpErrorResponse(statusCode, response, false);
+                throwOnHttpErrorResponse(statusCode, response, false, actualTimeoutMillis);
             } catch (HttpClientException e) {
                 // this is a network error, we can retry
                 lastFlushFailed = true;
@@ -848,16 +853,16 @@ public abstract class AbstractLineHttpSender implements Sender {
         }
     }
 
-    private void throwOnHttpErrorResponse(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable) {
+    private void throwOnHttpErrorResponse(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable, int timeoutMillis) {
         CharSequence statusAscii = statusCode.asAsciiCharSequence();
         if (Chars.equals("405", statusAscii)) {
-            consumeChunkedResponse(response);
+            consumeChunkedResponse(response, timeoutMillis);
             client.disconnect();
             throw new LineSenderException("Could not flush buffer: HTTP endpoint does not support ILP. [http-status=405]", retryable);
         }
         if (Chars.equals("401", statusAscii) || Chars.equals("403", statusAscii)) {
             sink.clear();
-            chunkedResponseToSink(response, sink);
+            chunkedResponseToSink(response, sink, timeoutMillis);
             LineSenderException ex = new LineSenderException("Could not flush buffer: HTTP endpoint authentication error", retryable);
             if (sink.length() > 0) {
                 // sanitize the raw server body before it reaches the exception message (and any log/terminal):
@@ -874,13 +879,13 @@ public abstract class AbstractLineHttpSender implements Sender {
                 jsonErrorParser = new JsonErrorParser();
             }
             jsonErrorParser.reset();
-            LineSenderException ex = jsonErrorParser.toException(response.getResponse(), statusCode, retryable);
+            LineSenderException ex = jsonErrorParser.toException(response.getResponse(), statusCode, retryable, timeoutMillis);
             client.disconnect();
             throw ex;
         }
         // ok, no JSON, let's do something more generic
         sink.clear();
-        chunkedResponseToSink(response, sink);
+        chunkedResponseToSink(response, sink, timeoutMillis);
         // sanitize the raw server body before it reaches the exception message (and any log/terminal):
         // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
         LineSenderException ex = new LineSenderException("Could not flush buffer: ", retryable)
@@ -1081,10 +1086,10 @@ public abstract class AbstractLineHttpSender implements Sender {
             jsonSink.clear();
         }
 
-        LineSenderException toException(Response chunkedRsp, DirectUtf8Sequence httpStatus, boolean retryable) {
+        LineSenderException toException(Response chunkedRsp, DirectUtf8Sequence httpStatus, boolean retryable, int timeoutMillis) {
             Fragment fragment;
             LineSenderException exception = new LineSenderException("Could not flush buffer: ", retryable);
-            while ((fragment = chunkedRsp.recv()) != null) {
+            while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
                 try {
                     jsonSink.putNonAscii(fragment.lo(), fragment.hi());
                     lexer.parse(fragment.lo(), fragment.hi(), this);
@@ -1092,7 +1097,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                     // we failed to parse JSON, but we still want to show the error message.
                     // if we cannot parse it then we show the whole response as is.
                     // let's make sure we have the whole message - there might be more chunks
-                    while ((fragment = chunkedRsp.recv()) != null) {
+                    while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
                         jsonSink.putNonAscii(fragment.lo(), fragment.hi());
                     }
                     // sanitize the raw server body before it reaches the exception message (and any log/terminal):

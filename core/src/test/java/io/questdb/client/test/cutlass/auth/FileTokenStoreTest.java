@@ -45,8 +45,10 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -503,15 +505,19 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             Files.createDirectories(dir);
             TokenStoreKey key = sampleKey();
-            // two instances over one directory model two processes; a generous acquire budget makes a
-            // contender wait for the lock rather than degrade, and a large staleness window stops either from
-            // stealing the other's live lock - so the two critical sections must run strictly one at a time
+            // two instances over one directory model two concurrent users of one identity; a generous acquire
+            // budget makes a contender wait rather than degrade, and a large staleness window stops either from
+            // stealing the other's live lock - so the two critical sections must run strictly one at a time. In a
+            // single JVM the in-process lock (keyed on the identity) is what serializes them; it stands in for the
+            // cross-process file lock that only genuinely separate processes would exercise.
             FileTokenStore storeA = new FileTokenStore(dir, 10_000, 600_000);
             FileTokenStore storeB = new FileTokenStore(dir, 10_000, 600_000);
 
             AtomicInteger inside = new AtomicInteger();
             AtomicInteger maxInside = new AtomicInteger();
             AtomicInteger overlaps = new AtomicInteger();
+            AtomicInteger ran = new AtomicInteger();
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
             TokenStore.CriticalSection section = () -> {
                 int now = inside.incrementAndGet();
                 maxInside.accumulateAndGet(now, Math::max);
@@ -520,16 +526,38 @@ public class FileTokenStoreTest {
                 }
                 Os.sleep(200);
                 inside.decrementAndGet();
+                ran.incrementAndGet();
                 return true;
             };
 
-            Thread tA = new Thread(() -> storeA.inLock(key, section));
-            Thread tB = new Thread(() -> storeB.inLock(key, section));
+            // a barrier forces the two threads to genuinely contend, rather than one running and finishing before
+            // the other starts (which would satisfy the overlap check without ever exercising mutual exclusion)
+            CyclicBarrier barrier = new CyclicBarrier(2);
+            Thread tA = new Thread(() -> {
+                try {
+                    barrier.await();
+                    storeA.inLock(key, section);
+                } catch (Throwable t) {
+                    workerError.compareAndSet(null, t);
+                }
+            });
+            Thread tB = new Thread(() -> {
+                try {
+                    barrier.await();
+                    storeB.inLock(key, section);
+                } catch (Throwable t) {
+                    workerError.compareAndSet(null, t);
+                }
+            });
             tA.start();
             tB.start();
             tA.join();
             tB.join();
 
+            // capture a worker throwable on the main thread: without this, a contender that THREW instead of
+            // waiting would die silently and leave the other holder looking (falsely) like correct exclusion
+            Assert.assertNull("a contender thread failed instead of running its critical section", workerError.get());
+            Assert.assertEquals("both critical sections must have run", 2, ran.get());
             Assert.assertEquals("the two critical sections must never overlap", 0, overlaps.get());
             Assert.assertEquals("at most one holder at a time", 1, maxInside.get());
         });

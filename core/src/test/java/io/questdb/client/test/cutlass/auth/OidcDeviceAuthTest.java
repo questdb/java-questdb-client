@@ -1585,6 +1585,7 @@ public class OidcDeviceAuthTest {
             // behaviour: the HttpTokenProvider contract permits a brief wait behind a silent refresh.)
             CountDownLatch refreshInFlight = new CountDownLatch(1);
             CountDownLatch releaseRefresh = new CountDownLatch(1);
+            AtomicReference<String> handlerError = new AtomicReference<>();
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
@@ -1593,7 +1594,9 @@ public class OidcDeviceAuthTest {
                     refreshInFlight.countDown();
                     try {
                         if (!releaseRefresh.await(30, TimeUnit.SECONDS)) {
-                            Assert.fail("token refresh timeout expired");
+                            // on a MockOidcServer thread: JUnit would swallow an Assert.fail here, so record it
+                            // and let the main thread assert on it at the end
+                            handlerError.set("the test never released the refresh within 30s");
                         }
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -1626,7 +1629,9 @@ public class OidcDeviceAuthTest {
                 // a refresh holds the lock now; a second getToken() must WAIT for it, not fail fast
                 AtomicReference<String> waiterResult = new AtomicReference<>();
                 AtomicReference<Throwable> waiterError = new AtomicReference<>();
+                CountDownLatch waiterStarted = new CountDownLatch(1);
                 Thread waiter = new Thread(() -> {
+                    waiterStarted.countDown(); // signal we are about to enter getToken()
                     try {
                         waiterResult.set(auth.getToken());
                     } catch (Throwable t) {
@@ -1635,10 +1640,14 @@ public class OidcDeviceAuthTest {
                 }, "oidc-getToken-waiter");
                 waiter.setDaemon(true);
                 waiter.start();
+                Assert.assertTrue("the waiter thread did not start", waiterStarted.await(10, TimeUnit.SECONDS));
                 try {
-                    // give the waiter time to (wrongly) fail fast if it were going to; while the refresh is
-                    // held it must instead still be blocked - no result and, crucially, no error yet
+                    // give the waiter time to (wrongly) fail fast if it were going to; while the refresh is held it
+                    // must instead still be BLOCKED - proven by isAlive() (a fail-fast throw would have finished the
+                    // thread), so this cannot pass merely because the waiter had not started yet
                     Thread.sleep(500);
+                    Assert.assertTrue("getToken() must still be blocked behind the peer's refresh, not finished",
+                            waiter.isAlive());
                     Assert.assertNull("getToken() must not fail fast behind a silent refresh, but threw: " + waiterError.get(),
                             waiterError.get());
                     Assert.assertNull("getToken() must wait, not return, while the peer's refresh is still in flight",
@@ -1652,6 +1661,41 @@ public class OidcDeviceAuthTest {
                 Assert.assertNull("getToken() must not throw when it waits out a peer's refresh: " + waiterError.get(),
                         waiterError.get());
                 Assert.assertEquals("getToken() must serve the freshly refreshed token after waiting", "ACCESS-2", waiterResult.get());
+                Assert.assertNull("the mock server handler must not have reported an error", handlerError.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testGetTokenRefreshesWhenServedKindIsNullButRefreshTokenExists() throws Exception {
+        assertMemoryLeak(() -> {
+            // groupsInToken=true, but the device-code grant returns an access_token + refresh_token and NO
+            // id_token: signIn() rejects that grant (the served id_token is missing) yet leaves the refresh token
+            // in memory. A later getToken() must then attempt a silent refresh - which here yields the id_token -
+            // rather than give up with "no token has been obtained yet". M5: the refresh is no longer foreclosed
+            // just because the served-kind token is currently null.
+            AtomicInteger refreshCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    refreshCalls.incrementAndGet();
+                    return MockOidcServer.json(200, tokenJson("ACCESS-2", "ID-2", "REFRESH-2", 3600)); // now with id_token
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 3600)); // initial grant: no id_token
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) { // groupsInToken=true
+                try {
+                    auth.signIn();
+                    Assert.fail("signIn() must reject a grant with no id_token when groups are encoded in the token");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no id_token"));
+                }
+                // the partial grant left a refresh token in memory; getToken() must refresh to obtain the id_token
+                Assert.assertEquals("ID-2", auth.getToken());
+                Assert.assertEquals("getToken() must have performed a silent refresh", 1, refreshCalls.get());
             }
         });
     }

@@ -35,8 +35,6 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -222,6 +220,35 @@ public class OidcDeviceAuthPersistenceTest {
                 }
             }
         });
+    }
+
+    @Test
+    public void testDefaultInLockRunsTheAction() {
+        // TokenStore.inLock has a default that simply runs the action (no cross-process coordination). It is a
+        // public extension point users implement, so a store that does NOT override inLock must still run its
+        // critical section and return the action's result. Both in-tree stores override inLock, so this pins the
+        // default directly; a regression to, say, "return false" without running the action would fail here.
+        TokenStore store = new TokenStore() {
+            @Override
+            public void clear(TokenStoreKey key) {
+            }
+
+            @Override
+            public PersistedToken load(TokenStoreKey key) {
+                return null;
+            }
+
+            @Override
+            public void save(TokenStoreKey key, PersistedToken token) {
+            }
+        };
+        AtomicBoolean ran = new AtomicBoolean();
+        boolean result = store.inLock(null, () -> {
+            ran.set(true);
+            return true;
+        });
+        Assert.assertTrue("the default inLock must run the action", ran.get());
+        Assert.assertTrue("the default inLock must return the action's result", result);
     }
 
     @Test(timeout = 30_000)
@@ -512,18 +539,14 @@ public class OidcDeviceAuthPersistenceTest {
             };
             FakeTokenStore fake = new FakeTokenStore();
             fake.failSave = true;
-            PrintStream originalErr = System.err;
-            ByteArrayOutputStream captured = new ByteArrayOutputStream();
-            System.setErr(new PrintStream(captured, true, "UTF-8"));
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
-                // the save throws, but the sign-in still yields the valid in-memory token
+                // the store's save throws, but the failure is swallowed (warned best-effort, then ignored) and
+                // the sign-in still yields the valid in-memory token
                 Assert.assertEquals("ACCESS-1", auth.signIn());
-            } finally {
-                System.setErr(originalErr);
             }
-            String err = new String(captured.toByteArray(), StandardCharsets.UTF_8);
-            Assert.assertTrue("a save failure must warn to System.err: " + err, err.contains("token store save failed"));
+            // the save was actually attempted, so the throwing path was exercised rather than skipped
+            Assert.assertTrue("the token store save must have been attempted", fake.saves.get() >= 1);
         });
     }
 

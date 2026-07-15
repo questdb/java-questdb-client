@@ -34,6 +34,9 @@ import io.questdb.client.std.Os;
 import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.std.str.StringSink;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
@@ -57,7 +60,9 @@ import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The default {@link TokenStore}: one plaintext JSON file per identity under a directory, with the
@@ -131,6 +136,7 @@ public final class FileTokenStore implements TokenStore {
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
     private static final long LOCK_POLL_SLICE_MILLIS = 50L;
+    private static final Logger LOG = LoggerFactory.getLogger(FileTokenStore.class);
     // reject a token file larger than this; a real entry is a few KB even with a group-laden id token, so
     // anything past this is corrupt or hostile and is not read into memory
     private static final long MAX_FILE_BYTES = 1 << 20;
@@ -144,6 +150,14 @@ public final class FileTokenStore implements TokenStore {
     // attacker-writable directory as the token file, and a real owner stamp (pid@host + millis + UUID) is a
     // few hundred bytes, so anything past this cap is corrupt or hostile and is not read into memory
     private static final int MAX_LOCK_FILE_BYTES = 1 << 12;
+    // Serializes same-identity critical sections WITHIN this JVM, keyed on the identity fingerprint. Two
+    // OidcDeviceAuth instances for one identity in a single process (e.g. an ILP Sender and a QwpQueryClient)
+    // have separate instance locks, so only this shared lock stops them running the read-refresh-write
+    // concurrently and double-POSTing the same parent refresh token - which a reuse-detecting IdP revokes the
+    // whole token family for. The cross-process file lock's lock-free degrade must not license an intra-process
+    // race, so this in-process lock is taken first and is never subject to that degrade. Bounded by identity
+    // count (a handful), so it never grows unbounded.
+    private static final ConcurrentHashMap<String, ReentrantLock> PROCESS_LOCKS = new ConcurrentHashMap<>();
     // Windows can fail the atomic token-file rename with a transient AccessDeniedException (a sharing violation)
     // when a concurrent reader in any process holds the target open; retry the rename this many times on a short
     // backoff before giving up, so a routine read/write overlap does not needlessly degrade persistence. Kept
@@ -255,27 +269,39 @@ public final class FileTokenStore implements TokenStore {
 
     @Override
     public boolean inLock(TokenStoreKey key, CriticalSection action) {
-        Path lock = null;
-        // the unique owner nonce stamped into the lock when we acquired it, or null if we did not (or could
-        // not) acquire one and are running lock-free; releaseLock deletes the lock only when it still carries
-        // this nonce, so we never delete a lock a peer has since stolen
-        String nonce = null;
+        // First serialize other threads of THIS JVM sharing the same identity: the cross-process file lock below
+        // degrades to lock-free after lockAcquireBudgetMillis, which is a fine cross-process fallback but must
+        // not let two threads of one process run the critical section at once (they would double-POST the same
+        // rotating refresh token and get the whole family revoked on a reuse-detecting IdP). This lock is not
+        // subject to the file lock's degrade. ReentrantLock is safe even though inLock's contract forbids
+        // nesting - a mistaken re-entry cannot self-deadlock.
+        final ReentrantLock processLock = PROCESS_LOCKS.computeIfAbsent(key.hash(), k -> new ReentrantLock());
+        processLock.lock();
         try {
-            ensureDirectory();
-            lock = lockFile(key);
-            nonce = acquireLock(lock);
-        } catch (IOException e) {
-            // could not prepare the lock directory or file; run without the lock. Layer-1 atomic
-            // replacement still keeps every reader consistent - only a rotating-refresh-token race across
-            // processes is left unguarded for this one refresh.
-            nonce = null;
-        }
-        try {
-            return action.run();
-        } finally {
-            if (nonce != null) {
-                releaseLock(lock, nonce);
+            Path lock = null;
+            // the unique owner nonce stamped into the lock when we acquired it, or null if we did not (or could
+            // not) acquire one and are running lock-free; releaseLock deletes the lock only when it still carries
+            // this nonce, so we never delete a lock a peer has since stolen
+            String nonce = null;
+            try {
+                ensureDirectory();
+                lock = lockFile(key);
+                nonce = acquireLock(lock);
+            } catch (IOException e) {
+                // could not prepare the lock directory or file; run without the cross-process lock. Layer-1
+                // atomic replacement still keeps every reader consistent - only a rotating-refresh-token race
+                // across processes is left unguarded for this one refresh.
+                nonce = null;
             }
+            try {
+                return action.run();
+            } finally {
+                if (nonce != null) {
+                    releaseLock(lock, nonce);
+                }
+            }
+        } finally {
+            processLock.unlock();
         }
     }
 
@@ -638,9 +664,9 @@ public final class FileTokenStore implements TokenStore {
         if (!warnedNoPosixPerms.compareAndSet(false, true)) {
             return;
         }
-        System.err.println("questdb client: the OIDC token store could not enforce owner-only (0600/0700) "
-                + "permissions on this filesystem; the persisted refresh token is protected only by the "
-                + "directory's default ACL. Back the store with an OS keychain for at-rest encryption.");
+        LOG.warn("the OIDC token store could not enforce owner-only (0600/0700) permissions on this "
+                + "filesystem; the persisted refresh token is protected only by the directory's default ACL. "
+                + "Back the store with an OS keychain for at-rest encryption.");
     }
 
     private static void writeAndFlush(Path file, byte[] content) throws IOException {

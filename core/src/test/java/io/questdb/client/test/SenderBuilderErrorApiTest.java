@@ -230,11 +230,13 @@ public class SenderBuilderErrorApiTest {
 
     @Test
     public void testCategoryAndPolicyAreStillEnumerable() {
-        // Cross-check that the user-facing SenderError enum surface is intact. valueOf(name) throws at
-        // RUNTIME if a constant is renamed or removed, so this actually fails on a regression - unlike
-        // asserting a compiled constant reference is non-null, which the compiler already guarantees.
-        Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, SenderError.Category.valueOf("SCHEMA_MISMATCH"));
-        Assert.assertEquals(SenderError.Policy.RETRIABLE, SenderError.Policy.valueOf("RETRIABLE"));
+        // Cross-check that the user-facing SenderError enum surface is intact, driven by NAME strings the
+        // compiler does not resolve, so a rename or removal fails this test at RUNTIME (valueOf throws
+        // IllegalArgumentException). Using a compiled constant reference (SenderError.Category.SCHEMA_MISMATCH) as
+        // the expected value instead would only fail to COMPILE on a rename - the source, not the assertion,
+        // would break - so it would test nothing at runtime.
+        Assert.assertEquals("SCHEMA_MISMATCH", SenderError.Category.valueOf("SCHEMA_MISMATCH").name());
+        Assert.assertEquals("RETRIABLE", SenderError.Policy.valueOf("RETRIABLE").name());
     }
 
     @Test

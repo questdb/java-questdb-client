@@ -676,6 +676,7 @@ public class JsonLexerTest {
             assertDecodedValue("{\"v\":\"a\\\"b\"}", "a\"b");                   // escaped quote -> quote
             assertDecodedValue("{\"v\":\"a\\\\b\"}", "a\\b");                   // escaped backslash -> backslash
             assertDecodedValue("{\"v\":\"X\\u0041Y\"}", "XAY");                // 4-hex unicode escape decoded
+            assertDecodedValue("{\"v\":\"X\\u0041\"}", "XA");                  // \\uXXXX at end of value (i+6==n boundary)
             assertDecodedValue("{\"v\":\"tab\\tend\"}", "tab\tend");            // escaped tab -> tab
             assertDecodedValue("{\"v\":\"plain\"}", "plain");                  // no escapes (fast path)
         });
