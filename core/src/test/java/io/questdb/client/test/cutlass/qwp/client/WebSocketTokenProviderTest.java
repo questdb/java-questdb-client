@@ -36,6 +36,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -270,13 +271,18 @@ public class WebSocketTokenProviderTest {
         });
     }
 
-    @Test
-    public void testPersistentlyThrowingProviderOnReconnectTerminatesTheSender() throws Exception {
+    @Test(timeout = 60_000)
+    public void testPersistentlyThrowingProviderOnReconnectDoesNotTerminateAndRecovers() throws Exception {
         assertMemoryLeak(() -> {
-            // The complement to the recover-on-transient case: a provider that keeps throwing on every reconnect
-            // must NOT be silently swallowed on the background I/O thread - once the (short here) reconnect
-            // budget is exhausted the sender terminates, and a subsequent send/flush must surface the failure
-            // rather than block forever or silently drop data. A cap on the reconnect duration keeps this fast.
+            // Invariant B: the RUNNING store-and-forward drainer must NEVER terminate on a token-provider
+            // failure, however long it persists. A failing provider (IdP unreachable, a silent refresh failing,
+            // sign-in not yet complete) is a transient outage like any other - the un-acked rows stay safe in SF
+            // and the sender recovers once a token is available again. Here the provider throws for FAR longer
+            // than the (deliberately short) reconnect budget: the sender must stay alive the whole time - no
+            // terminal, no exception surfaced to the producer - and then ship the buffered row once the provider
+            // recovers. Before the fix the drainer latched a TERMINAL SECURITY_ERROR at reconnectMaxDurationMillis
+            // and dropped the producer store-and-forward had promised to keep alive.
+            AtomicBoolean providerFailing = new AtomicBoolean(false);
             AtomicInteger calls = new AtomicInteger();
             DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -284,53 +290,65 @@ public class WebSocketTokenProviderTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
+                long budgetMillis = 300; // SHORT: the outage below far exceeds it, proving the budget is not consulted
                 try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
                         .address("localhost:" + port)
                         .reconnectInitialBackoffMillis(20)
                         .reconnectMaxBackoffMillis(20)
-                        .reconnectMaxDurationMillis(300) // short budget so persistent failure terminates quickly
+                        .reconnectMaxDurationMillis(budgetMillis)
                         .httpTokenProvider(() -> {
                             int n = calls.incrementAndGet();
-                            if (n == 1) {
-                                return "TOKEN-1"; // initial connect succeeds
+                            if (providerFailing.get()) {
+                                throw new OidcAuthException("persistent: not signed in");
                             }
-                            throw new OidcAuthException("persistent: not signed in"); // every reconnect pull fails
+                            return "TOKEN-" + n;
                         })
                         .build()) {
                     Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
 
-                    // batch 1 lands and is ACKed, then the server drops the socket -> the reconnect keeps failing
+                    // Arm the provider failure on the established connection, BEFORE the drop triggers a reconnect,
+                    // so every reconnect pull throws (no race where the first reconnect succeeds first).
+                    providerFailing.set(true);
+                    // batch 1 lands and is ACKed on the initial connection, then the server drops the socket ->
+                    // the background reconnect loop starts and every provider pull now throws
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
 
-                    // once the reconnect budget exhausts, the terminated sender must surface the failure on a
-                    // later send/flush (never a silent success), so drive rows until one throws
-                    waitFor(() -> {
-                        try {
-                            sender.table("foo").longColumn("v", 2L).atNow();
-                            sender.flush();
-                            return false; // not terminated yet - the reconnect is still within budget
-                        } catch (Exception e) {
-                            return true; // terminated: the persistent provider failure surfaced, as intended
-                        }
-                    }, 15_000);
-                    Assert.assertTrue("the provider must have been re-queried on the failing reconnect, got " + calls.get(),
-                            calls.get() >= 2);
+                    // let the failing reconnect run for 4x the budget - the old code would have terminated at 1x
+                    int callsAtOutageStart = calls.get();
+                    Thread.sleep(budgetMillis * 4);
+
+                    // the drainer kept re-querying the provider (retrying, not giving up) ...
+                    Assert.assertTrue("the provider must be re-queried during the outage, got " + calls.get(),
+                            calls.get() > callsAtOutageStart);
+                    // ... and the sender is still ALIVE: buffering another row must not surface a terminal even
+                    // though every reconnect is currently failing. Before the fix this threw a SECURITY_ERROR
+                    // "token-provider-failed" once the budget elapsed.
+                    try {
+                        sender.table("foo").longColumn("v", 2L).atNow();
+                    } catch (Exception e) {
+                        Assert.fail("the drainer terminated the sender on a transient provider outage: " + e.getMessage());
+                    }
+
+                    // the provider recovers -> the next reconnect succeeds and the buffered row drains
+                    providerFailing.set(false);
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
                 }
             }
         });
     }
 
-    @Test(timeout = 30_000)
-    public void testCredentialFailureTimerResetsAcrossTransientReconnectFailures() throws Exception {
+    @Test(timeout = 60_000)
+    public void testCredentialFailuresInterleavedWithRoleRejectsDoNotTerminateAndRecover() throws Exception {
         assertMemoryLeak(() -> {
-            // The SF credential terminal budget must accumulate only across an UNINTERRUPTED run of
-            // credential-acquisition failures: a transient reconnect failure (here a 421 role reject) between
-            // credential blips must RESET the timer, so a provider that fails only intermittently - interleaved
-            // with transport/role failures - never terminates the sender even when the total credential-failing
-            // span far exceeds the reconnect budget. Without the reset (credentialFailingSinceNanos = 0L on the
-            // transport / role-mismatch catch) the credential blips accumulate and terminate the sender at the
-            // budget, so batch 2 would never land.
+            // Neither a token-provider failure nor a transient role reject may terminate the running drainer, and
+            // interleaving them must not either: both fall through to capped backoff and retry indefinitely
+            // (Invariant B). Here credential blips (even provider calls throw) alternate with 421 role rejects
+            // (odd calls return a token whose upgrade the server rejects) for far longer than the reconnect
+            // budget; the sender must survive the whole span and then ship batch 2 once both faults clear. Before
+            // the fix the credential blips accumulated to a budget-latched terminal and the sender was dropped.
             AtomicInteger calls = new AtomicInteger();
             DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -338,7 +356,7 @@ public class WebSocketTokenProviderTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                long budgetMillis = 800; // short: WITHOUT the reset, accumulation terminates well before recovery
+                long budgetMillis = 300; // short: the interleaved outage below far exceeds it
                 try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
                         .address("localhost:" + port)
                         .reconnectInitialBackoffMillis(20)
@@ -347,10 +365,9 @@ public class WebSocketTokenProviderTest {
                         .httpTokenProvider(() -> {
                             int n = calls.incrementAndGet();
                             // call 1: the initial connect (must succeed). Then alternate on every reconnect
-                            // attempt: even calls THROW (a credential blip -> timer starts), odd calls RETURN a
-                            // valid token (whose connect then hits the transient 421 role reject below -> the
-                            // role-mismatch catch RESETS the timer). So credential blips and role rejects strictly
-                            // alternate: the timer is set then reset each cycle and never approaches the budget.
+                            // attempt: even calls THROW (a credential blip), odd calls RETURN a token whose
+                            // connect then hits the 421 role reject below. So credential failures and role
+                            // rejects strictly alternate across the whole outage.
                             if (n > 1 && n % 2 == 0) {
                                 throw new OidcAuthException("transient: a silent refresh failed");
                             }
@@ -359,24 +376,25 @@ public class WebSocketTokenProviderTest {
                         .build()) {
                     Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
 
-                    // reject every NEW handshake with a transient 421 role reject BEFORE the drop, so the
-                    // reconnect attempts deterministically hit it (no race where a reconnect succeeds first). The
-                    // already-established initial connection is unaffected and still ships batch 1.
+                    // reject every NEW handshake with a transient 421 role reject BEFORE the drop, so a
+                    // token-returning reconnect attempt deterministically hits it. The already-established
+                    // initial connection is unaffected and still ships batch 1.
                     server.setRejectWithRole("replica");
-                    // batch 1 lands on the established connection and is ACKed, then the server drops the socket
-                    // -> the background reconnect loop starts and enters the credential-blip / role-reject cycle
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
                     waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
 
-                    // let the interleaved credential + role failures run for well over the budget; if the reset
-                    // were broken the credential blips would accumulate and terminate the sender by now
-                    Thread.sleep(budgetMillis * 3);
+                    // let the interleaved credential + role failures run for well over the budget; the sender
+                    // must NOT terminate on either fault class or their interleaving
+                    Thread.sleep(budgetMillis * 4);
+                    try {
+                        sender.table("foo").longColumn("v", 2L).atNow();
+                    } catch (Exception e) {
+                        Assert.fail("the drainer terminated during interleaved credential/role failures: " + e.getMessage());
+                    }
 
-                    // clear the reject: the next token-returning reconnect attempt now succeeds. The sender must
-                    // still be alive (never terminated during the reject phase), so batch 2 lands.
+                    // clear the reject: the next token-returning reconnect now succeeds and batch 2 drains
                     server.setRejectWithRole(null);
-                    sender.table("foo").longColumn("v", 2L).atNow();
                     sender.flush();
                     waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
                     Assert.assertTrue("the provider must have been re-queried across the reconnect phase, got " + calls.get(),

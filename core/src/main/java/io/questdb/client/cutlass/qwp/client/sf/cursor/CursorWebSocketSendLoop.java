@@ -1138,18 +1138,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // INVARIANT B: a store-and-forward drainer must NEVER terminate on a
         // wall-clock reconnect budget. A replica-only / all-endpoints-replica
         // window is TRANSIENT -- a replica gets promoted, a primary reappears --
-        // so this background loop retries for as long as it is running, backing
-        // off between attempts. The ONLY terminal conditions are a genuinely
-        // non-retriable upgrade (auth / non-421 upgrade / durable-ack capability
-        // gap), which return directly below, a credential the client cannot
-        // ACQUIRE (QwpCredentialUnavailableException -- see its catch below), or
-        // the sender being stopped. SF exhaustion is surfaced to the PRODUCER as
-        // append backpressure, never here. reconnect_max_duration_millis is
-        // intentionally NOT consulted for a TRANSPORT outage: for those it bounds
-        // only the blocking (non-lazy) initial connect in
-        // QwpWebSocketSender.buildAndConnect, never this background loop. It does
-        // bound an uninterrupted run of credential-acquisition failures, which no
-        // amount of retrying can clear.
+        // and so is a token-provider failure -- the IdP becomes reachable again,
+        // or the user completes an interactive sign-in -- so this background loop
+        // retries all of them for as long as it is running, backing off between
+        // attempts. The ONLY terminal conditions are a genuinely non-retriable
+        // upgrade (auth / non-421 upgrade / durable-ack capability gap), which
+        // return directly below, or the sender being stopped. SF exhaustion is
+        // surfaced to the PRODUCER as append backpressure, never here.
+        // reconnect_max_duration_millis is intentionally NOT consulted anywhere
+        // in this background loop: it bounds only the blocking (non-lazy) initial
+        // connect in QwpWebSocketSender.buildAndConnect, never this loop.
         long backoffMillis = reconnectInitialBackoffMillis;
         if (paceFirstAttemptMillis > 0 && running) {
             // NACK-initiated recycle against a reachable server: pace the
@@ -1170,11 +1168,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         int attempts = 0;
         long lastLogNanos = 0L;
         Throwable lastReconnectError = initial;
-        // Start of the current UNINTERRUPTED run of credential-acquisition failures; 0 when none is in
-        // flight. Any other outcome (a connect, or a transport-class failure) clears it, so only a
-        // sustained inability to obtain a credential burns the budget and terminates -- a token blip
-        // between transport errors still recovers.
-        long credentialFailingSinceNanos = 0L;
         while (running) {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
@@ -1271,52 +1264,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 dispatchError(err);
                 return;
             } catch (QwpCredentialUnavailableException e) {
-                // The token provider threw instead of returning a credential. Unlike a transport outage
-                // (Invariant B), retrying alone cannot clear this: the loop cannot conjure a token the
-                // provider will not hand over. But a silent refresh can fail transiently, so retry while
-                // one still might recover -- bounded by the reconnect budget -- and only terminate once
-                // credential acquisition has failed for that whole uninterrupted window. Terminating is
-                // what keeps a dead credential ("not signed in") from reconnect-looping forever behind
-                // throttled logs: it surfaces the provider's own message to the producer via checkError()
-                // and to the async handler, exactly as a server-side 401/403 does above.
-                long now = System.nanoTime();
-                if (credentialFailingSinceNanos == 0L) {
-                    credentialFailingSinceNanos = now;
-                }
-                // Compare in millis, not nanos: the builder puts no upper bound on the budget, and a
-                // millis-to-nanos multiply of a large one overflows to a negative bound -- which would
-                // terminate on the FIRST credential blip instead of never.
-                if ((now - credentialFailingSinceNanos) / 1_000_000L > reconnectMaxDurationMillis) {
-                    LOG.error("token provider failed for {}ms during {} -- won't retry: {}",
-                            reconnectMaxDurationMillis, phase, e.getMessage());
-                    long fromFsn = engine.ackedFsn() + 1L;
-                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                    SenderError err = new SenderError(
-                            SenderError.Category.SECURITY_ERROR,
-                            SenderError.Policy.TERMINAL,
-                            SenderError.NO_STATUS_BYTE,
-                            "token-provider-failed: " + e.getMessage(),
-                            SenderError.NO_MESSAGE_SEQUENCE,
-                            fromFsn,
-                            toFsn,
-                            null,
-                            System.nanoTime()
-                    );
-                    totalServerErrors.incrementAndGet();
-                    recordFatal(new LineSenderServerException(err));
-                    dispatchError(err);
-                    return;
-                }
+                // The token provider threw instead of returning a credential (a failed silent refresh, an
+                // interactive sign-in in progress on another thread, or not signed in yet). In the RUNNING
+                // background drainer this is a TRANSIENT outage like any other under Invariant B: the provider
+                // hands over a token again once the IdP is reachable or the user finishes signing in, and the
+                // un-acked rows stay safe in on-disk SF meanwhile. So retry indefinitely with capped backoff --
+                // NEVER bound by a wall-clock budget and NEVER latch a terminal, which would drop a producer
+                // that store-and-forward promised to keep alive on a recoverable fault. The foreground/SYNC
+                // initial connect still fails fast with the provider's own exception (connectWithRetry, and the
+                // OFF-mode connect in QwpWebSocketSender), because a connectivity error is only the caller's to
+                // see DURING initialization, not after the drainer is running.
                 lastReconnectError = e;
+                long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
-                    LOG.warn("{} attempt {}: the token provider failed ({}); retrying within the "
-                                    + "credential budget -- if this persists the sender terminates",
+                    LOG.warn("{} attempt {}: the token provider failed ({}); retrying with capped backoff -- "
+                                    + "the sender keeps buffering to SF and recovers once a token is available",
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
                 // fall through to the shared capped-backoff block
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
-                credentialFailingSinceNanos = 0L;
                 // Role mismatch: every reachable endpoint role-rejected the
                 // upgrade -- right now they are all replicas / primary-catchup.
                 // This is a TRANSIENT failover window (a replica is promotable),
@@ -1355,7 +1322,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     recordFatal(e);
                     throw (Error) e;
                 }
-                credentialFailingSinceNanos = 0L;
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {

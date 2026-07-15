@@ -548,6 +548,13 @@ public abstract class HttpClient implements QuietCloseable {
         }
 
         public void trimContentToLen(int contentLen) {
+            if (contentStart < 0) {
+                // withContent() has not started a content section yet, so contentStart is the -1 sentinel
+                // and contentStart + contentLen would be a negative, invalid write pointer that the next
+                // write would segfault on. Nothing has been written into a content section, so there is
+                // nothing to trim.
+                return;
+            }
             ptr = contentStart + contentLen;
         }
 

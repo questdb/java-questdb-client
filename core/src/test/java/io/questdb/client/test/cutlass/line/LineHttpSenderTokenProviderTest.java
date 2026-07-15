@@ -88,6 +88,49 @@ public class LineHttpSenderTokenProviderTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCancelRowWithPendingTokenDoesNotCorruptRequest() throws Exception {
+        assertMemoryLeak(() -> {
+            // Regression: with an httpTokenProvider, newRequest() defers the token and leaves the request at the
+            // header stage (withContent() not yet run), so the native contentStart is still the -1 sentinel and
+            // no row bytes are buffered. cancelRow() must be a safe no-op in that window: trimContentToLen(0)
+            // would otherwise set the write pointer to contentStart + 0 == -1, and the next buffer write (the
+            // deferred Authorization header on the following row) would segfault the JVM. The window is entered
+            // after build() and again after every flush (reset() re-arms the pending token); a rejected table
+            // name - validateTableName() runs BEFORE the token is stamped - is a mainstream way to reach a
+            // cancelRow() with the token still pending.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                AtomicInteger calls = new AtomicInteger();
+                HttpTokenProvider provider = () -> "TOKEN-" + calls.incrementAndGet();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(provider)
+                        .build()) {
+                    // (1) cancelRow immediately after build(), token pending, nothing buffered: before the fix the
+                    // write pointer went to -1 and the following row's write segfaulted the JVM
+                    sender.cancelRow();
+                    Assert.assertEquals("cancelRow must not pull the deferred token", 0, calls.get());
+
+                    // the sender is still usable: a real row buffers, flushes, and carries the token to the wire
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush();
+
+                    // (2) after a flush the token is pending again; cancelRow in that window must also be a safe
+                    // no-op, and the next row must still send its (rotated) token
+                    sender.cancelRow();
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    sender.flush();
+                }
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals("both flushes must reach the server", 2, auth.size());
+                Assert.assertEquals("Bearer TOKEN-1", auth.get(0));
+                Assert.assertEquals("Bearer TOKEN-2", auth.get(1));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testChangedProviderTokenIsRevalidated() throws Exception {
         assertMemoryLeak(() -> {
             // the per-flush token validation is skipped only for the SAME instance already validated, so a

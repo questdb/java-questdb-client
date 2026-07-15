@@ -469,6 +469,15 @@ public abstract class AbstractLineHttpSender implements Sender {
     @Override
     public void cancelRow() {
         validateNotClosed();
+        if (isTokenPending) {
+            // newRequest() left the request at the header stage with the provider token deferred, so
+            // withContent() has not run and contentStart is still -1 (getContentLength() reads 0): no row
+            // bytes were written, so there is nothing to trim. trimContentToLen(0) would set the write
+            // pointer to contentStart + 0 == -1 and the next buffer write would segfault. Just reset the
+            // row state and leave the token pending for the next row.
+            state = RequestState.EMPTY;
+            return;
+        }
         request.trimContentToLen(rowBookmark);
         state = RequestState.EMPTY;
     }
