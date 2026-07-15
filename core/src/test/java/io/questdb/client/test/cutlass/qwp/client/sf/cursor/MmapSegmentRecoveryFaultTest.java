@@ -317,11 +317,20 @@ public class MmapSegmentRecoveryFaultTest {
             // facade reports a full page, so openExisting maps that beyond-EOF
             // page and the header read faults on it on any filesystem.
             truncateTo(path, 0L);
-            FilesFacade ff = new MapPastEofFacade(path, page);
+            MapPastEofFacade ff = new MapPastEofFacade(path, page);
             // SegmentRing opens the sole segment through the facade, catches the
             // converted MmapSegmentException, skips the file, and returns no ring.
             assertNull("a beyond-EOF header page must be skipped, not recovered or fatal",
                     SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
+            // Guard against a silent pass: the skip must be the beyond-EOF mmap
+            // fault, not a "file shorter than header" throw. That holds only if
+            // the facade's inflated length actually reached the recovery mapping
+            // -- i.e. the path SegmentRing rebuilds (sfDir + "/" + name) matched
+            // targetPath. If that coupling ever broke, openExisting would see the
+            // real length 0 and skip via a throw that survives reverting the
+            // mmap-fault guard, gutting this fail-on-revert guard unnoticed.
+            assertTrue("the injected beyond-EOF length must have driven the recovery mapping",
+                    ff.isInflatedLengthServed);
         });
     }
 
@@ -394,6 +403,10 @@ public class MmapSegmentRecoveryFaultTest {
      * {@link FilesFacade#INSTANCE}.
      */
     private static final class MapPastEofFacade implements FilesFacade {
+        // Set once length() has served the inflated length for targetPath, i.e.
+        // the injection actually reached the recovery mapping. A test asserts
+        // this so a broken path match cannot let the guard pass vacuously.
+        private boolean isInflatedLengthServed;
         private final long reportedLength;
         private final String targetPath;
 
@@ -469,7 +482,11 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long length(String path) {
-            return targetPath.equals(path) ? reportedLength : INSTANCE.length(path);
+            if (targetPath.equals(path)) {
+                isInflatedLengthServed = true;
+                return reportedLength;
+            }
+            return INSTANCE.length(path);
         }
 
         @Override
