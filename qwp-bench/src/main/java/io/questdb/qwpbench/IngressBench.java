@@ -19,7 +19,7 @@ import java.util.concurrent.Future;
  * JSON report rather than measured directly.
  */
 public final class IngressBench {
-    static final int CHECKPOINT_BATCHES = 64;
+    static final int CHECKPOINT_BATCHES = (int) Env.zu("CHECKPOINT_BATCHES", 64);
     static final long ACK_TIMEOUT_MS = 120_000;
     // Precomputed column names for S2_WIDE's wide symbol/double columns --
     // avoids a per-row "s" + c / "d" + k allocation in the timed pass() loop.
@@ -85,23 +85,45 @@ public final class IngressBench {
         String[] symPool = BenchSchema.symPool(symCard);
         String[][] hiPools = kind == BenchSchema.Kind.S2_WIDE ? BenchSchema.hiSymPools(hiCard) : null;
 
+        String runMode = Env.str("RUN_MODE", "full");
+        boolean doFloor = !"e2e".equals(runMode);
+        boolean doE2e = !"floor".equals(runMode);
+
         Sender[] pool = new Sender[senders];
         long[][] ranges = new long[senders][];
+        long[] wallF = new long[iterations];
+        long[] cpuF = new long[iterations];
+        long[] gcF = new long[iterations];
         ExecutorService exec = senders > 1 ? Executors.newFixedThreadPool(senders) : null;
         try {
             for (int k = 0; k < senders; k++) {
                 pool[k] = Sender.fromConfig(conf);
                 ranges[k] = senderRange(rows, senders, k);
             }
-            for (int w = 0; w < warmups; w++) {
-                multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
+            if (doFloor) {
+                System.err.println("[qwp_ingress_java] measuring row-build floor ...");
+                for (int w = 0; w < warmups; w++) {
+                    floorPass(pool[0], kind, rows, symPool, hiPools, notes, maxBatch);
+                }
+                for (int it = 0; it < iterations; it++) {
+                    long g0 = BenchJson.gcMs(), c0 = BenchJson.processCpuNs(), t0 = BenchJson.nowNs();
+                    floorPass(pool[0], kind, rows, symPool, hiPools, notes, maxBatch);
+                    wallF[it] = BenchJson.nowNs() - t0;
+                    cpuF[it] = BenchJson.processCpuNs() - c0;
+                    gcF[it] = BenchJson.gcMs() - g0;
+                }
             }
-            for (int it = 0; it < iterations; it++) {
-                long g0 = BenchJson.gcMs(), c0 = BenchJson.processCpuNs(), t0 = BenchJson.nowNs();
-                multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
-                wall[it] = BenchJson.nowNs() - t0;
-                cpu[it] = BenchJson.processCpuNs() - c0;
-                gc[it] = BenchJson.gcMs() - g0;
+            if (doE2e) {
+                for (int w = 0; w < warmups; w++) {
+                    multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
+                }
+                for (int it = 0; it < iterations; it++) {
+                    long g0 = BenchJson.gcMs(), c0 = BenchJson.processCpuNs(), t0 = BenchJson.nowNs();
+                    multiPass(exec, pool, ranges, kind, symPool, hiPools, notes, maxBatch);
+                    wall[it] = BenchJson.nowNs() - t0;
+                    cpu[it] = BenchJson.processCpuNs() - c0;
+                    gc[it] = BenchJson.gcMs() - g0;
+                }
             }
         } finally {
             if (exec != null) exec.shutdownNow();
@@ -109,7 +131,7 @@ public final class IngressBench {
                 if (s != null) s.close();
             }
         }
-        long count = http.waitForCount(table, rows);
+        long count = doE2e ? http.waitForCount(table, rows) : 0;
 
         BenchJson.Obj report = new BenchJson.Obj();
         report.put("schema", kind == BenchSchema.Kind.S1_NARROW ? "s1-narrow" : "s2-wide");
@@ -117,7 +139,7 @@ public final class IngressBench {
         report.put("columns", (long) kind.columns());
         report.put("direction", "ingress");
         report.put("client", "java-row");
-        report.put("run_mode", Env.str("RUN_MODE", "full"));
+        report.put("run_mode", runMode);
         report.put("warmups", (long) warmups);
         report.put("wire_bytes", 0L);
         report.put("senders", (long) senders);
@@ -130,12 +152,14 @@ public final class IngressBench {
         String jc = System.getenv("JAVA_QUESTDB_CLIENT_COMMIT");
         if (jc != null) commits.put("java_questdb_client", jc); else commits.putNull("java_questdb_client");
         report.put("commits", commits);
-        BenchJson.Obj rcc = new BenchJson.Obj();
-        rcc.put("expected", rows);
-        rcc.put("actual", count);
-        rcc.put("ok", count == rows);
-        rcc.put("inflated", count > rows);
-        report.put("row_count_check", rcc);
+        if (doE2e) {
+            BenchJson.Obj rcc = new BenchJson.Obj();
+            rcc.put("expected", rows);
+            rcc.put("actual", count);
+            rcc.put("ok", count == rows);
+            rcc.put("inflated", count > rows);
+            report.put("row_count_check", rcc);
+        }
         double e2e = BenchJson.medianS(wall, iterations);
         BenchJson.Obj headline = new BenchJson.Obj();
         headline.put("row_flush_s", e2e);
@@ -144,10 +168,16 @@ public final class IngressBench {
         report.put("real_conf", conf);
         report.put("http_base", base);
         BenchJson.Obj paths = new BenchJson.Obj();
-        paths.put("row-flush", BenchJson.pathSummary(wall, cpu, gc, iterations, rows, kind.columns(), 0, "e2e", warmups > 0));
+        if (doE2e) {
+            paths.put("row-flush", BenchJson.pathSummary(wall, cpu, gc, iterations, rows, kind.columns(), 0, "e2e", warmups > 0));
+        }
+        if (doFloor) {
+            paths.put("row-build", BenchJson.pathSummary(wallF, cpuF, gcF, iterations, rows,
+                    kind.columns(), 0, "floor", warmups > 0));
+        }
         report.put("paths", paths);
         System.out.println(report.render());
-        return count == rows ? 0 : 2;
+        return (!doE2e || count == rows) ? 0 : 2;
     }
 
     /**
@@ -171,6 +201,46 @@ public final class IngressBench {
                 + ";auto_flush_rows=2147483647;auto_flush_interval=2147483646;";
     }
 
+    /**
+     * Appends one row's worth of columns to {@code sender} without flushing.
+     * Shared by {@link #pass} (e2e) and {@link #floorPass} (floor) so the two
+     * paths stay byte-identical in what per-row work they measure.
+     */
+    private static void appendRow(Sender sender, BenchSchema.Kind kind, long i,
+                                  String[] symPool, String[][] hiPools, String[] notes) {
+        sender.table(kind.tableName());
+        sender.symbol("sym", symPool[(int) (i % symPool.length)]);
+        if (kind == BenchSchema.Kind.S2_WIDE) {
+            for (int c = 1; c <= BenchSchema.N_WIDE_SYMS; c++) {
+                sender.symbol(S_NAMES[c], hiPools[c][(int) (i % hiPools[c].length)]);
+            }
+        }
+        sender.longColumn("id", BenchSchema.id(i));
+        sender.doubleColumn("price", BenchSchema.price(i));
+        sender.stringColumn("note", notes[(int) (i % notes.length)]);
+        if (kind == BenchSchema.Kind.S2_WIDE) {
+            for (int k = 1; k <= BenchSchema.N_WIDE_DOUBLES; k++) {
+                sender.doubleColumn(D_NAMES[k], BenchSchema.wideDouble(i, k));
+            }
+        }
+        sender.at(BenchSchema.tsNanos(i), ChronoUnit.NANOS);
+    }
+
+    /** Floor "row-build": appendRow per row, reset() per batch, no flush/acks.
+     *  Single-threaded over [0, rows) regardless of SENDERS (parity with rust
+     *  measure_row_build). NOTE: unlike rust's standalone Buffer, this exercises
+     *  a connected Sender's internal buffer; connection stays idle. */
+    private static void floorPass(Sender sender, BenchSchema.Kind kind, long rows,
+                                  String[] symPool, String[][] hiPools, String[] notes, long maxBatch) {
+        for (long start = 0; start < rows; start += maxBatch) {
+            long end = Math.min(start + maxBatch, rows);
+            for (long i = start; i < end; i++) {
+                appendRow(sender, kind, i, symPool, hiPools, notes);
+            }
+            sender.reset();
+        }
+    }
+
     // package-private: EgressBench reuses this for its populate step.
     // symPool/hiPools are read-only and safely shared across sender threads;
     // hiPools is null iff kind != S2_WIDE (never dereferenced then).
@@ -181,23 +251,7 @@ public final class IngressBench {
         for (long start = lo; start < hi; start += maxBatch) {
             long end = Math.min(start + maxBatch, hi);
             for (long i = start; i < end; i++) {
-                sender.table(kind.tableName());
-                // symbols must precede other columns (Sender contract)
-                sender.symbol("sym", symPool[(int) (i % symPool.length)]);
-                if (kind == BenchSchema.Kind.S2_WIDE) {
-                    for (int c = 1; c <= BenchSchema.N_WIDE_SYMS; c++) {
-                        sender.symbol(S_NAMES[c], hiPools[c][(int) (i % hiPools[c].length)]);
-                    }
-                }
-                sender.longColumn("id", BenchSchema.id(i));
-                sender.doubleColumn("price", BenchSchema.price(i));
-                sender.stringColumn("note", notes[(int) (i % notes.length)]);
-                if (kind == BenchSchema.Kind.S2_WIDE) {
-                    for (int k = 1; k <= BenchSchema.N_WIDE_DOUBLES; k++) {
-                        sender.doubleColumn(D_NAMES[k], BenchSchema.wideDouble(i, k));
-                    }
-                }
-                sender.at(BenchSchema.tsNanos(i), ChronoUnit.NANOS);
+                appendRow(sender, kind, i, symPool, hiPools, notes);
             }
             lastFsn = sender.flushAndGetSequence();
             if (++batchNo % CHECKPOINT_BATCHES == 0 && lastFsn >= 0) {
