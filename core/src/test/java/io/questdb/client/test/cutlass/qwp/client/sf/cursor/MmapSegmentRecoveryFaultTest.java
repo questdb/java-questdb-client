@@ -280,31 +280,7 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * Portable fail-on-revert guard for the {@code openExisting} header-block
-     * guard, driven through the real recovery entry point
-     * {@link SegmentRing#openExisting}. The file is truncated to empty and the
-     * facade reports a full page, so the very first header read (magic) lands on
-     * a beyond-EOF page and faults on any filesystem.
-     * {@link MmapSegment#openExisting} must convert that to a
-     * {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
-     * catches to skip just this {@code .sfa} -- so recovery of the sole
-     * (unreadable) segment yields no ring rather than aborting or surfacing a
-     * raw {@code InternalError}. Revert the header-block conversion and the raw
-     * {@code InternalError} escapes {@code openExisting}, propagates out of
-     * {@code SegmentRing}'s recovery loop, and this errors instead of returning
-     * {@code null}.
-     * <p>
-     * Routing through {@code SegmentRing} rather than calling
-     * {@code MmapSegment.openExisting} directly is deliberate, and is what makes
-     * this test stable on the JDK 8 CI. It mirrors production, where the
-     * faulting header read sits behind a real (non-inlined) call frame whose
-     * {@code catch (Throwable)} runs the fault-to-{@code MmapSegmentException}
-     * conversion. A direct call instead lets HotSpot's C2 inline
-     * {@code openExisting} into the handler-less test frame and deliver the
-     * async "recent unsafe memory access" {@code InternalError} past that
-     * inlined catch -- an artifact of the test call shape, not of any
-     * production path -- which flaked the direct-call form on the larger
-     * (JIT-warming) CI suite.
+     * Verifies that recovery skips a segment whose first mapped header page lies beyond EOF.
      */
     @Test
     public void testHeaderFaultOnMapPastEofIsSkippableAnyFilesystem() throws Exception {
@@ -318,8 +294,8 @@ public class MmapSegmentRecoveryFaultTest {
             // page and the header read faults on it on any filesystem.
             truncateTo(path, 0L);
             MapPastEofFacade ff = new MapPastEofFacade(path, page);
-            // SegmentRing opens the sole segment through the facade, catches the
-            // converted MmapSegmentException, skips the file, and returns no ring.
+            // Keep the production SegmentRing call shape: a direct call can be inlined by JDK 8 C2 and let the
+            // asynchronous unsafe-access InternalError bypass the conversion in this test-only call frame.
             assertNull("a beyond-EOF header page must be skipped, not recovered or fatal",
                     SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
             // Guard against a silent pass: the skip must be the beyond-EOF mmap
