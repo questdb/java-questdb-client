@@ -3933,6 +3933,33 @@ public class QwpWebSocketSender implements Sender {
         ObjList<String> fromFrames = new ObjList<>();
         long coverage = cursorEngine.collectReplaySymbolsAbove(baseline, fromFrames);
         if (coverage < 0) {
+            // A gap: the surviving frames reference ids below their own delta start,
+            // introduced by frames since acked and trimmed away, and the persisted
+            // dictionary no longer holds them (a host crash tore its unsynced tail, or it
+            // could not be opened). That gap only matters for frames that will REPLAY.
+            // When every recovered committed frame is already acked
+            // (ackedFsn >= recoveredCommitBoundaryFsn), NOTHING replays: the gap is in
+            // data the server already has, and the retired orphan-deferred tail above the
+            // commit boundary is never transmitted. Throwing here would raise a false
+            // "resend required" for delivered data AND -- because such a slot is fully
+            // drained -- let build()'s connect-path close unlink the (already-delivered)
+            // bytes the quarantine claims to preserve. So DON'T throw: seed the intact
+            // prefix only, leaving fromFrames unused exactly as the send loop's mirror
+            // does on a -1 (it adds nothing), so the producer baseline and the mirror's
+            // sentDictCount still agree by construction. The producer resumes above the
+            // prefix and the fully-drained slot is cleaned up on close.
+            long ackedFsn = cursorEngine.ackedFsn();
+            long commitBoundaryFsn = cursorEngine.recoveredCommitBoundaryFsn();
+            if (ackedFsn >= commitBoundaryFsn) {
+                sentMaxSymbolId = globalSymbolDictionary.size() - 1;
+                LOG.info("recovered store-and-forward slot has a torn/incomplete symbol dictionary, "
+                                + "but every committed frame was already acked so nothing needs replaying; "
+                                + "resuming on the intact prefix without quarantine and without data loss "
+                                + "[recoveredPrefixSize={}, ackedFsn={}, commitBoundaryFsn={}]",
+                        baseline, ackedFsn, commitBoundaryFsn);
+                return;
+            }
+            // Genuine loss: unacked committed frames reference ids nothing still holds.
             // Typed, because Sender.build() sets such a slot aside instead of failing: this
             // is the point at which every source of truth has been tried and none of them
             // holds the missing ids. See UnreplayableSlotException.

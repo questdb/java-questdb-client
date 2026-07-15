@@ -249,6 +249,62 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testFullyAckedTornSlotResumesInPlaceWithoutQuarantine() throws Exception {
+        // M1 regression -- the ACKED counterpart to
+        // testTrimmedRegisteringFramesAreUnreplayableAndTheSlotIsSetAside. The on-disk
+        // tear is IDENTICAL (earliest segment trimmed, .symbol-dict torn to its header,
+        // so the surviving frames' deltas start above ids nothing on disk still holds),
+        // but here every committed frame was already ACKED before the crash. Nothing is
+        // left to replay, so the "gap" is entirely in data the server already has.
+        //
+        // seedGlobalDictionaryFromPersisted must therefore NOT raise
+        // UnreplayableSlotException. Quarantining a fully-delivered slot would fire a
+        // false "resend required" alarm AND -- because such a slot is fully drained --
+        // let build()'s connect-path close unlink the (already-delivered) bytes the
+        // quarantine claims to preserve. The slot must resume IN PLACE.
+        //
+        // Before the fix the gap detector ignored ack state and threw, so this slot was
+        // set aside as default.unreplayable-0 with a "resend required" error for data the
+        // server had already acknowledged.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            // Mark every committed frame acked. writeAndTearUnreplayableSlot writes 12
+            // frames (FSNs 0..11), so stamping the watermark at 11 makes
+            // ackedFsn == recoveredCommitBoundaryFsn: a torn dictionary with nothing left
+            // to replay. (Not higher than 11 -- that would make the resuming producer's
+            // next frame look pre-acked.)
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            writeAckWatermark(slot.resolve(".ack-watermark"), 11);
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // build() must succeed WITHOUT setting the slot aside, and the producer
+                // must keep working on the SAME slot.
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
+                        Thread.sleep(20);
+                    }
+                }
+            }
+            // The fully-acked slot was NOT quarantined: no set-aside copy exists (the
+            // inverse of assertUnreplayableSlotSetAside), and the sender resumed on the
+            // original slot.
+            Assert.assertFalse("a fully-acked torn slot must NOT be quarantined -- its data "
+                            + "was already delivered, so there is nothing to resend",
+                    java.nio.file.Files.isDirectory(Paths.get(sfDir, "default.unreplayable-0")));
+            Assert.assertTrue("the sender must resume on the original slot",
+                    java.nio.file.Files.isDirectory(slot));
+        });
+    }
+
     private static int countSegmentFiles(java.nio.file.Path dir) {
         java.io.File[] files = dir.toFile().listFiles();
         int n = 0;
