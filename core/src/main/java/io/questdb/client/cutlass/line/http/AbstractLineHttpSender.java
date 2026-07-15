@@ -715,9 +715,12 @@ public abstract class AbstractLineHttpSender implements Sender {
                 response.await(remainingMillis);
                 DirectUtf8Sequence statusCode = response.getStatusCode();
                 if (isSuccessResponse(statusCode)) {
-                    // bound the body drain by the whole per-flush budget (base + throughput extension), NOT the
-                    // raw request_timeout: recv() otherwise inherits defaultTimeout, so a tuned-low request_timeout
-                    // paired with request_min_throughput would abort a large, still-progressing chunked body
+                    // pass the whole per-flush budget (base + throughput extension) as EACH recv() read's
+                    // timeout, NOT the raw request_timeout: recv() otherwise inherits defaultTimeout, so a
+                    // tuned-low request_timeout paired with request_min_throughput would abort a large,
+                    // still-progressing chunked body. This bounds each read, not the whole body cumulatively -
+                    // fine here because the ILP server is trusted (unlike OidcDeviceAuth.parseBody, which also
+                    // caps total bytes and wall-clock time against an untrusted identity provider).
                     consumeChunkedResponse(response, actualTimeoutMillis); // if any
                     if (keepAliveDisabled(response)) {
                         // Server has HTTP keep-alive disabled, and it's closing this TCP connection.

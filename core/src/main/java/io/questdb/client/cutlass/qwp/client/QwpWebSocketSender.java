@@ -145,8 +145,10 @@ public class QwpWebSocketSender implements Sender {
     // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
     // so the initial connect and every reconnect re-handshake carry the current token. May be null
     // when no auth is configured. Evaluated once per (re)connect round in buildAndConnect, before the
-    // endpoint walk (not once per endpoint); a throwing provider propagates to the connectWithRetry
-    // reconnect wrapper, which retries it within the reconnect budget and surfaces the provider's message.
+    // endpoint walk (not once per endpoint); a throwing provider is wrapped as
+    // QwpCredentialUnavailableException: the foreground/SYNC initial connect fails fast with the provider's
+    // own exception, while the running background drainer treats it as a transient outage and retries it
+    // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
     private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
@@ -2811,20 +2813,23 @@ public class QwpWebSocketSender implements Sender {
         // javadoc documents - NOT once per endpoint: a token-provider failure is cluster-wide (a failed silent
         // refresh, or not signed in), not a per-endpoint transport fault, so re-querying it per endpoint would
         // hammer the token endpoint with the same dead credential and mislabel the failure as "all endpoints
-        // unreachable". A throw here propagates to the connectWithRetry reconnect wrapper, which retries it
-        // within the reconnect budget like any other connect failure and surfaces the provider's own message,
-        // so a transient failed refresh recovers and only a persistent one terminates the sender (this
-        // transport's documented reconnect model). Mirrors QwpQueryClient, which likewise resolves the
-        // credential once before its endpoint walk.
+        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the
+        // foreground/SYNC initial connect unwraps it and fails fast with the provider's own message, while the
+        // running background drainer treats it as a transient outage and retries it indefinitely with capped
+        // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
+        // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
+        // Mirrors QwpQueryClient, which likewise resolves the credential once before its endpoint walk.
         final String authHeader;
         try {
             authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
         } catch (RuntimeException e) {
-            // Tag the failure CLASS before it reaches a retry loop: a credential we cannot acquire is not a
-            // transport outage, so the background reconnect loop must not retry it forever under Invariant B
-            // -- it bounds this class by the reconnect budget and then terminates with the provider's message.
-            // A foreground connect unwraps this and rethrows the provider's own exception, so build() still
-            // surfaces the provider's error directly rather than an internal wrapper.
+            // Tag the failure CLASS so each context applies the right policy: a credential we cannot acquire is
+            // not a transport outage. A foreground/SYNC connect unwraps this and rethrows the provider's own
+            // exception, so build() surfaces the provider's error directly rather than an internal wrapper. The
+            // running background drainer, by contrast, treats it as a transient outage and retries it
+            // indefinitely under Invariant B -- never bounding it by the reconnect budget, never latching a
+            // terminal -- so a recoverable credential outage never drops a producer store-and-forward promised
+            // to keep alive.
             throw new QwpCredentialUnavailableException(e);
         }
         while (true) {

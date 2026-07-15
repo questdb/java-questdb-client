@@ -495,8 +495,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * {@link Builder#httpTimeoutMillis(int)} and still failing fast the moment an interactive sign-in or
      * {@link #close()} begins meanwhile. It is not, otherwise, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint (and, with a
-     * coordinating {@link TokenStore}, may first wait briefly to acquire the store's per-identity lock - a few
-     * seconds at most for {@link FileTokenStore}, then it proceeds without the lock - before that round-trip).
+     * coordinating {@link TokenStore}, may first wait to acquire the store's per-identity lock before that
+     * round-trip). For {@link FileTokenStore} the CROSS-process file lock is bounded to a few seconds and then
+     * proceeds without it; but the IN-process lock that serializes two instances sharing one identity in the
+     * same JVM (an ILP {@code Sender} and a {@code QwpQueryClient}, say) is not time-bounded, so such a
+     * concurrent caller instead waits out the peer's whole refresh - itself bounded only by the OS connect
+     * stall described next, not by a few seconds.
      * The send, response wait and body parse of that round-trip are each bounded by
      * {@link Builder#httpTimeoutMillis(int)} (30s by default); the connection phase that precedes them - DNS
      * resolution, the TCP connect and the TLS handshake - is bounded by the OS, not by httpTimeoutMillis, so an

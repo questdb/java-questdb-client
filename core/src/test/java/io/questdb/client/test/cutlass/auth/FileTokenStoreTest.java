@@ -206,8 +206,8 @@ public class FileTokenStoreTest {
             // which two holders can briefly run concurrently. That residual needs three or more contenders and
             // degrades only to one extra token refresh (a re-prompt on a rotating-refresh-token IdP), never a
             // torn or forged credential, since the Layer-1 atomic-rename write is independent of the lock.
-            // testConcurrentStealContentionTwoWayPreservesMutualExclusion pins the exclusion the atomic capture
-            // does guarantee, deterministically, with two contenders.
+            // testSameProcessContendersSerializeAndBothStealStaleLock covers the two-contender same-JVM case
+            // (where PROCESS_LOCKS, not the file-lock capture, provides the exclusion it asserts).
             final int threads = 4;
             AtomicInteger ran = new AtomicInteger();
             TokenStore.CriticalSection section = () -> {
@@ -235,7 +235,7 @@ public class FileTokenStoreTest {
     }
 
     @Test
-    public void testConcurrentStealContentionTwoWayPreservesMutualExclusion() throws Exception {
+    public void testSameProcessContendersSerializeAndBothStealStaleLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
             Files.createDirectories(dir);
@@ -245,15 +245,16 @@ public class FileTokenStoreTest {
             Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
             Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
 
-            // TWO processes race to steal the one abandoned lock. With exactly two contenders the steal is
-            // deterministically mutually exclusive: the atomic capture (rename) lets exactly one steal the
-            // abandoned lock, and once a winner holds a freshly-stamped lock the loser reads that live stamp,
-            // judges it not stale (the 60s window far exceeds each ~100ms hold) and waits rather than stealing
-            // it; the empty-lock grace likewise stops the loser stealing the winner's lock in its brief
-            // create->stamp gap. The three-actor residual stealIfStale documents - a peer recreating the lock
-            // while a second captures it AND a third claims the freed path - structurally cannot arise with two
-            // threads, so exclusion holds exactly here (the N-way best-effort path is
-            // testConcurrentStealContentionDegradesCleanly).
+            // Two threads of the SAME JVM contend for the one abandoned lock. SCOPE NOTE: the mutual exclusion
+            // asserted below (overlaps==0, maxInside==1) is provided by the in-process PROCESS_LOCKS
+            // ReentrantLock, which inLock() takes on key.hash() BEFORE any file-lock logic - so it would hold
+            // even if the file-lock steal were broken. What this test genuinely proves is that two same-process
+            // contenders each steal the stale lock and run their critical section (ran==2), serialized, without
+            // leaving an orphaned capture temp (assertNoCaptureTempFiles). The CROSS-process capture-verify in
+            // stealIfStale - that among separate OS PROCESSES exactly one steal wins - is masked by PROCESS_LOCKS
+            // here and cannot be exercised in a single JVM; it is verified by inspection, and a two-holder
+            // outcome is a documented best-effort residual anyway. The N-way degrade path is
+            // testConcurrentStealContentionDegradesCleanly.
             final int threads = 2;
             AtomicInteger inside = new AtomicInteger();
             AtomicInteger maxInside = new AtomicInteger();
@@ -286,7 +287,7 @@ public class FileTokenStoreTest {
             }
 
             Assert.assertEquals("every contender must run its critical section", threads, ran.get());
-            Assert.assertEquals("the steal must never admit two holders at once", 0, overlaps.get());
+            Assert.assertEquals("same-process contenders must never overlap (PROCESS_LOCKS serializes them)", 0, overlaps.get());
             Assert.assertEquals("at most one holder at a time", 1, maxInside.get());
             assertNoCaptureTempFiles(dir, key);
         });
