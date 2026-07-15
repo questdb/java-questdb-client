@@ -394,6 +394,10 @@ public class DeltaDictRecoveryTest {
                     while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
                         Thread.sleep(20);
                     }
+                    Assert.assertEquals(
+                            "the resumed sender must deliver new data from the original slot",
+                            Arrays.asList("after-recovery"),
+                            handler.dictSnapshot());
                 }
             }
             // The fully-acked slot was NOT quarantined: no set-aside copy exists (the
