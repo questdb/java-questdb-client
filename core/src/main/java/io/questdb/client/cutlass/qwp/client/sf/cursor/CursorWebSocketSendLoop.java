@@ -197,6 +197,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
+    // Test seam: when true, appendSymbolToMirror throws instead of appending,
+    // simulating the native realloc OOM (or MAX_SENT_DICT_BYTES ceiling) that
+    // ensureSentDictCapacity can raise while the constructor seeds the recovery
+    // mirror. Lets a test prove the constructor frees the already-malloc'd mirror on
+    // such a throw rather than leaking it. Production never sets it; volatile only so
+    // a test thread's write is visible to the loop under test.
+    @TestOnly
+    static volatile boolean forceMirrorSeedFailureForTest;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
     private final long durableAckKeepaliveIntervalNanos;
@@ -717,11 +725,30 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // nothing and cost a catch-up frame on every connection -- full-dict slots must stay
         // catch-up-free.
         if (engine.recoveredMaxSymbolDeltaStart() > 0L) {
-            ObjList<String> fromFrames = new ObjList<>();
-            if (engine.collectReplaySymbolsAbove(sentDictCount, fromFrames) >= 0) {
-                for (int i = 0, n = fromFrames.size(); i < n; i++) {
-                    appendSymbolToMirror(fromFrames.getQuick(i));
+            // The prefix seed above may already have malloc'd the mirror, and
+            // appendSymbolToMirror -> ensureSentDictCapacity can still throw here (a
+            // native realloc OOM, or the MAX_SENT_DICT_BYTES ceiling). Such a throw
+            // propagates out of the constructor, so the half-built loop is never
+            // assigned to a reference -- neither ensureConnected's catch nor
+            // BackgroundDrainer's finally can close() it -- and the mirror would leak.
+            // Free it on any throw so the constructor leaves nothing behind, mirroring
+            // the loopNeverRan free in close() / ioLoop's exit.
+            try {
+                ObjList<String> fromFrames = new ObjList<>();
+                if (engine.collectReplaySymbolsAbove(sentDictCount, fromFrames) >= 0) {
+                    for (int i = 0, n = fromFrames.size(); i < n; i++) {
+                        appendSymbolToMirror(fromFrames.getQuick(i));
+                    }
                 }
+            } catch (Throwable t) {
+                if (sentDictBytesAddr != 0) {
+                    Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
+                    sentDictBytesAddr = 0;
+                    sentDictBytesCapacity = 0;
+                    sentDictBytesLen = 0;
+                    sentDictCount = 0;
+                }
+                throw t;
             }
         }
         this.fsnAtZero = fsnAtZero;
@@ -2299,6 +2326,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * construction; {@link #accumulateSentDict} extends it from live frames thereafter.
      */
     private void appendSymbolToMirror(CharSequence symbol) {
+        if (forceMirrorSeedFailureForTest) {
+            // Simulate a native realloc OOM on the seed path (see the field).
+            throw new LineSenderException("simulated mirror seed allocation failure (test only)");
+        }
         int utf8Len = Utf8s.utf8Bytes(symbol);
         int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len;
         ensureSentDictCapacity((long) sentDictBytesLen + wireLen);

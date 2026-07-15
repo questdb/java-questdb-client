@@ -223,32 +223,7 @@ public class DeltaDictRecoveryTest {
         // retained on close, so every retry re-recovered the same slot and threw again, and the
         // application could not construct a Sender at all -- it could not even buffer new rows.
         assertMemoryLeak(() -> {
-            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-                int port = silent.getPort();
-                silent.start();
-                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-                // Small segments so the frames roll into several files and the earliest ones
-                // can be trimmed away independently.
-                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_bytes=256;close_flush_timeout_millis=0;";
-                try (Sender s1 = Sender.fromConfig(cfg)) {
-                    for (int i = 0; i < 12; i++) {
-                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
-                        s1.flush();
-                    }
-                }
-            }
-
-            java.nio.file.Path slot = Paths.get(sfDir, "default");
-            Assert.assertTrue("the frames must have rolled into more than one segment",
-                    countSegmentFiles(slot) > 1);
-            // TRIM the segment that holds the earliest frames -- munmap + unlink is exactly what
-            // SegmentManager does once they are acked. Their symbols are now gone from disk.
-            java.nio.file.Files.delete(slot.resolve("sf-initial.sfa"));
-            // ...and the dictionary is torn away as well, so nothing holds them at all.
-            java.nio.file.Path dict = slot.resolve(".symbol-dict");
-            java.nio.file.Files.write(dict,
-                    Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8));
+            writeAndTearUnreplayableSlot();
 
             DictReconstructingHandler handler = new DictReconstructingHandler();
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
@@ -285,6 +260,82 @@ public class DeltaDictRecoveryTest {
             }
         }
         return n;
+    }
+
+    @Test
+    public void testQuarantineFailsLoudlyWhenAllSlotNamesSaturated() throws Exception {
+        // M2 regression: when a recovered slot is genuinely unreplayable, build() sets
+        // it aside (quarantineTornSlot) and starts the producer on a fresh slot. But if
+        // it cannot free the slot name -- here every default.unreplayable-<i> candidate
+        // up to MAX_QUARANTINE_SLOT_ATTEMPTS (64) already exists -- it MUST fail LOUDLY:
+        // throw and leave the slot's bytes on disk for a manual resend, never silently
+        // drop data. Only the happy rename path was covered before.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            // Saturate every quarantine candidate so quarantineTornSlot's rename loop
+            // finds no free name.
+            for (int i = 0; i < 64; i++) {
+                java.nio.file.Files.createDirectories(Paths.get(sfDir, "default.unreplayable-" + i));
+            }
+
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                Sender s = null;
+                try {
+                    s = Sender.fromConfig(cfg);
+                    Assert.fail("build() must throw when the unreplayable slot cannot be set aside");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue("unexpected message: " + expected.getMessage(),
+                            expected.getMessage().contains("too many quarantined slots already under")
+                                    && expected.getMessage().contains("moved or removed by hand"));
+                } finally {
+                    if (s != null) {
+                        s.close();
+                    }
+                }
+            }
+            // The unreplayable slot's bytes must survive on disk for a manual resend --
+            // the guard fails loudly rather than dropping data.
+            Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(slot));
+            Assert.assertTrue("the slot's segment data must be preserved",
+                    countSegmentFiles(slot) >= 1);
+        });
+    }
+
+    // Writes 12 delta frames (each introducing a new symbol) into the default slot
+    // across several small segments, then makes the slot GENUINELY unreplayable: trims
+    // the segment holding the earliest ids (munmap + unlink, exactly what SegmentManager
+    // does once they are acked) and tears the .symbol-dict down to its header, so the
+    // surviving frames' deltas start above ids nothing on disk still holds. Recovering
+    // such a slot throws UnreplayableSlotException.
+    private void writeAndTearUnreplayableSlot() throws Exception {
+        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+            int port = silent.getPort();
+            silent.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            // Small segments so the frames roll into several files and the earliest ones
+            // can be trimmed away independently.
+            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                    + ";sf_max_bytes=256;close_flush_timeout_millis=0;";
+            try (Sender s1 = Sender.fromConfig(cfg)) {
+                for (int i = 0; i < 12; i++) {
+                    s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                    s1.flush();
+                }
+            }
+        }
+        java.nio.file.Path slot = Paths.get(sfDir, "default");
+        Assert.assertTrue("the frames must have rolled into more than one segment",
+                countSegmentFiles(slot) > 1);
+        // TRIM the segment that holds the earliest frames.
+        java.nio.file.Files.delete(slot.resolve("sf-initial.sfa"));
+        // ...and tear the dictionary away as well, so nothing holds those ids at all.
+        java.nio.file.Path dict = slot.resolve(".symbol-dict");
+        java.nio.file.Files.write(dict, Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8));
     }
 
     @Test

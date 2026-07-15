@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
@@ -156,6 +157,63 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         }
     }
 
+    @Test
+    public void testCtorFreesSeededMirrorWhenFrameSeedThrows() throws Exception {
+        // C1 regression: the constructor seeds the recovery mirror in TWO steps -- a
+        // malloc from the persisted dictionary's intact prefix, then an extension from
+        // the surviving frames' own deltas (appendSymbolToMirror). If that second step
+        // throws (a native realloc OOM, or the MAX_SENT_DICT_BYTES ceiling), the throw
+        // leaves the constructor with the object unpublished, so neither
+        // ensureConnected's catch nor BackgroundDrainer's finally can ever close() it --
+        // and the already-malloc'd prefix mirror leaks. The constructor must free it on
+        // the throw. Pre-fix, the mirror leaks here and assertMemoryLeak fails.
+        Path sfDir = Files.createTempDirectory("qwp-mirror-ctor-throw");
+        try {
+            // A torn-dict SUBSET: three delta frames a@0,b@1,c@2 survive on disk, but the
+            // .symbol-dict is rewritten to hold only [a,b] (a host-crash tail tear). On
+            // recovery pd.size()==2 seeds (mallocs) the mirror, then the frame-seed
+            // rebuilds c@2 from the surviving frame -- the append the fault interrupts.
+            populateThreeFrameSlot(sfDir);
+            Path slot = sfDir.resolve("default");
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull(torn);
+                torn.appendSymbol("a");
+                torn.appendSymbol("b");
+                Assert.assertEquals(2, torn.size());
+            }
+
+            assertMemoryLeak(() -> {
+                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                    PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                    Assert.assertNotNull("recovery must open the torn subset dict", pd);
+                    Assert.assertEquals("prefix seed must malloc a 2-entry mirror", 2, pd.size());
+                    Assert.assertTrue("the frame-seed path must run (frames out-reach the dict)",
+                            engine.recoveredMaxSymbolDeltaStart() > 0L);
+
+                    setMirrorSeedFault(true);
+                    try {
+                        new CursorWebSocketSendLoop(
+                                null, engine, 0, 1_000_000L,
+                                () -> {
+                                    throw new IOException("no reconnect in this test");
+                                },
+                                0, 0, 1);
+                        Assert.fail("ctor must propagate the injected mirror-seed failure");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue("unexpected message: " + expected.getMessage(),
+                                expected.getMessage().contains("simulated mirror seed allocation failure"));
+                    } finally {
+                        setMirrorSeedFault(false);
+                    }
+                    // The outer assertMemoryLeak proves the prefix-seeded mirror the ctor
+                    // malloc'd was freed on the throw -- pre-fix it leaks here.
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
     // Constructs a recovery send loop but does NOT start it: the ctor seeds the
     // catch-up mirror synchronously, which is all these tests observe. The
     // reconnect factory is never invoked.
@@ -189,10 +247,41 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         }
     }
 
+    // Three delta frames a@0, b@1, c@2, nothing acked, so all three survive and
+    // replay from frame 0. Paired with a dictionary truncated to [a,b], this is a
+    // torn-dict SUBSET whose recovery drives the constructor's frame-seed path.
+    private static void populateThreeFrameSlot(Path sfDir) throws Exception {
+        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+            int port = silent.getPort();
+            silent.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + port
+                    + ";sf_dir=" + sfDir
+                    + ";close_flush_timeout_millis=0;";
+            try (Sender s = Sender.fromConfig(cfg)) {
+                s.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                s.flush();
+                s.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                s.flush();
+                s.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                s.flush();
+            }
+        }
+    }
+
     private static int readInt(CursorWebSocketSendLoop loop, String name) throws Exception {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
         f.setAccessible(true);
         return f.getInt(loop);
+    }
+
+    // Toggles the loop's @TestOnly mirror-seed fault flag. Reflection because the
+    // flag is package-private in the production package (this test is in a sibling
+    // test package), the same non-reflective-path-unavailable reason readInt uses.
+    private static void setMirrorSeedFault(boolean value) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField("forceMirrorSeedFailureForTest");
+        f.setAccessible(true);
+        f.setBoolean(null, value);
     }
 
     private static void rmDir(Path dir) throws IOException {
