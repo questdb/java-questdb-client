@@ -13,10 +13,14 @@ import java.util.concurrent.Future;
  * Row-API ingress bench over QWP/WebSocket, mirroring the cadence of
  * examples/qwp_ingress_c.c in c-questdb-client: append rows per batch, flush
  * per {@code MAX_BATCH_ROWS}, ack checkpoint every {@link #CHECKPOINT_BATCHES}
- * batches, final ack wait. Java's {@link Sender} has no offline wire-staging
- * API, so unlike the C twin this bench has a single e2e path ("row-flush");
- * the floor/e2e asymmetry versus C is documented via that single path in the
- * JSON report rather than measured directly.
+ * batches, final ack wait. {@code RUN_MODE} selects {@code full} (default),
+ * {@code e2e}, or {@code floor}. Java's {@link Sender} has no offline
+ * wire-staging API, so the row-build floor is measured via
+ * {@link #floorPass}: single-threaded, {@code reset()} per batch through the
+ * connected Sender's own buffer -- unlike the Rust twin's standalone offline
+ * {@code Buffer}, so this floor includes inline global-symbol-dict resolution
+ * and requires a live server. Floor mode still creates the table and
+ * connects all {@code SENDERS}.
  */
 public final class IngressBench {
     static final int CHECKPOINT_BATCHES = (int) Env.zu("CHECKPOINT_BATCHES", 64);
