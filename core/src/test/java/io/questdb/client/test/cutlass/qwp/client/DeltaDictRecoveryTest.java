@@ -27,10 +27,13 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
@@ -46,9 +49,11 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -245,6 +250,103 @@ public class DeltaDictRecoveryTest {
                 // unreplayable slot does.
                 Assert.assertEquals("the producer must keep producing on its fresh slot",
                         Arrays.asList("after-recovery"), handler.dictSnapshot());
+            }
+        });
+    }
+
+    @Test
+    public void testQueuedOrphanCannotAdoptSlotWhileQuarantineRecreatesItsName() throws Exception {
+        // Sender 1 leaves a genuinely unreplayable default slot. Sender 2 recovers it,
+        // closes the directory-local lock, quarantines the directory and recreates the
+        // default pathname. A scanner may already have queued that pathname before sender
+        // 2 starts; the queued drainer must not acquire the old lock inode in the close ->
+        // rename gap and later issue path-based writes/unlinks against sender 2's fresh slot.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            ObjList<String> scannerSnapshot = OrphanScanner.scan(sfDir, "other-sender");
+            Assert.assertEquals(1, scannerSnapshot.size());
+            String staleSnapshotPath = scannerSnapshot.get(0);
+
+            CountDownLatch producerInRenameGap = new CountDownLatch(1);
+            CountDownLatch allowQuarantineRename = new CountDownLatch(1);
+            AtomicReference<Sender> recoveredSender = new AtomicReference<>();
+            AtomicReference<Throwable> recoveryFailure = new AtomicReference<>();
+            Thread recoveryThread = null;
+            Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(() -> {
+                producerInRenameGap.countDown();
+                try {
+                    if (!allowQuarantineRename.await(15, TimeUnit.SECONDS)) {
+                        throw new AssertionError("timed out waiting to finish quarantine rename");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("quarantine hook interrupted", e);
+                }
+            });
+            try {
+                DictReconstructingHandler handler = new DictReconstructingHandler();
+                try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                    int port = good.getPort();
+                    good.start();
+                    Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                    String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+
+                    recoveryThread = new Thread(() -> {
+                        try {
+                            recoveredSender.set(Sender.fromConfig(cfg));
+                        } catch (Throwable t) {
+                            recoveryFailure.set(t);
+                        }
+                    }, "qwp-quarantine-recovery");
+                    recoveryThread.start();
+                    Assert.assertTrue("recovering sender did not reach the quarantine gap",
+                            producerInRenameGap.await(10, TimeUnit.SECONDS));
+
+                    BackgroundDrainer queuedDrainer = new BackgroundDrainer(
+                            staleSnapshotPath, 256, 8192, () -> null,
+                            1000, 1, 10, true, 0);
+                    Thread drainerThread = new Thread(queuedDrainer, "qwp-queued-orphan");
+                    drainerThread.start();
+                    drainerThread.join(5_000);
+                    Assert.assertFalse("queued drainer must not wait on or adopt the old inode",
+                            drainerThread.isAlive());
+                    Assert.assertEquals(BackgroundDrainer.DrainOutcome.LOCKED_BY_OTHER,
+                            queuedDrainer.outcome());
+
+                    allowQuarantineRename.countDown();
+                    recoveryThread.join(10_000);
+                    Assert.assertFalse("recovering sender did not finish", recoveryThread.isAlive());
+                    if (recoveryFailure.get() != null) {
+                        throw new AssertionError("recovering sender failed", recoveryFailure.get());
+                    }
+                    Sender sender = recoveredSender.get();
+                    Assert.assertNotNull(sender);
+                    sender.table("m").symbol("s", "after-race").longColumn("v", 99).atNow();
+                    sender.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
+                        Thread.sleep(20);
+                    }
+                    sender.close();
+                    recoveredSender.set(null);
+
+                    assertUnreplayableSlotSetAside();
+                    Assert.assertEquals("fresh producer slot must remain intact and usable",
+                            Arrays.asList("after-race"), handler.dictSnapshot());
+                }
+            } finally {
+                allowQuarantineRename.countDown();
+                if (recoveryThread != null) {
+                    recoveryThread.join(10_000);
+                    if (recoveryThread.isAlive()) {
+                        recoveryThread.interrupt();
+                    }
+                }
+                Sender sender = recoveredSender.getAndSet(null);
+                if (sender != null) {
+                    sender.close();
+                }
+                Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(null);
             }
         });
     }

@@ -104,6 +104,30 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testLogicalLockRemainsContendedAcrossSlotRenameAndRecreate() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/rename";
+            String moved = parentDir + "/rename.quarantined";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+
+            try (SlotLock ignored = SlotLock.acquireLogical(slot)) {
+                assertEquals(0, Files.rename(slot, moved));
+                assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+
+                try (SlotLock unexpected = SlotLock.acquireLogical(slot)) {
+                    fail("logical slot lock must survive rename and recreate");
+                } catch (IllegalStateException expected) {
+                    assertTrue(expected.getMessage().contains("already in use"));
+                }
+            }
+
+            try (SlotLock reacquired = SlotLock.acquireLogical(slot)) {
+                assertEquals(slot, reacquired.slotDir());
+            }
+        });
+    }
+
+    @Test
     public void testTwoDifferentSlotsCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slotA = parentDir + "/a";

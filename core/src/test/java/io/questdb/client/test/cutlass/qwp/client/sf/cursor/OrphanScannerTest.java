@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
@@ -318,6 +319,30 @@ public class OrphanScannerTest {
             OrphanScanner.markFailed(slot, "x");
             assertFalse("slot with .failed is not a candidate",
                     OrphanScanner.isCandidateOrphan(slot));
+        });
+    }
+
+    @Test
+    public void testDrainerRevalidatesStaleScannerSnapshotBeforeCreatingEngine() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = sfDir + "/stale";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            String segment = slot + "/sf-0001.sfa";
+            touchFile(segment);
+            assertTrue(OrphanScanner.isCandidateOrphan(slot));
+
+            // The scanner has already queued this pathname, but another owner
+            // drains/removes its last segment before the worker gets to run.
+            assertTrue(Files.remove(segment));
+            BackgroundDrainer drainer = new BackgroundDrainer(
+                    slot, 1024, 8192, () -> {
+                throw new AssertionError("a stale candidate must not connect");
+            }, 1000, 1, 10, true, 0);
+            drainer.run();
+
+            assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+            assertFalse("stale adoption must not create the directory-local lock",
+                    Files.exists(slot + "/.lock"));
         });
     }
 

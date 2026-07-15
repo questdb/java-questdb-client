@@ -33,10 +33,14 @@ import io.questdb.client.std.Unsafe;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Advisory exclusive lock for a single SF slot directory.
+ * Advisory exclusive locks for a single SF slot.
  * <p>
- * One {@code .lock} file per slot, held via {@code flock}/{@code LockFileEx}
- * for the entire lifetime of the engine that owns the slot. The lock is
+ * {@link #acquire(String)} locks a {@code .lock} file inside the slot directory
+ * for the entire lifetime of the engine that owns it. {@link #acquireLogical(String)}
+ * locks a sibling file under the parent SF directory for short-lived pathname
+ * transitions and orphan adoption; because it is outside the slot directory,
+ * it remains stable if that directory is renamed. Both use
+ * {@code flock}/{@code LockFileEx}. A lock is
  * automatically released when the fd is closed — including on hard process
  * exit, since the kernel cleans up file locks for terminated processes.
  * <p>
@@ -58,6 +62,7 @@ public final class SlotLock implements QuietCloseable {
 
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
+    private static final String LOGICAL_LOCK_DIR_NAME = ".slot-locks";
     private final String slotDir;
     private int fd;
 
@@ -75,18 +80,42 @@ public final class SlotLock implements QuietCloseable {
      *                               or lock contention.
      */
     public static SlotLock acquire(String slotDir) {
-        if (slotDir == null || slotDir.isEmpty()) {
-            throw new IllegalArgumentException("slotDir must not be empty");
-        }
-        if (!Files.exists(slotDir)) {
-            int rc = Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT);
-            if (rc != 0) {
-                throw new IllegalStateException(
-                        "could not create slot dir: " + slotDir + " rc=" + rc);
-            }
-        }
+        validateSlotDir(slotDir);
+        ensureDirectory(slotDir, "slot dir");
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
+        return acquireAt(slotDir, lockPath, pidPath);
+    }
+
+    /**
+     * Acquires the stable logical lock for {@code slotDir}. Unlike the
+     * directory-local {@code .lock}, this lock is anchored in the parent SF
+     * directory, so renaming the slot cannot move the lock inode away from the
+     * logical slot name it guards.
+     * <p>
+     * Callers use this as a short-lived transition/adoption lock, always before
+     * acquiring the directory-local lock. In particular it must cover an
+     * unreplayable slot's close -&gt; rename -&gt; recreate transition, preventing a
+     * queued orphan drainer from adopting the renamed inode and later touching
+     * the fresh directory through the old pathname.
+     */
+    public static SlotLock acquireLogical(String slotDir) {
+        validateSlotDir(slotDir);
+        int separator = slotDir.lastIndexOf('/');
+        if (separator < 1 || separator == slotDir.length() - 1) {
+            throw new IllegalArgumentException(
+                    "slotDir must contain a parent and slot name: " + slotDir);
+        }
+        String parentDir = slotDir.substring(0, separator);
+        String slotName = slotDir.substring(separator + 1);
+        String logicalLockDir = parentDir + "/" + LOGICAL_LOCK_DIR_NAME;
+        ensureDirectory(logicalLockDir, "logical slot lock dir");
+        String lockPath = logicalLockDir + "/" + slotName + ".lock";
+        String pidPath = logicalLockDir + "/" + slotName + ".lock.pid";
+        return acquireAt(slotDir, lockPath, pidPath);
+    }
+
+    private static SlotLock acquireAt(String slotDir, String lockPath, String pidPath) {
         int fd = Files.openRW(lockPath);
         if (fd < 0) {
             throw new IllegalStateException(
@@ -108,6 +137,25 @@ public final class SlotLock implements QuietCloseable {
             if (!ok) {
                 Files.close(fd);
             }
+        }
+    }
+
+    private static void ensureDirectory(String path, String description) {
+        if (!Files.exists(path)) {
+            int rc = Files.mkdir(path, Files.DIR_MODE_DEFAULT);
+            // Multiple senders may create the shared parent lock directory
+            // concurrently. Treat EEXIST as success, just as the builder does
+            // for the SF root itself.
+            if (rc != 0 && !Files.exists(path)) {
+                throw new IllegalStateException(
+                        "could not create " + description + ": " + path + " rc=" + rc);
+            }
+        }
+    }
+
+    private static void validateSlotDir(String slotDir) {
+        if (slotDir == null || slotDir.isEmpty()) {
+            throw new IllegalArgumentException("slotDir must not be empty");
         }
     }
 

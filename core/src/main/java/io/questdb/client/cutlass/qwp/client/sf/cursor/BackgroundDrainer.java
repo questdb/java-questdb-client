@@ -44,7 +44,9 @@ import java.util.concurrent.locks.LockSupport;
  * <p>
  * Lifecycle:
  * <ol>
- *   <li>Acquire the slot's {@code .lock}; skip silently on contention.</li>
+ *   <li>Acquire the parent-anchored logical-slot lock and revalidate the
+ *       scanner snapshot; skip silently on contention or a stale snapshot.</li>
+ *   <li>Acquire the slot's {@code .lock}, then release the logical lock.</li>
  *   <li>Open a {@link CursorSendEngine} on the slot — recovery picks up
  *       every {@code .sfa} file already on disk.</li>
  *   <li>Open a fresh {@link WebSocketClient} via the supplied factory
@@ -529,26 +531,53 @@ public final class BackgroundDrainer implements Runnable {
     @Override
     public void run() {
         runnerThread = Thread.currentThread();
+        SlotLock logicalSlotLock = null;
         CursorSendEngine engine = null;
         WebSocketClient client = null;
         CursorWebSocketSendLoop loop = null;
         try {
-            // The engine acquires the slot's .lock itself — we don't need
-            // (and must not) double-lock it. If another sender or drainer
-            // holds it, the engine constructor throws and we exit silently
-            // (no .failed sentinel — contention is expected, not an error).
+            // Scanner results are only snapshots. Serialize adoption against
+            // a producer's close -> quarantine rename -> fresh-slot recreate
+            // transition, then revalidate while that stable parent-anchored
+            // lock is held. The slot's own .lock inode moves with a rename and
+            // cannot provide this guarantee by itself.
+            if (slotPath != null) {
+                try {
+                    logicalSlotLock = SlotLock.acquireLogical(slotPath);
+                } catch (IllegalStateException t) {
+                    if (isLockContention(t)) {
+                        LOG.info("orphan logical slot already locked, skipping: {} ({})",
+                                slotPath, t.getMessage());
+                        outcome = DrainOutcome.LOCKED_BY_OTHER;
+                        return;
+                    }
+                    throw t;
+                }
+                if (!OrphanScanner.isCandidateOrphan(slotPath)) {
+                    LOG.info("orphan candidate changed before adoption, skipping: {}", slotPath);
+                    outcome = DrainOutcome.SUCCESS;
+                    return;
+                }
+            }
+
+            // The engine acquires the directory-local .lock itself. Keep the
+            // lock order logical -> local, and release the short-lived logical
+            // lock only after the engine has secured stable ownership.
             try {
                 engine = new CursorSendEngine(slotPath, segmentSizeBytes,
                         sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
             } catch (IllegalStateException t) {
-                String msg = t.getMessage();
-                if (msg != null && msg.contains("already in use")) {
+                if (isLockContention(t)) {
                     LOG.info("orphan slot already locked, skipping: {} ({})",
-                            slotPath, msg);
+                            slotPath, t.getMessage());
                     outcome = DrainOutcome.LOCKED_BY_OTHER;
                     return;
                 }
                 throw t;
+            }
+            if (logicalSlotLock != null) {
+                logicalSlotLock.close();
+                logicalSlotLock = null;
             }
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
@@ -724,10 +753,18 @@ public final class BackgroundDrainer implements Runnable {
                             + "slot lock releases when it exits", slotPath);
                 }
             }
+            if (logicalSlotLock != null) {
+                logicalSlotLock.close();
+            }
             // Don't let a later requestStop() unpark an unrelated task that
             // the pool's executor may have scheduled onto this same thread.
             runnerThread = null;
         }
+    }
+
+    private static boolean isLockContention(IllegalStateException error) {
+        String message = error.getMessage();
+        return message != null && message.contains("already in use");
     }
 
     /**

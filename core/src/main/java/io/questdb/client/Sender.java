@@ -40,6 +40,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
@@ -1012,6 +1013,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_TCP = 0;
         private static final int PROTOCOL_UDP = 3;
         private static final int PROTOCOL_WEBSOCKET = 2;
+        @TestOnly
+        private static volatile Runnable quarantineAfterCloseHook;
         // Suffix for a slot set aside by quarantineTornSlot. Deliberately NOT the
         // sender's own slot name, so a restarted sender does not re-adopt it as its own;
         // quarantineTornSlot then marks it .failed, so the orphan drainer skips it too and
@@ -1559,91 +1562,101 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
                                 ? CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
                                 : sfAppendDeadlineMillis * 1_000_000L;
-                CursorSendEngine cursorEngine = new CursorSendEngine(
-                        slotPath, actualSfMaxBytes,
-                        actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
-                int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
-                        ? errorInboxCapacity
-                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
-                int actualConnectionListenerInboxCapacity = connectionListenerInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
-                        ? connectionListenerInboxCapacity
-                        : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher.DEFAULT_CAPACITY;
-                List<QwpWebSocketSender.Endpoint> wsEndpoints =
-                        new ArrayList<>(hosts.size());
-                for (int i = 0, n = hosts.size(); i < n; i++) {
-                    wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
-                }
-                // The recovery seed inside connect() is the authority on whether a recovered
-                // slot can be replayed: it rebuilds the dictionary from its intact prefix and
-                // then from the surviving frames' own delta sections, and throws
-                // UnreplayableSlotException only once neither source holds the missing ids.
-                // Quarantining on anything weaker would set aside slots that recovery can
-                // still rescue, so build() waits for that verdict rather than pre-judging it.
                 QwpWebSocketSender connected = null;
-                boolean quarantined = false;
-                while (connected == null) {
-                try {
-                    connected = QwpWebSocketSender.connect(
-                            wsEndpoints,
-                            wsTlsConfig,
-                            actualAutoFlushRows,
-                            actualAutoFlushBytes,
-                            actualAutoFlushIntervalNanos,
-                            wsAuthHeader,
-                            requestDurableAck,
-                            cursorEngine,
-                            actualCloseFlushTimeoutMillis,
-                            actualReconnectMaxDurationMillis,
-                            actualReconnectInitialBackoffMillis,
-                            actualReconnectMaxBackoffMillis,
-                            actualInitialConnectMode,
-                            errorHandler,
-                            actualErrorInboxCapacity,
-                            actualDurableAckKeepaliveIntervalMillis,
-                            authTimeoutMillis,
-                            connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
-                            connectionListener,
-                            actualConnectionListenerInboxCapacity,
-                            actualMaxFrameRejections,
-                            actualPoisonMinEscalationWindowMillis,
-                            actualCatchUpCapGapMinEscalationWindowMillis
-                    );
-                } catch (UnreplayableSlotException e) {
-                    // The one failure build() recovers from. The slot's frames reference ids
-                    // that nothing still holds, so they can never go on the wire -- but that is
-                    // no reason to take the producer down with them. Before this, the throw
-                    // escaped build() and, because senderId is stable and a not-fully-drained
-                    // slot is retained on close, every retry re-recovered the same slot and
-                    // threw again: the application could not construct a Sender at all, so it
-                    // could not even BUFFER new rows. An already-lost batch became an unbounded
-                    // outage of everything after it.
-                    //
-                    // Set the slot aside instead, keep its bytes for forensics and resend, and
-                    // start the producer on a clean one. Once only: a second such failure would
-                    // mean the FRESH slot is unreplayable, which cannot happen, so let it out
-                    // rather than loop.
-                    if (quarantined || slotPath == null) {
-                        try {
-                            cursorEngine.close();
-                        } catch (Throwable ignored) {
-                            // best-effort
-                        }
-                        throw e;
-                    }
-                    quarantined = true;
-                    cursorEngine = quarantineTornSlot(
-                            cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxBytes,
+                // The parent-anchored logical lock is stable across a slot rename. Keep it
+                // from before the directory-local lock is acquired until connect() has either
+                // adopted that engine or quarantine has closed, renamed and recreated it.
+                // This closes the inode-swap window in which an already-queued orphan drainer
+                // could otherwise acquire the renamed directory's old .lock and later operate
+                // on the fresh slot through the original pathname.
+                try (SlotLock logicalSlotLock = slotPath == null
+                        ? null
+                        : SlotLock.acquireLogical(slotPath)) {
+                    CursorSendEngine cursorEngine = new CursorSendEngine(
+                            slotPath, actualSfMaxBytes,
                             actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
-                } catch (Throwable t) {
-                    // connect() failed before ownership of cursorEngine
-                    // transferred — close it ourselves.
-                    try {
-                        cursorEngine.close();
-                    } catch (Throwable ignored) {
-                        // best-effort
+                    int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                            ? errorInboxCapacity
+                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
+                    int actualConnectionListenerInboxCapacity = connectionListenerInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
+                            ? connectionListenerInboxCapacity
+                            : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher.DEFAULT_CAPACITY;
+                    List<QwpWebSocketSender.Endpoint> wsEndpoints =
+                            new ArrayList<>(hosts.size());
+                    for (int i = 0, n = hosts.size(); i < n; i++) {
+                        wsEndpoints.add(new QwpWebSocketSender.Endpoint(hosts.getQuick(i), ports.getQuick(i)));
                     }
-                    throw t;
-                }
+                    // The recovery seed inside connect() is the authority on whether a recovered
+                    // slot can be replayed: it rebuilds the dictionary from its intact prefix and
+                    // then from the surviving frames' own delta sections, and throws
+                    // UnreplayableSlotException only once neither source holds the missing ids.
+                    // Quarantining on anything weaker would set aside slots that recovery can
+                    // still rescue, so build() waits for that verdict rather than pre-judging it.
+                    boolean quarantined = false;
+                    while (connected == null) {
+                        try {
+                            connected = QwpWebSocketSender.connect(
+                                    wsEndpoints,
+                                    wsTlsConfig,
+                                    actualAutoFlushRows,
+                                    actualAutoFlushBytes,
+                                    actualAutoFlushIntervalNanos,
+                                    wsAuthHeader,
+                                    requestDurableAck,
+                                    cursorEngine,
+                                    actualCloseFlushTimeoutMillis,
+                                    actualReconnectMaxDurationMillis,
+                                    actualReconnectInitialBackoffMillis,
+                                    actualReconnectMaxBackoffMillis,
+                                    actualInitialConnectMode,
+                                    errorHandler,
+                                    actualErrorInboxCapacity,
+                                    actualDurableAckKeepaliveIntervalMillis,
+                                    authTimeoutMillis,
+                                    connectTimeoutMillis == PARAMETER_NOT_SET_EXPLICITLY ? 0 : connectTimeoutMillis,
+                                    connectionListener,
+                                    actualConnectionListenerInboxCapacity,
+                                    actualMaxFrameRejections,
+                                    actualPoisonMinEscalationWindowMillis,
+                                    actualCatchUpCapGapMinEscalationWindowMillis
+                            );
+                        } catch (UnreplayableSlotException e) {
+                            // The one failure build() recovers from. The slot's frames reference ids
+                            // that nothing still holds, so they can never go on the wire -- but that is
+                            // no reason to take the producer down with them. Before this, the throw
+                            // escaped build() and, because senderId is stable and a not-fully-drained
+                            // slot is retained on close, every retry re-recovered the same slot and
+                            // threw again: the application could not construct a Sender at all, so it
+                            // could not even BUFFER new rows. An already-lost batch became an unbounded
+                            // outage of everything after it.
+                            //
+                            // Set the slot aside instead, keep its bytes for forensics and resend, and
+                            // start the producer on a clean one. Once only: a second such failure would
+                            // mean the FRESH slot is unreplayable, which cannot happen, so let it out
+                            // rather than loop.
+                            if (quarantined || slotPath == null) {
+                                try {
+                                    cursorEngine.close();
+                                } catch (Throwable ignored) {
+                                    // best-effort
+                                }
+                                throw e;
+                            }
+                            quarantined = true;
+                            cursorEngine = quarantineTornSlot(
+                                    cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxBytes,
+                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                        } catch (Throwable t) {
+                            // connect() failed before ownership of cursorEngine
+                            // transferred — close it ourselves.
+                            try {
+                                cursorEngine.close();
+                            } catch (Throwable ignored) {
+                                // best-effort
+                            }
+                            throw t;
+                        }
+                    }
                 }
                 // connect() succeeded — `connected` now owns cursorEngine
                 // via setCursorEngine(engine, true). From here on, ANY
@@ -3047,6 +3060,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // path already closed the engine; close() is idempotent, so make it explicit rather
             // than depend on that.
             torn.close();
+            Runnable hook = quarantineAfterCloseHook;
+            if (hook != null) {
+                hook.run();
+            }
 
             String quarantinePath = null;
             for (int i = 0; i < MAX_QUARANTINE_SLOT_ATTEMPTS; i++) {
@@ -3072,6 +3089,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             + "this sender continues on a fresh, empty slot at {}",
                     detail, quarantinePath, slotPath);
             return new CursorSendEngine(slotPath, sfMaxBytes, sfMaxTotalBytes, sfAppendDeadlineNanos);
+        }
+
+        @TestOnly
+        public static void setQuarantineAfterCloseHookForTest(Runnable hook) {
+            quarantineAfterCloseHook = hook;
         }
 
         private static int resolveIPv4(String host) {
