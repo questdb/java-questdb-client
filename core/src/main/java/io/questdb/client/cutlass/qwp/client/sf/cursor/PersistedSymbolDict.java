@@ -215,7 +215,22 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        long existing = ff.exists(filePath) ? ff.length(filePath) : -1L;
+        boolean exists = ff.exists(filePath);
+        long existing = exists ? ff.length(filePath) : -1L;
+        if (exists && existing < 0) {
+            // The file is present but its length could not be stat'd (a transient EIO
+            // on a flaky disk). Do NOT fall through to openFresh below, which O_TRUNCs:
+            // truncating the only copy of load-bearing state on a TRANSIENT fault is the
+            // exact destruction the class-level "Never recreate over an existing file"
+            // note forbids -- and unlike the openExisting read path, this routing check
+            // otherwise has no guard. A genuine sub-header stub reports a length in
+            // [0, HEADER_SIZE); only a stat error reports < 0, so the two are
+            // distinguishable. Degrade to full self-sufficient frames and leave every
+            // byte on disk for a later attempt, once the transient clears.
+            LOG.warn("symbol dict {} exists but its length could not be read; "
+                    + "falling back to full-dictionary frames (file left intact)", filePath);
+            return null;
+        }
         if (existing >= HEADER_SIZE) {
             // A dictionary at or past Integer.MAX_VALUE cannot be read back:
             // openExisting reads it into ONE int-sized native buffer, and the (int)
@@ -310,36 +325,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // with the entries it holds, shifting the dense id->symbol map on recovery.
         // The sole caller derives count and len from one beginMessage, so this cannot
         // fire today -- but the file this guards is the one the "resend required"
-        // contract rests on, so it stays.
-        long src = addr;
-        long srcLimit = addr + len;
-        for (int i = 0; i < count; i++) {
-            long symLen = 0;
-            int shift = 0;
-            while (src < srcLimit) {
-                byte b = Unsafe.getUnsafe().getByte(src++);
-                symLen |= (long) (b & 0x7F) << shift;
-                if ((b & 0x80) == 0) {
-                    break;
-                }
-                shift += 7;
-                if (shift > 35) {
-                    // A canonical entry-length varint is <= 5 bytes; a longer
-                    // continuation run is corrupt. The bound check below rejects it.
-                    break;
-                }
-            }
-            src += symLen; // src was just past the len varint
-            if (src > srcLimit) {
-                throw new IllegalStateException("malformed raw symbol-dict entries to " + FILE_NAME
-                        + " [entry=" + i + ", count=" + count + ']');
-            }
-        }
-        if (src != srcLimit) {
-            throw new IllegalStateException("raw symbol-dict entries under-filled the buffer to "
-                    + FILE_NAME + " [count=" + count + ", len=" + len
-                    + ", consumed=" + (int) (src - addr) + ']');
-        }
+        // contract rests on, so keep the structural guard. Gated behind assert: it
+        // re-walks every entry's length prefix on the common flush path, and the client
+        // library runs without -ea in production (embedded in user apps), so this holds
+        // the guard in the client's own -ea test suite without the per-flush cost in
+        // production.
+        assert validateRawEntries(addr, len, count);
         int hdrLen = NativeBufferWriter.varintSize(count) + NativeBufferWriter.varintSize(len);
         ensureScratch((long) hdrLen + len + CRC_SIZE);
         long p = NativeBufferWriter.writeVarint(scratchAddr, count);
@@ -691,6 +682,48 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
         }
         return new PersistedSymbolDict(ff, fd, HEADER_SIZE, 0, 0L, 0);
+    }
+
+    /**
+     * Verifies that {@code count} wire entries ({@code [len varint][utf8]}) occupy
+     * exactly {@code len} bytes from {@code addr}. Returns {@code true} when the triple
+     * is consistent; throws {@link IllegalStateException} (naming the offending entry /
+     * count / consumed bytes) otherwise. Called only from an {@code assert} in
+     * {@link #appendRawEntries}: it guards an internal invariant the sole caller cannot
+     * violate today, so it runs under the test suite's {@code -ea} but is elided from
+     * the per-flush production path (client apps run without {@code -ea}).
+     */
+    private static boolean validateRawEntries(long addr, int len, int count) {
+        long src = addr;
+        long srcLimit = addr + len;
+        for (int i = 0; i < count; i++) {
+            long symLen = 0;
+            int shift = 0;
+            while (src < srcLimit) {
+                byte b = Unsafe.getUnsafe().getByte(src++);
+                symLen |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    break;
+                }
+                shift += 7;
+                if (shift > 35) {
+                    // A canonical entry-length varint is <= 5 bytes; a longer
+                    // continuation run is corrupt. The bound check below rejects it.
+                    break;
+                }
+            }
+            src += symLen; // src was just past the len varint
+            if (src > srcLimit) {
+                throw new IllegalStateException("malformed raw symbol-dict entries to " + FILE_NAME
+                        + " [entry=" + i + ", count=" + count + ']');
+            }
+        }
+        if (src != srcLimit) {
+            throw new IllegalStateException("raw symbol-dict entries under-filled the buffer to "
+                    + FILE_NAME + " [count=" + count + ", len=" + len
+                    + ", consumed=" + (int) (src - addr) + ']');
+        }
+        return true;
     }
 
     /**

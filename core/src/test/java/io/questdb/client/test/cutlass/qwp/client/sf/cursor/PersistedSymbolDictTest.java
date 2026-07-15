@@ -31,6 +31,7 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -144,6 +145,56 @@ public class PersistedSymbolDictTest {
                     Assert.assertEquals("MSFT", symbols.getQuick(2));
                 } finally {
                     recovered.close();
+                }
+            } finally {
+                rmDir(src);
+                rmDir(dst);
+            }
+        });
+    }
+
+    @Test
+    public void testAppendRawEntriesRejectsInconsistentTripleUnderAssertions() throws Exception {
+        // appendRawEntries validates the (addr,len,count) triple before writing: an
+        // inconsistent triple would record a chunk whose stored entryCount disagreed
+        // with its entries and shift the dense id->symbol map on recovery, so it must
+        // fail loudly rather than corrupt the file. That check is an assert -- gated on
+        // -ea to keep the per-entry walk off the per-flush production path (client apps
+        // run without -ea) -- so observe it under the test suite's -ea, and skip if
+        // assertions happen to be disabled.
+        boolean assertionsEnabled = false;
+        assert assertionsEnabled = true;
+        Assume.assumeTrue("the guard is assert-gated; only observable under -ea", assertionsEnabled);
+        assertMemoryLeak(() -> {
+            Path src = Files.createTempDirectory("qwp-symdict-src");
+            Path dst = Files.createTempDirectory("qwp-symdict-dst");
+            try {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                dict.getOrAddSymbol("AAPL"); // id 0
+                dict.getOrAddSymbol("MSFT"); // id 1
+                dict.getOrAddSymbol("GOOG"); // id 2
+                PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString());
+                encoded.appendSymbols(dict, 0, 2);
+                encoded.close();
+
+                // Grab the on-disk entry region (3 entries) verbatim, then feed it back
+                // with a count of 1: validateRawEntries stops one entry in with
+                // src < srcLimit and throws "under-filled", before any bytes are written.
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(src.toString());
+                try {
+                    PersistedSymbolDict raw = PersistedSymbolDict.open(dst.toString());
+                    try {
+                        raw.appendRawEntries(reopened.loadedEntriesAddr(), reopened.loadedEntriesLen(), 1);
+                        Assert.fail("an inconsistent (len,count) triple must be rejected");
+                    } catch (IllegalStateException expected) {
+                        Assert.assertTrue("message names the under-filled buffer: " + expected.getMessage(),
+                                expected.getMessage().contains("under-filled"));
+                        Assert.assertEquals("a rejected triple must write nothing", 0, raw.size());
+                    } finally {
+                        raw.close();
+                    }
+                } finally {
+                    reopened.close();
                 }
             } finally {
                 rmDir(src);
@@ -775,6 +826,60 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testTransientLengthFaultDegradesWithoutDestroyingTheFile() throws Exception {
+        // open() routes on ff.length(): a value < HEADER_SIZE falls through to the
+        // truncating openFresh(). A genuine sub-header stub reports a length in
+        // [0, HEADER_SIZE), but a TRANSIENT stat failure (an EIO on a flaky disk)
+        // reports the -1 error sentinel for a fully populated file -- and routing that
+        // to openFresh would O_TRUNC the only copy of load-bearing state, the exact
+        // destruction the "Never recreate over an existing file" contract forbids. A
+        // negative length is distinguishable from a stub, so open() must degrade to
+        // null (fall back to full self-sufficient frames) and leave every byte on disk
+        // for a later attempt, once the transient clears.
+        assertMemoryLeak(() -> {
+            Path dir = Files.createTempDirectory("qwp-symdict");
+            try {
+                PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString());
+                d.appendSymbol("one");
+                d.appendSymbol("two");
+                d.close();
+
+                Path f = dir.resolve(".symbol-dict");
+                byte[] before = Files.readAllBytes(f);
+                Assert.assertTrue("a populated dict must exceed the header", before.length > HEADER_SIZE);
+
+                // Reopen through a facade whose length() reports the -1 stat-error
+                // sentinel for the (present) file -- the branch under test.
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(new StatFailsLengthFacade(), dir.toString());
+                if (reopened != null) {
+                    // Pre-fix: open() fell through to openFresh() and handed back a fresh
+                    // empty dict over the now-truncated file. Close its fd so only the
+                    // assertion below reports the failure, not a leaked descriptor.
+                    reopened.close();
+                }
+                Assert.assertNull("a populated dict whose length cannot be stat'd must degrade to null, not truncate",
+                        reopened);
+                Assert.assertArrayEquals("a transient length-stat fault must NOT destroy the dictionary",
+                        before, Files.readAllBytes(f));
+
+                // Once the filesystem recovers, the SAME file reopens its intact content.
+                PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString());
+                Assert.assertNotNull(re);
+                try {
+                    Assert.assertEquals("the intact content survives the transient", 2, re.size());
+                    ObjList<String> s = re.readLoadedSymbols();
+                    Assert.assertEquals("one", s.getQuick(0));
+                    Assert.assertEquals("two", s.getQuick(1));
+                } finally {
+                    re.close();
+                }
+            } finally {
+                rmDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testTruncateFailureDegradesWithoutDestroyingTheFile() throws Exception {
         // A host crash can leave a torn/stale tail past the last complete chunk.
         // open() drops it with a truncate; if that truncate FAILS (a read-only
@@ -892,6 +997,19 @@ public class PersistedSymbolDictTest {
                 return INSTANCE.write(fd, addr, len - 1, offset);
             }
             return INSTANCE.write(fd, addr, len, offset);
+        }
+    }
+
+    /**
+     * Reports a length of -1 -- the stat-error sentinel -- for the dictionary file,
+     * reproducing a transient stat failure (an EIO on a flaky disk) where the file is
+     * present but its size cannot be read. open() must treat this as "present but
+     * unreadable" and degrade to null, NOT route it to the truncating fresh-open path.
+     */
+    private static final class StatFailsLengthFacade extends DelegatingFilesFacade {
+        @Override
+        public long length(String path) {
+            return -1L;
         }
     }
 }
