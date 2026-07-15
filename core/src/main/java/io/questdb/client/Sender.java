@@ -1013,8 +1013,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_UDP = 3;
         private static final int PROTOCOL_WEBSOCKET = 2;
         // Suffix for a slot set aside by quarantineTornSlot. Deliberately NOT the
-        // sender's own slot name, so OrphanScanner sees the quarantined copy and the
-        // orphan drainer can still deliver it if its frames turn out to be replayable.
+        // sender's own slot name, so a restarted sender does not re-adopt it as its own;
+        // quarantineTornSlot then marks it .failed, so the orphan drainer skips it too and
+        // the bytes stay put for a human to inspect and resend.
         private static final String QUARANTINE_SLOT_SUFFIX = ".unreplayable-";
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
@@ -1758,23 +1759,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * close() drain timeout in milliseconds. The sender's {@code close()}
-         * method blocks up to this many millis waiting for the server to ACK
-         * every batch already published into the engine before shutting down
-         * the I/O loop. Default {@code 60000} (60 s) -- generous enough to
-         * survive real-workload backlogs (slow consumers, catch-up replicas,
-         * chunky payloads on small server send buffers) without silently
-         * dropping unacked rows; callers that need a longer pre-close wait
-         * for a specific submission can call
-         * {@link Sender#drain(long)} explicitly before close().
-         * <p>
-         * Set to {@code 0} or {@code -1} to opt out — close() will not wait
-         * at all (fast close). Pending data is then lost in memory mode and
-         * recovered by the next sender in SF mode.
-         * <p>
-         * WebSocket transport only.
-         */
-        /**
          * Minimum wall-clock time (millis) a symbol-dictionary catch-up CAP GAP must
          * persist before the sender gives up on it and fails.
          * <p>
@@ -1805,6 +1789,23 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        /**
+         * close() drain timeout in milliseconds. The sender's {@code close()}
+         * method blocks up to this many millis waiting for the server to ACK
+         * every batch already published into the engine before shutting down
+         * the I/O loop. Default {@code 60000} (60 s) -- generous enough to
+         * survive real-workload backlogs (slow consumers, catch-up replicas,
+         * chunky payloads on small server send buffers) without silently
+         * dropping unacked rows; callers that need a longer pre-close wait
+         * for a specific submission can call
+         * {@link Sender#drain(long)} explicitly before close().
+         * <p>
+         * Set to {@code 0} or {@code -1} to opt out — close() will not wait
+         * at all (fast close). Pending data is then lost in memory mode and
+         * recovered by the next sender in SF mode.
+         * <p>
+         * WebSocket transport only.
+         */
         public LineSenderBuilder closeFlushTimeoutMillis(long timeoutMillis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
@@ -3019,13 +3020,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * already-lost batch for an unbounded outage of everything after it, which inverts
          * the one guarantee store-and-forward exists to give.
          * <p>
-         * So: rename the slot aside instead. The bytes are preserved for forensics and for
-         * the orphan drainer, which reaches the same verdict independently (its send loop's
-         * replay guard fires and it marks the slot {@code .failed}) -- and which, on a slot
-         * that turns out to be drainable after all (frames written in full-dictionary
-         * fallback mode are self-sufficient), simply drains it. The new name is NOT the
-         * sender's own slot name, so {@code OrphanScanner} will consider it. The producer,
-         * meanwhile, starts on a clean empty slot and never notices.
+         * So: rename the slot aside instead, and mark it {@code .failed}. The verdict is
+         * authoritative -- the recovery seed already tried every source of truth (the
+         * persisted prefix AND the surviving frames' own deltas), and the orphan drainer's
+         * own replay guard uses that same walk, so there is nothing a drainer could rebuild
+         * that the seed did not. {@code markFailed} (below) therefore quarantines the copy
+         * for a human rather than leaving a drainer to retry an unreplayable slot forever;
+         * a full-dictionary-fallback slot never reaches here, because its dictionary is
+         * discarded at recovery and it never throws. The bytes are preserved on disk for
+         * forensics and a manual resend, and the new name -- NOT the sender's own slot name
+         * -- keeps a restarted sender from re-adopting it. The producer, meanwhile, starts
+         * on a clean empty slot and never notices.
          * <p>
          * If the rename fails (a Windows share lock, a read-only mount) there is no way to
          * free the slot name without destroying data, so fall back to the old behaviour and

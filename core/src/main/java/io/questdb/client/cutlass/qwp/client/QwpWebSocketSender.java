@@ -3751,7 +3751,9 @@ public class QwpWebSocketSender implements Sender {
         // what has already been sent -- and therefore already persisted. In delta
         // mode pass sentMaxSymbolId, yielding an empty delta
         // [sentMaxSymbolId+1 .. sentMaxSymbolId]; in full-dict mode keep
-        // currentBatchMaxSymbolId so the frame stays self-sufficient. Any symbol a
+        // currentBatchMaxSymbolId (reset to -1 by the prior flush, so the commit frame
+        // carries an empty delta too -- harmless, since the preceding full-dict data
+        // frames already registered the dictionary on this connection). Any symbol a
         // cancelled row leaked is picked up (and persisted) by the next real flush,
         // whose persistNewSymbolsBeforePublish resumes from pd.size().
         int commitBatchMaxId = deltaDictEnabled ? sentMaxSymbolId : currentBatchMaxSymbolId;

@@ -783,7 +783,6 @@ public final class CursorSendEngine implements QuietCloseable {
         return sfDir == null || persistedSymbolDict != null;
     }
 
-
     /**
      * Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}.
      */

@@ -525,37 +525,6 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) any
-     * delta-flagged frame in this segment carries, or {@code 0} only when NO
-     * delta-flagged frame is present. A frame with {@code deltaCount == 0} (a commit
-     * or a symbol-reusing frame -- the encoder always sets the delta flag) still
-     * contributes its {@code deltaStart}, i.e. the producer's baseline at encode
-     * time, NOT 0. That is deliberate: it anchors the torn-dict guard at that
-     * baseline so a dictionary torn below it is detected -- a conservative
-     * over-strand (it may over-reject a frame whose rows reference only surviving
-     * ids), never an under-strand that could silently shift the dense id map.
-     * Read-only walk over the recovered frames, used
-     * once at recovery to detect a persisted {@code .symbol-dict} torn (host crash,
-     * out-of-order page loss) below the ids the surviving frames still reference: if
-     * the max here reaches at or beyond the recovered dictionary size, a resuming
-     * producer -- seeded from the shorter dictionary -- would re-use ids the frames
-     * already define. Only frames at or below {@code maxFsnInclusive} count: frames
-     * above it are the aborted orphan-deferred tail, which {@code trySendOne} retires
-     * without ever transmitting, so their ids must not inflate the result (a resuming
-     * producer never reuses them on the wire). The frame layout mirrors
-     * {@link #findLastFrameFsnWithoutPayloadFlag}: the QWP message header
-     * ({@code qwpHeaderSize} bytes) is followed by the delta section
-     * {@code [deltaStart varint][deltaCount varint]...}.
-     *
-     * @param headerMagic     the QWP message magic identifying a well-formed frame
-     * @param flagsOffset     byte offset of the flags field within the QWP header
-     * @param flagDeltaMask   the FLAG_DELTA_SYMBOL_DICT bit
-     * @param qwpHeaderSize   the QWP message header size (delta section starts past it)
-     * @param maxFsnInclusive highest frame FSN to consider; frames above it are the
-     *                        retired orphan-deferred tail -- pass
-     *                        {@code recoveredCommitBoundaryFsn}
-     */
-    /**
      * Rebuilds, from the frames' own delta sections, the symbols a replay of
      * {@code [minFsnInclusive .. maxFsnInclusive]} would register ABOVE {@code coverage},
      * appending them to {@code out} in ascending id order. Returns the coverage the walk
@@ -670,6 +639,37 @@ public final class MmapSegment implements QuietCloseable {
         return coverage;
     }
 
+    /**
+     * Highest {@code deltaStart + deltaCount} (one past the highest symbol id) any
+     * delta-flagged frame in this segment carries, or {@code 0} only when NO
+     * delta-flagged frame is present. A frame with {@code deltaCount == 0} (a commit
+     * or a symbol-reusing frame -- the encoder always sets the delta flag) still
+     * contributes its {@code deltaStart}, i.e. the producer's baseline at encode
+     * time, NOT 0. That is deliberate: it anchors the torn-dict guard at that
+     * baseline so a dictionary torn below it is detected -- a conservative
+     * over-strand (it may over-reject a frame whose rows reference only surviving
+     * ids), never an under-strand that could silently shift the dense id map.
+     * Read-only walk over the recovered frames, used
+     * once at recovery to detect a persisted {@code .symbol-dict} torn (host crash,
+     * out-of-order page loss) below the ids the surviving frames still reference: if
+     * the max here reaches at or beyond the recovered dictionary size, a resuming
+     * producer -- seeded from the shorter dictionary -- would re-use ids the frames
+     * already define. Only frames at or below {@code maxFsnInclusive} count: frames
+     * above it are the aborted orphan-deferred tail, which {@code trySendOne} retires
+     * without ever transmitting, so their ids must not inflate the result (a resuming
+     * producer never reuses them on the wire). The frame layout mirrors
+     * {@link #findLastFrameFsnWithoutPayloadFlag}: the QWP message header
+     * ({@code qwpHeaderSize} bytes) is followed by the delta section
+     * {@code [deltaStart varint][deltaCount varint]...}.
+     *
+     * @param headerMagic     the QWP message magic identifying a well-formed frame
+     * @param flagsOffset     byte offset of the flags field within the QWP header
+     * @param flagDeltaMask   the FLAG_DELTA_SYMBOL_DICT bit
+     * @param qwpHeaderSize   the QWP message header size (delta section starts past it)
+     * @param maxFsnInclusive highest frame FSN to consider; frames above it are the
+     *                        retired orphan-deferred tail -- pass
+     *                        {@code recoveredCommitBoundaryFsn}
+     */
     public long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
         long off = HEADER_SIZE;
