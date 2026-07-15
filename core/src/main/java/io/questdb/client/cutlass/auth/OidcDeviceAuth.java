@@ -1601,12 +1601,15 @@ public class OidcDeviceAuth implements QuietCloseable {
             return false;
         }
         // succeed only on a clean 2xx (no OAuth error) returning the token getToken() actually serves (the
-        // id token when groups are encoded in it, the access token otherwise). A refresh that omits the id
-        // token - which RFC 6749 permits and many providers do - or carries an error or a non-2xx status
-        // must fall back to the interactive flow rather than be cached (and later fail in selectToken())
+        // id token when groups are encoded in it, the access token otherwise). A refresh that omits the served
+        // kind - which RFC 6749 permits and many providers do - or returns it blank/whitespace-only, or carries
+        // an error or a non-2xx status, must fall back to the interactive flow rather than be cached. Test the
+        // served kind with Chars.isBlank, the SAME contract storeTokens/adopt use to fold a blank token to null:
+        // gating on length() > 0 here would pass a whitespace-only token, which storeTokens then nulls, so
+        // tryRefresh would report success while selectToken() throws "no token" instead of falling back.
         boolean hasRequiredToken = (groupsInToken
-                ? tokenParser.idToken.length() > 0
-                : tokenParser.accessToken.length() > 0)
+                ? !Chars.isBlank(tokenParser.idToken)
+                : !Chars.isBlank(tokenParser.accessToken))
                 && isHttpStatusSuccess()
                 && tokenParser.error.length() == 0;
         if (hasRequiredToken) {

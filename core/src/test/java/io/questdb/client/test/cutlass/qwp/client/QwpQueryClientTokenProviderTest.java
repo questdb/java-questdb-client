@@ -26,18 +26,28 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Unit coverage for {@link QwpQueryClient#withBearerTokenProvider}: header
@@ -52,6 +62,20 @@ import java.util.List;
  * {@link QwpQueryClientPostConnectGuardTest}.
  */
 public class QwpQueryClientTokenProviderTest {
+
+    private static final QwpColumnBatchHandler NOOP_BATCH_HANDLER = new QwpColumnBatchHandler() {
+        @Override
+        public void onBatch(QwpColumnBatch batch) {
+        }
+
+        @Override
+        public void onEnd(long totalRows) {
+        }
+
+        @Override
+        public void onError(byte status, String message) {
+        }
+    };
 
     @Test
     public void testProviderConflictsWithBasicAuth() {
@@ -123,6 +147,54 @@ public class QwpQueryClientTokenProviderTest {
         try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
                 .withBearerTokenProvider(() -> "abc123")) {
             Assert.assertEquals("Bearer abc123", c.getAuthorizationHeaderForTest());
+        }
+    }
+
+    @Test(timeout = 20_000)
+    public void testProviderTokenReResolvedOnFailoverReconnect() throws Exception {
+        // The failover reconnect path (reconnectViaTracker) resolves the Authorization header once before its
+        // endpoint walk, exactly as connect() does, so a rotating token reaches the reconnect upgrade. This
+        // pins that a regression dropping the re-resolve from the reconnect path would be caught: bind endpoint
+        // A on the initial connect (capturing tok-0), drop it, then run a query - the failover reconnect to
+        // endpoint B must upgrade with a FRESHLY resolved token, not the stale connect-time one.
+        AtomicInteger calls = new AtomicInteger();
+        TestWebSocketServer a = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        });
+        a.setSendServerInfo(true);
+        TestWebSocketServer b = new TestWebSocketServer(new ExecDoneQueryServer());
+        b.setSendServerInfo(true);
+        try {
+            a.start();
+            b.start();
+            Assert.assertTrue(a.awaitStart(5, TimeUnit.SECONDS));
+            Assert.assertTrue(b.awaitStart(5, TimeUnit.SECONDS));
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                    "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort() + ";auth_timeout_ms=2000;")
+                    .withBearerTokenProvider(() -> "tok-" + calls.getAndIncrement())) {
+                client.connect();
+                Assert.assertTrue("client must bind the first endpoint on connect", client.isConnected());
+                String aHeader = a.pollAuthorizationHeader(5, TimeUnit.SECONDS);
+                Assert.assertEquals("the initial connect upgrade must carry the first resolved token",
+                        "Bearer tok-0", aHeader);
+
+                // drop endpoint A so the next execute() cannot use its connection and must fail over
+                a.close();
+
+                // the query fails on the dead A connection, drives the failover loop -> reconnectViaTracker,
+                // which re-resolves the header and upgrades B; B answers EXEC_DONE so execute() returns
+                client.execute("SELECT 1", NOOP_BATCH_HANDLER, false);
+
+                String bHeader = b.pollAuthorizationHeader(5, TimeUnit.SECONDS);
+                Assert.assertNotNull("the failover reconnect must upgrade endpoint B", bHeader);
+                Assert.assertTrue("the reconnect upgrade must carry a Bearer token, was: " + bHeader,
+                        bHeader.startsWith("Bearer tok-"));
+                Assert.assertNotEquals("the failover reconnect must RE-RESOLVE the provider, not reuse the "
+                        + "connect-time token", aHeader, bHeader);
+            }
+        } finally {
+            a.close();
+            b.close();
         }
     }
 
@@ -232,6 +304,36 @@ public class QwpQueryClientTokenProviderTest {
                 Assert.assertTrue(expected.getClass().getName(), expected instanceof LineSenderException);
                 Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("provider down"));
                 Assert.assertFalse(expected.getMessage(), expected.getMessage().contains("unreachable"));
+            }
+        }
+    }
+
+    private static byte[] buildExecDone(byte[] queryRequest) {
+        int bodyLen = 1 + 8 + 1 + 1; // msg_kind + request_id + op_type + rows_affected varint
+        byte[] frame = new byte[QwpConstants.HEADER_SIZE + bodyLen];
+        ByteBuffer bb = ByteBuffer.wrap(frame).order(ByteOrder.LITTLE_ENDIAN);
+        bb.put((byte) 'Q').put((byte) 'W').put((byte) 'P').put((byte) '1');
+        bb.put((byte) 1);       // version
+        bb.put((byte) 0);       // flags
+        bb.putShort((short) 0); // table_count
+        bb.putInt(bodyLen);     // payload_length
+        bb.put(QwpEgressMsgKind.EXEC_DONE);
+        bb.put(queryRequest, 1, 8); // echo request_id verbatim
+        bb.put((byte) 0);       // op_type
+        bb.put((byte) 0);       // rows_affected = 0
+        return frame;
+    }
+
+    private static final class ExecDoneQueryServer implements TestWebSocketServer.WebSocketServerHandler {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (data.length == 0 || data[0] != QwpEgressMsgKind.QUERY_REQUEST) {
+                return;
+            }
+            try {
+                client.sendBinary(buildExecDone(data));
+            } catch (IOException e) {
+                // best-effort: a failed reply surfaces to the client as a transport error
             }
         }
     }

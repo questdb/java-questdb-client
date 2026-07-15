@@ -1776,6 +1776,41 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testBlankTokenFromRefreshFallsBackToInteractiveFlow() throws Exception {
+        assertMemoryLeak(() -> {
+            // a non-conformant IdP answers a SILENT REFRESH with a 2xx carrying a whitespace-only access token.
+            // The refresh gate (hasRequiredToken) must treat it as absent with the same Chars.isBlank contract
+            // storeTokens uses, so tryRefresh() reports failure and signIn() falls back to the interactive device
+            // flow - rather than caching a token storeTokens then nulls, which would make signIn() throw "no
+            // access_token" while a fresh interactive sign-in was still possible.
+            AtomicInteger deviceCodePolls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    // blank served token on refresh: the gate must fall back, not cache-and-serve it
+                    return MockOidcServer.json(200, tokenJson("   ", null, null, 3600));
+                }
+                // the device-code grant: the first poll mints the initial short-lived token; the second is the
+                // interactive fallback after the blank refresh and mints a fresh, usable one
+                return deviceCodePolls.incrementAndGet() == 1
+                        ? MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 60))
+                        : MockOidcServer.json(200, tokenJson("ACCESS-FALLBACK", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn());
+                expireCachedToken(auth); // force the silent-refresh path on the next sign-in
+                // with the blank-refresh gate fixed, signIn() falls back to the device flow instead of throwing
+                Assert.assertEquals("ACCESS-FALLBACK", auth.signIn());
+                Assert.assertEquals("the interactive device flow must run again as the fallback",
+                        2, deviceCodePolls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGroupsInTokenButNoIdTokenFails() throws Exception {
         assertMemoryLeak(() -> {
             // groups encoded in token, but the IdP returns only an access token on the initial grant

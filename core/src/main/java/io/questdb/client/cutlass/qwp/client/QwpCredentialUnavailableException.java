@@ -32,13 +32,15 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * returning a token -- a failed silent refresh, or no sign-in yet.
  * <p>
  * Distinct from {@link QwpAuthFailedException}, which means the server rejected a
- * credential the client did present. Neither is a transport outage, so neither heals
- * by retrying alone: a reconnect loop cannot conjure a credential it is unable to
- * acquire. The cursor send loop therefore retries this class only for as long as a
- * transient refresh could still recover -- bounded by {@code reconnectMaxDurationMillis}
- * -- and then terminates the sender with the provider's own message, rather than
- * reconnect-looping forever against a dead credential (Invariant B, which governs
- * genuine transport outages, stays untouched).
+ * credential the client did present (a terminal auth failure). A credential the client
+ * cannot ACQUIRE is instead handled by connection phase, exactly like a transport outage:
+ * the RUNNING store-and-forward drainer retries it indefinitely with capped backoff under
+ * Invariant B -- the IdP becomes reachable again, or the user completes an interactive
+ * sign-in -- holding the un-acked rows in SF meanwhile, and NEVER bounds it by
+ * {@code reconnectMaxDurationMillis} nor latches a terminal (either would drop a producer
+ * store-and-forward promised to keep alive). Only the foreground/SYNC initial connect
+ * fails fast, because a connectivity error is the caller's to see during initialization,
+ * not after the drainer is running.
  * <p>
  * This is an internal marker that carries the provider's own exception: it exists so
  * the send loop can tell "the provider failed" apart from "the network failed". A

@@ -352,11 +352,13 @@ public final class FileTokenStore implements TokenStore {
     }
 
     private static void createLockFile(Path lock, String nonce) throws IOException {
-        // Exclusively create the lock (O_CREAT|O_EXCL via CREATE_NEW) AND write the owner nonce in a single
-        // open, so there is NO create->stamp gap for a GC/safepoint pause (or a cross-machine clock skew) to
-        // straddle and make our freshly-created lock look empty-and-stale to a peer. FileAlreadyExists means a
-        // peer already holds it. releaseLock and stealIfStale verify this nonce before deleting. Keep the
-        // owner-only perms (and the non-POSIX fallback) to match the store's other files.
+        // Exclusively create the lock (O_CREAT|O_EXCL via CREATE_NEW), then write the owner nonce into that same
+        // open channel before closing it. The file exists empty only for the tiny window between the create and
+        // the stamp; a GC/safepoint pause (or a cross-machine clock skew) CAN land in that window, so what keeps
+        // our freshly-created lock from being stolen as empty-and-stale is EMPTY_LOCK_STEAL_GRACE_MILLIS sitting
+        // well above it, not the absence of the window. FileAlreadyExists means a peer already holds it.
+        // releaseLock and stealIfStale verify this nonce before deleting. Keep the owner-only perms (and the
+        // non-POSIX fallback) to match the store's other files.
         final byte[] bytes = nonce.getBytes(StandardCharsets.UTF_8);
         try {
             writeNewFile(lock, bytes, FILE_ATTRS);
@@ -701,8 +703,9 @@ public final class FileTokenStore implements TokenStore {
         final long deadline = System.currentTimeMillis() + lockAcquireBudgetMillis;
         while (true) {
             try {
-                // atomic exclusive-create + stamp in one call: no create->stamp gap, so a GC/safepoint pause
-                // can no longer make our freshly-created lock look empty-and-stale to a peer mid-acquisition
+                // exclusive-create then stamp on the same open channel: the empty-file window between the two is
+                // tiny and covered by EMPTY_LOCK_STEAL_GRACE_MILLIS, so a GC/safepoint pause mid-acquisition
+                // cannot get our freshly-created lock stolen as empty-and-stale
                 createLockFile(lock, nonce);
                 return nonce;
             } catch (FileAlreadyExistsException e) {
@@ -792,11 +795,12 @@ public final class FileTokenStore implements TokenStore {
                 return;
             }
         } else if (!isOlderThan(lock, Math.min(EMPTY_LOCK_STEAL_GRACE_MILLIS, lockStaleMillis))) {
-            // an empty/unreadable lock is never a validly-held lock: acquireLock creates the lock and writes
-            // the owner nonce in ONE atomic call (createLockFile via CREATE_NEW), so a live lock always carries
-            // a stamp. An empty lock therefore means a crash mid-write - the exclusive create succeeded but the
-            // nonce write did not - a rare, narrow window with NO Java-level create->stamp gap for a GC/safepoint
-            // pause to straddle (the pause would have to land inside the single write call). Steal it on the
+            // an empty/unreadable lock is almost never a validly-held lock: acquireLock creates the lock and
+            // stamps the owner nonce onto the same open channel (createLockFile via CREATE_NEW), so a live lock
+            // carries its stamp within the tiny create->stamp window. An empty lock therefore means either a
+            // crash mid-write (the exclusive create succeeded but the nonce write did not) or a peer momentarily
+            // caught in that narrow window - a GC/safepoint pause CAN land there, which is exactly why the grace
+            // exists. Steal it on the
             // short empty-lock grace rather than the full staleness window, so a crash orphan stops wedging peers
             // for the whole window; the capture-verify below still confirms the lock is unchanged before
             // completing the steal. (A cross-machine clock skew wider than the grace could still pre-empt such a
