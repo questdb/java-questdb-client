@@ -163,8 +163,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     // Settle budget for the symbol-dict catch-up cap gap: how many cap-gap attempts
     // -- catch-ups that reached a fresh server and found a single dictionary entry
-    // too large for its advertised batch cap -- may occur, with no intervening
-    // SUCCESSFUL catch-up, before an orphan drainer latches a terminal. This is a
+    // too large for its advertised batch cap -- may occur consecutively before an
+    // orphan drainer latches a terminal. This is a
     // SANCTIONED orphan-only terminal (a genuine cluster batch-size capability gap),
     // the connect-time analog of the orphan drainer's durable-ack capability gap
     // (DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS). A homogeneous cluster never trips
@@ -173,18 +173,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // cluster, where a failover to a smaller-cap node can hit it for an entry an
     // earlier node accepted. A foreground sender retries forever. An orphan drainer
     // rides out the transient window until a larger-cap node returns; only a persistent
-    // gap (this many cap gaps with no successful catch-up in between) latches.
+    // gap (this many consecutive cap gaps with no successful catch-up or unrelated
+    // reconnect state in between) latches.
     //
     // Budget accounting (satisfies "a transient must never burn the terminal
     // budget"): catchUpCapGapAttempts increments ONLY inside sendDictCatchUp when a
-    // node is reached and an entry is oversized, and resets ONLY when a catch-up fully
-    // succeeds. A TRANSIENT reconnect (connect refuse, upgrade/role failure) never
-    // reaches the catch-up, so it NEITHER increments nor resets the counter -- it only
-    // lengthens the wall-clock settle window. The terminal therefore always requires
-    // this many GENUINE cap gaps; a transient can never inflate it. Deliberately NOT
-    // reset on a mere successful RECONNECT: a reconnect to the small-cap node itself
-    // produces the cap gap, so resetting there would stop a persistent gap from ever
-    // latching -- the reset must gate on a successful CATCH-UP, not on connecting.
+    // node is reached and an entry is oversized. A successful catch-up ends the
+    // episode, as does any unrelated reconnect state (connect refusal, catch-up send
+    // failure, upgrade/role rejection): otherwise its downtime would count toward the
+    // wall-clock dwell even though no cap gap was observed. The cap-gap exception
+    // itself does NOT reset the episode, so consecutive small-cap nodes still prove a
+    // persistent cluster capability gap and can exhaust the orphan policy.
     private static final int MAX_CATCHUP_CAP_GAP_ATTEMPTS = 16;
     // Hard ceiling for the lifetime-monotonic sent-dictionary mirror. The mirror
     // fields are int, so it cannot exceed Integer.MAX_VALUE bytes; reaching even
@@ -302,19 +301,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private int sentDictBytesLen;
     private int sentDictCount;
     // Orphan-policy cap-gap attempts -- catch-ups that reached a node and found an entry
-    // too large for its batch cap -- since the last SUCCESSFUL catch-up (see
-    // MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting). Foreground retries
-    // never increment it. A successful catch-up resets it; a transient reconnect neither
-    // increments nor resets it. I/O-thread-only.
+    // too large for its batch cap -- with no intervening successful catch-up or unrelated
+    // reconnect state (see MAX_CATCHUP_CAP_GAP_ATTEMPTS for the full budget accounting).
+    // Foreground retries never increment it. I/O-thread-only.
     private int catchUpCapGapAttempts;
     // System.nanoTime() of the FIRST cap gap of the current orphan-policy episode.
     // Anchors the escalation dwell. Reset together with catchUpCapGapAttempts on a
-    // successful catch-up, so a node that accepts the dictionary ends the episode.
-    // Anchoring at the FIRST gap (not at loop entry, and not refreshed per attempt) is
-    // what keeps a TRANSIENT from burning the terminal budget: a transient never reaches
-    // the catch-up, so it neither increments the counter nor moves the anchor -- it can
-    // only lengthen the wall clock, which alone can never latch the terminal because the
-    // strike count still has to be satisfied. I/O-thread-only, like catchUpCapGapAttempts.
+    // successful catch-up or an unrelated reconnect state, so only an uninterrupted run
+    // of cap-gap observations contributes wall-clock dwell. Anchoring at the FIRST gap
+    // (not refreshed per attempt) lets consecutive small-cap nodes satisfy the dwell;
+    // resetting after transport/role states prevents their downtime from doing so.
+    // I/O-thread-only, like catchUpCapGapAttempts.
     //
     // -1 marks "no episode open" for a debugger or a heap dump, but it is NOT the test
     // for one -- catchUpCapGapAttempts == 0 is (see sendDictCatchUp). A nanoTime instant
@@ -1436,6 +1433,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         lastFrameOrPingNanos = 0L;
     }
 
+    private static boolean isCatchUpCapGap(Throwable t) {
+        return t instanceof CatchUpSendException && ((CatchUpSendException) t).capGap;
+    }
+
+    private void resetCatchUpCapGapEpisode() {
+        catchUpCapGapAttempts = 0;
+        catchUpCapGapFirstNanos = -1L;
+    }
+
     /**
      * Shared per-outage retry loop. Used by {@link #fail(Throwable)} for
      * mid-flight wire failures (phase="reconnect") and by
@@ -1449,6 +1455,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (reconnectFactory == null || !running) {
             recordFatal(initial);
             return;
+        }
+        // A wire/role state that interrupted an orphan cap-gap run is not evidence that
+        // the cluster's batch cap stayed incompatible during the outage. Start a fresh
+        // episode; the cap-gap exception itself is the one reconnect cause that preserves
+        // the existing attempt count and dwell anchor.
+        if (!isCatchUpCapGap(initial)) {
+            resetCatchUpCapGapEpisode();
         }
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
@@ -1519,6 +1532,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, elapsedMs, attempts, fsnAtZero);
                     return;
                 }
+                // A null factory result is an unsuccessful connect state, not a cap-gap
+                // observation. Do not let the time spent retrying it satisfy orphan dwell.
+                resetCatchUpCapGapEpisode();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 // Terminal across all configured endpoints per spec sf-client.md
                 // section 13.3: auth (401/403) bypasses reconnect and surfaces as
@@ -1595,6 +1611,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // endpoint, forever. Growing to reconnectMaxBackoffMillis
                 // mirrors the orphan drainer's role-reject path and honours the
                 // documented capped-exponential-backoff contract.
+                resetCatchUpCapGapEpisode();
                 lastReconnectError = e;
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
@@ -1617,6 +1634,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // down the shutdown latch and close() cannot hang.
                     recordFatal(e);
                     throw (Error) e;
+                }
+                if (!isCatchUpCapGap(e)) {
+                    resetCatchUpCapGapEpisode();
                 }
                 lastReconnectError = e;
                 long now = System.nanoTime();
@@ -2490,10 +2510,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // it to the producer. Only an orphan drainer may apply the settle budget
                 // below and quarantine its slot after a persistent gap. Under budget the
                 // throw is RETRIABLE (no recordFatal) -- connectLoop reconnects with
-                // backoff and re-runs the catch-up, which resets the counter on a node
-                // that accepts it. A transient reconnect (connect/upgrade failure, role
-                // reject) never reaches the catch-up, so it neither increments nor burns
-                // the orphan budget. On exhaustion latch via recordFatal, NOT fail() --
+                // backoff and re-runs the catch-up, which resets the episode on a node
+                // that accepts it. An unrelated transport/upgrade/role state also resets
+                // the episode, so its downtime cannot satisfy the orphan dwell. On
+                // exhaustion latch via recordFatal, NOT fail() --
                 // failing from inside the catch-up would re-enter connectLoop (see
                 // CatchUpSendException); the data must be resent after the cap is raised.
                 // Escalation needs BOTH the strike count AND a minimum wall-clock dwell
@@ -2517,7 +2537,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     throw new CatchUpSendException(new LineSenderException(
                             "symbol dictionary entry too large for the server batch cap during catch-up ["
                                     + "frameLen=" + soloFrameLen + ", cap=" + cap + ']'
-                                    + "; retrying indefinitely -- a larger-cap node may return"));
+                                    + "; retrying indefinitely -- a larger-cap node may return"), true);
                 }
 
                 long nowNanos = System.nanoTime();
@@ -2540,7 +2560,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 if (exhausted) {
                     recordFatal(err);
                 }
-                throw new CatchUpSendException(err);
+                throw new CatchUpSendException(err, true);
             }
             if (chunkSymbols > 0 && chunkBytes + entryBytes > budget) {
                 sendCatchUpChunk(chunkStartId, chunkSymbols, chunkStartAddr, (int) chunkBytes);
@@ -2563,8 +2583,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // count and the wall-clock anchor. Resetting only the count would leave a stale
         // anchor from an old episode, so the very first strike of a LATER episode would
         // already satisfy the dwell.
-        catchUpCapGapAttempts = 0;
-        catchUpCapGapFirstNanos = -1L;
+        resetCatchUpCapGapEpisode();
         return framesSent;
     }
 
@@ -2888,11 +2907,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * connectLoop}'s own retry catch (swapClient path), a fresh {@code fail()}
      * from the I/O loop body (trySendOne path), or dropping the dead client so
      * the I/O thread reconnects (start path). A JVM {@code Error} is never
-     * wrapped -- it must stay terminal.
+     * wrapped -- it must stay terminal. The {@code capGap} marker lets the reconnect
+     * loop preserve only consecutive incompatible-cap observations; ordinary catch-up
+     * send failures restart the orphan settle episode.
      */
     private static final class CatchUpSendException extends RuntimeException {
+        private final boolean capGap;
+
         CatchUpSendException(Throwable cause) {
+            this(cause, false);
+        }
+
+        CatchUpSendException(Throwable cause, boolean capGap) {
             super(cause);
+            this.capGap = capGap;
         }
     }
 

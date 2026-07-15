@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
@@ -40,12 +41,12 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
-import java.util.concurrent.TimeUnit;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -473,6 +474,16 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testTransportOutageRestartsCapGapEpisode() throws Exception {
+        assertUnrelatedReconnectStateRestartsCapGapEpisode(false);
+    }
+
+    @Test
+    public void testRoleRejectRestartsCapGapEpisode() throws Exception {
+        assertUnrelatedReconnectStateRestartsCapGapEpisode(true);
+    }
+
+    @Test
     public void testCatchUpCapGapRetriesUntilBudgetThenLatches() throws Exception {
         // M1: an entry too large for the fresh server's cap during catch-up (a
         // heterogeneous / rolling-cap failover to a smaller-cap node) must NOT latch
@@ -660,6 +671,76 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
     }
 
+    private void assertUnrelatedReconnectStateRestartsCapGapEpisode(boolean roleReject) throws Exception {
+        // Accrue an orphan drainer's cap-gap strikes to one short of terminal, then
+        // simulate a long unrelated outage before another small-cap node appears. The
+        // outage must end the old episode: its wall-clock duration says nothing about
+        // whether the cluster's batch cap remained incompatible while no node answered.
+        TestUtils.assertMemoryLeak(() -> {
+            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
+            maxField.setAccessible(true);
+            int maxAttempts = maxField.getInt(null);
+            assertTrue("the cap-gap settle budget must have a retriable interval", maxAttempts > 1);
+
+            int[] reconnectCalls = {0};
+            long[] staleAnchor = {Long.MIN_VALUE};
+            CursorWebSocketSendLoop[] loopRef = new CursorWebSocketSendLoop[1];
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        () -> {
+                            int call = ++reconnectCalls[0];
+                            if (call < maxAttempts) {
+                                return new CatchUpCapturingClient(160);
+                            }
+                            if (call == maxAttempts) {
+                                assertEquals("precondition: consecutive cap gaps survive reconnect",
+                                        maxAttempts - 1,
+                                        readInt(loopRef[0], "catchUpCapGapAttempts"));
+                                // Model the elapsed outage without sleeping. With the defect,
+                                // this old anchor survives the unrelated failure and the next
+                                // cap gap immediately satisfies both terminal conditions.
+                                staleAnchor[0] = System.nanoTime() - TimeUnit.HOURS.toNanos(2);
+                                setField(loopRef[0], "catchUpCapGapFirstNanos", staleAnchor[0]);
+                                if (roleReject) {
+                                    throw new QwpRoleMismatchException(
+                                            "PRIMARY", null, "all endpoints role-rejected");
+                                }
+                                throw new LineSenderException("transport unavailable");
+                            }
+                            if (call == maxAttempts + 1) {
+                                // Stop after getServerMaxBatchSize() has driven the final cap
+                                // gap, leaving its fresh episode state observable below.
+                                return new CatchUpCapturingClient(160, false,
+                                        () -> setBooleanFieldUnchecked(loopRef[0], "running", false));
+                            }
+                            throw new AssertionError("unexpected reconnect call " + call);
+                        },
+                        5_000L, 0L, 0L, false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        0L, TimeUnit.HOURS.toMillis(1),
+                        CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
+                loopRef[0] = loop;
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    setBooleanField(loop, "running", true);
+                    invokeConnectLoop(loop);
+
+                    loop.checkError();
+                    assertEquals("pre-outage cap gaps must not carry into the new episode",
+                            1, readInt(loop, "catchUpCapGapAttempts"));
+                    assertTrue("the post-outage cap gap must get a fresh dwell anchor",
+                            readLong(loop, "catchUpCapGapFirstNanos") > staleAnchor[0]);
+                    assertEquals("test must observe gaps, the unrelated state, and a new gap",
+                            maxAttempts + 1, reconnectCalls[0]);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     // Builds a QWP delta frame [12-byte header][deltaStart varint][deltaCount
     // varint][ [len varint][utf8] ... ] for the given symbols. accumulateSentDict
     // skips the header, so its content is irrelevant; the caller frees the frame.
@@ -742,6 +823,13 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("setWireBaselineWithCatchUp", long.class);
         m.setAccessible(true);
         m.invoke(loop, replayStart);
+    }
+
+    private static void invokeConnectLoop(CursorWebSocketSendLoop loop) throws Exception {
+        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
+                "connectLoop", Throwable.class, String.class, long.class);
+        m.setAccessible(true);
+        m.invoke(loop, new LineSenderException("test reconnect"), "reconnect", 0L);
     }
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
@@ -830,6 +918,20 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         f.setInt(target, value);
     }
 
+    private static void setBooleanField(Object target, String name, boolean value) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        f.setBoolean(target, value);
+    }
+
+    private static void setBooleanFieldUnchecked(Object target, String name, boolean value) {
+        try {
+            setBooleanField(target, name, value);
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
     private static int varintSize(long value) {
         int n = 1;
         while (value > 0x7F) {
@@ -856,6 +958,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // Mutable so a test can model a rolling-cap cluster: raise it for a node that
         // accepts the dictionary, lower it for a smaller-cap node that cap-gaps.
         private int cap;
+        private final Runnable onCapRead;
         private final boolean throwOnSend;
         private int framesSent;
 
@@ -864,13 +967,21 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
 
         CatchUpCapturingClient(int cap, boolean throwOnSend) {
+            this(cap, throwOnSend, null);
+        }
+
+        CatchUpCapturingClient(int cap, boolean throwOnSend, Runnable onCapRead) {
             super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
             this.cap = cap;
             this.throwOnSend = throwOnSend;
+            this.onCapRead = onCapRead;
         }
 
         @Override
         public int getServerMaxBatchSize() {
+            if (onCapRead != null) {
+                onCapRead.run();
+            }
             return cap;
         }
 
