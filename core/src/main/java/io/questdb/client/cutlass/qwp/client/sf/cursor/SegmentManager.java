@@ -962,37 +962,63 @@ public final class SegmentManager implements QuietCloseable {
         boolean trimFailed = false;
         Throwable trimFailure = null;
         int unlinked = 0;
+        int batchSize = 0;
         MmapSegment segment = first;
         long coveredAck = durableAck;
-        while (segment != null && unlinked < MAX_TRIMS_PER_RING_PASS) {
+        while (segment != null && batchSize < MAX_TRIMS_PER_RING_PASS) {
             long lastSeq = segment.baseSeq() + segment.frameCount() - 1L;
             if (lastSeq > coveredAck) {
                 break;
             }
-            MmapSegment next = e.ring.nextSealedAfter(segment);
-            String path = segment.path();
+            trimBatch[batchSize++] = segment;
+            segment = e.ring.nextSealedAfter(segment);
+        }
+        if (batchSize > 0) {
             try {
-                // Durably commit the head advance past this segment before
-                // unlinking it. The ring recomputes the successor under its
-                // own monitor -- computing it here from `next` would race
-                // with a concurrent rotation sealing the active, letting the
-                // head leapfrog a still-unacked sealed segment (whose file a
-                // later recovery would then discard as "stale below head").
-                e.ring.advanceManifestHeadPast(segment);
-                segment.close();
-                // A retry after a post-unlink directory-sync failure sees an
-                // already absent path. Treat absence as the prior successful
-                // unlink and retry the batch barrier rather than wedging.
-                if (!filesFacade.remove(path) && filesFacade.exists(path)) {
+                // Durably commit the head advance past the LAST batch member
+                // before unlinking any of them. One commit covers the whole
+                // batch: head values are segment boundaries and the batch is
+                // a contiguous prefix of the sealed chain, so recovery
+                // discards every batch member as "stale below head" whether
+                // the crash lands mid-unlink or after -- byte-identical to a
+                // per-segment commit, minus up to 63 device flushes. The ring
+                // recomputes the successor under its own monitor --
+                // computing it here from the walk above would race with a
+                // concurrent rotation sealing the active, letting the head
+                // leapfrog a still-unacked sealed segment (whose file a later
+                // recovery would then discard as "stale below head").
+                e.ring.advanceManifestHeadPast(trimBatch[batchSize - 1]);
+            } catch (Throwable t) {
+                for (int i = 0; i < batchSize; i++) {
+                    trimBatch[i] = null;
+                }
+                recordTrimFailure(e, TRIM_RETRY_UNLINK, now, t);
+                return false;
+            }
+            while (unlinked < batchSize) {
+                MmapSegment trimming = trimBatch[unlinked];
+                String path = trimming.path();
+                try {
+                    trimming.close();
+                    // A retry after a post-unlink directory-sync failure sees
+                    // an already absent path. Treat absence as the prior
+                    // successful unlink and retry the batch barrier rather
+                    // than wedging. A retry after a mid-batch unlink failure
+                    // re-collects from firstTrimmable(); its head advance
+                    // clamps to the already-committed boundary (no fsync).
+                    if (!filesFacade.remove(path) && filesFacade.exists(path)) {
+                        trimFailed = true;
+                        break;
+                    }
+                    unlinked++;
+                } catch (Throwable t) {
                     trimFailed = true;
+                    trimFailure = t;
                     break;
                 }
-                trimBatch[unlinked++] = segment;
-                segment = next;
-            } catch (Throwable t) {
-                trimFailed = true;
-                trimFailure = t;
-                break;
+            }
+            for (int i = unlinked; i < batchSize; i++) {
+                trimBatch[i] = null;
             }
         }
 

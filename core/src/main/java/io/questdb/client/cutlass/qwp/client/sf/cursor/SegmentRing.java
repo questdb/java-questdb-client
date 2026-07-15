@@ -518,13 +518,17 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Durably advances the manifest head past {@code trimming} (the sealed
-     * segment the manager is about to unlink). The successor and the current
-     * active are both read under the ring monitor, so a concurrent rotation
-     * (which also mutates the manifest under this monitor) can never make the
-     * head leapfrog a still-live sealed segment: if rotation sealed the old
-     * active after the caller's snapshot, {@code trimming.successor()} now
-     * points at that sealed segment, not at the new active.
+     * Durably advances the manifest head past {@code trimming} (the LAST
+     * sealed segment of the bounded batch the manager is about to unlink).
+     * One durable commit covers every earlier batch member: head values are
+     * segment boundaries and the batch is a contiguous prefix of the sealed
+     * chain, so recovery discards each member as "stale below head"
+     * regardless of how far the unlink loop got. The successor and the
+     * current active are both read under the ring monitor, so a concurrent
+     * rotation (which also mutates the manifest under this monitor) can never
+     * make the head leapfrog a still-live sealed segment: if rotation sealed
+     * the old active after the caller's snapshot, {@code trimming.successor()}
+     * now points at that sealed segment, not at the new active.
      */
     synchronized void advanceManifestHeadPast(MmapSegment trimming) {
         if (manifest == null) {

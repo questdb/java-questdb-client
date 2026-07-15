@@ -49,6 +49,10 @@ final class SfManifest implements QuietCloseable {
     private final int fd;
     private final FilesFacade filesFacade;
     private final String path;
+    // Preallocated record scratch for update(): the trim path calls update()
+    // once per batch and must not malloc/free per call. Guarded by this
+    // object's monitor (update() and close() are both synchronized).
+    private final long writeScratch;
     private long activeBase;
     private boolean closed;
     private long generation;
@@ -62,6 +66,7 @@ final class SfManifest implements QuietCloseable {
         this.generation = generation;
         this.headBase = headBase;
         this.activeBase = activeBase;
+        this.writeScratch = Unsafe.malloc(RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
     }
 
     static SfManifest create(FilesFacade filesFacade, String dir, long headBase, long activeBase) {
@@ -71,11 +76,12 @@ final class SfManifest implements QuietCloseable {
             throw new MmapSegmentException("exclusive create failed for SF manifest " + path);
         }
         boolean success = false;
+        SfManifest manifest = null;
         try {
             if (!filesFacade.allocate(fd, FILE_SIZE)) {
                 throw new MmapSegmentException("could not allocate SF manifest " + path);
             }
-            SfManifest manifest = new SfManifest(filesFacade, path, fd, 0, -1, -1);
+            manifest = new SfManifest(filesFacade, path, fd, 0, -1, -1);
             manifest.update(headBase, activeBase);
             if (filesFacade.fsyncDir(dir) != 0) {
                 throw new MmapSegmentException("could not sync SF manifest directory " + dir);
@@ -84,7 +90,13 @@ final class SfManifest implements QuietCloseable {
             return manifest;
         } finally {
             if (!success) {
-                filesFacade.close(fd);
+                if (manifest != null) {
+                    // close() frees the constructor-owned scratch buffer as
+                    // well as the fd; closing only the raw fd would leak it.
+                    manifest.close();
+                } else {
+                    filesFacade.close(fd);
+                }
                 filesFacade.remove(path);
             }
         }
@@ -151,9 +163,13 @@ final class SfManifest implements QuietCloseable {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        // Synchronized against update() so the scratch buffer can never be
+        // freed under a concurrent writer; update() checks `closed` inside
+        // the same monitor.
         if (!closed) {
             closed = true;
+            Unsafe.free(writeScratch, RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
             filesFacade.close(fd);
         }
     }
@@ -202,29 +218,24 @@ final class SfManifest implements QuietCloseable {
             return;
         }
         long nextGeneration = generation + 1;
-        long buffer = Unsafe.malloc(RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
-        try {
-            Unsafe.getUnsafe().setMemory(buffer, RECORD_SIZE, (byte) 0);
-            Unsafe.getUnsafe().putInt(buffer, MAGIC);
-            Unsafe.getUnsafe().putInt(buffer + 4, VERSION);
-            Unsafe.getUnsafe().putLong(buffer + 8, nextGeneration);
-            Unsafe.getUnsafe().putLong(buffer + 16, newHeadBase);
-            Unsafe.getUnsafe().putLong(buffer + 24, newActiveBase);
-            int crc = Crc32c.update(Crc32c.INIT, buffer, CRC_OFFSET);
-            Unsafe.getUnsafe().putInt(buffer + CRC_OFFSET, crc);
-            long offset = (nextGeneration & 1L) * RECORD_SIZE;
-            if (filesFacade.write(fd, buffer, RECORD_SIZE, offset) != RECORD_SIZE) {
-                throw new MmapSegmentException("short write updating SF manifest " + path);
-            }
-            if (filesFacade.fsync(fd) != 0) {
-                throw new MmapSegmentException("could not sync SF manifest " + path);
-            }
-            generation = nextGeneration;
-            headBase = newHeadBase;
-            activeBase = newActiveBase;
-        } finally {
-            Unsafe.free(buffer, RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
+        Unsafe.getUnsafe().setMemory(writeScratch, RECORD_SIZE, (byte) 0);
+        Unsafe.getUnsafe().putInt(writeScratch, MAGIC);
+        Unsafe.getUnsafe().putInt(writeScratch + 4, VERSION);
+        Unsafe.getUnsafe().putLong(writeScratch + 8, nextGeneration);
+        Unsafe.getUnsafe().putLong(writeScratch + 16, newHeadBase);
+        Unsafe.getUnsafe().putLong(writeScratch + 24, newActiveBase);
+        int crc = Crc32c.update(Crc32c.INIT, writeScratch, CRC_OFFSET);
+        Unsafe.getUnsafe().putInt(writeScratch + CRC_OFFSET, crc);
+        long offset = (nextGeneration & 1L) * RECORD_SIZE;
+        if (filesFacade.write(fd, writeScratch, RECORD_SIZE, offset) != RECORD_SIZE) {
+            throw new MmapSegmentException("short write updating SF manifest " + path);
         }
+        if (filesFacade.fsync(fd) != 0) {
+            throw new MmapSegmentException("could not sync SF manifest " + path);
+        }
+        generation = nextGeneration;
+        headBase = newHeadBase;
+        activeBase = newActiveBase;
     }
 
     /**
