@@ -39,7 +39,7 @@ public class SegmentManagerCrashConsistencyTest {
 
     private static void awaitTrimmed(SegmentRing ring) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (ring.firstSealed() != null) {
+        while (ring.firstSealed() != null || ring.getPendingTrimCount() != 0) {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("manager did not trim acknowledged segments");
             }
@@ -160,8 +160,12 @@ public class SegmentManagerCrashConsistencyTest {
                         manager.start();
                         ff.awaitFailure();
                         if (failAt == 5) {
-                            Assert.assertNotNull("post-unlink barrier failure committed ring removal",
+                            Assert.assertNull("post-unlink barrier failure exposed a closed segment",
+                                    ring.findSegmentContaining(0L));
+                            Assert.assertNull("post-unlink barrier failure kept a closed segment live",
                                     ring.firstSealed());
+                            Assert.assertEquals("post-unlink barrier failure lost cleanup ownership",
+                                    2, ring.getPendingTrimCount());
                             ff.advance(TimeUnit.SECONDS.toNanos(2));
                             manager.wakeWorker();
                             awaitTrimmed(ring);
@@ -173,6 +177,8 @@ public class SegmentManagerCrashConsistencyTest {
                         Assert.assertNotNull("barrier failure removed ring bookkeeping", ring.firstSealed());
                     } else {
                         Assert.assertNull("post-unlink barrier retry did not commit ring removal", ring.firstSealed());
+                        Assert.assertEquals("post-unlink barrier retry retained pending ownership",
+                                0, ring.getPendingTrimCount());
                     }
                     Assert.assertFalse("segment deletion began without a durable covering watermark",
                             ff.removeCalls.get() > 0 && !ff.durableWatermark);
@@ -332,8 +338,10 @@ public class SegmentManagerCrashConsistencyTest {
                         awaitValue(ff.failureCalls, 1, "initial persistent failure was not attempted");
                         awaitValue(logs, 1, "initial failure transition was not logged");
                         if ("segment-remove".equals(failure)) {
-                            Assert.assertEquals("successful unlink prefix was not committed", 1L,
-                                    ring.firstSealed().baseSeq());
+                            Assert.assertNull("failed unlink left a closed segment live",
+                                    ring.firstSealed());
+                            Assert.assertEquals("successful unlink prefix was not committed",
+                                    1, ring.getPendingTrimCount());
                             Assert.assertFalse(Files.exists(root + "/sf-0.sfa"));
                             Assert.assertTrue(Files.exists(root + "/sf-1.sfa"));
                         }

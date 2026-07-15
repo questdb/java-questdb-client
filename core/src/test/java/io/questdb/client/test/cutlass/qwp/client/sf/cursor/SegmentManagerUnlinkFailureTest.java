@@ -135,9 +135,10 @@ public class SegmentManagerUnlinkFailureTest {
                 Assert.assertTrue("failed unlink path must remain observable", Files.exists(failedPath));
                 Assert.assertTrue("failed unlink changed the acknowledged segment bytes",
                         Arrays.equals(original, java.nio.file.Files.readAllBytes(Paths.get(failedPath))));
-                Assert.assertNotNull("failed unlink removed the segment from ring bookkeeping",
+                Assert.assertNull("failed unlink left a closed segment in live traversal",
                         ring.firstSealed());
-                Assert.assertEquals(failedPath, ring.firstSealed().path());
+                Assert.assertEquals("failed unlink lost pending cleanup ownership",
+                        1, ring.getPendingTrimCount());
                 Assert.assertEquals("failed unlink must remain covered by the durable cumulative watermark",
                         0L, watermark.read());
 
@@ -165,6 +166,8 @@ public class SegmentManagerUnlinkFailureTest {
                 MmapSegment firstSealed = ring.firstSealed();
                 Assert.assertTrue("successful retry retained the acknowledged segment",
                         firstSealed == null || !failedPath.equals(firstSealed.path()));
+                Assert.assertEquals("successful retry retained pending cleanup ownership",
+                        0, ring.getPendingTrimCount());
             } finally {
                 Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
                 ring.close();

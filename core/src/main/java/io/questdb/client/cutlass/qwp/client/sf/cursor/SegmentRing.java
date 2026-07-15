@@ -43,10 +43,10 @@ import java.util.IdentityHashMap;
  *   <li><b>Producer thread</b> (single user thread): {@link #appendOrFsn},
  *       {@link #installHotSpare}, {@link #publishedFsn}.</li>
  *   <li><b>I/O thread</b>: {@link #publishedFsn} (read-only), {@link #acknowledge}
- *       (single writer), {@link #drainTrimmable} (single reader).</li>
+ *       (single writer), and one pinned segment cursor for native reads.</li>
  *   <li><b>Segment manager</b>: polls {@link #needsHotSpare}, hands new
- *       segments via {@link #installHotSpare}, drains trim-eligible segments
- *       via {@link #drainTrimmable} on its own cadence.</li>
+ *       segments via {@link #installHotSpare}, and stages trim-eligible
+ *       segments into hidden cleanup ownership on its own cadence.</li>
  * </ul>
  * No locks; the only cross-thread state is {@link #publishedFsn} (volatile,
  * single-writer) and {@link #ackedFsn} (volatile, single-writer). Hot-spare
@@ -68,6 +68,7 @@ public final class SegmentRing implements QuietCloseable {
     private static final RetainedSegmentMembershipMode DEFAULT_MEMBERSHIP_MODE =
             RetainedSegmentMembershipMode.IDENTITY;
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
+    private static final int MAX_PENDING_TRIMS = 64;
     // Tally of sealed-list entries inspected by nextSealedAfter(). Test-only
     // operation count for deterministic traversal-complexity assertions.
     private static long nextSealedComparisons;
@@ -84,6 +85,11 @@ public final class SegmentRing implements QuietCloseable {
     private static long trimMovedReferences;
     private final long maxBytesPerSegment;
     private final SfManifest manifest;
+    // ACKed segments leave live traversal under the ring monitor before the
+    // manager unmaps them. They remain owned here until close + unlink + the
+    // directory barrier succeed, so failures stay retryable and accounted.
+    // At most one bounded manager batch is pending at a time.
+    private final ObjList<MmapSegment> pendingTrims = new ObjList<>(MAX_PENDING_TRIMS);
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
     // Single-writer (producer thread, on rotation); single-reader at trim time
     // (the segment manager). For now, both sides synchronize via the single-
@@ -115,12 +121,15 @@ public final class SegmentRing implements QuietCloseable {
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
     private volatile MmapSegment hotSpare;
+    // Segment whose native mapping the single I/O consumer may dereference.
+    // Guarded by this monitor: cursor lookup/switch and manager trim staging
+    // are atomic, so a pinned segment cannot be hidden or unmapped.
+    private MmapSegment ioPinnedSegment;
     // Optional callback the segment manager registers via setManagerWakeup
     // so the producer can wake the manager out of its poll-park the moment
-    // a spare is needed (rotation just consumed one, or active crossed the
-    // high-water mark while no spare is installed). Without this, the
-    // manager only notices on its next polling tick -- fine on average,
-    // but the worst-case wait is the full poll interval. Producer-thread-only.
+    // a spare is needed, and the I/O thread can wake it after releasing a
+    // segment that may now be trimmable. Without this, the manager only
+    // notices on its next polling tick.
     private Runnable managerWakeup;
     private long nextSeq;
     private volatile long publishedFsn;
@@ -530,7 +539,7 @@ public final class SegmentRing implements QuietCloseable {
      * the old active after the caller's snapshot, {@code trimming.successor()}
      * now points at that sealed segment, not at the new active.
      */
-    synchronized void advanceManifestHeadPast(MmapSegment trimming) {
+    private synchronized void advanceManifestHeadPast(MmapSegment trimming) {
         if (manifest == null) {
             return;
         }
@@ -913,6 +922,7 @@ public final class SegmentRing implements QuietCloseable {
         // / firstSealed / findSegmentContaining, so they don't iterate
         // half-freed state.
         closed = true;
+        ioPinnedSegment = null;
         if (active != null) {
             active.close();
             active = null;
@@ -926,6 +936,10 @@ public final class SegmentRing implements QuietCloseable {
         }
         sealedSegments.clear();
         sealedHead = 0;
+        for (int i = 0, n = pendingTrims.size(); i < n; i++) {
+            pendingTrims.getQuick(i).close();
+        }
+        pendingTrims.clear();
         if (manifest != null) {
             manifest.close();
         }
@@ -946,6 +960,9 @@ public final class SegmentRing implements QuietCloseable {
         // that isn't fully acked, none of the later ones can be either.
         while (sealedHead < sealedSegments.size()) {
             MmapSegment s = sealedSegments.get(sealedHead);
+            if (s == ioPinnedSegment) {
+                break;
+            }
             long lastSeq = s.baseSeq() + s.frameCount() - 1;
             if (lastSeq > acked) {
                 break;
@@ -971,21 +988,20 @@ public final class SegmentRing implements QuietCloseable {
      * scan cost doesn't matter.
      */
     public synchronized MmapSegment findSegmentContaining(long fsn) {
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            MmapSegment s = sealedSegments.get(i);
-            long base = s.baseSeq();
-            if (fsn >= base && fsn < base + s.frameCount()) {
-                return s;
-            }
+        return findSegmentContaining0(fsn);
+    }
+
+    /**
+     * Atomically finds and pins the segment containing {@code fsn}. The pin
+     * remains until the I/O cursor switches or releases it, preventing trim
+     * staging from hiding or unmapping the returned segment meanwhile.
+     */
+    synchronized MmapSegment pinSegmentContaining(long fsn) {
+        MmapSegment segment = findSegmentContaining0(fsn);
+        if (segment != null) {
+            switchIoPin(segment);
         }
-        MmapSegment a = active;
-        if (a != null) {
-            long base = a.baseSeq();
-            if (fsn >= base && fsn < base + a.frameCount()) {
-                return a;
-            }
-        }
-        return null;
+        return segment;
     }
 
     /**
@@ -998,16 +1014,19 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Returns the oldest fully acknowledged sealed segment without removing
-     * it. The segment manager keeps it owned by the ring until close + unlink
-     * succeeds, so a failed unlink cannot make the path disappear from live
-     * bookkeeping or allow its identifier to be reused.
+     * Returns the oldest fully acknowledged, unpinned live segment without
+     * removing it. Staging later transfers it to hidden ring-owned cleanup
+     * state, where unlink/barrier failures remain retryable without exposing
+     * an unmapped segment to traversal.
      */
     public synchronized MmapSegment firstTrimmable() {
         if (sealedHead == sealedSegments.size()) {
             return null;
         }
         MmapSegment segment = sealedSegments.get(sealedHead);
+        if (segment == ioPinnedSegment) {
+            return null;
+        }
         long lastSeq = segment.baseSeq() + segment.frameCount() - 1;
         return lastSeq <= ackedFsn ? segment : null;
     }
@@ -1044,6 +1063,13 @@ public final class SegmentRing implements QuietCloseable {
 
     public MmapSegment getActive() {
         return active;
+    }
+
+    /** Atomically pins and returns the current active segment for I/O. */
+    synchronized MmapSegment pinActiveSegment() {
+        MmapSegment segment = active;
+        switchIoPin(segment);
+        return segment;
     }
 
     /**
@@ -1086,6 +1112,30 @@ public final class SegmentRing implements QuietCloseable {
     /** True when the segment manager should prepare and install a fresh spare. */
     public boolean needsHotSpare() {
         return hotSpare == null;
+    }
+
+    /**
+     * Atomically advances the I/O pin from {@code current} to the next live
+     * sealed segment, or to the active segment when no sealed successor
+     * remains. An active cursor stays pinned in place until rotation seals it.
+     */
+    synchronized MmapSegment advancePinnedSegment(MmapSegment current) {
+        assert ioPinnedSegment == current;
+        MmapSegment liveActive = active;
+        if (current == liveActive) {
+            return current;
+        }
+        MmapSegment next = nextSealedAfter(current);
+        if (next == null) {
+            MmapSegment first = sealedHead < sealedSegments.size()
+                    ? sealedSegments.get(sealedHead)
+                    : null;
+            next = first != null && first.baseSeq() > current.baseSeq()
+                    ? first
+                    : liveActive;
+        }
+        switchIoPin(next);
+        return next;
     }
 
     /**
@@ -1139,11 +1189,77 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
+     * Drops a directory-durable prefix from hidden trim ownership and returns
+     * its exact byte total for manager accounting.
+     */
+    synchronized long commitPendingTrims(MmapSegment[] expected, int count) {
+        if (count < 0 || count > pendingTrims.size()) {
+            throw new IllegalArgumentException("invalid pending trim count: " + count);
+        }
+        long bytes = 0;
+        for (int i = 0; i < count; i++) {
+            MmapSegment segment = pendingTrims.getQuick(i);
+            if (segment != expected[i]) {
+                throw new IllegalStateException("pending trim prefix changed");
+            }
+            bytes += segment.sizeBytes();
+        }
+        if (count == pendingTrims.size()) {
+            pendingTrims.clear();
+        } else if (count > 0) {
+            pendingTrims.remove(0, count - 1);
+        }
+        return bytes;
+    }
+
+    /** Copies the hidden retry batch into manager-thread scratch storage. */
+    synchronized int copyPendingTrims(MmapSegment[] target) {
+        int count = pendingTrims.size();
+        if (target.length < count) {
+            throw new IllegalArgumentException("pending trim target is too small");
+        }
+        for (int i = 0; i < count; i++) {
+            target[i] = pendingTrims.getQuick(i);
+        }
+        return count;
+    }
+
+    /** Number of hidden trim entries retained for retry. */
+    synchronized int pendingTrimCount() {
+        return pendingTrims.size();
+    }
+
+    @TestOnly
+    public synchronized int getPendingTrimCount() {
+        return pendingTrims.size();
+    }
+
+    @TestOnly
+    public synchronized MmapSegment pinSegmentContainingForTest(long fsn) {
+        return pinSegmentContaining(fsn);
+    }
+
+    @TestOnly
+    public synchronized void releasePinnedSegmentForTest(MmapSegment expected) {
+        releasePinnedSegment(expected);
+    }
+
+    /** Releases the I/O cursor pin and wakes trim if it still names {@code expected}. */
+    synchronized void releasePinnedSegment(MmapSegment expected) {
+        if (ioPinnedSegment == expected) {
+            ioPinnedSegment = null;
+            wakeManager();
+        }
+    }
+
+    /**
      * Commits removal of the segment returned by {@link #firstTrimmable()}.
      * Returns false if concurrent lifecycle activity changed the head.
      */
     public synchronized boolean removeTrimmable(MmapSegment segment) {
-        if (sealedHead == sealedSegments.size() || sealedSegments.get(sealedHead) != segment) {
+        if (sealedHead == sealedSegments.size()
+                || sealedSegments.get(sealedHead) != segment
+                || segment == ioPinnedSegment) {
             return false;
         }
         long lastSeq = segment.baseSeq() + segment.frameCount() - 1;
@@ -1152,6 +1268,47 @@ public final class SegmentRing implements QuietCloseable {
         }
         removeSealedHead();
         return true;
+    }
+
+    /**
+     * Durably advances the manifest past, then hides, one bounded ACKed and
+     * unpinned sealed prefix. Once this returns, I/O lookup cannot discover
+     * any staged segment; the manager owns only the physical cleanup attempt.
+     */
+    synchronized int stagePendingTrims(MmapSegment[] target, int maxCount, long coveredAck) {
+        if (pendingTrims.size() != 0) {
+            return 0;
+        }
+        if (maxCount < 0 || maxCount > MAX_PENDING_TRIMS || target.length < maxCount) {
+            throw new IllegalArgumentException("invalid trim batch size: " + maxCount);
+        }
+        int count = 0;
+        for (int i = sealedHead, n = sealedSegments.size(); i < n && count < maxCount; i++) {
+            MmapSegment segment = sealedSegments.get(i);
+            long lastSeq = segment.baseSeq() + segment.frameCount() - 1L;
+            if (segment == ioPinnedSegment || lastSeq > coveredAck) {
+                break;
+            }
+            target[count++] = segment;
+        }
+        if (count == 0) {
+            return 0;
+        }
+        try {
+            advanceManifestHeadPast(target[count - 1]);
+        } catch (Throwable t) {
+            for (int i = 0; i < count; i++) {
+                target[i] = null;
+            }
+            throw t;
+        }
+        for (int i = 0; i < count; i++) {
+            MmapSegment segment = target[i];
+            assert sealedSegments.get(sealedHead) == segment;
+            pendingTrims.add(segment);
+            removeSealedHead();
+        }
+        return count;
     }
 
     /**
@@ -1207,7 +1364,28 @@ public final class SegmentRing implements QuietCloseable {
         for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             total += sealedSegments.get(i).sizeBytes();
         }
+        for (int i = 0, n = pendingTrims.size(); i < n; i++) {
+            total += pendingTrims.getQuick(i).sizeBytes();
+        }
         return total;
+    }
+
+    private MmapSegment findSegmentContaining0(long fsn) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
+            MmapSegment segment = sealedSegments.get(i);
+            long base = segment.baseSeq();
+            if (fsn >= base && fsn < base + segment.frameCount()) {
+                return segment;
+            }
+        }
+        MmapSegment liveActive = active;
+        if (liveActive != null) {
+            long base = liveActive.baseSeq();
+            if (fsn >= base && fsn < base + liveActive.frameCount()) {
+                return liveActive;
+            }
+        }
+        return null;
     }
 
     private void compactSealedSegments() {
@@ -1227,6 +1405,21 @@ public final class SegmentRing implements QuietCloseable {
             sealedHead = 0;
         } else if (sealedHead >= 64 && sealedHead >= size - sealedHead) {
             compactSealedSegments();
+        }
+    }
+
+    private void switchIoPin(MmapSegment segment) {
+        MmapSegment previous = ioPinnedSegment;
+        ioPinnedSegment = segment;
+        if (previous != null && previous != segment) {
+            wakeManager();
+        }
+    }
+
+    private void wakeManager() {
+        Runnable wakeup = managerWakeup;
+        if (wakeup != null) {
+            wakeup.run();
         }
     }
 

@@ -528,6 +528,10 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.getActive();
     }
 
+    MmapSegment pinActiveSegment() {
+        return ring.pinActiveSegment();
+    }
+
     /**
      * Append the payload, blocking up to {@link #appendDeadlineNanos} when
      * the cursor ring is at its memory/disk cap and waiting for ACK-driven
@@ -613,7 +617,7 @@ public final class CursorSendEngine implements QuietCloseable {
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
         // closed, its accessors aren't safe to read. The active segment is
-        // never trimmed by drainTrimmable (only sealed segments are), so
+        // never trim-eligible (only sealed segments are), so
         // when everything published has been acked we have to unlink the
         // residual .sfa files here. Without this, the next sender (or a
         // drainer adopting this slot) would replay already-acked data
@@ -1191,6 +1195,10 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.findSegmentContaining(fsn);
     }
 
+    MmapSegment pinSegmentContaining(long fsn) {
+        return ring.pinSegmentContaining(fsn);
+    }
+
     /**
      * Pass-through to {@link SegmentRing#firstSealed()}.
      */
@@ -1213,6 +1221,14 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public MmapSegment nextSealedAfter(MmapSegment current) {
         return ring.nextSealedAfter(current);
+    }
+
+    MmapSegment advancePinnedSegment(MmapSegment current) {
+        return ring.advancePinnedSegment(current);
+    }
+
+    void releasePinnedSegment(MmapSegment current) {
+        ring.releasePinnedSegment(current);
     }
 
     /**

@@ -896,6 +896,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             ioThread = null;
         }
+        // Covers close-before-start and start failures; normal I/O-thread
+        // exit already released the same pin in its finally block.
+        releaseSendingSegment();
         // Close the current client. After a reconnect, swapClient has
         // replaced the original (and closed it); the owner only retains
         // the stale pre-reconnect reference. Without closing the live
@@ -1102,17 +1105,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // walks back to the lowest unacked frame so sealed-segment data
         // actually reaches the wire — without it, start() would skip
         // straight to the active and orphan everything in sealed.
-        positionCursorForStart();
+        try {
+            positionCursorForStart();
+        } catch (Throwable t) {
+            running = false;
+            releaseSendingSegment();
+            shutdownLatch.countDown();
+            throw t;
+        }
         Thread t = new Thread(this::ioLoop, "qdb-cursor-ws-io");
         t.setDaemon(true);
         try {
             t.start();
         } catch (Throwable th) {
             // Thread.start() failed (e.g. native stack alloc OOM). ioLoop
-            // never ran, so its finally{shutdownLatch.countDown()} never
-            // fires. Release the latch and reset state so a subsequent
-            // close() doesn't block on a thread that doesn't exist.
+            // never ran, so its finally block cannot release the segment pin
+            // or count down the latch.
             running = false;
+            releaseSendingSegment();
             shutdownLatch.countDown();
             throw th;
         }
@@ -1132,35 +1142,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * else the active). Returns the same segment if it's still being written
      * (we're on the active and just need to wait for more publishedFsn).
      * <p>
-     * Uses {@link CursorSendEngine#nextSealedAfter} so we never have to
-     * snapshot the full sealed list — important when the producer outpaces
-     * the I/O thread and the sealed list can grow to thousands of entries
-     * (cursor SF lets the producer fan out at memory speed; the wire path
-     * catches up at WebSocket speed).
+     * The ring switches the single I/O pin atomically with choosing the next
+     * segment, so trim can never unmap either side of the handoff. No sealed
+     * list snapshot is needed when the producer outpaces the wire path.
      */
     private MmapSegment advanceSegment() {
         MmapSegment current = sendingSegment;
-        MmapSegment liveActive = engine.activeSegment();
-        if (current == liveActive) {
-            // We're on the active — there's no "next", just wait for more
-            // bytes to be published into it. Caller's sendOne will see
-            // publishedOffset > sendOffset eventually and resume.
-            return current;
+        MmapSegment next = engine.advancePinnedSegment(current);
+        if (next != current) {
+            sendOffset = MmapSegment.HEADER_SIZE;
         }
-        sendOffset = MmapSegment.HEADER_SIZE;
-        MmapSegment next = engine.nextSealedAfter(current);
-        if (next != null) {
-            return next;
-        }
-        // current was the newest sealed (no later sealed exists). If it's
-        // still in the sealed list, the next segment must be the active;
-        // if it's been trimmed out from under us, fall back to the oldest
-        // remaining sealed before resorting to the active.
-        next = engine.firstSealed();
-        if (next != null && next.baseSeq() > current.baseSeq()) {
-            return next;
-        }
-        return liveActive;
+        return next;
     }
 
     private void applyDurableAck() {
@@ -1760,6 +1752,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
             }
         } finally {
+            // Release native-segment lifetime before publishing I/O-thread
+            // completion or running delegated engine cleanup.
+            releaseSendingSegment();
             // Last act of the I/O thread: dispose of whatever client it
             // holds. This is the airtight half of the close()-vs-reconnect
             // race — when close()'s latch await is interrupted (drainer pool
@@ -1809,7 +1804,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * loop will then wait until the producer publishes more bytes.
      */
     private void positionCursorAt(long targetFsn) {
-        MmapSegment seg = engine.findSegmentContaining(targetFsn);
+        MmapSegment seg = engine.pinSegmentContaining(targetFsn);
         if (seg == null) {
             // No segment currently advertises targetFsn. That normally means
             // targetFsn is just past publishedFsn and there is nothing to
@@ -1818,14 +1813,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // The producer is concurrent with this I/O thread, though. It can
             // publish targetFsn after the first findSegmentContaining() returns
             // null but before or during the active-tip snapshot below.
-            sendingSegment = engine.activeSegment();
+            sendingSegment = engine.pinActiveSegment();
             sendOffset = sendingSegment.publishedOffset();
             // The publishedOffset read is the producer's volatile publish
             // barrier. If it saw the new frame bytes, the frameCount write that
             // makes targetFsn discoverable is also visible, so a second lookup
             // must now find it. If the producer publishes later, sendOffset is
             // still at the old tip and trySendOne() will send the frame normally.
-            seg = engine.findSegmentContaining(targetFsn);
+            seg = engine.pinSegmentContaining(targetFsn);
             if (seg != null) {
                 positionCursorInSegment(seg, targetFsn);
             }
@@ -1903,6 +1898,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             Arrays.fill(e.tableNames, null);
         }
         pendingDurablePool.addFirst(e);
+    }
+
+    private void releaseSendingSegment() {
+        MmapSegment segment = sendingSegment;
+        if (segment != null) {
+            engine.releasePinnedSegment(segment);
+            sendingSegment = null;
+        }
     }
 
     /**

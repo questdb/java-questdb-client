@@ -866,20 +866,21 @@ public final class SegmentManager implements QuietCloseable {
             }
         }
 
-        // 2. Trim any segments that the ring says are fully acked. Memory
-        //    mode only frees native memory. Disk mode first makes the current
-        //    cumulative ACK durable, then durably establishes the watermark's
-        //    directory entry, unlinks one bounded batch, and finally commits
-        //    those directory removals before ring/accounting state changes.
-        //    No syscall runs under the manager lock.
+        // 2. Trim fully ACKed segments. The ring first transfers one bounded,
+        //    unpinned prefix out of live traversal and into hidden pending
+        //    ownership. Only then may this worker unmap it. Disk mode keeps the
+        //    pending prefix until unlink + directory fsync are durable; memory
+        //    mode commits each successfully freed prefix immediately. No
+        //    syscall runs under the manager lock.
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
             hook.run();
         }
-        MmapSegment first = e.ring.firstTrimmable();
-        if (first == null) {
+        int pendingCount = e.ring.pendingTrimCount();
+        MmapSegment first = pendingCount == 0 ? e.ring.firstTrimmable() : null;
+        if (pendingCount == 0 && first == null) {
             // Preserve the cheap mmap-only watermark cadence for ACKs that do
-            // not yet cover a complete sealed segment.
+            // not yet cover a complete, unpinned sealed segment.
             synchronized (lock) {
                 if (e.isRegistered() && e.watermark != null) {
                     long currentAck = e.ring.ackedFsn();
@@ -893,28 +894,37 @@ public final class SegmentManager implements QuietCloseable {
         }
 
         if (memoryMode) {
-            int trimmed = 0;
-            while (trimmed < MAX_TRIMS_PER_RING_PASS) {
-                MmapSegment segment = e.ring.firstTrimmable();
-                if (segment == null) {
+            int batchSize = pendingCount > 0
+                    ? e.ring.copyPendingTrims(trimBatch)
+                    : e.ring.stagePendingTrims(
+                            trimBatch, MAX_TRIMS_PER_RING_PASS, e.ring.ackedFsn());
+            int closed = 0;
+            Throwable closeFailure = null;
+            while (closed < batchSize) {
+                try {
+                    trimBatch[closed].close();
+                    closed++;
+                } catch (Throwable t) {
+                    closeFailure = t;
                     break;
                 }
-                try {
-                    segment.close();
-                    synchronized (lock) {
-                        if (e.ring.removeTrimmable(segment)) {
-                            trimmed++;
-                            if (e.isRegistered()) {
-                                totalBytes -= segment.sizeBytes();
-                            }
-                        }
+            }
+            if (closed > 0) {
+                synchronized (lock) {
+                    long removedBytes = e.ring.commitPendingTrims(trimBatch, closed);
+                    if (e.isRegistered()) {
+                        totalBytes -= removedBytes;
                     }
-                } catch (Throwable t) {
-                    LOG.warn("Failed to trim memory segment", t);
-                    return false;
                 }
             }
-            return trimmed == MAX_TRIMS_PER_RING_PASS && e.ring.firstTrimmable() != null;
+            for (int i = 0; i < batchSize; i++) {
+                trimBatch[i] = null;
+            }
+            if (closeFailure != null) {
+                LOG.warn("Failed to trim memory segment", closeFailure);
+                return false;
+            }
+            return e.ring.firstTrimmable() != null;
         }
 
         // A deferred disk retry does no sync, unlink, or logging work. Signed
@@ -926,10 +936,9 @@ public final class SegmentManager implements QuietCloseable {
             return false;
         }
 
-        // A disk segment cannot be safely unlinked without durable ACK cover.
-        // The registration check and mmap store are atomic with deregister.
-        // Once the store wins, deregistration may proceed, but its owner must
-        // await this in-service pass before closing the watermark or ring.
+        // Every attempt repeats the cheap covering barrier. Besides keeping
+        // the latest cumulative ACK durable, this preserves the same strict
+        // pre-unlink/post-unlink directory ordering on pending retries.
         if (e.watermark == null) {
             if (!e.missingWatermarkLogged) {
                 e.missingWatermarkLogged = true;
@@ -959,101 +968,88 @@ public final class SegmentManager implements QuietCloseable {
             return false;
         }
 
-        boolean trimFailed = false;
-        Throwable trimFailure = null;
-        int unlinked = 0;
-        int batchSize = 0;
-        MmapSegment segment = first;
-        long coveredAck = durableAck;
-        while (segment != null && batchSize < MAX_TRIMS_PER_RING_PASS) {
-            long lastSeq = segment.baseSeq() + segment.frameCount() - 1L;
-            if (lastSeq > coveredAck) {
-                break;
-            }
-            trimBatch[batchSize++] = segment;
-            segment = e.ring.nextSealedAfter(segment);
-        }
-        if (batchSize > 0) {
+        int batchSize;
+        if (pendingCount > 0) {
+            batchSize = e.ring.copyPendingTrims(trimBatch);
+        } else {
             try {
-                // Durably commit the head advance past the LAST batch member
-                // before unlinking any of them. One commit covers the whole
-                // batch: head values are segment boundaries and the batch is
-                // a contiguous prefix of the sealed chain, so recovery
-                // discards every batch member as "stale below head" whether
-                // the crash lands mid-unlink or after -- byte-identical to a
-                // per-segment commit, minus up to 63 device flushes. The ring
-                // recomputes the successor under its own monitor --
-                // computing it here from the walk above would race with a
-                // concurrent rotation sealing the active, letting the head
-                // leapfrog a still-unacked sealed segment (whose file a later
-                // recovery would then discard as "stale below head").
-                e.ring.advanceManifestHeadPast(trimBatch[batchSize - 1]);
+                // Under the ring monitor: advance the manifest past the last
+                // eligible member, then atomically hide the batch. No I/O pin
+                // can appear between the eligibility check and live removal.
+                batchSize = e.ring.stagePendingTrims(
+                        trimBatch, MAX_TRIMS_PER_RING_PASS, durableAck);
             } catch (Throwable t) {
-                for (int i = 0; i < batchSize; i++) {
+                for (int i = 0; i < trimBatch.length; i++) {
                     trimBatch[i] = null;
                 }
                 recordTrimFailure(e, TRIM_RETRY_UNLINK, now, t);
                 return false;
             }
-            while (unlinked < batchSize) {
-                MmapSegment trimming = trimBatch[unlinked];
-                String path = trimming.path();
-                try {
-                    trimming.close();
-                    // A retry after a post-unlink directory-sync failure sees
-                    // an already absent path. Treat absence as the prior
-                    // successful unlink and retry the batch barrier rather
-                    // than wedging. A retry after a mid-batch unlink failure
-                    // re-collects from firstTrimmable(); its head advance
-                    // clamps to the already-committed boundary (no fsync).
-                    if (!filesFacade.remove(path) && filesFacade.exists(path)) {
-                        trimFailed = true;
-                        break;
-                    }
-                    unlinked++;
-                } catch (Throwable t) {
+            if (batchSize == 0) {
+                return false;
+            }
+        }
+
+        boolean trimFailed = false;
+        Throwable trimFailure = null;
+        int unlinked = 0;
+        while (unlinked < batchSize) {
+            MmapSegment trimming = trimBatch[unlinked];
+            String path = trimming.path();
+            try {
+                trimming.close();
+                if (!filesFacade.remove(path) && filesFacade.exists(path)) {
                     trimFailed = true;
-                    trimFailure = t;
                     break;
                 }
-            }
-            for (int i = unlinked; i < batchSize; i++) {
-                trimBatch[i] = null;
+                unlinked++;
+            } catch (Throwable t) {
+                trimFailed = true;
+                trimFailure = t;
+                break;
             }
         }
 
         if (unlinked > 0) {
             try {
                 if (filesFacade.fsyncDir(e.dir) != 0) {
-                    for (int i = 0; i < unlinked; i++) {
+                    for (int i = 0; i < batchSize; i++) {
                         trimBatch[i] = null;
                     }
                     recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, null);
                     return false;
                 }
             } catch (Throwable t) {
-                for (int i = 0; i < unlinked; i++) {
+                for (int i = 0; i < batchSize; i++) {
                     trimBatch[i] = null;
                 }
                 recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, t);
                 return false;
             }
-            synchronized (lock) {
-                for (int i = 0; i < unlinked; i++) {
-                    MmapSegment removed = trimBatch[i];
-                    trimBatch[i] = null;
-                    if (e.ring.removeTrimmable(removed) && e.isRegistered()) {
-                        totalBytes -= removed.sizeBytes();
+            try {
+                synchronized (lock) {
+                    long removedBytes = e.ring.commitPendingTrims(trimBatch, unlinked);
+                    if (e.isRegistered()) {
+                        totalBytes -= removedBytes;
                     }
                 }
+            } catch (Throwable t) {
+                for (int i = 0; i < batchSize; i++) {
+                    trimBatch[i] = null;
+                }
+                recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, t);
+                return false;
             }
+        }
+        for (int i = 0; i < batchSize; i++) {
+            trimBatch[i] = null;
         }
         if (trimFailed) {
             recordTrimFailure(e, TRIM_RETRY_UNLINK, now, trimFailure);
             return false;
         }
         recordTrimSuccess(e);
-        return unlinked == MAX_TRIMS_PER_RING_PASS && e.ring.firstTrimmable() != null;
+        return e.ring.firstTrimmable() != null;
     }
 
     private void recordTrimFailure(RingEntry e, int failureKind, long now, Throwable failure) {

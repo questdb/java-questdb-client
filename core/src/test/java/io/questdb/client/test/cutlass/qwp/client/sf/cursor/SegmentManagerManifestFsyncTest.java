@@ -102,7 +102,7 @@ public class SegmentManagerManifestFsyncTest {
 
     private static void awaitTrimmed(SegmentRing ring) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-        while (ring.firstSealed() != null) {
+        while (ring.firstSealed() != null || ring.getPendingTrimCount() != 0) {
             if (System.nanoTime() > deadline) {
                 throw new AssertionError("manager did not trim acknowledged segments");
             }
