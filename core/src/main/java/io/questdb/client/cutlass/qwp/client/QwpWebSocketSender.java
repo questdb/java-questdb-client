@@ -3664,7 +3664,6 @@ public class QwpWebSocketSender implements Sender {
                     splitFrameBodyBytes.getQuick(bodyIdx), simBaseline, currentBatchMaxSymbolId);
             bodyIdx++;
             if (messageSize > cap) {
-                resetTableBuffersAfterFlush(keys);
                 throw new LineSenderException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)

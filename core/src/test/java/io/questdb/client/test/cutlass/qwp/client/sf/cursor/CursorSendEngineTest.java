@@ -299,6 +299,51 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testV2DiskSlotForcesLegacyReaderToFailClosed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                    assertEquals(0L, engine.appendBlocking(buf, 16));
+                }
+
+                // Real segments carry v2: their payload may depend on the
+                // persisted dictionary and must never be replayed by a v1-only
+                // client as though every frame were self-sufficient.
+                try (MmapSegment data = MmapSegment.openExisting(tmpDir + "/sf-initial.sfa")) {
+                    assertEquals(MmapSegment.VERSION, data.version());
+                    assertEquals(1L, data.frameCount());
+                }
+
+                // A legacy reader rejects the v2 data segment, but accepts both
+                // guards as ordinary non-empty v1 segments. Their ranges cannot
+                // be contiguous, so its mandatory global recovery check throws
+                // before any replay or fresh-slot fallback can happen.
+                try (MmapSegment guardA = MmapSegment.openExisting(
+                        tmpDir + "/.qwp-v2-guard-a.sfa");
+                     MmapSegment guardB = MmapSegment.openExisting(
+                             tmpDir + "/.qwp-v2-guard-b.sfa")) {
+                    assertEquals(MmapSegment.LEGACY_VERSION, guardA.version());
+                    assertEquals(MmapSegment.LEGACY_VERSION, guardB.version());
+                    assertEquals(1L, guardA.frameCount());
+                    assertEquals(1L, guardB.frameCount());
+                    assertTrue("legacy guard ranges must force an FSN gap",
+                            guardA.baseSeq() + guardA.frameCount() != guardB.baseSeq());
+                }
+
+                // Current recovery skips the reserved guards and adopts only
+                // the real v2 log.
+                try (CursorSendEngine recovered = new CursorSendEngine(tmpDir, 4096)) {
+                    assertTrue(recovered.wasRecoveredFromDisk());
+                    assertEquals(0L, recovered.publishedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testRecoveryIgnoresWatermarkAbovePublishedFsn() throws Exception {
         // Pin the corruption defence: a watermark higher than what the
         // on-disk segments could account for must be rejected so
@@ -413,7 +458,11 @@ public class CursorSendEngineTest {
                     int rc = 1;
                     while (rc > 0) {
                         String name = Files.utf8ToString(Files.findName(find));
-                        if (name != null && name.endsWith(".sfa")) sfaCount++;
+                        if (name != null
+                                && name.endsWith(".sfa")
+                                && !name.startsWith(".qwp-v2-guard-")) {
+                            sfaCount++;
+                        }
                         rc = Files.findNext(find);
                     }
                 } finally {

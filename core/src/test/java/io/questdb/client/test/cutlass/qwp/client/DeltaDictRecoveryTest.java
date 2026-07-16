@@ -414,7 +414,8 @@ public class DeltaDictRecoveryTest {
         int n = 0;
         if (files != null) {
             for (java.io.File f : files) {
-                if (f.getName().endsWith(".sfa")) {
+                if (f.getName().endsWith(".sfa")
+                        && !f.getName().startsWith(".qwp-v2-guard-")) {
                     n++;
                 }
             }
@@ -1495,7 +1496,9 @@ public class DeltaDictRecoveryTest {
         java.io.File[] files = dir.toFile().listFiles();
         if (files != null) {
             for (java.io.File f : files) {
-                if (f.getName().endsWith(".sfa") && f.length() > 0) {
+                if (f.getName().endsWith(".sfa")
+                        && !f.getName().startsWith(".qwp-v2-guard-")
+                        && f.length() > 0) {
                     return true;
                 }
             }

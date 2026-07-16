@@ -316,6 +316,21 @@ public class SelfSufficientFramesTest {
                         Assert.assertTrue(e.getMessage(),
                                 e.getMessage().contains("too large for server batch cap"));
                     }
+                    // Sender.flush() is retryable: a rejected flush must leave the
+                    // source rows intact. Repeating it under the same cap therefore
+                    // has to reject the same batch again. Before the fix, the first
+                    // failure reset every table buffer and this second flush was a
+                    // silent no-op -- the caller's rows had been lost.
+                    try {
+                        sender.flush();
+                        Assert.fail("retrying the retained oversized batch must throw again");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("too large for server batch cap"));
+                    }
+                    // Explicit reset is the caller-controlled discard boundary and
+                    // prevents close() from making a third retry in this test.
+                    sender.reset();
                     // close() drains the ring: pre-fix, the stranded "small" frame
                     // would be sent (and committed) here.
                 }

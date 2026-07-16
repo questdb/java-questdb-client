@@ -154,7 +154,9 @@ public class RecoveryReplayTest {
             int rc = 1;
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
-                if (name != null && name.endsWith(".sfa")) {
+                if (name != null
+                        && name.endsWith(".sfa")
+                        && !name.startsWith(".qwp-v2-guard-")) {
                     try {
                         try (MmapSegment seg = MmapSegment.openExisting(dir + "/" + name)) {
                             if (seg.frameCount() > 0) n++;

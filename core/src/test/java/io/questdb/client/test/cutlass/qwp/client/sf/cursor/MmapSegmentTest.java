@@ -35,6 +35,8 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.RandomAccessFile;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -109,6 +111,31 @@ public class MmapSegmentTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testCurrentReaderStillOpensLegacyV1Segment() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-v1.sfa";
+            long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 7L, 4096)) {
+                    assertEquals(MmapSegment.VERSION, seg.version());
+                    assertTrue(seg.tryAppend(buf, 8) >= 0L);
+                }
+                try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
+                    file.seek(4L);
+                    file.writeByte(MmapSegment.LEGACY_VERSION);
+                }
+                try (MmapSegment legacy = MmapSegment.openExisting(path)) {
+                    assertEquals(MmapSegment.LEGACY_VERSION, legacy.version());
+                    assertEquals(7L, legacy.baseSeq());
+                    assertEquals(1L, legacy.frameCount());
+                }
+            } finally {
+                Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

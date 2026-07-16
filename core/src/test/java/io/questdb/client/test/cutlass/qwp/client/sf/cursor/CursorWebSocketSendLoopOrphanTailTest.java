@@ -28,6 +28,7 @@ import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
@@ -394,6 +395,55 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testSelfSufficientFrameRepairsAckedRecoveryGap() throws Exception {
+        // fsn 0 models the tail of an old delta epoch whose registering frames
+        // have already been trimmed: with an empty persisted dictionary its
+        // deltaStart=1 is a gap. It is durably ACKed, so it will not replay.
+        // fsn 1 starts a new, self-sufficient epoch from id 0 and is the first
+        // frame that WILL replay. Recovery must use that full frame as the new
+        // source of truth instead of permanently latching the earlier gap.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaFrame(engine, false, 1, 0);
+                appendDeltaSymbolFrame(engine, 0, 'a');
+            }
+            try (AckWatermark watermark = AckWatermark.open(tmpDir)) {
+                assertNotNull(watermark);
+                watermark.write(0L);
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals(0L, engine.ackedFsn());
+                ObjList<String> recovered = new ObjList<>();
+                assertEquals("the full frame must re-anchor replay coverage",
+                        1L, engine.collectReplaySymbolsAbove(0, recovered));
+                assertEquals(1, recovered.size());
+                assertEquals("a", recovered.getQuick(0));
+            }
+        });
+    }
+
+    @Test
+    public void testSelfSufficientFrameCannotHideUnackedRecoveryGap() throws Exception {
+        // Safety twin: when the gapped frame itself is unacked, it reaches the
+        // wire before the later full frame. Recovery must keep the gap latched
+        // and quarantine rather than pretending the later reset repairs the
+        // invalid replay order.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaFrame(engine, false, 1, 0);
+                appendDeltaSymbolFrame(engine, 0, 'a');
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                ObjList<String> recovered = new ObjList<>();
+                assertEquals("an unacked gap remains unreplayable",
+                        -1L, engine.collectReplaySymbolsAbove(0, recovered));
+                assertEquals(0, recovered.size());
             }
         });
     }

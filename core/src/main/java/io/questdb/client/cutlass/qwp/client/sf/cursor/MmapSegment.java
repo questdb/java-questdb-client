@@ -46,7 +46,7 @@ import org.slf4j.LoggerFactory;
  * <p>
  * On-disk layout — header and frame format:
  * <pre>
- *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags=0] [u16 reserved=0]
+ *   [u32 magic 'SF01'] [u8 ver]   [u8 flags=0] [u16 reserved=0]
  *   [u64 baseSeq]       [u64 createdMicros]                       24-byte header
  *   frame, frame, ...                                              each frame:
  *                                                                  [u32 crc32c]
@@ -65,7 +65,8 @@ public final class MmapSegment implements QuietCloseable {
     public static final int FILE_MAGIC = 0x31304653; // 'SF01' little-endian
     public static final int FRAME_HEADER_SIZE = 8;   // u32 crc + u32 payloadLen
     public static final int HEADER_SIZE = 24;
-    public static final byte VERSION = 1;
+    public static final byte LEGACY_VERSION = 1;
+    public static final byte VERSION = 2;
     private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
@@ -76,6 +77,7 @@ public final class MmapSegment implements QuietCloseable {
     // memory-backed segments — same cursor architecture, no disk involvement.
     // close() and msync() branch on this flag.
     private final boolean memoryBacked;
+    private final byte version;
     // appendCursor: written only by the producer thread, never read by anyone else
     // — it's the reservation cursor. Plain field is fine.
     private long appendCursor;
@@ -106,7 +108,7 @@ public final class MmapSegment implements QuietCloseable {
 
     private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
                         long baseSeq, long initialCursor, long frameCount,
-                        boolean memoryBacked, long tornTailBytes) {
+                        boolean memoryBacked, long tornTailBytes, byte version) {
         this.path = path;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
@@ -117,6 +119,7 @@ public final class MmapSegment implements QuietCloseable {
         this.frameCount = frameCount;
         this.memoryBacked = memoryBacked;
         this.tornTailBytes = tornTailBytes;
+        this.version = version;
     }
 
     /**
@@ -164,6 +167,50 @@ public final class MmapSegment implements QuietCloseable {
      * per-call {@code byte[]} + native-malloc the way the String overload does.
      */
     public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes) {
+        return create(ff, pathPtr, displayPath, baseSeq, sizeBytes, VERSION);
+    }
+
+    /**
+     * Creates a tiny v1 segment containing one deliberately non-QWP payload.
+     * Two such files with non-contiguous base sequences form the rollback
+     * barrier installed by {@link SegmentRing}: a v1-only reader opens both
+     * and fails its mandatory FSN-contiguity check before replay. If a process
+     * dies after creating only one guard, that reader still adopts a non-empty
+     * log and sends the invalid one-byte head frame first, so it cannot silently
+     * discard the v2 files and start a fresh slot.
+     */
+    static void createLegacyReaderGuard(String path, long baseSeq) {
+        long pathPtr = FilesFacade.INSTANCE.allocNativePath(path);
+        long payload = 0L;
+        try (MmapSegment segment = create(
+                FilesFacade.INSTANCE,
+                pathPtr,
+                path,
+                baseSeq,
+                HEADER_SIZE + FRAME_HEADER_SIZE + 1L,
+                LEGACY_VERSION
+        )) {
+            payload = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.getUnsafe().putByte(payload, (byte) 0);
+            if (segment.tryAppend(payload, 1) != HEADER_SIZE) {
+                throw new MmapSegmentException("could not append legacy-reader guard frame: " + path);
+            }
+        } finally {
+            if (payload != 0L) {
+                Unsafe.free(payload, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+            FilesFacade.INSTANCE.freeNativePath(pathPtr);
+        }
+    }
+
+    private static MmapSegment create(
+            FilesFacade ff,
+            long pathPtr,
+            String displayPath,
+            long baseSeq,
+            long sizeBytes,
+            byte version
+    ) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
@@ -194,12 +241,13 @@ public final class MmapSegment implements QuietCloseable {
             }
             // Header goes straight into the mapping — no separate write syscall.
             Unsafe.getUnsafe().putInt(addr, FILE_MAGIC);
-            Unsafe.getUnsafe().putByte(addr + 4, VERSION);
+            Unsafe.getUnsafe().putByte(addr + 4, version);
             Unsafe.getUnsafe().putByte(addr + 5, (byte) 0); // flags
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
+            return new MmapSegment(displayPath, fd, addr, sizeBytes, baseSeq,
+                    HEADER_SIZE, 0, false, 0L, version);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -236,7 +284,8 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L);
+            return new MmapSegment(null, -1, addr, sizeBytes, baseSeq,
+                    HEADER_SIZE, 0, true, 0L, VERSION);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
@@ -300,7 +349,7 @@ public final class MmapSegment implements QuietCloseable {
                         "bad magic in " + path + ": 0x" + Integer.toHexString(magic));
             }
             byte version = Unsafe.getUnsafe().getByte(addr + 4);
-            if (version != VERSION) {
+            if (version != LEGACY_VERSION && version != VERSION) {
                 throw new MmapSegmentException("unsupported version in " + path + ": " + version);
             }
             long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
@@ -326,7 +375,8 @@ public final class MmapSegment implements QuietCloseable {
                                 + "Investigate disk health or unexpected writer crash.",
                         path, tornTail, lastGood, fileSize, count);
             }
-            return new MmapSegment(path, fd, addr, fileSize, baseSeq, lastGood, count, false, tornTail);
+            return new MmapSegment(path, fd, addr, fileSize, baseSeq,
+                    lastGood, count, false, tornTail, version);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
@@ -438,6 +488,11 @@ public final class MmapSegment implements QuietCloseable {
 
     public long sizeBytes() {
         return sizeBytes;
+    }
+
+    /** On-disk format version read from or written to this segment. */
+    public byte version() {
+        return version;
     }
 
     /**

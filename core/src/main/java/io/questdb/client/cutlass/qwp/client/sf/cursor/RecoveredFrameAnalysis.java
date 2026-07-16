@@ -41,6 +41,7 @@ import io.questdb.client.std.str.Utf8s;
 final class RecoveredFrameAnalysis implements QuietCloseable {
 
     private static final int MAX_RAW_BYTES = Integer.MAX_VALUE - 8;
+    private final long ackedFsn;
     private final int baseline;
     private long committedBoundaryFsn = -1L;
     private long committedCoverage;
@@ -51,6 +52,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private int committedRawLen;
     private long framesVisited;
     private boolean runningGap;
+    private boolean runningUnackedGap;
     private long runningMaxDeltaEnd;
     private long runningMaxDeltaStart;
     private long rawAddr;
@@ -59,8 +61,9 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private int runningRawLen;
     private long runningCoverage;
 
-    RecoveredFrameAnalysis(int baseline) {
+    RecoveredFrameAnalysis(int baseline, long ackedFsn) {
         this.baseline = baseline;
+        this.ackedFsn = ackedFsn;
         this.runningCoverage = baseline;
         this.committedCoverage = baseline;
     }
@@ -74,7 +77,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
                 ? Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
                 : 0;
         if (isQwp && (flags & QwpConstants.FLAG_DELTA_SYMBOL_DICT) != 0) {
-            foldDelta(payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
+            foldDelta(fsn, payload + QwpConstants.HEADER_SIZE, payload + payloadLen);
         }
 
         // Only a positively identified deferred QWP frame can belong to an
@@ -179,10 +182,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         runningRawCount++;
     }
 
-    private void foldDelta(long p, long limit) {
+    private void foldDelta(long fsn, long p, long limit) {
         long encodedStart = readVarint(p, limit);
         if (encodedStart < 0L) {
-            runningGap = true;
+            markGap(fsn);
             return;
         }
         int startLen = (int) (encodedStart & 7L);
@@ -194,7 +197,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
         long encodedCount = readVarint(p, limit);
         if (encodedCount < 0L) {
-            runningGap = true;
+            markGap(fsn);
             return;
         }
         int countLen = (int) (encodedCount & 7L);
@@ -207,10 +210,21 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             runningMaxDeltaEnd = deltaEnd;
         }
         if (runningGap) {
-            return;
+            // A full dictionary is a new self-sufficient epoch, but it may only
+            // repair a gap that is entirely behind the durable ACK watermark.
+            // If any gapped frame will replay first, accepting this reset would
+            // hide the unsafe wire-order gap and let the server observe missing
+            // ids before it reaches the full frame.
+            if (deltaStart != 0L || runningUnackedGap) {
+                return;
+            }
+            runningGap = false;
+            runningCoverage = baseline;
+            runningRawLen = 0;
+            runningRawCount = 0;
         }
         if (deltaStart > runningCoverage) {
-            runningGap = true;
+            markGap(fsn);
             return;
         }
 
@@ -219,14 +233,14 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             long entryStart = p;
             long encodedLen = readVarint(p, limit);
             if (encodedLen < 0L) {
-                runningGap = true;
+                markGap(fsn);
                 return;
             }
             int varintLen = (int) (encodedLen & 7L);
             long symbolLen = encodedLen >>> 3;
             p += varintLen;
             if (symbolLen > limit - p) {
-                runningGap = true;
+                markGap(fsn);
                 return;
             }
             p += symbolLen;
@@ -236,6 +250,13 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         }
         if (deltaEnd > runningCoverage) {
             runningCoverage = deltaEnd;
+        }
+    }
+
+    private void markGap(long fsn) {
+        runningGap = true;
+        if (fsn > ackedFsn) {
+            runningUnackedGap = true;
         }
     }
 

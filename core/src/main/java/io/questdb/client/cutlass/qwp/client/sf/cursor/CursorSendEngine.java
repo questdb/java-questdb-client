@@ -254,6 +254,14 @@ public final class CursorSendEngine implements QuietCloseable {
         PersistedSymbolDict persistedDictInProgress = null;
         RecoveredFrameAnalysis recoveredFrameAnalysisInProgress = null;
         try {
+            // v2 segment payloads may depend on a persisted symbol-dictionary
+            // prefix. Install the rollback barrier before recovery or any new
+            // append so a v1-only client can never skip the v2 files, treat the
+            // slot as empty, and silently restart at FSN 0. Current recovery
+            // recognizes and skips the reserved guard filenames.
+            if (!memoryMode) {
+                SegmentRing.installLegacyReaderBarrier(sfDir);
+            }
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs

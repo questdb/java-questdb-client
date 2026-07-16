@@ -62,6 +62,8 @@ public final class SegmentRing implements QuietCloseable {
     public static final long BACKPRESSURE_NO_SPARE = -1L;
     /** Sentinel: append failed because the payload doesn't fit in a fresh segment. */
     public static final long PAYLOAD_TOO_LARGE = -2L;
+    static final String LEGACY_READER_GUARD_A = ".qwp-v2-guard-a.sfa";
+    static final String LEGACY_READER_GUARD_B = ".qwp-v2-guard-b.sfa";
     private static final Logger LOG = LoggerFactory.getLogger(SegmentRing.class);
     // Tally of baseSeq comparisons performed by sortByBaseSeq across every
     // openExisting() recovery on this JVM. Used by SegmentRingTest to
@@ -178,7 +180,9 @@ public final class SegmentRing implements QuietCloseable {
                 int rc = 1;
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && name.endsWith(".sfa")) {
+                    if (name != null
+                            && name.endsWith(".sfa")
+                            && !isLegacyReaderGuard(name)) {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
                         try {
@@ -323,6 +327,23 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long ackedFsn() {
         return ackedFsn;
+    }
+
+    /**
+     * Installs an on-disk rollback barrier before any v2 segment can be
+     * created or appended. The guards are valid v1 segments so a legacy
+     * reader cannot skip them as an unknown format. Their deliberately
+     * non-contiguous FSN ranges make its recovery fail closed before replay;
+     * current readers recognize the reserved names and omit them from the
+     * logical ring.
+     */
+    static void installLegacyReaderBarrier(String sfDir) {
+        MmapSegment.createLegacyReaderGuard(
+                sfDir + '/' + LEGACY_READER_GUARD_A,
+                Long.MAX_VALUE - 4L);
+        MmapSegment.createLegacyReaderGuard(
+                sfDir + '/' + LEGACY_READER_GUARD_B,
+                Long.MAX_VALUE - 1L);
     }
 
     /**
@@ -586,7 +607,7 @@ public final class SegmentRing implements QuietCloseable {
      * active segment. The returned native suffix remains owned by the caller.
      */
     synchronized RecoveredFrameAnalysis analyzeRecovery(int symbolBaseline) {
-        RecoveredFrameAnalysis analysis = new RecoveredFrameAnalysis(symbolBaseline);
+        RecoveredFrameAnalysis analysis = new RecoveredFrameAnalysis(symbolBaseline, ackedFsn);
         try {
             for (int i = 0, n = sealedSegments.size(); i < n; i++) {
                 sealedSegments.get(i).scanRecovery(analysis);
@@ -857,6 +878,10 @@ public final class SegmentRing implements QuietCloseable {
                 hi = store;
             }
         }
+    }
+
+    private static boolean isLegacyReaderGuard(String name) {
+        return LEGACY_READER_GUARD_A.equals(name) || LEGACY_READER_GUARD_B.equals(name);
     }
 
     private static void swap(ObjList<MmapSegment> list, int i, int j) {
