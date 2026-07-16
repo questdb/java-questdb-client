@@ -26,8 +26,8 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.ObjList;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -389,18 +389,13 @@ public class SelfSufficientFramesTest {
                         // The write-ahead already ran: both of the batch's new symbols are
                         // durable even though the frame that references them never
                         // published. Move the persist after sealAndSwapBuffer and this is 0.
-                        PersistedSymbolDict pd = PersistedSymbolDict.open(
-                                sfDir.resolve("default").toString());
-                        Assert.assertNotNull(pd);
-                        try {
-                            Assert.assertEquals("the split path must persist its new symbols BEFORE "
-                                    + "publishing the frame that references them", 2, pd.size());
-                            ObjList<String> symbols = pd.readLoadedSymbols();
-                            Assert.assertEquals("alpha", symbols.getQuick(0));
-                            Assert.assertEquals("bravo", symbols.getQuick(1));
-                        } finally {
-                            pd.close();
-                        }
+                        ObjList<String> persisted =
+                                ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                        Assert.assertNotNull(persisted);
+                        Assert.assertEquals("the split path must persist its new symbols BEFORE "
+                                + "publishing the frame that references them", 2, persisted.size());
+                        Assert.assertEquals("alpha", persisted.getQuick(0));
+                        Assert.assertEquals("bravo", persisted.getQuick(1));
                     } finally {
                         try {
                             sender.close();

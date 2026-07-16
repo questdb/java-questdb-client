@@ -31,6 +31,8 @@ import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * Advisory exclusive locks for a single SF slot.
@@ -101,13 +103,15 @@ public final class SlotLock implements QuietCloseable {
      */
     public static SlotLock acquireLogical(String slotDir) {
         validateSlotDir(slotDir);
-        int separator = slotDir.lastIndexOf('/');
-        if (separator < 1 || separator == slotDir.length() - 1) {
+        Path slotPath = Paths.get(slotDir);
+        Path parentPath = slotPath.getParent();
+        Path slotNamePath = slotPath.getFileName();
+        if (parentPath == null || slotNamePath == null || slotNamePath.toString().isEmpty()) {
             throw new IllegalArgumentException(
                     "slotDir must contain a parent and slot name: " + slotDir);
         }
-        String parentDir = slotDir.substring(0, separator);
-        String slotName = slotDir.substring(separator + 1);
+        String parentDir = parentPath.toString();
+        String slotName = slotNamePath.toString();
         String logicalLockDir = parentDir + "/" + LOGICAL_LOCK_DIR_NAME;
         ensureDirectory(logicalLockDir, "logical slot lock dir");
         String lockPath = logicalLockDir + "/" + slotName + ".lock";

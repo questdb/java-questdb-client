@@ -1797,6 +1797,38 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Snapshot of the producer's symbol prefix whose persisted-dictionary chunks
+     * have committed. The persisted size advances only after the chunk CRC and
+     * payload have been written, so this observes the write-ahead boundary without
+     * reopening the live mmap-backed dictionary (which would attempt recovery-tail
+     * truncation and is not supported while the producer owns the file on Windows).
+     * Returns {@code null} in memory mode or when the persisted dictionary is
+     * unavailable.
+     */
+    @TestOnly
+    public ObjList<String> getPersistedSymbolsForTest() {
+        CursorSendEngine engine = cursorEngine;
+        if (engine == null) {
+            return null;
+        }
+        PersistedSymbolDict persisted = engine.getPersistedSymbolDict();
+        if (persisted == null) {
+            return null;
+        }
+        int persistedSize = persisted.size();
+        int globalSize = globalSymbolDictionary.size();
+        if (persistedSize > globalSize) {
+            throw new IllegalStateException("persisted symbol dictionary exceeds producer dictionary"
+                    + " [persisted=" + persistedSize + ", producer=" + globalSize + ']');
+        }
+        ObjList<String> snapshot = new ObjList<>(persistedSize);
+        for (int i = 0; i < persistedSize; i++) {
+            snapshot.add(globalSymbolDictionary.getSymbol(i));
+        }
+        return snapshot;
+    }
+
+    /**
      * Server-advertised cap on the per-batch raw byte size. Zero before the
      * first connect; updated by every successful reconnect via
      * {@link #applyServerBatchSizeLimit(int)}.

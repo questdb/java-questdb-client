@@ -877,15 +877,11 @@ public class DeltaDictRecoveryTest {
 
                     // The persisted dictionary must hold "s0" EXACTLY ONCE.
                     // Pre-fix, the retry duplicated it (size == 2).
-                    PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
-                    Assert.assertNotNull(pd);
-                    try {
-                        Assert.assertEquals("failed-publish retry must not duplicate the persisted symbol",
-                                1, pd.size());
-                        Assert.assertEquals("s0", pd.readLoadedSymbols().getQuick(0));
-                    } finally {
-                        pd.close();
-                    }
+                    ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    Assert.assertNotNull(persisted);
+                    Assert.assertEquals("failed-publish retry must not duplicate the persisted symbol",
+                            1, persisted.size());
+                    Assert.assertEquals("s0", persisted.getQuick(0));
                 } finally {
                     try {
                         sender.close();
@@ -942,16 +938,12 @@ public class DeltaDictRecoveryTest {
                     // The else branch persisted ONLY s1 (the suffix). The dictionary holds
                     // s0, s1 exactly once each. Pre-fix (appendSymbols from
                     // sentMaxSymbolId+1) re-appended s0, giving size 3.
-                    PersistedSymbolDict pd = PersistedSymbolDict.open(Paths.get(sfDir, "default").toString());
-                    Assert.assertNotNull(pd);
-                    try {
-                        Assert.assertEquals("re-encode suffix must not duplicate the persisted prefix",
-                                2, pd.size());
-                        Assert.assertEquals("s0", pd.readLoadedSymbols().getQuick(0));
-                        Assert.assertEquals("s1", pd.readLoadedSymbols().getQuick(1));
-                    } finally {
-                        pd.close();
-                    }
+                    ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    Assert.assertNotNull(persisted);
+                    Assert.assertEquals("re-encode suffix must not duplicate the persisted prefix",
+                            2, persisted.size());
+                    Assert.assertEquals("s0", persisted.getQuick(0));
+                    Assert.assertEquals("s1", persisted.getQuick(1));
                 } finally {
                     try {
                         sender.close();

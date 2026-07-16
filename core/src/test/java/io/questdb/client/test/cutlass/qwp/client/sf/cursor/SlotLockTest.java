@@ -106,8 +106,10 @@ public class SlotLockTest {
     @Test
     public void testLogicalLockRemainsContendedAcrossSlotRenameAndRecreate() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            String slot = parentDir + "/rename";
-            String moved = parentDir + "/rename.quarantined";
+            // Use the platform-native separator. In particular, this exercises
+            // acquireLogical with a backslash-only path on Windows.
+            String slot = Paths.get(parentDir, "rename").toString();
+            String moved = Paths.get(parentDir, "rename.quarantined").toString();
             assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
 
             try (SlotLock ignored = SlotLock.acquireLogical(slot)) {
