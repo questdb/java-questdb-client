@@ -364,8 +364,9 @@ public final class MmapSegment implements QuietCloseable {
                 throw new MmapSegmentException(
                         "bad baseSeq in " + path + ": " + baseSeq);
             }
-            long lastGood = scanFrames(addr, fileSize);
-            long count = countFrames(addr, lastGood);
+            FrameScan scan = scanFrames(addr, fileSize);
+            long lastGood = scan.lastGood;
+            long count = scan.frameCount;
             long tornTail = detectTornTail(addr, lastGood, fileSize);
             if (tornTail > 0) {
                 LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
@@ -907,14 +908,15 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Forward scan that returns the offset just past the last frame whose
-     * CRC verifies. A torn-tail frame (declared length runs past EOF, or
-     * CRC mismatch) leaves both cursors at the start of that frame; the
-     * next {@link #tryAppend} will overwrite it. The scan only reads from
-     * the mapping — no syscalls.
+     * Forward scan that returns the offset just past the last frame whose CRC
+     * verifies and the number of verified frames. A torn-tail frame (declared
+     * length runs past EOF, or CRC mismatch) leaves both cursors at the start of
+     * that frame; the next {@link #tryAppend} will overwrite it. The scan only
+     * reads from the mapping — no syscalls.
      */
-    private static long scanFrames(long addr, long fileSize) {
+    private static FrameScan scanFrames(long addr, long fileSize) {
         long pos = HEADER_SIZE;
+        long frameCount = 0L;
         try {
             while (pos + FRAME_HEADER_SIZE <= fileSize) {
                 int crcRead = Unsafe.getUnsafe().getInt(addr + pos);
@@ -922,7 +924,7 @@ public final class MmapSegment implements QuietCloseable {
                 // Defensive: a corrupt length field could be enormous or negative,
                 // both of which would otherwise overrun the mapping.
                 if (payloadLen < 0 || pos + FRAME_HEADER_SIZE + payloadLen > fileSize) {
-                    return pos;
+                    return new FrameScan(pos, frameCount);
                 }
                 // CRC over the contiguous (payloadLen, payload) pair, folded
                 // via Unsafe reads rather than the native Crc32c.update.
@@ -945,9 +947,10 @@ public final class MmapSegment implements QuietCloseable {
                 // table CRC here is immaterial.
                 int crcCalc = crc32cRecovery(addr + pos + 4, 4L + payloadLen);
                 if (crcCalc != crcRead) {
-                    return pos;
+                    return new FrameScan(pos, frameCount);
                 }
                 pos += FRAME_HEADER_SIZE + payloadLen;
+                frameCount++;
             }
         } catch (InternalError e) {
             // The read at `pos` hit a mapped page that is not backed by real
@@ -973,7 +976,7 @@ public final class MmapSegment implements QuietCloseable {
                             + "if this recurs.",
                     pos, fileSize);
         }
-        return pos;
+        return new FrameScan(pos, frameCount);
     }
 
     /**
@@ -1049,19 +1052,13 @@ public final class MmapSegment implements QuietCloseable {
         return 0L;
     }
 
-    /**
-     * Counts frames in {@code [HEADER_SIZE, lastGood)}. Walks the framing in
-     * lockstep with {@link #scanFrames} (which already validated CRCs); so
-     * this is just length-driven traversal, no CRC re-check.
-     */
-    private static long countFrames(long addr, long lastGood) {
-        long pos = HEADER_SIZE;
-        long count = 0;
-        while (pos < lastGood) {
-            int payloadLen = Unsafe.getUnsafe().getInt(addr + pos + 4);
-            pos += FRAME_HEADER_SIZE + payloadLen;
-            count++;
+    private static final class FrameScan {
+        private final long frameCount;
+        private final long lastGood;
+
+        private FrameScan(long lastGood, long frameCount) {
+            this.lastGood = lastGood;
+            this.frameCount = frameCount;
         }
-        return count;
     }
 }

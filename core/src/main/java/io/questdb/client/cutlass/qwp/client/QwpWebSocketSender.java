@@ -3942,7 +3942,7 @@ public class QwpWebSocketSender implements Sender {
      * <ol>
      *   <li>the slot's persisted {@code .symbol-dict} -- its intact prefix; then</li>
      *   <li>the surviving frames' OWN delta sections, for every id above that prefix
-     *       ({@link CursorSendEngine#collectReplaySymbolsAbove}).</li>
+     *       ({@link CursorSendEngine#addRecoveredSymbolsTo}).</li>
      * </ol>
      * Those are exactly the two sources, in exactly the order, that the send loop's mirror
      * is built from: its constructor seeds {@code sentDictCount} from the same dictionary,
@@ -3976,7 +3976,7 @@ public class QwpWebSocketSender implements Sender {
      * <b>What still fails clean.</b> A genuine GAP: the ids below a surviving frame's delta
      * start were introduced by frames that were acked and TRIMMED away, so they lived only in
      * the lost dictionary and nothing can rebuild them.
-     * {@code collectReplaySymbolsAbove} returns -1 for that and we throw. It is the same
+     * {@code addRecoveredSymbolsTo} returns -1 for that and we throw. It is the same
      * condition the send loop's replay guard ({@code deltaStart > sentDictCount}) trips on, so
      * producer and drainer now agree on exactly which slots are recoverable, instead of the
      * producer rejecting slots the drainer drains.
@@ -3990,17 +3990,13 @@ public class QwpWebSocketSender implements Sender {
         //    mirror also seeds sentDictCount from.
         int baseline = 0;
         if (pd != null && pd.size() > 0) {
-            ObjList<String> persisted = pd.readLoadedSymbols();
-            for (int i = 0, n = persisted.size(); i < n; i++) {
-                globalSymbolDictionary.addRecoveredSymbol(persisted.getQuick(i));
-            }
+            pd.addLoadedSymbolsTo(globalSymbolDictionary);
             baseline = globalSymbolDictionary.size();
         }
         // 2. Everything the surviving frames define above that prefix, straight out of their
         //    own delta sections -- the same bytes, in the same order, accumulateSentDict will
         //    feed the mirror as those frames go back on the wire.
-        ObjList<String> fromFrames = new ObjList<>();
-        long coverage = cursorEngine.collectReplaySymbolsAbove(baseline, fromFrames);
+        long coverage = cursorEngine.addRecoveredSymbolsTo(baseline, globalSymbolDictionary);
         if (coverage < 0) {
             // A gap: the surviving frames reference ids below their own delta start,
             // introduced by frames since acked and trimmed away, and the persisted
@@ -4013,8 +4009,8 @@ public class QwpWebSocketSender implements Sender {
             // "resend required" for delivered data AND -- because such a slot is fully
             // drained -- let build()'s connect-path close unlink the (already-delivered)
             // bytes the quarantine claims to preserve. So DON'T throw: seed the intact
-            // prefix only, leaving fromFrames unused exactly as the send loop's mirror
-            // does on a -1 (it adds nothing), so the producer baseline and the mirror's
+            // prefix only; addRecoveredSymbolsTo adds nothing on a -1 exactly as the
+            // send loop's mirror does, so the producer baseline and the mirror's
             // sentDictCount still agree by construction. The producer resumes above the
             // prefix and the fully-drained slot is cleaned up on close.
             long ackedFsn = cursorEngine.ackedFsn();
@@ -4039,9 +4035,6 @@ public class QwpWebSocketSender implements Sender {
                             + "were introduced by frames since acked and trimmed away, so nothing still "
                             + "holds them; the recovered dictionary holds only "
                             + (pd == null ? 0 : pd.size()) + " id(s) -- resend the affected data");
-        }
-        for (int i = 0, n = fromFrames.size(); i < n; i++) {
-            globalSymbolDictionary.addRecoveredSymbol(fromFrames.getQuick(i));
         }
         // Producer baseline == the coverage the replay will establish == the mirror's
         // sentDictCount once those frames have gone out. The first new frame therefore

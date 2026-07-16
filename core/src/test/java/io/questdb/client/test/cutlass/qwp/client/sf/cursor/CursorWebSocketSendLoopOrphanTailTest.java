@@ -27,10 +27,12 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -395,6 +397,35 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRecoverySkipsEntriesAlreadyCoveredByPersistedPrefix() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+                pd.appendSymbol("c");
+                appendDeltaSymbolFrame(engine, 0, 'a');
+                appendDeltaSymbolFrame(engine, 1, 'b');
+                appendDeltaSymbolFrame(engine, 2, 'c');
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals("covered delta payloads must not be parsed entry-by-entry",
+                        0L, engine.recoverySymbolEntriesVisited());
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                assertNotNull(pd);
+                pd.addLoadedSymbolsTo(recovered);
+                assertEquals(3L, engine.addRecoveredSymbolsTo(recovered.size(), recovered));
+                assertEquals("direct decode must not duplicate the covered frame entries",
+                        3, recovered.size());
+                assertEquals("c", recovered.getSymbol(2));
             }
         });
     }

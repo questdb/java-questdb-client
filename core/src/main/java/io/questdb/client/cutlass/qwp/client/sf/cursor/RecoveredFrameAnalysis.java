@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
@@ -55,6 +56,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private boolean runningUnackedGap;
     private long runningMaxDeltaEnd;
     private long runningMaxDeltaStart;
+    private long symbolEntriesVisited;
     private long rawAddr;
     private int rawCapacity;
     private int runningRawCount;
@@ -95,6 +97,14 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     }
 
     void appendDecodedSymbols(ObjList<String> out) {
+        decodeSymbols(null, out);
+    }
+
+    void addDecodedSymbolsTo(GlobalSymbolDictionary target) {
+        decodeSymbols(target, null);
+    }
+
+    private void decodeSymbols(GlobalSymbolDictionary target, ObjList<String> out) {
         long p = rawAddr;
         long limit = rawAddr + committedRawLen;
         for (int i = 0; i < committedRawCount; i++) {
@@ -108,7 +118,12 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             if (symbolLen > limit - p) {
                 throw new IllegalStateException("truncated cached symbol dictionary suffix");
             }
-            out.add(Utf8s.stringFromUtf8Bytes(p, p + symbolLen));
+            String symbol = Utf8s.stringFromUtf8Bytes(p, p + symbolLen);
+            if (target != null) {
+                target.addRecoveredSymbol(symbol);
+            } else {
+                out.add(symbol);
+            }
             p += symbolLen;
         }
         if (p != limit) {
@@ -150,6 +165,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
     int rawLen() {
         return committedRawLen;
+    }
+
+    long symbolEntriesVisited() {
+        return symbolEntriesVisited;
     }
 
     @Override
@@ -227,9 +246,16 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             markGap(fsn);
             return;
         }
+        // The segment scan already CRC-validated this frame. When its entire
+        // range is covered, entry parsing cannot extend recovery state, so skip
+        // the cardinality-proportional payload walk.
+        if (deltaEnd <= runningCoverage) {
+            return;
+        }
 
         long id = deltaStart;
         for (long i = 0; i < deltaCount; i++, id++) {
+            symbolEntriesVisited++;
             long entryStart = p;
             long encodedLen = readVarint(p, limit);
             if (encodedLen < 0L) {

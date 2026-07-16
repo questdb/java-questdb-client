@@ -299,6 +299,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long sentDictBytesAddr;
     private int sentDictBytesCapacity;
     private int sentDictBytesLen;
+    // False only while an orphan-drainer loop borrows the persisted prefix.
+    // Any growth first performs a copy-on-write; only owned buffers are freed.
+    private boolean sentDictBytesOwned;
     private int sentDictCount;
     // Reusable staging frame for dictionary catch-up chunks. A reconnect may split a
     // large dictionary into many chunks, and every later reconnect repeats that split;
@@ -721,24 +724,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // tracks. When the dictionary could not be opened, pd is null, the mirror
         // simply starts empty and grows from the frames themselves.
         PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+        int persistedPrefixLen = 0;
         if (pd != null && pd.size() > 0) {
             int len = pd.loadedEntriesLen();
             if (len > 0) {
-                // COPY the persisted dictionary's loaded-entries buffer into this
-                // loop's own mirror rather than taking ownership of it. The engine
-                // (and its PersistedSymbolDict) OUTLIVES this loop on the orphan
-                // drainer path: BackgroundDrainer builds a fresh send loop per wire
-                // session against the same engine on a durable-ack capability-gap
-                // recycle. A one-shot ownership transfer would leave every loop
-                // after the first with an EMPTY mirror -- it would then send no
-                // reconnect catch-up, and the first replayed delta frame
-                // (deltaStart > 0) would trip the torn-dict guard, falsely
-                // quarantining a healthy slot. Copying keeps the dictionary's
-                // loaded entries intact for the engine's lifetime so every
-                // recycled loop re-seeds; pd.close() (at engine close) frees the
-                // dictionary's copy, this loop frees its own copy on exit.
-                sentDictBytesAddr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
-                Unsafe.getUnsafe().copyMemory(pd.loadedEntriesAddr(), sentDictBytesAddr, len);
+                // Seed by reference. The foreground loop takes ownership after
+                // construction succeeds; orphan-drainer loops keep borrowing because
+                // one engine can create several sessions during capability-gap
+                // recycling. A borrowed mirror performs copy-on-write if a recovered
+                // frame suffix must extend it.
+                persistedPrefixLen = len;
+                sentDictBytesAddr = pd.loadedEntriesAddr();
                 sentDictBytesCapacity = len;
                 sentDictBytesLen = len;
                 // Set the count only alongside the bytes so sentDictCount can
@@ -786,14 +782,23 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                 }
             } catch (Throwable t) {
-                if (sentDictBytesAddr != 0) {
-                    Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
-                    sentDictBytesAddr = 0;
-                    sentDictBytesCapacity = 0;
-                    sentDictBytesLen = 0;
-                    sentDictCount = 0;
-                }
+                releaseSentDictBytes();
                 throw t;
+            }
+        }
+        // QwpWebSocketSender seeds the producer dictionary before constructing
+        // its one foreground loop, so that loop can own the recovered prefix and
+        // eliminate the engine-side duplicate. BackgroundDrainer must retain the
+        // prefix for later recycled loops and therefore keeps borrowing it.
+        if (persistedPrefixLen > 0 && catchUpCapGapPolicy == CatchUpCapGapPolicy.RETRY_FOREVER) {
+            long persistedPrefixAddr = pd.takeLoadedEntries();
+            if (sentDictBytesOwned) {
+                // Copy-on-grow already produced the combined mirror. Retire the
+                // no-longer-needed persisted prefix after successful construction.
+                Unsafe.free(persistedPrefixAddr, persistedPrefixLen, MemoryTag.NATIVE_DEFAULT);
+            } else {
+                assert persistedPrefixAddr == sentDictBytesAddr;
+                sentDictBytesOwned = true;
             }
         }
         this.fsnAtZero = fsnAtZero;
@@ -1131,15 +1136,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // thread may still be mid-send, so touching the mirror here would race.
         // A duplicate close observes sentDictBytesAddr == 0 and skips.
         if (loopNeverRan && sentDictBytesAddr != 0) {
-            Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
-            sentDictBytesAddr = 0;
-            sentDictBytesCapacity = 0;
-            sentDictBytesLen = 0;
-            // Reset the count alongside the buffer so the mirror stays all-or-
-            // nothing: a hypothetical close()-then-start() (start() has no closed
-            // guard) must not observe a non-zero sentDictCount against a freed
-            // buffer and drive setWireBaselineWithCatchUp into a null-mirror catch-up.
-            sentDictCount = 0;
+            releaseSentDictBytes();
         }
         if (loopNeverRan) {
             freeCatchUpFrameBuffer();
@@ -2048,11 +2045,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // The symbol-dict mirror is I/O-thread-owned; free it here, on the
             // owning thread's exit path, after the last send that could touch it.
             if (sentDictBytesAddr != 0) {
-                Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
-                sentDictBytesAddr = 0;
-                sentDictBytesCapacity = 0;
-                sentDictBytesLen = 0;
-                sentDictCount = 0; // keep the mirror all-or-nothing (see close())
+                releaseSentDictBytes();
             }
             freeCatchUpFrameBuffer();
             shutdownLatch.countDown();
@@ -2438,8 +2431,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (newCap > MAX_SENT_DICT_BYTES) {
             newCap = MAX_SENT_DICT_BYTES;
         }
-        sentDictBytesAddr = Unsafe.realloc(sentDictBytesAddr, sentDictBytesCapacity, (int) newCap, MemoryTag.NATIVE_DEFAULT);
+        if (sentDictBytesOwned) {
+            sentDictBytesAddr = Unsafe.realloc(
+                    sentDictBytesAddr,
+                    sentDictBytesCapacity,
+                    (int) newCap,
+                    MemoryTag.NATIVE_DEFAULT);
+        } else {
+            long newAddr = Unsafe.malloc((int) newCap, MemoryTag.NATIVE_DEFAULT);
+            if (sentDictBytesLen > 0) {
+                Unsafe.getUnsafe().copyMemory(sentDictBytesAddr, newAddr, sentDictBytesLen);
+            }
+            sentDictBytesAddr = newAddr;
+            sentDictBytesOwned = true;
+        }
         sentDictBytesCapacity = (int) newCap;
+    }
+
+    private void releaseSentDictBytes() {
+        if (sentDictBytesAddr != 0 && sentDictBytesOwned) {
+            Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
+        }
+        sentDictBytesAddr = 0;
+        sentDictBytesCapacity = 0;
+        sentDictBytesLen = 0;
+        sentDictBytesOwned = false;
+        sentDictCount = 0;
     }
 
     private long readVarintAt(long p, long limit) {

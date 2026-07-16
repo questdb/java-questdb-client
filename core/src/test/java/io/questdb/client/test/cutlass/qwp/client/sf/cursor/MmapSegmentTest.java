@@ -100,6 +100,8 @@ public class MmapSegmentTest {
                     long expectedEnd = MmapSegment.HEADER_SIZE
                             + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
                     assertEquals(expectedEnd, seg.publishedOffset());
+                    assertEquals("validation scan must return the frame count",
+                            100L, seg.frameCount());
                 }
 
                 // Re-open: scan must land at exactly the same offset.

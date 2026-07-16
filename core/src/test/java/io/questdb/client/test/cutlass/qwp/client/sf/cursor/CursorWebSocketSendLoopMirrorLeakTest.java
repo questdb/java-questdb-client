@@ -81,6 +81,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     Assert.assertNotNull("disk-mode engine must open a persisted dict", pd);
                     Assert.assertTrue("recovery must load the persisted symbols (seeds the mirror)",
                             pd.size() > 0 && pd.loadedEntriesLen() > 0);
+                    long persistedAddr = pd.loadedEntriesAddr();
 
                     CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
                             null, engine, 0, 1_000_000L,
@@ -92,6 +93,12 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     // thread's to free, since the I/O loop never ran.
                     Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
                             readInt(loop, "sentDictCount") > 0);
+                    Assert.assertEquals("foreground loop must take the persisted buffer without copying",
+                            persistedAddr, readLong(loop, "sentDictBytesAddr"));
+                    Assert.assertEquals("ownership transfer must clear the persisted pointer",
+                            0L, pd.loadedEntriesAddr());
+                    Assert.assertTrue("foreground mirror must own the transferred buffer",
+                            readBoolean(loop, "sentDictBytesOwned"));
                     loop.close();
                     // close() must reset sentDictCount alongside freeing the buffer,
                     // so the mirror stays all-or-nothing: a hypothetical post-close
@@ -111,14 +118,14 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         // C1 regression: the orphan drainer (BackgroundDrainer) builds a NEW
         // CursorWebSocketSendLoop per wire session against the SAME, persistent
         // engine when a durable-ack capability gap forces a mid-drain recycle. The
-        // recovery mirror seed must survive that recycle. If the first loop CONSUMED
+        // recovery mirror seed must survive that recycle. If the first loop consumes
         // the persisted dictionary's loaded entries (a one-shot ownership transfer),
         // the second loop seeds an EMPTY mirror (sentDictCount = 0), sends no
         // reconnect catch-up, and the first replayed delta frame (deltaStart > 0)
         // trips the torn-dict guard -- falsely quarantining a healthy slot with a
-        // bogus "resend required" terminal. Copying the entries (leaving the
-        // dictionary intact for the engine's lifetime) lets every recycled loop
-        // re-seed. Pre-fix, loop2's sentDictCount is 0 and this assertion fails.
+        // bogus "resend required" terminal. Borrowing the entries leaves the
+        // dictionary intact for the engine's lifetime without making another native
+        // copy, so every recycled loop can re-seed.
         Path sfDir = Files.createTempDirectory("qwp-mirror-reseed");
         try {
             populateRecoverableSlot(sfDir);
@@ -129,15 +136,22 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     Assert.assertNotNull(pd);
                     int dictSize = pd.size();
                     Assert.assertTrue("recovery must load a non-empty dictionary", dictSize > 0);
+                    long persistedAddr = pd.loadedEntriesAddr();
 
                     // Session 1 seeds its mirror from the persisted dictionary.
                     CursorWebSocketSendLoop loop1 = newRecoveryLoop(engine);
                     try {
                         Assert.assertEquals("session-1 mirror must seed from the persisted dict",
                                 dictSize, readInt(loop1, "sentDictCount"));
+                        Assert.assertEquals("orphan session must borrow the persisted bytes",
+                                persistedAddr, readLong(loop1, "sentDictBytesAddr"));
+                        Assert.assertFalse("borrowed orphan mirror must not own the persisted bytes",
+                                readBoolean(loop1, "sentDictBytesOwned"));
                     } finally {
                         loop1.close();
                     }
+                    Assert.assertEquals("closing a borrowed loop must leave the engine prefix alive",
+                            persistedAddr, pd.loadedEntriesAddr());
 
                     // Session 2 against the SAME engine (the drainer recycle): the
                     // seed must NOT have been consumed -- the mirror must re-seed to
@@ -147,6 +161,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                         Assert.assertEquals("recycled session-2 mirror must re-seed from the "
                                         + "persisted dict (pre-fix it was 0)",
                                 dictSize, readInt(loop2, "sentDictCount"));
+                        Assert.assertEquals(persistedAddr, readLong(loop2, "sentDictBytesAddr"));
                     } finally {
                         loop2.close();
                     }
@@ -205,6 +220,8 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     } finally {
                         setMirrorSeedFault(false);
                     }
+                    Assert.assertTrue("failed foreground construction must leave the persisted prefix owned",
+                            pd.loadedEntriesAddr() != 0L);
                     // The outer assertMemoryLeak proves the prefix-seeded mirror the ctor
                     // malloc'd was freed on the throw -- pre-fix it leaks here.
                 }
@@ -223,7 +240,9 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
-                0, 0, 1);
+                0, 0, 1,
+                false, 0L, 3, 0L, 0L,
+                CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
     }
 
     private static void populateRecoverableSlot(Path sfDir) throws Exception {
@@ -273,6 +292,18 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
         f.setAccessible(true);
         return f.getInt(loop);
+    }
+
+    private static boolean readBoolean(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getBoolean(loop);
+    }
+
+    private static long readLong(CursorWebSocketSendLoop loop, String name) throws Exception {
+        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getLong(loop);
     }
 
     // Toggles the loop's @TestOnly mirror-seed fault flag. Reflection because the

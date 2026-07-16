@@ -77,6 +77,13 @@ public class PersistedSymbolDictTest {
                 Assert.assertEquals("GOOG", symbols.getQuick(1));
                 Assert.assertEquals("MSFT", symbols.getQuick(2));
                 Assert.assertTrue(reopened.loadedEntriesLen() > 0);
+                Assert.assertTrue("production recovery must parse through mmap instead of a heap file copy",
+                        reopened.usedMappedRecoveryInput());
+
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+                reopened.addLoadedSymbolsTo(recovered);
+                Assert.assertEquals("direct recovery decode must preserve dense ids", 3, recovered.size());
+                Assert.assertEquals("GOOG", recovered.getSymbol(1));
 
                 // Appending after recovery continues from the recovered tip.
                 reopened.appendSymbol("TSLA");

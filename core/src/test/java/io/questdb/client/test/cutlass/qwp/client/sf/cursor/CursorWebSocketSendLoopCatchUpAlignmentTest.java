@@ -960,6 +960,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             }
         }
         setField(loop, "sentDictBytesAddr", addr);
+        setBooleanField(loop, "sentDictBytesOwned", true);
         setIntField(loop, "sentDictBytesCapacity", total);
         setIntField(loop, "sentDictBytesLen", total);
         setIntField(loop, "sentDictCount", symbols.length);

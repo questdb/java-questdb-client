@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
@@ -760,6 +761,24 @@ public final class CursorSendEngine implements QuietCloseable {
         );
     }
 
+    /**
+     * Decodes the cached recovery suffix directly into the producer's global
+     * dictionary. Recovery always builds the analysis with the persisted
+     * prefix size as its baseline, so no intermediate cardinality-sized list is
+     * needed on the production path.
+     */
+    public long addRecoveredSymbolsTo(int baseline, GlobalSymbolDictionary target) {
+        if (recoveredFrameAnalysis == null) {
+            return baseline;
+        }
+        RecoveredFrameAnalysis analysis = checkedRecoveryAnalysis(baseline);
+        long coverage = analysis.coverage();
+        if (coverage >= 0L) {
+            analysis.addDecodedSymbolsTo(target);
+        }
+        return coverage;
+    }
+
     long recoveredSymbolCoverage(int baseline) {
         return checkedRecoveryAnalysis(baseline).coverage();
     }
@@ -783,6 +802,11 @@ public final class CursorSendEngine implements QuietCloseable {
     @TestOnly
     public long recoveryFramesVisited() {
         return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.framesVisited();
+    }
+
+    @TestOnly
+    public long recoverySymbolEntriesVisited() {
+        return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.symbolEntriesVisited();
     }
 
     private RecoveredFrameAnalysis checkedRecoveryAnalysis(int baseline) {
