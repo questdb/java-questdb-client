@@ -70,8 +70,10 @@ import java.util.concurrent.locks.LockSupport;
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget),
- *       with only auth-style failures (401/403/non-101 upgrade reject) treated
- *       as terminal. On reconnect success, repositions the cursor at
+ *       with endpoint-policy failures terminal only for an initial foreground
+ *       connect or an orphan drainer. A previously-live foreground sender keeps
+ *       retrying so credential and rolling-capability changes remain contained
+ *       by store-and-forward. On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
  * No locks on the steady-state path. The producer thread (user) writes
@@ -225,6 +227,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // user-facing 5-minute default is applied at the config layer.
     private final long catchUpCapGapMinEscalationWindowNanos;
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
+    private final ReconnectPolicy reconnectPolicy;
     private final CursorSendEngine engine;
     private final long parkNanos;
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
@@ -370,9 +373,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
     // successful connect attempt in any mode). Once true, stays true. Used to
-    // distinguish a "never reached the server" terminal failure (looks like a
-    // config typo or firewall block) from "lost connection after we were
-    // up" (looks transient).
+    // distinguish an initial endpoint-policy failure (fail fast) from a
+    // post-start failure that a foreground sender must contain and retry.
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
     // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
@@ -381,8 +383,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // QwpDurableAckMismatchException. The orphan drainer consults it to route
     // a mid-drain capability gap into its budgeted settle-retry
     // (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining
-    // the slot on the first sweep; the foreground sender ignores it and keeps
-    // its spec'd loud-fail (sf-client.md section 8.1). Write-once alongside
+    // the slot on the first sweep. Foreground reconnects never set this marker;
+    // they keep retrying after a successful initial connection. Write-once alongside
     // terminalError: the only writer runs on the I/O thread under the same
     // first-writer-wins latch.
     private volatile QwpDurableAckMismatchException capabilityGapTerminal;
@@ -512,9 +514,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code client} may be {@code null} only if {@code reconnectFactory}
      * is non-null — this is the async-initial-connect path: the I/O thread
      * runs the same retry loop on its first iteration to obtain a live
-     * client, and a terminal failure (auth/upgrade reject) is delivered
-     * through the dispatcher rather than thrown to the constructor's
-     * caller; plain connect failures are retried indefinitely
+     * client, and an initial terminal failure (auth/upgrade reject or durable-ack
+     * mismatch) is delivered through the dispatcher rather than thrown to the
+     * constructor's caller; plain connect failures are retried indefinitely
      * (Invariant B: no wall-clock budget give-up).
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
@@ -656,10 +658,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Policy-aware master constructor. Foreground senders must pass
-     * {@link CatchUpCapGapPolicy#RETRY_FOREVER}; only orphan drainers may pass
-     * {@link CatchUpCapGapPolicy#TERMINAL_AFTER_SETTLE_BUDGET} and quarantine a slot
-     * after the attempt and dwell thresholds are both exhausted.
+     * Compatibility policy-aware constructor. New production call sites should
+     * use the {@link ReconnectPolicy} overload below, which names the foreground
+     * versus orphan ownership distinction directly.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -696,6 +697,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             throw new IllegalArgumentException("catchUpCapGapPolicy must be non-null");
         }
         this.catchUpCapGapPolicy = catchUpCapGapPolicy;
+        this.reconnectPolicy = catchUpCapGapPolicy == CatchUpCapGapPolicy.RETRY_FOREVER
+                ? ReconnectPolicy.FOREGROUND
+                : ReconnectPolicy.ORPHAN;
         if (engine == null) {
             throw new IllegalArgumentException("engine must be non-null");
         }
@@ -829,6 +833,41 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             this.orphanSkipStartFsn = engine.recoveredCommitBoundaryFsn() + 1L;
             this.orphanSkipTipFsn = orphanTip;
         }
+    }
+
+    /**
+     * Policy-aware master constructor. A foreground sender fails fast while
+     * establishing its first connection, then retries endpoint-policy failures
+     * indefinitely after it has been live. An orphan drainer returns such failures
+     * to its owner so the slot can follow its settle/quarantine policy.
+     */
+    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+                                   long fsnAtZero, long parkNanos,
+                                   ReconnectFactory reconnectFactory,
+                                   long reconnectMaxDurationMillis,
+                                   long reconnectInitialBackoffMillis,
+                                   long reconnectMaxBackoffMillis,
+                                   boolean durableAckMode,
+                                   long durableAckKeepaliveIntervalMillis,
+                                   int maxHeadFrameRejections,
+                                   long poisonMinEscalationWindowMillis,
+                                   long catchUpCapGapMinEscalationWindowMillis,
+                                   ReconnectPolicy reconnectPolicy) {
+        this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, durableAckMode,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
+                catchUpPolicyFor(reconnectPolicy));
+    }
+
+    private static CatchUpCapGapPolicy catchUpPolicyFor(ReconnectPolicy reconnectPolicy) {
+        if (reconnectPolicy == null) {
+            throw new IllegalArgumentException("reconnectPolicy must be non-null");
+        }
+        return reconnectPolicy == ReconnectPolicy.FOREGROUND
+                ? CatchUpCapGapPolicy.RETRY_FOREVER
+                : CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET;
     }
 
     /**
@@ -1487,13 +1526,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.warn("cursor I/O loop entering {} loop: {}",
                 phase, initial.getMessage());
         long outageStartNanos = System.nanoTime();
-        // INVARIANT B: a store-and-forward drainer must NEVER terminate on a
+        // INVARIANT B: a store-and-forward loop must NEVER terminate on a
         // wall-clock reconnect budget. A replica-only / all-endpoints-replica
         // window is TRANSIENT -- a replica gets promoted, a primary reappears --
         // so this background loop retries for as long as it is running, backing
-        // off between attempts. The ONLY terminal conditions are a genuinely
-        // non-retriable upgrade (auth / non-421 upgrade / durable-ack capability
-        // gap), which return directly below, or the sender being stopped. SF
+        // off between attempts. Endpoint-policy failures (auth / non-421
+        // upgrade / durable-ack capability gap) are terminal only for orphan
+        // drainers and a foreground sender's first connection. Once a foreground
+        // sender has connected, those states are retried so a credential or cluster
+        // capability rotation cannot stop its producer. SF
         // exhaustion is surfaced to the PRODUCER as append backpressure, never
         // here. reconnect_max_duration_millis is intentionally NOT consulted: it
         // bounds only the blocking (non-lazy) initial connect in
@@ -1557,65 +1598,78 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // observation. Do not let the time spent retrying it satisfy orphan dwell.
                 resetCatchUpCapGapEpisode();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
-                // Terminal across all configured endpoints per spec sf-client.md
-                // section 13.3: auth (401/403) bypasses reconnect and surfaces as
-                // SECURITY_ERROR. WebSocketUpgradeException reaching here is always
-                // non-421: QwpUpgradeFailures.classify upstream converts a
-                // 421-with-X-QuestDB-Role to QwpIngressRoleRejectedException, and a
-                // 421 without that header walks the transport-error path in
-                // buildAndConnect and lands as a LineSenderException, falling into
-                // the Throwable branch below.
-                LOG.error("terminal upgrade error during {} -- won't retry: {}",
-                        phase, e.getMessage());
-                long fromFsn = engine.ackedFsn() + 1L;
-                long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                SenderError err = new SenderError(
-                        SenderError.Category.SECURITY_ERROR,
-                        SenderError.Policy.TERMINAL,
-                        SenderError.NO_STATUS_BYTE,
-                        "ws-upgrade-failed: " + e.getMessage(),
-                        SenderError.NO_MESSAGE_SEQUENCE,
-                        fromFsn,
-                        toFsn,
-                        null,
-                        System.nanoTime()
-                );
-                totalServerErrors.incrementAndGet();
-                recordFatal(new LineSenderServerException(err));
-                dispatchError(err);
-                return;
-            } catch (QwpDurableAckMismatchException e) {
-                // Per spec sf-client.md section 8.1: the client opted into durable
-                // ack but the cluster cannot honour it. Loud fail at connect rather
-                // than silently waiting for ack frames that will never arrive.
-                // Classified as PROTOCOL_VIOLATION (config/capability mismatch),
-                // not SECURITY_ERROR -- this is not an auth failure.
-                LOG.error("durable-ack mismatch during {} -- won't retry: {}",
-                        phase, e.getMessage());
-                if (terminalError == null) {
-                    // Mirror recordFatal's first-writer-wins latch: only the
-                    // sweep that owns the terminal may mark the gap, and the
-                    // marker must be visible before the terminalError volatile
-                    // write that checkError() keys on.
-                    capabilityGapTerminal = e;
+                if (endpointPolicyFailureIsTerminal()) {
+                    // Orphans return control to their quarantine owner; a
+                    // foreground sender that never connected still fails fast.
+                    // WebSocketUpgradeException reaching here is always non-421:
+                    // role rejects are classified into the transient branch below.
+                    LOG.error("terminal upgrade error during {} -- won't retry: {}",
+                            phase, e.getMessage());
+                    long fromFsn = engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    SenderError err = new SenderError(
+                            SenderError.Category.SECURITY_ERROR,
+                            SenderError.Policy.TERMINAL,
+                            SenderError.NO_STATUS_BYTE,
+                            "ws-upgrade-failed: " + e.getMessage(),
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            fromFsn,
+                            toFsn,
+                            null,
+                            System.nanoTime()
+                    );
+                    totalServerErrors.incrementAndGet();
+                    recordFatal(new LineSenderServerException(err));
+                    dispatchError(err);
+                    return;
                 }
-                long fromFsn = engine.ackedFsn() + 1L;
-                long toFsn = Math.max(fromFsn, engine.publishedFsn());
-                SenderError err = new SenderError(
-                        SenderError.Category.PROTOCOL_VIOLATION,
-                        SenderError.Policy.TERMINAL,
-                        SenderError.NO_STATUS_BYTE,
-                        "durable-ack-mismatch: " + e.getMessage(),
-                        SenderError.NO_MESSAGE_SEQUENCE,
-                        fromFsn,
-                        toFsn,
-                        null,
-                        System.nanoTime()
-                );
-                totalServerErrors.incrementAndGet();
-                recordFatal(new LineSenderServerException(err));
-                dispatchError(err);
-                return;
+                resetCatchUpCapGapEpisode();
+                lastReconnectError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: foreground auth/upgrade policy rejected the connection; "
+                                    + "retrying because this sender was previously live -- {}",
+                            phase, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+            } catch (QwpDurableAckMismatchException e) {
+                if (endpointPolicyFailureIsTerminal()) {
+                    // Orphans hand a capability gap back to BackgroundDrainer's
+                    // settle budget. An initial foreground connect remains loud.
+                    LOG.error("durable-ack mismatch during {} -- won't retry: {}",
+                            phase, e.getMessage());
+                    if (terminalError == null) {
+                        // Publish the marker before terminalError, which is the
+                        // volatile first-writer-wins latch observed by the owner.
+                        capabilityGapTerminal = e;
+                    }
+                    long fromFsn = engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    SenderError err = new SenderError(
+                            SenderError.Category.PROTOCOL_VIOLATION,
+                            SenderError.Policy.TERMINAL,
+                            SenderError.NO_STATUS_BYTE,
+                            "durable-ack-mismatch: " + e.getMessage(),
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            fromFsn,
+                            toFsn,
+                            null,
+                            System.nanoTime()
+                    );
+                    totalServerErrors.incrementAndGet();
+                    recordFatal(new LineSenderServerException(err));
+                    dispatchError(err);
+                    return;
+                }
+                resetCatchUpCapGapEpisode();
+                lastReconnectError = e;
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: foreground durable-ack capability is temporarily "
+                                    + "unavailable; retrying because this sender was previously live -- {}",
+                            phase, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
                 // Role mismatch: every reachable endpoint role-rejected the
                 // upgrade -- right now they are all replicas / primary-catchup.
@@ -1702,6 +1756,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         LOG.info("cursor I/O loop {} stopped after {}ms, {} attempts (sender closing); "
                         + "un-acked rows remain in SF for retry; last error: {}",
                 phase, elapsedMs, attempts, lastMsg);
+    }
+
+    private boolean endpointPolicyFailureIsTerminal() {
+        return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
     }
 
     /**
@@ -2949,13 +3007,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         TERMINAL_AFTER_SETTLE_BUDGET
     }
 
+    /** Identifies who owns data while the reconnect loop is unavailable. */
+    public enum ReconnectPolicy {
+        /** A live producer keeps buffering and retries endpoint-policy failures. */
+        FOREGROUND,
+        /** An orphan drainer returns terminal states to its quarantine owner. */
+        ORPHAN
+    }
+
     /**
      * Factory used by the I/O loop to build a fresh, connected, upgraded
      * {@link WebSocketClient} after a wire failure. Implementations close
      * the old client (if needed), build a new one with the same auth/TLS
      * config, connect, perform the WebSocket upgrade, and return it ready
-     * to send. Throw on a terminal failure (auth rejection, etc.) — the
-     * I/O loop will treat the throw as fatal.
+     * to send. The loop's {@link ReconnectPolicy} decides whether endpoint-policy
+     * failures are retried or returned as terminal.
      */
     @FunctionalInterface
     public interface ReconnectFactory {

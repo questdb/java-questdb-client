@@ -3430,7 +3430,7 @@ public class QwpWebSocketSender implements Sender {
                     maxFrameRejections,
                     poisonMinEscalationWindowMillis,
                     catchUpCapGapMinEscalationWindowMillis,
-                    CursorWebSocketSendLoop.CatchUpCapGapPolicy.RETRY_FOREVER);
+                    CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles

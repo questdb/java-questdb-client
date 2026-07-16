@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -203,14 +202,13 @@ public class ReconnectTest {
     }
 
     @Test
-    public void testTerminalUpgradeErrorAbortsReconnect() throws Exception {
+    public void testPostStartAuthErrorRemainsBuffered() throws Exception {
         // Bespoke raw-socket fixture: first connection completes the
         // WebSocket upgrade and feeds back STATUS_OK ACKs; any subsequent
         // connection gets HTTP 401 Unauthorized — exercising the
-        // auth-terminal path. With reconnect_max_duration_millis=10s and
-        // a 401 happening on the very first reconnect, the cursor I/O
-        // loop should surface the terminal error within hundreds of ms,
-        // not after 10s.
+        // post-start auth-rotation path. Once a foreground sender has been
+        // live, store-and-forward owns its unacked data: repeated 401s must
+        // remain contained and retried rather than stopping the producer.
         try (Auth401AfterFirstConnectionFixture fixture =
                      new Auth401AfterFirstConnectionFixture()) {
             fixture.start();
@@ -224,9 +222,8 @@ public class ReconnectTest {
                 // Wait for first connection to ACK + close
                 waitFor(() -> fixture.acceptedConnections.get() >= 2, 5_000);
 
-                long t0 = System.nanoTime();
                 Throwable observed = null;
-                long deadline = System.currentTimeMillis() + 5_000;
+                long deadline = System.currentTimeMillis() + 750;
                 while (System.currentTimeMillis() < deadline) {
                     try {
                         sender.table("foo").longColumn("v", 2L).atNow();
@@ -237,23 +234,10 @@ public class ReconnectTest {
                     }
                     Thread.sleep(50);
                 }
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                Assert.assertNotNull("expected terminal error after auth rejection",
+                Assert.assertNull("post-start auth rejection must stay buffered and retriable",
                         observed);
-                Assert.assertTrue(
-                        "terminal upgrade error must surface well inside the cap; took "
-                                + elapsedMs + "ms (cap was 10000ms)",
-                        elapsedMs < 5_000);
-                String msg = observed.getMessage() == null ? "" : observed.getMessage();
-                Assert.assertTrue(
-                        "error must mention the terminal upgrade failure: " + msg,
-                        msg.contains("WebSocket upgrade failed")
-                                || msg.contains("I/O thread failed")
-                                || msg.contains("401"));
-            } catch (LineSenderException ignored) {
+                waitFor(() -> fixture.acceptedConnections.get() >= 3, 5_000);
             }
-            // close() rethrows the latched terminal upgrade error
-            // (commit 052f6ee). Already observed and asserted above.
         }
     }
 

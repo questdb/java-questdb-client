@@ -241,8 +241,8 @@ public class BackgroundDrainerDurableAckRetryTest {
             CountingListener listener = new CountingListener();
             // A genuinely non-retriable upgrade error (non-421 5xx upgrade reject) is
             // terminal -- waiting will not fix it -- so the drainer quarantines on the
-            // first attempt, exactly like the live sender's background loop halts on
-            // auth/upgrade. A TRANSPORT error, by contrast, is transient and is
+            // first attempt under the orphan reconnect policy. A TRANSPORT error,
+            // by contrast, is transient and is
             // retried (see testTransportErrorNeverQuarantinesInvariantB).
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(
                     () -> new WebSocketUpgradeException(500, null, "server error during upgrade"));

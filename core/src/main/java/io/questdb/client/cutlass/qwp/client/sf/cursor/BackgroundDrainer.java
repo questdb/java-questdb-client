@@ -243,8 +243,10 @@ public final class BackgroundDrainer implements Runnable {
      * durable ack -- i.e. the symptom of a misconfigured cluster or a
      * rolling-upgrade transient.
      * <p>
-     * For the foreground sender that condition is loud-fail: the producer
-     * is actively pushing data. The drainer is asymmetric: source data is
+     * For a foreground sender's initial connection that condition is loud-fail;
+     * after the sender has been live, its reconnect loop keeps buffering and
+     * retrying through a rolling capability change. The drainer is asymmetric:
+     * source data is
      * pinned (durable-ack-mode trims only on STATUS_DURABLE_ACK frames,
      * which the offending endpoints by definition do not send), so we
      * give the cluster a budget to settle before quarantining the slot.
@@ -318,8 +320,7 @@ public final class BackgroundDrainer implements Runnable {
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 // Genuinely non-retriable across the cluster (auth 401/403, or a
                 // non-421 upgrade reject): waiting will not fix it, so quarantine
-                // immediately -- exactly as the live sender's background loop
-                // (CursorWebSocketSendLoop.connectLoop) halts on these errors.
+                // immediately under the orphan reconnect policy.
                 String msg = e.getMessage();
                 LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
                 lastErrorMessage = msg;
@@ -639,7 +640,7 @@ public final class BackgroundDrainer implements Runnable {
                         maxHeadFrameRejections,
                         poisonMinEscalationWindowMillis,
                         catchUpCapGapMinEscalationWindowMillis,
-                        CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {
