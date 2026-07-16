@@ -53,6 +53,7 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -682,8 +683,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     "catchUpCapGapMinEscalationWindowMillis must be >= 0: "
                             + catchUpCapGapMinEscalationWindowMillis);
         }
+        // TimeUnit conversion saturates at Long.MAX_VALUE. A raw multiply
+        // wraps large valid millisecond values negative, which makes the
+        // elapsed-time gate appear satisfied as soon as the strike threshold
+        // is reached and can quarantine a recoverable orphan slot prematurely.
         this.catchUpCapGapMinEscalationWindowNanos =
-                catchUpCapGapMinEscalationWindowMillis * 1_000_000L;
+                TimeUnit.MILLISECONDS.toNanos(catchUpCapGapMinEscalationWindowMillis);
         if (catchUpCapGapPolicy == null) {
             throw new IllegalArgumentException("catchUpCapGapPolicy must be non-null");
         }

@@ -398,6 +398,33 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testCatchUpCapGapDwellConversionSaturatesInsteadOfOverflowing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long maxExactMillis = Long.MAX_VALUE / 1_000_000L;
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop exactLoop = newLoop(
+                        engine, new CatchUpCapturingClient(0), maxExactMillis);
+                try {
+                    assertEquals(maxExactMillis * 1_000_000L,
+                            readLong(exactLoop, "catchUpCapGapMinEscalationWindowNanos"));
+                } finally {
+                    exactLoop.close();
+                }
+
+                CursorWebSocketSendLoop saturatedLoop = newLoop(
+                        engine, new CatchUpCapturingClient(0), maxExactMillis + 1L);
+                try {
+                    assertEquals("an oversized dwell must become effectively infinite, not negative",
+                            Long.MAX_VALUE,
+                            readLong(saturatedLoop, "catchUpCapGapMinEscalationWindowNanos"));
+                } finally {
+                    saturatedLoop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCapGapEpisodeWithANegativeAnchorStillEscalates() throws Exception {
         // A cap-gap episode anchored at a NEGATIVE nanoTime instant must escalate like any
         // other. A System.nanoTime() value is only meaningful as a difference -- its origin
