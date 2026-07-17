@@ -33,6 +33,7 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Regression guard for the I/O-thread silent-death hazard in
@@ -134,5 +135,46 @@ public class CursorWebSocketSendLoopZeroBackoffTest {
                 loop.close();
             }
         }
+    }
+
+    /**
+     * Regression guard for the connect-budget overflow. A large
+     * {@code reconnect_max_duration_millis} -- {@code Long.MAX_VALUE} is the
+     * natural "retry until the server boots" value, and the builder setter
+     * imposes no upper bound -- must NOT collapse the budget to zero. The pre-fix
+     * {@code startNanos + maxDurationMillis * 1_000_000L} wrapped NEGATIVE, so the
+     * pre-condition retry loop ran ZERO iterations and {@code connectWithRetry}
+     * threw "no attempts made" without ever calling the factory: the exact
+     * opposite of the requested maximal patience. Post-fix the saturating
+     * elapsed-vs-budget comparison keeps the loop live, so at least one attempt
+     * is made.
+     * <p>
+     * The factory throws an {@link Error} rather than a retriable transport
+     * failure on purpose: under a {@code Long.MAX_VALUE} budget a retriable
+     * failure would retry forever, whereas an Error propagates on the first
+     * attempt -- and it can only propagate if the loop body ran at all, which is
+     * precisely the signal the pre-fix overflow destroyed.
+     */
+    @Test(timeout = 30_000)
+    public void connectWithRetryWithSaturatingBudgetStillMakesAttempts() {
+        AtomicInteger attempts = new AtomicInteger();
+        try {
+            CursorWebSocketSendLoop.connectWithRetry(
+                    () -> {
+                        attempts.incrementAndGet();
+                        throw new LinkageError("attempt reached (test)");
+                    },
+                    Long.MAX_VALUE,  // pre-fix: startNanos + MAX * 1_000_000L wraps negative
+                    1L,
+                    4L,
+                    "test-connect-budget-overflow");
+            Assert.fail("expected the factory's Error to propagate after an attempt");
+        } catch (LinkageError expected) {
+            Assert.assertEquals("attempt reached (test)", expected.getMessage());
+        }
+        Assert.assertEquals(
+                "a Long.MAX_VALUE reconnect budget must not collapse to zero attempts "
+                        + "(pre-fix millis * 1_000_000L overflow)",
+                1, attempts.get());
     }
 }

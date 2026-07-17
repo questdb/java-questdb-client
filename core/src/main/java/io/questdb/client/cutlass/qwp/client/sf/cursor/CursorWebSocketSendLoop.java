@@ -951,12 +951,21 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             String contextLabel
     ) {
         long startNanos = System.nanoTime();
-        long deadlineNanos = startNanos + maxDurationMillis * 1_000_000L;
+        // Saturating budget, compared against ELAPSED rather than an absolute
+        // startNanos+budget deadline. A large reconnect_max_duration_millis (e.g.
+        // Long.MAX_VALUE, the natural "retry until the server boots") must not collapse
+        // the budget to zero: a raw maxDurationMillis*1_000_000L wraps NEGATIVE -- the
+        // same overflow the drainer's capabilityGapBudgetNanos and the loop dwells were
+        // hardened against -- so the pre-condition loop below would make ZERO attempts.
+        // Even TimeUnit.toNanos saturated to Long.MAX_VALUE would overflow an absolute
+        // startNanos+budget sum; comparing the bounded nanoTime difference against the
+        // budget stays correct at saturation.
+        long budgetNanos = TimeUnit.MILLISECONDS.toNanos(maxDurationMillis);
         long backoffMillis = initialBackoffMillis;
         int attempts = 0;
         long lastLogNanos = 0L;
         Throwable lastError = null;
-        while (System.nanoTime() < deadlineNanos) {
+        while (System.nanoTime() - startNanos < budgetNanos) {
             attempts++;
             try {
                 WebSocketClient c = factory.reconnect();
@@ -1011,7 +1020,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // this > 0. Mirrors BackgroundDrainer's sweep-loop jitter guard.
             long jitter = ThreadLocalRandom.current().nextLong(Math.max(1L, backoffMillis));
             long sleepMillis = backoffMillis + jitter;
-            long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
+            long remainingMillis = (budgetNanos - (System.nanoTime() - startNanos)) / 1_000_000L;
             if (remainingMillis <= 0) {
                 break;
             }
