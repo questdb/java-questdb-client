@@ -452,6 +452,54 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    @Test
+    public void testMappedAppendSpansMultipleWindowsAndRecoversDenseIds() throws Exception {
+        // A dictionary larger than one 4 MiB append window must remap the window
+        // mid-append (appendMapGrowthCount >= 2) and still recover every symbol in
+        // dense id order across the boundary. Guards two paths the single-window
+        // happy path leaves uncovered: the remap arithmetic in ensureAppendMap, and
+        // the single-pass appendSymbols encode as its chunks straddle the boundary.
+        assertMemoryLeak(() -> {
+            final int n = 640;
+            final String pad = TestUtils.repeat("x", 8192); // ~8 KiB per symbol -> >4 MiB total
+            GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+            for (int i = 0; i < n; i++) {
+                dict.getOrAddSymbol("sym-" + i + "-" + pad); // distinct, id == i
+            }
+            Assert.assertEquals(n, dict.size());
+
+            Path dir = newFolder("qwp-symdict");
+            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(d);
+                // Multi-symbol batches so the appendSymbols encode loop is exercised,
+                // not just the single-symbol path.
+                for (int from = 0; from < n; from += 8) {
+                    int to = Math.min(from + 8, n) - 1;
+                    d.appendSymbols(dict, from, to);
+                }
+                Assert.assertEquals(n, d.size());
+                Assert.assertEquals("production mmap appends must not use positioned writes",
+                        0L, d.appendWriteCount());
+                Assert.assertTrue(
+                        "a dictionary larger than the 4 MiB window must remap at least once (saw "
+                                + d.appendMapGrowthCount() + ")",
+                        d.appendMapGrowthCount() >= 2);
+            }
+
+            // Fresh open: every id must resolve to its own symbol, including the ids
+            // whose chunks straddled the 4 MiB window boundary.
+            try (PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(re);
+                Assert.assertEquals(n, re.size());
+                ObjList<String> got = re.readLoadedSymbols();
+                for (int i = 0; i < n; i++) {
+                    Assert.assertEquals("symbol at id " + i + " must survive the window boundary",
+                            dict.getSymbol(i), got.getQuick(i));
+                }
+            }
+        });
+    }
+
     private static int varintSize(int v) {
         int n = 1;
         while ((v >>>= 7) != 0) {

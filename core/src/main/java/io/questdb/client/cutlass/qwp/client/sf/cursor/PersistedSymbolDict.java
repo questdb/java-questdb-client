@@ -415,11 +415,18 @@ public final class PersistedSymbolDict implements QuietCloseable {
 
     /**
      * Appends the dense id range {@code [from .. to]} as one chunk with one
-     * checksum. Production encodes directly into a segmented append mapping, avoiding
-     * both the staging copy and a positioned-write syscall on every flush. The
-     * scratch/positioned-write fallback exists only behind an injected filesystem
-     * facade so short-write recovery tests retain their fault seam. Callers pass the
-     * dictionary and the range so the ids resolve to their symbol strings.
+     * checksum. This is the RE-ENCODE path: the steady-state persist ships a frame's
+     * pre-encoded delta bytes through {@link #appendRawEntries}, and only a retry
+     * after a failed publish rebuilds a range straight from the dictionary. The
+     * mapped path stages the entry region in the scratch buffer with a single UTF-8
+     * walk per symbol, then bulk-copies it into the append window after the header,
+     * and still commits WITHOUT a positioned-write syscall. A direct encode into the
+     * window would walk each symbol's UTF-8 length twice -- the exact entriesLen sizes
+     * both the header varint and the mmap reserve -- and the back-to-back chunk format
+     * leaves no room to reserve-and-back-fill the header in place. The
+     * positioned-write fallback runs only behind an injected filesystem facade so
+     * short-write recovery tests retain their fault seam. Callers pass the dictionary
+     * and the range so the ids resolve to their symbol strings.
      * <p>
      * Same durability and idempotency contract as {@link #appendSymbol}: no fsync,
      * and a short write throws WITHOUT advancing {@code size}/{@code appendOffset},
@@ -432,32 +439,32 @@ public final class PersistedSymbolDict implements QuietCloseable {
         }
         int count = to - from + 1;
         if (mappedAppend) {
-            long entriesLenLong = 0L;
+            // Stage the entry region in scratch with ONE UTF-8 walk per symbol, then
+            // bulk-copy it into the append window after the header (see the method
+            // javadoc for why a direct in-window encode would have to walk each symbol
+            // twice). ensureScratch enforces the same MAX_SCRATCH_BYTES ceiling the old
+            // sizing pass did, throwing before size/appendOffset advance.
+            int entriesLen = 0;
             for (int id = from; id <= to; id++) {
-                int utf8Len = Utf8s.utf8Bytes(dict.getSymbol(id));
-                entriesLenLong += NativeBufferWriter.varintSize(utf8Len) + (long) utf8Len;
-                if (entriesLenLong > MAX_SCRATCH_BYTES) {
-                    throw new IllegalStateException("symbol dict chunk exceeds the maximum size to "
-                            + FILE_NAME + " [required=" + entriesLenLong + ", max="
-                            + MAX_SCRATCH_BYTES + ']');
+                CharSequence symbol = dict.getSymbol(id);
+                int utf8Len = Utf8s.utf8Bytes(symbol);
+                int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len; // [len][utf8]
+                ensureScratch((long) entriesLen + wireLen);
+                long q = NativeBufferWriter.writeVarint(scratchAddr + entriesLen, utf8Len);
+                if (utf8Len > 0) {
+                    Utf8s.strCpyUtf8(symbol, q, utf8Len);
                 }
+                entriesLen += wireLen;
             }
-            int entriesLen = (int) entriesLenLong;
             int hdrLen = NativeBufferWriter.varintSize(count)
                     + NativeBufferWriter.varintSize(entriesLen);
             long recLen = (long) hdrLen + entriesLen + CRC_SIZE;
             ensureAppendMap(checkedRequiredOffset(recLen));
             long recStart = appendMapAddr + appendOffset - appendMapOffset;
             long p = NativeBufferWriter.writeVarint(recStart, count);
-            p = NativeBufferWriter.writeVarint(p, entriesLen);
-            for (int id = from; id <= to; id++) {
-                CharSequence symbol = dict.getSymbol(id);
-                int utf8Len = Utf8s.utf8Bytes(symbol);
-                p = NativeBufferWriter.writeVarint(p, utf8Len);
-                if (utf8Len > 0) {
-                    Utf8s.strCpyUtf8(symbol, p, utf8Len);
-                    p += utf8Len;
-                }
+            NativeBufferWriter.writeVarint(p, entriesLen);
+            if (entriesLen > 0) {
+                Unsafe.getUnsafe().copyMemory(scratchAddr, recStart + hdrLen, entriesLen);
             }
             commitMappedChunk(recStart, hdrLen, entriesLen, count);
             return;
