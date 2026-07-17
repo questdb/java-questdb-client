@@ -1353,6 +1353,101 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testFullDictFramesRecoverBesideASurvivingPopulatedDictionary() throws Exception {
+        // The populated-side-file twin of testFullDictFramesRecoverInFullDictModeInsteadOf-
+        // Bricking. Self-sufficient frames can also be recovered next to a .symbol-dict
+        // that HOLDS entries, and that slot must recover exactly as the empty-side-file
+        // one does.
+        //
+        // It takes one transient plus one crash. A delta session leaves a populated
+        // .symbol-dict. The next session's open of it fails transiently (EIO, fd
+        // exhaustion, a Windows share lock), so that session runs full-dict fallback --
+        // and PersistedSymbolDict's never-recreate contract deliberately leaves the
+        // older side-file intact rather than truncating the only copy of load-bearing
+        // state. That session writes self-sufficient frames out-reaching the stale
+        // dictionary, then crashes. This recovery opens the survivor: size() > 0,
+        // maxSymbolDeltaStart == 0, recoveredMaxSymbolId >= size().
+        //
+        // CursorSendEngine discards the dictionary here (the frames carry their own, so
+        // it is not needed) -- but the recovery analysis was folded with the dictionary's
+        // size as its baseline, while seedGlobalDictionaryFromPersisted computes baseline
+        // 0 once pd is gone. checkedRecoveryAnalysis then threw
+        // IllegalStateException("recovery symbol baseline mismatch"), which is NOT an
+        // UnreplayableSlotException, so build()'s quarantine handler could not set the
+        // slot aside. With a stable senderId every restart re-recovered the same slot and
+        // threw again: the application could never construct a Sender, so it could not
+        // even buffer new rows -- on a slot that is perfectly recoverable. The engine now
+        // re-folds at baseline 0 when it discards.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            // Phase 1: force full-dict fallback with a planted directory, so the frames
+            // land self-sufficient (deltaStart=0) and no side-file is written.
+            java.nio.file.Files.createDirectories(dict);
+            java.nio.file.Path blocker = dict.resolve("blocker");
+            java.nio.file.Files.createFile(blocker);
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                Assert.assertTrue("full-dict fallback: .symbol-dict must stay a directory",
+                        java.nio.file.Files.isDirectory(dict));
+            }
+
+            // Swap the planted directory for the POPULATED side-file the earlier delta
+            // session left behind. Fewer entries than the frames reference, so the
+            // discard's recoveredMaxSymbolId >= size() guard fires with size() > 0 --
+            // the case that bricked build().
+            java.nio.file.Files.delete(blocker);
+            java.nio.file.Files.delete(dict);
+            final int survivingEntries = 3;
+            Assert.assertTrue(survivingEntries < DISTINCT_SYMBOLS);
+            try (PersistedSymbolDict survivor = PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                for (int i = 0; i < survivingEntries; i++) {
+                    survivor.appendSymbol("sym-" + i);
+                }
+                Assert.assertEquals(survivingEntries, survivor.size());
+            }
+
+            // Phase 2: recover. build() must SUCCEED, and the self-sufficient frames must
+            // replay gap-free in full-dict mode -- the stale dictionary is discarded, not
+            // trusted, so it cannot misattribute an id.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) { // must NOT throw
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertFalse("a discarded dictionary leaves full-dict mode, which is "
+                        + "catch-up-free", handler.sawCatchUpFrame);
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size",
+                        DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFullDictFramesRecoverInFullDictModeInsteadOfBricking() throws Exception {
         // M1 regression (counterpoint to testTornDictTotalLossFailsCleanOnResume): a
         // slot written in FULL-DICT fallback -- the .symbol-dict could not open when

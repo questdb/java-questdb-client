@@ -404,6 +404,36 @@ public final class CursorSendEngine implements QuietCloseable {
                         && recoveredMaxSymbolDeltaStart == 0L) {
                     persistedDictInProgress.close();
                     persistedDictInProgress = null;
+                    // Re-fold at baseline 0. The analysis above was keyed to the
+                    // dictionary's size, and every consumer of it presents the baseline it
+                    // derived the same way -- seedGlobalDictionaryFromPersisted computes
+                    // baseline 0 once pd is gone, and checkedRecoveryAnalysis rejects a
+                    // baseline that disagrees with the fold. Discarding a dictionary that
+                    // held entries (size > 0) therefore desynchronised the two and threw
+                    // IllegalStateException("recovery symbol baseline mismatch") out of
+                    // build(). That is NOT an UnreplayableSlotException, so build()'s
+                    // quarantine handler could not catch it and set the slot aside: with a
+                    // stable senderId every restart re-recovered the same slot and threw
+                    // again, so the application could never construct a Sender -- it could
+                    // not even BUFFER new rows. Exactly the outage quarantineTornSlot
+                    // exists to prevent, on a slot that is fully recoverable (its frames
+                    // carry their whole dictionary inline).
+                    //
+                    // Reachable on one transient plus one crash: a session whose
+                    // .symbol-dict fails to open (EIO, fd exhaustion, a Windows share
+                    // lock) falls back to full-dict frames and, per the never-recreate
+                    // contract, leaves the previous session's populated side-file intact;
+                    // if that session then crashes, this recovery opens a dictionary with
+                    // size > 0 next to self-sufficient frames that out-reach it.
+                    //
+                    // Re-folding rather than keeping the dictionary preserves the discard's
+                    // whole point -- the slot recovers in full-dict mode, exactly as it was
+                    // written, with producer, mirror and replay guard all anchored at 0.
+                    recoveredFrameAnalysisInProgress.close();
+                    recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(0);
+                    this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
+                    this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
+                    this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
                 }
             } else {
                 // Fresh start with no recovered segments. Any stale
