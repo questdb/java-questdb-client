@@ -46,6 +46,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class PersistedSymbolDictTest {
 
+    private static final int APPEND_MAP_CAPACITY = 4 * 1024 * 1024;
     // On-disk geometry, mirrored from PersistedSymbolDict so the layout-derived
     // corruption tests below read as arithmetic rather than magic numbers.
     private static final int CRC_SIZE = 4;
@@ -375,9 +376,10 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testMappedAppendAmortizesFlushesWithoutPositionedWrites() throws Exception {
+    public void testMappedAppendUsesMultiMegabyteWindowsWithoutPositionedWrites() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
+            Path file = dir.resolve(PersistedSymbolDict.FILE_NAME);
             try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
                 Assert.assertNotNull(d);
                 for (int i = 0; i < 10_000; i++) {
@@ -386,9 +388,13 @@ public class PersistedSymbolDictTest {
                 Assert.assertEquals(10_000, d.size());
                 Assert.assertEquals("production appends must write directly into the mmap",
                         0L, d.appendWriteCount());
-                Assert.assertEquals("ten thousand flushes must require only three mapped windows",
-                        3, d.appendMapGrowthCount());
+                Assert.assertEquals("ten thousand flushes must share one 4 MiB mapped window",
+                        1, d.appendMapGrowthCount());
+                Assert.assertEquals("the active append window must reserve one bounded segment",
+                        APPEND_MAP_CAPACITY, Files.size(file));
             }
+            Assert.assertTrue("close must truncate the unused mmap reserve",
+                    Files.size(file) < APPEND_MAP_CAPACITY);
 
             try (PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString())) {
                 Assert.assertNotNull(re);

@@ -71,6 +71,7 @@ public final class SegmentRing implements QuietCloseable {
     // (CI runner variance makes elapsed-millisecond bounds flaky). Cheap
     // in production: one volatile-free add per partition pass, dwarfed by
     // the mmap I/O the recovery does on every segment.
+    private static final int SEALED_PREFIX_COMPACTION_THRESHOLD = 64;
     private static long sortComparisons;
     private final long maxBytesPerSegment;
     // Sealed segments in baseSeq order, oldest first. Active is held separately.
@@ -80,6 +81,16 @@ public final class SegmentRing implements QuietCloseable {
     // looks at sealedSegments after observing a higher ackedFsn, by which
     // point the producer thread's add to sealedSegments has retired.
     private final ObjList<MmapSegment> sealedSegments = new ObjList<>();
+    // Logical deque head. Trimming nulls and advances this cursor instead of
+    // shifting the remaining ObjList on every ACK. When the dead prefix is at
+    // least half the backing list (and non-trivially large), one bulk compaction
+    // reclaims it. Each live reference is therefore moved at most once per
+    // halving, making sequential trim O(N) overall instead of O(N^2).
+    private int sealedHead;
+    // Deterministic performance probes: unlike elapsed-time assertions these
+    // let tests pin binary successor search and amortized prefix compaction.
+    private int lastNextSealedSearchComparisons;
+    private long sealedCompactionMoves;
     // High-water byte offset within the active segment at which we proactively
     // ask the segment manager to provision a spare (if one isn't already
     // installed). Computed once as 3/4 of segment capacity -- leaves the manager
@@ -460,13 +471,14 @@ public final class SegmentRing implements QuietCloseable {
             hotSpare.close();
             hotSpare = null;
         }
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             MmapSegment s = sealedSegments.get(i);
             if (s != null) {
                 s.close();
             }
         }
         sealedSegments.clear();
+        sealedHead = 0;
     }
 
     /**
@@ -483,9 +495,10 @@ public final class SegmentRing implements QuietCloseable {
         // Sealed segments are in baseSeq order, oldest first; once we hit one
         // that isn't fully acked, none of the later ones can be either.
         // Synchronized so the I/O thread's snapshotSealedSegments() can't
-        // race against the remove(0) shuffling slots underneath it.
-        while (sealedSegments.size() > 0) {
-            MmapSegment s = sealedSegments.get(0);
+        // race against logical-head advancement or a bulk prefix compaction.
+        int n = sealedSegments.size();
+        while (sealedHead < n) {
+            MmapSegment s = sealedSegments.get(sealedHead);
             long lastSeq = s.baseSeq() + s.frameCount() - 1;
             if (lastSeq > acked) {
                 break;
@@ -494,8 +507,9 @@ public final class SegmentRing implements QuietCloseable {
                 out = new ObjList<>();
             }
             out.add(s);
-            sealedSegments.remove(0);
+            sealedSegments.setQuick(sealedHead++, null);
         }
+        compactSealedPrefixIfNeeded();
         return out;
     }
 
@@ -511,7 +525,7 @@ public final class SegmentRing implements QuietCloseable {
      * scan cost doesn't matter.
      */
     public synchronized MmapSegment findSegmentContaining(long fsn) {
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             MmapSegment s = sealedSegments.get(i);
             long base = s.baseSeq();
             if (fsn >= base && fsn < base + s.frameCount()) {
@@ -534,7 +548,7 @@ public final class SegmentRing implements QuietCloseable {
      * fallback -- see {@link #nextSealedAfter(MmapSegment)}.
      */
     public synchronized MmapSegment firstSealed() {
-        return sealedSegments.size() > 0 ? sealedSegments.get(0) : null;
+        return sealedHead < sealedSegments.size() ? sealedSegments.get(sealedHead) : null;
     }
 
     /** Active segment -- exposed for the I/O thread's "send next batch" path. */
@@ -557,7 +571,7 @@ public final class SegmentRing implements QuietCloseable {
      */
     public synchronized long findLastFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
         long best = -1L;
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             long fsn = sealedSegments.get(i).findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
             if (fsn > best) {
                 best = fsn;
@@ -589,7 +603,7 @@ public final class SegmentRing implements QuietCloseable {
             ObjList<String> out
     ) {
         long coverage = baseline;
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             coverage = sealedSegments.get(i).collectReplaySymbolsAbove(
                     headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize,
                     minFsnInclusive, maxFsnInclusive, coverage, out);
@@ -609,7 +623,7 @@ public final class SegmentRing implements QuietCloseable {
     synchronized RecoveredFrameAnalysis analyzeRecovery(int symbolBaseline) {
         RecoveredFrameAnalysis analysis = new RecoveredFrameAnalysis(symbolBaseline, ackedFsn);
         try {
-            for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+            for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
                 sealedSegments.get(i).scanRecovery(analysis);
             }
             active.scanRecovery(analysis);
@@ -631,7 +645,7 @@ public final class SegmentRing implements QuietCloseable {
      */
     public synchronized long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxEnd = 0L;
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             long end = sealedSegments.get(i).maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
             if (end > maxEnd) {
                 maxEnd = end;
@@ -650,7 +664,7 @@ public final class SegmentRing implements QuietCloseable {
      */
     public synchronized long maxSymbolDeltaStart(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
         long maxStart = 0L;
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             long start = sealedSegments.get(i).maxSymbolDeltaStart(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
             if (start > maxStart) {
                 maxStart = start;
@@ -670,7 +684,8 @@ public final class SegmentRing implements QuietCloseable {
      * concurrent rotation. Cross-thread readers (typically the I/O loop)
      * should use {@link #snapshotSealedSegments(MmapSegment[])} instead.
      */
-    public ObjList<MmapSegment> getSealedSegments() {
+    public synchronized ObjList<MmapSegment> getSealedSegments() {
+        compactSealedPrefix();
         return sealedSegments;
     }
 
@@ -722,13 +737,20 @@ public final class SegmentRing implements QuietCloseable {
      */
     public synchronized MmapSegment nextSealedAfter(MmapSegment current) {
         long currentBase = current.baseSeq();
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
-            MmapSegment s = sealedSegments.get(i);
-            if (s.baseSeq() > currentBase) {
-                return s;
+        int lo = sealedHead;
+        int hi = sealedSegments.size();
+        int comparisons = 0;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            comparisons++;
+            if (sealedSegments.get(mid).baseSeq() <= currentBase) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        return null;
+        lastNextSealedSearchComparisons = comparisons;
+        return lo < sealedSegments.size() ? sealedSegments.get(lo) : null;
     }
 
     /**
@@ -777,15 +799,15 @@ public final class SegmentRing implements QuietCloseable {
      * the I/O loop is about to do.
      */
     public synchronized int snapshotSealedSegments(MmapSegment[] target) {
-        int n = sealedSegments.size();
+        int n = sealedSegments.size() - sealedHead;
         if (n > target.length) {
             for (int i = 0; i < target.length; i++) {
-                target[i] = sealedSegments.get(i);
+                target[i] = sealedSegments.get(sealedHead + i);
             }
             return -1;
         }
         for (int i = 0; i < n; i++) {
-            target[i] = sealedSegments.get(i);
+            target[i] = sealedSegments.get(sealedHead + i);
         }
         return n;
     }
@@ -803,11 +825,21 @@ public final class SegmentRing implements QuietCloseable {
         if (a != null) total += a.sizeBytes();
         MmapSegment hs = hotSpare;
         if (hs != null) total += hs.sizeBytes();
-        for (int i = 0, n = sealedSegments.size(); i < n; i++) {
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
             MmapSegment s = sealedSegments.get(i);
             if (s != null) total += s.sizeBytes();
         }
         return total;
+    }
+
+    @TestOnly
+    public synchronized int getLastNextSealedSearchComparisons() {
+        return lastNextSealedSearchComparisons;
+    }
+
+    @TestOnly
+    public synchronized long getSealedCompactionMoves() {
+        return sealedCompactionMoves;
     }
 
     /**
@@ -829,6 +861,38 @@ public final class SegmentRing implements QuietCloseable {
     @TestOnly
     public static void resetSortComparisons() {
         sortComparisons = 0;
+    }
+
+    private void compactSealedPrefix() {
+        if (sealedHead == 0) {
+            return;
+        }
+        int size = sealedSegments.size();
+        int remaining = size - sealedHead;
+        if (remaining == 0) {
+            // Every retired slot was nulled while draining, so resetting pos
+            // neither retains references nor has to clear the backing array.
+            sealedSegments.setPos(0);
+        } else {
+            sealedCompactionMoves += remaining;
+            for (int i = 0; i < remaining; i++) {
+                sealedSegments.setQuick(i, sealedSegments.get(sealedHead + i));
+            }
+            for (int i = remaining; i < size; i++) {
+                sealedSegments.setQuick(i, null);
+            }
+            sealedSegments.setPos(remaining);
+        }
+        sealedHead = 0;
+    }
+
+    private void compactSealedPrefixIfNeeded() {
+        int size = sealedSegments.size();
+        if (sealedHead == size
+                || (sealedHead >= SEALED_PREFIX_COMPACTION_THRESHOLD
+                && sealedHead >= size - sealedHead)) {
+            compactSealedPrefix();
+        }
     }
 
     /**

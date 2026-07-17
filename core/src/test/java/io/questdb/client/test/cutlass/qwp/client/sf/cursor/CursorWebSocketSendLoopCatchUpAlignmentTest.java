@@ -163,29 +163,37 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
-    public void testSplitCatchUpReusesOneFrameBufferAcrossReconnects() throws Exception {
+    public void testSplitCatchUpReusesEntryIndexAndStagesOnlyPrefixAcrossReconnects() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CatchUpCapturingClient client = new CatchUpCapturingClient(3_100);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 3_000), TestUtils.repeat("y", 3_000));
+                    assertEquals("the mirror is indexed once when it is built",
+                            1, loop.catchUpEntryIndexBuildCount());
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the small cap must split the dictionary", 2, client.framesSent);
-                    assertEquals("the split chunks fit the initial native buffer",
+                    assertEquals("catch-up must send the symbol bytes as a second payload slice",
+                            2, client.multipartFramesSent);
+                    assertEquals("the split chunks need one small prefix buffer",
                             1, loop.catchUpFrameGrowthCount());
 
                     client.cap = 7_000;
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the larger cap must combine the dictionary", 3, client.framesSent);
-                    assertEquals("the combined frame must grow the retained native buffer once",
-                            2, loop.catchUpFrameGrowthCount());
+                    assertEquals("combining symbols must not grow the prefix-only buffer",
+                            1, loop.catchUpFrameGrowthCount());
+                    assertEquals("reconnect must reuse cached entry ends instead of reparsing",
+                            1, loop.catchUpEntryIndexBuildCount());
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the next reconnect sends one combined frame", 4, client.framesSent);
-                    assertEquals("the grown native frame buffer must be reused across reconnects",
-                            2, loop.catchUpFrameGrowthCount());
+                    assertEquals("the prefix buffer must be reused across reconnects",
+                            1, loop.catchUpFrameGrowthCount());
+                    assertEquals("later reconnects must still reuse the entry index",
+                            1, loop.catchUpEntryIndexBuildCount());
                 } finally {
                     // assertMemoryLeak verifies that close releases the retained buffer.
                     loop.close();
@@ -964,6 +972,10 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         setIntField(loop, "sentDictBytesCapacity", total);
         setIntField(loop, "sentDictBytesLen", total);
         setIntField(loop, "sentDictCount", symbols.length);
+        Method index = CursorWebSocketSendLoop.class.getDeclaredMethod(
+                "rebuildSentDictEntryIndex");
+        index.setAccessible(true);
+        index.invoke(loop);
     }
 
     private static void setField(Object target, String name, long value) throws Exception {
@@ -1021,6 +1033,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         private final Runnable onCapRead;
         private final boolean throwOnSend;
         private int framesSent;
+        private int multipartFramesSent;
 
         CatchUpCapturingClient(int cap) {
             this(cap, false);
@@ -1052,6 +1065,21 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
 
         @Override
         public void sendBinary(long dataPtr, int length) {
+            recordSend();
+        }
+
+        @Override
+        public void sendBinary(
+                long firstPtr,
+                int firstLength,
+                long secondPtr,
+                int secondLength
+        ) {
+            multipartFramesSent++;
+            recordSend();
+        }
+
+        private void recordSend() {
             if (throwOnSend) {
                 throw new RuntimeException("transient wire failure during catch-up");
             }

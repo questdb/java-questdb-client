@@ -467,8 +467,11 @@ public class SegmentRingTest {
                     assertEquals(0, cursor.baseSeq());
                     int visited = 1;
                     long prevBase = cursor.baseSeq();
+                    int maxSearchComparisons = 0;
                     while (true) {
                         MmapSegment next = ring.nextSealedAfter(cursor);
+                        maxSearchComparisons = Math.max(maxSearchComparisons,
+                                ring.getLastNextSealedSearchComparisons());
                         if (next == null) break;
                         assertTrue("baseSeq must strictly increase: prev=" + prevBase
                                         + " next=" + next.baseSeq(),
@@ -480,6 +483,31 @@ public class SegmentRingTest {
                     assertEquals("must visit every sealed segment", sealedCount, visited);
                     // Walking past the last sealed → null (caller falls through to active).
                     assertNull(ring.nextSealedAfter(cursor));
+                    maxSearchComparisons = Math.max(maxSearchComparisons,
+                            ring.getLastNextSealedSearchComparisons());
+                    int binarySearchBound = 32 - Integer.numberOfLeadingZeros(sealedCount) + 1;
+                    assertTrue("successor search used " + maxSearchComparisons
+                                    + " comparisons for " + sealedCount
+                                    + " segments; expected binary search <= " + binarySearchBound,
+                            maxSearchComparisons <= binarySearchBound);
+
+                    // Trim one segment per ACK. remove(0) shifts the whole suffix on
+                    // every iteration (O(N^2)); the logical deque head only performs
+                    // occasional bulk compactions whose total moved references stay
+                    // linear in the original sealed count.
+                    for (int i = 0; i < sealedCount; i++) {
+                        ring.acknowledge(i);
+                        ObjList<MmapSegment> drained = ring.drainTrimmable();
+                        assertNotNull(drained);
+                        assertEquals(1, drained.size());
+                        assertEquals(i, drained.get(0).baseSeq());
+                        drained.get(0).close();
+                    }
+                    assertNull(ring.firstSealed());
+                    assertTrue("prefix compaction moved " + ring.getSealedCompactionMoves()
+                                    + " references while trimming " + sealedCount
+                                    + " segments; expected amortized O(1) trim",
+                            ring.getSealedCompactionMoves() < sealedCount);
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);

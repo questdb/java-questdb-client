@@ -1392,6 +1392,7 @@ public class DeltaDictRecoveryTest {
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
         private int dataFrameCount;
+        private TestWebSocketServer.ClientHandler droppedClient;
         private boolean firstDataFrameDropped;
         private volatile int lastDataDeltaStart = -1;
 
@@ -1425,6 +1426,14 @@ public class DeltaDictRecoveryTest {
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // Closing the socket below does not discard frames that its reader has
+            // already decoded. A faster replay loop can therefore deliver another
+            // callback for the deliberately dropped client while (or even after)
+            // the replacement connection starts. Those stale frames must not reset
+            // the fresh connection's synthetic dictionary / ACK sequence.
+            if (client == droppedClient) {
+                return;
+            }
             boolean newConnection = currentClient != client;
             if (newConnection) {
                 currentClient = client;
@@ -1440,6 +1449,7 @@ public class DeltaDictRecoveryTest {
                 lastDataDeltaStart = QwpWireTestUtils.readVarint(data, new int[]{12});
                 if (dropFirstDataFrame && !firstDataFrameDropped) {
                     firstDataFrameDropped = true;
+                    droppedClient = client;
                     client.close();
                     return;
                 }

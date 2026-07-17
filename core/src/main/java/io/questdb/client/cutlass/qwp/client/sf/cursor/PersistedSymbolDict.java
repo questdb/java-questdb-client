@@ -146,7 +146,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
     static final int CRC_SIZE = 4; // u32 CRC-32C trailing every chunk
     static final int FILE_MAGIC = 0x31445953; // 'SYD1' little-endian
     static final int HEADER_SIZE = 8;
-    static final int INITIAL_APPEND_MAP_CAPACITY = 64 * 1024;
+    // One bounded, segment-sized append window avoids the allocate/unmap/mmap
+    // cycle every 64 KiB without geometrically reserving up to 2x a large
+    // dictionary. close() truncates the unused tail back to appendOffset.
+    static final int APPEND_MAP_CAPACITY = 4 * 1024 * 1024;
     /**
      * Upper bound on a chunk's two header varints ({@code entryCount} and
      * {@code entryBytes}): each is at most 5 bytes for a 32-bit value. The
@@ -883,9 +886,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
 
     /**
      * Ensures the production append mmap covers the absolute file offset
-     * {@code required}. The log is mapped in 64 KiB-aligned windows: small flushes
-     * share a window, while a large existing dictionary does not force the process
-     * to reserve and remap its whole prefix (or geometrically over-allocate it).
+     * {@code required}. The log is mapped in 4 MiB-aligned windows: small flushes
+     * share a segment-sized window, while a large existing dictionary does not force
+     * the process to reserve and remap its whole prefix or geometrically over-allocate it.
      */
     private void ensureAppendMap(long required) {
         if (appendMapAddr != 0L
@@ -893,12 +896,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 && required <= appendMapOffset + appendMapCapacity) {
             return;
         }
-        long newOffset = appendOffset - appendOffset % INITIAL_APPEND_MAP_CAPACITY;
+        long newOffset = appendOffset - appendOffset % APPEND_MAP_CAPACITY;
         long needed = required - newOffset;
-        long newCapacity = Math.max(INITIAL_APPEND_MAP_CAPACITY, needed);
-        long remainder = newCapacity % INITIAL_APPEND_MAP_CAPACITY;
+        long newCapacity = Math.max(APPEND_MAP_CAPACITY, needed);
+        long remainder = newCapacity % APPEND_MAP_CAPACITY;
         if (remainder != 0L) {
-            long padding = INITIAL_APPEND_MAP_CAPACITY - remainder;
+            long padding = APPEND_MAP_CAPACITY - remainder;
             if (newCapacity > Long.MAX_VALUE - padding) {
                 throw new IllegalStateException("symbol dict mmap capacity overflow to "
                         + FILE_NAME + " [required=" + required + ']');
