@@ -30,9 +30,10 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
-import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -58,59 +59,58 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     private static final int DISTINCT_SYMBOLS = 8;
     private static final int ROWS = 40;
 
+    @Rule
+    public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
+
     @Test
     public void testSeededMirrorFreedWhenLoopClosedWithoutStart() throws Exception {
-        Path sfDir = Files.createTempDirectory("qwp-mirror-leak");
-        try {
-            // Populate a slot with delta frames + a non-empty .symbol-dict, then
-            // abandon it (silent server, close-fast) -- outside assertMemoryLeak,
-            // because a full Sender+server round trip is not net-zero on its own.
-            populateRecoverableSlot(sfDir);
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-leak").toPath();
+        // Populate a slot with delta frames + a non-empty .symbol-dict, then
+        // abandon it (silent server, close-fast) -- outside assertMemoryLeak,
+        // because a full Sender+server round trip is not net-zero on its own.
+        populateRecoverableSlot(sfDir);
 
-            Path slot = sfDir.resolve("default");
-            Assert.assertTrue("populate must leave a persisted dictionary",
-                    Files.exists(slot.resolve(".symbol-dict")));
+        Path slot = sfDir.resolve("default");
+        Assert.assertTrue("populate must leave a persisted dictionary",
+                Files.exists(slot.resolve(".symbol-dict")));
 
-            // Only the recovery construct + close is leak-checked: the engine
-            // recovers (loading the dict), the loop ctor seeds the mirror from it,
-            // and close() -- with NO start() -- must free every native allocation.
-            // Pre-fix the seeded mirror leaks here and this assertion fails.
-            assertMemoryLeak(() -> {
-                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
-                    PersistedSymbolDict pd = engine.getPersistedSymbolDict();
-                    Assert.assertNotNull("disk-mode engine must open a persisted dict", pd);
-                    Assert.assertTrue("recovery must load the persisted symbols (seeds the mirror)",
-                            pd.size() > 0 && pd.loadedEntriesLen() > 0);
-                    long persistedAddr = pd.loadedEntriesAddr();
+        // Only the recovery construct + close is leak-checked: the engine
+        // recovers (loading the dict), the loop ctor seeds the mirror from it,
+        // and close() -- with NO start() -- must free every native allocation.
+        // Pre-fix the seeded mirror leaks here and this assertion fails.
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                Assert.assertNotNull("disk-mode engine must open a persisted dict", pd);
+                Assert.assertTrue("recovery must load the persisted symbols (seeds the mirror)",
+                        pd.size() > 0 && pd.loadedEntriesLen() > 0);
+                long persistedAddr = pd.loadedEntriesAddr();
 
-                    CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
-                            null, engine, 0, 1_000_000L,
-                            () -> {
-                                throw new IOException("no reconnect in this test");
-                            },
-                            0, 0, 1);
-                    // Close without start(): the ctor-seeded mirror is this
-                    // thread's to free, since the I/O loop never ran.
-                    Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
-                            readInt(loop, "sentDictCount") > 0);
-                    Assert.assertEquals("foreground loop must take the persisted buffer without copying",
-                            persistedAddr, readLong(loop, "sentDictBytesAddr"));
-                    Assert.assertEquals("ownership transfer must clear the persisted pointer",
-                            0L, pd.loadedEntriesAddr());
-                    Assert.assertTrue("foreground mirror must own the transferred buffer",
-                            readBoolean(loop, "sentDictBytesOwned"));
-                    loop.close();
-                    // close() must reset sentDictCount alongside freeing the buffer,
-                    // so the mirror stays all-or-nothing: a hypothetical post-close
-                    // start() (no closed guard) cannot read a stale count against a
-                    // freed buffer and drive a null-mirror catch-up.
-                    Assert.assertEquals("close() must reset sentDictCount to 0",
-                            0, readInt(loop, "sentDictCount"));
-                }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0, 1_000_000L,
+                        () -> {
+                            throw new IOException("no reconnect in this test");
+                        },
+                        0, 0, 1);
+                // Close without start(): the ctor-seeded mirror is this
+                // thread's to free, since the I/O loop never ran.
+                Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
+                        readInt(loop, "sentDictCount") > 0);
+                Assert.assertEquals("foreground loop must take the persisted buffer without copying",
+                        persistedAddr, readLong(loop, "sentDictBytesAddr"));
+                Assert.assertEquals("ownership transfer must clear the persisted pointer",
+                        0L, pd.loadedEntriesAddr());
+                Assert.assertTrue("foreground mirror must own the transferred buffer",
+                        readBoolean(loop, "sentDictBytesOwned"));
+                loop.close();
+                // close() must reset sentDictCount alongside freeing the buffer,
+                // so the mirror stays all-or-nothing: a hypothetical post-close
+                // start() (no closed guard) cannot read a stale count against a
+                // freed buffer and drive a null-mirror catch-up.
+                Assert.assertEquals("close() must reset sentDictCount to 0",
+                        0, readInt(loop, "sentDictCount"));
+            }
+        });
     }
 
     @Test
@@ -126,170 +126,154 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         // bogus "resend required" terminal. Borrowing the entries leaves the
         // dictionary intact for the engine's lifetime without making another native
         // copy, so every recycled loop can re-seed.
-        Path sfDir = Files.createTempDirectory("qwp-mirror-reseed");
-        try {
-            populateRecoverableSlot(sfDir);
-            Path slot = sfDir.resolve("default");
-            assertMemoryLeak(() -> {
-                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
-                    PersistedSymbolDict pd = engine.getPersistedSymbolDict();
-                    Assert.assertNotNull(pd);
-                    int dictSize = pd.size();
-                    Assert.assertTrue("recovery must load a non-empty dictionary", dictSize > 0);
-                    long persistedAddr = pd.loadedEntriesAddr();
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-reseed").toPath();
+        populateRecoverableSlot(sfDir);
+        Path slot = sfDir.resolve("default");
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                Assert.assertNotNull(pd);
+                int dictSize = pd.size();
+                Assert.assertTrue("recovery must load a non-empty dictionary", dictSize > 0);
+                long persistedAddr = pd.loadedEntriesAddr();
 
-                    // Session 1 seeds its mirror from the persisted dictionary.
-                    CursorWebSocketSendLoop loop1 = newRecoveryLoop(engine);
-                    try {
-                        Assert.assertEquals("session-1 mirror must seed from the persisted dict",
-                                dictSize, readInt(loop1, "sentDictCount"));
-                        Assert.assertEquals("orphan session must borrow the persisted bytes",
-                                persistedAddr, readLong(loop1, "sentDictBytesAddr"));
-                        Assert.assertFalse("borrowed orphan mirror must not own the persisted bytes",
-                                readBoolean(loop1, "sentDictBytesOwned"));
-                    } finally {
-                        loop1.close();
-                    }
-                    Assert.assertEquals("closing a borrowed loop must leave the engine prefix alive",
-                            persistedAddr, pd.loadedEntriesAddr());
-
-                    // Session 2 against the SAME engine (the drainer recycle): the
-                    // seed must NOT have been consumed -- the mirror must re-seed to
-                    // the full dictionary so the reconnect catch-up is complete.
-                    CursorWebSocketSendLoop loop2 = newRecoveryLoop(engine);
-                    try {
-                        Assert.assertEquals("recycled session-2 mirror must re-seed from the "
-                                        + "persisted dict (pre-fix it was 0)",
-                                dictSize, readInt(loop2, "sentDictCount"));
-                        Assert.assertEquals(persistedAddr, readLong(loop2, "sentDictBytesAddr"));
-                    } finally {
-                        loop2.close();
-                    }
+                // Session 1 seeds its mirror from the persisted dictionary.
+                CursorWebSocketSendLoop loop1 = newRecoveryLoop(engine);
+                try {
+                    Assert.assertEquals("session-1 mirror must seed from the persisted dict",
+                            dictSize, readInt(loop1, "sentDictCount"));
+                    Assert.assertEquals("orphan session must borrow the persisted bytes",
+                            persistedAddr, readLong(loop1, "sentDictBytesAddr"));
+                    Assert.assertFalse("borrowed orphan mirror must not own the persisted bytes",
+                            readBoolean(loop1, "sentDictBytesOwned"));
+                } finally {
+                    loop1.close();
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+                Assert.assertEquals("closing a borrowed loop must leave the engine prefix alive",
+                        persistedAddr, pd.loadedEntriesAddr());
+
+                // Session 2 against the SAME engine (the drainer recycle): the
+                // seed must NOT have been consumed -- the mirror must re-seed to
+                // the full dictionary so the reconnect catch-up is complete.
+                CursorWebSocketSendLoop loop2 = newRecoveryLoop(engine);
+                try {
+                    Assert.assertEquals("recycled session-2 mirror must re-seed from the "
+                                    + "persisted dict (pre-fix it was 0)",
+                            dictSize, readInt(loop2, "sentDictCount"));
+                    Assert.assertEquals(persistedAddr, readLong(loop2, "sentDictBytesAddr"));
+                } finally {
+                    loop2.close();
+                }
+            }
+        });
     }
 
     @Test
     public void testCtorFreesSeededMirrorWhenFrameSeedThrows() throws Exception {
         // C1 regression: the constructor seeds the recovery mirror in TWO steps -- a
         // malloc from the persisted dictionary's intact prefix, then an extension from
-        // the surviving frames' own deltas (appendSymbolToMirror). If that second step
+        // the recovered suffix retained by the engine. If that second step
         // throws (a native realloc OOM, or the MAX_SENT_DICT_BYTES ceiling), the throw
         // leaves the constructor with the object unpublished, so neither
         // ensureConnected's catch nor BackgroundDrainer's finally can ever close() it --
         // and the already-malloc'd prefix mirror leaks. The constructor must free it on
         // the throw. Pre-fix, the mirror leaks here and assertMemoryLeak fails.
-        Path sfDir = Files.createTempDirectory("qwp-mirror-ctor-throw");
-        try {
-            // A torn-dict SUBSET: three delta frames a@0,b@1,c@2 survive on disk, but the
-            // .symbol-dict is rewritten to hold only [a,b] (a host-crash tail tear). On
-            // recovery pd.size()==2 seeds (mallocs) the mirror, then the frame-seed
-            // rebuilds c@2 from the surviving frame -- the append the fault interrupts.
-            populateThreeFrameSlot(sfDir);
-            Path slot = sfDir.resolve("default");
-            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-ctor-throw").toPath();
+        // A torn-dict SUBSET: three delta frames a@0,b@1,c@2 survive on disk, but the
+        // .symbol-dict is rewritten to hold only [a,b] (a host-crash tail tear). On
+        // recovery pd.size()==2 seeds (mallocs) the mirror, then the frame-seed
+        // copies c@2 from the recovered suffix -- the operation the fault interrupts.
+        populateThreeFrameSlot(sfDir);
+        Path slot = sfDir.resolve("default");
+        replacePersistedDictionaryWithTwoSymbolPrefix(slot);
 
-            assertMemoryLeak(() -> {
-                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
-                    PersistedSymbolDict pd = engine.getPersistedSymbolDict();
-                    Assert.assertNotNull("recovery must open the torn subset dict", pd);
-                    Assert.assertEquals("prefix seed must malloc a 2-entry mirror", 2, pd.size());
-                    Assert.assertTrue("the frame-seed path must run (frames out-reach the dict)",
-                            engine.recoveredMaxSymbolDeltaStart() > 0L);
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                Assert.assertNotNull("recovery must open the torn subset dict", pd);
+                Assert.assertEquals("prefix seed must malloc a 2-entry mirror", 2, pd.size());
+                Assert.assertTrue("the frame-seed path must run (frames out-reach the dict)",
+                        engine.recoveredMaxSymbolDeltaStart() > 0L);
 
-                    setMirrorSeedFault(true);
-                    try {
-                        new CursorWebSocketSendLoop(
-                                null, engine, 0, 1_000_000L,
-                                () -> {
-                                    throw new IOException("no reconnect in this test");
-                                },
-                                0, 0, 1);
-                        Assert.fail("ctor must propagate the injected mirror-seed failure");
-                    } catch (LineSenderException expected) {
-                        Assert.assertTrue("unexpected message: " + expected.getMessage(),
-                                expected.getMessage().contains("simulated mirror seed allocation failure"));
-                    } finally {
-                        setMirrorSeedFault(false);
-                    }
-                    Assert.assertTrue("failed foreground construction must leave the persisted prefix owned",
-                            pd.loadedEntriesAddr() != 0L);
-                    Assert.assertTrue("failed construction must retain the recovered suffix for retry",
-                            engine.recoverySymbolNativeCapacity() > 0);
-                    // The outer assertMemoryLeak proves the prefix-seeded mirror the ctor
-                    // malloc'd was freed on the throw -- pre-fix it leaks here.
-                }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
-    }
-
-    @Test
-    public void testForegroundLoopReleasesRecoveredSuffixAfterSeeding() throws Exception {
-        Path sfDir = Files.createTempDirectory("qwp-mirror-suffix-release");
-        try {
-            populateThreeFrameSlot(sfDir);
-            Path slot = sfDir.resolve("default");
-            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
-
-            assertMemoryLeak(() -> {
-                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
-                    Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
-                            engine.recoverySymbolNativeCapacity() > 0);
-                    CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                setMirrorSeedFault(true);
+                try {
+                    new CursorWebSocketSendLoop(
                             null, engine, 0, 1_000_000L,
                             () -> {
                                 throw new IOException("no reconnect in this test");
                             },
                             0, 0, 1);
-                    try {
-                        Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
-                                3, readInt(loop, "sentDictCount"));
-                        Assert.assertEquals("engine must release its duplicate recovery suffix",
-                                0, engine.recoverySymbolNativeCapacity());
-                    } finally {
-                        loop.close();
-                    }
+                    Assert.fail("ctor must propagate the injected mirror-seed failure");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue("unexpected message: " + expected.getMessage(),
+                            expected.getMessage().contains("simulated mirror seed allocation failure"));
+                } finally {
+                    setMirrorSeedFault(false);
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+                Assert.assertTrue("failed foreground construction must leave the persisted prefix owned",
+                        pd.loadedEntriesAddr() != 0L);
+                Assert.assertTrue("failed construction must retain the recovered suffix for retry",
+                        engine.recoverySymbolNativeCapacity() > 0);
+                // The outer assertMemoryLeak proves the prefix-seeded mirror the ctor
+                // malloc'd was freed on the throw -- pre-fix it leaks here.
+            }
+        });
+    }
+
+    @Test
+    public void testForegroundLoopReleasesRecoveredSuffixAfterSeeding() throws Exception {
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-suffix-release").toPath();
+        populateThreeFrameSlot(sfDir);
+        Path slot = sfDir.resolve("default");
+        replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
+                        engine.recoverySymbolNativeCapacity() > 0);
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null, engine, 0, 1_000_000L,
+                        () -> {
+                            throw new IOException("no reconnect in this test");
+                        },
+                        0, 0, 1);
+                try {
+                    Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
+                            3, readInt(loop, "sentDictCount"));
+                    Assert.assertEquals("engine must release its duplicate recovery suffix",
+                            0, engine.recoverySymbolNativeCapacity());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
     }
 
     @Test
     public void testOrphanLoopsRetainRecoveredSuffixForRecycle() throws Exception {
-        Path sfDir = Files.createTempDirectory("qwp-mirror-suffix-recycle");
-        try {
-            populateThreeFrameSlot(sfDir);
-            Path slot = sfDir.resolve("default");
-            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-suffix-recycle").toPath();
+        populateThreeFrameSlot(sfDir);
+        Path slot = sfDir.resolve("default");
+        replacePersistedDictionaryWithTwoSymbolPrefix(slot);
 
-            assertMemoryLeak(() -> {
-                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
-                    int suffixCapacity = engine.recoverySymbolNativeCapacity();
-                    Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
-                            suffixCapacity > 0);
-                    for (int session = 0; session < 2; session++) {
-                        CursorWebSocketSendLoop loop = newRecoveryLoop(engine);
-                        try {
-                            Assert.assertEquals("orphan mirror must include prefix and recovered suffix",
-                                    3, readInt(loop, "sentDictCount"));
-                            Assert.assertEquals("orphan engine must retain suffix for the next session",
-                                    suffixCapacity, engine.recoverySymbolNativeCapacity());
-                        } finally {
-                            loop.close();
-                        }
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                int suffixCapacity = engine.recoverySymbolNativeCapacity();
+                Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
+                        suffixCapacity > 0);
+                for (int session = 0; session < 2; session++) {
+                    CursorWebSocketSendLoop loop = newRecoveryLoop(engine);
+                    try {
+                        Assert.assertEquals("orphan mirror must include prefix and recovered suffix",
+                                3, readInt(loop, "sentDictCount"));
+                        Assert.assertEquals("orphan engine must retain suffix for the next session",
+                                suffixCapacity, engine.recoverySymbolNativeCapacity());
+                    } finally {
+                        loop.close();
                     }
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+            }
+        });
     }
 
     // Constructs a recovery send loop but does NOT start it: the ctor seeds the
@@ -383,10 +367,6 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         Field f = CursorWebSocketSendLoop.class.getDeclaredField("forceMirrorSeedFailureForTest");
         f.setAccessible(true);
         f.setBoolean(null, value);
-    }
-
-    private static void rmDir(Path dir) throws IOException {
-        TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {

@@ -35,10 +35,11 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
-import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -71,17 +72,15 @@ public class DeltaDictRecoveryTest {
 
     private static final int DISTINCT_SYMBOLS = 8;
     private static final int ROWS = 40;
+
+    @Rule
+    public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
+
     private String sfDir;
 
     @Before
     public void setUp() {
-        sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-delta-recov-" + System.nanoTime()).toString();
-    }
-
-    @After
-    public void tearDown() {
-        TestUtils.removeTmpDirRec(sfDir);
+        sfDir = temporaryFolder.getRoot().toPath().resolve("qdb-delta-recovery").toString();
     }
 
     @Test

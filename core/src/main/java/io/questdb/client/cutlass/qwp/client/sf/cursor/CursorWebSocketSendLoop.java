@@ -43,7 +43,6 @@ import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.std.CharSequenceLongHashMap;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
-import io.questdb.client.std.str.Utf8s;
 import io.questdb.client.std.Unsafe;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
@@ -2457,32 +2456,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
         sentDictBytesLen += regionBytes;
         sentDictCount += (int) newCount;
-        sentDictIndexedCount = sentDictCount;
-    }
-
-    /**
-     * Appends one symbol to the sent-dictionary mirror in wire form
-     * ({@code [len varint][utf8]}), advancing {@code sentDictCount}. Seeds the mirror at
-     * construction; {@link #accumulateSentDict} extends it from live frames thereafter.
-     */
-    private void appendSymbolToMirror(CharSequence symbol) {
-        if (forceMirrorSeedFailureForTest) {
-            // Simulate a native realloc OOM on the seed path (see the field).
-            throw new LineSenderException("simulated mirror seed allocation failure (test only)");
-        }
-        int utf8Len = Utf8s.utf8Bytes(symbol);
-        int wireLen = NativeBufferWriter.varintSize(utf8Len) + utf8Len;
-        ensureSentDictCapacity((long) sentDictBytesLen + wireLen);
-        ensureSentDictEntryEndsCapacity((long) sentDictCount + 1L);
-        long p = NativeBufferWriter.writeVarint(sentDictBytesAddr + sentDictBytesLen, utf8Len);
-        if (utf8Len > 0) {
-            Utf8s.strCpyUtf8(symbol, p, utf8Len);
-        }
-        sentDictBytesLen += wireLen;
-        Unsafe.getUnsafe().putInt(
-                sentDictEntryEndsAddr + (long) sentDictCount * Integer.BYTES,
-                sentDictBytesLen);
-        sentDictCount++;
         sentDictIndexedCount = sentDictCount;
     }
 

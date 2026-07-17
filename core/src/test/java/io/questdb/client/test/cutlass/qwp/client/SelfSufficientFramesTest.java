@@ -31,7 +31,9 @@ import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -63,57 +65,56 @@ public class SelfSufficientFramesTest {
     /** First byte of the symbol-dict delta payload after the 12-byte QWP header. */
     private static final int DELTA_START_OFFSET = 12;
 
+    @Rule
+    public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
+
     @Test
     public void testFileModeShipsMonotonicDeltaAndPersistsDict() throws Exception {
         // File-backed SF also ships monotonic deltas now: batch 2 carries only
         // "beta" (deltaStart=1). The dictionary is durably kept in .symbol-dict
         // so a recovered/orphan-drained slot can rebuild it.
-        Path sfDir = Files.createTempDirectory("qwp-sf-selfsufficient");
-        try {
-            assertMemoryLeak(() -> {
-                CapturingHandler handler = new CapturingHandler();
-                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                    int port = server.getPort();
-                    server.start();
-                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-selfsufficient").toPath();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                    // The engine places slot files under sf_dir/<sender_id> (default "default").
-                    Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
-                    try (Sender sender = Sender.fromConfig(config)) {
-                        sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                        sender.flush();
-                        waitFor(() -> handler.batches.size() >= 1, 5_000);
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // The engine places slot files under sf_dir/<sender_id> (default "default").
+                Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
+                try (Sender sender = Sender.fromConfig(config)) {
+                    sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 5_000);
 
-                        sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
-                        sender.flush();
-                        waitFor(() -> handler.batches.size() >= 2, 5_000);
+                    sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
 
-                        // Check the persisted dictionary while the sender is live: a
-                        // fully-drained close intentionally unlinks it (slot cleanup).
-                        Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
-                        byte[] dict = Files.readAllBytes(dictFile);
-                        Assert.assertTrue("dictionary retains alpha", containsUtf8(dict, "alpha"));
-                        Assert.assertTrue("dictionary retains beta", containsUtf8(dict, "beta"));
-                    }
-
-                    Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
-                    byte[] b1 = handler.batches.get(0);
-                    byte[] b2 = handler.batches.get(1);
-
-                    Assert.assertEquals("batch 1 deltaStart must be 0",
-                            0, readVarint(b1, DELTA_START_OFFSET));
-                    Assert.assertEquals("batch 1 deltaCount must be 1", 1, readVarint(b1, DELTA_START_OFFSET + 1));
-                    // batch 2 ships ONLY beta as a delta from id 1.
-                    Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
-                            1, readVarint(b2, DELTA_START_OFFSET));
-                    Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
-                            1, readVarint(b2, DELTA_START_OFFSET + 1));
+                    // Check the persisted dictionary while the sender is live: a
+                    // fully-drained close intentionally unlinks it (slot cleanup).
+                    Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
+                    byte[] dict = Files.readAllBytes(dictFile);
+                    Assert.assertTrue("dictionary retains alpha", containsUtf8(dict, "alpha"));
+                    Assert.assertTrue("dictionary retains beta", containsUtf8(dict, "beta"));
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+
+                Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+                byte[] b1 = handler.batches.get(0);
+                byte[] b2 = handler.batches.get(1);
+
+                Assert.assertEquals("batch 1 deltaStart must be 0",
+                        0, readVarint(b1, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 1 deltaCount must be 1", 1, readVarint(b1, DELTA_START_OFFSET + 1));
+                // batch 2 ships ONLY beta as a delta from id 1.
+                Assert.assertEquals("batch 2 deltaStart must be 1 (monotonic)",
+                        1, readVarint(b2, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 2 deltaCount must be 1 (only the new symbol)",
+                        1, readVarint(b2, DELTA_START_OFFSET + 1));
+            }
+        });
     }
 
     @Test
@@ -126,54 +127,50 @@ public class SelfSufficientFramesTest {
         // server -- the full-dict frame is the safe degradation. Force the open
         // failure by planting a DIRECTORY where the dictionary file belongs:
         // openRW / openCleanRW on a directory fails, so open() returns null.
-        Path sfDir = Files.createTempDirectory("qwp-sf-fallback");
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-fallback").toPath();
         Path dictPath = sfDir.resolve("default").resolve(".symbol-dict");
         Files.createDirectories(dictPath);             // a directory, not a file
         Files.createFile(dictPath.resolve("blocker")); // non-empty: cannot be unlinked/rmdir'd
-        try {
-            assertMemoryLeak(() -> {
-                CapturingHandler handler = new CapturingHandler();
-                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                    int port = server.getPort();
-                    server.start();
-                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                    try (Sender sender = Sender.fromConfig(config)) {
-                        sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
-                        sender.flush();
-                        waitFor(() -> handler.batches.size() >= 1, 5_000);
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 5_000);
 
-                        sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
-                        sender.flush();
-                        waitFor(() -> handler.batches.size() >= 2, 5_000);
-                    }
-
-                    // The planted directory is untouched -- the dictionary never
-                    // opened, so delta encoding stayed disabled.
-                    Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
-                            Files.isDirectory(dictPath));
-
-                    Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
-                    byte[] b1 = handler.batches.get(0);
-                    byte[] b2 = handler.batches.get(1);
-
-                    // Full-dict fallback: BOTH batches start at id 0, and batch 2
-                    // re-ships the WHOLE dictionary (alpha + beta), NOT a monotonic
-                    // delta (which would be deltaStart=1, deltaCount=1 as above).
-                    Assert.assertEquals("batch 1 deltaStart must be 0",
-                            0, readVarint(b1, DELTA_START_OFFSET));
-                    Assert.assertEquals("batch 1 deltaCount must be 1",
-                            1, readVarint(b1, DELTA_START_OFFSET + 1));
-                    Assert.assertEquals("batch 2 deltaStart must be 0 (full-dict fallback, not monotonic)",
-                            0, readVarint(b2, DELTA_START_OFFSET));
-                    Assert.assertEquals("batch 2 deltaCount must be 2 (whole dictionary re-shipped)",
-                            2, readVarint(b2, DELTA_START_OFFSET + 1));
+                    sender.table("foo").symbol("s", "beta").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+
+                // The planted directory is untouched -- the dictionary never
+                // opened, so delta encoding stayed disabled.
+                Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
+                        Files.isDirectory(dictPath));
+
+                Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
+                byte[] b1 = handler.batches.get(0);
+                byte[] b2 = handler.batches.get(1);
+
+                // Full-dict fallback: BOTH batches start at id 0, and batch 2
+                // re-ships the WHOLE dictionary (alpha + beta), NOT a monotonic
+                // delta (which would be deltaStart=1, deltaCount=1 as above).
+                Assert.assertEquals("batch 1 deltaStart must be 0",
+                        0, readVarint(b1, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 1 deltaCount must be 1",
+                        1, readVarint(b1, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("batch 2 deltaStart must be 0 (full-dict fallback, not monotonic)",
+                        0, readVarint(b2, DELTA_START_OFFSET));
+                Assert.assertEquals("batch 2 deltaCount must be 2 (whole dictionary re-shipped)",
+                        2, readVarint(b2, DELTA_START_OFFSET + 1));
+            }
+        });
     }
 
     private static boolean containsUtf8(byte[] haystack, String needle) {
@@ -375,56 +372,52 @@ public class SelfSufficientFramesTest {
         // attempted. sf_max_bytes=64 then makes every frame larger than the segment, so
         // appendBlocking fails with PAYLOAD_TOO_LARGE -- deterministically, no
         // backpressure timing needed.
-        Path sfDir = Files.createTempDirectory("qwp-sf-split-persist-fail");
-        try {
-            assertMemoryLeak(() -> {
-                CapturingHandler handler = new CapturingHandler();
-                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                    server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
-                    int port = server.getPort();
-                    server.start();
-                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-split-persist-fail").toPath();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                            + ";sf_max_bytes=64;";
-                    String pad = TestUtils.repeat("x", 60);
-                    Sender sender = Sender.fromConfig(config);
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_bytes=64;";
+                String pad = TestUtils.repeat("x", 60);
+                Sender sender = Sender.fromConfig(config);
+                try {
+                    sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
                     try {
-                        sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
-                        sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
-                        try {
-                            sender.flush();
-                            Assert.fail("a split frame larger than the segment must fail to publish");
-                        } catch (LineSenderException expected) {
-                            // PAYLOAD_TOO_LARGE -- the publish, not the pre-flight.
-                        }
-                        Assert.assertEquals("the publish must fail, so no frame reaches the server",
-                                0, handler.batches.size());
+                        sender.flush();
+                        Assert.fail("a split frame larger than the segment must fail to publish");
+                    } catch (LineSenderException expected) {
+                        // PAYLOAD_TOO_LARGE -- the publish, not the pre-flight.
+                    }
+                    Assert.assertEquals("the publish must fail, so no frame reaches the server",
+                            0, handler.batches.size());
 
-                        // The write-ahead already ran: both of the batch's new symbols are
-                        // durable even though the frame that references them never
-                        // published. Move the persist after sealAndSwapBuffer and this is 0.
-                        ObjList<String> persisted =
-                                ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
-                        Assert.assertNotNull(persisted);
-                        Assert.assertEquals("the split path must persist its new symbols BEFORE "
-                                + "publishing the frame that references them", 2, persisted.size());
-                        Assert.assertEquals("alpha", persisted.getQuick(0));
-                        Assert.assertEquals("bravo", persisted.getQuick(1));
-                    } finally {
-                        try {
-                            sender.close();
-                        } catch (LineSenderException ignored) {
-                            // close() re-flushes the still-buffered oversized rows and fails
-                            // again; expected, and not what this test asserts. close() still
-                            // runs its resource cleanup, so no native memory leaks.
-                        }
+                    // The write-ahead already ran: both of the batch's new symbols are
+                    // durable even though the frame that references them never
+                    // published. Move the persist after sealAndSwapBuffer and this is 0.
+                    ObjList<String> persisted =
+                            ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    Assert.assertNotNull(persisted);
+                    Assert.assertEquals("the split path must persist its new symbols BEFORE "
+                            + "publishing the frame that references them", 2, persisted.size());
+                    Assert.assertEquals("alpha", persisted.getQuick(0));
+                    Assert.assertEquals("bravo", persisted.getQuick(1));
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered oversized rows and fails
+                        // again; expected, and not what this test asserts. close() still
+                        // runs its resource cleanup, so no native memory leaks.
                     }
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+            }
+        });
     }
 
     @Test
@@ -437,43 +430,39 @@ public class SelfSufficientFramesTest {
         // recovered / orphan-drained slot can rebuild what the delta frames reference.
         // The other split tests run in memory mode, so this is the only coverage of the
         // split x persist path with a live PersistedSymbolDict.
-        Path sfDir = Files.createTempDirectory("qwp-sf-split-persist");
-        try {
-            assertMemoryLeak(() -> {
-                CapturingHandler handler = new CapturingHandler();
-                try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-                    server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
-                    int port = server.getPort();
-                    server.start();
-                    Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-split-persist").toPath();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150); // forces the two-table batch to split
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                    String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                    Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
-                    String pad = new String(new char[60]).replace('\0', 'x');
-                    try (Sender sender = Sender.fromConfig(config)) {
-                        // Two tables, two new symbols, ONE flush -> the combined message
-                        // exceeds cap 150 and splits into two frames.
-                        sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
-                        sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
-                        sender.flush();
-                        waitFor(() -> handler.batches.size() >= 2, 5_000);
+                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                Path dictFile = sfDir.resolve("default").resolve(".symbol-dict");
+                String pad = new String(new char[60]).replace('\0', 'x');
+                try (Sender sender = Sender.fromConfig(config)) {
+                    // Two tables, two new symbols, ONE flush -> the combined message
+                    // exceeds cap 150 and splits into two frames.
+                    sender.table("t1").symbol("s", "alpha").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    sender.table("t2").symbol("s", "bravo").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 5_000);
 
-                        // Check .symbol-dict while the sender is live: a fully-drained
-                        // close would unlink it. The split's first-frame write-ahead
-                        // persist must have recorded BOTH new symbols.
-                        Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
-                        byte[] dict = Files.readAllBytes(dictFile);
-                        Assert.assertTrue("split-flush persist must record alpha", containsUtf8(dict, "alpha"));
-                        Assert.assertTrue("split-flush persist must record bravo", containsUtf8(dict, "bravo"));
-                    }
-
-                    Assert.assertEquals("the oversized two-table batch must split into 2 frames",
-                            2, handler.batches.size());
+                    // Check .symbol-dict while the sender is live: a fully-drained
+                    // close would unlink it. The split's first-frame write-ahead
+                    // persist must have recorded BOTH new symbols.
+                    Assert.assertTrue("persisted dictionary file exists", Files.exists(dictFile));
+                    byte[] dict = Files.readAllBytes(dictFile);
+                    Assert.assertTrue("split-flush persist must record alpha", containsUtf8(dict, "alpha"));
+                    Assert.assertTrue("split-flush persist must record bravo", containsUtf8(dict, "bravo"));
                 }
-            });
-        } finally {
-            rmDir(sfDir);
-        }
+
+                Assert.assertEquals("the oversized two-table batch must split into 2 frames",
+                        2, handler.batches.size());
+            }
+        });
     }
 
     @Test
@@ -546,21 +535,7 @@ public class SelfSufficientFramesTest {
     }
 
     private static int readVarint(byte[] buf, int offset) {
-        // Simple unsigned varint decode — sufficient for small values.
-        int result = 0;
-        int shift = 0;
-        while (offset < buf.length) {
-            int b = buf[offset++] & 0xFF;
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0) return result;
-            shift += 7;
-            if (shift > 28) throw new IllegalStateException("varint too long");
-        }
-        throw new IllegalStateException("varint truncated");
-    }
-
-    private static void rmDir(Path dir) {
-        TestUtils.removeTmpDirRec(dir == null ? null : dir.toString());
+        return QwpWireTestUtils.readVarint(buf, new int[]{offset});
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {
