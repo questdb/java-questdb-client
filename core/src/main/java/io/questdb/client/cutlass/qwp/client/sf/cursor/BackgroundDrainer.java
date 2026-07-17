@@ -77,12 +77,10 @@ public final class BackgroundDrainer implements Runnable {
      * wall-clock budget {@code reconnectMaxDurationMillis} also caps this
      * capability-gap loop; whichever is hit first triggers escalation. Both
      * halves of the budget measure a capability-gap <i>episode</i>: the
-     * wall clock accumulates only across uninterrupted gap-to-gap intervals
-     * (never before the first gap is observed, and never across an
-     * intervening transport window -- an unreachable cluster is not
-     * "failing to settle"), and an intervening role reject restarts the
-     * episode -- it proves the topology changed, so the next capability-gap
-     * error is a fresh episode against a newly promoted node. 16
+     * wall clock accumulates only across uninterrupted gap-to-gap intervals.
+     * Any intervening transport or role state restarts the episode: capability
+     * gaps separated by an unrelated transient are not consecutive evidence
+     * of a persistent cluster capability mismatch. 16
      * attempts gives the cluster room to settle through a rolling upgrade
      * (each attempt walks every endpoint internally) without letting a genuine
      * cluster-wide misconfig hang the drainer forever.
@@ -243,10 +241,9 @@ public final class BackgroundDrainer implements Runnable {
      * durable ack -- i.e. the symptom of a misconfigured cluster or a
      * rolling-upgrade transient.
      * <p>
-     * For a foreground sender's initial connection that condition is loud-fail;
-     * after the sender has been live, its reconnect loop keeps buffering and
-     * retrying through a rolling capability change. The drainer is asymmetric:
-     * source data is
+     * Blocking foreground startup keeps its fail-fast policy, while asynchronous
+     * foreground startup and reconnect keep buffering and retrying through a
+     * rolling capability change. The orphan drainer is asymmetric: source data is
      * pinned (durable-ack-mode trims only on STATUS_DURABLE_ACK frames,
      * which the offending endpoints by definition do not send), so we
      * give the cluster a budget to settle before quarantining the slot.
@@ -259,11 +256,8 @@ public final class BackgroundDrainer implements Runnable {
      * {@link QwpDurableAckMismatchException} sweeps only. Transient
      * conditions -- an all-replica failover window (role reject) or a
      * transport error -- are retried indefinitely (Invariant B) and never
-     * consume the budget: the wall-clock half accumulates only across
-     * uninterrupted gap-to-gap intervals, so a mid-episode transport window
-     * pauses the clock (without touching the attempt count), and a role
-     * reject additionally restarts the episode, because it proves the
-     * topology changed under the rolling upgrade.
+     * consume the budget. Either transient restarts the attempt count and wall
+     * clock so only uninterrupted capability-gap sweeps can escalate.
      * Genuine terminals (auth failure, non-421 upgrade reject) preserve
      * the original behavior: mark failed, exit.
      *
@@ -281,23 +275,17 @@ public final class BackgroundDrainer implements Runnable {
         // QwpDurableAckMismatchException sweeps; the wall-clock half
         // accumulates ONLY across uninterrupted gap-to-gap intervals, so
         // transient churn (role reject, transport) can never burn the budget
-        // -- neither before the first gap is observed nor mid-episode (a
-        // cluster unreachable for longer than the whole budget that comes
-        // back still gapped has consumed none of it). An intervening role
-        // reject resets the episode (topology churn: the offending node is
-        // gone); a transport error neither increments nor resets the attempt
-        // count -- a dropped socket does not prove promotion churn, and
-        // resetting on it would let a flaky-but-misconfigured cluster evade
-        // the cap forever -- it only pauses the wall clock: the gap-to-gap
-        // interval spanning the transport window is not charged.
+        // -- neither before the first gap is observed nor mid-episode. Any
+        // intervening role or transport state resets the episode: after the
+        // cluster leaves the capability-gap state, later gaps must establish a
+        // fresh consecutive run before quarantine is permitted.
         int capabilityGapAttempts = 0;
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
         // capabilityGapBudgetNanos (or the attempt cap fires first).
         long capabilityGapElapsedNanos = 0L;
         // Timestamp of the previous capability-gap sweep; 0 = the next gap
-        // charges nothing (episode start, post-role-reject restart, or the
-        // interval was interrupted by a transport window).
+        // charges nothing because a fresh episode is starting.
         long lastCapabilityGapNanos = 0L;
         final long capabilityGapBudgetNanos = reconnectMaxDurationMillis * 1_000_000L;
         // Observability-only counter for the transient all-replica window;
@@ -433,10 +421,11 @@ public final class BackgroundDrainer implements Runnable {
                 // Invariant B -- but it is NOT a transport outage, so log it
                 // truthfully below rather than mislabelling it "cluster unreachable".
                 lastErrorMessage = t.getMessage();
-                // Pause the episode wall clock: the gap-to-gap interval this
-                // window interrupts is never charged. Attempts and elapsed
-                // already accumulated are preserved (anti-evasion: see the
-                // budget comment above).
+                // This unrelated state breaks the consecutive capability-gap
+                // run. Restart both halves of the settle budget so a later gap
+                // must establish a fresh episode before quarantine.
+                capabilityGapAttempts = 0;
+                capabilityGapElapsedNanos = 0L;
                 lastCapabilityGapNanos = 0L;
                 long nowWarn = System.nanoTime();
                 if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {

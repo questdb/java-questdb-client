@@ -290,9 +290,8 @@ public class QwpWebSocketSender implements Sender {
     //         still terminal.
     // ASYNC → user thread does not connect at all. The I/O thread runs
     //         the reconnect loop in the background, indefinitely
-    //         (Invariant B); terminal failures (auth/upgrade reject)
-    //         are delivered to the SenderError dispatcher rather than
-    //         thrown from the constructor.
+    //         (Invariant B); endpoint-policy and transport failures stay
+    //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
     private long pendingBytes;
@@ -3399,10 +3398,10 @@ public class QwpWebSocketSender implements Sender {
                 // Encoder stays at its default (V1 -- the only supported wire
                 // version today). Frames written before the first successful
                 // connect commit to V1 because cursor segments are immutable;
-                // a future version bump must account for that. Auth/upgrade
-                // rejects are surfaced via the error inbox by the I/O
-                // thread, not thrown here; plain connect failures retry
-                // indefinitely (Invariant B).
+                // a future version bump must account for that. Auth, upgrade,
+                // capability and transport failures all retry indefinitely on
+                // the I/O thread (Invariant B); none is surfaced here or later
+                // to the producer.
                 client = null;
                 break;
             case OFF:

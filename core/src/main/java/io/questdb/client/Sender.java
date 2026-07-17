@@ -794,12 +794,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. Connect failures are retried
-     *       indefinitely in the background; a terminal upgrade failure
-     *       (auth reject, capability mismatch) is delivered to the async
-     *       error inbox as a {@link io.questdb.client.SenderError} (no
-     *       synchronous throw on the user call site). Wire
-     *       {@code error_handler=...} to observe these.</li>
+     *       engine until the wire is up. Transport, auth, upgrade and
+     *       capability failures are retried indefinitely in the background;
+     *       none is surfaced to producer calls or the async error inbox.</li>
      * </ul>
      * <p>
      * Default resolution when the caller does not pick a value:
@@ -1077,8 +1074,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // explicitly", which build() resolves to SYNC when any reconnect_*
         // knob was tuned by the user, otherwise OFF. SYNC retries on the
         // user thread up to the reconnect cap. ASYNC returns immediately
-        // and lets the I/O thread retry in the background, surfacing
-        // terminal failures via the error inbox.
+        // and lets the I/O thread retry every endpoint/transport failure in
+        // the background without surfacing it to the producer.
         private InitialConnectMode initialConnectMode = null;
         private String keyId;
         private int maxBackgroundDrainers = DEFAULT_MAX_BACKGROUND_DRAINERS;
@@ -2246,11 +2243,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Opt in to retrying the initial connect with the same backoff /
-         * cap / auth-terminal policy as in-flight reconnect. Set true if
-         * your deployment expects the server to come up shortly after the
-         * sender. Auth failures (HTTP 401/403/non-101) stay terminal in
-         * either mode.
+         * Opt in to retrying the initial connect with backoff on the calling
+         * thread, bounded by the configured reconnect cap. Set true if your
+         * deployment expects the server to come up shortly after the sender.
+         * Auth failures (HTTP 401/403/non-101) stay terminal in this SYNC mode.
          * <p>
          * When this method is not called, the resolution rule documented
          * on {@link InitialConnectMode} applies: SYNC implicitly when any
@@ -2591,8 +2587,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * with exponential backoff until connect succeeds or this many
          * millis elapse, then throws. The background reconnect loop
          * (mid-stream outages and async initial connect) does NOT consult
-         * this value: it retries indefinitely and halts only on a terminal
-         * auth/upgrade error or {@code close()}.
+         * this value: endpoint and transport failures are retried indefinitely
+         * until {@code close()}.
          * <p>
          * Default {@code 300_000} (5 minutes). Lower for fail-fast startup;
          * higher for tolerating a slow server boot. Must be positive: a zero

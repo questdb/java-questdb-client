@@ -55,6 +55,18 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
     public final TemporaryFolder sfDir = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
+    public void testAsyncInitialAuthFailureRetriesUntilCredentialsRecover() throws Exception {
+        assertAsyncInitialForegroundRecovers(false,
+                () -> new QwpAuthFailedException(401, "localhost", 1));
+    }
+
+    @Test
+    public void testAsyncInitialDurableAckMismatchRetriesUntilCapabilityRecovers() throws Exception {
+        assertAsyncInitialForegroundRecovers(true,
+                () -> new QwpDurableAckMismatchException("localhost", 1, "primary"));
+    }
+
+    @Test
     public void testPostStartAuthFailureRetriesUntilCredentialsRecover() throws Exception {
         assertForegroundRecovers(false,
                 () -> new QwpAuthFailedException(401, "localhost", 1));
@@ -66,9 +78,64 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                 () -> new QwpDurableAckMismatchException("localhost", 1, "primary"));
     }
 
+    private void assertAsyncInitialForegroundRecovers(
+            boolean durableAck,
+            FailureSupplier failureSupplier
+    ) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            DropFirstConnectionHandler handler = new DropFirstConnectionHandler(durableAck, false);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true);
+                 CursorSendEngine engine = new CursorSendEngine(
+                         sfDir.newFolder().getAbsolutePath(), SEGMENT_SIZE_BYTES)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                GatedFactory factory = new GatedFactory(
+                        server.getPort(), durableAck, failureSupplier);
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null,
+                        engine,
+                        0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        factory,
+                        100L,
+                        1L,
+                        4L,
+                        durableAck,
+                        durableAck ? 10L : 0L,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        0L,
+                        0L,
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                try {
+                    appendFrame(engine, (byte) 1);
+                    loop.start();
+
+                    await(() -> factory.attempts() >= 2 || loop.getTerminalError() != null,
+                            "async foreground did not retry the endpoint-policy failure");
+                    Assert.assertNull(
+                            "async initial endpoint-policy failures must not stop the producer",
+                            loop.getTerminalError());
+                    Assert.assertFalse(loop.hasEverConnected());
+
+                    long target = appendFrame(engine, (byte) 2);
+                    factory.allowConnect();
+                    await(() -> engine.ackedFsn() >= target || loop.getTerminalError() != null,
+                            "async foreground did not deliver after endpoint policy recovered");
+                    Assert.assertNull(loop.getTerminalError());
+                    Assert.assertTrue(loop.hasEverConnected());
+                    Assert.assertEquals(target, engine.ackedFsn());
+                } finally {
+                    factory.allowConnect();
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private void assertForegroundRecovers(boolean durableAck, FailureSupplier failureSupplier) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            DropFirstConnectionHandler handler = new DropFirstConnectionHandler(durableAck);
+            DropFirstConnectionHandler handler = new DropFirstConnectionHandler(durableAck, true);
             try (TestWebSocketServer server = new TestWebSocketServer(handler, true);
                  CursorSendEngine engine = new CursorSendEngine(
                          sfDir.newFolder().getAbsolutePath(), SEGMENT_SIZE_BYTES)) {
@@ -190,16 +257,49 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         }
     }
 
+    private static final class GatedFactory implements CursorWebSocketSendLoop.ReconnectFactory {
+        private final AtomicInteger attempts = new AtomicInteger();
+        private final boolean durableAck;
+        private final FailureSupplier failureSupplier;
+        private final int port;
+        private volatile boolean connectAllowed;
+
+        private GatedFactory(int port, boolean durableAck, FailureSupplier failureSupplier) {
+            this.port = port;
+            this.durableAck = durableAck;
+            this.failureSupplier = failureSupplier;
+        }
+
+        void allowConnect() {
+            connectAllowed = true;
+        }
+
+        int attempts() {
+            return attempts.get();
+        }
+
+        @Override
+        public WebSocketClient reconnect() throws Exception {
+            attempts.incrementAndGet();
+            if (!connectAllowed) {
+                throw failureSupplier.get();
+            }
+            return connect(port, durableAck);
+        }
+    }
+
     private static final class DropFirstConnectionHandler
             implements TestWebSocketServer.WebSocketServerHandler {
         private static final String TABLE = "trades";
         private final boolean durableAck;
+        private final boolean dropFirstConnection;
         private final Map<TestWebSocketServer.ClientHandler, long[]> wireSeqByConnection =
                 new IdentityHashMap<>();
         private TestWebSocketServer.ClientHandler firstConnection;
 
-        private DropFirstConnectionHandler(boolean durableAck) {
+        private DropFirstConnectionHandler(boolean durableAck, boolean dropFirstConnection) {
             this.durableAck = durableAck;
+            this.dropFirstConnection = dropFirstConnection;
         }
 
         @Override
@@ -218,7 +318,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                 if (durableAck) {
                     client.sendBinary(durableAckFrame(wireSeq));
                 }
-                if (client == firstConnection) {
+                if (dropFirstConnection && client == firstConnection) {
                     client.close();
                 }
             } catch (IOException ignored) {

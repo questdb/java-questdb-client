@@ -50,58 +50,47 @@ import java.util.concurrent.atomic.AtomicReference;
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
  * {@code Sender.fromConfig} must return immediately even when no server
  * is reachable; the I/O thread retries connect in the background. Plain
- * connect failures are retried indefinitely (Invariant B: no wall-clock
- * budget give-up); only genuine terminals (auth/upgrade reject,
- * durable-ack capability gap) are delivered through the async error
- * inbox rather than thrown at the call site.
+ * failures are retried indefinitely (Invariant B: no wall-clock budget
+ * give-up), including authentication, upgrade and durable-ack capability
+ * failures. Those endpoint states stay inside the I/O thread and never stop
+ * the producer.
  */
 public class InitialConnectAsyncTest {
 
     @Test
-    public void testAsyncAuthFailureDeliversToErrorInbox() throws Exception {
-        // Server returns HTTP 401 on every upgrade attempt. Auth failures
-        // are terminal at the I/O thread; in async mode they are
-        // delivered as a SenderError, not thrown from fromConfig.
+    public void testAsyncAuthFailureRetriesForeverNoTerminal() throws Exception {
+        // Server returns HTTP 401 on every upgrade attempt. Once ASYNC build()
+        // has returned, store-and-forward owns the buffered rows: the I/O thread
+        // must keep retrying rather than terminalizing the producer.
         try (Always401Fixture fixture = new Always401Fixture()) {
             fixture.start();
             int port = fixture.getPort();
             ErrorInbox inbox = new ErrorInbox();
             String cfg = "ws::addr=localhost:" + port
                     + sfDirOpt() + ";initial_connect_retry=async"
-                    + ";reconnect_max_duration_millis=10000"
+                    + ";reconnect_max_duration_millis=200"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
             Sender sender = Sender.builder(cfg)
                     .errorHandler(inbox)
                     .build();
             try {
-                // Auth-terminal must surface within hundreds of ms even
-                // though the cap is 10s.
-                long t0 = System.nanoTime();
-                Assert.assertTrue(
-                        "401 upgrade reject must surface a SenderError within 5s",
-                        inbox.await(5, TimeUnit.SECONDS));
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
-                SenderError err = inbox.get();
-                Assert.assertNotNull(
-                        "401 upgrade reject must surface a SenderError",
-                        err);
-                Assert.assertTrue(
-                        "auth-terminal must surface well inside the cap; took "
-                                + elapsedMs + "ms (cap was 10000ms)",
-                        elapsedMs < 5_000L);
-                Assert.assertEquals(
-                        "category must be SECURITY_ERROR for ws-upgrade-failed",
-                        SenderError.Category.SECURITY_ERROR, err.getCategory());
-                Assert.assertEquals(
-                        "auth failure is TERMINAL",
-                        SenderError.Policy.TERMINAL, err.getAppliedPolicy());
-                String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
-                Assert.assertTrue(
-                        "error message must mention ws-upgrade-failed: " + msg,
-                        msg.contains("ws-upgrade-failed")
-                                || msg.contains("401"));
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                awaitAtLeastOneConnectAttempt(wss);
+
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+
+                Assert.assertFalse(
+                        "async 401 rejection must stay inside the retry loop",
+                        inbox.await(1_500, TimeUnit.MILLISECONDS));
+                Assert.assertNull("no terminal SenderError may be delivered for an async 401",
+                        inbox.get());
+                Assert.assertFalse("no upgrade has succeeded yet", wss.wasEverConnected());
+                awaitReconnectAttemptsAdvance(wss);
             } finally {
-                assertCloseRethrowsTerminal(sender, "ws-upgrade-failed");
+                closeQuietly(sender);
             }
         }
     }
@@ -113,8 +102,8 @@ public class InitialConnectAsyncTest {
         // (it may appear; the data is safe in SF), so the I/O thread retries
         // forever. reconnect_max_duration_millis is IGNORED as a give-up deadline:
         // no SenderError lands, the sender stays usable, and wasEverConnected()
-        // stays false. Only a GENUINE terminal (auth/upgrade) or SF exhaustion may
-        // surface -- see testAsyncAuthFailureDeliversToErrorInbox.
+        // stays false. Endpoint-policy failures are covered by
+        // testAsyncAuthFailureRetriesForeverNoTerminal.
         int port = TestPorts.findUnusedPort();
         ErrorInbox inbox = new ErrorInbox();
         String cfg = "ws::addr=localhost:" + port
@@ -374,31 +363,6 @@ public class InitialConnectAsyncTest {
     }
 
     /**
-     * Closes the sender and tolerates either outcome:
-     * * close() throws -- the latched terminal must mention the expected
-     * substring (safety-net rethrow path);
-     * * close() returns cleanly -- the user installed an async error
-     * handler in this test, so the dispatcher already delivered the
-     * error to the handler (or will, on shutdown). Rethrowing on top
-     * of that would mask try-with-resources cleanup in real callers,
-     * so close() suppresses the rethrow when a custom handler is
-     * installed.
-     * Either way, the inbox observation earlier in the test pins the
-     * primary contract -- this helper just guards against close() throwing
-     * with a wrong message.
-     */
-    private static void assertCloseRethrowsTerminal(Sender sender, String expectedSubstring) {
-        try {
-            sender.close();
-        } catch (Throwable t) {
-            String msg = t.getMessage() == null ? "" : t.getMessage();
-            Assert.assertTrue(
-                    "close() rethrow must mention " + expectedSubstring + ": " + msg,
-                    msg.contains(expectedSubstring));
-        }
-    }
-
-    /**
      * Returns a unique temp sf_dir snippet for embedding in a config
      * string. The builder does NOT require sf_dir for any
      * initial_connect_retry mode — without it the sender builds in
@@ -478,9 +442,9 @@ public class InitialConnectAsyncTest {
 
     /**
      * Raw-socket fixture: every accepted connection responds with HTTP
-     * 401 Unauthorized and closes. Used to drive the async-init
-     * auth-terminal path: the I/O thread's first connect attempt classifies
-     * the response as a terminal upgrade failure.
+     * 401 Unauthorized and closes. Used to prove that the async-init I/O
+     * thread keeps retrying an endpoint-policy failure without terminalizing
+     * the producer.
      */
     private static class Always401Fixture implements AutoCloseable {
         private final java.util.List<Socket> openSockets = new java.util.concurrent.CopyOnWriteArrayList<>();

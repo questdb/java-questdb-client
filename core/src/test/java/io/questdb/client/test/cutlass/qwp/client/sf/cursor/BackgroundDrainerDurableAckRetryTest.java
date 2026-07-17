@@ -709,13 +709,11 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test
-    public void testTransportErrorDoesNotResetCapabilityGapEpisode() throws Exception {
+    public void testTransportErrorResetsCapabilityGapEpisode() throws Exception {
         assertMemoryLeak(() -> {
-            // A transport blip between gap attempts does not prove promotion
-            // churn: it must neither consume the budget (no increment) nor
-            // restart it (no reset) -- otherwise a flaky-but-misconfigured
-            // cluster would evade the cap forever. 15 gaps, one transport error,
-            // one gap: escalates on that 16th gap attempt.
+            // A transport state breaks a consecutive capability-gap episode.
+            // After 15 gaps and one transport error, the drainer must observe a
+            // fresh run of 16 gaps before quarantining the slot.
             int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
             CountingListener listener = new CountingListener();
             AtomicInteger sweeps = new AtomicInteger();
@@ -732,30 +730,24 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertNull(out);
             assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
             assertEquals(1, listener.persistentFailures.get());
-            assertEquals("transport blip must not restart the episode",
+            assertEquals("the fresh episode must exhaust its own full attempt budget",
                     cap, listener.lastPersistentTotalAttempts.get());
-            // 15 gap + 1 transport + 1 gap = 17 sweeps total.
-            assertEquals(cap + 1, factory.attempts());
+            // 15 gaps + 1 transport + a fresh 16-gap episode.
+            assertEquals(2 * cap, factory.attempts());
+            assertEquals(2 * (cap - 1), listener.unavailableAttempts.size());
+            assertEquals("attempt numbering must restart after transport",
+                    1, (int) listener.unavailableAttempts.get(cap - 1));
             assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
     }
 
     @Test
-    public void testTransportWindowDoesNotBurnCapabilityGapWallClock() throws Exception {
+    public void testTransportWindowResetsCapabilityGapWallClock() throws Exception {
         assertMemoryLeak(() -> {
-            // Red-first: the wall-clock half of the settle budget is anchored at
-            // gap #1, and a transport window BETWEEN gap sweeps must PAUSE it --
-            // only gap-to-gap time is the cluster "failing to settle". Under the
-            // bug the deadline keeps ticking while the cluster is unreachable:
-            // gap #1 anchors the deadline, the cluster then drops off the network
-            // for longer than the entire budget (transport errors are retried
-            // "forever" and charge nothing else), and when it comes back still
-            // briefly gapped, gap #2 observes an expired deadline and quarantines
-            // the slot after just 2 gap sweeps -- contradicting both the
-            // 16-attempt settle intent and Invariant B's "transients never
-            // consume the budget". Evasion is not a concern: the attempt counter
-            // survives the window untouched, which
-            // testTransportErrorDoesNotResetCapabilityGapEpisode pins.
+            // The wall-clock half of the settle budget is anchored at gap #1.
+            // A transport window breaks that episode completely, so the next gap
+            // receives a fresh clock rather than inheriting time accumulated before
+            // or during the unrelated outage.
             // Here the cluster actually settles after the outage (two more gap
             // sweeps, then durable-ack-capable), so the drain must proceed --
             // no escalation, no sentinel.

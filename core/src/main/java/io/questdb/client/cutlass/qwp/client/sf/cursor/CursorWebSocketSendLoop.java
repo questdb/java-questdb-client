@@ -70,10 +70,10 @@ import java.util.concurrent.locks.LockSupport;
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
  *       a store-and-forward drainer never gives up on a wall-clock budget),
- *       with endpoint-policy failures terminal only for an initial foreground
- *       connect or an orphan drainer. A previously-live foreground sender keeps
- *       retrying so credential and rolling-capability changes remain contained
- *       by store-and-forward. On reconnect success, repositions the cursor at
+ *       with endpoint-policy failures terminal only for an orphan drainer. A
+ *       foreground sender keeps retrying from asynchronous startup onward so
+ *       credential and rolling-capability changes remain contained by
+ *       store-and-forward. On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
  * No locks on the steady-state path. The producer thread (user) writes
@@ -514,10 +514,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * {@code client} may be {@code null} only if {@code reconnectFactory}
      * is non-null — this is the async-initial-connect path: the I/O thread
      * runs the same retry loop on its first iteration to obtain a live
-     * client, and an initial terminal failure (auth/upgrade reject or durable-ack
-     * mismatch) is delivered through the dispatcher rather than thrown to the
-     * constructor's caller; plain connect failures are retried indefinitely
-     * (Invariant B: no wall-clock budget give-up).
+     * client. Every endpoint-policy and transport failure stays inside that
+     * background retry loop; it is never delivered to the foreground producer
+     * (Invariant B: no wall-clock budget give-up). Blocking OFF/SYNC startup
+     * performs its fail-fast policy before constructing this loop.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -1468,10 +1468,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     /**
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
-     * Reuses the same retry+backoff machinery as {@link #fail(Throwable)} —
-     * connect failures are retried indefinitely (Invariant B), and a
-     * terminal upgrade reject is delivered through the dispatcher, not
-     * thrown to the producer.
+     * Reuses the same retry+backoff machinery as {@link #fail(Throwable)}.
+     * Transport, authentication, upgrade and capability failures are all
+     * retried indefinitely here (Invariant B); none is surfaced to the
+     * foreground producer.
      */
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(
@@ -1532,9 +1532,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // so this background loop retries for as long as it is running, backing
         // off between attempts. Endpoint-policy failures (auth / non-421
         // upgrade / durable-ack capability gap) are terminal only for orphan
-        // drainers and a foreground sender's first connection. Once a foreground
-        // sender has connected, those states are retried so a credential or cluster
-        // capability rotation cannot stop its producer. SF
+        // drainers. Foreground senders retry them from asynchronous startup onward
+        // so a credential or cluster capability rotation cannot stop the producer. SF
         // exhaustion is surfaced to the PRODUCER as append backpressure, never
         // here. reconnect_max_duration_millis is intentionally NOT consulted: it
         // bounds only the blocking (non-lazy) initial connect in
@@ -1599,8 +1598,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 resetCatchUpCapGapEpisode();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 if (endpointPolicyFailureIsTerminal()) {
-                    // Orphans return control to their quarantine owner; a
-                    // foreground sender that never connected still fails fast.
+                    // Orphans return control to their quarantine owner.
                     // WebSocketUpgradeException reaching here is always non-421:
                     // role rejects are classified into the transient branch below.
                     LOG.error("terminal upgrade error during {} -- won't retry: {}",
@@ -1628,14 +1626,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
                     LOG.warn("{} attempt {}: foreground auth/upgrade policy rejected the connection; "
-                                    + "retrying because this sender was previously live -- {}",
+                                    + "retrying while store-and-forward owns the buffered data -- {}",
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
             } catch (QwpDurableAckMismatchException e) {
                 if (endpointPolicyFailureIsTerminal()) {
                     // Orphans hand a capability gap back to BackgroundDrainer's
-                    // settle budget. An initial foreground connect remains loud.
+                    // settle budget.
                     LOG.error("durable-ack mismatch during {} -- won't retry: {}",
                             phase, e.getMessage());
                     if (terminalError == null) {
@@ -1666,7 +1664,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
                     LOG.warn("{} attempt {}: foreground durable-ack capability is temporarily "
-                                    + "unavailable; retrying because this sender was previously live -- {}",
+                                    + "unavailable; retrying while store-and-forward owns the buffered data -- {}",
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
@@ -1759,7 +1757,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     private boolean endpointPolicyFailureIsTerminal() {
-        return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
+        return reconnectPolicy == ReconnectPolicy.ORPHAN;
     }
 
     /**
@@ -1911,8 +1909,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * listener both non-null), enters the per-outage retry loop: capped
      * exponential backoff with jitter, retried for as long as the loop is
      * running -- there is NO wall-clock give-up (Invariant B: a store-and-
-     * forward drainer only terminates on SF exhaustion or a genuinely non-
-     * retriable auth/upgrade reject). On the first successful reconnect the
+     * forward drainer does not give up on endpoint or transport state). On the
+     * first successful reconnect the
      * I/O loop resumes with reset wire state and replays from
      * {@code engine.ackedFsn() + 1}.
      * <p>
@@ -2018,11 +2016,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // Async-initial-connect path: ctor accepted a null client because
             // a reconnect factory is wired. Drive the very first connect on
             // this thread so the producer thread never blocks on it.
-            // attemptInitialConnect either sets `client` (success) or records
-            // a terminal failure and clears `running` (auth/upgrade reject;
-            // plain connect failures retry indefinitely under Invariant B).
-            // Either way, the main loop below sees the outcome via the
-            // `running` and `client` fields.
+            // attemptInitialConnect retries every endpoint/transport failure
+            // indefinitely under Invariant B and returns only after it installs
+            // a client or close() clears `running`. The main loop below sees the
+            // outcome via the `running` and `client` fields.
             if (client == null && running) {
                 attemptInitialConnect();
             }
@@ -2272,9 +2269,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
-        // Sticky: once the wire is up, we've reached the server at least
-        // once for this sender's lifetime. Used downstream to classify a
-        // subsequent terminal failure as transient vs config-likely.
+        // Sticky: once the wire is up, we've reached the server at least once
+        // for this sender's lifetime. Exposed to the owning sender for
+        // connection-state observability; reconnect policy does not depend on it.
         this.hasEverConnected = true;
         if (old != null) {
             try {
