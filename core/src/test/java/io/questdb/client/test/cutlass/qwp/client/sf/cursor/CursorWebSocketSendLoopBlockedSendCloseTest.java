@@ -95,7 +95,14 @@ public class CursorWebSocketSendLoopBlockedSendCloseTest {
 
                 Thread ioThread = client.sendThread.get();
                 Assert.assertNotNull(ioThread);
-                Assert.assertFalse("I/O worker must be dead when close returns", ioThread.isAlive());
+                // close() returns when the worker counts shutdownLatch down --
+                // the worker's last action before its exit tail -- so the
+                // thread can be observably alive for a scheduling beat after
+                // close() returns. Quiescence is the latch plus the cleanup
+                // asserts below (cleanup runs before the countdown), not
+                // thread death: join briefly instead of asserting the race.
+                ioThread.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse("I/O worker did not exit after close returned", ioThread.isAlive());
                 Assert.assertEquals("full client cleanup must run exactly once", 1, client.cleanupCount.get());
                 Assert.assertEquals("the I/O worker must own cleanup before publishing exit",
                         ioThread, client.cleanupThread.get());
