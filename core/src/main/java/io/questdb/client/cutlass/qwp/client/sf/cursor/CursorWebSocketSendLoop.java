@@ -799,19 +799,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
         }
         // QwpWebSocketSender seeds the producer dictionary before constructing
-        // its one foreground loop, so that loop can own the recovered prefix and
-        // eliminate the engine-side duplicate. BackgroundDrainer must retain the
-        // prefix for later recycled loops and therefore keeps borrowing it.
-        if (persistedPrefixLen > 0 && catchUpCapGapPolicy == CatchUpCapGapPolicy.RETRY_FOREVER) {
-            long persistedPrefixAddr = pd.takeLoadedEntries();
-            if (sentDictBytesOwned) {
-                // Copy-on-grow already produced the combined mirror. Retire the
-                // no-longer-needed persisted prefix after successful construction.
-                Unsafe.free(persistedPrefixAddr, persistedPrefixLen, MemoryTag.NATIVE_DEFAULT);
-            } else {
-                assert persistedPrefixAddr == sentDictBytesAddr;
-                sentDictBytesOwned = true;
+        // its one foreground loop, so after the loop has built its mirror it can
+        // retire both engine-owned recovery sources. BackgroundDrainer must retain
+        // them for later recycled loops and therefore keeps borrowing them.
+        if (reconnectPolicy == ReconnectPolicy.FOREGROUND) {
+            if (persistedPrefixLen > 0) {
+                long persistedPrefixAddr = pd.takeLoadedEntries();
+                if (sentDictBytesOwned) {
+                    // Copy-on-grow already produced the combined mirror. Retire the
+                    // no-longer-needed persisted prefix after successful construction.
+                    Unsafe.free(persistedPrefixAddr, persistedPrefixLen, MemoryTag.NATIVE_DEFAULT);
+                } else {
+                    assert persistedPrefixAddr == sentDictBytesAddr;
+                    sentDictBytesOwned = true;
+                }
             }
+            engine.releaseRecoveredSymbolStorage();
         }
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;

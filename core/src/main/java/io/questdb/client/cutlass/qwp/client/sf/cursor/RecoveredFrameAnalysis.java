@@ -195,19 +195,30 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         return rawCapacity;
     }
 
+    /**
+     * Releases the cached suffix after a foreground producer and its one send
+     * loop have both consumed it. Recovery metadata remains available, but the
+     * raw entries must not be requested again.
+     */
+    void releaseRawStorage() {
+        if (rawAddr != 0L) {
+            Unsafe.free(rawAddr, rawCapacity, MemoryTag.NATIVE_DEFAULT);
+            rawAddr = 0L;
+            rawCapacity = 0;
+        }
+        runningRawLen = 0;
+        runningRawCount = 0;
+        committedRawLen = 0;
+        committedRawCount = 0;
+    }
+
     long symbolEntriesVisited() {
         return symbolEntriesVisited;
     }
 
     @Override
     public void close() {
-        if (rawAddr != 0L) {
-            Unsafe.free(rawAddr, rawCapacity, MemoryTag.NATIVE_DEFAULT);
-            rawAddr = 0L;
-            rawCapacity = 0;
-            runningRawLen = 0;
-            committedRawLen = 0;
-        }
+        releaseRawStorage();
     }
 
     private void appendRaw(long entryStart, int entryLen) {

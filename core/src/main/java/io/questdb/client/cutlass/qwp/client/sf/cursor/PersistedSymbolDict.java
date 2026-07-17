@@ -163,7 +163,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     static final int MAX_SCRATCH_BYTES = Integer.MAX_VALUE - 8;
     static final byte VERSION = 3; // v3 moved the CRC-32C from per-entry to per-chunk
-    private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
     // Filesystem seam. Production is FilesFacade.INSTANCE (straight to Files);
@@ -731,26 +730,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
         assert dstPos == entriesLen;
     }
 
-    private static int[] buildCrc32cTable() {
-        int[] table = new int[256];
-        for (int n = 0; n < 256; n++) {
-            int c = n;
-            for (int k = 0; k < 8; k++) {
-                c = (c & 1) != 0 ? (0x82F63B78 ^ (c >>> 1)) : (c >>> 1);
-            }
-            table[n] = c;
-        }
-        return table;
-    }
-
-    private static int crc32cRecovery(long addr, long len) {
-        int crc = ~Crc32c.INIT;
-        for (long i = 0; i < len; i++) {
-            crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ Unsafe.getUnsafe().getByte(addr + i)) & 0xFF];
-        }
-        return ~crc;
-    }
-
     private static RecoveryScan scanRecoveredChunks(long inputAddr, int len) {
         Varint v = new Varint();
         int count = 0;
@@ -772,7 +751,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
             int chunkEndI = (int) chunkEnd;
             int crcStored = Unsafe.getUnsafe().getInt(inputAddr + chunkEndI);
-            int crcCalc = crc32cRecovery(inputAddr + diskPos, chunkEndI - diskPos);
+            int crcCalc = Crc32c.updateUnsafe(
+                    Crc32c.INIT,
+                    inputAddr + diskPos,
+                    chunkEndI - diskPos);
             if (crcCalc != crcStored
                     || entryCount <= 0
                     || (long) count + entryCount > Integer.MAX_VALUE

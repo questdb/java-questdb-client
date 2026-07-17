@@ -190,12 +190,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
             // rebuilds c@2 from the surviving frame -- the append the fault interrupts.
             populateThreeFrameSlot(sfDir);
             Path slot = sfDir.resolve("default");
-            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString())) {
-                Assert.assertNotNull(torn);
-                torn.appendSymbol("a");
-                torn.appendSymbol("b");
-                Assert.assertEquals(2, torn.size());
-            }
+            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
 
             assertMemoryLeak(() -> {
                 try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
@@ -222,8 +217,74 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     }
                     Assert.assertTrue("failed foreground construction must leave the persisted prefix owned",
                             pd.loadedEntriesAddr() != 0L);
+                    Assert.assertTrue("failed construction must retain the recovered suffix for retry",
+                            engine.recoverySymbolNativeCapacity() > 0);
                     // The outer assertMemoryLeak proves the prefix-seeded mirror the ctor
                     // malloc'd was freed on the throw -- pre-fix it leaks here.
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
+    @Test
+    public void testForegroundLoopReleasesRecoveredSuffixAfterSeeding() throws Exception {
+        Path sfDir = Files.createTempDirectory("qwp-mirror-suffix-release");
+        try {
+            populateThreeFrameSlot(sfDir);
+            Path slot = sfDir.resolve("default");
+            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+
+            assertMemoryLeak(() -> {
+                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                    Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
+                            engine.recoverySymbolNativeCapacity() > 0);
+                    CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                            null, engine, 0, 1_000_000L,
+                            () -> {
+                                throw new IOException("no reconnect in this test");
+                            },
+                            0, 0, 1);
+                    try {
+                        Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
+                                3, readInt(loop, "sentDictCount"));
+                        Assert.assertEquals("engine must release its duplicate recovery suffix",
+                                0, engine.recoverySymbolNativeCapacity());
+                    } finally {
+                        loop.close();
+                    }
+                }
+            });
+        } finally {
+            rmDir(sfDir);
+        }
+    }
+
+    @Test
+    public void testOrphanLoopsRetainRecoveredSuffixForRecycle() throws Exception {
+        Path sfDir = Files.createTempDirectory("qwp-mirror-suffix-recycle");
+        try {
+            populateThreeFrameSlot(sfDir);
+            Path slot = sfDir.resolve("default");
+            replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+
+            assertMemoryLeak(() -> {
+                try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                    int suffixCapacity = engine.recoverySymbolNativeCapacity();
+                    Assert.assertTrue("recovery must retain c@2 above the persisted [a,b] prefix",
+                            suffixCapacity > 0);
+                    for (int session = 0; session < 2; session++) {
+                        CursorWebSocketSendLoop loop = newRecoveryLoop(engine);
+                        try {
+                            Assert.assertEquals("orphan mirror must include prefix and recovered suffix",
+                                    3, readInt(loop, "sentDictCount"));
+                            Assert.assertEquals("orphan engine must retain suffix for the next session",
+                                    suffixCapacity, engine.recoverySymbolNativeCapacity());
+                        } finally {
+                            loop.close();
+                        }
+                    }
                 }
             });
         } finally {
@@ -285,6 +346,15 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 s.table("m").symbol("s", "c").longColumn("v", 2).atNow();
                 s.flush();
             }
+        }
+    }
+
+    private static void replacePersistedDictionaryWithTwoSymbolPrefix(Path slot) {
+        try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString())) {
+            Assert.assertNotNull(torn);
+            torn.appendSymbol("a");
+            torn.appendSymbol("b");
+            Assert.assertEquals(2, torn.size());
         }
     }
 

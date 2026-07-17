@@ -799,6 +799,12 @@ public final class CursorSendEngine implements QuietCloseable {
         }
     }
 
+    void releaseRecoveredSymbolStorage() {
+        if (recoveredFrameAnalysis != null) {
+            recoveredFrameAnalysis.releaseRawStorage();
+        }
+    }
+
     @TestOnly
     public long recoveryFramesVisited() {
         return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.framesVisited();

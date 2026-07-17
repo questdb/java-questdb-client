@@ -67,7 +67,6 @@ public final class MmapSegment implements QuietCloseable {
     public static final int HEADER_SIZE = 24;
     public static final byte LEGACY_VERSION = 1;
     public static final byte VERSION = 2;
-    private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
     private final String path;
@@ -943,9 +942,13 @@ public final class MmapSegment implements QuietCloseable {
                 // the same scan). Folding over Unsafe keeps every fault
                 // catchable -- handled below as the boundary of recoverable
                 // data; a page that instead reads back as zeroes just fails the
-                // CRC check and ends the scan. Recovery is cold, so the slower
-                // table CRC here is immaterial.
-                int crcCalc = crc32cRecovery(addr + pos + 4, 4L + payloadLen);
+                // CRC check and ends the scan. The shared Java/Unsafe
+                // slice-by-8 path keeps those faults catchable without imposing
+                // a scalar byte-at-a-time scan on large recovery backlogs.
+                int crcCalc = Crc32c.updateUnsafe(
+                        Crc32c.INIT,
+                        addr + pos + 4,
+                        4L + payloadLen);
                 if (crcCalc != crcRead) {
                     return new FrameScan(pos, frameCount);
                 }
@@ -977,42 +980,6 @@ public final class MmapSegment implements QuietCloseable {
                     pos, fileSize);
         }
         return new FrameScan(pos, frameCount);
-    }
-
-    /**
-     * CRC-32C (Castagnoli) of {@code [addr, addr + len)} read through
-     * {@link Unsafe}, seeded like {@code Crc32c.update(Crc32c.INIT, addr, len)}
-     * and bit-identical to it (verified) -- but every byte load is an Unsafe
-     * intrinsic, so a fault on an unbacked mapped page is a catchable
-     * {@link InternalError} instead of the uncatchable JNI SIGBUS the native
-     * {@link Crc32c} would raise. Byte-at-a-time via a precomputed table
-     * ({@code ~0.5 GiB/s}); used only on the cold recovery scan, never on the
-     * append hot path (which stays on the native, hardware-friendly path).
-     */
-    private static int crc32cRecovery(long addr, long len) {
-        int crc = ~Crc32c.INIT;
-        for (long i = 0; i < len; i++) {
-            crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ Unsafe.getUnsafe().getByte(addr + i)) & 0xFF];
-        }
-        return ~crc;
-    }
-
-    /**
-     * Standard reflected CRC-32C byte table (polynomial {@code 0x82F63B78}),
-     * matching {@code crc32c_table[0]} in the native {@code crc32c.c}. Computed
-     * at class init to avoid 256 hand-transcribed literals; drives
-     * {@link #crc32cRecovery}.
-     */
-    private static int[] buildCrc32cTable() {
-        int[] table = new int[256];
-        for (int n = 0; n < 256; n++) {
-            int c = n;
-            for (int k = 0; k < 8; k++) {
-                c = (c & 1) != 0 ? (0x82F63B78 ^ (c >>> 1)) : (c >>> 1);
-            }
-            table[n] = c;
-        }
-        return table;
     }
 
     /**
