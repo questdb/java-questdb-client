@@ -36,6 +36,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
 /**
@@ -287,7 +288,17 @@ public final class BackgroundDrainer implements Runnable {
         // Timestamp of the previous capability-gap sweep; 0 = the next gap
         // charges nothing because a fresh episode is starting.
         long lastCapabilityGapNanos = 0L;
-        final long capabilityGapBudgetNanos = reconnectMaxDurationMillis * 1_000_000L;
+        // Saturate rather than multiply: reconnect_max_duration_millis is validated only
+        // as > 0, so a large value (Long.MAX_VALUE is the natural way to ask for "never
+        // give up") wraps a raw multiply NEGATIVE. capabilityGapElapsedNanos then clears
+        // the budget on the FIRST capability-gap sweep -- 0 >= a negative -- and, because
+        // this gate is an OR with the attempt cap, nothing else holds it back: the slot
+        // quarantines immediately, skipping the whole 16-sweep settle budget. Asking for
+        // more tolerance would buy exactly none. TimeUnit clamps at Long.MAX_VALUE, which
+        // is the intended "effectively unbounded". CursorWebSocketSendLoop's dwell
+        // conversion guards the same way for the same reason.
+        final long capabilityGapBudgetNanos =
+                TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis);
         // Observability-only counter for the transient all-replica window;
         // never consulted for escalation (Invariant B).
         int roleRejectAttempts = 0;

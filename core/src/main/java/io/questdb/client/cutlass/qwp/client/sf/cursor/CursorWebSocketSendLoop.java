@@ -839,12 +839,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
         this.durableAckMode = durableAckMode;
+        // Saturate, never multiply raw -- the same hazard the cap-gap dwell above
+        // guards. A raw multiply wraps a large millisecond value NEGATIVE, and both of
+        // these read as "elapsed >= window", so a negative makes the gate trivially
+        // true: the keepalive would ping on every loop pass, and the poison detector
+        // would escalate on the strike count alone -- exactly the transient-to-terminal
+        // false positive the dwell exists to stop (Invariant B). Both keys are
+        // user-supplied and validated only as >= 0, so asking for a very long window is
+        // legal, and asking for a longer one must never buy a shorter one.
         this.durableAckKeepaliveIntervalNanos = durableAckKeepaliveIntervalMillis > 0
-                ? durableAckKeepaliveIntervalMillis * 1_000_000L
+                ? TimeUnit.MILLISECONDS.toNanos(durableAckKeepaliveIntervalMillis)
                 : 0L;
         this.maxHeadFrameRejections = maxHeadFrameRejections;
         this.poisonMinEscalationWindowNanos = poisonMinEscalationWindowMillis > 0
-                ? poisonMinEscalationWindowMillis * 1_000_000L
+                ? TimeUnit.MILLISECONDS.toNanos(poisonMinEscalationWindowMillis)
                 : 0L;
         // SYNC/OFF startup hands a live client to the constructor, so we
         // already know we reached the server at least once. ASYNC startup

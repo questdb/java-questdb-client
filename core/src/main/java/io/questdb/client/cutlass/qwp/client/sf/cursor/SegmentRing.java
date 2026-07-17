@@ -349,12 +349,47 @@ public final class SegmentRing implements QuietCloseable {
      * logical ring.
      */
     static void installLegacyReaderBarrier(String sfDir) {
-        MmapSegment.createLegacyReaderGuard(
-                sfDir + '/' + LEGACY_READER_GUARD_A,
-                Long.MAX_VALUE - 4L);
-        MmapSegment.createLegacyReaderGuard(
-                sfDir + '/' + LEGACY_READER_GUARD_B,
-                Long.MAX_VALUE - 1L);
+        installLegacyReaderGuardIfDamaged(sfDir + '/' + LEGACY_READER_GUARD_A, Long.MAX_VALUE - 4L);
+        installLegacyReaderGuardIfDamaged(sfDir + '/' + LEGACY_READER_GUARD_B, Long.MAX_VALUE - 1L);
+    }
+
+    /**
+     * Verifies the guard at {@code path} and rewrites it only when it is missing or
+     * damaged.
+     * <p>
+     * A guard's content never changes, so re-creating one that is already intact buys
+     * nothing -- and costs the only window in which the barrier can be lost. Creation
+     * goes through {@code openCleanRW} (which truncates) and does not fsync, so an
+     * unconditional rewrite on every engine open re-opens that window every time. A host
+     * crash inside it leaves a zero-filled guard next to v2 segment data that is already
+     * durable; a rolled-back v1 reader then skips the guard (bad magic) AND the v2
+     * segments (bad version), concludes the slot is empty, and truncates the unacked log
+     * the barrier exists to protect. Keeping an intact guard means the steady state never
+     * enters that window at all.
+     */
+    private static void installLegacyReaderGuardIfDamaged(String path, long baseSeq) {
+        if (isIntactLegacyReaderGuard(path, baseSeq)) {
+            return;
+        }
+        MmapSegment.createLegacyReaderGuard(path, baseSeq);
+    }
+
+    private static boolean isIntactLegacyReaderGuard(String path, long baseSeq) {
+        if (!Files.exists(path)) {
+            return false;
+        }
+        try (MmapSegment guard = MmapSegment.openExisting(path)) {
+            // Anything short of the exact shape createLegacyReaderGuard writes -- a
+            // zero-filled survivor of a torn creation included -- is rewritten.
+            return guard != null
+                    && guard.version() == MmapSegment.LEGACY_VERSION
+                    && guard.baseSeq() == baseSeq
+                    && guard.frameCount() == 1
+                    && guard.tornTailBytes() == 0L;
+        } catch (Throwable t) {
+            LOG.warn("legacy-reader guard {} could not be verified ({}); rewriting it", path, t.toString());
+            return false;
+        }
     }
 
     /**
@@ -945,7 +980,15 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
-    private static boolean isLegacyReaderGuard(String name) {
+    /**
+     * Whether {@code name} is one of the reserved rollback-barrier files this class
+     * plants in every disk-mode slot. They carry the {@code .sfa} suffix so a rolled-back
+     * v1 reader cannot skip them, which means every directory walk that reasons about
+     * "does this slot hold data" has to exclude them -- they are a barrier, not a log.
+     * Package-private so {@link OrphanScanner} shares this one definition rather than
+     * matching the names itself.
+     */
+    static boolean isLegacyReaderGuard(String name) {
         return LEGACY_READER_GUARD_A.equals(name) || LEGACY_READER_GUARD_B.equals(name);
     }
 

@@ -47,6 +47,7 @@ import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -294,6 +295,62 @@ public class CursorSendEngineTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testLegacyReaderGuardsSurviveReopenAndAreRepairedWhenDamaged() throws Exception {
+        // The barrier is only worth what it is worth on disk. Creating it truncates
+        // (openCleanRW) and, before this, did not sync -- and it ran unconditionally on
+        // EVERY engine open, so every open destroyed a durable guard and re-dirtied it.
+        // A host crash inside that writeback window leaves a zero-filled guard beside v2
+        // segments that ARE already durable; a rolled-back v1 reader then skips the guard
+        // (bad magic) and the segments (bad version) alike, reads the slot as empty, and
+        // truncates the unacked log the guard was planted to protect. The guard's content
+        // never changes, so an intact one is verified and kept, and only a damaged one is
+        // rewritten -- the steady state never re-enters the window.
+        //
+        // Two guards created with identical arguments are NOT byte-identical (they
+        // differ in the frame header region), so a KEPT guard is byte-identical to
+        // itself across a reopen while a REWRITTEN one is not -- which is exactly the
+        // discriminator this needs. The repair leg then only asserts semantic validity,
+        // since a rebuilt guard legitimately differs byte-for-byte from the original.
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                    assertEquals(0L, engine.appendBlocking(buf, 16));
+                }
+                String guardA = tmpDir + "/.qwp-v2-guard-a.sfa";
+                byte[] planted = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(guardA));
+                assertTrue("the guard must carry bytes", planted.length > 0);
+
+                // Reopening the slot must leave an intact guard untouched. Under the old
+                // unconditional re-create this rewrites it, and because the frame is not
+                // byte-reproducible the bytes then differ -- so this comparison fails.
+                try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                    assertEquals("recovery must adopt the one real frame, not a guard",
+                            0L, reopened.publishedFsn());
+                }
+                assertArrayEquals("an intact guard must survive a reopen untouched",
+                        planted, java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(guardA)));
+
+                // Zero it -- the shape a torn creation leaves -- and it must be rebuilt to
+                // a valid guard, otherwise a slot that crashed mid-plant stays unprotected.
+                java.nio.file.Files.write(java.nio.file.Paths.get(guardA), new byte[planted.length]);
+                try (CursorSendEngine repaired = new CursorSendEngine(tmpDir, 4096)) {
+                    assertEquals("recovery must adopt the one real frame, not a guard",
+                            0L, repaired.publishedFsn());
+                }
+                try (MmapSegment guard = MmapSegment.openExisting(guardA)) {
+                    assertNotNull("a damaged guard must be rewritten to a valid one", guard);
+                    assertEquals(MmapSegment.LEGACY_VERSION, guard.version());
+                    assertEquals(1L, guard.frameCount());
+                    assertEquals("a rewritten guard must not read as torn", 0L, guard.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

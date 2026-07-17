@@ -3702,10 +3702,23 @@ public class QwpWebSocketSender implements Sender {
                     splitFrameBodyBytes.getQuick(bodyIdx), simBaseline, currentBatchMaxSymbolId);
             bodyIdx++;
             if (messageSize > cap) {
+                // The batch stays BUFFERED: this throw precedes every publish, and a
+                // rejected flush must not silently discard the caller's rows (see
+                // SelfSufficientFramesTest#testOversizedTableSplitStrandsNothing). So the
+                // next flush() re-encodes and re-rejects the same batch until either the
+                // reachable cap grows -- a failover to a larger-cap node, which is the
+                // case retaining the rows exists to survive -- or the sender is closed,
+                // which discards them. It cannot drain against a cap this table will
+                // never fit, so say that here rather than let a caller read the repeat
+                // rejections as a transient and keep appending to a batch that only
+                // grows.
                 throw new LineSenderException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
-                        .put(", serverMaxBatchSize=").put(cap).put(']');
+                        .put(", serverMaxBatchSize=").put(cap).put(']')
+                        .put("; the batch is retained for retry and every flush() will "
+                                + "reject it again until a larger-cap node is reached -- "
+                                + "close the sender to discard it, or produce smaller batches");
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.

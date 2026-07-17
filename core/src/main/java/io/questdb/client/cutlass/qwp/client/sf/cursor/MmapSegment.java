@@ -194,6 +194,15 @@ public final class MmapSegment implements QuietCloseable {
             if (segment.tryAppend(payload, 1) != HEADER_SIZE) {
                 throw new MmapSegmentException("could not append legacy-reader guard frame: " + path);
             }
+            // Unlike the segment log this file guards, the guard IS msync'd. It is a
+            // rollback barrier, so it has to be durable before the data it protects
+            // becomes durable -- a guard still sitting in the page cache when the host
+            // dies leaves zeroes on disk beside written-back v2 segments, and a
+            // rolled-back v1 reader skips the guard (bad magic) and the segments (bad
+            // version) alike, sees an empty slot, and truncates the log. It is 33 bytes
+            // written once per slot lifetime, not per flush, so the sync costs nothing
+            // measurable and buys the barrier the durability its whole purpose assumes.
+            segment.msync();
         } finally {
             if (payload != 0L) {
                 Unsafe.free(payload, 1, MemoryTag.NATIVE_DEFAULT);
