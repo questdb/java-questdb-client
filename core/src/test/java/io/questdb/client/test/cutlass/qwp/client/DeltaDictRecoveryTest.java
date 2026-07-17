@@ -471,7 +471,16 @@ public class DeltaDictRecoveryTest {
         assertMemoryLeak(() -> {
             writeAndTearUnreplayableSlot();
             java.nio.file.Path slot = Paths.get(sfDir, "default");
-            int segmentCount = countSegmentFiles(slot);
+            // Snapshot when quarantine STARTS (after the engine closed, before the
+            // rename), not before build(). Recovery legitimately unlinks an empty
+            // never-rotated hot-spare on the way in (SegmentRing: frameCount()==0 and
+            // no torn tail), and whether SegmentManager provisioned one is a race --
+            // so a pre-build count measures that race, not this test's subject. What
+            // the rename failure must preserve is whatever the slot holds at the
+            // moment quarantine begins.
+            AtomicInteger atQuarantineStart = new AtomicInteger(-1);
+            Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(
+                    () -> atQuarantineStart.set(countSegmentFiles(slot)));
             Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(new DelegatingFilesFacade() {
                 @Override
                 public int rename(String oldPath, String newPath) {
@@ -503,11 +512,16 @@ public class DeltaDictRecoveryTest {
                 }
             } finally {
                 Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(null);
+                Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(null);
             }
             Assert.assertTrue("rename failure must preserve the original slot directory",
                     java.nio.file.Files.isDirectory(slot));
+            // Guards the equality below against passing vacuously on an empty slot:
+            // 0 == 0 would "preserve every segment" while holding nothing.
+            Assert.assertTrue("quarantine must have started with data-bearing segments, saw: "
+                    + atQuarantineStart.get(), atQuarantineStart.get() > 0);
             Assert.assertEquals("rename failure must preserve every segment",
-                    segmentCount, countSegmentFiles(slot));
+                    atQuarantineStart.get(), countSegmentFiles(slot));
             Assert.assertFalse("failed rename must not leave a quarantine directory",
                     java.nio.file.Files.exists(Paths.get(sfDir, "default.unreplayable-0")));
         });
