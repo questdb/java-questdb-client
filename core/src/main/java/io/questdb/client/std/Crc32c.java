@@ -73,6 +73,14 @@ public final class Crc32c {
      * mmap access fault into a catchable {@link InternalError}; the native
      * {@link #update} path cannot provide that guarantee because a SIGBUS raised
      * inside JNI aborts the JVM.
+     * <p>
+     * The hot loop consumes each 8-byte block with two {@code getInt}s rather than
+     * eight {@code getByte}s -- 9 loads per block instead of 16, for the same table
+     * work. {@code getInt} is an {@link Unsafe} intrinsic exactly as {@code getByte}
+     * is, so the fault-catchability above is unaffected. It does make the loop
+     * little-endian, which costs nothing here: the segment and dictionary formats this
+     * checksums are already little-endian throughout (their headers are read back with
+     * {@code getInt}), and the native twin this must agree with asserts the same.
      *
      * @param seed previous CRC value, or {@link #INIT} to start fresh
      * @param addr off-heap address of at least {@code len} readable bytes
@@ -84,22 +92,18 @@ public final class Crc32c {
         int crc = ~seed;
         int[] table = CRC32C_TABLE;
         while (len >= Long.BYTES) {
-            int b0 = Unsafe.getUnsafe().getByte(addr) & 0xFF;
-            int b1 = Unsafe.getUnsafe().getByte(addr + 1) & 0xFF;
-            int b2 = Unsafe.getUnsafe().getByte(addr + 2) & 0xFF;
-            int b3 = Unsafe.getUnsafe().getByte(addr + 3) & 0xFF;
-            int b4 = Unsafe.getUnsafe().getByte(addr + 4) & 0xFF;
-            int b5 = Unsafe.getUnsafe().getByte(addr + 5) & 0xFF;
-            int b6 = Unsafe.getUnsafe().getByte(addr + 6) & 0xFF;
-            int b7 = Unsafe.getUnsafe().getByte(addr + 7) & 0xFF;
-            crc = table[7 * 256 + ((crc ^ b0) & 0xFF)]
-                    ^ table[6 * 256 + (((crc >>> 8) ^ b1) & 0xFF)]
-                    ^ table[5 * 256 + (((crc >>> 16) ^ b2) & 0xFF)]
-                    ^ table[4 * 256 + (((crc >>> 24) ^ b3) & 0xFF)]
-                    ^ table[3 * 256 + b4]
-                    ^ table[2 * 256 + b5]
-                    ^ table[256 + b6]
-                    ^ table[b7];
+            // Little-endian: lo holds bytes 0..3 and hi bytes 4..7, ascending from the
+            // low byte, so the per-byte table lookups below stay in wire order.
+            int lo = Unsafe.getUnsafe().getInt(addr) ^ crc;
+            int hi = Unsafe.getUnsafe().getInt(addr + Integer.BYTES);
+            crc = table[7 * 256 + (lo & 0xFF)]
+                    ^ table[6 * 256 + ((lo >>> 8) & 0xFF)]
+                    ^ table[5 * 256 + ((lo >>> 16) & 0xFF)]
+                    ^ table[4 * 256 + (lo >>> 24)]
+                    ^ table[3 * 256 + (hi & 0xFF)]
+                    ^ table[2 * 256 + ((hi >>> 8) & 0xFF)]
+                    ^ table[256 + ((hi >>> 16) & 0xFF)]
+                    ^ table[hi >>> 24];
             addr += Long.BYTES;
             len -= Long.BYTES;
         }

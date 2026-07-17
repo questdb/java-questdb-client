@@ -170,19 +170,24 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
 
     @Test
     public void testCtorFreesSeededMirrorWhenFrameSeedThrows() throws Exception {
-        // C1 regression: the constructor seeds the recovery mirror in TWO steps -- a
-        // malloc from the persisted dictionary's intact prefix, then an extension from
-        // the recovered suffix retained by the engine. If that second step
-        // throws (a native realloc OOM, or the MAX_SENT_DICT_BYTES ceiling), the throw
-        // leaves the constructor with the object unpublished, so neither
-        // ensureConnected's catch nor BackgroundDrainer's finally can ever close() it --
-        // and the already-malloc'd prefix mirror leaks. The constructor must free it on
-        // the throw. Pre-fix, the mirror leaks here and assertMemoryLeak fails.
+        // C1 regression: the constructor seeds the recovery mirror in TWO steps. It
+        // first BORROWS the persisted dictionary's intact prefix by reference, then
+        // extends it with the recovered suffix the engine retains -- and that extension
+        // calls ensureSentDictCapacity, which copy-on-writes the borrowed prefix into a
+        // fresh loop-OWNED allocation. A throw just past that grow (a native realloc
+        // OOM, or the MAX_SENT_DICT_BYTES ceiling) leaves the constructor with the
+        // object unpublished, so neither ensureConnected's catch nor BackgroundDrainer's
+        // finally can ever close() it -- and the owned mirror leaks. The constructor
+        // must free it on the throw. Delete that free and assertMemoryLeak fails here.
+        //
+        // The fault therefore has to sit AFTER the grow. Injected before it, the mirror
+        // is still borrowed (sentDictBytesOwned == false), the cleanup is a no-op, and
+        // this test would pass with the cleanup deleted.
         Path sfDir = temporaryFolder.newFolder("qwp-mirror-ctor-throw").toPath();
         // A torn-dict SUBSET: three delta frames a@0,b@1,c@2 survive on disk, but the
         // .symbol-dict is rewritten to hold only [a,b] (a host-crash tail tear). On
-        // recovery pd.size()==2 seeds (mallocs) the mirror, then the frame-seed
-        // copies c@2 from the recovered suffix -- the operation the fault interrupts.
+        // recovery pd.size()==2 seeds the borrowed prefix, then the frame-seed grows the
+        // mirror to take c@2 from the recovered suffix -- the step the fault interrupts.
         populateThreeFrameSlot(sfDir);
         Path slot = sfDir.resolve("default");
         replacePersistedDictionaryWithTwoSymbolPrefix(slot);

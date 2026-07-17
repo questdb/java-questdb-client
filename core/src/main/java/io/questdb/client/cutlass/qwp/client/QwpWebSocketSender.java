@@ -3905,15 +3905,16 @@ public class QwpWebSocketSender implements Sender {
                 pd.appendSymbols(globalSymbolDictionary, from, currentBatchMaxSymbolId);
             }
         } catch (Throwable t) {
-            // A short write (disk full / quota) to the persisted dictionary throws
-            // a low-level IllegalStateException. Surface it as a LineSenderException
-            // -- like every other flush-path failure, e.g. the cursor append in
-            // sealAndSwapBuffer -- so a caller catching LineSenderException around
-            // flush() also catches a disk-full during the write-ahead persist. The
-            // persist ran before publish and pd.size() did not advance on the short
-            // write, so the still-buffered rows re-persist the same range
-            // idempotently on retry. A JVM Error is never a persist failure; let it
-            // propagate.
+            // A failed write to the persisted dictionary throws a low-level
+            // IllegalStateException: in production that is ff.allocate refusing to grow
+            // the mmap append window (how a full disk / exhausted quota surfaces there),
+            // and behind an injected facade a short positioned write. Surface it as a
+            // LineSenderException -- like every other flush-path failure, e.g. the cursor
+            // append in sealAndSwapBuffer -- so a caller catching LineSenderException
+            // around flush() also catches a disk-full during the write-ahead persist. The
+            // persist ran before publish and pd.size() did not advance on the failure, so
+            // the still-buffered rows re-persist the same range idempotently on retry.
+            // A JVM Error is never a persist failure; let it propagate.
             if (t instanceof Error) {
                 throw (Error) t;
             }

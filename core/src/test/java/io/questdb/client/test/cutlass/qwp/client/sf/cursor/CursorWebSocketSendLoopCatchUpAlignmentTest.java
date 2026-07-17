@@ -170,8 +170,12 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 3_000), TestUtils.repeat("y", 3_000));
-                    assertEquals("the mirror is indexed once when it is built",
-                            1, loop.catchUpEntryIndexBuildCount());
+                    // Building the mirror must NOT index it: the index serves only the
+                    // catch-up, so paying for it on the per-frame send path -- and
+                    // retaining it -- would tax every connection for a reconnect that
+                    // may never come.
+                    assertEquals("accumulating the mirror must not build the entry index",
+                            0, loop.catchUpEntryIndexBuildCount());
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the small cap must split the dictionary", 2, client.framesSent);
@@ -972,10 +976,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         setIntField(loop, "sentDictBytesCapacity", total);
         setIntField(loop, "sentDictBytesLen", total);
         setIntField(loop, "sentDictCount", symbols.length);
-        Method index = CursorWebSocketSendLoop.class.getDeclaredMethod(
-                "rebuildSentDictEntryIndex");
-        index.setAccessible(true);
-        index.invoke(loop);
+        // Leave sentDictIndexedCount at 0: the mirror carries its own entry lengths, and
+        // the entry-ends index is built lazily by the catch-up. Pre-building it here
+        // would hide that from every test that seeds this way.
     }
 
     private static void setField(Object target, String name, long value) throws Exception {

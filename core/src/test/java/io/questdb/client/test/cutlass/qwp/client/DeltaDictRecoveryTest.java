@@ -822,12 +822,20 @@ public class DeltaDictRecoveryTest {
     public void testPersistFailureSurfacesAsLineSenderException() throws Exception {
         // A dictionary write that fails mid-flush -- a full disk, an exhausted quota --
         // must reach the caller as a LineSenderException, like every other flush-path
-        // failure. PersistedSymbolDict throws a low-level IllegalStateException on a short
-        // write; persistNewSymbolsBeforePublish wraps it. Without the wrap the raw
-        // IllegalStateException sails straight past every user's
-        // `catch (LineSenderException)` around flush() and takes the application down.
+        // failure. PersistedSymbolDict throws a low-level IllegalStateException when it
+        // cannot grow its append window; persistNewSymbolsBeforePublish wraps it.
+        // Without the wrap the raw IllegalStateException sails straight past every
+        // user's `catch (LineSenderException)` around flush() and takes the application
+        // down.
         //
-        // Nothing could reach that translation before: PersistedSymbolDict has
+        // The fault is a REFUSED ff.allocate on the mmap append window, with the facade
+        // opting into isMmapAllowed(): that is both the real shape of ENOSPC here and
+        // the path production actually runs. A facade that inherits the default
+        // isMmapAllowed() (this == INSTANCE -> false) silently swaps the dictionary onto
+        // the positioned-write fallback, which production never executes -- so a
+        // short-write fault would prove this translation on dead code.
+        //
+        // Nothing could reach the translation at all before: PersistedSymbolDict has
         // facade-aware overloads, but CursorSendEngine called only the
         // FilesFacade.INSTANCE ones, so no test could inject a dictionary I/O fault
         // through the real producer path. The engine now takes a FilesFacade for exactly
@@ -842,7 +850,7 @@ public class DeltaDictRecoveryTest {
                 String slot = Paths.get(sfDir, "default").toString();
                 Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
                         io.questdb.client.std.Files.DIR_MODE_DEFAULT));
-                ShortDictWriteFacade ff = new ShortDictWriteFacade();
+                FullDiskDictFacade ff = new FullDiskDictFacade();
                 // The engine owns the dictionary; the fault facade reaches only it, so the
                 // segment files still write normally and the ONLY failure is the persist.
                 CursorSendEngine engine = new CursorSendEngine(
@@ -851,7 +859,7 @@ public class DeltaDictRecoveryTest {
                 Sender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, 0, 0, 0L, null, false, engine);
                 try {
-                    ff.armed = true; // the next dictionary append short-writes
+                    ff.armed = true; // the next dictionary append cannot grow its window
                     sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
                     try {
                         sender.flush();
@@ -1553,16 +1561,27 @@ public class DeltaDictRecoveryTest {
      * fills mid-flush. Offset 0 is left alone so the file header still writes -- only the
      * entry append fails, which is the path under test.
      */
-    private static final class ShortDictWriteFacade extends DelegatingFilesFacade {
+    /**
+     * Refuses to grow the symbol dictionary's mmap append window -- the production
+     * shape of a full disk, since PersistedSymbolDict reserves that window through
+     * {@code ff.allocate} and ENOSPC surfaces there as a refusal.
+     * <p>
+     * {@code isMmapAllowed()} opts IN deliberately. The inherited default is
+     * {@code this == INSTANCE}, so any wrapping facade otherwise routes the dictionary
+     * down the positioned-write fallback that production never executes -- injecting a
+     * fault would then silently replace the code under test.
+     */
+    private static final class FullDiskDictFacade extends DelegatingFilesFacade {
         boolean armed;
 
         @Override
-        public long write(int fd, long addr, long len, long offset) {
-            if (armed && offset > 0 && len > 1) {
-                armed = false;
-                return INSTANCE.write(fd, addr, len - 1, offset);
-            }
-            return INSTANCE.write(fd, addr, len, offset);
+        public boolean allocate(int fd, long size) {
+            return !armed && INSTANCE.allocate(fd, size);
+        }
+
+        @Override
+        public boolean isMmapAllowed() {
+            return true;
         }
     }
 

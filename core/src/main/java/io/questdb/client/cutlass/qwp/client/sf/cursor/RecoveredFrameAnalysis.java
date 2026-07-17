@@ -221,8 +221,14 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         releaseRawStorage();
     }
 
-    private void appendRaw(long entryStart, int entryLen) {
-        long required = (long) runningRawLen + entryLen;
+    /**
+     * Appends one contiguous run of {@code count} wire entries -- {@code [len][utf8]}
+     * repeated, exactly as a delta section carries them -- in a single copy. Callers
+     * pass a whole frame's new-symbol suffix at once; see {@link #foldDelta} for why
+     * that suffix is always contiguous.
+     */
+    private void appendRaw(long addr, int len, int count) {
+        long required = (long) runningRawLen + len;
         if (required > MAX_RAW_BYTES) {
             throw new IllegalStateException("recovered symbol dictionary suffix exceeds maximum size "
                     + "[required=" + required + ", max=" + MAX_RAW_BYTES + ']');
@@ -235,9 +241,9 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             rawAddr = Unsafe.realloc(rawAddr, rawCapacity, (int) newCapacity, MemoryTag.NATIVE_DEFAULT);
             rawCapacity = (int) newCapacity;
         }
-        Unsafe.getUnsafe().copyMemory(entryStart, rawAddr + runningRawLen, entryLen);
-        runningRawLen += entryLen;
-        runningRawCount++;
+        Unsafe.getUnsafe().copyMemory(addr, rawAddr + runningRawLen, len);
+        runningRawLen += len;
+        runningRawCount += count;
     }
 
     private void foldDelta(long fsn, long p, long limit) {
@@ -292,7 +298,24 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             return;
         }
 
+        // runningCoverage is loop-invariant here -- it only advances after the walk --
+        // and id ascends from deltaStart, so `id >= runningCoverage` is a step
+        // predicate: the entries this frame contributes are always ONE contiguous run
+        // at the tail of its delta section. Note where that run starts and copy it in a
+        // single memcpy once the walk succeeds, rather than paying a bound check, a
+        // capacity check and a ~12-byte copyMemory per symbol. Recovery walks the whole
+        // backlog, and the workload this feature exists for introduces a new symbol per
+        // ROW, so that is millions of stub-dispatched small copies where one bulk copy
+        // per frame does the job.
+        //
+        // Deferring the copy past the markGap bail-outs also drops the partial prefix
+        // the per-entry version used to leave behind. That residue was already
+        // unreachable -- a gap pins coverage() at -1, and a later self-sufficient frame
+        // resets runningRawLen/runningRawCount -- so not writing it is equivalent, and
+        // leaves less state to reason about.
         long id = deltaStart;
+        long suffixStart = 0L;
+        int suffixCount = 0;
         for (long i = 0; i < deltaCount; i++, id++) {
             symbolEntriesVisited++;
             long entryStart = p;
@@ -310,8 +333,14 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             }
             p += symbolLen;
             if (id >= runningCoverage) {
-                appendRaw(entryStart, (int) (p - entryStart));
+                if (suffixCount == 0) {
+                    suffixStart = entryStart;
+                }
+                suffixCount++;
             }
+        }
+        if (suffixCount > 0) {
+            appendRaw(suffixStart, (int) (p - suffixStart), suffixCount);
         }
         if (deltaEnd > runningCoverage) {
             runningCoverage = deltaEnd;

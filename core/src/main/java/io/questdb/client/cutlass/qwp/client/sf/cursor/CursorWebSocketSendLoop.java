@@ -197,12 +197,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
     private static final long RECONNECT_LOG_THROTTLE_NANOS = 5_000_000_000L;
-    // Test seam: when true, recovery mirror seeding throws before growing,
-    // simulating the native realloc OOM (or MAX_SENT_DICT_BYTES ceiling) that
-    // ensureSentDictCapacity can raise while the constructor seeds the recovery
-    // mirror. Lets a test prove the constructor frees the already-malloc'd mirror on
-    // such a throw rather than leaking it. Production never sets it; volatile only so
-    // a test thread's write is visible to the loop under test.
+    // Test seam: when true, recovery mirror seeding throws immediately AFTER
+    // ensureSentDictCapacity has grown (and therefore taken ownership of) the mirror,
+    // standing in for the copyRecoveredSymbolSuffix-adjacent failure that leaves a
+    // freshly malloc'd mirror with no owner. It sits after the grow deliberately: the
+    // constructor's cleanup only frees an OWNED mirror, so a seam before the grow
+    // would leave nothing to free and the leak guard would pass with the cleanup
+    // deleted. Production never sets it; volatile only so a test thread's write is
+    // visible to the loop under test.
     @TestOnly
     static volatile boolean forceMirrorSeedFailureForTest;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
@@ -784,11 +786,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     int suffixLen = engine.recoveredSymbolSuffixLen(baseline);
                     int suffixCount = engine.recoveredSymbolSuffixCount(baseline);
                     if (suffixLen > 0) {
+                        ensureSentDictCapacity((long) sentDictBytesLen + suffixLen);
                         if (forceMirrorSeedFailureForTest) {
+                            // Throw AFTER the grow, never before it. ensureSentDictCapacity
+                            // is what copy-on-writes a borrowed prefix into a loop-OWNED
+                            // allocation (sentDictBytesOwned = true), and the catch's
+                            // releaseSentDictBytes() is gated on exactly that flag. A seam
+                            // in front of the grow fires while the mirror is still borrowed
+                            // from PersistedSymbolDict, so the cleanup frees nothing and the
+                            // guard below passes even with the cleanup deleted -- it would
+                            // stop pinning the leak it exists for.
                             throw new LineSenderException(
                                     "simulated mirror seed allocation failure (test only)");
                         }
-                        ensureSentDictCapacity((long) sentDictBytesLen + suffixLen);
                         engine.copyRecoveredSymbolSuffix(
                                 baseline, sentDictBytesAddr + sentDictBytesLen);
                         sentDictBytesLen += suffixLen;
@@ -796,9 +806,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                 }
             }
-            if (sentDictCount > 0) {
-                rebuildSentDictEntryIndex();
-            }
+            // The entry-ends index is NOT built here. sendDictCatchUp is its only
+            // reader and builds it on demand, so a recovered slot that drains without
+            // ever reconnecting -- the normal case -- never pays the O(n) walk nor
+            // retains the 4-bytes-per-symbol index.
         } catch (Throwable t) {
             releaseSentDictBytes();
             throw t;
@@ -2446,7 +2457,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (deltaCount <= 0 || deltaStart > sentDictCount || deltaEnd <= sentDictCount) {
             return;
         }
-        ensureSentDictEntryIndex();
+        // Deliberately does NOT touch the entry-ends index. Only sendDictCatchUp reads
+        // it, so maintaining it here would put a store per new symbol on the per-frame
+        // I/O path -- and on the workload this feature targets (a new symbol per ROW)
+        // that is a store per row, plus 4 bytes per symbol retained for the connection's
+        // whole life, to serve a reconnect that may never happen. sendDictCatchUp calls
+        // ensureSentDictEntryIndex(), which notices sentDictIndexedCount has fallen
+        // behind sentDictCount and rebuilds; that O(n) walk runs at most once per
+        // reconnect and is dwarfed by shipping the same n bytes over the wire. A
+        // connection that never reconnects now never allocates the index at all.
+        //
         // Walk past the already-held prefix [deltaStart, sentDictCount), then copy
         // the new tail [sentDictCount, deltaEnd).
         int skip = sentDictCount - deltaStart;
@@ -2459,8 +2479,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         long regionStart = p;
         long newCount = deltaEnd - sentDictCount;
-        long requiredEntryCount = (long) sentDictCount + newCount;
-        ensureSentDictEntryEndsCapacity(requiredEntryCount);
+        // Walk the new tail only to find where it ends; the entry boundaries are not
+        // recorded here (see above -- the catch-up rebuilds them on demand).
         for (long i = 0; i < newCount; i++) {
             long len = readVarintAt(p, limit);
             p = varintEnd + len;
@@ -2469,9 +2489,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // than corrupt the mirror.
                 return;
             }
-            Unsafe.getUnsafe().putInt(
-                    sentDictEntryEndsAddr + ((long) sentDictCount + i) * Integer.BYTES,
-                    sentDictBytesLen + (int) (p - regionStart));
         }
         int regionBytes = (int) (p - regionStart);
         // long sum: sentDictBytesLen + regionBytes can exceed Integer.MAX_VALUE on
@@ -2482,7 +2499,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         Unsafe.getUnsafe().copyMemory(regionStart, sentDictBytesAddr + sentDictBytesLen, regionBytes);
         sentDictBytesLen += regionBytes;
         sentDictCount += (int) newCount;
-        sentDictIndexedCount = sentDictCount;
     }
 
     private void ensureSentDictCapacity(long required) {
