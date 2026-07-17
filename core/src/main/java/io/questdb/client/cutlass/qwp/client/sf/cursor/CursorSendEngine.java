@@ -25,7 +25,6 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
-import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -375,14 +374,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 // .symbol-dict no longer holds, resuming would re-use it. The walk is
                 // bounded to recoveredCommitBoundaryFsn so the aborted orphan-deferred
                 // tail -- retired without ever being transmitted -- does not inflate
-                // this and over-reject an otherwise-recoverable slot. maxSymbolDeltaEnd
+                // this and over-reject an otherwise-recoverable slot. maxDeltaEnd()
                 // returns 0 when no such frame carries a symbol, yielding -1 here.
                 // Computed before the I/O loop or producer append; single-threaded.
                 this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
                 // Full-dict-fallback recovery. When the persisted .symbol-dict is a
                 // SUBSET of the ids the surviving frames reference
                 // (recoveredMaxSymbolId >= its size) YET every such frame is
-                // self-sufficient (maxSymbolDeltaStart == 0 -- a full-dict frame that
+                // self-sufficient (maxDeltaStart() == 0 -- a full-dict frame that
                 // re-registers its dictionary from id 0), the slot was written in
                 // full-dict fallback: the dictionary never opened when writing, so no
                 // side-file exists and this recovery opened a FRESH EMPTY one. Those
@@ -392,7 +391,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // was written. Without this the sender's seed-time guard would treat the
                 // empty dictionary as a host-crash tear and brick build(), even though
                 // the orphan drainer drains the same frames fine. A genuine torn DELTA
-                // dictionary keeps a frame with deltaStart > 0 (maxSymbolDeltaStart > 0)
+                // dictionary keeps a frame with deltaStart > 0 (maxDeltaStart() > 0)
                 // and is NOT discarded here: it still fails clean at seed time, since
                 // the ids its delta frames reference cannot be rebuilt without the lost
                 // dictionary. The recoveredMaxSymbolId >= size guard means this never
@@ -739,56 +738,6 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
         }
-    }
-
-    /**
-     * Rebuilds, from the surviving frames' OWN delta sections, the symbols the upcoming
-     * replay will register ABOVE {@code baseline}, appending them to {@code out} in
-     * ascending id order. Returns the coverage the replay establishes (one past the highest
-     * id it registers), or {@code -1} when the frames have a genuine GAP above the baseline.
-     * <p>
-     * The producer seeds its dictionary from the persisted {@code .symbol-dict} and THEN
-     * from this, so it is fed the same entries, in the same order, that the send loop's
-     * {@code accumulateSentDict} will feed its mirror from as those very frames replay. The
-     * producer's delta baseline and the loop's mirror coverage therefore land on the same
-     * number by construction, which is the invariant the torn-dictionary guard rests on.
-     * <p>
-     * This is what makes a slot whose dictionary was torn -- or lost outright -- still
-     * recoverable when the surviving frames define the ids themselves (they carry the
-     * symbols in their own deltas; it is why the orphan drainer can drain such a slot). Only
-     * a real gap, where the ids were introduced by frames since acked and trimmed away, is
-     * unrecoverable -- and that is precisely when this returns -1.
-     * <p>
-     * Bounded above by {@link #recoveredCommitBoundaryFsn} like {@link #recoveredMaxSymbolId}:
-     * frames past it are the aborted orphan-deferred tail, retired without ever being
-     * transmitted, so their ids never reach a server and must not inflate the baseline.
-     */
-    public long collectReplaySymbolsAbove(int baseline, ObjList<String> out) {
-        if (recoveredFrameAnalysis != null
-                && recoveredFrameAnalysis.baseline() == baseline) {
-            recoveredFrameAnalysis.appendDecodedSymbols(out);
-            return recoveredFrameAnalysis.coverage();
-        }
-        if (ring == null) {
-            return baseline;
-        }
-        return ring.collectReplaySymbolsAbove(
-                QwpConstants.MAGIC_MESSAGE,
-                QwpConstants.HEADER_OFFSET_FLAGS,
-                QwpConstants.FLAG_DELTA_SYMBOL_DICT,
-                QwpConstants.HEADER_SIZE,
-                // Walk from the LOWEST frame still on disk, not from ackedFsn+1. An acked frame
-                // is not trimmed the instant it is acked -- trim drops whole SEALED segments --
-                // so the symbols it registered are usually still sitting right there, and they
-                // are exactly the ids the replay set's deltas start above. Skipping them threw
-                // away the only surviving copy of those symbols and condemned a slot that had
-                // everything it needed. A slot whose registering frames really HAVE been
-                // trimmed still reports the gap, because then no frame on disk holds them.
-                0L,
-                recoveredCommitBoundaryFsn,
-                baseline,
-                out
-        );
     }
 
     /**

@@ -24,10 +24,10 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -85,9 +85,9 @@ public class RecoveredFrameAnalysisTest {
             }
 
             try (CursorSendEngine recovered = new CursorSendEngine(slot.toString(), 4_096)) {
-                ObjList<String> symbols = new ObjList<>();
+                GlobalSymbolDictionary symbols = new GlobalSymbolDictionary();
                 Assert.assertEquals("malformed recovered delta must be fail-clean",
-                        -1L, recovered.collectReplaySymbolsAbove(0, symbols));
+                        -1L, recovered.addRecoveredSymbolsTo(0, symbols));
                 Assert.assertEquals("malformed delta must not recover partial symbols", 0, symbols.size());
                 Assert.assertEquals("the malformed frame must be visited during recovery",
                         1L, recovered.recoveryFramesVisited());

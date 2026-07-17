@@ -617,41 +617,6 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Rebuilds the symbols a replay of {@code [minFsnInclusive .. maxFsnInclusive]} would
-     * register ABOVE {@code baseline}, appending them to {@code out} in ascending id order.
-     * Returns the coverage the replay establishes, or {@code -1} on a genuine gap. See
-     * {@link MmapSegment#collectReplaySymbolsAbove}.
-     * <p>
-     * Walks the segments in ascending FSN order -- {@code sealedSegments} are held in
-     * baseSeq order and {@code active} is the newest (see {@code recover}) -- threading the
-     * coverage through, because unlike {@link #maxSymbolDeltaEnd} (a plain max) this walk is
-     * ORDER-DEPENDENT: each frame may only extend a dictionary the frames before it built.
-     */
-    public synchronized long collectReplaySymbolsAbove(
-            int headerMagic,
-            int flagsOffset,
-            int flagDeltaMask,
-            int qwpHeaderSize,
-            long minFsnInclusive,
-            long maxFsnInclusive,
-            long baseline,
-            ObjList<String> out
-    ) {
-        long coverage = baseline;
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            coverage = sealedSegments.get(i).collectReplaySymbolsAbove(
-                    headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize,
-                    minFsnInclusive, maxFsnInclusive, coverage, out);
-            if (coverage < 0) {
-                return -1L;
-            }
-        }
-        return active.collectReplaySymbolsAbove(
-                headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize,
-                minFsnInclusive, maxFsnInclusive, coverage, out);
-    }
-
-    /**
      * Performs the one ordered recovery fold across sealed segments and the
      * active segment. The returned native suffix remains owned by the caller.
      */
@@ -668,45 +633,6 @@ public final class SegmentRing implements QuietCloseable {
             analysis.close();
             throw t;
         }
-    }
-
-    /**
-     * Highest {@code deltaStart + deltaCount} any symbol-dict delta frame at or below
-     * {@code maxFsnInclusive} references (0 when none). See
-     * {@link MmapSegment#maxSymbolDeltaEnd}; used once at recovery to detect a
-     * persisted dictionary torn below the ids the surviving committed frames
-     * reference. Frames above {@code maxFsnInclusive} are the retired orphan-deferred
-     * tail and are excluded.
-     */
-    public synchronized long maxSymbolDeltaEnd(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
-        long maxEnd = 0L;
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            long end = sealedSegments.get(i).maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
-            if (end > maxEnd) {
-                maxEnd = end;
-            }
-        }
-        long end = active.maxSymbolDeltaEnd(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
-        return Math.max(maxEnd, end);
-    }
-
-    /**
-     * Highest {@code deltaStart} any symbol-dict delta frame at or below
-     * {@code maxFsnInclusive} carries (0 when none, or when every such frame is
-     * self-sufficient). See {@link MmapSegment#maxSymbolDeltaStart}; paired with
-     * {@link #maxSymbolDeltaEnd} at recovery to tell a full-dict-fallback slot
-     * (recoverable with no dictionary) from a torn delta dictionary (fails clean).
-     */
-    public synchronized long maxSymbolDeltaStart(int headerMagic, int flagsOffset, int flagDeltaMask, int qwpHeaderSize, long maxFsnInclusive) {
-        long maxStart = 0L;
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            long start = sealedSegments.get(i).maxSymbolDeltaStart(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
-            if (start > maxStart) {
-                maxStart = start;
-            }
-        }
-        long start = active.maxSymbolDeltaStart(headerMagic, flagsOffset, flagDeltaMask, qwpHeaderSize, maxFsnInclusive);
-        return Math.max(maxStart, start);
     }
 
     public MmapSegment getActive() {

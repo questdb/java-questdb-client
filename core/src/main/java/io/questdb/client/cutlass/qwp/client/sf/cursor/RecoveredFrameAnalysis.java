@@ -27,7 +27,6 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.Utf8s;
@@ -96,15 +95,11 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         }
     }
 
-    void appendDecodedSymbols(ObjList<String> out) {
-        decodeSymbols(null, out);
-    }
-
     void addDecodedSymbolsTo(GlobalSymbolDictionary target) {
-        decodeSymbols(target, null);
+        decodeSymbols(target);
     }
 
-    private void decodeSymbols(GlobalSymbolDictionary target, ObjList<String> out) {
+    private void decodeSymbols(GlobalSymbolDictionary target) {
         long p = rawAddr;
         long limit = rawAddr + committedRawLen;
         for (int i = 0; i < committedRawCount; i++) {
@@ -118,12 +113,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             if (symbolLen > limit - p) {
                 throw new IllegalStateException("truncated cached symbol dictionary suffix");
             }
-            String symbol = Utf8s.stringFromUtf8Bytes(p, p + symbolLen);
-            if (target != null) {
-                target.addRecoveredSymbol(symbol);
-            } else {
-                out.add(symbol);
-            }
+            target.addRecoveredSymbol(Utf8s.stringFromUtf8Bytes(p, p + symbolLen));
             p += symbolLen;
         }
         if (p != limit) {

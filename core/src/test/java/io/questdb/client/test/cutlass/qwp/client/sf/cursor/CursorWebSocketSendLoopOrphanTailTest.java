@@ -37,7 +37,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -398,12 +397,12 @@ public class CursorWebSocketSendLoopOrphanTailTest {
             try (CursorSendEngine engine = newEngine()) {
                 assertEquals("one recovery visit per frame", 3L, engine.recoveryFramesVisited());
 
-                ObjList<String> first = new ObjList<>();
-                ObjList<String> second = new ObjList<>();
-                assertEquals(3L, engine.collectReplaySymbolsAbove(0, first));
-                assertEquals(3L, engine.collectReplaySymbolsAbove(0, second));
-                assertEquals("a", first.getQuick(0));
-                assertEquals("c", second.getQuick(2));
+                GlobalSymbolDictionary first = new GlobalSymbolDictionary();
+                GlobalSymbolDictionary second = new GlobalSymbolDictionary();
+                assertEquals(3L, engine.addRecoveredSymbolsTo(0, first));
+                assertEquals(3L, engine.addRecoveredSymbolsTo(0, second));
+                assertEquals("a", first.getSymbol(0));
+                assertEquals("c", second.getSymbol(2));
                 assertEquals("producer seed reads must reuse the recovery result",
                         3L, engine.recoveryFramesVisited());
 
@@ -467,11 +466,11 @@ public class CursorWebSocketSendLoopOrphanTailTest {
 
             try (CursorSendEngine engine = newEngine()) {
                 assertEquals(0L, engine.ackedFsn());
-                ObjList<String> recovered = new ObjList<>();
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
                 assertEquals("the full frame must re-anchor replay coverage",
-                        1L, engine.collectReplaySymbolsAbove(0, recovered));
+                        1L, engine.addRecoveredSymbolsTo(0, recovered));
                 assertEquals(1, recovered.size());
-                assertEquals("a", recovered.getQuick(0));
+                assertEquals("a", recovered.getSymbol(0));
             }
         });
     }
@@ -488,9 +487,9 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 appendDeltaSymbolFrame(engine, 0, 'a');
             }
             try (CursorSendEngine engine = newEngine()) {
-                ObjList<String> recovered = new ObjList<>();
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
                 assertEquals("an unacked gap remains unreplayable",
-                        -1L, engine.collectReplaySymbolsAbove(0, recovered));
+                        -1L, engine.addRecoveredSymbolsTo(0, recovered));
                 assertEquals(0, recovered.size());
             }
         });
