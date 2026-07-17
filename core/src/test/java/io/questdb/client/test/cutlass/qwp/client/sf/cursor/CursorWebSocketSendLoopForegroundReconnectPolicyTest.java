@@ -55,15 +55,17 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
     public final TemporaryFolder sfDir = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
-    public void testAsyncInitialAuthFailureRetriesUntilCredentialsRecover() throws Exception {
-        assertAsyncInitialForegroundRecovers(false,
-                () -> new QwpAuthFailedException(401, "localhost", 1));
+    public void testAsyncInitialAuthFailureSurfacesTerminalToTheCaller() throws Exception {
+        assertAsyncInitialForegroundSurfacesTerminal(false,
+                () -> new QwpAuthFailedException(401, "localhost", 1),
+                "ws-upgrade-failed");
     }
 
     @Test
-    public void testAsyncInitialDurableAckMismatchRetriesUntilCapabilityRecovers() throws Exception {
-        assertAsyncInitialForegroundRecovers(true,
-                () -> new QwpDurableAckMismatchException("localhost", 1, "primary"));
+    public void testAsyncInitialDurableAckMismatchSurfacesTerminalToTheCaller() throws Exception {
+        assertAsyncInitialForegroundSurfacesTerminal(true,
+                () -> new QwpDurableAckMismatchException("localhost", 1, "primary"),
+                "durable-ack-mismatch");
     }
 
     @Test
@@ -78,9 +80,18 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                 () -> new QwpDurableAckMismatchException("localhost", 1, "primary"));
     }
 
-    private void assertAsyncInitialForegroundRecovers(
+    /**
+     * An endpoint-policy failure before the sender has EVER reached the server is a
+     * startup problem, so it must reach the caller rather than retry silently: an
+     * operator with wrong credentials has to learn that, not watch a mute sender
+     * buffer forever. ASYNC startup has no caller left to throw at, so the terminal
+     * is latched for {@code SenderErrorHandler} delivery and the {@code close()}
+     * rethrow. Post-start the opposite holds -- see {@link #assertForegroundRecovers}.
+     */
+    private void assertAsyncInitialForegroundSurfacesTerminal(
             boolean durableAck,
-            FailureSupplier failureSupplier
+            FailureSupplier failureSupplier,
+            String expectedDetail
     ) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             DropFirstConnectionHandler handler = new DropFirstConnectionHandler(durableAck, false);
@@ -111,20 +122,18 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                     appendFrame(engine, (byte) 1);
                     loop.start();
 
-                    await(() -> factory.attempts() >= 2 || loop.getTerminalError() != null,
-                            "async foreground did not retry the endpoint-policy failure");
-                    Assert.assertNull(
-                            "async initial endpoint-policy failures must not stop the producer",
-                            loop.getTerminalError());
+                    await(() -> loop.getTerminalError() != null,
+                            "an async initial endpoint-policy failure must latch a terminal");
+                    Assert.assertTrue("the terminal must name the endpoint-policy failure, got: "
+                                    + loop.getTerminalError().getMessage(),
+                            loop.getTerminalError().getMessage().contains(expectedDetail));
+                    // Never reached the server, so the terminal is a startup verdict.
                     Assert.assertFalse(loop.hasEverConnected());
-
-                    long target = appendFrame(engine, (byte) 2);
-                    factory.allowConnect();
-                    await(() -> engine.ackedFsn() >= target || loop.getTerminalError() != null,
-                            "async foreground did not deliver after endpoint policy recovered");
-                    Assert.assertNull(loop.getTerminalError());
-                    Assert.assertTrue(loop.hasEverConnected());
-                    Assert.assertEquals(target, engine.ackedFsn());
+                    // Latched on the FIRST rejection: retrying an endpoint-policy
+                    // failure at startup is exactly the silent-buffering regression
+                    // this pins. Attempts cannot climb once running flips false.
+                    Assert.assertEquals("a startup endpoint-policy failure must not be retried",
+                            1, factory.attempts());
                 } finally {
                     factory.allowConnect();
                     loop.close();
@@ -133,6 +142,13 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         });
     }
 
+    /**
+     * The post-start twin of {@link #assertAsyncInitialForegroundSurfacesTerminal}:
+     * handing the loop a live client seeds {@code hasEverConnected}, so the sender is
+     * past initialization and store-and-forward owns the buffered data. Every
+     * endpoint-policy failure is then a transient to ride out, never a terminal
+     * (Invariant B).
+     */
     private void assertForegroundRecovers(boolean durableAck, FailureSupplier failureSupplier) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             DropFirstConnectionHandler handler = new DropFirstConnectionHandler(durableAck, true);

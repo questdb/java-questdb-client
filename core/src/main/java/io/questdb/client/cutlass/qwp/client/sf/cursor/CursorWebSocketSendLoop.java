@@ -1772,8 +1772,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 phase, elapsedMs, attempts, lastMsg);
     }
 
+    /**
+     * Whether an endpoint-policy failure (auth, non-421 upgrade, durable-ack
+     * capability gap) latches a terminal instead of retrying under Invariant B.
+     * <p>
+     * Two callers own a terminal, for different reasons:
+     * <ul>
+     *   <li>An ORPHAN drainer: a sanctioned terminal that hands the slot back to
+     *       its quarantine owner.</li>
+     *   <li>A sender still INITIALIZING ({@code !hasEverConnected}): connectivity
+     *       problems are the caller's problem during startup and must reach it, so
+     *       an operator learns their credentials are wrong instead of watching a
+     *       silent sender buffer forever. SYNC/OFF startup reports them by throwing
+     *       from {@code build()}; ASYNC startup has no caller left to throw at, so
+     *       the latched terminal reaches the user through {@code SenderErrorHandler}
+     *       and a {@code close()} rethrow. The constructor seeds
+     *       {@code hasEverConnected = client != null}, so SYNC/OFF (which is handed a
+     *       live client) is already past initialization here and never latches.</li>
+     * </ul>
+     * Once a FOREGROUND sender has reached the server even once, initialization is
+     * over and store-and-forward owns the buffered data: every endpoint-policy
+     * failure is then a transient the drainer must ride out, never a producer-fatal
+     * terminal (Invariant B).
+     */
     private boolean endpointPolicyFailureIsTerminal() {
-        return reconnectPolicy == ReconnectPolicy.ORPHAN;
+        return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
     }
 
     /**
@@ -2287,7 +2310,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.client = newClient;
         // Sticky: once the wire is up, we've reached the server at least once
         // for this sender's lifetime. Exposed to the owning sender for
-        // connection-state observability; reconnect policy does not depend on it.
+        // connection-state observability, and it ends initialization: from here
+        // on endpointPolicyFailureIsTerminal() stops latching endpoint-policy
+        // failures on a foreground sender and rides them out instead, because
+        // store-and-forward now owns the buffered data (Invariant B).
         this.hasEverConnected = true;
         if (old != null) {
             try {

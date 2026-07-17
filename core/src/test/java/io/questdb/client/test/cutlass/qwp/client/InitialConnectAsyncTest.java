@@ -58,10 +58,21 @@ import java.util.concurrent.atomic.AtomicReference;
 public class InitialConnectAsyncTest {
 
     @Test
-    public void testAsyncAuthFailureRetriesForeverNoTerminal() throws Exception {
-        // Server returns HTTP 401 on every upgrade attempt. Once ASYNC build()
-        // has returned, store-and-forward owns the buffered rows: the I/O thread
-        // must keep retrying rather than terminalizing the producer.
+    public void testAsyncAuthFailureSurfacesTerminal() throws Exception {
+        // Server returns HTTP 401 on every upgrade attempt. A rejection by ENDPOINT
+        // POLICY before the sender has ever reached the server is a startup problem,
+        // not a transient, so it must reach the caller: an operator with the wrong
+        // credentials has to learn that, rather than watch a mute sender buffer into
+        // SF until it fills and misreports the cause as "out of space". SYNC/OFF
+        // startup reports it by throwing from build(); ASYNC has no caller left to
+        // throw at, so it arrives on the SenderErrorHandler instead.
+        //
+        // Contrast testAsyncNoServerRetriesForeverNoTerminal: a dead port is a
+        // TRANSPORT failure -- genuinely transient -- and retries forever even during
+        // startup. And once the wire has been up even once, initialization is over
+        // and store-and-forward owns the data, so the same 401 becomes a transient to
+        // ride out (CursorWebSocketSendLoopForegroundReconnectPolicyTest
+        // #testPostStartAuthFailureRetriesUntilCredentialsRecover).
         try (Always401Fixture fixture = new Always401Fixture()) {
             fixture.start();
             int port = fixture.getPort();
@@ -79,16 +90,17 @@ public class InitialConnectAsyncTest {
                 QwpWebSocketSender wss = (QwpWebSocketSender) sender;
                 awaitAtLeastOneConnectAttempt(wss);
 
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
-
-                Assert.assertFalse(
-                        "async 401 rejection must stay inside the retry loop",
-                        inbox.await(1_500, TimeUnit.MILLISECONDS));
-                Assert.assertNull("no terminal SenderError may be delivered for an async 401",
-                        inbox.get());
+                Assert.assertTrue(
+                        "an async 401 must surface a terminal to the errorHandler",
+                        inbox.await(5, TimeUnit.SECONDS));
+                SenderError err = inbox.get();
+                Assert.assertNotNull("a SenderError must be delivered for an async 401", err);
+                Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+                Assert.assertEquals(SenderError.Category.SECURITY_ERROR, err.getCategory());
+                Assert.assertTrue("the terminal must name the upgrade rejection, got: "
+                                + err.getServerMessage(),
+                        err.getServerMessage().contains("ws-upgrade-failed"));
                 Assert.assertFalse("no upgrade has succeeded yet", wss.wasEverConnected());
-                awaitReconnectAttemptsAdvance(wss);
             } finally {
                 closeQuietly(sender);
             }
@@ -102,8 +114,9 @@ public class InitialConnectAsyncTest {
         // (it may appear; the data is safe in SF), so the I/O thread retries
         // forever. reconnect_max_duration_millis is IGNORED as a give-up deadline:
         // no SenderError lands, the sender stays usable, and wasEverConnected()
-        // stays false. Endpoint-policy failures are covered by
-        // testAsyncAuthFailureRetriesForeverNoTerminal.
+        // stays false. This is the TRANSPORT half of the startup contract; the
+        // endpoint-POLICY half, which does surface, is
+        // testAsyncAuthFailureSurfacesTerminal.
         int port = TestPorts.findUnusedPort();
         ErrorInbox inbox = new ErrorInbox();
         String cfg = "ws::addr=localhost:" + port
