@@ -147,6 +147,30 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
         return framesVisited;
     }
 
+    /**
+     * Discards native bytes accumulated only while scanning an uncommitted
+     * deferred tail. Call exactly once after the ordered recovery walk.
+     */
+    void finish() {
+        runningRawLen = committedRawLen;
+        runningRawCount = committedRawCount;
+        if (rawCapacity == committedRawLen) {
+            return;
+        }
+        if (committedRawLen == 0) {
+            Unsafe.free(rawAddr, rawCapacity, MemoryTag.NATIVE_DEFAULT);
+            rawAddr = 0L;
+            rawCapacity = 0;
+            return;
+        }
+        rawAddr = Unsafe.realloc(
+                rawAddr,
+                rawCapacity,
+                committedRawLen,
+                MemoryTag.NATIVE_DEFAULT);
+        rawCapacity = committedRawLen;
+    }
+
     long maxDeltaEnd() {
         return committedMaxDeltaEnd;
     }
@@ -165,6 +189,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
     int rawLen() {
         return committedRawLen;
+    }
+
+    int rawCapacity() {
+        return rawCapacity;
     }
 
     long symbolEntriesVisited() {

@@ -28,6 +28,7 @@ import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -180,6 +181,22 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 } finally {
                     loop.close();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryReleasesAbortedTailSymbolStorage() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaSymbolFrame(engine, 0, 'a');
+                appendLargeDeferredDeltaSymbolFrame(engine, 1, 8_000);
+            }
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals("native recovery storage must be trimmed to the committed prefix",
+                        2, engine.recoverySymbolNativeCapacity());
+                assertEquals("large deferred frame is the aborted tail",
+                        1L, engine.recoveredOrphanTipFsn());
             }
         });
     }
@@ -583,6 +600,34 @@ public class CursorWebSocketSendLoopOrphanTailTest {
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) 1);
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 2, (byte) 1);
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 3, (byte) symbol);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void appendLargeDeferredDeltaSymbolFrame(
+            CursorSendEngine engine,
+            int deltaStart,
+            int symbolLen
+    ) {
+        int size = HEADER_SIZE
+                + NativeBufferWriter.varintSize(deltaStart)
+                + NativeBufferWriter.varintSize(1)
+                + NativeBufferWriter.varintSize(symbolLen)
+                + symbolLen;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + HEADER_OFFSET_FLAGS,
+                    (byte) (FLAG_DEFER_COMMIT | FLAG_DELTA_SYMBOL_DICT));
+            long p = NativeBufferWriter.writeVarint(buf + HEADER_SIZE, deltaStart);
+            p = NativeBufferWriter.writeVarint(p, 1);
+            p = NativeBufferWriter.writeVarint(p, symbolLen);
+            Unsafe.getUnsafe().setMemory(p, symbolLen, (byte) 'z');
             engine.appendBlocking(buf, size);
         } finally {
             Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);

@@ -594,6 +594,11 @@ public final class BackgroundDrainer implements Runnable {
                 logicalSlotLock.close();
                 logicalSlotLock = null;
             }
+            // A recovered deferred-only tail is an aborted transaction and can
+            // be retired locally once everything below it is already ACKed.
+            // Do this before opening a socket: auth/upgrade failures must not
+            // quarantine a slot that has no wire-visible work left.
+            engine.retireRecoveredOrphanTailIfReady();
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
                 LOG.info("orphan slot already drained: {} (acked={} target={})",

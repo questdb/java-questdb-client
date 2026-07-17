@@ -1338,7 +1338,9 @@ public class DeltaDictRecoveryTest {
 
             // Phase 2: recover. build() must SUCCEED (not throw the torn-dict guard),
             // and the self-sufficient frames replay against a fresh server gap-free.
-            DictReconstructingHandler handler = new DictReconstructingHandler();
+            // Drop the first replayed data frame before ACK so a second connection
+            // must replay it and prove full-dict mode stays catch-up-free.
+            DictReconstructingHandler handler = new DictReconstructingHandler(true);
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();
                 good.start();
@@ -1347,13 +1349,17 @@ public class DeltaDictRecoveryTest {
                 try (Sender ignored = Sender.fromConfig(cfg)) { // must NOT throw
                     long deadline = System.currentTimeMillis() + 5_000;
                     while (System.currentTimeMillis() < deadline
-                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                            && (handler.dataFrameCount() < 2
+                            || handler.maxDictSize() < DISTINCT_SYMBOLS)) {
                         Thread.sleep(20);
                     }
                 }
+                Assert.assertTrue("test must force a reconnect and replay the full-dict frame",
+                        handler.dataFrameCount() >= 2);
                 // Full-dict recovery re-ships the whole dictionary inline on every
-                // frame, so there is NO 0-table catch-up frame (that is the delta-mode
-                // reconnect path). The reconstructed dictionary is still gap-free.
+                // frame, including after the forced reconnect, so there is NO 0-table
+                // catch-up frame (that is the delta-mode reconnect path). The
+                // reconstructed dictionary is still gap-free.
                 Assert.assertFalse("full-dict recovery must NOT send a catch-up frame",
                         handler.sawCatchUpFrame);
                 List<String> reconstructed = handler.dictSnapshot();
@@ -1382,9 +1388,20 @@ public class DeltaDictRecoveryTest {
         volatile boolean sawCatchUpFrame;
         private final List<Long> ackSequenceStarts = new ArrayList<>();
         private final List<String> dict = new ArrayList<>();
+        private final boolean dropFirstDataFrame;
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
+        private int dataFrameCount;
+        private boolean firstDataFrameDropped;
         private volatile int lastDataDeltaStart = -1;
+
+        private DictReconstructingHandler() {
+            this(false);
+        }
+
+        private DictReconstructingHandler(boolean dropFirstDataFrame) {
+            this.dropFirstDataFrame = dropFirstDataFrame;
+        }
 
         synchronized List<Long> ackSequenceStarts() {
             return new ArrayList<>(ackSequenceStarts);
@@ -1392,6 +1409,10 @@ public class DeltaDictRecoveryTest {
 
         synchronized List<String> dictSnapshot() {
             return new ArrayList<>(dict);
+        }
+
+        synchronized int dataFrameCount() {
+            return dataFrameCount;
         }
 
         synchronized int maxDictSize() {
@@ -1415,7 +1436,13 @@ public class DeltaDictRecoveryTest {
             if (tableCount == 0 && QwpWireTestUtils.hasDelta(data)) {
                 sawCatchUpFrame = true;
             } else if (tableCount > 0 && QwpWireTestUtils.hasDelta(data)) {
+                dataFrameCount++;
                 lastDataDeltaStart = QwpWireTestUtils.readVarint(data, new int[]{12});
+                if (dropFirstDataFrame && !firstDataFrameDropped) {
+                    firstDataFrameDropped = true;
+                    client.close();
+                    return;
+                }
             }
             try {
                 long ackSequence = nextSeq.getAndIncrement();

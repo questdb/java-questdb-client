@@ -809,6 +809,11 @@ public final class CursorSendEngine implements QuietCloseable {
         return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.symbolEntriesVisited();
     }
 
+    @TestOnly
+    public int recoverySymbolNativeCapacity() {
+        return recoveredFrameAnalysis == null ? 0 : recoveredFrameAnalysis.rawCapacity();
+    }
+
     private RecoveredFrameAnalysis checkedRecoveryAnalysis(int baseline) {
         if (recoveredFrameAnalysis == null || recoveredFrameAnalysis.baseline() != baseline) {
             throw new IllegalStateException("recovery symbol baseline mismatch [expected="
@@ -958,6 +963,31 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long recoveredOrphanTipFsn() {
         return recoveredOrphanTipFsn;
+    }
+
+    /**
+     * Retires a recovered deferred tail once every frame below it is ACKed.
+     * The operation is local and idempotent: no wire sequence ever referred
+     * to these aborted-transaction frames.
+     *
+     * @return true if no orphan tail remains, false if lower frames still need
+     *         server ACKs
+     */
+    public boolean retireRecoveredOrphanTailIfReady() {
+        long orphanTip = recoveredOrphanTipFsn;
+        if (orphanTip < 0L) {
+            return true;
+        }
+        long orphanStart = recoveredCommitBoundaryFsn + 1L;
+        if (ackedFsn() < orphanStart - 1L) {
+            return false;
+        }
+        LOG.warn("retiring orphaned deferred tail: {} frame(s) [fsn {}..{}] belong to a transaction "
+                        + "whose commit was never published; aborting them (never transmitted, slots trimmed)",
+                orphanTip - orphanStart + 1L, orphanStart, orphanTip);
+        acknowledge(orphanTip);
+        recoveredOrphanTipFsn = -1L;
+        return true;
     }
 
     /**

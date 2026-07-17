@@ -306,6 +306,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Any growth first performs a copy-on-write; only owned buffers are freed.
     private boolean sentDictBytesOwned;
     private int sentDictCount;
+    // True when replay frames can start above dictionary id zero and therefore
+    // depend on a catch-up on a fresh connection. Delta-enabled live engines
+    // always have this dependency. A recovered delta slot whose dictionary
+    // failed to open is identified by its non-zero recovered delta start. The
+    // remaining false case is full-dictionary fallback: every frame re-registers
+    // from id zero, so sending the mirror first would duplicate the dictionary.
+    private final boolean hasReplayDictionaryDependency;
     // Reusable staging frame for dictionary catch-up chunks. A reconnect may split a
     // large dictionary into many chunks, and every later reconnect repeats that split;
     // retaining one growable loop-owned buffer turns the old malloc/free-per-chunk path
@@ -372,9 +379,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long fsnAtZero;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
-    // successful connect attempt in any mode). Once true, stays true. Used to
-    // distinguish an initial endpoint-policy failure (fail fast) from a
-    // post-start failure that a foreground sender must contain and retry.
+    // successful connect attempt in any mode). Once true, stays true. This is
+    // connection-state observability only; reconnect policy is role-based.
     private volatile boolean hasEverConnected;
     private volatile Thread ioThread;
     // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
@@ -709,6 +715,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         this.client = client;
         this.engine = engine;
+        this.hasReplayDictionaryDependency = engine.isDeltaDictEnabled()
+                || engine.recoveredMaxSymbolDeltaStart() > 0L;
         // Recovery / orphan-drain: the loop starts with a fresh in-memory mirror,
         // so seed it from the slot's persisted dictionary. That way the very first
         // connection re-registers the whole dictionary (via a catch-up frame)
@@ -2320,15 +2328,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // handleServerRejection can tell "only the catch-up went out" from "the
         // head data frame went out".
         dataFrameSentThisConnection = false;
-        // Not gated on isDeltaDictEnabled() -- see the constructor. The mirror is
-        // non-empty exactly when this loop has already put symbols on a wire, and a
-        // FRESH server holds none of them, so it must be re-registered before any
-        // frame that back-references an id. In full-dict mode the mirror is non-empty
-        // too and the catch-up is then redundant (the next frame re-registers from id
-        // 0 anyway) but harmless: the server overwrites identical ids with identical
-        // symbols. Redundant-but-uniform beats a mode flag that can go false while the
-        // frames on disk are still deltas.
-        if (client != null && sentDictCount > 0) {
+        // Do not gate solely on isDeltaDictEnabled(): a recovered delta slot can
+        // lose access to its side-file while its on-disk frames still start above
+        // zero. hasReplayDictionaryDependency preserves that distinction while
+        // keeping full-dictionary fallback catch-up-free across every reconnect.
+        if (client != null && sentDictCount > 0 && hasReplayDictionaryDependency) {
             this.nextWireSeq = 0L;
             // The catch-up may span several frames when the dictionary exceeds the
             // server's batch cap; each consumes a wire sequence (0 .. n-1) that maps
@@ -2981,13 +2985,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (orphanSkipTipFsn < 0) {
             return true;
         }
-        if (engine.ackedFsn() < orphanSkipStartFsn - 1L) {
+        if (!engine.retireRecoveredOrphanTailIfReady()) {
             return false;
         }
-        LOG.warn("retiring orphaned deferred tail: {} frame(s) [fsn {}..{}] belong to a transaction "
-                        + "whose commit was never published; aborting them (never transmitted, slots trimmed)",
-                orphanSkipTipFsn - orphanSkipStartFsn + 1, orphanSkipStartFsn, orphanSkipTipFsn);
-        engine.acknowledge(orphanSkipTipFsn);
         orphanSkipStartFsn = -1L;
         orphanSkipTipFsn = -1L;
         return true;

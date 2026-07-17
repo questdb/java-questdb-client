@@ -613,6 +613,7 @@ public final class SegmentRing implements QuietCloseable {
                 sealedSegments.get(i).scanRecovery(analysis);
             }
             active.scanRecovery(analysis);
+            analysis.finish();
             return analysis;
         } catch (Throwable t) {
             analysis.close();
