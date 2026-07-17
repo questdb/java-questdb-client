@@ -172,8 +172,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
     // tests inject a fault facade to exercise recovery I/O failures (a truncate
     // that cannot drop a torn tail, a short write) without a real broken disk.
     private final FilesFacade ff;
-    // Production writes directly into segmented append mappings. Custom facades retain the
-    // positioned-write path so fault tests can inject short writes through ff.write.
+    // Production writes directly into segmented append mappings. Wrapping facades retain the
+    // positioned-write path by default so fault tests can inject short writes through ff.write;
+    // mmap-specific fault facades opt in through FilesFacade.isMmapAllowed().
     private final boolean mappedAppend;
     // True only when recovery parsed the file through a temporary read-only
     // mmap instead of allocating a second native buffer as large as the file.
@@ -210,7 +211,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
     ) {
         this.ff = ff;
         this.fd = fd;
-        this.mappedAppend = ff == FilesFacade.INSTANCE;
+        this.mappedAppend = ff.isMmapAllowed();
         this.mappedRecoveryInput = mappedRecoveryInput;
         this.appendOffset = appendOffset;
         this.size = size;
@@ -492,7 +493,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             loadedEntriesLen = 0;
         }
         if (appendMapAddr != 0L) {
-            Files.munmap(appendMapAddr, appendMapCapacity, MemoryTag.MMAP_DEFAULT);
+            ff.munmap(appendMapAddr, appendMapCapacity, MemoryTag.MMAP_DEFAULT);
             appendMapAddr = 0L;
             appendMapCapacity = 0L;
             appendMapOffset = 0L;
@@ -639,13 +640,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return null;
         }
         int len = (int) fileLen; // open() bounds fileLen to [HEADER_SIZE, Integer.MAX_VALUE)
-        boolean mappedInput = ff == FilesFacade.INSTANCE;
+        boolean mappedInput = ff.isMmapAllowed();
         long inputAddr = 0L;
         long entriesAddr = 0L;
         int entriesLen = 0;
         try {
             if (mappedInput) {
-                inputAddr = Files.mmap(fd, fileLen, 0L, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
+                inputAddr = ff.mmap(fd, fileLen, 0L, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
                 if (inputAddr == Files.FAILED_MMAP_ADDRESS) {
                     inputAddr = 0L;
                     throw new IllegalStateException("could not mmap symbol dictionary for recovery");
@@ -675,7 +676,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 copyRecoveredEntries(inputAddr, scan.validLen, entriesAddr, entriesLen);
             }
             if (mappedInput) {
-                Files.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
+                ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
             } else {
                 Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
             }
@@ -695,7 +696,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         } catch (Throwable t) {
             if (inputAddr != 0L) {
                 if (mappedInput) {
-                    Files.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
+                    ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
                 } else {
                     Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
                 }
@@ -923,9 +924,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             appendMapAddr = 0L;
             appendMapCapacity = 0L;
             appendMapOffset = 0L;
-            Files.munmap(oldAddr, oldCapacity, MemoryTag.MMAP_DEFAULT);
+            ff.munmap(oldAddr, oldCapacity, MemoryTag.MMAP_DEFAULT);
         }
-        long newAddr = Files.mmap(
+        long newAddr = ff.mmap(
                 fd, newCapacity, newOffset, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
         if (newAddr == Files.FAILED_MMAP_ADDRESS) {
             throw new IllegalStateException("could not mmap append region for "

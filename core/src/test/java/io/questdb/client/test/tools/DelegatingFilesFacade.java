@@ -33,9 +33,9 @@ import io.questdb.client.std.FilesFacade;
  * implausible file length -- so a test can drive a real I/O failure path without a
  * real broken disk.
  * <p>
- * {@code FilesFacade} has no default methods, so the delegation boilerplate is
- * unavoidable; it lives here once rather than being stamped into each test that
- * needs a fault seam.
+ * {@code FilesFacade} deliberately leaves most operations abstract, so the
+ * delegation boilerplate lives here once rather than being stamped into each
+ * test that needs a fault seam.
  */
 public class DelegatingFilesFacade implements FilesFacade {
     @Override

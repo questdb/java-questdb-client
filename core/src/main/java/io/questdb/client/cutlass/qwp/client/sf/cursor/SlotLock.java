@@ -26,9 +26,11 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -65,10 +67,12 @@ public final class SlotLock implements QuietCloseable {
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
     private static final String LOGICAL_LOCK_DIR_NAME = ".slot-locks";
+    private final FilesFacade ff;
     private final String slotDir;
     private int fd;
 
-    private SlotLock(String slotDir, int fd) {
+    private SlotLock(FilesFacade ff, String slotDir, int fd) {
+        this.ff = ff;
         this.slotDir = slotDir;
         this.fd = fd;
     }
@@ -83,10 +87,10 @@ public final class SlotLock implements QuietCloseable {
      */
     public static SlotLock acquire(String slotDir) {
         validateSlotDir(slotDir);
-        ensureDirectory(slotDir, "slot dir");
+        ensureDirectory(FilesFacade.INSTANCE, slotDir, "slot dir");
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
-        return acquireAt(slotDir, lockPath, pidPath);
+        return acquireAt(FilesFacade.INSTANCE, slotDir, lockPath, pidPath);
     }
 
     /**
@@ -102,6 +106,12 @@ public final class SlotLock implements QuietCloseable {
      * the fresh directory through the old pathname.
      */
     public static SlotLock acquireLogical(String slotDir) {
+        return acquireLogical(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /** Facade-aware variant used to exercise logical-lock I/O failures. */
+    @TestOnly
+    public static SlotLock acquireLogical(FilesFacade ff, String slotDir) {
         validateSlotDir(slotDir);
         Path slotPath = Paths.get(slotDir);
         Path parentPath = slotPath.getParent();
@@ -113,44 +123,44 @@ public final class SlotLock implements QuietCloseable {
         String parentDir = parentPath.toString();
         String slotName = slotNamePath.toString();
         String logicalLockDir = parentDir + "/" + LOGICAL_LOCK_DIR_NAME;
-        ensureDirectory(logicalLockDir, "logical slot lock dir");
+        ensureDirectory(ff, logicalLockDir, "logical slot lock dir");
         String lockPath = logicalLockDir + "/" + slotName + ".lock";
         String pidPath = logicalLockDir + "/" + slotName + ".lock.pid";
-        return acquireAt(slotDir, lockPath, pidPath);
+        return acquireAt(ff, slotDir, lockPath, pidPath);
     }
 
-    private static SlotLock acquireAt(String slotDir, String lockPath, String pidPath) {
-        int fd = Files.openRW(lockPath);
+    private static SlotLock acquireAt(FilesFacade ff, String slotDir, String lockPath, String pidPath) {
+        int fd = ff.openRW(lockPath);
         if (fd < 0) {
             throw new IllegalStateException(
                     "could not open slot lock file: " + lockPath);
         }
         boolean ok = false;
         try {
-            int rc = Files.lock(fd);
+            int rc = ff.lock(fd);
             if (rc != 0) {
                 String holder = readHolder(pidPath);
                 throw new IllegalStateException(
                         "sf slot already in use by another process [slot="
                                 + slotDir + ", holder=" + holder + "]");
             }
-            writePid(pidPath);
+            writePid(ff, pidPath);
             ok = true;
-            return new SlotLock(slotDir, fd);
+            return new SlotLock(ff, slotDir, fd);
         } finally {
             if (!ok) {
-                Files.close(fd);
+                ff.close(fd);
             }
         }
     }
 
-    private static void ensureDirectory(String path, String description) {
-        if (!Files.exists(path)) {
-            int rc = Files.mkdir(path, Files.DIR_MODE_DEFAULT);
+    private static void ensureDirectory(FilesFacade ff, String path, String description) {
+        if (!ff.exists(path)) {
+            int rc = ff.mkdir(path, Files.DIR_MODE_DEFAULT);
             // Multiple senders may create the shared parent lock directory
             // concurrently. Treat EEXIST as success, just as the builder does
             // for the SF root itself.
-            if (rc != 0 && !Files.exists(path)) {
+            if (rc != 0 && !ff.exists(path)) {
                 throw new IllegalStateException(
                         "could not create " + description + ": " + path + " rc=" + rc);
             }
@@ -174,7 +184,7 @@ public final class SlotLock implements QuietCloseable {
         // file or the .lock.pid sidecar — a stale PID is harmless (next
         // acquirer overwrites .lock.pid on success).
         if (fd >= 0) {
-            Files.close(fd);
+            ff.close(fd);
             fd = -1;
         }
     }
@@ -204,7 +214,7 @@ public final class SlotLock implements QuietCloseable {
         }
     }
 
-    private static void writePid(String pidPath) {
+    private static void writePid(FilesFacade ff, String pidPath) {
         long pid;
         try {
             pid = Compat.currentPid();
@@ -212,25 +222,25 @@ public final class SlotLock implements QuietCloseable {
             // Diagnostic-only — never block lock acquisition on it.
             pid = -1L;
         }
-        int wfd = Files.openRW(pidPath);
+        int wfd = ff.openRW(pidPath);
         if (wfd < 0) {
             // Diagnostic-only — never block lock acquisition on it.
             return;
         }
         try {
-            Files.truncate(wfd, 0L);
+            ff.truncate(wfd, 0L);
             byte[] payload = (pid + "\n").getBytes(StandardCharsets.UTF_8);
             long addr = Unsafe.malloc(payload.length, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (int i = 0; i < payload.length; i++) {
                     Unsafe.getUnsafe().putByte(addr + i, payload[i]);
                 }
-                Files.write(wfd, addr, payload.length, 0L);
+                ff.write(wfd, addr, payload.length, 0L);
             } finally {
                 Unsafe.free(addr, payload.length, MemoryTag.NATIVE_DEFAULT);
             }
         } finally {
-            Files.close(wfd);
+            ff.close(wfd);
         }
     }
 }

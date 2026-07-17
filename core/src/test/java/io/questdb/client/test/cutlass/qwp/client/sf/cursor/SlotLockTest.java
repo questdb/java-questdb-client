@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -34,6 +35,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -130,6 +132,36 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testLogicalLockRejectsInvalidPaths() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            assertLogicalPathRejected(null, "slotDir must not be empty");
+            assertLogicalPathRejected("", "slotDir must not be empty");
+            assertLogicalPathRejected("slot",
+                    "slotDir must contain a parent and slot name: slot");
+        });
+    }
+
+    @Test
+    public void testLogicalLockReportsLockDirectoryCreationFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = Paths.get(parentDir, "mkdir-failure").toString();
+            String lockDir = Paths.get(parentDir, ".slot-locks").toString();
+            LockDirectoryFailureFacade ff = new LockDirectoryFailureFacade(lockDir);
+            try {
+                SlotLock.acquireLogical(ff, slot);
+                fail("expected logical lock directory creation failure");
+            } catch (IllegalStateException expected) {
+                assertEquals("could not create logical slot lock dir: " + lockDir + " rc=-1",
+                        expected.getMessage());
+            }
+            assertEquals("lock file must not be opened after directory creation fails",
+                    0, ff.openRwCalls);
+            assertFalse("failed mkdir must not leave the lock directory behind",
+                    Files.exists(lockDir));
+        });
+    }
+
+    @Test
     public void testTwoDifferentSlotsCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slotA = parentDir + "/a";
@@ -168,11 +200,47 @@ public class SlotLockTest {
         Files.remove(dir);
     }
 
+    private static void assertLogicalPathRejected(String slotDir, String expectedMessage) {
+        Throwable thrown = null;
+        try {
+            SlotLock.acquireLogical(slotDir);
+        } catch (Throwable t) {
+            thrown = t;
+        }
+        assertTrue("expected IllegalArgumentException", thrown instanceof IllegalArgumentException);
+        assertEquals(expectedMessage, thrown.getMessage());
+    }
+
     private static boolean isDir(String path) {
         // Cheap heuristic: directories have a readable findFirst handle.
         long find = Files.findFirst(path);
         if (find <= 0) return false;
         Files.findClose(find);
         return true;
+    }
+
+    private static final class LockDirectoryFailureFacade extends DelegatingFilesFacade {
+        private final String lockDir;
+        private int openRwCalls;
+
+        private LockDirectoryFailureFacade(String lockDir) {
+            this.lockDir = lockDir;
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return !lockDir.equals(path) && super.exists(path);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return lockDir.equals(path) ? -1 : super.mkdir(path, mode);
+        }
+
+        @Override
+        public int openRW(String path) {
+            openRwCalls++;
+            return super.openRW(path);
+        }
     }
 }

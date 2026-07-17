@@ -85,6 +85,16 @@ public interface FilesFacade {
 
     int fsync(int fd);
 
+    /**
+     * Whether callers should use this facade's mmap path. The production facade
+     * returns {@code true}; wrapping fault facades retain positioned I/O unless
+     * they explicitly opt in, preserving their ability to inject short reads and
+     * writes.
+     */
+    default boolean isMmapAllowed() {
+        return this == INSTANCE;
+    }
+
     long length(int fd);
 
     /**
@@ -106,6 +116,19 @@ public interface FilesFacade {
     int lock(int fd);
 
     int mkdir(String path, int mode);
+
+    /**
+     * Maps a file region. Kept on the facade so mmap failures can be injected
+     * without relying on platform-specific filesystem behavior.
+     */
+    default long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+        return Files.mmap(fd, len, offset, flags, memoryTag);
+    }
+
+    /** Releases a region returned by {@link #mmap(int, long, long, int, int)}. */
+    default void munmap(long address, long len, int memoryTag) {
+        Files.munmap(address, len, memoryTag);
+    }
 
     int openCleanRW(String path);
 

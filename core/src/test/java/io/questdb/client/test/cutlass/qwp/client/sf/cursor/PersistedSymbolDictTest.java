@@ -56,6 +56,54 @@ public class PersistedSymbolDictTest {
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
+    public void testAppendAllocateFailureClosesDescriptorWithoutNativeLeak() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-allocate-failure");
+            IoFailureFacade ff = new IoFailureFacade(IoFailure.ALLOCATE);
+            try (PersistedSymbolDict dict = PersistedSymbolDict.openClean(ff, dir.toString())) {
+                Assert.assertNotNull(dict);
+                try {
+                    dict.appendSymbol("A");
+                    Assert.fail("expected append allocation failure");
+                } catch (IllegalStateException expected) {
+                    Assert.assertEquals(
+                            "could not grow mmap append region for .symbol-dict"
+                                    + " [required=16, fileSize=" + APPEND_MAP_CAPACITY + ']',
+                            expected.getMessage());
+                }
+                Assert.assertEquals("failed append must not advance the dictionary", 0, dict.size());
+            }
+            ff.assertAllOpenedDescriptorsClosed();
+            Assert.assertEquals(1, ff.allocateCalls);
+            Assert.assertEquals(0, ff.mmapCalls);
+        });
+    }
+
+    @Test
+    public void testAppendMmapFailureClosesDescriptorWithoutNativeLeak() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-mmap-append-failure");
+            IoFailureFacade ff = new IoFailureFacade(IoFailure.MMAP);
+            try (PersistedSymbolDict dict = PersistedSymbolDict.openClean(ff, dir.toString())) {
+                Assert.assertNotNull(dict);
+                try {
+                    dict.appendSymbol("A");
+                    Assert.fail("expected append mmap failure");
+                } catch (IllegalStateException expected) {
+                    Assert.assertEquals(
+                            "could not mmap append region for .symbol-dict"
+                                    + " [offset=0, capacity=" + APPEND_MAP_CAPACITY + ']',
+                            expected.getMessage());
+                }
+                Assert.assertEquals("failed append must not advance the dictionary", 0, dict.size());
+            }
+            ff.assertAllOpenedDescriptorsClosed();
+            Assert.assertEquals(1, ff.allocateCalls);
+            Assert.assertEquals(1, ff.mmapCalls);
+        });
+    }
+
+    @Test
     public void testAppendPersistsAcrossReopen() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
@@ -621,6 +669,52 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testOpenFailuresDoNotCreateOrDestroyDictionaryFiles() throws Exception {
+        assertMemoryLeak(() -> {
+            Path freshDir = newFolder("qwp-symdict-fresh-open-failure");
+            IoFailureFacade freshFf = new IoFailureFacade(IoFailure.OPEN_CLEAN);
+            Assert.assertNull(PersistedSymbolDict.openClean(freshFf, freshDir.toString()));
+            Assert.assertEquals(1, freshFf.openCleanAttempts);
+            freshFf.assertAllOpenedDescriptorsClosed();
+            Assert.assertFalse(Files.exists(freshDir.resolve(PersistedSymbolDict.FILE_NAME)));
+
+            Path existingDir = newFolder("qwp-symdict-existing-open-failure");
+            try (PersistedSymbolDict seed = PersistedSymbolDict.open(existingDir.toString())) {
+                Assert.assertNotNull(seed);
+                seed.appendSymbol("AAPL");
+            }
+            Path file = existingDir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(file);
+            IoFailureFacade existingFf = new IoFailureFacade(IoFailure.OPEN_EXISTING);
+            Assert.assertNull(PersistedSymbolDict.open(existingFf, existingDir.toString()));
+            Assert.assertEquals(1, existingFf.openRwAttempts);
+            existingFf.assertAllOpenedDescriptorsClosed();
+            Assert.assertArrayEquals("failed recovery open must preserve the load-bearing file",
+                    before, Files.readAllBytes(file));
+        });
+    }
+
+    @Test
+    public void testRecoveryMmapFailureClosesDescriptorAndPreservesFile() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-recovery-mmap-failure");
+            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(seed);
+                seed.appendSymbol("AAPL");
+            }
+            Path file = dir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(file);
+
+            IoFailureFacade ff = new IoFailureFacade(IoFailure.MMAP);
+            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
+            ff.assertAllOpenedDescriptorsClosed();
+            Assert.assertEquals(1, ff.mmapCalls);
+            Assert.assertArrayEquals("failed recovery mmap must preserve the load-bearing file",
+                    before, Files.readAllBytes(file));
+        });
+    }
+
+    @Test
     public void testRemoveOrphanDeletesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
@@ -631,6 +725,37 @@ public class PersistedSymbolDictTest {
             Assert.assertTrue(Files.exists(f));
             PersistedSymbolDict.removeOrphan(dir.toString());
             Assert.assertFalse(Files.exists(f));
+        });
+    }
+
+    @Test
+    public void testShortHeaderWriteClosesDescriptorAndRemovesStub() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-short-header");
+            IoFailureFacade ff = new IoFailureFacade(IoFailure.HEADER_WRITE);
+            Assert.assertNull(PersistedSymbolDict.openClean(ff, dir.toString()));
+            ff.assertAllOpenedDescriptorsClosed();
+            Assert.assertFalse("headerless stub must be removed",
+                    Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
+        });
+    }
+
+    @Test
+    public void testShortRecoveryReadClosesDescriptorAndPreservesFile() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-short-read");
+            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(seed);
+                seed.appendSymbol("AAPL");
+            }
+            Path file = dir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(file);
+
+            IoFailureFacade ff = new IoFailureFacade(IoFailure.READ);
+            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
+            ff.assertAllOpenedDescriptorsClosed();
+            Assert.assertArrayEquals("short recovery read must preserve the load-bearing file",
+                    before, Files.readAllBytes(file));
         });
     }
 
@@ -809,6 +934,102 @@ public class PersistedSymbolDictTest {
 
     private Path newFolder(String name) throws IOException {
         return temporaryFolder.newFolder(name).toPath();
+    }
+
+    private enum IoFailure {
+        ALLOCATE,
+        HEADER_WRITE,
+        MMAP,
+        OPEN_CLEAN,
+        OPEN_EXISTING,
+        READ
+    }
+
+    private static final class IoFailureFacade extends DelegatingFilesFacade {
+        private final IoFailure failure;
+        private int allocateCalls;
+        private int closeCalls;
+        private int mmapCalls;
+        private int openCleanAttempts;
+        private int openRwAttempts;
+        private int openedDescriptors;
+
+        private IoFailureFacade(IoFailure failure) {
+            this.failure = failure;
+        }
+
+        @Override
+        public boolean allocate(int fd, long size) {
+            allocateCalls++;
+            return failure != IoFailure.ALLOCATE && super.allocate(fd, size);
+        }
+
+        @Override
+        public int close(int fd) {
+            closeCalls++;
+            return super.close(fd);
+        }
+
+        @Override
+        public boolean isMmapAllowed() {
+            return failure == IoFailure.ALLOCATE || failure == IoFailure.MMAP;
+        }
+
+        @Override
+        public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+            mmapCalls++;
+            if (failure == IoFailure.MMAP) {
+                return io.questdb.client.std.Files.FAILED_MMAP_ADDRESS;
+            }
+            return io.questdb.client.std.Files.mmap(fd, len, offset, flags, memoryTag);
+        }
+
+        @Override
+        public int openCleanRW(String path) {
+            openCleanAttempts++;
+            if (failure == IoFailure.OPEN_CLEAN) {
+                return -1;
+            }
+            int fd = super.openCleanRW(path);
+            if (fd >= 0) {
+                openedDescriptors++;
+            }
+            return fd;
+        }
+
+        @Override
+        public int openRW(String path) {
+            openRwAttempts++;
+            if (failure == IoFailure.OPEN_EXISTING) {
+                return -1;
+            }
+            int fd = super.openRW(path);
+            if (fd >= 0) {
+                openedDescriptors++;
+            }
+            return fd;
+        }
+
+        @Override
+        public long read(int fd, long addr, long len, long offset) {
+            if (failure == IoFailure.READ && len > 0) {
+                return super.read(fd, addr, len - 1, offset);
+            }
+            return super.read(fd, addr, len, offset);
+        }
+
+        @Override
+        public long write(int fd, long addr, long len, long offset) {
+            if (failure == IoFailure.HEADER_WRITE && offset == 0 && len == HEADER_SIZE) {
+                return super.write(fd, addr, len - 1, offset);
+            }
+            return super.write(fd, addr, len, offset);
+        }
+
+        private void assertAllOpenedDescriptorsClosed() {
+            Assert.assertEquals("every successfully opened fd must be closed",
+                    openedDescriptors, closeCalls);
+        }
     }
 
     /**

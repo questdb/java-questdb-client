@@ -1286,6 +1286,69 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testSplitMessageValidatesArgumentsAndSizeOverflow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 MicrobatchBuffer target = new MicrobatchBuffer(64);
+                 QwpTableBuffer table = new QwpTableBuffer("alpha")) {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                int aapl = dict.getOrAddSymbol("AAPL");
+                dict.getOrAddSymbol("GOOG");
+                table.getOrCreateColumn("sym", TYPE_SYMBOL, false)
+                        .addSymbolWithGlobalId("AAPL", aapl);
+                table.nextRow();
+
+                encoder.beginMessage(1, dict, -1, 1);
+                int tableBodyOffset = encoder.getBuffer().getPosition();
+                encoder.addTable(table);
+                int tableBodyLength = encoder.getBuffer().getPosition() - tableBodyOffset;
+                encoder.finishMessage();
+
+                target.setBufferPos(1);
+                assertFailure(IllegalStateException.class,
+                        "split message target is not empty",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength, false, -1, 1));
+                Assert.assertEquals("invalid target must not be modified", 1, target.getBufferPos());
+                target.reset();
+
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset - 1, tableBodyLength, false, -1, 1));
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, -1, false, -1, 1));
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength + 1, false, -1, 1));
+                Assert.assertEquals("invalid slices must not write the target", 0, target.getBufferPos());
+
+                assertFailure(IllegalStateException.class,
+                        "split delta does not match the staged message"
+                                + " [stagedStart=0, stagedCount=2, splitStart=1, splitCount=1]",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength, false, 0, 1));
+                Assert.assertEquals("delta mismatch must not write the target", 0, target.getBufferPos());
+
+                assertFailure(IllegalArgumentException.class,
+                        "tableBodyLength must be non-negative",
+                        () -> encoder.getSplitMessageSize(-1, -1, 1));
+                long overflowSize = (long) HEADER_SIZE
+                        + 1 // delta start 0
+                        + 1 // delta count 2
+                        + encoder.getDeltaEntriesLen()
+                        + Integer.MAX_VALUE;
+                assertFailure(OutOfMemoryError.class,
+                        "split QWP message size overflow: " + overflowSize,
+                        () -> encoder.getSplitMessageSize(Integer.MAX_VALUE, -1, 1));
+            }
+        });
+    }
+
+    @Test
     public void testSplitMessageCopiesStagedTableBodies() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1386,6 +1449,22 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
             }
         });
+    }
+
+    private static void assertFailure(
+            Class<? extends Throwable> expectedType,
+            String expectedMessage,
+            Runnable action
+    ) {
+        Throwable thrown = null;
+        try {
+            action.run();
+        } catch (Throwable t) {
+            thrown = t;
+        }
+        Assert.assertNotNull("expected " + expectedType.getSimpleName(), thrown);
+        Assert.assertEquals(expectedType, thrown.getClass());
+        Assert.assertEquals(expectedMessage, thrown.getMessage());
     }
 
     private static final class Cursor {
