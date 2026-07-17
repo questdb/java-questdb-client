@@ -467,6 +467,53 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testQuarantineRenameFailurePreservesOriginalSlot() throws Exception {
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            int segmentCount = countSegmentFiles(slot);
+            Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(new DelegatingFilesFacade() {
+                @Override
+                public int rename(String oldPath, String newPath) {
+                    return -1;
+                }
+            });
+            try {
+                try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                    int port = good.getPort();
+                    good.start();
+                    Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                    String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    try {
+                        Sender.fromConfig(cfg).close();
+                        Assert.fail("build() must throw when the unreplayable slot rename fails");
+                    } catch (LineSenderException expected) {
+                        Assert.assertEquals(
+                                "recovered store-and-forward symbol dictionary is incomplete and cannot be rebuilt "
+                                        + "from the surviving frames (likely a host crash tore its unsynced tail): "
+                                        + "the frames reference symbol ids below their own delta start, which were "
+                                        + "introduced by frames since acked and trimmed away, so nothing still holds "
+                                        + "them; the recovered dictionary holds only 0 id(s) -- resend the affected "
+                                        + "data; the affected data must be resent. The slot could not be set aside "
+                                        + "automatically (rename to " + sfDir + "/default.unreplayable-0 failed), so "
+                                        + "this sender cannot start until " + sfDir + "/default is moved or removed "
+                                        + "by hand",
+                                expected.getMessage());
+                    }
+                }
+            } finally {
+                Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(null);
+            }
+            Assert.assertTrue("rename failure must preserve the original slot directory",
+                    java.nio.file.Files.isDirectory(slot));
+            Assert.assertEquals("rename failure must preserve every segment",
+                    segmentCount, countSegmentFiles(slot));
+            Assert.assertFalse("failed rename must not leave a quarantine directory",
+                    java.nio.file.Files.exists(Paths.get(sfDir, "default.unreplayable-0")));
+        });
+    }
+
     // Writes 12 delta frames (each introducing a new symbol) into the default slot
     // across several small segments, then makes the slot GENUINELY unreplayable: trims
     // the segment holding the earliest ids (munmap + unlink, exactly what SegmentManager

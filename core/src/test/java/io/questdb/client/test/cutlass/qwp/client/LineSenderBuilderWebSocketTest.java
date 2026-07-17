@@ -223,6 +223,49 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testCatchUpCapGapMinEscalationWindowBuilderNegativeRejected() {
+        assertThrows("catchup_cap_gap_min_escalation_window_millis must be >= 0: -1",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .catchUpCapGapMinEscalationWindowMillis(-1));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowBuilderNotSupportedForTcp() {
+        assertThrows("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .catchUpCapGapMinEscalationWindowMillis(300_000));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowConfigStringNegativeRejected() {
+        assertThrows("catchup_cap_gap_min_escalation_window_millis must be >= 0: -1",
+                () -> Sender.builder("ws::addr=localhost:9000;"
+                        + "catchup_cap_gap_min_escalation_window_millis=-1;"));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowConfigStringNotSupportedForTcp() {
+        assertThrows("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+                () -> Sender.builder("tcp::addr=localhost:9009;"
+                        + "catchup_cap_gap_min_escalation_window_millis=300000;"));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowDefaultsToFiveMinutes() {
+        Assert.assertEquals(300_000L,
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .wsConfigSnapshotForTest()
+                        .get("catchup_cap_gap_min_escalation_window_millis"));
+        Assert.assertEquals(300_000L,
+                Sender.builder("ws::addr=localhost:9000;")
+                        .wsConfigSnapshotForTest()
+                        .get("catchup_cap_gap_min_escalation_window_millis"));
+    }
+
+    @Test
     public void testConnectionRefused() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();

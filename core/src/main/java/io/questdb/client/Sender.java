@@ -52,6 +52,7 @@ import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.IntList;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
@@ -1012,6 +1013,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static final int PROTOCOL_WEBSOCKET = 2;
         @TestOnly
         private static volatile Runnable quarantineAfterCloseHook;
+        @TestOnly
+        private static volatile FilesFacade quarantineFilesFacade = FilesFacade.INSTANCE;
         // Suffix for a slot set aside by quarantineTornSlot. Deliberately NOT the
         // sender's own slot name, so a restarted sender does not re-adopt it as its own;
         // quarantineTornSlot then marks it .failed, so the orphan drainer skips it too and
@@ -3061,15 +3064,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 hook.run();
             }
 
+            FilesFacade ff = quarantineFilesFacade;
             String quarantinePath = null;
             for (int i = 0; i < MAX_QUARANTINE_SLOT_ATTEMPTS; i++) {
                 String candidate = sfDir + "/" + senderId + QUARANTINE_SLOT_SUFFIX + i;
-                if (!Files.exists(candidate)) {
+                if (!ff.exists(candidate)) {
                     quarantinePath = candidate;
                     break;
                 }
             }
-            if (quarantinePath == null || Files.rename(slotPath, quarantinePath) != 0) {
+            if (quarantinePath == null || ff.rename(slotPath, quarantinePath) != 0) {
                 throw new LineSenderException(
                         detail + "; the affected data must be resent. The slot could not be set aside "
                                 + "automatically (" + (quarantinePath == null
@@ -3090,6 +3094,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         @TestOnly
         public static void setQuarantineAfterCloseHookForTest(Runnable hook) {
             quarantineAfterCloseHook = hook;
+        }
+
+        @TestOnly
+        public static void setQuarantineFilesFacadeForTest(FilesFacade ff) {
+            quarantineFilesFacade = ff == null ? FilesFacade.INSTANCE : ff;
         }
 
         private static int resolveIPv4(String host) {
@@ -4047,7 +4056,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_background_drainers", maxBackgroundDrainers);
             m.put("max_frame_rejections", maxFrameRejections);
             m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
-            m.put("catchup_cap_gap_min_escalation_window_millis", catchUpCapGapMinEscalationWindowMillis);
+            m.put("catchup_cap_gap_min_escalation_window_millis",
+                    catchUpCapGapMinEscalationWindowMillis == PARAMETER_NOT_SET_EXPLICITLY
+                            ? CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS
+                            : catchUpCapGapMinEscalationWindowMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

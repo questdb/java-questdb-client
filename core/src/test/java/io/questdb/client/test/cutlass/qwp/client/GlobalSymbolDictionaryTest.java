@@ -62,6 +62,23 @@ public class GlobalSymbolDictionaryTest {
     }
 
     @Test
+    public void testAddRecoveredSymbol_rejectsNullWithoutMutation() {
+        GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+        assertEquals(0, dict.addRecoveredSymbol("AAPL"));
+
+        try {
+            dict.addRecoveredSymbol(null);
+            fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            assertEquals("symbol cannot be null", expected.getMessage());
+        }
+
+        assertEquals(1, dict.size());
+        assertEquals("AAPL", dict.getSymbol(0));
+        assertEquals(0, dict.getId("AAPL"));
+    }
+
+    @Test
     public void testAddSymbol_assignsSequentialIds() {
         GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
 
