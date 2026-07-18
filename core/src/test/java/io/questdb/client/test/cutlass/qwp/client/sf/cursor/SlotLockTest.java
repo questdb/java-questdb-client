@@ -144,8 +144,14 @@ public class SlotLockTest {
     @Test
     public void testLogicalLockReportsLockDirectoryCreationFailure() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            String slot = Paths.get(parentDir, "mkdir-failure").toString();
-            String lockDir = Paths.get(parentDir, ".slot-locks").toString();
+            String slot = parentDir + "/mkdir-failure";
+            // Build the lock-dir path exactly as SlotLock.acquireLogical does
+            // (parent + "/" + ".slot-locks"), NOT via Paths.get: on Windows
+            // Paths.get yields a '\' separator, so the facade's lockDir.equals(path)
+            // check never matched the production forward-slash path and the mkdir
+            // failure was never injected -- the sole cause of the Windows-only
+            // failure of this test.
+            String lockDir = parentDir + "/.slot-locks";
             LockDirectoryFailureFacade ff = new LockDirectoryFailureFacade(lockDir);
             try {
                 SlotLock.acquireLogical(ff, slot);
