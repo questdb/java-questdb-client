@@ -229,9 +229,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // user-facing 5-minute default is applied at the config layer.
     private final long catchUpCapGapMinEscalationWindowNanos;
     private final CatchUpCapGapPolicy catchUpCapGapPolicy;
-    private final ReconnectPolicy reconnectPolicy;
     private final CursorSendEngine engine;
     private final long parkNanos;
+    private final ReconnectPolicy reconnectPolicy;
     // FIFO of OK-acked batches awaiting durable-upload confirmation. Used only
     // when durableAckMode is true. Each entry binds a wireSeq to the per-table
     // (name, seqTxn) pairs the server reported on the OK frame. The queue is
@@ -1548,7 +1548,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     private static boolean isCatchUpCapGap(Throwable t) {
-        return t instanceof CatchUpSendException && ((CatchUpSendException) t).capGap;
+        return t instanceof CatchUpSendException && ((CatchUpSendException) t).isCapGap;
     }
 
     private void resetCatchUpCapGapEpisode() {
@@ -3103,7 +3103,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // Re-anchor's catch-up send failed. fail() here is a fresh,
                     // non-re-entrant connectLoop entry from the I/O loop body --
                     // the same recovery a normal trySendOne send failure takes.
-                    fail(e.getCause());
+                    // Preserve the wrapper on a cap gap so connectLoop's
+                    // isCatchUpCapGap keeps the orphan settle episode (attempt count
+                    // + dwell anchor) alive across the re-anchor recycle; an ordinary
+                    // failure unwraps to the raw cause and restarts the episode, like
+                    // any normal send failure.
+                    fail(isCatchUpCapGap(e) ? e : e.getCause());
                     return false;
                 }
                 return true;
@@ -3325,15 +3330,15 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * send failures restart the orphan settle episode.
      */
     private static final class CatchUpSendException extends RuntimeException {
-        private final boolean capGap;
+        private final boolean isCapGap;
 
         CatchUpSendException(Throwable cause) {
             this(cause, false);
         }
 
-        CatchUpSendException(Throwable cause, boolean capGap) {
+        CatchUpSendException(Throwable cause, boolean isCapGap) {
             super(cause);
-            this.capGap = capGap;
+            this.isCapGap = isCapGap;
         }
     }
 

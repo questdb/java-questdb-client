@@ -265,7 +265,6 @@ public final class BackgroundDrainer implements Runnable {
      * @return a fresh durable-ack-capable client, or {@code null} if
      *         {@link #outcome} has been set to FAILED or STOPPED
      */
-    @TestOnly
     public WebSocketClient connectWithDurableAckRetry() {
         // run() already set runnerThread; setting it again here is a no-op
         // on that path but wires up direct @TestOnly calls so requestStop()

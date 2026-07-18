@@ -270,6 +270,8 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 }
                 // No strike was ever charged, so nothing escalated: the loop stays
                 // retriable and the producer-facing error latch is clear.
+                assertEquals("a catch-up-only non-orderly close must charge no poison strike",
+                        0, loop.poisonStrikes());
                 loop.checkError();
             } finally {
                 closeAll(clients);
@@ -306,6 +308,8 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 }
                 // No strike was ever charged, so nothing escalated: the loop stays
                 // retriable and the producer-facing error latch is clear.
+                assertEquals("a catch-up-only NACK must charge no poison strike",
+                        0, loop.poisonStrikes());
                 loop.checkError();
             } finally {
                 closeAll(clients);

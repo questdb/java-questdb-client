@@ -356,7 +356,7 @@ public class CursorSendEngineTest {
     }
 
     @Test
-    public void testV2DiskSlotForcesLegacyReaderToFailClosed() throws Exception {
+    public void testLegacyGuardsForceFsnGapAndCurrentRecoveryAdoptsV2Slot() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {

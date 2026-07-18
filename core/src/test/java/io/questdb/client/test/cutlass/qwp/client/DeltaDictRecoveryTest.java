@@ -1636,26 +1636,6 @@ public class DeltaDictRecoveryTest {
         }
     }
 
-    /** Counts every binary frame it receives and acks it. */
-    private static class CountingHandler implements TestWebSocketServer.WebSocketServerHandler {
-        final AtomicInteger frames = new AtomicInteger();
-        private final AtomicLong nextSeq = new AtomicLong(0);
-
-        @Override
-        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            frames.incrementAndGet();
-            try {
-                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }
-    }
-    /**
-     * Short-writes the FIRST dictionary append after it is armed, modelling a disk that
-     * fills mid-flush. Offset 0 is left alone so the file header still writes -- only the
-     * entry append fails, which is the path under test.
-     */
     /**
      * Refuses to grow the symbol dictionary's mmap append window -- the production
      * shape of a full disk, since PersistedSymbolDict reserves that window through

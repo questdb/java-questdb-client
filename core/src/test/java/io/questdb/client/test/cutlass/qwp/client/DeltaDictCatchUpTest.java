@@ -164,7 +164,7 @@ public class DeltaDictCatchUpTest {
         // table("t").symbol("s", <173 chars>).atNow() encodes to 198 bytes (<=200,
         // accepted), its dict entry is 2+173=175 bytes (> old budget 172 -> old
         // terminal), while the real solo catch-up frame is 12+1+1+175=189 (<=200 ->
-        // fits). Unlike testCatchUpEntryTooLargeForCapFailsTerminally (a genuinely
+        // fits). Unlike testCatchUpCapGapRetriesUntilBudgetThenLatches (a genuinely
         // oversized entry on a shrunk cap, which MUST still terminate), this entry
         // is legally shippable and must NOT terminate.
         final int cap = 200;
