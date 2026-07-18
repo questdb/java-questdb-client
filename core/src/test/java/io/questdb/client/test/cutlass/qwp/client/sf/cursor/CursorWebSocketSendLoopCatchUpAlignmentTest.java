@@ -39,9 +39,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -118,7 +115,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             1L, engine.ackedFsn());
                     // Mechanism: the catch-up frames are anchored below replayStart.
                     assertEquals("fsnAtZero must be anchored catchUpFrames below replayStart",
-                            replayStart - client.framesSent, readLong(loop, "fsnAtZero"));
+                            replayStart - client.framesSent, loop.fsnAtZero());
                 } finally {
                     loop.close(); // frees the seeded mirror + the stub client's buffers
                 }
@@ -154,7 +151,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     assertEquals("no catch-up frame ACK may advance the trim watermark",
                             2L, engine.ackedFsn());
                     assertEquals("fsnAtZero must subtract the full split frame count",
-                            replayStart - client.framesSent, readLong(loop, "fsnAtZero"));
+                            replayStart - client.framesSent, loop.fsnAtZero());
                 } finally {
                     loop.close();
                 }
@@ -229,9 +226,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                         fail("a transient catch-up send failure must raise a retriable "
                                 + "CatchUpSendException, not be swallowed into fail()/a terminal");
-                    } catch (InvocationTargetException e) {
+                    } catch (RuntimeException e) {
                         assertEquals("transient catch-up send failure must surface as CatchUpSendException",
-                                "CatchUpSendException", e.getCause().getClass().getSimpleName());
+                                "CatchUpSendException", e.getClass().getSimpleName());
                     }
                     // Retriable, not terminal: the producer-facing error latch stays clear.
                     loop.checkError();
@@ -261,15 +258,12 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     int[] frameLen = new int[1];
                     long frame = buildDeltaFrame(0, new String[]{"aa", "bb", "cc"}, frameLen);
                     try {
-                        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
-                                "accumulateSentDict", long.class, int.class, int.class);
-                        m.setAccessible(true);
-                        m.invoke(loop, frame, frameLen[0], 0);
+                        loop.accumulateSentDictForTest(frame, frameLen[0], 0);
                     } finally {
                         Unsafe.free(frame, frameLen[0], MemoryTag.NATIVE_DEFAULT);
                     }
                     assertEquals("straddling delta must extend the mirror to all 3 ids",
-                            3, readInt(loop, "sentDictCount"));
+                            3, loop.sentDictCount());
                     assertEquals("mirror must hold the two new tail symbols after the "
                                     + "already-held prefix, gap-free",
                             Arrays.asList("aa", "bb", "cc"), readMirrorSymbols(loop));
@@ -293,18 +287,15 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
-                    Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
-                            "sendCatchUpChunk", int.class, int.class, long.class, int.class);
-                    m.setAccessible(true);
                     // symbolsLen past the mirror ceiling: HEADER + varints + symbolsLen
                     // overflows an int, so the guard must reject it before malloc.
-                    m.invoke(loop, 0, 1, 0L, Integer.MAX_VALUE - 4);
+                    loop.sendCatchUpChunkForTest(0, 1, 0L, Integer.MAX_VALUE - 4);
                     fail("an overflowing catch-up frame size must fail loud, not malloc negative");
-                } catch (InvocationTargetException e) {
+                } catch (RuntimeException e) {
                     assertEquals("overflow must surface as CatchUpSendException",
-                            "CatchUpSendException", e.getCause().getClass().getSimpleName());
-                    assertTrue("message must name the frame-size guard: " + e.getCause().getMessage(),
-                            e.getCause().getMessage().contains("catch-up frame exceeds the maximum size"));
+                            "CatchUpSendException", e.getClass().getSimpleName());
+                    assertTrue("message must name the frame-size guard: " + e.getMessage(),
+                            e.getMessage().contains("catch-up frame exceeds the maximum size"));
                 } finally {
                     loop.close();
                 }
@@ -318,9 +309,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // quarantine budget. Drive more cap gaps than that entire budget and assert every
         // failure remains retriable to the I/O loop and invisible to the producer.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             CatchUpCapturingClient client = new CatchUpCapturingClient(160);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newForegroundLoop(engine, client);
@@ -330,15 +319,15 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                         loop.checkError();
                     }
                     assertEquals("foreground retries must not burn the orphan attempt budget",
-                            0, readInt(loop, "catchUpCapGapAttempts"));
+                            0, loop.catchUpCapGapAttempts());
                     assertEquals("foreground retries must not anchor an orphan cap-gap episode",
-                            -1L, readLong(loop, "catchUpCapGapFirstNanos"));
+                            -1L, loop.catchUpCapGapFirstNanos());
                 } finally {
                     loop.close();
                 }
@@ -358,9 +347,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // exists to ride out. Here we drive far MORE than the budget's strikes inside a
         // deliberately huge window and assert the orphan loop stays retriable.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             CatchUpCapturingClient client = new CatchUpCapturingClient(160);
             try (CursorSendEngine engine = newEngine()) {
                 // A one-hour dwell the test cannot possibly elapse.
@@ -371,28 +358,26 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                         // The producer-facing latch must stay clear on EVERY attempt,
                         // including the ones past the strike budget.
                         loop.checkError();
                     }
                     assertTrue("the strikes really did exceed the budget",
-                            readInt(loop, "catchUpCapGapAttempts") > maxAttempts);
+                            loop.catchUpCapGapAttempts() > maxAttempts);
 
                     // Backdate the episode anchor past the window: the very next cap gap
                     // now satisfies BOTH conditions and latches. This pins the AND -- if
                     // escalation ignored the wall clock the loop would already have
                     // latched above; if it ignored the strike count it could never latch.
-                    Field anchor = CursorWebSocketSendLoop.class.getDeclaredField("catchUpCapGapFirstNanos");
-                    anchor.setAccessible(true);
-                    anchor.setLong(loop, System.nanoTime() - TimeUnit.HOURS.toNanos(2));
+                    loop.setCatchUpCapGapFirstNanosForTest(System.nanoTime() - TimeUnit.HOURS.toNanos(2));
                     try {
                         invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                         fail("the escalating cap gap must still raise CatchUpSendException");
-                    } catch (InvocationTargetException e) {
-                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    } catch (RuntimeException e) {
+                        assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                     }
                     try {
                         loop.checkError();
@@ -418,7 +403,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         engine, new CatchUpCapturingClient(0), maxExactMillis);
                 try {
                     assertEquals(maxExactMillis * 1_000_000L,
-                            readLong(exactLoop, "catchUpCapGapMinEscalationWindowNanos"));
+                            exactLoop.catchUpCapGapMinEscalationWindowNanos());
                 } finally {
                     exactLoop.close();
                 }
@@ -428,7 +413,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 try {
                     assertEquals("an oversized dwell must become effectively infinite, not negative",
                             Long.MAX_VALUE,
-                            readLong(saturatedLoop, "catchUpCapGapMinEscalationWindowNanos"));
+                            saturatedLoop.catchUpCapGapMinEscalationWindowNanos());
                 } finally {
                     saturatedLoop.close();
                 }
@@ -453,9 +438,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // a long-lived dev box (which is why it passed locally). Planting the negative anchor
         // directly pins the sentinel on ANY machine, whatever its uptime.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             CatchUpCapturingClient client = new CatchUpCapturingClient(160);
             try (CursorSendEngine engine = newEngine()) {
                 // A one-hour dwell, against an anchor two hours back: satisfied on elapsed,
@@ -468,22 +451,20 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                         loop.checkError(); // dwell unmet => retriable, whatever the count
                     }
                     // The episode began two hours ago on a machine booted minutes ago.
-                    Field anchor = CursorWebSocketSendLoop.class.getDeclaredField("catchUpCapGapFirstNanos");
-                    anchor.setAccessible(true);
-                    anchor.setLong(loop, -TimeUnit.HOURS.toNanos(2));
+                    loop.setCatchUpCapGapFirstNanosForTest(-TimeUnit.HOURS.toNanos(2));
 
                     // Both halves now hold, so this strike must latch the terminal.
                     try {
                         invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                         fail("the escalating cap gap must still raise CatchUpSendException");
-                    } catch (InvocationTargetException e) {
-                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    } catch (RuntimeException e) {
+                        assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                     }
                     try {
                         loop.checkError();
@@ -514,9 +495,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // 16-strike budget anyway. So drive MORE transients than the whole budget and
         // assert the counter never moves and no terminal ever latches.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             // A cap that FITS (no cap gap), but whose sendBinary always throws: every
             // failure here is transport-transient, never a capability gap.
             CatchUpCapturingClient client = new CatchUpCapturingClient(0, true);
@@ -528,14 +507,14 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("a transient send failure must raise CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                         loop.checkError(); // a transient is retriable, forever
                         assertEquals("a transient must NOT burn the cap-gap terminal budget",
-                                0, readInt(loop, "catchUpCapGapAttempts"));
+                                0, loop.catchUpCapGapAttempts());
                         assertEquals("a transient must NOT anchor a cap-gap episode",
-                                -1L, readLong(loop, "catchUpCapGapFirstNanos"));
+                                -1L, loop.catchUpCapGapFirstNanos());
                     }
                 } finally {
                     loop.close();
@@ -565,9 +544,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // smaller-cap node quarantined the orphan slot. (A successful catch-up resets the budget;
         // the other catch-up tests, which use a fitting cap, never trip it.)
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             // Pin the budget against a LITERAL before deriving anything from it. The
             // retriable loop below is bounded by maxAttempts, so keying this test purely
             // off the constant under test makes it TAUTOLOGICAL: a regression of
@@ -592,11 +569,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                             assertTrue("attempt " + i + " must name the catch-up cap gap: "
-                                            + e.getCause().getMessage(),
-                                    e.getCause().getMessage().contains("during catch-up"));
+                                            + e.getMessage(),
+                                    e.getMessage().contains("during catch-up"));
                         }
                         loop.checkError(); // under budget => retriable => no terminal
                     }
@@ -604,8 +581,8 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     try {
                         invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                         fail("the exhausting cap gap must still raise CatchUpSendException");
-                    } catch (InvocationTargetException e) {
-                        assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                    } catch (RuntimeException e) {
+                        assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                     }
                     try {
                         loop.checkError();
@@ -632,9 +609,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // testCatchUpCapGapRetriesUntilBudgetThenLatches only accrues gaps under one
         // fixed cap with no success interleaved, so it cannot pin the reset.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             // Same anti-tautology pin as testCatchUpCapGapRetriesUntilBudgetThenLatches.
             // With maxAttempts == 1 the accrual loop below would run ZERO times and the
             // "budget accrued to max-1" precondition would degenerate to 0 == 0, so the
@@ -652,19 +627,19 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                     }
                     assertEquals("precondition: budget accrued to max-1",
-                            maxAttempts - 1, readInt(loop, "catchUpCapGapAttempts"));
+                            maxAttempts - 1, loop.catchUpCapGapAttempts());
 
                     // A larger-cap node returns: the whole dictionary re-registers with
                     // no cap gap, so the settle budget must reset to 0.
                     client.cap = 0; // no cap => the 200-char symbol fits one frame
                     invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                     assertEquals("a successful catch-up must reset the cap-gap settle budget",
-                            0, readInt(loop, "catchUpCapGapAttempts"));
+                            0, loop.catchUpCapGapAttempts());
 
                     // Behavioural proof the budget is genuinely fresh: max-1 more cap
                     // gaps still latch NO terminal (they would if the counter had stayed
@@ -674,8 +649,8 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         try {
                             invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
                             fail("post-reset cap gap must be retriable (attempt " + i + ')');
-                        } catch (InvocationTargetException e) {
-                            assertEquals("CatchUpSendException", e.getCause().getClass().getSimpleName());
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
                         }
                         loop.checkError(); // fresh budget => still under max => no terminal
                     }
@@ -694,23 +669,19 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // (~200M+ symbols on one connection), so drive the guard directly with an
         // oversized required, mirroring testCatchUpChunkFrameSizeOverflowFailsLoud.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_SENT_DICT_BYTES");
-            maxField.setAccessible(true);
-            long overCeiling = (long) maxField.getInt(null) + 1L;
+            long overCeiling = (long) CursorWebSocketSendLoop.maxSentDictBytes() + 1L;
             CatchUpCapturingClient client = new CatchUpCapturingClient(0);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
-                    Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("ensureSentDictCapacity", long.class);
-                    m.setAccessible(true);
                     try {
-                        m.invoke(loop, overCeiling);
+                        loop.ensureSentDictCapacityForTest(overCeiling);
                         fail("a mirror capacity past MAX_SENT_DICT_BYTES must fail loud, not overflow");
-                    } catch (InvocationTargetException e) {
+                    } catch (LineSenderException e) {
                         assertEquals("overflow must surface as LineSenderException",
-                                "LineSenderException", e.getCause().getClass().getSimpleName());
-                        assertTrue("message must name the mirror ceiling: " + e.getCause().getMessage(),
-                                e.getCause().getMessage().contains("mirror exceeds the maximum size"));
+                                "LineSenderException", e.getClass().getSimpleName());
+                        assertTrue("message must name the mirror ceiling: " + e.getMessage(),
+                                e.getMessage().contains("mirror exceeds the maximum size"));
                     }
                     // recordFatal (not a bare throw) latched the terminal, so the loop
                     // winds down instead of reconnecting into the same overflow.
@@ -748,9 +719,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // outage must end the old episode: its wall-clock duration says nothing about
         // whether the cluster's batch cap remained incompatible while no node answered.
         TestUtils.assertMemoryLeak(() -> {
-            Field maxField = CursorWebSocketSendLoop.class.getDeclaredField("MAX_CATCHUP_CAP_GAP_ATTEMPTS");
-            maxField.setAccessible(true);
-            int maxAttempts = maxField.getInt(null);
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
             assertTrue("the cap-gap settle budget must have a retriable interval", maxAttempts > 1);
 
             int[] reconnectCalls = {0};
@@ -767,12 +736,12 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             if (call == maxAttempts) {
                                 assertEquals("precondition: consecutive cap gaps survive reconnect",
                                         maxAttempts - 1,
-                                        readInt(loopRef[0], "catchUpCapGapAttempts"));
+                                        loopRef[0].catchUpCapGapAttempts());
                                 // Model the elapsed outage without sleeping. With the defect,
                                 // this old anchor survives the unrelated failure and the next
                                 // cap gap immediately satisfies both terminal conditions.
                                 staleAnchor[0] = System.nanoTime() - TimeUnit.HOURS.toNanos(2);
-                                setField(loopRef[0], "catchUpCapGapFirstNanos", staleAnchor[0]);
+                                loopRef[0].setCatchUpCapGapFirstNanosForTest(staleAnchor[0]);
                                 if (roleReject) {
                                     throw new QwpRoleMismatchException(
                                             "PRIMARY", null, "all endpoints role-rejected");
@@ -783,7 +752,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                                 // Stop after getServerMaxBatchSize() has driven the final cap
                                 // gap, leaving its fresh episode state observable below.
                                 return new CatchUpCapturingClient(160, false,
-                                        () -> setBooleanFieldUnchecked(loopRef[0], "running", false));
+                                        () -> loopRef[0].setRunningForTest(false));
                             }
                             throw new AssertionError("unexpected reconnect call " + call);
                         },
@@ -795,14 +764,14 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 loopRef[0] = loop;
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 200));
-                    setBooleanField(loop, "running", true);
+                    loop.setRunningForTest(true);
                     invokeConnectLoop(loop);
 
                     loop.checkError();
                     assertEquals("pre-outage cap gaps must not carry into the new episode",
-                            1, readInt(loop, "catchUpCapGapAttempts"));
+                            1, loop.catchUpCapGapAttempts());
                     assertTrue("the post-outage cap gap must get a fresh dwell anchor",
-                            readLong(loop, "catchUpCapGapFirstNanos") > staleAnchor[0]);
+                            loop.catchUpCapGapFirstNanos() > staleAnchor[0]);
                     assertEquals("test must observe gaps, the unrelated state, and a new gap",
                             maxAttempts + 1, reconnectCalls[0]);
                 } finally {
@@ -836,17 +805,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         return addr;
     }
 
-    private static int readInt(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getInt(loop);
-    }
-
     // Parses the loop's native sent-dictionary mirror ([len varint][utf8]...) back
     // into the symbol strings a reconnect catch-up would re-register.
     private static List<String> readMirrorSymbols(CursorWebSocketSendLoop loop) throws Exception {
-        long addr = readLong(loop, "sentDictBytesAddr");
-        int len = readInt(loop, "sentDictBytesLen");
+        long addr = loop.sentDictBytesAddr();
+        int len = loop.sentDictBytesLen();
         List<String> out = new ArrayList<>();
         long p = addr;
         long limit = addr + len;
@@ -879,28 +842,18 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             Unsafe.getUnsafe().putByte(ptr, WebSocketResponse.STATUS_OK);
             Unsafe.getUnsafe().putLong(ptr + 1, wireSeq);
             Unsafe.getUnsafe().putShort(ptr + 9, (short) 0);
-            Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
-            f.setAccessible(true);
-            Object handler = f.get(loop);
-            Method m = handler.getClass().getDeclaredMethod("onBinaryMessage", long.class, int.class);
-            m.setAccessible(true);
-            m.invoke(handler, ptr, size);
+            loop.deliverResponseForTest(ptr, size);
         } finally {
             Unsafe.free(ptr, size, MemoryTag.NATIVE_DEFAULT);
         }
     }
 
-    private static void invokeSetWireBaselineWithCatchUp(CursorWebSocketSendLoop loop, long replayStart) throws Exception {
-        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod("setWireBaselineWithCatchUp", long.class);
-        m.setAccessible(true);
-        m.invoke(loop, replayStart);
+    private static void invokeSetWireBaselineWithCatchUp(CursorWebSocketSendLoop loop, long replayStart) {
+        loop.setWireBaselineWithCatchUpForTest(replayStart);
     }
 
-    private static void invokeConnectLoop(CursorWebSocketSendLoop loop) throws Exception {
-        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(
-                "connectLoop", Throwable.class, String.class, long.class);
-        m.setAccessible(true);
-        m.invoke(loop, new LineSenderException("test reconnect"), "reconnect", 0L);
+    private static void invokeConnectLoop(CursorWebSocketSendLoop loop) {
+        loop.connectLoopForTest(new LineSenderException("test reconnect"), "reconnect", 0L);
     }
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
@@ -947,12 +900,6 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         return new CursorSendEngine(tmpDir, 16_384);
     }
 
-    private static long readLong(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getLong(loop);
-    }
-
     // Populates the loop's native sent-dictionary mirror with {@code symbols} in
     // the on-wire [len varint][utf8] layout, so setWireBaselineWithCatchUp sees a
     // non-empty dictionary to re-register. loop.close() frees it.
@@ -971,40 +918,10 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 Unsafe.getUnsafe().putByte(p++, b);
             }
         }
-        setField(loop, "sentDictBytesAddr", addr);
-        setBooleanField(loop, "sentDictBytesOwned", true);
-        setIntField(loop, "sentDictBytesCapacity", total);
-        setIntField(loop, "sentDictBytesLen", total);
-        setIntField(loop, "sentDictCount", symbols.length);
+        loop.seedSentDictMirrorForTest(addr, total, symbols.length);
         // Leave sentDictIndexedCount at 0: the mirror carries its own entry lengths, and
         // the entry-ends index is built lazily by the catch-up. Pre-building it here
         // would hide that from every test that seeds this way.
-    }
-
-    private static void setField(Object target, String name, long value) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        f.setLong(target, value);
-    }
-
-    private static void setIntField(Object target, String name, int value) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        f.setInt(target, value);
-    }
-
-    private static void setBooleanField(Object target, String name, boolean value) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        f.setBoolean(target, value);
-    }
-
-    private static void setBooleanFieldUnchecked(Object target, String name, boolean value) {
-        try {
-            setBooleanField(target, name, value);
-        } catch (Exception e) {
-            throw new AssertionError(e);
-        }
     }
 
     private static int varintSize(long value) {

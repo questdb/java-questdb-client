@@ -36,7 +36,6 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
@@ -95,20 +94,20 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 // Close without start(): the ctor-seeded mirror is this
                 // thread's to free, since the I/O loop never ran.
                 Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
-                        readInt(loop, "sentDictCount") > 0);
+                        loop.sentDictCount() > 0);
                 Assert.assertEquals("foreground loop must take the persisted buffer without copying",
-                        persistedAddr, readLong(loop, "sentDictBytesAddr"));
+                        persistedAddr, loop.sentDictBytesAddr());
                 Assert.assertEquals("ownership transfer must clear the persisted pointer",
                         0L, pd.loadedEntriesAddr());
                 Assert.assertTrue("foreground mirror must own the transferred buffer",
-                        readBoolean(loop, "sentDictBytesOwned"));
+                        loop.sentDictBytesOwned());
                 loop.close();
                 // close() must reset sentDictCount alongside freeing the buffer,
                 // so the mirror stays all-or-nothing: a hypothetical post-close
                 // start() (no closed guard) cannot read a stale count against a
                 // freed buffer and drive a null-mirror catch-up.
                 Assert.assertEquals("close() must reset sentDictCount to 0",
-                        0, readInt(loop, "sentDictCount"));
+                        0, loop.sentDictCount());
             }
         });
     }
@@ -141,11 +140,11 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 CursorWebSocketSendLoop loop1 = newRecoveryLoop(engine);
                 try {
                     Assert.assertEquals("session-1 mirror must seed from the persisted dict",
-                            dictSize, readInt(loop1, "sentDictCount"));
+                            dictSize, loop1.sentDictCount());
                     Assert.assertEquals("orphan session must borrow the persisted bytes",
-                            persistedAddr, readLong(loop1, "sentDictBytesAddr"));
+                            persistedAddr, loop1.sentDictBytesAddr());
                     Assert.assertFalse("borrowed orphan mirror must not own the persisted bytes",
-                            readBoolean(loop1, "sentDictBytesOwned"));
+                            loop1.sentDictBytesOwned());
                 } finally {
                     loop1.close();
                 }
@@ -159,8 +158,8 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 try {
                     Assert.assertEquals("recycled session-2 mirror must re-seed from the "
                                     + "persisted dict (pre-fix it was 0)",
-                            dictSize, readInt(loop2, "sentDictCount"));
-                    Assert.assertEquals(persistedAddr, readLong(loop2, "sentDictBytesAddr"));
+                            dictSize, loop2.sentDictCount());
+                    Assert.assertEquals(persistedAddr, loop2.sentDictBytesAddr());
                 } finally {
                     loop2.close();
                 }
@@ -200,7 +199,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 Assert.assertTrue("the frame-seed path must run (frames out-reach the dict)",
                         engine.recoveredMaxSymbolDeltaStart() > 0L);
 
-                setMirrorSeedFault(true);
+                CursorWebSocketSendLoop.forceMirrorSeedFailureForTest = true;
                 try {
                     new CursorWebSocketSendLoop(
                             null, engine, 0, 1_000_000L,
@@ -213,7 +212,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     Assert.assertTrue("unexpected message: " + expected.getMessage(),
                             expected.getMessage().contains("simulated mirror seed allocation failure"));
                 } finally {
-                    setMirrorSeedFault(false);
+                    CursorWebSocketSendLoop.forceMirrorSeedFailureForTest = false;
                 }
                 Assert.assertTrue("failed foreground construction must leave the persisted prefix owned",
                         pd.loadedEntriesAddr() != 0L);
@@ -244,7 +243,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                         0, 0, 1);
                 try {
                     Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
-                            3, readInt(loop, "sentDictCount"));
+                            3, loop.sentDictCount());
                     Assert.assertEquals("engine must release its duplicate recovery suffix",
                             0, engine.recoverySymbolNativeCapacity());
                 } finally {
@@ -270,7 +269,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                     CursorWebSocketSendLoop loop = newRecoveryLoop(engine);
                     try {
                         Assert.assertEquals("orphan mirror must include prefix and recovered suffix",
-                                3, readInt(loop, "sentDictCount"));
+                                3, loop.sentDictCount());
                         Assert.assertEquals("orphan engine must retain suffix for the next session",
                                 suffixCapacity, engine.recoverySymbolNativeCapacity());
                     } finally {
@@ -345,33 +344,6 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
             torn.appendSymbol("b");
             Assert.assertEquals(2, torn.size());
         }
-    }
-
-    private static int readInt(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getInt(loop);
-    }
-
-    private static boolean readBoolean(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getBoolean(loop);
-    }
-
-    private static long readLong(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getLong(loop);
-    }
-
-    // Toggles the loop's @TestOnly mirror-seed fault flag. Reflection because the
-    // flag is package-private in the production package (this test is in a sibling
-    // test package), the same non-reflective-path-unavailable reason readInt uses.
-    private static void setMirrorSeedFault(boolean value) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("forceMirrorSeedFailureForTest");
-        f.setAccessible(true);
-        f.setBoolean(null, value);
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {

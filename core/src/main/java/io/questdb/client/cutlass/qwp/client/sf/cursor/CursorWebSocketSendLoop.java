@@ -206,7 +206,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // deleted. Production never sets it; volatile only so a test thread's write is
     // visible to the loop under test.
     @TestOnly
-    static volatile boolean forceMirrorSeedFailureForTest;
+    public static volatile boolean forceMirrorSeedFailureForTest;
     // Pre-converted to nanos for the comparison in sendDurableAckKeepaliveIfDue.
     // Zero or negative disables the keepalive entirely.
     private final long durableAckKeepaliveIntervalNanos;
@@ -1089,6 +1089,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             default:
                 return false;
         }
+    }
+
+    @TestOnly
+    public static int maxCatchUpCapGapAttempts() {
+        return MAX_CATCHUP_CAP_GAP_ATTEMPTS;
+    }
+
+    @TestOnly
+    public static int maxSentDictBytes() {
+        return MAX_SENT_DICT_BYTES;
     }
 
     /**
@@ -2893,6 +2903,140 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public int catchUpFrameGrowthCount() {
         return catchUpFrameGrowthCount;
+    }
+
+    @TestOnly
+    public int catchUpCapGapAttempts() {
+        return catchUpCapGapAttempts;
+    }
+
+    @TestOnly
+    public long catchUpCapGapFirstNanos() {
+        return catchUpCapGapFirstNanos;
+    }
+
+    @TestOnly
+    public long catchUpCapGapMinEscalationWindowNanos() {
+        return catchUpCapGapMinEscalationWindowNanos;
+    }
+
+    @TestOnly
+    public long fsnAtZero() {
+        return fsnAtZero;
+    }
+
+    @TestOnly
+    public long poisonFsn() {
+        return poisonFsn;
+    }
+
+    @TestOnly
+    public int poisonStrikes() {
+        return poisonStrikes;
+    }
+
+    @TestOnly
+    public long sentDictBytesAddr() {
+        return sentDictBytesAddr;
+    }
+
+    @TestOnly
+    public int sentDictBytesLen() {
+        return sentDictBytesLen;
+    }
+
+    @TestOnly
+    public boolean sentDictBytesOwned() {
+        return sentDictBytesOwned;
+    }
+
+    @TestOnly
+    public int sentDictCount() {
+        return sentDictCount;
+    }
+
+    @TestOnly
+    public int zeroProgressRecycles() {
+        return zeroProgressRecycles;
+    }
+
+    @TestOnly
+    public void accumulateSentDictForTest(long payloadAddr, int payloadLen, int deltaStart) {
+        accumulateSentDict(payloadAddr, payloadLen, deltaStart);
+    }
+
+    @TestOnly
+    public void connectLoopForTest(Throwable initial, String phase, long paceFirstAttemptMillis) {
+        connectLoop(initial, phase, paceFirstAttemptMillis);
+    }
+
+    @TestOnly
+    public void deliverCloseForTest(int code, String reason) {
+        responseHandler.onClose(code, reason);
+    }
+
+    @TestOnly
+    public void deliverResponseForTest(long payloadPtr, int payloadLen) {
+        responseHandler.onBinaryMessage(payloadPtr, payloadLen);
+    }
+
+    @TestOnly
+    public void ensureSentDictCapacityForTest(long required) {
+        ensureSentDictCapacity(required);
+    }
+
+    @TestOnly
+    public void positionCursorForStartForTest() {
+        positionCursorForStart();
+    }
+
+    @TestOnly
+    public void seedSentDictMirrorForTest(long addr, int bytes, int symbolCount) {
+        sentDictBytesAddr = addr;
+        sentDictBytesCapacity = bytes;
+        sentDictBytesLen = bytes;
+        sentDictCount = symbolCount;
+        sentDictBytesOwned = true;
+    }
+
+    @TestOnly
+    public void sendCatchUpChunkForTest(int deltaStart, int deltaCount, long symbolsAddr, int symbolsLen) {
+        sendCatchUpChunk(deltaStart, deltaCount, symbolsAddr, symbolsLen);
+    }
+
+    @TestOnly
+    public void setCatchUpCapGapFirstNanosForTest(long nanos) {
+        catchUpCapGapFirstNanos = nanos;
+    }
+
+    @TestOnly
+    public void setDataFrameSentThisConnectionForTest(boolean value) {
+        dataFrameSentThisConnection = value;
+    }
+
+    @TestOnly
+    public void setFsnAtZeroForTest(long value) {
+        fsnAtZero = value;
+    }
+
+    @TestOnly
+    public void setNextWireSeqForTest(long value) {
+        nextWireSeq = value;
+    }
+
+    @TestOnly
+    public void setRunningForTest(boolean value) {
+        running = value;
+    }
+
+    @TestOnly
+    public void setWireBaselineWithCatchUpForTest(long replayStart) {
+        setWireBaselineWithCatchUp(replayStart);
+    }
+
+    @TestOnly
+    public boolean trySendOneForTest() {
+        return trySendOne();
     }
 
     private void ensureCatchUpFrameCapacity(int required) {

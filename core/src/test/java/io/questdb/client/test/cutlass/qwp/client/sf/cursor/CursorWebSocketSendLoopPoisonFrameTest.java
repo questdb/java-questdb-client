@@ -41,8 +41,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -326,10 +324,6 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // backoff. Red behavior: hundreds of full recycles per second.
         final long initialBackoffMillis = 200L;
         final long runMillis = 1_200L;
-        // Generous ceiling: with >=200ms pacing, a 1.2s window fits at most
-        // 6 recycles; allow 10 for scheduling noise. The unpaced bug
-        // overshoots this by orders of magnitude, so no flakiness risk.
-        final int maxReconnects = 10;
 
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
@@ -357,18 +351,26 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 } finally {
                     loop.close();
                 }
-                int count;
+                Long[] stamps;
                 synchronized (reconnectNanos) {
-                    count = reconnectNanos.size();
+                    stamps = reconnectNanos.toArray(new Long[0]); // insertion order == reconnect order
                 }
-                assertTrue("NACK-triggered recycles against a healthy server must be paced "
-                                + "by the initial reconnect backoff (" + initialBackoffMillis
-                                + "ms): observed " + count + " reconnects in " + runMillis
-                                + "ms -- the recycle loop is running at server NACK rate "
-                                + "with zero pacing",
-                        count <= maxReconnects);
                 assertTrue("sanity: the NACK must actually recycle the connection at least once",
-                        count >= 1);
+                        stamps.length >= 1);
+                // Pacing is per-recycle: each recycle parks >= the reconnect backoff before
+                // the next connect. Assert consecutive-reconnect gaps, not a count in a fixed
+                // window, so a starved/oversleeping test thread only yields MORE paced
+                // samples, never a false failure. Floor = 3/4 of the configured backoff:
+                // below the >=200ms real park, far above the unpaced bug's sub-ms gaps.
+                final long minGapNanos = initialBackoffMillis * 1_000_000L * 3 / 4;
+                for (int i = 1; i < stamps.length; i++) {
+                    long gapNanos = stamps[i] - stamps[i - 1];
+                    assertTrue("NACK-triggered recycles against a healthy server must be paced "
+                                    + "by the initial reconnect backoff (" + initialBackoffMillis
+                                    + "ms): recycle " + i + " came " + (gapNanos / 1_000_000L)
+                                    + "ms after the previous one -- the recycle loop is unpaced",
+                            gapNanos >= minGapNanos);
+                }
             }
         });
     }
@@ -390,11 +392,6 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // reconnect backoff. Red behavior: hundreds of full recycles per second.
         final long initialBackoffMillis = 200L;
         final long runMillis = 1_200L;
-        // With >=200ms pacing (escalating), a 1.2s window fits at most a
-        // handful of recycles; allow 10 for scheduling noise. The unpaced bug
-        // overshoots this by orders of magnitude, so no flakiness risk.
-        final int maxReconnects = 10;
-
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
                 appendFrames(engine, 1);
@@ -422,17 +419,26 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 } finally {
                     loop.close();
                 }
-                int count;
+                Long[] stamps;
                 synchronized (reconnectNanos) {
-                    count = reconnectNanos.size();
+                    stamps = reconnectNanos.toArray(new Long[0]); // insertion order == reconnect order
                 }
-                assertTrue("non-orderly-close recycles against an accepting middlebox must be "
-                                + "paced by the reconnect backoff (" + initialBackoffMillis
-                                + "ms): observed " + count + " reconnects in " + runMillis
-                                + "ms -- the close path is recycling unpaced at connect+close RTT rate",
-                        count <= maxReconnects);
                 assertTrue("sanity: the non-orderly close must actually recycle the connection at least once",
-                        count >= 1);
+                        stamps.length >= 1);
+                // Pacing is per-recycle: each recycle parks >= the reconnect backoff before
+                // the next connect. Assert consecutive-reconnect gaps, not a count in a fixed
+                // window, so a starved/oversleeping test thread only yields MORE paced
+                // samples, never a false failure. Floor = 3/4 of the configured backoff:
+                // below the >=200ms real park, far above the unpaced bug's sub-ms gaps.
+                final long minGapNanos = initialBackoffMillis * 1_000_000L * 3 / 4;
+                for (int i = 1; i < stamps.length; i++) {
+                    long gapNanos = stamps[i] - stamps[i - 1];
+                    assertTrue("non-orderly-close recycles against an accepting middlebox must be "
+                                    + "paced by the reconnect backoff (" + initialBackoffMillis
+                                    + "ms): recycle " + i + " came " + (gapNanos / 1_000_000L)
+                                    + "ms after the previous one -- the close path is recycling unpaced",
+                            gapNanos >= minGapNanos);
+                }
             }
         });
     }
@@ -453,11 +459,6 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // Red behavior: hundreds of full recycles per second.
         final long initialBackoffMillis = 200L;
         final long runMillis = 1_200L;
-        // First recycle is immediate, then doses escalate from 200ms; a 1.2s
-        // window fits a handful of recycles. Allow 10 for scheduling noise --
-        // the unpaced bug overshoots by orders of magnitude.
-        final int maxReconnects = 10;
-
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
                 appendFrames(engine, 1);
@@ -487,18 +488,28 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 } finally {
                     loop.close();
                 }
-                int count;
+                Long[] stamps;
                 synchronized (reconnectNanos) {
-                    count = reconnectNanos.size();
+                    stamps = reconnectNanos.toArray(new Long[0]); // insertion order == reconnect order
                 }
-                assertTrue("orderly-close (GOING_AWAY) recycles against a draining peer must "
-                                + "be paced by the reconnect backoff after the first recycle ("
-                                + initialBackoffMillis + "ms): observed " + count
-                                + " reconnects in " + runMillis + "ms -- the orderly-close path "
-                                + "is recycling unpaced at connect+close RTT rate",
-                        count <= maxReconnects);
                 assertTrue("sanity: the orderly close must actually recycle the connection at least once",
-                        count >= 1);
+                        stamps.length >= 1);
+                // Pacing is per-recycle: the FIRST recycle is immediate (failover latency),
+                // then each consecutive zero-progress recycle parks >= the reconnect backoff.
+                // Assert consecutive-reconnect gaps, not a count in a fixed window, so a
+                // starved/oversleeping test thread only yields MORE paced samples, never a
+                // false failure. The one immediate first recycle is reconnect[0], never a
+                // measured gap. Floor = 3/4 of the configured backoff.
+                final long minGapNanos = initialBackoffMillis * 1_000_000L * 3 / 4;
+                for (int i = 1; i < stamps.length; i++) {
+                    long gapNanos = stamps[i] - stamps[i - 1];
+                    assertTrue("orderly-close (GOING_AWAY) recycles against a draining peer must "
+                                    + "be paced by the reconnect backoff after the first recycle ("
+                                    + initialBackoffMillis + "ms): recycle " + i + " came "
+                                    + (gapNanos / 1_000_000L) + "ms after the previous one -- the "
+                                    + "orderly-close path is recycling unpaced",
+                            gapNanos >= minGapNanos);
+                }
             }
         });
     }
@@ -516,7 +527,6 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // must survive (pacing, not a terminal -- Invariant B).
         final long initialBackoffMillis = 200L;
         final long runMillis = 1_200L;
-        final int maxReconnects = 10;
 
         TestUtils.assertMemoryLeak(() -> {
             try (CursorSendEngine engine = newEngine()) {
@@ -546,18 +556,28 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 } finally {
                     loop.close();
                 }
-                int count;
+                Long[] stamps;
                 synchronized (reconnectNanos) {
-                    count = reconnectNanos.size();
+                    stamps = reconnectNanos.toArray(new Long[0]); // insertion order == reconnect order
                 }
-                assertTrue("pre-send close recycles (close before any send, nextWireSeq == 0) "
-                                + "must be paced by the reconnect backoff (" + initialBackoffMillis
-                                + "ms): observed " + count + " reconnects in " + runMillis
-                                + "ms -- the strike-exempt close path is recycling unpaced at "
-                                + "connect+close RTT rate",
-                        count <= maxReconnects);
                 assertTrue("sanity: the pre-send close must actually recycle the connection at least once",
-                        count >= 1);
+                        stamps.length >= 1);
+                // Pacing is per-recycle: the FIRST recycle is immediate (failover latency),
+                // then each consecutive zero-progress recycle parks >= the reconnect backoff.
+                // Assert consecutive-reconnect gaps, not a count in a fixed window, so a
+                // starved/oversleeping test thread only yields MORE paced samples, never a
+                // false failure. The one immediate first recycle is reconnect[0], never a
+                // measured gap. Floor = 3/4 of the configured backoff.
+                final long minGapNanos = initialBackoffMillis * 1_000_000L * 3 / 4;
+                for (int i = 1; i < stamps.length; i++) {
+                    long gapNanos = stamps[i] - stamps[i - 1];
+                    assertTrue("pre-send close recycles (close before any send, nextWireSeq == 0) "
+                                    + "must be paced by the reconnect backoff (" + initialBackoffMillis
+                                    + "ms): recycle " + i + " came " + (gapNanos / 1_000_000L)
+                                    + "ms after the previous one -- the strike-exempt close path "
+                                    + "is recycling unpaced",
+                            gapNanos >= minGapNanos);
+                }
             }
         });
     }
@@ -581,17 +601,22 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 long t0 = System.nanoTime();
                 deliverOrderlyClose(loop);
                 long firstNanos = System.nanoTime() - t0;
-                assertTrue("the FIRST zero-progress exempt recycle must stay immediate "
-                                + "(failover latency): took " + (firstNanos / 1_000_000L) + "ms",
-                        firstNanos < 300_000_000L);
+                assertEquals("the FIRST exempt recycle must take the immediate (level-0) branch",
+                        1, loop.zeroProgressRecycles());
 
                 t0 = System.nanoTime();
                 deliverOrderlyClose(loop);
                 long secondNanos = System.nanoTime() - t0;
-                assertTrue("a CONSECUTIVE zero-progress exempt recycle must park for at least "
-                                + "the initial reconnect backoff (" + initialBackoffMillis
-                                + "ms): took " + (secondNanos / 1_000_000L) + "ms",
+                assertEquals("a CONSECUTIVE exempt recycle must take the paced (level-1) branch",
+                        2, loop.zeroProgressRecycles());
+                assertTrue("a CONSECUTIVE zero-progress exempt recycle must park for at least the "
+                                + "initial reconnect backoff (" + initialBackoffMillis + "ms): took "
+                                + (secondNanos / 1_000_000L) + "ms",
                         secondNanos >= initialBackoffMillis * 1_000_000L);
+                assertTrue("the FIRST exempt recycle must stay immediate (failover latency), far "
+                                + "shorter than the paced second: first=" + (firstNanos / 1_000_000L)
+                                + "ms second=" + (secondNanos / 1_000_000L) + "ms",
+                        firstNanos * 2 <= secondNanos);
 
                 // OK-level acceptance progress (fsn 0 accepted) resets the
                 // pacer: the next exempt recycle is a fresh failover.
@@ -600,10 +625,12 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 t0 = System.nanoTime();
                 deliverOrderlyClose(loop);
                 long thirdNanos = System.nanoTime() - t0;
-                assertTrue("OK-level progress must reset the zero-progress pacer -- the next "
-                                + "exempt recycle is a fresh failover, not churn: took "
-                                + (thirdNanos / 1_000_000L) + "ms",
-                        thirdNanos < 300_000_000L);
+                assertEquals("OK-level progress must reset the zero-progress pacer -- the next exempt "
+                                + "recycle is a fresh failover (level 0), not churn",
+                        1, loop.zeroProgressRecycles());
+                assertTrue("the post-progress exempt recycle must stay immediate: third="
+                                + (thirdNanos / 1_000_000L) + "ms second=" + (secondNanos / 1_000_000L) + "ms",
+                        thirdNanos * 2 <= secondNanos);
             } finally {
                 closeAll(clients);
             }
@@ -620,38 +647,51 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
         // only after it elapses may a further same-frame strike escalate. The
         // window=0 (legacy immediate) path is covered by
         // testPoisonTerminalNamesTheRejectedFsn.
-        final long windowMillis = 600L;
         TestUtils.assertMemoryLeak(() -> {
-            List<WebSocketClient> clients = new ArrayList<>();
-            try (CursorSendEngine engine = newEngine()) {
-                appendFrames(engine, 2);
-                CursorWebSocketSendLoop loop = newDurableLoopWithWindow(engine, clients, 2, windowMillis);
-                setSentCount(loop, 2);
-                deliverOk(loop, 0, names("trades"), txns(7L));
-
-                // Burst PAST the strike threshold (2), all within the window.
+            // Claim A: strike threshold reached, dwell window still open -> NO escalation.
+            // Huge window so a synchronous burst can't cross it; no sleep -> no added time.
+            final long heldWindowMillis = 60_000L;
+            List<WebSocketClient> clientsHeld = new ArrayList<>();
+            try (CursorSendEngine engineHeld = newEngine()) {
+                appendFrames(engineHeld, 2);
+                CursorWebSocketSendLoop loopHeld = newDurableLoopWithWindow(engineHeld, clientsHeld, 2, heldWindowMillis);
+                setSentCount(loopHeld, 2);
+                deliverOk(loopHeld, 0, names("trades"), txns(7L));
                 for (int i = 0; i < 3; i++) {
-                    setSentCount(loop, 2);
-                    deliverRetriableNack(loop, 1, "disk full");
+                    setSentCount(loopHeld, 2);
+                    deliverRetriableNack(loopHeld, 1, "disk full");
                 }
-                // Threshold reached, window still open -> must not have escalated.
-                loop.checkError();
+                assertEquals("burst must accrue strikes past the threshold (non-vacuous)",
+                        3, loopHeld.poisonStrikes());
+                loopHeld.checkError(); // window open -> must not have escalated
+            } finally {
+                closeAll(clientsHeld);
+            }
 
-                // Cross the window, then one more same-frame strike escalates.
-                Thread.sleep(windowMillis + 150);
-                setSentCount(loop, 2);
-                deliverRetriableNack(loop, 1, "disk full");
+            // Claim B: once the window elapses, the next same-frame strike escalates.
+            final long escWindowMillis = 200L;
+            List<WebSocketClient> clientsEsc = new ArrayList<>();
+            try (CursorSendEngine engineEsc = newEngine()) {
+                appendFrames(engineEsc, 2);
+                CursorWebSocketSendLoop loopEsc = newDurableLoopWithWindow(engineEsc, clientsEsc, 2, escWindowMillis);
+                setSentCount(loopEsc, 2);
+                deliverOk(loopEsc, 0, names("trades"), txns(7L));
+                setSentCount(loopEsc, 2);
+                deliverRetriableNack(loopEsc, 1, "disk full"); // strike 1 anchors the window
+                loopEsc.checkError();                           // below threshold -> no escalation
+                Thread.sleep(escWindowMillis + 150);            // cross the window (sleep only lengthens under starvation)
+                setSentCount(loopEsc, 2);
+                deliverRetriableNack(loopEsc, 1, "disk full"); // threshold reached AND window elapsed
                 try {
-                    loop.checkError();
+                    loopEsc.checkError();
                     fail("after the dwell window elapses, the next strike must escalate");
                 } catch (LineSenderServerException e) {
-                    assertEquals(SenderError.Category.PROTOCOL_VIOLATION,
-                            e.getServerError().getCategory());
+                    assertEquals(SenderError.Category.PROTOCOL_VIOLATION, e.getServerError().getCategory());
                     assertEquals("escalated terminal must still name the poisoned frame (fsn 1)",
                             1L, e.getServerError().getFromFsn());
                 }
             } finally {
-                closeAll(clients);
+                closeAll(clientsEsc);
             }
         });
     }
@@ -680,7 +720,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 // strictly below the -1 sentinel so the assertion discriminates.
                 setPostCatchUpDataFrameBaseline(loop, -2L, 3L);
                 assertEquals("precondition: no poison suspect yet",
-                        -1L, getLongField(loop, "poisonFsn"));
+                        -1L, loop.poisonFsn());
 
                 deliverRetriableNack(loop, 0, "disk full");
 
@@ -688,7 +728,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 // the sentinel is intact. Pre-fix it was set to -2, laundering the
                 // poison detector's state.
                 assertEquals("catch-up NACK must not set/launder the poison sentinel",
-                        -1L, getLongField(loop, "poisonFsn"));
+                        -1L, loop.poisonFsn());
                 loop.checkError();
             } finally {
                 closeAll(clients);
@@ -716,7 +756,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 // = -1. A NACK of catch-up wire seq 0 maps to fsn -1 == ackedFsn exactly.
                 setPostCatchUpDataFrameBaseline(loop, -1L, 2L);
                 assertEquals("precondition: no strikes yet",
-                        0L, getLongField(loop, "poisonStrikes"));
+                        0L, loop.poisonStrikes());
 
                 deliverRetriableNack(loop, 0, "disk full");
 
@@ -728,9 +768,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 // strike) shows as poisonStrikes staying 0. A "<=" -> "<" mutation of the
                 // fsn-vs-ackedFsn guard charges the strike and fails this.
                 assertEquals("catch-up NACK at fsn == ackedFsn must not charge a poison strike",
-                        0L, getLongField(loop, "poisonStrikes"));
+                        0L, loop.poisonStrikes());
                 assertEquals("... and must leave the poison sentinel intact",
-                        -1L, getLongField(loop, "poisonFsn"));
+                        -1L, loop.poisonFsn());
                 loop.checkError();
             } finally {
                 closeAll(clients);
@@ -797,18 +837,22 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 long t0 = System.nanoTime();
                 deliverNotWritableNack(loop, 1, "read-only replica");
                 long firstNanos = System.nanoTime() - t0;
-                assertTrue("the FIRST NOT_WRITABLE recycle must stay immediate (failover "
-                                + "latency): took " + (firstNanos / 1_000_000L) + "ms",
-                        firstNanos < 300_000_000L);
+                assertEquals("the FIRST NOT_WRITABLE recycle must take the immediate (level-0) branch",
+                        1, loop.zeroProgressRecycles());
 
                 setSentCount(loop, 2);
                 t0 = System.nanoTime();
                 deliverNotWritableNack(loop, 1, "read-only replica");
                 long secondNanos = System.nanoTime() - t0;
-                assertTrue("a CONSECUTIVE zero-progress NOT_WRITABLE recycle must park for at "
-                                + "least the initial reconnect backoff (" + initialBackoffMillis
-                                + "ms): took " + (secondNanos / 1_000_000L) + "ms",
+                assertEquals("a CONSECUTIVE NOT_WRITABLE recycle must take the paced (level-1) branch",
+                        2, loop.zeroProgressRecycles());
+                assertTrue("a CONSECUTIVE zero-progress NOT_WRITABLE recycle must park for at least the "
+                                + "initial reconnect backoff (" + initialBackoffMillis + "ms): took "
+                                + (secondNanos / 1_000_000L) + "ms",
                         secondNanos >= initialBackoffMillis * 1_000_000L);
+                assertTrue("the FIRST NOT_WRITABLE recycle must stay immediate: first="
+                                + (firstNanos / 1_000_000L) + "ms second=" + (secondNanos / 1_000_000L) + "ms",
+                        firstNanos * 2 <= secondNanos);
 
                 // Pacing only, never a terminal: NOT_WRITABLE says nothing
                 // about the bytes.
@@ -1052,21 +1096,11 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     private static void deliverOrderlyClose(CursorWebSocketSendLoop loop) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
-        f.setAccessible(true);
-        Object handler = f.get(loop);
-        Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
-        m.setAccessible(true);
-        m.invoke(handler, 1001, "server draining"); // GOING_AWAY: orderly, strike-exempt
+        loop.deliverCloseForTest(1001, "server draining"); // GOING_AWAY: orderly, strike-exempt
     }
 
     private static void deliverNonOrderlyClose(CursorWebSocketSendLoop loop) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
-        f.setAccessible(true);
-        Object handler = f.get(loop);
-        Method m = handler.getClass().getDeclaredMethod("onClose", int.class, String.class);
-        m.setAccessible(true);
-        m.invoke(handler, 1006, "connection reset"); // ABNORMAL_CLOSURE
+        loop.deliverCloseForTest(1006, "connection reset"); // ABNORMAL_CLOSURE
     }
 
     private static void deliverNotWritableNack(CursorWebSocketSendLoop loop, long wireSeq,
@@ -1106,12 +1140,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     private static void invokeOnBinaryMessage(CursorWebSocketSendLoop loop, long ptr, int size) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("responseHandler");
-        f.setAccessible(true);
-        Object handler = f.get(loop);
-        Method m = handler.getClass().getDeclaredMethod("onBinaryMessage", long.class, int.class);
-        m.setAccessible(true);
-        m.invoke(handler, ptr, size);
+        loop.deliverResponseForTest(ptr, size);
     }
 
     private static String[] names(String... v) {
@@ -1119,25 +1148,19 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     }
 
     private static void setSentCount(CursorWebSocketSendLoop loop, long count) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
-        f.setAccessible(true);
-        f.setLong(loop, count);
+        loop.setNextWireSeqForTest(count);
         // A non-zero sent count models DATA frames sent on this connection. The
         // poison-strike / pre-send gates key off dataFrameSentThisConnection, not
         // nextWireSeq (the dictionary catch-up advances nextWireSeq without sending
         // a data frame), so keep the two in sync for these white-box scenarios.
-        Field d = CursorWebSocketSendLoop.class.getDeclaredField("dataFrameSentThisConnection");
-        d.setAccessible(true);
-        d.setBoolean(loop, count > 0);
+        loop.setDataFrameSentThisConnectionForTest(count > 0);
     }
 
     // Sets ONLY nextWireSeq -- deliberately NOT dataFrameSentThisConnection -- to
     // model the dictionary catch-up having advanced the wire sequence with no data
     // frame sent yet. Contrast setSentCount, which sets both.
     private static void setCatchUpWireSeqOnly(CursorWebSocketSendLoop loop, long count) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
-        f.setAccessible(true);
-        f.setLong(loop, count);
+        loop.setNextWireSeqForTest(count);
     }
 
     // Models a fresh connection that has shipped the dictionary catch-up (advancing
@@ -1145,21 +1168,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
     // nextWireSeq, and dataFrameSentThisConnection=true together.
     private static void setPostCatchUpDataFrameBaseline(CursorWebSocketSendLoop loop,
                                                         long fsnAtZero, long nextWireSeq) throws Exception {
-        Field z = CursorWebSocketSendLoop.class.getDeclaredField("fsnAtZero");
-        z.setAccessible(true);
-        z.setLong(loop, fsnAtZero);
-        Field w = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
-        w.setAccessible(true);
-        w.setLong(loop, nextWireSeq);
-        Field d = CursorWebSocketSendLoop.class.getDeclaredField("dataFrameSentThisConnection");
-        d.setAccessible(true);
-        d.setBoolean(loop, true);
-    }
-
-    private static long getLongField(CursorWebSocketSendLoop loop, String name) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField(name);
-        f.setAccessible(true);
-        return f.getLong(loop);
+        loop.setFsnAtZeroForTest(fsnAtZero);
+        loop.setNextWireSeqForTest(nextWireSeq);
+        loop.setDataFrameSentThisConnectionForTest(true);
     }
 
     private static long[] txns(long... v) {
@@ -1191,12 +1202,10 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 5_000L, 5L, 10L, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 MAX_REJECTIONS);
-        // The loop is driven by reflection, not by its own I/O thread, but
-        // the recycle machinery must see a live loop or connectLoop's guard
+        // The loop is driven directly by the test, not by its own I/O thread,
+        // but the recycle machinery must see a live loop or connectLoop's guard
         // treats the first retriable NACK as fatal.
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
-        f.setAccessible(true);
-        f.setBoolean(loop, true);
+        loop.setRunningForTest(true);
         return loop;
     }
 
@@ -1220,9 +1229,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 5_000L, initialBackoffMillis, 5 * initialBackoffMillis, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 1_000_000);
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
-        f.setAccessible(true);
-        f.setBoolean(loop, true);
+        loop.setRunningForTest(true);
         return loop;
     }
 
@@ -1246,9 +1253,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                 5_000L, 5L, 10L, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 maxRejections, windowMillis);
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
-        f.setAccessible(true);
-        f.setBoolean(loop, true);
+        loop.setRunningForTest(true);
         return loop;
     }
 }

@@ -40,8 +40,6 @@ import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -89,12 +87,12 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
                 // while the first surviving frame's delta starts above it.
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
-                    setRunning(loop);
+                    loop.setRunningForTest(true);
                     // Position at the first unsent frame exactly as the I/O loop does
                     // before its first send (no catch-up: the mirror is empty).
-                    invoke(loop, "positionCursorForStart");
+                    loop.positionCursorForStartForTest();
 
-                    boolean sent = (Boolean) invoke(loop, "trySendOne");
+                    boolean sent = loop.trySendOneForTest();
 
                     Assert.assertFalse("the torn-dict guard must refuse to send the gapped frame", sent);
                     Assert.assertEquals("no frame may reach the server through a gap",
@@ -126,18 +124,6 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
             }
         }
         return n;
-    }
-
-    private static Object invoke(CursorWebSocketSendLoop loop, String method) throws Exception {
-        Method m = CursorWebSocketSendLoop.class.getDeclaredMethod(method);
-        m.setAccessible(true);
-        return m.invoke(loop);
-    }
-
-    private static void setRunning(CursorWebSocketSendLoop loop) throws Exception {
-        Field f = CursorWebSocketSendLoop.class.getDeclaredField("running");
-        f.setAccessible(true);
-        f.setBoolean(loop, true);
     }
 
     // Constructs a recovery send loop that is never started -- the test drives
