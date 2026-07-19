@@ -3421,7 +3421,6 @@ public class QwpWebSocketSender implements Sender {
                     client, cursorEngine,
                     0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     reconnectFactory,
-                    reconnectMaxDurationMillis,
                     reconnectInitialBackoffMillis,
                     reconnectMaxBackoffMillis,
                     requestDurableAck,

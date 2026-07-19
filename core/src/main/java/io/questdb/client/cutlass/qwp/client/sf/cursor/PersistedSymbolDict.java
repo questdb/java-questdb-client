@@ -601,26 +601,30 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private void decodeLoadedSymbols(GlobalSymbolDictionary target, ObjList<String> out) {
         long p = loadedEntriesAddr;
         long limit = p + loadedEntriesLen;
-        for (int i = 0; i < size && p < limit; i++) {
+        // open() CRC-validated these bytes and copyRecoveredEntries laid down exactly
+        // `size` entries, so this decode runs on trusted, self-consistent input. Any
+        // mismatch means an internal invariant broke: fail loud like the rest of this
+        // file (copyRecoveredEntries throws too) instead of silently under-populating
+        // the dictionary, which would shift every id above the short point.
+        for (int i = 0; i < size; i++) {
             long len = 0;
             int shift = 0;
+            boolean terminated = false;
             while (p < limit) {
                 byte b = Unsafe.getUnsafe().getByte(p++);
                 len |= (long) (b & 0x7F) << shift;
                 if ((b & 0x80) == 0) {
+                    terminated = true;
                     break;
                 }
                 shift += 7;
                 if (shift > 35) {
-                    // Bound the varint like the other decoders: a canonical length is
-                    // <= 5 bytes. open() already CRC-validated these bytes, so this is
-                    // defensive only; the p + len > limit check below rejects the
-                    // over-long run.
-                    break;
+                    break; // over-long run -- a canonical length varint is <= 5 bytes
                 }
             }
-            if (p + len > limit) {
-                break; // defensive: torn tail (should not happen past parse in open)
+            if (!terminated || p + len > limit) {
+                throw new IllegalStateException("truncated loaded symbol dictionary entry to "
+                        + FILE_NAME + " [entry=" + i + ", size=" + size + ']');
             }
             String symbol = Utf8s.stringFromUtf8Bytes(p, p + len);
             if (target != null) {
@@ -629,6 +633,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 out.add(symbol);
             }
             p += len;
+        }
+        if (p != limit) {
+            throw new IllegalStateException("loaded symbol dictionary has trailing bytes to "
+                    + FILE_NAME + " [consumed=" + (p - loadedEntriesAddr) + ", length=" + loadedEntriesLen + ']');
         }
     }
 
@@ -985,8 +993,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * same offset.
      */
     private void flushChunk(long recStart, int hdrLen, int entriesLen, int count) {
-        int bodyLen = hdrLen + entriesLen;
-        int recLen = bodyLen + CRC_SIZE;
+        // long math, matching commitMappedChunk: hdrLen + entriesLen can reach
+        // Integer.MAX_VALUE (entriesLen is bounded only by MAX_SCRATCH_BYTES), and an
+        // int sum would wrap negative and hand a bogus length to the CRC and the write.
+        long bodyLen = (long) hdrLen + entriesLen;
+        long recLen = bodyLen + CRC_SIZE;
         Unsafe.getUnsafe().putInt(recStart + bodyLen, Crc32c.update(Crc32c.INIT, recStart, bodyLen));
         appendWriteCount++;
         long written = ff.write(fd, recStart, recLen, appendOffset);

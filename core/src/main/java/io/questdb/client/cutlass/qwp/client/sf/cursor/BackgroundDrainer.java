@@ -636,7 +636,6 @@ public final class BackgroundDrainer implements Runnable {
                         client, engine,
                         0L, CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         clientFactory,
-                        reconnectMaxDurationMillis,
                         reconnectInitialBackoffMillis,
                         reconnectMaxBackoffMillis,
                         requestDurableAck,

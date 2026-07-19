@@ -683,6 +683,6 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                     }
                     return c;
                 },
-                5_000L, 1L, 5L);
+                1L, 5L);
     }
 }

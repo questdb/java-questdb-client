@@ -70,7 +70,6 @@ public class CloseOwnershipRaceTest {
                         () -> {
                             throw new QwpAuthFailedException(401, "localhost", 1);
                         },
-                        0,
                         1, 1,
                         false,
                         0,

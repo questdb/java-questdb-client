@@ -252,7 +252,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // give-up from connectLoop. The budget still bounds the blocking (non-lazy)
     // initial connect via QwpWebSocketSender -> connectWithRetry, which takes it
     // as an explicit argument rather than reading this field.
-    private final long reconnectMaxDurationMillis;
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
@@ -528,11 +527,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, false);
     }
 
@@ -548,12 +546,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS);
     }
@@ -568,19 +565,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, DEFAULT_MAX_HEAD_FRAME_REJECTIONS);
     }
 
     /**
-     * Eleven-arg overload — omits the poison-escalation dwell window, which
+     * Ten-arg overload — omits the poison-escalation dwell window, which
      * defaults to {@code 0} (legacy: escalate as soon as maxHeadFrameRejections
      * strikes accrue, with no minimum wall-clock). The user-facing 5s default
      * ({@link #DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS}) is applied at the
@@ -591,28 +587,26 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
                                    long durableAckKeepaliveIntervalMillis,
                                    int maxHeadFrameRejections) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections, 0L);
     }
 
     /**
-     * Twelve-arg overload — omits the symbol-dict cap-gap escalation dwell, which
-     * defaults to {@code 0}. This and the thirteen-arg overload use the foreground-safe
+     * Eleven-arg overload — omits the symbol-dict cap-gap escalation dwell, which
+     * defaults to {@code 0}. This and the twelve-arg overload use the foreground-safe
      * retry-forever policy; orphan drainers opt into count-and-dwell escalation through
      * the policy-aware master constructor.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
@@ -620,14 +614,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, 0L);
     }
 
     /**
-     * Thirteen-arg overload. Catch-up cap gaps are retried indefinitely, which is the
+     * Twelve-arg overload. Catch-up cap gaps are retried indefinitely, which is the
      * required policy for a foreground store-and-forward sender. Orphan drainers use the
      * policy-aware overload below to opt into bounded terminal escalation.
      * <p>
@@ -647,7 +641,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
@@ -656,7 +649,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
@@ -671,7 +664,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
@@ -827,7 +819,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
-        this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
         this.reconnectMaxBackoffMillis = reconnectMaxBackoffMillis;
         this.durableAckMode = durableAckMode;
@@ -871,7 +862,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
-                                   long reconnectMaxDurationMillis,
                                    long reconnectInitialBackoffMillis,
                                    long reconnectMaxBackoffMillis,
                                    boolean durableAckMode,
@@ -881,7 +871,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    long catchUpCapGapMinEscalationWindowMillis,
                                    ReconnectPolicy reconnectPolicy) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,

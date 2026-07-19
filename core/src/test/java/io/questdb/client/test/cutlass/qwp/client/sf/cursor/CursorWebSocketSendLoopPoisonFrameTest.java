@@ -343,7 +343,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         new NackingClient(), engine, 0L,
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
-                        5_000L, initialBackoffMillis, 1_000L,
+                        initialBackoffMillis, 1_000L,
                         false,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
@@ -410,7 +410,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         new ClosingMiddleboxClient(), engine, 0L,
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
-                        5_000L, initialBackoffMillis, 1_000L,
+                        initialBackoffMillis, 1_000L,
                         false,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Keep the detector out of the way: this test measures
@@ -477,7 +477,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         new OrderlyClosingClient(), engine, 0L,
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
-                        5_000L, initialBackoffMillis, 1_000L,
+                        initialBackoffMillis, 1_000L,
                         false,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         // Detector out of the way -- orderly closes must not
@@ -547,7 +547,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         new PreSendClosingClient(), engine, 0L,
                         CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                         factory,
-                        5_000L, initialBackoffMillis, 1_000L,
+                        initialBackoffMillis, 1_000L,
                         false,
                         CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                         1_000_000);
@@ -1203,7 +1203,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                5_000L, 5L, 10L, true,
+                5L, 10L, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 MAX_REJECTIONS);
         // The loop is driven directly by the test, not by its own I/O thread,
@@ -1230,7 +1230,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                5_000L, initialBackoffMillis, 5 * initialBackoffMillis, true,
+                initialBackoffMillis, 5 * initialBackoffMillis, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 1_000_000);
         loop.setRunningForTest(true);
@@ -1254,7 +1254,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                     clients.add(c);
                     return c;
                 },
-                5_000L, 5L, 10L, true,
+                5L, 10L, true,
                 CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
                 maxRejections, windowMillis);
         loop.setRunningForTest(true);

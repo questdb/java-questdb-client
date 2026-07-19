@@ -108,7 +108,6 @@ public class CursorWebSocketSendLoopZeroBackoffTest {
                         // Invariant B — never terminal, never latched.
                         throw new IOException("connection refused (test)");
                     },
-                    0,
                     0,   // non-positive initial backoff: pre-fix IAE in nextLong
                     1);
             try {

@@ -90,7 +90,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
-                        0, 0, 1);
+                        0, 1);
                 // Close without start(): the ctor-seeded mirror is this
                 // thread's to free, since the I/O loop never ran.
                 Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
@@ -206,7 +206,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                             () -> {
                                 throw new IOException("no reconnect in this test");
                             },
-                            0, 0, 1);
+                            0, 1);
                     Assert.fail("ctor must propagate the injected mirror-seed failure");
                 } catch (LineSenderException expected) {
                     Assert.assertTrue("unexpected message: " + expected.getMessage(),
@@ -240,7 +240,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                         () -> {
                             throw new IOException("no reconnect in this test");
                         },
-                        0, 0, 1);
+                        0, 1);
                 try {
                     Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
                             3, loop.sentDictCount());
@@ -289,7 +289,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
-                0, 0, 1,
+                0, 1,
                 false, 0L, 3, 0L, 0L,
                 CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
     }

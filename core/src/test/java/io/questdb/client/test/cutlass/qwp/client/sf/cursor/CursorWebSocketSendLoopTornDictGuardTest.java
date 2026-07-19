@@ -135,7 +135,7 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
                 () -> {
                     throw new IOException("no reconnect in this test");
                 },
-                0, 0, 1);
+                0, 1);
     }
 
     // Writes 12 delta frames (each a new symbol) into the default slot across several
