@@ -4155,12 +4155,18 @@ public class QwpWebSocketSender implements Sender {
         // batch stay intact. (The check ignores the null-padding bytes
         // nextRow() will add; that's bounded by numColumns * elemSize and
         // far below any realistic cap.)
-        if (serverMaxBatchSize > 0) {
+        // Snapshot the volatile cap ONCE, as flushPendingRows does. The I/O thread
+        // lowers serverMaxBatchSize -- or clears it to 0 on a failover to a node that
+        // advertises no cap -- mid-stream via applyServerBatchSizeLimit. Re-reading the
+        // field across the guard and the throw could observe it drop to 0 between reads
+        // and reject the row against a "cap" of 0, which actually means "no cap".
+        int cap = serverMaxBatchSize;
+        if (cap > 0) {
             long rowBytes = currentTableBuffer.getBufferedBytes() - currentTableBufferSnapshotBytes;
-            if (rowBytes > serverMaxBatchSize) {
+            if (rowBytes > cap) {
                 throw new LineSenderException("row too large for server batch cap")
                         .put(" [rowBytes=").put(rowBytes)
-                        .put(", serverMaxBatchSize=").put(serverMaxBatchSize).put(']');
+                        .put(", serverMaxBatchSize=").put(cap).put(']');
             }
         }
 
