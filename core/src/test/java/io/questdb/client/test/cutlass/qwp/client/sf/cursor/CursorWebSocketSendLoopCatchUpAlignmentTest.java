@@ -160,19 +160,13 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
-    public void testSplitCatchUpReusesEntryIndexAndStagesOnlyPrefixAcrossReconnects() throws Exception {
+    public void testSplitCatchUpStagesOnlyPrefixAcrossReconnects() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CatchUpCapturingClient client = new CatchUpCapturingClient(3_100);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
                     seedMirror(loop, TestUtils.repeat("x", 3_000), TestUtils.repeat("y", 3_000));
-                    // Building the mirror must NOT index it: the index serves only the
-                    // catch-up, so paying for it on the per-frame send path -- and
-                    // retaining it -- would tax every connection for a reconnect that
-                    // may never come.
-                    assertEquals("accumulating the mirror must not build the entry index",
-                            0, loop.catchUpEntryIndexBuildCount());
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the small cap must split the dictionary", 2, client.framesSent);
@@ -186,15 +180,11 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     assertEquals("the larger cap must combine the dictionary", 3, client.framesSent);
                     assertEquals("combining symbols must not grow the prefix-only buffer",
                             1, loop.catchUpFrameGrowthCount());
-                    assertEquals("reconnect must reuse cached entry ends instead of reparsing",
-                            1, loop.catchUpEntryIndexBuildCount());
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the next reconnect sends one combined frame", 4, client.framesSent);
                     assertEquals("the prefix buffer must be reused across reconnects",
                             1, loop.catchUpFrameGrowthCount());
-                    assertEquals("later reconnects must still reuse the entry index",
-                            1, loop.catchUpEntryIndexBuildCount());
                 } finally {
                     // assertMemoryLeak verifies that close releases the retained buffer.
                     loop.close();
@@ -296,6 +286,47 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             "CatchUpSendException", e.getClass().getSimpleName());
                     assertTrue("message must name the frame-size guard: " + e.getMessage(),
                             e.getMessage().contains("catch-up frame exceeds the maximum size"));
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCorruptCatchUpMirrorLatchesTerminalNotLivelock() throws Exception {
+        // A mirror whose [len varint][utf8] framing disagrees with sentDictCount can
+        // only arise from memory corruption -- it is built from CRC-validated frames.
+        // The split catch-up's running-pointer walk must latch a terminal (recordFatal,
+        // surfaced by checkError) rather than let a bare throw unwind into connectLoop
+        // and reconnect-livelock. A non-zero cap forces the packing loop that walks it.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(64);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    // Entry 0 = [len=1]['a'] (2 bytes); entry 1 = [len=100] with no bytes
+                    // following (a truncated tail), so the second entry's end runs past the
+                    // buffer while sentDictCount = 2 claims both. loop.close() frees addr.
+                    long addr = Unsafe.malloc(3, MemoryTag.NATIVE_DEFAULT);
+                    long p = writeVarint(addr, 1);
+                    Unsafe.getUnsafe().putByte(p, (byte) 'a');
+                    writeVarint(addr + 2, 100);
+                    loop.seedSentDictMirrorForTest(addr, 3, 2);
+
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, 0L);
+                        fail("a corrupt mirror must raise CatchUpSendException");
+                    } catch (RuntimeException e) {
+                        assertEquals("CatchUpSendException", e.getClass().getSimpleName());
+                    }
+                    try {
+                        loop.checkError();
+                        fail("a corrupt catch-up mirror must latch a terminal, not livelock");
+                    } catch (LineSenderException terminal) {
+                        assertTrue("terminal must name the corrupt mirror: " + terminal.getMessage(),
+                                terminal.getMessage().contains("invalid symbol dictionary mirror during catch-up"));
+                    }
                 } finally {
                     loop.close();
                 }
@@ -919,9 +950,8 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             }
         }
         loop.seedSentDictMirrorForTest(addr, total, symbols.length);
-        // Leave sentDictIndexedCount at 0: the mirror carries its own entry lengths, and
-        // the entry-ends index is built lazily by the catch-up. Pre-building it here
-        // would hide that from every test that seeds this way.
+        // The mirror carries its own entry lengths ([len varint][utf8]); the catch-up
+        // walks them with a running pointer on demand, so nothing else to seed here.
     }
 
     private static int varintSize(long value) {

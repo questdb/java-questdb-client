@@ -192,7 +192,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // workload. The guard exists so that pathological growth fails loudly instead
     // of overflowing the int capacity math into a heap-corrupting copyMemory.
     private static final int MAX_SENT_DICT_BYTES = Integer.MAX_VALUE - 8;
-    private static final int MAX_SENT_DICT_ENTRIES = MAX_SENT_DICT_BYTES / Integer.BYTES;
     /**
      * Throttle "reconnect attempt N failed" WARN logs to one per 5 s.
      */
@@ -308,12 +307,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // Any growth first performs a copy-on-write; only owned buffers are freed.
     private boolean sentDictBytesOwned;
     private int sentDictCount;
-    // Relative byte end of every [len varint][utf8] entry in sentDictBytesAddr.
-    // The mirror is parsed once as it is built/recovered; reconnect catch-up then
-    // reads fixed-width offsets instead of decoding every length varint again.
-    private long sentDictEntryEndsAddr;
-    private int sentDictEntryEndsCapacity;
-    private int sentDictIndexedCount;
     // True when replay frames can start above dictionary id zero and therefore
     // depend on a catch-up on a fresh connection. Delta-enabled live engines
     // always have this dependency. A recovered delta slot whose dictionary
@@ -326,7 +319,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // second WebSocket payload slice, avoiding a full-dictionary staging copy.
     private long catchUpFrameAddr;
     private int catchUpFrameCapacity;
-    private int catchUpEntryIndexBuildCount;
     private int catchUpFrameGrowthCount;
     // Orphan-policy cap-gap attempts -- catch-ups that reached a node and found an entry
     // too large for its batch cap -- with no intervening successful catch-up or unrelated
@@ -2484,15 +2476,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (deltaCount <= 0 || deltaStart > sentDictCount || deltaEnd <= sentDictCount) {
             return;
         }
-        // Deliberately does NOT touch the entry-ends index. Only sendDictCatchUp reads
-        // it, so maintaining it here would put a store per new symbol on the per-frame
-        // I/O path -- and on the workload this feature targets (a new symbol per ROW)
-        // that is a store per row, plus 4 bytes per symbol retained for the connection's
-        // whole life, to serve a reconnect that may never happen. sendDictCatchUp calls
-        // ensureSentDictEntryIndex(), which notices sentDictIndexedCount has fallen
-        // behind sentDictCount and rebuilds; that O(n) walk runs at most once per
-        // reconnect and is dwarfed by shipping the same n bytes over the wire. A
-        // connection that never reconnects now never allocates the index at all.
+        // Keeps no per-entry offset index: the mirror stores each entry as
+        // [len varint][utf8], so the reconnect catch-up (sendDictCatchUp) walks it with
+        // a running pointer on demand. Maintaining an index here would put a store per
+        // new symbol on the per-frame I/O path -- and on the workload this feature
+        // targets (a new symbol per ROW) that is a store per row -- to serve a reconnect
+        // that may never happen; the catch-up's single walk is dwarfed by shipping the
+        // same n bytes over the wire.
         //
         // Walk past the already-held prefix [deltaStart, sentDictCount), then copy
         // the new tail [sentDictCount, deltaEnd).
@@ -2507,7 +2497,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long regionStart = p;
         long newCount = deltaEnd - sentDictCount;
         // Walk the new tail only to find where it ends; the entry boundaries are not
-        // recorded here (see above -- the catch-up rebuilds them on demand).
+        // recorded here (see above -- the catch-up re-walks the mirror when it needs them).
         for (long i = 0; i < newCount; i++) {
             long len = readVarintAt(p, limit);
             p = varintEnd + len;
@@ -2574,76 +2564,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (sentDictBytesAddr != 0 && sentDictBytesOwned) {
             Unsafe.free(sentDictBytesAddr, sentDictBytesCapacity, MemoryTag.NATIVE_DEFAULT);
         }
-        if (sentDictEntryEndsAddr != 0L) {
-            Unsafe.free(
-                    sentDictEntryEndsAddr,
-                    sentDictEntryEndsCapacity * Integer.BYTES,
-                    MemoryTag.NATIVE_DEFAULT);
-        }
         sentDictBytesAddr = 0;
         sentDictBytesCapacity = 0;
         sentDictBytesLen = 0;
         sentDictBytesOwned = false;
         sentDictCount = 0;
-        sentDictEntryEndsAddr = 0L;
-        sentDictEntryEndsCapacity = 0;
-        sentDictIndexedCount = 0;
-    }
-
-    private void ensureSentDictEntryEndsCapacity(long required) {
-        if (required <= sentDictEntryEndsCapacity) {
-            return;
-        }
-        if (required > MAX_SENT_DICT_ENTRIES) {
-            LineSenderException err = new LineSenderException(
-                    "symbol dictionary entry index exceeds the maximum size [required="
-                            + required + ", max=" + MAX_SENT_DICT_ENTRIES + ']');
-            recordFatal(err);
-            throw err;
-        }
-        long newCapacity = Math.max(
-                (long) sentDictEntryEndsCapacity * 2L,
-                Math.max(1024L, required));
-        if (newCapacity > MAX_SENT_DICT_ENTRIES) {
-            newCapacity = MAX_SENT_DICT_ENTRIES;
-        }
-        sentDictEntryEndsAddr = Unsafe.realloc(
-                sentDictEntryEndsAddr,
-                sentDictEntryEndsCapacity * Integer.BYTES,
-                (int) newCapacity * Integer.BYTES,
-                MemoryTag.NATIVE_DEFAULT);
-        sentDictEntryEndsCapacity = (int) newCapacity;
-    }
-
-    private void ensureSentDictEntryIndex() {
-        if (sentDictIndexedCount != sentDictCount) {
-            rebuildSentDictEntryIndex();
-        }
-    }
-
-    private void rebuildSentDictEntryIndex() {
-        ensureSentDictEntryEndsCapacity(sentDictCount);
-        long p = sentDictBytesAddr;
-        long limit = sentDictBytesAddr + sentDictBytesLen;
-        for (int i = 0; i < sentDictCount; i++) {
-            long len = readVarintAt(p, limit);
-            p = varintEnd + len;
-            if (p > limit) {
-                throw new LineSenderException(
-                        "invalid symbol dictionary mirror while building the entry index [entry="
-                                + i + ", count=" + sentDictCount + ']');
-            }
-            Unsafe.getUnsafe().putInt(
-                    sentDictEntryEndsAddr + (long) i * Integer.BYTES,
-                    (int) (p - sentDictBytesAddr));
-        }
-        if (p != limit) {
-            throw new LineSenderException(
-                    "invalid symbol dictionary mirror length while building the entry index [indexed="
-                            + (p - sentDictBytesAddr) + ", length=" + sentDictBytesLen + ']');
-        }
-        sentDictIndexedCount = sentDictCount;
-        catchUpEntryIndexBuildCount++;
     }
 
     private long readVarintAt(long p, long limit) {
@@ -2693,7 +2618,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             resetCatchUpCapGapEpisode();
             return 1;
         }
-        ensureSentDictEntryIndex();
         // The frame ceiling a catch-up chunk must not exceed: the server's
         // advertised cap, or -- when the server advertises none (cap <= 0) --
         // MAX_SENT_DICT_BYTES so sendCatchUpChunk's int frameLen (HEADER_SIZE +
@@ -2717,15 +2641,27 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long chunkStartAddr = sentDictBytesAddr;
         int chunkSymbols = 0;
         long chunkBytes = 0;
+        // Walk the mirror once with a running pointer, deriving each entry's byte span
+        // from its own [len varint][utf8] framing -- no separate offset index is kept
+        // (see accumulateSentDict). A mirror built from CRC-validated frames is always
+        // well-formed, so entryEnd can exceed the limit only under memory corruption;
+        // latch a terminal via recordFatal rather than let a bare throw unwind into
+        // connectLoop as a transient and reconnect-livelock.
+        long entryPtr = sentDictBytesAddr;
+        long mirrorLimit = sentDictBytesAddr + sentDictBytesLen;
         for (int entryId = 0; entryId < sentDictCount; entryId++) {
-            int entryStartOffset = entryId == 0
-                    ? 0
-                    : Unsafe.getUnsafe().getInt(
-                            sentDictEntryEndsAddr + (long) (entryId - 1) * Integer.BYTES);
-            int entryEndOffset = Unsafe.getUnsafe().getInt(
-                    sentDictEntryEndsAddr + (long) entryId * Integer.BYTES);
-            long entryStart = sentDictBytesAddr + entryStartOffset;
-            long entryBytes = entryEndOffset - entryStartOffset;
+            long entryStart = entryPtr;
+            long entryLen = readVarintAt(entryPtr, mirrorLimit);
+            long entryEnd = varintEnd + entryLen;
+            if (entryEnd > mirrorLimit) {
+                LineSenderException err = new LineSenderException(
+                        "invalid symbol dictionary mirror during catch-up [entry="
+                                + entryId + ", count=" + sentDictCount + ']');
+                recordFatal(err);
+                throw new CatchUpSendException(err);
+            }
+            entryPtr = entryEnd;
+            long entryBytes = entryEnd - entryStart;
             // The exact table-less frame sendCatchUpChunk would build for THIS entry
             // alone: header + deltaStart varint (the entry's own global id) +
             // deltaCount varint (1) + the entry bytes. A cap gap exists only when even
@@ -2893,11 +2829,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         nextWireSeq++; // this catch-up chunk consumed a wire sequence
         lastFrameOrPingNanos = System.nanoTime();
         totalFramesSent.incrementAndGet();
-    }
-
-    @TestOnly
-    public int catchUpEntryIndexBuildCount() {
-        return catchUpEntryIndexBuildCount;
     }
 
     @TestOnly
