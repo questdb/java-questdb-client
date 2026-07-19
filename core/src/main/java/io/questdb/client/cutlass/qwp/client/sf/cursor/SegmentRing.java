@@ -226,16 +226,16 @@ public final class SegmentRing implements QuietCloseable {
 
         ObjList<MmapSegment> all = new ObjList<>();
         // Files whose own bytes prove corruption (bad magic, sub-header size,
-        // negative baseSeq, unreadable header page). They are excluded from
-        // the chain and quarantined to <name>.corrupt — but only AFTER the
-        // surviving chain validates (or resolves to EMPTY), so a failed
-        // recovery never mutates the slot. Whether a quarantined file was
-        // load-bearing is decided by the manifest-boundary / contiguity
-        // checks below, not by the skip itself. Operational open errors
-        // (EMFILE, EACCES, mmap rejection, unsupported version) are NOT in
-        // this bucket: they throw the plain MmapSegmentException type and
-        // abort recovery, because the underlying file may be perfectly
-        // intact and silently dropping it could lose durable frames.
+        // negative baseSeq). They are excluded from the chain and quarantined
+        // to <name>.corrupt — but only AFTER the surviving chain validates (or
+        // resolves to EMPTY), so a failed recovery never mutates the slot.
+        // Whether a quarantined file was load-bearing is decided by the
+        // manifest-boundary / contiguity checks below, not by the skip itself.
+        // Operational open/stat/read/mmap errors, observed size instability,
+        // and unsupported versions are NOT in this bucket: they throw the
+        // plain MmapSegmentException type and abort recovery, because the
+        // underlying file may be perfectly intact and silently dropping it
+        // could lose durable frames.
         ObjList<String> corruptPaths = null;
         SfManifest manifest = null;
         try {

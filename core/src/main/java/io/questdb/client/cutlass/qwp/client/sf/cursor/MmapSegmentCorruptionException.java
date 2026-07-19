@@ -27,9 +27,9 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 /**
  * Positively-identified segment corruption: the file's own bytes prove it is
  * not (or no longer) a readable SF segment — truncated below the fixed header,
- * wrong magic, a negative {@code baseSeq}, or an unreadable (unbacked/torn)
- * header page. Distinct from its parent {@link MmapSegmentException}, which
- * recovery treats as an <b>operational</b> failure (open/mmap error on a file
+ * wrong magic, or a negative {@code baseSeq}. Distinct from its parent
+ * {@link MmapSegmentException}, which recovery treats as an <b>operational</b>
+ * failure (open/read/mmap error on a file
  * whose contents may be perfectly intact) and must therefore be fatal.
  * <p>
  * Recovery quarantines corruption (rename to {@code <name>.corrupt}) and

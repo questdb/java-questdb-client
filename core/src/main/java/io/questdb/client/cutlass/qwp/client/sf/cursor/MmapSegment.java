@@ -65,8 +65,8 @@ public final class MmapSegment implements QuietCloseable {
     public static final int HEADER_SIZE = 24;
     public static final byte MANIFEST_REQUIRED_FLAG = 1;
     public static final byte VERSION = 1;
-    private static final int[] CRC32C_TABLE = buildCrc32cTable();
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
+    private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
     private final String path;
@@ -102,8 +102,8 @@ public final class MmapSegment implements QuietCloseable {
     // close deliberately retains it so a cursor can advance after head trim.
     private volatile MmapSegment successor;
     // Bytes between the last valid frame and the file end that look like an
-    // attempted-but-invalid frame write (non-zero bytes at the bail-out
-    // position). Zero for fresh segments and for cleanly partially-filled
+    // attempted-but-invalid frame write (the suffix contains non-zero bytes).
+    // Zero for fresh segments and for cleanly partially-filled
     // segments (uninitialised tail). Set only by openExisting; visible to
     // recovery callers for diagnostics. Final after construction.
     private final long tornTailBytes;
@@ -257,16 +257,16 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Opens an existing segment file for recovery. mmaps it RW, validates the
-     * header magic / version, then scans frames forward verifying each CRC.
+     * Opens an existing segment file for recovery. Validates the header and
+     * scans frames through positioned reads, then mmaps the validated file RW.
      * The first bad CRC (or a frame whose declared length runs past the file
      * end) is treated as a torn tail; both cursors are positioned at the
      * start of that frame. Returns the segment ready for further appends.
      * Throws {@link MmapSegmentException} on header validation failure.
      * <p>
-     * If recovery observes a torn tail (the bytes at the bail-out position
-     * are non-zero, indicating an attempted-but-failed frame write rather
-     * than clean unwritten space), a {@code WARN} is emitted with the byte
+     * If recovery observes a torn tail (the suffix after the last valid frame
+     * contains non-zero bytes, indicating an attempted-but-failed frame write
+     * rather than clean unwritten space), a {@code WARN} is emitted with the byte
      * count and the bytes are exposed via {@link #tornTailBytes()} so
      * operators can detect silent truncation from corruption or partial
      * writes. Clean partial fills (writer never attempted to write past the
@@ -277,100 +277,90 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Facade-aware variant of {@link #openExisting(String)} that takes the file
-     * length (and open/close) through a {@link FilesFacade} instead of straight
-     * off {@link Files}. Production uses {@link FilesFacade#INSTANCE}; the seam
-     * exists so recovery's mmap-fault guard can be regression-tested on any
-     * filesystem.
+     * Facade-aware variant of {@link #openExisting(String)}. Recovery reads the
+     * file through {@link FilesFacade#read(int, long, long, long)} before it
+     * creates the mapping, so sparse or unbacked pages cannot raise SIGBUS in
+     * the JVM. The descriptor length is checked before and after the scan and
+     * again after mmap; a short read or size change is an operational failure
+     * and aborts recovery.
      * <p>
-     * The mapping is sized to {@code ff.length(path)} and every recovery read
-     * runs straight out of it, so a facade that reports a length <em>larger</em>
-     * than the real file makes the mapping extend past end-of-file. A read of a
-     * page beyond real EOF raises SIGBUS on <em>every</em> filesystem — the same
-     * fault an unbacked/sparse page raises on ZFS, but reproduced
-     * deterministically on ext4/xfs, where a within-EOF hole would instead
-     * zero-fill and never exercise the guard. See
-     * {@link FilesFacade#length(String)}.
+     * The caller must prevent concurrent writers from modifying the file during
+     * recovery and for the lifetime of the returned segment. The length checks
+     * detect observed truncate/extend races, but no mmap-based implementation
+     * can remain safe against uncoordinated mutation after the final check.
      */
     public static MmapSegment openExisting(FilesFacade ff, String path) {
-        long fileSize = ff.length(path);
-        if (fileSize < HEADER_SIZE) {
-            // Corruption, not an operational error: the bytes themselves prove
-            // this cannot be a whole segment (a create() is never durable at a
-            // sub-header size — allocate() reserves the full extent up front).
-            throw new MmapSegmentCorruptionException(
-                    "file shorter than header: " + path + " size=" + fileSize);
-        }
         int fd = ff.openRW(path);
         if (fd < 0) {
             throw new MmapSegmentException("openRW failed for " + path);
         }
         long addr = Files.FAILED_MMAP_ADDRESS;
+        long fileSize = -1L;
         try {
+            fileSize = ff.length(fd);
+            if (fileSize < 0) {
+                throw new MmapSegmentException(
+                        "could not stat open segment " + path + " [errno=" + Os.errno() + ']');
+            }
+            if (fileSize < HEADER_SIZE) {
+                // Corruption, not an operational error: the bytes themselves prove
+                // this cannot be a whole segment (a create() is never durable at a
+                // sub-header size — allocate() reserves the full extent up front).
+                throw new MmapSegmentCorruptionException(
+                        "file shorter than header: " + path + " size=" + fileSize);
+            }
+
+            RecoveryScan scan = scanForRecovery(ff, fd, path, fileSize);
+            long finalSize = ff.length(fd);
+            if (finalSize < 0) {
+                throw new MmapSegmentException(
+                        "could not re-stat open segment " + path + " [errno=" + Os.errno() + ']');
+            }
+            if (finalSize != fileSize) {
+                throw new MmapSegmentException(
+                        "segment size changed during recovery: " + path
+                                + " [before=" + fileSize + ", after=" + finalSize + ']');
+            }
+
             addr = ff.mmap(fd, fileSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
                 throw new MmapSegmentException("mmap failed for " + path);
             }
-            int magic = Unsafe.getUnsafe().getInt(addr);
-            if (magic != FILE_MAGIC) {
-                throw new MmapSegmentCorruptionException(
-                        "bad magic in " + path + ": 0x" + Integer.toHexString(magic));
+            long mappedSize = ff.length(fd);
+            if (mappedSize < 0) {
+                throw new MmapSegmentException(
+                        "could not stat mapped segment " + path + " [errno=" + Os.errno() + ']');
             }
-            byte version = Unsafe.getUnsafe().getByte(addr + 4);
-            if (version != VERSION) {
-                // Deliberately NOT the corruption subtype: an unsupported
-                // version is a well-formed segment written by a different
-                // client build (e.g. after a downgrade). Quarantine-renaming
-                // it would strand its frames for the writer that CAN read it;
-                // failing recovery keeps the slot intact for that writer.
-                throw new MmapSegmentException("unsupported version in " + path + ": " + version);
+            if (mappedSize != fileSize) {
+                throw new MmapSegmentException(
+                        "segment size changed while mapping: " + path
+                                + " [before=" + fileSize + ", after=" + mappedSize + ']');
             }
-            long baseSeq = Unsafe.getUnsafe().getLong(addr + 8);
-            // FSNs are non-negative by construction (see SegmentRing).
-            // A negative baseSeq on disk means bit-rot or a malicious file —
-            // refuse the segment so SegmentRing.openExisting's narrow catch
-            // skips it like any other unreadable .sfa rather than feeding
-            // the bad value into Long.compareUnsigned-based contiguity
-            // checks (which would place the segment last in baseSeq order
-            // and trip the FSN-gap throw, taking the whole recovery down).
-            if (baseSeq < 0L) {
-                throw new MmapSegmentCorruptionException(
-                        "bad baseSeq in " + path + ": " + baseSeq);
-            }
-            long lastGood = scanFrames(addr, fileSize);
-            long count = countFrames(addr, lastGood);
-            long tornTail = detectTornTail(addr, lastGood, fileSize);
-            if (tornTail > 0) {
+            if (scan.tornTailBytes > 0) {
                 LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
                                 + "(file size {}, frames recovered {}). "
                                 + "Recovery will overwrite this region on next append; "
                                 + "frames past the tear (if any) are discarded. "
                                 + "Investigate disk health or unexpected writer crash.",
-                        path, tornTail, lastGood, fileSize, count);
+                        path, scan.tornTailBytes, scan.lastGood, fileSize, scan.frameCount);
             }
-            return new MmapSegment(ff, path, fd, addr, fileSize, baseSeq, lastGood, count, false, tornTail);
+            return new MmapSegment(
+                    ff,
+                    path,
+                    fd,
+                    addr,
+                    fileSize,
+                    scan.baseSeq,
+                    scan.lastGood,
+                    scan.frameCount,
+                    false,
+                    scan.tornTailBytes
+            );
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 ff.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
             }
             ff.close(fd);
-            // The header reads above (magic/version/baseSeq) run before
-            // scanFrames and are otherwise unguarded. An unbacked page 0 --
-            // an unflushed header on a truncate-based-allocate filesystem
-            // after a crash (create() does not msync), or a file truncated
-            // under the mapping -- faults at the Unsafe intrinsic site as a
-            // catchable InternalError. Convert it to a MmapSegmentException so
-            // SegmentRing's per-file catch skips just this .sfa, instead of
-            // letting the raw InternalError escape to SegmentRing's outer catch
-            // and abort recovery of every sibling segment. scanFrames and
-            // detectTornTail already handle their own in-mapping faults; this
-            // covers the header block and any future reader placed ahead of the
-            // scan.
-            if (isMmapAccessFault(t)) {
-                throw new MmapSegmentCorruptionException(
-                        "unreadable mapped header page in " + path
-                                + " (unbacked/sparse page 0): " + t.getMessage(), t);
-            }
             throw t;
         }
     }
@@ -598,204 +588,220 @@ public final class MmapSegment implements QuietCloseable {
      * recovery observes non-zero bytes past the bail-out point. {@code 0} for
      * fresh segments, memory-backed segments, and cleanly partially-filled
      * recovered segments. Operators / tests can read this to tell silent
-     * truncation (corruption) from a normal partial fill (no incident).
-     * <p>
-     * One case this does NOT count: when the scan stops because the bail-out
-     * region is itself an unbacked mapped page (an in-mapping fault, not a
-     * backed torn header), that region cannot be probed, so this returns
-     * {@code 0} even though frames may have been discarded. That outcome is
-     * surfaced by the {@code WARN} in {@link #scanFrames} instead -- see it for
-     * the benign-tail-vs-media-error caveat.
+     * truncation (corruption) from a normal partial fill (no incident). Sparse
+     * holes read back as zeroes; an actual positioned-read failure aborts
+     * recovery instead of being classified as a clean tail.
      */
     public long tornTailBytes() {
         return tornTailBytes;
     }
 
     /**
-     * True when {@code t} is the JVM's recoverable signal for a fault while
-     * accessing a memory-mapped region -- a SIGBUS/SIGSEGV that HotSpot
-     * translates into an {@code InternalError} at an {@code Unsafe} intrinsic
-     * site instead of aborting the process. It surfaces when a mapped page is
-     * not backed by real file blocks: a sparse {@code .sfa} tail on a
-     * filesystem whose pre-allocation leaves holes (e.g. ZFS, where a
-     * truncate-based {@code allocate} does not materialize blocks), or a file
-     * truncated under the mapping. Recovery treats this as an I/O boundary --
-     * the same way MappedByteBuffer readers do -- not a fatal VM error.
-     * <p>
-     * The message is matched on the fragment {@code "unsafe memory access
-     * operation"}, which is common to both HotSpot wordings and NOT
-     * version-stable as a whole: pre-21 JDKs (including the shipping/CI JDK 8)
-     * emit {@code "a fault occurred in a recent unsafe memory access operation
-     * in compiled Java code"}, while JDK 21+ shortened it to {@code "a fault
-     * occurred in an unsafe memory access operation"}. Matching the shared
-     * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
-     * still being specific enough that a genuine VirtualMachineError (real OOM,
-     * StackOverflow) is never swallowed.
+     * Scans the header and frames through a bounded positioned-read buffer.
+     * Sparse file holes are returned by {@code pread}/{@code ReadFile} as zero
+     * bytes, while media errors and concurrent truncation surface as ordinary
+     * read failures. No recovery byte is dereferenced through mmap.
      */
-    private static boolean isMmapAccessFault(Throwable t) {
-        if (!(t instanceof InternalError)) {
-            return false;
-        }
-        String msg = t.getMessage();
-        return msg != null && msg.contains("unsafe memory access operation");
-    }
+    private static RecoveryScan scanForRecovery(
+            FilesFacade ff,
+            int fd,
+            String path,
+            long fileSize
+    ) {
+        try (RecoveryReader reader = new RecoveryReader(ff, fd, path, fileSize)) {
+            int magic = reader.getInt(0L);
+            if (magic != FILE_MAGIC) {
+                throw new MmapSegmentCorruptionException(
+                        "bad magic in " + path + ": 0x" + Integer.toHexString(magic));
+            }
+            byte version = reader.getByte(4L);
+            if (version != VERSION) {
+                // Deliberately NOT the corruption subtype: an unsupported
+                // version is a well-formed segment written by a different
+                // client build (e.g. after a downgrade). Quarantine-renaming
+                // it would strand its frames for the writer that CAN read it;
+                // failing recovery keeps the slot intact for that writer.
+                throw new MmapSegmentException("unsupported version in " + path + ": " + version);
+            }
+            long baseSeq = reader.getLong(8L);
+            // FSNs are non-negative by construction (see SegmentRing). A
+            // negative value on disk is positively identified corruption.
+            if (baseSeq < 0L) {
+                throw new MmapSegmentCorruptionException(
+                        "bad baseSeq in " + path + ": " + baseSeq);
+            }
 
-    /**
-     * Forward scan that returns the offset just past the last frame whose
-     * CRC verifies. A torn-tail frame (declared length runs past EOF, or
-     * CRC mismatch) leaves both cursors at the start of that frame; the
-     * next {@link #tryAppend} will overwrite it. The scan only reads from
-     * the mapping — no syscalls.
-     */
-    private static long scanFrames(long addr, long fileSize) {
-        long pos = HEADER_SIZE;
-        try {
-            while (pos + FRAME_HEADER_SIZE <= fileSize) {
-                int crcRead = Unsafe.getUnsafe().getInt(addr + pos);
-                int payloadLen = Unsafe.getUnsafe().getInt(addr + pos + 4);
-                // Defensive: a corrupt length field could be enormous or negative,
-                // both of which would otherwise overrun the mapping.
-                if (payloadLen < 0 || pos + FRAME_HEADER_SIZE + payloadLen > fileSize) {
-                    return pos;
+            long frameCount = 0L;
+            long pos = HEADER_SIZE;
+            while (fileSize - pos >= FRAME_HEADER_SIZE) {
+                int crcRead = reader.getInt(pos);
+                int payloadLen = reader.getInt(pos + 4L);
+                // Avoid addition overflow while rejecting a negative or
+                // beyond-EOF frame length as a torn tail.
+                if (payloadLen < 0 || payloadLen > fileSize - pos - FRAME_HEADER_SIZE) {
+                    break;
                 }
-                // CRC over the contiguous (payloadLen, payload) pair, folded
-                // via Unsafe reads rather than the native Crc32c.update.
-                // Recovery maps to the file's stat length, but a page inside
-                // that range can be unbacked: a sparse pre-allocation tail (a
-                // truncate-based allocate that never materialized blocks, as on
-                // ZFS), or -- via a torn write, since tryAppend writes the
-                // length field before copying the payload -- a real positive
-                // payloadLen whose payload spans into an unwritten hole. A raw
-                // read of an unbacked page raises SIGBUS; HotSpot translates
-                // that into a catchable InternalError ONLY at an Unsafe
-                // intrinsic site, NEVER inside JNI native code, so a native
-                // Crc32c.update over such a page aborts the whole JVM (and,
-                // empirically on pre-21 JDKs, a preceding Unsafe pre-touch does
-                // not reliably fault first once an earlier native CRC ran in
-                // the same scan). Folding over Unsafe keeps every fault
-                // catchable -- handled below as the boundary of recoverable
-                // data; a page that instead reads back as zeroes just fails the
-                // CRC check and ends the scan. Recovery is cold, so the slower
-                // table CRC here is immaterial.
-                int crcCalc = crc32cRecovery(addr + pos + 4, 4L + payloadLen);
+                int crcCalc = reader.crc32c(pos + 4L, 4L + payloadLen);
                 if (crcCalc != crcRead) {
-                    return pos;
+                    break;
                 }
                 pos += FRAME_HEADER_SIZE + payloadLen;
+                frameCount++;
             }
-        } catch (InternalError e) {
-            // The read at `pos` hit a mapped page that is not backed by real
-            // file blocks: the JVM translates the underlying SIGBUS into a
-            // recoverable InternalError instead of aborting the process. This
-            // happens when a prior session left a sparse segment tail (a
-            // truncate-based pre-allocation that does not materialize blocks,
-            // as on ZFS) or the file was truncated under the mapping. Every
-            // frame below `pos` already verified; treat the unreadable region
-            // exactly like unwritten space or a torn tail -- the boundary of
-            // recoverable data -- rather than letting the error abort recovery
-            // of the whole slot. Anything that is not the documented mmap
-            // access fault is a genuine VM error, so rethrow it.
-            if (!isMmapAccessFault(e)) {
-                throw e;
-            }
-            LOG.warn("SF segment recovery: unreadable mapped page at offset {} (file size {}); "
-                            + "treating it as the end of recoverable data -- any frames beyond this "
-                            + "offset are discarded. The usual cause is a benign sparse pre-allocation "
-                            + "tail (e.g. a truncate-based allocate on ZFS) left by a prior session, "
-                            + "but a mid-file media error (bad sector) is indistinguishable here; "
-                            + "check disk health if this segment was expected to be fully written or "
-                            + "if this recurs.",
-                    pos, fileSize);
+            long tornTailBytes = detectTornTail(reader, pos, fileSize);
+            return new RecoveryScan(baseSeq, frameCount, pos, tornTailBytes);
         }
-        return pos;
     }
 
     /**
-     * CRC-32C (Castagnoli) of {@code [addr, addr + len)} read through
-     * {@link Unsafe}, seeded like {@code Crc32c.update(Crc32c.INIT, addr, len)}
-     * and bit-identical to it (verified) -- but every byte load is an Unsafe
-     * intrinsic, so a fault on an unbacked mapped page is a catchable
-     * {@link InternalError} instead of the uncatchable JNI SIGBUS the native
-     * {@link Crc32c} would raise. Byte-at-a-time via a precomputed table
-     * ({@code ~0.5 GiB/s}); used only on the cold recovery scan, never on the
-     * append hot path (which stays on the native, hardware-friendly path).
+     * Distinguishes attempted frame data from clean zero-filled space after the
+     * recovery boundary. The entire suffix is inspected: an all-zero corrupt
+     * frame header must not hide a non-zero payload or later frames and make a
+     * data-bearing segment look like a reusable empty spare. Positioned-read
+     * failures are intentionally not swallowed; they are operational failures,
+     * not proof of an unwritten tail.
      */
-    private static int crc32cRecovery(long addr, long len) {
-        int crc = ~Crc32c.INIT;
-        for (long i = 0; i < len; i++) {
-            crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ Unsafe.getUnsafe().getByte(addr + i)) & 0xFF];
-        }
-        return ~crc;
-    }
-
-    /**
-     * Standard reflected CRC-32C byte table (polynomial {@code 0x82F63B78}),
-     * matching {@code crc32c_table[0]} in the native {@code crc32c.c}. Computed
-     * at class init to avoid 256 hand-transcribed literals; drives
-     * {@link #crc32cRecovery}.
-     */
-    private static int[] buildCrc32cTable() {
-        int[] table = new int[256];
-        for (int n = 0; n < 256; n++) {
-            int c = n;
-            for (int k = 0; k < 8; k++) {
-                c = (c & 1) != 0 ? (0x82F63B78 ^ (c >>> 1)) : (c >>> 1);
-            }
-            table[n] = c;
-        }
-        return table;
-    }
-
-    /**
-     * Distinguishes "torn tail" (writer attempted a write past the last valid
-     * frame and failed — partial write, mid-stream corruption, bit rot) from
-     * clean unwritten space (manager-allocated segment with zero-filled tail).
-     * Returns the byte count from {@code lastGood} to {@code fileSize} when
-     * the bytes at the bail-out frame header are non-zero, else {@code 0}.
-     * <p>
-     * Heuristic but robust for the common cases: {@link #create} truncates the
-     * file to size, leaving the tail zero-filled; the writer only writes
-     * non-zero bytes via {@link #tryAppend}, which writes the CRC and length
-     * fields together. So a non-zero byte at the failed-frame position
-     * implies an attempted write — exactly the case operators want flagged.
-     */
-    private static long detectTornTail(long addr, long lastGood, long fileSize) {
+    private static long detectTornTail(RecoveryReader reader, long lastGood, long fileSize) {
         if (lastGood >= fileSize) {
             return 0L;
         }
-        long probe = Math.min(FRAME_HEADER_SIZE, fileSize - lastGood);
-        try {
-            for (long i = 0; i < probe; i++) {
-                if (Unsafe.getUnsafe().getByte(addr + lastGood + i) != 0) {
-                    return fileSize - lastGood;
-                }
-            }
-        } catch (InternalError e) {
-            // The bail-out region is an unbacked (sparse) mapped page -- see
-            // scanFrames for the mechanism. An unbacked hole was never written,
-            // so it is clean unwritten space, not a torn write. Rethrow any
-            // error that is not the recoverable mmap access fault.
-            if (!isMmapAccessFault(e)) {
-                throw e;
-            }
-            return 0L;
-        }
-        return 0L;
+        return reader.hasNonZero(lastGood, fileSize - lastGood)
+                ? fileSize - lastGood
+                : 0L;
     }
 
-    /**
-     * Counts frames in {@code [HEADER_SIZE, lastGood)}. Walks the framing in
-     * lockstep with {@link #scanFrames} (which already validated CRCs); so
-     * this is just length-driven traversal, no CRC re-check.
-     */
-    private static long countFrames(long addr, long lastGood) {
-        long pos = HEADER_SIZE;
-        long count = 0;
-        while (pos < lastGood) {
-            int payloadLen = Unsafe.getUnsafe().getInt(addr + pos + 4);
-            pos += FRAME_HEADER_SIZE + payloadLen;
-            count++;
+    private static final class RecoveryReader implements QuietCloseable {
+        private final long bufferAddress;
+        private final int fd;
+        private final FilesFacade filesFacade;
+        private final long fileSize;
+        private final String path;
+        private int bufferLength;
+        private long bufferOffset = -1L;
+
+        private RecoveryReader(FilesFacade filesFacade, int fd, String path, long fileSize) {
+            this.filesFacade = filesFacade;
+            this.fd = fd;
+            this.path = path;
+            this.fileSize = fileSize;
+            this.bufferAddress = Unsafe.malloc(RECOVERY_BUFFER_SIZE, MemoryTag.NATIVE_DEFAULT);
         }
-        return count;
+
+        @Override
+        public void close() {
+            Unsafe.free(bufferAddress, RECOVERY_BUFFER_SIZE, MemoryTag.NATIVE_DEFAULT);
+        }
+
+        private int crc32c(long offset, long len) {
+            int crc = Crc32c.INIT;
+            while (len > 0L) {
+                ensure(offset, 1);
+                int bufferIndex = (int) (offset - bufferOffset);
+                long chunk = Math.min(len, bufferLength - bufferIndex);
+                crc = Crc32c.update(crc, bufferAddress + bufferIndex, chunk);
+                offset += chunk;
+                len -= chunk;
+            }
+            return crc;
+        }
+
+        private void ensure(long offset, int requiredBytes) {
+            if (offset >= bufferOffset
+                    && offset - bufferOffset <= bufferLength - requiredBytes) {
+                return;
+            }
+            if (offset < 0L || requiredBytes < 0 || offset > fileSize - requiredBytes) {
+                throw new MmapSegmentException(
+                        "recovery read outside segment " + path
+                                + " [offset=" + offset + ", required=" + requiredBytes
+                                + ", fileSize=" + fileSize + ']');
+            }
+            int len = (int) Math.min((long) RECOVERY_BUFFER_SIZE, fileSize - offset);
+            readFully(bufferAddress, len, offset);
+            bufferOffset = offset;
+            bufferLength = len;
+        }
+
+        private byte getByte(long offset) {
+            ensure(offset, 1);
+            return Unsafe.getUnsafe().getByte(bufferAddress + offset - bufferOffset);
+        }
+
+        private int getInt(long offset) {
+            ensure(offset, Integer.BYTES);
+            return Unsafe.getUnsafe().getInt(bufferAddress + offset - bufferOffset);
+        }
+
+        private long getLong(long offset) {
+            ensure(offset, Long.BYTES);
+            return Unsafe.getUnsafe().getLong(bufferAddress + offset - bufferOffset);
+        }
+
+        private boolean hasNonZero(long offset, long len) {
+            boolean nonZero = false;
+            while (len > 0L) {
+                ensure(offset, 1);
+                int bufferIndex = (int) (offset - bufferOffset);
+                int chunk = (int) Math.min(len, bufferLength - bufferIndex);
+                long address = bufferAddress + bufferIndex;
+                int i = 0;
+                while (i < chunk && ((address + i) & (Long.BYTES - 1L)) != 0L) {
+                    nonZero |= Unsafe.getUnsafe().getByte(address + i++) != 0;
+                }
+                while (i <= chunk - Long.BYTES) {
+                    nonZero |= Unsafe.getUnsafe().getLong(address + i) != 0L;
+                    i += Long.BYTES;
+                }
+                while (i < chunk) {
+                    nonZero |= Unsafe.getUnsafe().getByte(address + i++) != 0;
+                }
+                offset += chunk;
+                len -= chunk;
+            }
+            return nonZero;
+        }
+
+        private void readFully(long address, long len, long offset) {
+            long read = 0L;
+            while (read < len) {
+                long n = filesFacade.read(fd, address + read, len - read, offset + read);
+                if (n < 0L) {
+                    throw new MmapSegmentException(
+                            "could not read SF segment " + path
+                                    + " [offset=" + (offset + read)
+                                    + ", remaining=" + (len - read)
+                                    + ", errno=" + Os.errno() + ']');
+                }
+                if (n == 0L) {
+                    throw new MmapSegmentException(
+                            "short read while recovering SF segment " + path
+                                    + " [offset=" + (offset + read)
+                                    + ", remaining=" + (len - read)
+                                    + ", fileSize=" + fileSize + ']');
+                }
+                if (n > len - read) {
+                    throw new MmapSegmentException(
+                            "invalid read length while recovering SF segment " + path
+                                    + " [offset=" + (offset + read)
+                                    + ", requested=" + (len - read)
+                                    + ", actual=" + n + ']');
+                }
+                read += n;
+            }
+        }
+    }
+
+    private static final class RecoveryScan {
+        private final long baseSeq;
+        private final long frameCount;
+        private final long lastGood;
+        private final long tornTailBytes;
+
+        private RecoveryScan(long baseSeq, long frameCount, long lastGood, long tornTailBytes) {
+            this.baseSeq = baseSeq;
+            this.frameCount = frameCount;
+            this.lastGood = lastGood;
+            this.tornTailBytes = tornTailBytes;
+        }
     }
 }

@@ -28,10 +28,10 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
  * Hard failure of the MmapSegment layer — bad header, mmap rejection, file
  * too short for header, etc. Indicates the segment is unusable, not that
  * the disk is full (the latter surfaces as backpressure on the producer
- * via {@link io.questdb.client.cutlass.qwp.client.LineSenderException}).
+ * via {@link io.questdb.client.cutlass.line.LineSenderException}).
  * <p>
  * Recovery distinguishes two flavors: this base type marks <b>operational</b>
- * failures (open/mmap/enumeration errors — the file's contents may be fine,
+ * failures (open/read/mmap/enumeration errors — the file's contents may be fine,
  * so recovery must fail closed), while the {@link MmapSegmentCorruptionException}
  * subtype marks <b>positively-identified corruption</b> in the file's own
  * bytes, which recovery may quarantine instead of aborting.

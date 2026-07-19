@@ -48,7 +48,7 @@ import java.util.Map;
 
 /**
  * Regression tests for the SF recovery fail-open findings: directory
- * enumeration errors, per-file open/mmap errors and boundary (leading /
+ * enumeration errors, per-file open/read/mmap errors and boundary (leading /
  * trailing) segment loss must fail startup without mutating the slot, while
  * positively-identified corruption is quarantined only after the surviving
  * chain validates. Also pins the crash-window states of the manifest
@@ -180,6 +180,41 @@ public class SegmentRecoveryIntegrityTest {
             try {
                 SegmentRing.openExisting(facade, tmpDir, SEGMENT_SIZE).close();
                 Assert.fail("recovery must fail when a valid segment cannot be mapped");
+            } catch (MmapSegmentException expected) {
+                TestUtils.assertContains(expected.getMessage(), "recovery failed for recognized segment");
+            }
+            assertDirUnchanged(before);
+        });
+    }
+
+    @Test
+    public void testReadFailureOnValidSegmentFailsRecoveryAndPreservesBytes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            writeSegmentWithFrames(tmpDir + "/sf-initial.sfa", 0, 2);
+            String victim = tmpDir + "/sf-0000000000000001.sfa";
+            writeSegmentWithFrames(victim, 2, 3);
+            Map<String, byte[]> before = snapshotDir();
+
+            FilesFacade facade = new DelegatingFacade() {
+                private int victimFd = Integer.MIN_VALUE;
+
+                @Override
+                public int openRW(String path) {
+                    int fd = super.openRW(path);
+                    if (victim.equals(path)) {
+                        victimFd = fd;
+                    }
+                    return fd;
+                }
+
+                @Override
+                public long read(int fd, long addr, long len, long offset) {
+                    return fd == victimFd ? -1L : super.read(fd, addr, len, offset);
+                }
+            };
+            try {
+                SegmentRing.openExisting(facade, tmpDir, SEGMENT_SIZE).close();
+                Assert.fail("recovery must fail when a valid segment cannot be read");
             } catch (MmapSegmentException expected) {
                 TestUtils.assertContains(expected.getMessage(), "recovery failed for recognized segment");
             }

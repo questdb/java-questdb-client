@@ -215,9 +215,9 @@ public class MmapSegmentTest {
             // frames are followed by garbage. None cover frame[0] itself
             // being corrupt — yet a single bit-flip on the CRC of frame[0]
             // at rest (bit-rot, partial-page-write at crash) is the
-            // worst-case data-loss trigger: scanFrames bails at HEADER_SIZE
-            // and frameCount drops to 0, even though valid frames still
-            // sit on disk past the corrupt header.
+            // worst-case data-loss trigger: the recovery scan bails at
+            // HEADER_SIZE and frameCount drops to 0, even though valid frames
+            // still sit on disk past the corrupt header.
             //
             // Contract: tornTailBytes() must be non-zero (because non-zero
             // bytes exist past the last good frame), and openExisting
@@ -258,7 +258,7 @@ public class MmapSegmentTest {
                         Files.exists(path));
 
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    assertEquals("scanFrames must bail at the corrupt frame[0]",
+                    assertEquals("recovery scan must bail at the corrupt frame[0]",
                             0L, seg.frameCount());
                     assertEquals("publishedOffset must rewind to the header end",
                             MmapSegment.HEADER_SIZE, seg.publishedOffset());
@@ -272,6 +272,47 @@ public class MmapSegmentTest {
                         Files.exists(path));
             } finally {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testAllZeroCorruptFrameHeaderDoesNotHideNonZeroSuffix() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-zero-frame-header.sfa";
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(payload, 32, 0);
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    assertTrue(seg.tryAppend(payload, 32) >= 0L);
+                    assertTrue(seg.tryAppend(payload, 32) >= 0L);
+                    seg.msync();
+                }
+
+                // Zero both the CRC and length of frame[0]. Looking only at
+                // this 8-byte header would misclassify the segment as a clean
+                // empty spare even though its payload and frame[1] remain.
+                int fd = Files.openRW(path);
+                assertTrue("openRW must succeed", fd >= 0);
+                long zeroHeader = Unsafe.malloc(MmapSegment.FRAME_HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().setMemory(zeroHeader, MmapSegment.FRAME_HEADER_SIZE, (byte) 0);
+                    assertEquals(MmapSegment.FRAME_HEADER_SIZE,
+                            Files.write(fd, zeroHeader, MmapSegment.FRAME_HEADER_SIZE, MmapSegment.HEADER_SIZE));
+                    Files.fsync(fd);
+                } finally {
+                    Unsafe.free(zeroHeader, MmapSegment.FRAME_HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(0L, seg.frameCount());
+                    assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
+                    assertEquals("non-zero bytes later in the suffix must preserve corruption evidence",
+                            4096L - MmapSegment.HEADER_SIZE, seg.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
