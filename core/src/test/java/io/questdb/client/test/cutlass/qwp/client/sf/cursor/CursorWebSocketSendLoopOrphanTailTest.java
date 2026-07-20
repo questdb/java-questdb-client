@@ -184,6 +184,57 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    /**
+     * A whole-deferred slot that ALSO ships a dictionary catch-up must still retire its
+     * tail at start(), before any connection work, and must not reconnect.
+     * <p>
+     * testFastPathRetiresWholeDeferredLogBeforeAnySend covers the same shape without a
+     * dictionary, so nothing pinned that adding a catch-up -- which consumes wire
+     * sequences before any data frame -- leaves the start()-time retirement intact.
+     * <p>
+     * This deliberately does NOT pin trySendOne's in-place re-anchor arm: both connection
+     * setup sites call tryRetireOrphanTail first, so that arm is only reached when frames
+     * below the tail still needed acks -- which means they were sent on this connection.
+     * Verified by reverting its guard: this test still passes.
+     */
+    @Test
+    public void testCatchUpBearingWholeDeferredSlotRetiresAtStartWithoutReconnecting() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrame(engine, true);
+                appendFrame(engine, true);
+                appendFrame(engine, true);
+            }
+            // A populated dictionary is what makes the loop ship a catch-up. The frames
+            // carry no symbols, so recoveredMaxSymbolId stays -1 and the full-dict
+            // discard cannot fire on it.
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals(-1L, engine.recoveredCommitBoundaryFsn());
+                assertEquals(2L, engine.recoveredOrphanTipFsn());
+
+                List<AckingClient> clients = new ArrayList<>();
+                CursorWebSocketSendLoop loop = newLoop(engine, clients);
+                try {
+                    loop.start();
+                    assertEquals("scaffolding: the mirror must be seeded, so a catch-up ships",
+                            2, loop.sentDictCount());
+                    awaitAckedFsn(engine, 2L);
+                    assertTrue("retiring after only a catch-up must re-anchor in place, "
+                                    + "not reconnect",
+                            clientCount(clients) <= 1);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     @Test
     public void testRecoveryReleasesAbortedTailSymbolStorage() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

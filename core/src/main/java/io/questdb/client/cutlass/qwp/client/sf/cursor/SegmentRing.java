@@ -90,6 +90,7 @@ public final class SegmentRing implements QuietCloseable {
     private int sealedHead;
     // Deterministic performance probes: unlike elapsed-time assertions these
     // let tests pin binary successor search and amortized prefix compaction.
+    private int lastFindSegmentComparisons;
     private int lastNextSealedSearchComparisons;
     private long sealedCompactionMoves;
     // High-water byte offset within the active segment at which we proactively
@@ -608,8 +609,28 @@ public final class SegmentRing implements QuietCloseable {
      * scan cost doesn't matter.
      */
     public synchronized MmapSegment findSegmentContaining(long fsn) {
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            MmapSegment s = sealedSegments.get(i);
+        // Binary search, for the same reason nextSealedAfter got one: the sealed list
+        // is sorted by baseSeq and its ranges are disjoint, and its length is bounded
+        // only by the documented ~16K-segment ceiling -- so the linear scan this
+        // replaces cost up to 16K comparisons under the ring monitor, on the reconnect
+        // path, right beside a sibling doing the identical predicate in log N.
+        int lo = sealedHead;
+        int hi = sealedSegments.size();
+        int comparisons = 0;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            comparisons++;
+            if (sealedSegments.get(mid).baseSeq() <= fsn) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lastFindSegmentComparisons = comparisons;
+        // lo is the first segment whose baseSeq exceeds fsn, so the candidate is the
+        // one before it -- the only sealed segment whose range can contain fsn.
+        if (lo > sealedHead) {
+            MmapSegment s = sealedSegments.get(lo - 1);
             long base = s.baseSeq();
             if (fsn >= base && fsn < base + s.frameCount()) {
                 return s;
@@ -839,6 +860,11 @@ public final class SegmentRing implements QuietCloseable {
             if (s != null) total += s.sizeBytes();
         }
         return total;
+    }
+
+    @TestOnly
+    public synchronized int getLastFindSegmentComparisons() {
+        return lastFindSegmentComparisons;
     }
 
     @TestOnly

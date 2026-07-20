@@ -933,7 +933,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 && required <= appendMapOffset + appendMapCapacity) {
             return;
         }
-        long newOffset = appendOffset - appendOffset % APPEND_MAP_CAPACITY;
+        // Page-align, not APPEND_MAP_CAPACITY-align: mmap only requires a page-aligned
+        // file offset. Rounding the START down to a 4 MiB boundary while sizing `needed`
+        // to the record's END meant a chunk straddling that boundary produced a window
+        // spanning BOTH -- 8 MiB mapped and re-allocated, whose lower half covers bytes
+        // already written and never touched again. Steady state then advanced 4 MiB per
+        // remap while always mapping 8.
+        long pageMask = Files.PAGE_SIZE - 1;
+        long newOffset = appendOffset & ~pageMask;
         long needed = required - newOffset;
         long newCapacity = Math.max(APPEND_MAP_CAPACITY, needed);
         long remainder = newCapacity % APPEND_MAP_CAPACITY;

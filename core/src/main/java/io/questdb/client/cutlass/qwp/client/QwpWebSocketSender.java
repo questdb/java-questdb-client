@@ -155,7 +155,11 @@ public class QwpWebSocketSender implements Sender {
     private final QwpWebSocketEncoder encoder;
     private final List<Endpoint> endpoints;
     // Global symbol dictionary for delta encoding
-    private final GlobalSymbolDictionary globalSymbolDictionary;
+    // Not final: seedGlobalDictionaryFromPersisted replaces it with a pre-sized instance
+    // before anything can observe the original. Nothing retains a reference -- the encoder
+    // and the persisted dictionary both take it as a per-call parameter -- and the swap
+    // happens during construction, before the producer or the I/O thread exist.
+    private GlobalSymbolDictionary globalSymbolDictionary;
     // Serializes FOREGROUND connect walks only (see buildAndConnect): the
     // shared-round state in hostTracker (pickNext/beginRound/attempted
     // bits), roundSeq, roundConnectAttemptSeq, and the foreground lifecycle
@@ -4080,6 +4084,15 @@ public class QwpWebSocketSender implements Sender {
         // 1. The dictionary's intact prefix. addRecoveredSymbol appends without de-dup, so
         //    the producer's size tracks pd.size() exactly -- which is what the send loop's
         //    mirror also seeds sentDictCount from.
+        // Pre-size before pouring the recovered symbols in. The default capacity is 64,
+        // so rebuilding a large dictionary rehashed the map ~log2(n/64) times, each pass
+        // O(current size) -- roughly doubling the rebuild and touching a growing table
+        // the whole way. recoveredMaxSymbolId + 1 is the upper bound the seed can reach.
+        long expected = Math.max(pd == null ? 0L : pd.recoveredSize(),
+                cursorEngine.recoveredMaxSymbolId() + 1L);
+        if (expected > globalSymbolDictionary.size() && expected <= Integer.MAX_VALUE) {
+            globalSymbolDictionary = new GlobalSymbolDictionary((int) expected);
+        }
         int baseline = 0;
         if (pd != null && pd.size() > 0) {
             pd.addLoadedSymbolsTo(globalSymbolDictionary);

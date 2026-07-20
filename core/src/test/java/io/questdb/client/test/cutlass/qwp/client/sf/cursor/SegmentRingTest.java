@@ -462,6 +462,25 @@ public class SegmentRingTest {
                     // After the loop we have `sealedCount` sealed segments and one
                     // active (containing nothing yet — its base = sealedCount).
                     // Now walk: oldest sealed, then nextSealedAfter() repeatedly.
+                    // findSegmentContaining walks the SAME sorted, disjoint list and is
+                    // on the reconnect path, so it must be logarithmic too -- a linear
+                    // scan costs up to the ~16K-segment ceiling under the ring monitor.
+                    // The > 0 assertion is the anti-vacuity guard: the comparison counter
+                    // exists only in the binary search, so a revert to a linear scan would
+                    // leave it at 0 and make a bound-only assertion pass for free.
+                    int findCeiling = 33 - Integer.numberOfLeadingZeros(sealedCount);
+                    for (long probe = 0; probe < 16; probe++) {
+                        MmapSegment hit = ring.findSegmentContaining(probe);
+                        assertNotNull("fsn " + probe + " must resolve to a segment", hit);
+                        assertEquals("fsn " + probe + " lives in the segment based there",
+                                probe, hit.baseSeq());
+                        int comparisons = ring.getLastFindSegmentComparisons();
+                        assertTrue("the search must actually run", comparisons > 0);
+                        assertTrue("findSegmentContaining must be logarithmic: " + comparisons
+                                        + " comparisons over " + sealedCount + " sealed segments",
+                                comparisons <= findCeiling);
+                    }
+
                     MmapSegment cursor = ring.firstSealed();
                     assertNotNull(cursor);
                     assertEquals(0, cursor.baseSeq());

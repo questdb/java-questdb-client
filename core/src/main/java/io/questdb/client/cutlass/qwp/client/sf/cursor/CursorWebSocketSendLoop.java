@@ -346,8 +346,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // connection in setWireBaselineWithCatchUp; set in trySendOne after a successful
     // send.
     private boolean dataFrameSentThisConnection;
-    // End position (native address) written by the last readVarintAt() call.
-    private long varintEnd;
     private WebSocketClient client;
     // Optional: when non-null, every server-rejection error (retriable and
     // terminal alike) is offered to the dispatcher for async delivery to the user's
@@ -2416,7 +2414,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (!isDeltaFrame(payloadAddr, payloadLen)) {
             return -1;
         }
-        return (int) readVarintAt(payloadAddr + QwpConstants.HEADER_SIZE, payloadAddr + payloadLen);
+        long encoded = readVarintAt(payloadAddr + QwpConstants.HEADER_SIZE, payloadAddr + payloadLen);
+        // A malformed start id reads as "no delta section", which the caller's
+        // `deltaStart >= 0` gate already handles.
+        return encoded < 0L ? -1 : (int) (encoded >>> 3);
     }
 
     // True only for a well-formed QWP frame this encoder produced that carries a
@@ -2453,8 +2454,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // its canonical LEB128 encoding rather than re-reading the header and the
         // start-id varint.
         long p = payloadAddr + QwpConstants.HEADER_SIZE + NativeBufferWriter.varintSize(deltaStart);
-        long deltaCount = readVarintAt(p, limit);
-        p = varintEnd;
+        long encodedCount = readVarintAt(p, limit);
+        if (encodedCount < 0L) {
+            return; // malformed -- never happens for frames we encoded
+        }
+        long deltaCount = encodedCount >>> 3;
+        p += encodedCount & 7L;
         // The mirror holds ids [0, sentDictCount). Accumulate ONLY the part of this
         // frame's delta [deltaStart, deltaStart+deltaCount) that extends past the
         // tip -- ids [sentDictCount, deltaStart+deltaCount). Cases:
@@ -2486,10 +2491,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // the new tail [sentDictCount, deltaEnd).
         int skip = sentDictCount - deltaStart;
         for (int i = 0; i < skip; i++) {
-            long len = readVarintAt(p, limit);
-            p = varintEnd + len;
-            if (p > limit) {
+            long encoded = readVarintAt(p, limit);
+            if (encoded < 0L) {
                 return; // malformed -- bail rather than corrupt the mirror
+            }
+            p += (encoded & 7L) + (encoded >>> 3);
+            if (p > limit) {
+                return;
             }
         }
         long regionStart = p;
@@ -2497,11 +2505,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // Walk the new tail only to find where it ends; the entry boundaries are not
         // recorded here (see above -- the catch-up re-walks the mirror when it needs them).
         for (long i = 0; i < newCount; i++) {
-            long len = readVarintAt(p, limit);
-            p = varintEnd + len;
-            if (p > limit) {
+            long encoded = readVarintAt(p, limit);
+            if (encoded < 0L) {
                 // Malformed -- never happens for frames we encoded; bail rather
                 // than corrupt the mirror.
+                return;
+            }
+            p += (encoded & 7L) + (encoded >>> 3);
+            if (p > limit) {
                 return;
             }
         }
@@ -2569,28 +2580,34 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         sentDictCount = 0;
     }
 
-    private long readVarintAt(long p, long limit) {
+    /**
+     * Decodes the varint at {@code [p, limit)} and returns {@code (value << 3) | bytes},
+     * or {@code -1} when it is truncated or runs past a canonical length.
+     * <p>
+     * Packing the consumed length into the return value -- the shape
+     * {@code RecoveredFrameAnalysis.readVarint} already uses -- drops a store to an
+     * instance field on every call, and this runs once per SYMBOL: per frame in
+     * accumulateSentDict, and once per mirror entry in sendDictCatchUp.
+     * <p>
+     * The {@code -1} also makes truncation DETECTABLE. The field version returned 0 with
+     * {@code varintEnd == p} when {@code p >= limit}, so a caller computing
+     * {@code p = varintEnd + len} got {@code p == limit} and its {@code p > limit}
+     * bail-out could not fire at an exact boundary -- guards that could not guard.
+     */
+    private static long readVarintAt(long p, long limit) {
         long value = 0;
         int shift = 0;
-        long cur = p;
-        while (cur < limit) {
-            byte b = Unsafe.getUnsafe().getByte(cur++);
+        int bytes = 0;
+        while (p < limit && bytes < 6) {
+            byte b = Unsafe.getUnsafe().getByte(p++);
             value |= (long) (b & 0x7F) << shift;
+            bytes++;
             if ((b & 0x80) == 0) {
-                break;
+                return (value << 3) | bytes;
             }
             shift += 7;
-            if (shift > 35) {
-                // Defensive bound, matching PersistedSymbolDict.decodeVarint: a
-                // canonical entry-length / delta varint is <= 5 bytes. Every caller
-                // reads freshly-encoded, CRC- or openExisting-validated bytes, so
-                // this is unreachable, but it stops a corrupt continuation run from
-                // over-shifting into a garbage length.
-                break;
-            }
         }
-        varintEnd = cur;
-        return value;
+        return -1L;
     }
 
     /**
@@ -2649,9 +2666,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         long mirrorLimit = sentDictBytesAddr + sentDictBytesLen;
         for (int entryId = 0; entryId < sentDictCount; entryId++) {
             long entryStart = entryPtr;
-            long entryLen = readVarintAt(entryPtr, mirrorLimit);
-            long entryEnd = varintEnd + entryLen;
-            if (entryEnd > mirrorLimit) {
+            long encodedLen = readVarintAt(entryPtr, mirrorLimit);
+            long entryEnd = encodedLen < 0L
+                    ? -1L
+                    : entryPtr + (encodedLen & 7L) + (encodedLen >>> 3);
+            if (entryEnd < 0L || entryEnd > mirrorLimit) {
                 LineSenderException err = new LineSenderException(
                         "invalid symbol dictionary mirror during catch-up [entry="
                                 + entryId + ", count=" + sentDictCount + ']');
@@ -3023,9 +3042,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return false;
             }
             if (nextWireSeq == 0) {
-                // Nothing sent on this connection yet: re-anchor in place past
-                // the retired tail. The wireSeq<->FSN mapping is untouched
-                // because no wire sequence has been consumed.
+                // Reached only when the tail was NOT retirable at connection setup --
+                // both setup sites (swapClient, positionCursorForStart) call
+                // tryRetireOrphanTail first -- which means frames below it still needed
+                // acks, which means they were SENT on this connection. So nextWireSeq is
+                // never 0 here in practice and this arm is effectively dead; it is kept
+                // as a cheap correctness guard rather than removed.
+                //
+                // NB the mapping is untouched only while NO wire sequence has been
+                // consumed. A dictionary catch-up consumes sequences 0..n-1 before any
+                // data frame, so after one this test is false and the recycle below --
+                // which re-anchors the mapping from scratch -- is the correct path, not
+                // an avoidable cost.
                 try {
                     positionCursorForStart();
                 } catch (CatchUpSendException e) {
