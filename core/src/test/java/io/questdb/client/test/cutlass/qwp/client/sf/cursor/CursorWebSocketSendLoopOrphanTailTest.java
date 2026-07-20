@@ -446,6 +446,51 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    /**
+     * A gap-reset inside an UNCOMMITTED deferred tail must not publish the committed
+     * snapshot's counts over the tail's bytes.
+     * <p>
+     * accept() checkpoints committedRawLen/Count only at a commit-bearing frame, while
+     * foldDelta's gap-reset rewinds runningRawLen/Count to 0 without touching them. The
+     * next appendRaw therefore overwrites [0, committedRawLen) IN PLACE. That is harmless
+     * when a commit-bearing frame follows -- it re-checkpoints -- but a reset in the
+     * deferred tail never gets that refresh, and finish() then hands out the OLD counts
+     * over the TAIL's bytes.
+     * <p>
+     * Here fsn 0 commits symbol 'a' (committedRawCount=1 over 2 bytes), fsn 1 is a DEFERRED
+     * gap that is durably acked (so the reset is permitted), and fsn 2 is a DEFERRED
+     * self-sufficient frame carrying 'b' -- which rewinds and overwrites 'a' in place. No
+     * commit-bearing frame follows. Without the guard, recovery reports coverage 1 and
+     * decodes "b" as id 0, while the frame that actually replays registered "a": silent
+     * symbol misattribution. With it, recovery fails clean.
+     */
+    @Test
+    public void testGapResetInsideTheDeferredTailFailsCleanInsteadOfMisattributing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaSymbolFrame(engine, 0, 'a');            // fsn 0, commit-bearing
+                appendDeltaFrame(engine, true, 5, 0);              // fsn 1, deferred gap
+                appendDeferredDeltaSymbolFrame(engine, 0, 'b');    // fsn 2, deferred reset
+            }
+            // Ack through the gap so the reset at fsn 2 is permitted (an UNACKED gap is
+            // latched instead -- testSelfSufficientFrameCannotHideUnackedRecoveryGap).
+            try (AckWatermark watermark = AckWatermark.open(tmpDir)) {
+                assertNotNull(watermark);
+                watermark.write(1L);
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertEquals(1L, engine.ackedFsn());
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+                assertEquals("a rewind with no following commit must fail clean, not publish "
+                                + "the committed counts over the tail's bytes",
+                        -1L, engine.addRecoveredSymbolsTo(0, recovered));
+                assertEquals("nothing may be recovered from an overwritten snapshot",
+                        0, recovered.size());
+            }
+        });
+    }
+
     @Test
     public void testSelfSufficientFrameRepairsAckedRecoveryGap() throws Exception {
         // fsn 0 models the tail of an old delta epoch whose registering frames
@@ -580,6 +625,27 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                     (byte) (FLAG_DELTA_SYMBOL_DICT | (defer ? FLAG_DEFER_COMMIT : 0)));
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE, (byte) deltaStart);
             Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) deltaCount);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void appendDeferredDeltaSymbolFrame(
+            CursorSendEngine engine, int deltaStart, char symbol) {
+        int size = HEADER_SIZE + 4;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + HEADER_OFFSET_FLAGS,
+                    (byte) (FLAG_DELTA_SYMBOL_DICT | FLAG_DEFER_COMMIT));
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE, (byte) deltaStart);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 1, (byte) 1);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 2, (byte) 1);
+            Unsafe.getUnsafe().putByte(buf + HEADER_SIZE + 3, (byte) symbol);
             engine.appendBlocking(buf, size);
         } finally {
             Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);

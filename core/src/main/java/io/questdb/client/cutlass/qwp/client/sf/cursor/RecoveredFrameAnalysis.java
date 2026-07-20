@@ -51,6 +51,10 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private int committedRawCount;
     private int committedRawLen;
     private long framesVisited;
+    // Set when a gap-reset rewinds the raw write cursor, cleared at every commit
+    // checkpoint. Still set at finish() => the committed snapshot's bytes were
+    // overwritten by an uncommitted tail and must not be published. See finish().
+    private boolean hasRewoundSinceCommit;
     private boolean runningGap;
     private boolean runningUnackedGap;
     private long runningMaxDeltaEnd;
@@ -92,6 +96,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             committedMaxDeltaStart = runningMaxDeltaStart;
             committedRawLen = runningRawLen;
             committedRawCount = runningRawCount;
+            hasRewoundSinceCommit = false;
         }
     }
 
@@ -142,6 +147,18 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
      * deferred tail. Call exactly once after the ordered recovery walk.
      */
     void finish() {
+        if (hasRewoundSinceCommit) {
+            // A gap-reset rewound the write cursor after the last commit checkpoint, so
+            // the deferred tail has overwritten the bytes committedRawLen/Count still
+            // describe. Publishing them would decode the TAIL's entries under the
+            // committed ids -- exactly the silent misattribution this analysis exists to
+            // prevent. Fail clean instead: no suffix, and a gap so coverage() reports -1
+            // and the producer falls back to the persisted prefix (or, when unacked
+            // frames depend on the missing ids, quarantines).
+            committedRawLen = 0;
+            committedRawCount = 0;
+            committedGap = true;
+        }
         runningRawLen = committedRawLen;
         runningRawCount = committedRawCount;
         if (rawCapacity == committedRawLen) {
@@ -274,6 +291,13 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             }
             runningGap = false;
             runningCoverage = baseline;
+            // Rewinding the write cursor to 0 means the NEXT appendRaw overwrites
+            // [0, committedRawLen) in place -- bytes the committed snapshot still
+            // counts. That is harmless when a commit-bearing frame follows (accept()
+            // re-checkpoints and clears this flag), but a reset inside an uncommitted
+            // deferred TAIL never gets that refresh, and finish() would then hand out
+            // the old counts over the tail's bytes: silent symbol misattribution.
+            hasRewoundSinceCommit = true;
             runningRawLen = 0;
             runningRawCount = 0;
         }

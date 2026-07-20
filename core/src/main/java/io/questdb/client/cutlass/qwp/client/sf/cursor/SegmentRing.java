@@ -205,6 +205,10 @@ public final class SegmentRing implements QuietCloseable {
         try {
             try {
                 int rc = 1;
+                // Reused across files: MmapSegment.openExisting publishes the segment
+                // here before returning, so a pre-21 late-delivered unsafe-access fault
+                // that steals the return value still leaves us something to close.
+                final MmapSegment[] inFlight = new MmapSegment[1];
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
                     if (name != null
@@ -212,8 +216,9 @@ public final class SegmentRing implements QuietCloseable {
                             && !isLegacyReaderGuard(name)) {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
+                        inFlight[0] = null;
                         try {
-                            seg = MmapSegment.openExisting(ff, path);
+                            seg = MmapSegment.openExisting(ff, path, inFlight);
                             // Filter out empty leftovers -- typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
@@ -238,6 +243,7 @@ public final class SegmentRing implements QuietCloseable {
                                 long torn = seg.tornTailBytes();
                                 seg.close();
                                 seg = null;
+                                inFlight[0] = null;
                                 if (torn > 0) {
                                     Files.rename(path, path + ".corrupt");
                                 } else {
@@ -246,6 +252,7 @@ public final class SegmentRing implements QuietCloseable {
                             } else {
                                 opened.add(seg);
                                 seg = null;
+                                inFlight[0] = null;
                             }
                         } catch (Throwable t) {
                             // Per-file data error (bad magic, bad header,
@@ -285,9 +292,16 @@ public final class SegmentRing implements QuietCloseable {
                             // open and transfer -- most importantly an OOM
                             // from ObjList.add growing its backing array
                             // after the mmap+fd were already acquired.
-                            if (seg != null) {
+                            // seg may still be null while the segment was fully
+                            // constructed: a late-delivered mmap fault can surface at
+                            // openExisting's RETURN, before the assignment. inFlight is
+                            // cleared at every ownership transfer above, so this can
+                            // never close a segment `opened` now holds.
+                            MmapSegment orphan = seg != null ? seg : inFlight[0];
+                            inFlight[0] = null;
+                            if (orphan != null) {
                                 try {
-                                    seg.close();
+                                    orphan.close();
                                 } catch (Throwable closeErr) {
                                     LOG.warn("openExisting: error closing in-flight segment {}",
                                             path, closeErr);

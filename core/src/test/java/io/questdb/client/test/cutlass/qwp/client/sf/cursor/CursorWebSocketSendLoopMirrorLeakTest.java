@@ -95,13 +95,17 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 // thread's to free, since the I/O loop never ran.
                 Assert.assertTrue("precondition: the ctor seeded a non-empty mirror",
                         loop.sentDictCount() > 0);
-                Assert.assertEquals("foreground loop must take the persisted buffer without copying",
+                Assert.assertEquals("foreground loop must borrow the persisted buffer without copying",
                         persistedAddr, loop.sentDictBytesAddr());
-                Assert.assertEquals("ownership transfer must clear the persisted pointer",
-                        0L, pd.loadedEntriesAddr());
-                Assert.assertTrue("foreground mirror must own the transferred buffer",
+                Assert.assertEquals("borrowing must leave the engine's pointer intact so a retried "
+                                + "construction can re-seed from it",
+                        persistedAddr, pd.loadedEntriesAddr());
+                Assert.assertFalse("a borrowed mirror must not be loop-owned",
                         loop.sentDictBytesOwned());
                 loop.close();
+                Assert.assertEquals("close() must not free a buffer the loop only borrowed -- the "
+                                + "engine still owns it",
+                        persistedAddr, pd.loadedEntriesAddr());
                 // close() must reset sentDictCount alongside freeing the buffer,
                 // so the mirror stays all-or-nothing: a hypothetical post-close
                 // start() (no closed guard) cannot read a stale count against a
@@ -225,7 +229,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     }
 
     @Test
-    public void testForegroundLoopReleasesRecoveredSuffixAfterSeeding() throws Exception {
+    public void testForegroundLoopRetainsRecoveredSuffixForRetry() throws Exception {
         Path sfDir = temporaryFolder.newFolder("qwp-mirror-suffix-release").toPath();
         populateThreeFrameSlot(sfDir);
         Path slot = sfDir.resolve("default");
@@ -244,10 +248,55 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 try {
                     Assert.assertEquals("foreground mirror must include prefix and recovered suffix",
                             3, loop.sentDictCount());
-                    Assert.assertEquals("engine must release its duplicate recovery suffix",
-                            0, engine.recoverySymbolNativeCapacity());
+                    Assert.assertTrue("the engine must RETAIN its recovery suffix: the foreground "
+                                    + "loop borrows it, and a retried construction re-seeds from it",
+                            engine.recoverySymbolNativeCapacity() > 0);
                 } finally {
                     loop.close();
+                }
+            }
+        });
+    }
+
+    /**
+     * A foreground loop must be reconstructible against the same engine.
+     * <p>
+     * QwpWebSocketSender.ensureConnected's catch closes and nulls cursorSendLoop exactly so
+     * a caller can retry, and `connected` is only set at the very end -- so a second
+     * construction is reachable. The old foreground path consumed the engine's recovery
+     * sources (pd.takeLoadedEntries + releaseRecoveredSymbolStorage), and neither cleared
+     * the counts that gate re-seeding: the retry saw recoveredSize() > 0 with
+     * loadedEntriesLen() == 0, left sentDictCount at 0, and then either tripped the
+     * baseline mismatch or latched "resend required" on a healthy slot.
+     * <p>
+     * This is the foreground twin of testRecycledLoopReSeedsMirrorFromPersistedDict.
+     */
+    @Test
+    public void testForegroundLoopReSeedsAfterAClosedFirstAttempt() throws Exception {
+        Path sfDir = temporaryFolder.newFolder("qwp-mirror-foreground-retry").toPath();
+        populateThreeFrameSlot(sfDir);
+        Path slot = sfDir.resolve("default");
+        replacePersistedDictionaryWithTwoSymbolPrefix(slot);
+
+        assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+                int firstCount;
+                CursorWebSocketSendLoop first = newForegroundLoop(engine);
+                try {
+                    firstCount = first.sentDictCount();
+                    Assert.assertTrue("precondition: the first loop must seed a mirror",
+                            firstCount > 0);
+                } finally {
+                    // Exactly what ensureConnected's catch does before a retry.
+                    first.close();
+                }
+
+                CursorWebSocketSendLoop second = newForegroundLoop(engine);
+                try {
+                    Assert.assertEquals("a retried foreground construction must re-seed identically",
+                            firstCount, second.sentDictCount());
+                } finally {
+                    second.close();
                 }
             }
         });
@@ -292,6 +341,18 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 0, 1,
                 false, 0L, 3, 0L, 0L,
                 CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
+    }
+
+    private static CursorWebSocketSendLoop newForegroundLoop(CursorSendEngine engine) {
+        // The 7-arg ctor resolves to ReconnectPolicy.FOREGROUND -- newRecoveryLoop above
+        // builds an ORPHAN loop, which borrows by construction and so would not exercise
+        // the foreground path this test exists for.
+        return new CursorWebSocketSendLoop(
+                null, engine, 0, 1_000_000L,
+                () -> {
+                    throw new IOException("no reconnect in this test");
+                },
+                0, 1);
     }
 
     private static void populateRecoverableSlot(Path sfDir) throws Exception {

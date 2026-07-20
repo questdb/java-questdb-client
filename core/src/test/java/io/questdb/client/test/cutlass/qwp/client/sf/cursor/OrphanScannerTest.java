@@ -335,6 +335,32 @@ public class OrphanScannerTest {
     }
 
     @Test
+    public void testQuarantinedSlotIsNotACandidateEvenWithoutTheFailedSentinel() throws Exception {
+        // Sender.build() renames an unreplayable slot aside and then calls markFailed --
+        // which is BEST-EFFORT and returns silently when it cannot open the sentinel. The
+        // condition that makes a slot unreplayable (a full or read-only disk) is exactly
+        // the one that makes writing the sentinel fail, and twelve lines later the SAME
+        // build() dispatches its orphan drainers. Without a name-based exclusion the
+        // quarantined copy is re-adopted immediately: unbounded churn against data
+        // explicitly declared human-in-the-loop, repeating on every restart.
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = sfDir + "/default" + OrphanScanner.QUARANTINE_SLOT_INFIX + "0";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            touchFile(slot + "/sf-0001.sfa");
+            assertFalse("a quarantined slot must never be adopted, sentinel or not",
+                    OrphanScanner.isCandidateOrphan(slot));
+
+            // Control: the same shape under an ordinary name IS a candidate, so the
+            // assertion above is discriminating rather than vacuous.
+            String ordinary = sfDir + "/ordinary";
+            assertEquals(0, Files.mkdir(ordinary, Files.DIR_MODE_DEFAULT));
+            touchFile(ordinary + "/sf-0001.sfa");
+            assertTrue("scaffolding: an ordinary slot with data is a candidate",
+                    OrphanScanner.isCandidateOrphan(ordinary));
+        });
+    }
+
+    @Test
     public void testIsCandidateOrphanDirect() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = sfDir + "/probe";

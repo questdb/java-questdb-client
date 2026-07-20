@@ -335,6 +335,23 @@ public final class MmapSegment implements QuietCloseable {
      * {@link FilesFacade#length(String)}.
      */
     public static MmapSegment openExisting(FilesFacade ff, String path) {
+        return openExisting(ff, path, null);
+    }
+
+    /**
+     * As {@link #openExisting(FilesFacade, String)}, but also publishes the constructed
+     * segment into {@code inFlight[0]} immediately before returning it.
+     * <p>
+     * Pre-JDK-21 HotSpot delivers an unsafe-access fault ASYNCHRONOUSLY -- at the next
+     * return or safepoint check rather than at the faulting instruction (JDK-8283699).
+     * A fault taken while scanning this segment can therefore surface at this method's
+     * RETURN, in the caller's frame, so the caller's {@code seg = openExisting(...)}
+     * assignment never happens even though the fd and the whole-file mapping were
+     * already acquired -- and nothing is left holding them. The holder gives the
+     * caller's {@code finally} something to close. Callers MUST clear {@code inFlight[0]}
+     * wherever they transfer ownership, or they will close a segment they just handed on.
+     */
+    static MmapSegment openExisting(FilesFacade ff, String path, MmapSegment[] inFlight) {
         long fileSize = ff.length(path);
         if (fileSize < HEADER_SIZE) {
             throw new MmapSegmentException("file shorter than header: " + path + " size=" + fileSize);
@@ -382,8 +399,12 @@ public final class MmapSegment implements QuietCloseable {
                                 + "Investigate disk health or unexpected writer crash.",
                         path, tornTail, lastGood, fileSize, count);
             }
-            return new MmapSegment(path, fd, addr, fileSize, baseSeq,
+            MmapSegment segment = new MmapSegment(path, fd, addr, fileSize, baseSeq,
                     lastGood, count, false, tornTail, version);
+            if (inFlight != null) {
+                inFlight[0] = segment;
+            }
+            return segment;
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);

@@ -725,7 +725,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // tracks. When the dictionary could not be opened, pd is null, the mirror
         // simply starts empty and grows from the frames themselves.
         PersistedSymbolDict pd = engine.getPersistedSymbolDict();
-        int persistedPrefixLen = 0;
         if (pd != null && pd.recoveredSize() > 0) {
             int len = pd.loadedEntriesLen();
             if (len > 0) {
@@ -734,7 +733,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // one engine can create several sessions during capability-gap
                 // recycling. A borrowed mirror performs copy-on-write if a recovered
                 // frame suffix must extend it.
-                persistedPrefixLen = len;
                 sentDictBytesAddr = pd.loadedEntriesAddr();
                 sentDictBytesCapacity = len;
                 sentDictBytesLen = len;
@@ -803,24 +801,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releaseSentDictBytes();
             throw t;
         }
-        // QwpWebSocketSender seeds the producer dictionary before constructing
-        // its one foreground loop, so after the loop has built its mirror it can
-        // retire both engine-owned recovery sources. BackgroundDrainer must retain
-        // them for later recycled loops and therefore keeps borrowing them.
-        if (reconnectPolicy == ReconnectPolicy.FOREGROUND) {
-            if (persistedPrefixLen > 0) {
-                long persistedPrefixAddr = pd.takeLoadedEntries();
-                if (sentDictBytesOwned) {
-                    // Copy-on-grow already produced the combined mirror. Retire the
-                    // no-longer-needed persisted prefix after successful construction.
-                    Unsafe.free(persistedPrefixAddr, persistedPrefixLen, MemoryTag.NATIVE_DEFAULT);
-                } else {
-                    assert persistedPrefixAddr == sentDictBytesAddr;
-                    sentDictBytesOwned = true;
-                }
-            }
-            engine.releaseRecoveredSymbolStorage();
-        }
+        // BOTH policies borrow the engine-owned recovery sources; neither consumes them.
+        //
+        // The foreground path used to take ownership here -- pd.takeLoadedEntries() plus
+        // engine.releaseRecoveredSymbolStorage() -- which made the hand-off ONE-SHOT while
+        // leaving a second construction reachable: QwpWebSocketSender.ensureConnected's
+        // catch closes and nulls cursorSendLoop precisely so a caller can retry, and
+        // `connected` is only set at the very end. takeLoadedEntries zeroes addr/len but
+        // NOT size, and releaseRecoveredSymbolStorage zeroes the raw buffer but NOT
+        // baseline, so the retry saw pd.recoveredSize() > 0 with loadedEntriesLen() == 0,
+        // left sentDictCount at 0, and then either tripped checkedRecoveryAnalysis'
+        // baseline mismatch or -- when recoveredMaxSymbolDeltaStart == 0 -- latched the
+        // torn-dictionary terminal ("resend required") on a perfectly healthy slot.
+        //
+        // Borrowing removes the state machine instead of trying to make it idempotent.
+        // Lifetime is safe in both directions: QwpWebSocketSender.close() closes the loop
+        // before the engine, and BackgroundDrainer's finally does the same, so the buffers
+        // always outlive their borrower. Any growth copy-on-writes into loop-owned memory
+        // (ensureSentDictCapacity), and releaseSentDictBytes frees only what the loop owns.
         this.fsnAtZero = fsnAtZero;
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;

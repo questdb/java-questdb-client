@@ -1026,7 +1026,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // sender's own slot name, so a restarted sender does not re-adopt it as its own;
         // quarantineTornSlot then marks it .failed, so the orphan drainer skips it too and
         // the bytes stay put for a human to inspect and resend.
-        private static final String QUARANTINE_SLOT_SUFFIX = ".unreplayable-";
+        private static final String QUARANTINE_SLOT_SUFFIX =
+                OrphanScanner.QUARANTINE_SLOT_INFIX;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;

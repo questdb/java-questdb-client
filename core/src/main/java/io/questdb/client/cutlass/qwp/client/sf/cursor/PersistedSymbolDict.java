@@ -568,18 +568,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Transfers the recovered entry buffer to the foreground send loop. The
-     * symbol count remains unchanged because it is also the append baseline;
-     * only the native-buffer ownership moves. Construction-phase only.
-     */
-    synchronized long takeLoadedEntries() {
-        long addr = loadedEntriesAddr;
-        loadedEntriesAddr = 0L;
-        loadedEntriesLen = 0;
-        return addr;
-    }
-
-    /**
      * Number of symbols {@link #open} recovered from disk -- the exact entry count of
      * {@link #loadedEntriesAddr()} / {@link #loadedEntriesLen()}. Unlike {@link #size()}
      * this never advances, so a caller seeding from the loaded bytes stays in lockstep

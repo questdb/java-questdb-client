@@ -61,6 +61,20 @@ public final class OrphanScanner {
 
     /** Name of the sentinel that disqualifies a slot from auto-drain. */
     public static final String FAILED_SENTINEL_NAME = ".failed";
+    /**
+     * Reserved infix for a slot {@code Sender.build()} set aside as unreplayable. Such a
+     * copy is kept for forensics and a manual resend; it is NEVER drainable, so the
+     * scanner excludes it BY NAME.
+     * <p>
+     * Excluding it by name rather than by the {@code .failed} sentinel alone is what makes
+     * the exclusion reliable. {@code markFailed} is best-effort and returns silently when
+     * it cannot open the sentinel -- and the condition that makes a slot unreplayable (a
+     * full or read-only disk) is exactly the condition that makes writing the sentinel
+     * fail. Without the name check, the SAME build() that quarantined the slot dispatches
+     * its orphan drainers twelve lines later and re-adopts it: unbounded churn against
+     * data explicitly declared human-in-the-loop, repeating on every restart.
+     */
+    public static final String QUARANTINE_SLOT_INFIX = ".unreplayable-";
 
     private OrphanScanner() {
     }
@@ -271,10 +285,27 @@ public final class OrphanScanner {
         if (!Files.exists(slotPath)) {
             return false;
         }
+        if (isQuarantinedSlotName(slotPath)) {
+            return false;
+        }
         if (Files.exists(slotPath + "/" + FAILED_SENTINEL_NAME)) {
             return false;
         }
         return hasAnySegmentFile(slotPath);
+    }
+
+    /**
+     * Whether {@code slotPath}'s last path element names a quarantined slot. Independent
+     * of the {@code .failed} sentinel, which is best-effort -- see
+     * {@link #QUARANTINE_SLOT_INFIX}.
+     */
+    public static boolean isQuarantinedSlotName(String slotPath) {
+        if (slotPath == null) {
+            return false;
+        }
+        int slash = Math.max(slotPath.lastIndexOf('/'), slotPath.lastIndexOf('\\'));
+        String name = slash < 0 ? slotPath : slotPath.substring(slash + 1);
+        return name.contains(QUARANTINE_SLOT_INFIX);
     }
 
     /**
