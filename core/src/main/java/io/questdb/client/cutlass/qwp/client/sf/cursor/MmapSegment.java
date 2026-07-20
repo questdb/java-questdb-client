@@ -649,8 +649,23 @@ public final class MmapSegment implements QuietCloseable {
      * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
      * still being specific enough that a genuine VirtualMachineError (real OOM,
      * StackOverflow) is never swallowed.
+     * <p>
+     * <b>Delivery is NOT precise before JDK 21, so callers must guard too.</b>
+     * Pre-21 HotSpot records the fault and raises the {@code InternalError} at
+     * the next return or safepoint check rather than at the faulting
+     * instruction, so it can surface in a CALLER's frame -- past every handler
+     * in this class. Observed on JDK 8/17: a fault taken inside
+     * {@link #scanFrames} arrives only after {@link #openExisting} has already
+     * returned its segment, so neither the scan's own catch nor
+     * {@code openExisting}'s outer catch ever sees it. JDK-8283699 made
+     * delivery precise in 21+, which is why the same case is fully contained
+     * there. The in-class catches therefore handle the common (precise) case
+     * only; {@link SegmentRing#openExisting} applies this same predicate at the
+     * per-file boundary so a late-delivered fault still skips one {@code .sfa}
+     * instead of aborting recovery of the whole slot. Package-private for that
+     * caller.
      */
-    private static boolean isMmapAccessFault(Throwable t) {
+    static boolean isMmapAccessFault(Throwable t) {
         if (!(t instanceof InternalError)) {
             return false;
         }

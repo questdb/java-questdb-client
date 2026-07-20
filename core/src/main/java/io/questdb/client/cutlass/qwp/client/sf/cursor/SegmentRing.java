@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
@@ -168,6 +169,21 @@ public final class SegmentRing implements QuietCloseable {
      * depends on every segment being readable.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
+        return openExisting(FilesFacade.INSTANCE, sfDir, maxBytesPerSegment);
+    }
+
+    /**
+     * Facade-aware variant of {@link #openExisting(String, long)}. Only the
+     * per-segment {@link MmapSegment#openExisting(FilesFacade, String)} call
+     * takes the facade -- directory enumeration and the empty-segment unlink
+     * stay on {@link Files}, because the seam exists for one purpose: letting a
+     * facade report an inflated stat length so a segment maps past
+     * end-of-file and its recovery reads fault deterministically on ANY
+     * filesystem. That is what regression-tests the per-file mmap-fault skip
+     * below, which on a real deployment only triggers on a sparse
+     * pre-allocation tail (e.g. ZFS) or a file truncated under the mapping.
+     */
+    public static SegmentRing openExisting(FilesFacade ff, String sfDir, long maxBytesPerSegment) {
         if (!Files.exists(sfDir)) {
             return null;
         }
@@ -197,7 +213,7 @@ public final class SegmentRing implements QuietCloseable {
                         String path = sfDir + "/" + name;
                         MmapSegment seg = null;
                         try {
-                            seg = MmapSegment.openExisting(path);
+                            seg = MmapSegment.openExisting(ff, path);
                             // Filter out empty leftovers -- typically hot-spare
                             // segments the manager pre-allocated for a prior
                             // session that never got rotated into active. They
@@ -231,7 +247,7 @@ public final class SegmentRing implements QuietCloseable {
                                 opened.add(seg);
                                 seg = null;
                             }
-                        } catch (MmapSegmentException t) {
+                        } catch (Throwable t) {
                             // Per-file data error (bad magic, bad header,
                             // unsupported version, mmap rejection on this one
                             // file). Don't take down recovery for one corrupt
@@ -243,6 +259,24 @@ public final class SegmentRing implements QuietCloseable {
                             // an OOM would just fail again on the next file
                             // while silently leaking the segments we managed
                             // to recover before it.
+                            //
+                            // The mmap-access-fault arm catches Throwable
+                            // rather than just MmapSegmentException because
+                            // pre-21 HotSpot delivers an unsafe-access fault
+                            // ASYNCHRONOUSLY -- the InternalError can surface
+                            // here, in MmapSegment.openExisting's caller,
+                            // instead of inside the handlers that class
+                            // installs around its own reads (see
+                            // MmapSegment.isMmapAccessFault). An unbacked or
+                            // sparse page in ONE segment must still skip only
+                            // that segment; letting the raw InternalError reach
+                            // the outer catch would abort recovery of the whole
+                            // slot and strand every frame the other segments
+                            // still hold.
+                            if (!(t instanceof MmapSegmentException)
+                                    && !MmapSegment.isMmapAccessFault(t)) {
+                                throw t;
+                            }
                             LOG.warn("openExisting: skipping {} -- {}", path, t.toString());
                         } finally {
                             // Close any seg whose ownership wasn't transferred
