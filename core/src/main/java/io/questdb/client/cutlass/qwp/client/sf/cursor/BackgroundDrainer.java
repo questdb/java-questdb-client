@@ -728,10 +728,27 @@ public final class BackgroundDrainer implements Runnable {
                 LOG.debug("drainer setup failed for slot {}: {}", slotPath, msg, t);
             }
             lastErrorMessage = msg;
-            try {
-                OrphanScanner.markFailed(slotPath, "setup: " + msg);
-            } catch (Throwable ignored) {
-                // best-effort
+            // Quarantine ONLY a slot this drainer actually adopted. engine is
+            // assigned after CursorSendEngine has taken the slot's own .lock, so
+            // a null engine here means the failure happened before adoption --
+            // while merely probing a slot another live process still owns.
+            //
+            // The failures that reach this point pre-adoption are LOCAL and
+            // usually transient: acquireLogical rethrows anything that is not
+            // lock contention, so a permission problem on the shared
+            // .slot-locks directory or a momentary fd exhaustion lands here.
+            // Writing the sentinel then would exclude a healthy, in-use slot
+            // from orphan drain permanently (OrphanScanner.isCandidateOrphan
+            // treats .failed as disqualifying, and nothing ever removes it), so
+            // when its real owner later dies its unacked data would be stranded
+            // until an operator intervened. Leave the slot alone; the next scan
+            // retries it.
+            if (engine != null) {
+                try {
+                    OrphanScanner.markFailed(slotPath, "setup: " + msg);
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
             }
             outcome = DrainOutcome.FAILED;
         } finally {

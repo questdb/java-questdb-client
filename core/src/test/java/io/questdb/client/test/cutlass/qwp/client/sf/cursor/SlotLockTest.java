@@ -142,6 +142,32 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testSharedLockDirectoryIsCreatedUmaskGoverned() throws Exception {
+        // .slot-locks is the one directory every sender under an sf_dir must
+        // CREATE a file in, so unlike a slot directory it cannot be created
+        // 0755: the first process to start would own it and a sender running as
+        // a different uid could not create its lock file, failing build(). Pass
+        // 0777 and let the deployment's umask decide, exactly as it already does
+        // for the sf_dir these live under.
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/mode-check";
+            String lockDir = parentDir + "/.slot-locks";
+            RecordingMkdirFacade ff = new RecordingMkdirFacade();
+            try (SlotLock ignored = SlotLock.acquireLogical(ff, slot)) {
+                assertEquals("the shared lock dir must be created umask-governed",
+                        Files.DIR_MODE_SHARED, ff.modeFor(lockDir));
+            }
+            // The per-slot directory keeps the restrictive mode: one process
+            // creates it and only that process writes inside it.
+            RecordingMkdirFacade slotFf = new RecordingMkdirFacade();
+            String ownSlot = parentDir + "/own-slot";
+            slotFf.mkdir(ownSlot, Files.DIR_MODE_DEFAULT);
+            assertEquals("a slot dir must not be loosened",
+                    Files.DIR_MODE_DEFAULT, slotFf.modeFor(ownSlot));
+        });
+    }
+
+    @Test
     public void testLogicalLockReportsLockDirectoryCreationFailure() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/mkdir-failure";
@@ -257,6 +283,22 @@ public class SlotLockTest {
         if (find <= 0) return false;
         Files.findClose(find);
         return true;
+    }
+
+    /** Records the mode each directory was created with, then delegates. */
+    private static final class RecordingMkdirFacade extends DelegatingFilesFacade {
+        private final java.util.Map<String, Integer> modes = new java.util.HashMap<>();
+
+        int modeFor(String path) {
+            Integer mode = modes.get(path);
+            return mode == null ? -1 : mode;
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            modes.put(path, mode);
+            return super.mkdir(path, mode);
+        }
     }
 
     private static final class LockDirectoryFailureFacade extends DelegatingFilesFacade {

@@ -75,6 +75,17 @@ public final class Files {
      * others may traverse and read but not modify. 0755 octal
      */
     public static final int DIR_MODE_DEFAULT = 493;
+    /**
+     * Creation mode for a directory that processes running as DIFFERENT users
+     * must all create files in -- the store-and-forward logical slot-lock
+     * directory being the one such case. 0777 octal, so the deployment's umask
+     * decides the actual sharing policy exactly as it does for the sf_dir these
+     * live under: the usual 022 yields the same 0755 as
+     * {@link #DIR_MODE_DEFAULT}, while a shared-group deployment (umask 002)
+     * gets the group-writable directory a second uid needs. Do NOT use this for
+     * a directory only its creator writes to.
+     */
+    public static final int DIR_MODE_SHARED = 511;
 
     /** {@code dirent.d_type} sentinel: type unknown (filesystem doesn't fill it). */
     public static final int DT_UNKNOWN = 0;

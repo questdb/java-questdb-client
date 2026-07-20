@@ -87,7 +87,9 @@ public final class SlotLock implements QuietCloseable {
      */
     public static SlotLock acquire(String slotDir) {
         validateSlotDir(slotDir);
-        ensureDirectory(FilesFacade.INSTANCE, slotDir, "slot dir");
+        // DIR_MODE_DEFAULT is right here: one process creates its own slot
+        // directory and only that process writes inside it.
+        ensureDirectory(FilesFacade.INSTANCE, slotDir, "slot dir", Files.DIR_MODE_DEFAULT);
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
         return acquireAt(FilesFacade.INSTANCE, slotDir, lockPath, pidPath);
@@ -118,7 +120,17 @@ public final class SlotLock implements QuietCloseable {
             throw new IllegalArgumentException(
                     "slotDir must contain a parent and slot name: " + slotDir);
         }
-        ensureDirectory(ff, paths[0], "logical slot lock dir");
+        // SHARED_DIR_MODE, not DIR_MODE_DEFAULT: unlike a slot directory -- which
+        // one process creates and only that process writes -- this directory is
+        // shared by every sender under the same sf_dir, and each of them must
+        // CREATE its own lock file inside it. At 0755 the first process to start
+        // owns it and a sender running as a different uid cannot create its lock
+        // file at all, so build() throws before it can open the slot. Passing
+        // 0777 hands the sharing policy to the deployment's umask, which is what
+        // already governs sf_dir itself: an unset umask leaves this identical to
+        // the old 0755, while a shared-group deployment (umask 002) gets the
+        // group-writable directory it needs.
+        ensureDirectory(ff, paths[0], "logical slot lock dir", Files.DIR_MODE_SHARED);
         return acquireAt(ff, slotDir, paths[1], paths[2]);
     }
 
@@ -185,9 +197,9 @@ public final class SlotLock implements QuietCloseable {
         }
     }
 
-    private static void ensureDirectory(FilesFacade ff, String path, String description) {
+    private static void ensureDirectory(FilesFacade ff, String path, String description, int mode) {
         if (!ff.exists(path)) {
-            int rc = ff.mkdir(path, Files.DIR_MODE_DEFAULT);
+            int rc = ff.mkdir(path, mode);
             // Multiple senders may create the shared parent lock directory
             // concurrently. Treat EEXIST as success, just as the builder does
             // for the SF root itself.

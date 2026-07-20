@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class BackgroundDrainerOrphanTailTest {
 
@@ -81,6 +82,59 @@ public class BackgroundDrainerOrphanTailTest {
                     0, connectAttempts.get());
             assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
             assertFalse("local retirement must not quarantine the slot",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test
+    public void testPreAdoptionSetupFailureDoesNotQuarantineTheSlot() throws Exception {
+        // A drainer that cannot even take the logical lock has NOT adopted the
+        // slot -- another live process may still own it. The failures that reach
+        // that point are local and usually transient (acquireLogical rethrows
+        // anything that is not lock contention, so a permission problem on the
+        // shared .slot-locks directory or a momentary fd exhaustion lands
+        // there). Writing the .failed sentinel then would exclude a healthy,
+        // in-use slot from orphan drain permanently -- nothing ever removes it --
+        // so when its real owner later died its unacked data would be stranded
+        // until an operator intervened.
+        //
+        // Blocks the lock by planting .slot-locks as a regular FILE: acquireLogical
+        // sees it exists, skips the mkdir, and then cannot open a lock file
+        // beneath it. That reproduces the pre-adoption failure on every platform
+        // and without depending on the test user's privileges -- a chmod-based
+        // version would silently pass when CI runs as root.
+        String slotPath = temporaryFolder.newFolder("live-slot").getAbsolutePath();
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(slotPath, SEGMENT_SIZE_BYTES)) {
+                appendDeferredFrame(engine);
+            }
+            String parent = slotPath.substring(0, slotPath.lastIndexOf('/'));
+            String lockDirPath = parent + "/.slot-locks";
+            int fd = Files.openRW(lockDirPath);
+            assertTrue("could not plant the blocking file", fd > -1);
+            Files.close(fd);
+
+            AtomicInteger connectAttempts = new AtomicInteger();
+            BackgroundDrainer drainer = new BackgroundDrainer(
+                    slotPath,
+                    SEGMENT_SIZE_BYTES,
+                    1L << 20,
+                    () -> {
+                        connectAttempts.incrementAndGet();
+                        throw new AssertionError("setup must fail before any connect");
+                    },
+                    5_000L,
+                    1L,
+                    5L,
+                    true,
+                    200L);
+
+            drainer.run();
+
+            assertEquals("setup must fail before the reconnect factory is used",
+                    0, connectAttempts.get());
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertFalse("a slot this drainer never adopted must not be quarantined",
                     Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
     }
