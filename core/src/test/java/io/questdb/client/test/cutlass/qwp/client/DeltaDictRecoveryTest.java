@@ -1761,6 +1761,80 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    /**
+     * A dictionary that becomes unwritable mid-run must cost bandwidth, not the sender.
+     * <p>
+     * deltaDictEnabled was written once at setCursorEngine with no runtime disable, so
+     * the first persist failure killed flush() permanently -- every later flush re-threw.
+     * A full disk reaches exactly that state and is survivable: SF's segments are
+     * pre-allocated mmap files and stay writable while the growing .symbol-dict does not,
+     * and full self-sufficient frames need no side file at all (each carries the whole
+     * dictionary from id 0, which is what recovery replays anyway).
+     * <p>
+     * So the FIRST flush must still fail -- beginMessage has already baked a delta
+     * deltaStart into the staged frame, and publishing it would put ids on the ring the
+     * side-file cannot describe -- but the SECOND must succeed, in full-dict mode. Remove
+     * the disableDeltaDict call and the second flush throws exactly like the first.
+     */
+    @Test(timeout = 60_000L)
+    public void testPersistFailureDegradesToFullDictInsteadOfKillingFlushForever() throws Exception {
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String slot = Paths.get(sfDir, "default").toString();
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                FullDiskDictFacade ff = new FullDiskDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                try {
+                    // Armed from the start, so the very first ensureAppendMap is refused --
+                    // a later append would sit inside the window already mapped and never
+                    // call allocate at all.
+                    ff.armed = true;
+                    sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("the first flush must fail: its staged frame carries a delta "
+                                + "deltaStart the side-file cannot describe");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue("expected the persist-failure message, got: "
+                                        + expected.getMessage(),
+                                expected.getMessage().contains("failed to persist symbol dictionary"));
+                    }
+
+                    // The rows are still buffered (the throw precedes every publish), so the
+                    // retry re-encodes them from id 0. Pre-fix this threw forever.
+                    sender.flush();
+
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.dataFrameCount() < 1) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertTrue("the degraded flush must actually reach the server",
+                            handler.dataFrameCount() >= 1);
+                    Assert.assertEquals("a degraded frame must be self-sufficient (deltaStart 0)",
+                            0, handler.lastDataDeltaStart());
+                    Assert.assertEquals("the full dictionary must ride along",
+                            java.util.Collections.singletonList("a"), handler.dictSnapshot());
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // not what we assert
+                    }
+                }
+            }
+        });
+    }
+
     private static boolean hasSegmentFile(java.nio.file.Path dir) {
         java.io.File[] files = dir.toFile().listFiles();
         if (files != null) {

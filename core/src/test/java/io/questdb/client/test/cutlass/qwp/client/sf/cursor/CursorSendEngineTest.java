@@ -27,6 +27,8 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
@@ -56,6 +58,44 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class CursorSendEngineTest {
+
+    /**
+     * A recovery-seed baseline mismatch must be quarantinable, not a permanent brick.
+     * <p>
+     * checkedRecoveryAnalysis threw a raw IllegalStateException, and Sender.build() routes
+     * on the TYPE -- only UnreplayableSlotException reaches its quarantine handler. With a
+     * stable senderId and a not-fully-drained slot retained on close, every restart
+     * re-recovered the same slot and rethrew: the application could never construct a
+     * Sender, so it could not even BUFFER new rows. Revert the type and this goes red.
+     */
+    @Test(timeout = 10_000L)
+    public void testRecoveryBaselineMismatchIsQuarantinableNotAPermanentBrick() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                    engine.appendBlocking(buf, 64);
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("scaffolding: the slot must have been recovered",
+                        reopened.wasRecoveredFromDisk());
+                try {
+                    // The fold was keyed to the persisted prefix size; ask for a baseline
+                    // that cannot match it.
+                    reopened.addRecoveredSymbolsTo(9_999, new GlobalSymbolDictionary());
+                    fail("a baseline mismatch must be reported");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue("expected the baseline-mismatch message, got: "
+                                    + expected.getMessage(),
+                            expected.getMessage().contains("recovery symbol baseline mismatch"));
+                }
+            }
+        });
+    }
+
 
     private String tmpDir;
 

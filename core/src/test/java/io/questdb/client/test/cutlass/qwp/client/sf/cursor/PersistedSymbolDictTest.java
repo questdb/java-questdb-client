@@ -26,8 +26,12 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.FilesFacade;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -495,6 +499,70 @@ public class PersistedSymbolDictTest {
                 for (int i = 0; i < n; i++) {
                     Assert.assertEquals("symbol at id " + i + " must survive the window boundary",
                             dict.getSymbol(i), got.getQuick(i));
+                }
+            }
+        });
+    }
+
+    /**
+     * A loaded region that cannot be decoded must surface as an UnreplayableSlotException,
+     * not a raw IllegalStateException.
+     * <p>
+     * Sender.build() routes on the TYPE -- only UnreplayableSlotException reaches its
+     * quarantine handler. A raw IllegalStateException escapes build() instead, and with a
+     * stable senderId and a retained slot every restart re-recovers and rethrows: the
+     * application can never construct a Sender, so it cannot even BUFFER new rows.
+     * <p>
+     * The fixture also documents a real gap: scanRecoveredChunks validates the chunk CRC
+     * and rejects entryCount &lt;= 0, but never checks that entryBytes actually holds
+     * entryCount well-formed entries. A chunk claiming 3 entries inside a 2-byte region is
+     * therefore ACCEPTED here, and only the decoder notices. Validating the triple during
+     * the scan would end the trusted prefix at that chunk instead -- the same treatment a
+     * CRC failure gets.
+     */
+    @Test
+    public void testUndecodableLoadedRegionIsQuarantinableNotAPermanentBrick() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict");
+            Path f = dir.resolve(".symbol-dict");
+
+            // [entryCount=3][entryBytes=2][len=1]['a'] -- 3 entries claimed, 1 supplied.
+            byte[] body = new byte[]{0x03, 0x02, 0x01, (byte) 'a'};
+            int crc;
+            long scratch = Unsafe.malloc(body.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < body.length; i++) {
+                    Unsafe.getUnsafe().putByte(scratch + i, body[i]);
+                }
+                crc = Crc32c.update(Crc32c.INIT, scratch, body.length);
+            } finally {
+                Unsafe.free(scratch, body.length, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            byte[] file = new byte[8 + body.length + 4];
+            file[0] = 'S';
+            file[1] = 'Y';
+            file[2] = 'D';
+            file[3] = '1';
+            file[4] = 3; // VERSION
+            System.arraycopy(body, 0, file, 8, body.length);
+            int crcAt = 8 + body.length;
+            file[crcAt] = (byte) crc;
+            file[crcAt + 1] = (byte) (crc >>> 8);
+            file[crcAt + 2] = (byte) (crc >>> 16);
+            file[crcAt + 3] = (byte) (crc >>> 24);
+            Files.write(f, file);
+
+            try (PersistedSymbolDict dict = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull("the CRC is valid, so the chunk is accepted by the scan", dict);
+                Assert.assertEquals("the scan trusts the declared entryCount", 3, dict.size());
+                try {
+                    dict.addLoadedSymbolsTo(new GlobalSymbolDictionary());
+                    Assert.fail("decoding 3 entries out of a 2-byte region must fail");
+                } catch (UnreplayableSlotException expected) {
+                    Assert.assertTrue("expected the truncated-entry message, got: "
+                                    + expected.getMessage(),
+                            expected.getMessage().contains("truncated loaded symbol dictionary entry"));
                 }
             }
         });
