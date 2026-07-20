@@ -68,11 +68,13 @@ import java.util.concurrent.locks.LockSupport;
  *       can trim fully-acked segments.</li>
  *   <li>On wire failure, runs the configured reconnect policy: capped
  *       exponential backoff with jitter, retried indefinitely (Invariant B --
- *       a store-and-forward drainer never gives up on a wall-clock budget),
- *       with endpoint-policy failures terminal only for an orphan drainer. A
- *       foreground sender keeps retrying from asynchronous startup onward so
- *       credential and rolling-capability changes remain contained by
- *       store-and-forward. On reconnect success, repositions the cursor at
+ *       a store-and-forward drainer never gives up on a wall-clock budget).
+ *       Once a foreground sender has connected even once, endpoint-policy
+ *       failures (auth, upgrade, durable-ack capability) become transients it
+ *       keeps retrying, so credential and rolling-capability changes stay
+ *       contained by store-and-forward; they are terminal only for an orphan
+ *       drainer or on a foreground sender's initial connect (before the wire
+ *       has ever come up). On reconnect success, repositions the cursor at
  *       {@code ackedFsn+1} and replays.</li>
  * </ol>
  * No locks on the steady-state path. The producer thread (user) writes
@@ -1505,9 +1507,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Drives the very first connect attempt on the I/O thread, used in the
      * async-initial-connect mode (constructed with {@code client == null}).
      * Reuses the same retry+backoff machinery as {@link #fail(Throwable)}.
-     * Transport, authentication, upgrade and capability failures are all
-     * retried indefinitely here (Invariant B); none is surfaced to the
-     * foreground producer.
+     * Transport failures retry indefinitely here (Invariant B). But this path
+     * runs with {@code !hasEverConnected}, so an auth, upgrade or capability
+     * rejection is terminal (see {@link #endpointPolicyFailureIsTerminal()}):
+     * it is dispatched to the async {@code SenderErrorHandler} and latched for
+     * a {@code close()} rethrow, rather than retried.
      */
     private void attemptInitialConnect() {
         connectLoop(new LineSenderException(

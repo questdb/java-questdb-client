@@ -3398,10 +3398,12 @@ public class QwpWebSocketSender implements Sender {
                 // Encoder stays at its default (V1 -- the only supported wire
                 // version today). Frames written before the first successful
                 // connect commit to V1 because cursor segments are immutable;
-                // a future version bump must account for that. Auth, upgrade,
-                // capability and transport failures all retry indefinitely on
-                // the I/O thread (Invariant B); none is surfaced here or later
-                // to the producer.
+                // a future version bump must account for that. Transport
+                // failures retry indefinitely on the I/O thread (Invariant B).
+                // But a terminal auth, upgrade or capability rejection on this
+                // initial connect -- before the wire is ever up -- is surfaced
+                // to the async SenderErrorHandler and latched for a close()
+                // rethrow, not retried.
                 client = null;
                 break;
             case OFF:

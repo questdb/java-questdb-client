@@ -49,11 +49,13 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
  * {@code Sender.fromConfig} must return immediately even when no server
- * is reachable; the I/O thread retries connect in the background. Plain
- * failures are retried indefinitely (Invariant B: no wall-clock budget
- * give-up), including authentication, upgrade and durable-ack capability
- * failures. Those endpoint states stay inside the I/O thread and never stop
- * the producer.
+ * is reachable; the I/O thread retries connect in the background. Transport
+ * failures (unreachable or dropped server) are retried indefinitely
+ * (Invariant B: no wall-clock budget give-up) and never stop the producer.
+ * But the initial connect has never reached the server, so an endpoint-policy
+ * rejection there -- authentication, upgrade or durable-ack capability -- is
+ * terminal: with no caller thread left to throw at, it is delivered to the
+ * {@code SenderErrorHandler} instead of buffering forever.
  */
 public class InitialConnectAsyncTest {
 

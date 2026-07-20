@@ -795,9 +795,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *       unconnected sender; the I/O thread runs the same retry loop in
      *       the background. The user thread can call {@code at()} /
      *       {@code flush()} immediately; rows accumulate in the cursor SF
-     *       engine until the wire is up. Transport, auth, upgrade and
-     *       capability failures are retried indefinitely in the background;
-     *       none is surfaced to producer calls or the async error inbox.</li>
+     *       engine until the wire is up. Transport failures (unreachable or
+     *       dropped server) retry indefinitely and are never surfaced -- the
+     *       buffered rows are safe in SF and the server may still appear. A
+     *       terminal auth, upgrade or capability rejection on the initial
+     *       connect (before the wire has ever come up) has no caller left to
+     *       throw at, so it is delivered to the async error inbox as a
+     *       {@link io.questdb.client.SenderError}; wire {@code error_handler=...}
+     *       to observe it. Once the wire has come up even once, SF owns the
+     *       buffered data and the same rejections (e.g. a credential rotation)
+     *       become transients retried indefinitely.</li>
      * </ul>
      * <p>
      * Default resolution when the caller does not pick a value:
