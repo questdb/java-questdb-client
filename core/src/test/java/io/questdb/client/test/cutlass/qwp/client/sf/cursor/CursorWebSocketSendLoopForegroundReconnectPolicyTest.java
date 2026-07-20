@@ -34,6 +34,11 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -174,6 +179,17 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                         0L,
                         0L,
                         CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                // Wire an error sink. Retrying is what the store-and-forward contract
+                // demands, but until dispatchRetriedEndpointPolicyFailure existed the retry
+                // was programmatically INVISIBLE: dispatchError ran only in the terminal
+                // branches, so a revoked token produced nothing but a throttled slf4j WARN
+                // -- in a library that ships embedded in user apps, often with no binding
+                // configured -- and the failure eventually surfaced as "sf_max_total_bytes
+                // too small", blaming disk sizing for an auth problem.
+                List<SenderError> dispatched = Collections.synchronizedList(new ArrayList<>());
+                SenderErrorDispatcher dispatcher =
+                        new SenderErrorDispatcher(dispatched::add, 16);
+                loop.setErrorDispatcher(dispatcher);
                 try {
                     appendFrame(engine, (byte) 1);
                     loop.start();
@@ -183,6 +199,11 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                             "foreground reconnect did not complete");
                     Assert.assertNull("post-start endpoint-policy failures must not stop the producer",
                             loop.getTerminalError());
+                    await(() -> !dispatched.isEmpty(),
+                            "a retried endpoint-policy failure must reach the error handler");
+                    SenderError observed = dispatched.get(0);
+                    Assert.assertEquals("the retry must be reported as retriable, not terminal",
+                            SenderError.Policy.RETRIABLE, observed.getAppliedPolicy());
                     Assert.assertTrue("the reconnect loop must retry both scripted failures",
                             factory.attempts() >= 3);
 
@@ -193,6 +214,7 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
                     Assert.assertEquals(target, engine.ackedFsn());
                 } finally {
                     loop.close();
+                    dispatcher.close();
                     initialClient.close();
                 }
             }

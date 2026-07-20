@@ -1550,7 +1550,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     slotPath = null;
                 } else {
                     if (!Files.exists(sfDir)) {
-                        int rc = Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT);
+                        // DIR_MODE_SHARED, matching .slot-locks: a second uid has to create
+                        // its own slot directory in here, so restricting this to 0755 makes
+                        // the shared lock directory pointless (see Files.DIR_MODE_SHARED).
+                        // Under the usual umask 022 this is still 0755, plus sticky.
+                        int rc = Files.mkdir(sfDir, Files.DIR_MODE_SHARED);
                         // mkdir is non-zero on failure, but "already exists"
                         // is one such failure. Multiple SF senders sharing one
                         // sf_dir can be built concurrently (the pool calls

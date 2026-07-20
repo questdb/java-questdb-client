@@ -505,23 +505,25 @@ public class PersistedSymbolDictTest {
     }
 
     /**
-     * A loaded region that cannot be decoded must surface as an UnreplayableSlotException,
-     * not a raw IllegalStateException.
+     * A chunk whose declared entryCount disagrees with the entries its entryBytes region
+     * actually holds must END THE TRUSTED PREFIX, exactly as a CRC failure does.
      * <p>
-     * Sender.build() routes on the TYPE -- only UnreplayableSlotException reaches its
-     * quarantine handler. A raw IllegalStateException escapes build() instead, and with a
-     * stable senderId and a retained slot every restart re-recovers and rethrows: the
-     * application can never construct a Sender, so it cannot even BUFFER new rows.
+     * The CRC proves the bytes are what was WRITTEN; it says nothing about whether the
+     * header triple is self-consistent, and the only write-side guard
+     * ({@code validateRawEntries}) sits behind an assert -- which this library, shipping
+     * embedded in user applications, runs without. The scan used to accept such a chunk
+     * and count its declared 3 entries, leaving decodeLoadedSymbols to discover the
+     * problem later and throw two layers up: a quarantine of the whole slot instead of
+     * salvaging its intact prefix.
      * <p>
-     * The fixture also documents a real gap: scanRecoveredChunks validates the chunk CRC
-     * and rejects entryCount &lt;= 0, but never checks that entryBytes actually holds
-     * entryCount well-formed entries. A chunk claiming 3 entries inside a 2-byte region is
-     * therefore ACCEPTED here, and only the decoder notices. Validating the triple during
-     * the scan would end the trusted prefix at that chunk instead -- the same treatment a
-     * CRC failure gets.
+     * Validating during the scan is also what makes decodeLoadedSymbols' own throws
+     * unreachable through {@code open()}. Their type change -- IllegalStateException to
+     * UnreplayableSlotException, so Sender.build() can set a slot aside rather than
+     * rethrow forever -- stays pinned on its reachable sibling by
+     * CursorSendEngineTest#testRecoveryBaselineMismatchIsQuarantinableNotAPermanentBrick.
      */
     @Test
-    public void testUndecodableLoadedRegionIsQuarantinableNotAPermanentBrick() throws Exception {
+    public void testChunkWhoseCountDisagreesWithItsEntriesEndsTheTrustedPrefix() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
             Path f = dir.resolve(".symbol-dict");
@@ -554,17 +556,13 @@ public class PersistedSymbolDictTest {
             Files.write(f, file);
 
             try (PersistedSymbolDict dict = PersistedSymbolDict.open(dir.toString())) {
-                Assert.assertNotNull("the CRC is valid, so the chunk is accepted by the scan", dict);
-                Assert.assertEquals("the scan trusts the declared entryCount", 3, dict.size());
-                try {
-                    dict.addLoadedSymbolsTo(new GlobalSymbolDictionary());
-                    Assert.fail("decoding 3 entries out of a 2-byte region must fail");
-                } catch (UnreplayableSlotException expected) {
-                    Assert.assertTrue("expected the truncated-entry message, got: "
-                                    + expected.getMessage(),
-                            expected.getMessage().contains("truncated loaded symbol dictionary entry"));
-                }
+                Assert.assertNotNull("a valid CRC must not destroy the file", dict);
+                Assert.assertEquals("3 entries claimed inside a region holding 1 must end the "
+                        + "trusted prefix, not be counted", 0, dict.size());
+                // Nothing was trusted, so nothing decodes -- and no throw escapes.
+                dict.addLoadedSymbolsTo(new GlobalSymbolDictionary());
             }
+            Assert.assertEquals("the untrusted tail must be truncated away", 8L, Files.size(f));
         });
     }
 

@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
@@ -336,6 +337,55 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     }
                     // Retriable, not terminal: the producer-facing error latch stays clear.
                     loop.checkError();
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    /**
+     * A delta section that declares more entries than it carries must bail, not advance
+     * the mirror's count past bytes it does not hold.
+     * <p>
+     * readVarintAt used to return 0 with its end position AT the limit when the payload
+     * was already exhausted, so a caller computing {@code p = end + len} got exactly
+     * {@code p == limit} and its {@code p > limit} bail-out could not fire. The walk then
+     * ran the remaining pseudo-entries for free and {@code sentDictCount += newCount}
+     * claimed symbols the mirror has no bytes for -- after which the reconnect catch-up
+     * ships a chunk whose deltaCount exceeds its payload. Returning -1 for a truncated
+     * varint makes the boundary detectable and every bail-out fire.
+     * <p>
+     * The frame here is well-formed except for its count: two entries declared, one
+     * supplied, ending exactly on the boundary that used to slip through.
+     */
+    @Test
+    public void testDeltaDeclaringMoreEntriesThanItCarriesDoesNotAdvanceTheMirror() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    // [deltaStart=0][deltaCount=2][len=1]['a'] -- the second entry is absent
+                    // and the payload ends exactly where its length varint would start.
+                    int payloadLen = QwpConstants.HEADER_SIZE + 4;
+                    long frame = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        Unsafe.getUnsafe().setMemory(frame, payloadLen, (byte) 0);
+                        Unsafe.getUnsafe().putInt(frame, QwpConstants.MAGIC_MESSAGE);
+                        Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS,
+                                QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+                        long p = frame + QwpConstants.HEADER_SIZE;
+                        Unsafe.getUnsafe().putByte(p, (byte) 0);       // deltaStart
+                        Unsafe.getUnsafe().putByte(p + 1, (byte) 2);   // deltaCount: a lie
+                        Unsafe.getUnsafe().putByte(p + 2, (byte) 1);   // entry 0 length
+                        Unsafe.getUnsafe().putByte(p + 3, (byte) 'a'); // entry 0 payload
+                        loop.accumulateSentDictForTest(frame, payloadLen, 0);
+                    } finally {
+                        Unsafe.free(frame, payloadLen, MemoryTag.NATIVE_DEFAULT);
+                    }
+                    assertEquals("a truncated delta must not advance the mirror at all",
+                            0, loop.sentDictCount());
                 } finally {
                     loop.close();
                 }

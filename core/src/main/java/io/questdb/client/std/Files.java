@@ -76,16 +76,32 @@ public final class Files {
      */
     public static final int DIR_MODE_DEFAULT = 493;
     /**
-     * Creation mode for a directory that processes running as DIFFERENT users
-     * must all create files in -- the store-and-forward logical slot-lock
-     * directory being the one such case. 0777 octal, so the deployment's umask
-     * decides the actual sharing policy exactly as it does for the sf_dir these
-     * live under: the usual 022 yields the same 0755 as
-     * {@link #DIR_MODE_DEFAULT}, while a shared-group deployment (umask 002)
-     * gets the group-writable directory a second uid needs. Do NOT use this for
-     * a directory only its creator writes to.
+     * Creation mode for a directory that processes running as DIFFERENT users must all
+     * create entries in: the store-and-forward root and its logical slot-lock directory.
+     * <b>01777 octal -- 0777 plus the sticky bit.</b>
+     * <p>
+     * The deployment's umask decides the sharing policy: the usual 022 yields 01755, i.e.
+     * exactly {@link #DIR_MODE_DEFAULT} plus sticky, so the common case is unchanged;
+     * a shared-group deployment (umask 002) gets the 01775 a second uid needs. umask
+     * masks only the rwx bits, never the sticky bit, so the restricted-deletion semantics
+     * survive every umask.
+     * <p>
+     * The sticky bit is not optional here. Without it, on a multi-tenant host any local
+     * user with write access to the directory can unlink another process's lock file --
+     * which does not release that process's flock, but does free the pathname, so the
+     * next acquirer creates a SECOND inode and locks it successfully. Two owners of a
+     * lock whose entire job is mutual exclusion. Sticky restricts deletion to the file's
+     * owner and closes that.
+     * <p>
+     * This must be applied to EVERY directory on the path a foreign uid has to create in.
+     * Applying it only to {@code .slot-locks} -- while {@code sf_dir} itself stays 0755 --
+     * is a half-measure: umask can only clear bits, so under umask 002 the lock directory
+     * becomes group-writable while sf_dir does not, and the second uid still cannot create
+     * its slot directory. build() then fails one level before the problem this mode
+     * exists to solve. Do NOT use it for a directory only its creator writes to; the slot
+     * directory itself stays {@link #DIR_MODE_DEFAULT}.
      */
-    public static final int DIR_MODE_SHARED = 511;
+    public static final int DIR_MODE_SHARED = 1023;
 
     /** {@code dirent.d_type} sentinel: type unknown (filesystem doesn't fill it). */
     public static final int DT_UNKNOWN = 0;

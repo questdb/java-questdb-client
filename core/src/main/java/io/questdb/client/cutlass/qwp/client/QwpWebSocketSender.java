@@ -3347,14 +3347,24 @@ public class QwpWebSocketSender implements Sender {
             }
             if (System.nanoTime() >= deadlineNanos) {
                 long acked = cursorEngine.ackedFsn();
-                LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost",
-                        closeFlushTimeoutMillis, target, acked);
+                // Name the outage the I/O thread is riding out, when there is one. A
+                // foreground sender now retries endpoint-policy rejections indefinitely,
+                // so a revoked token reaches the operator HERE -- and blaming timeout
+                // tuning for what is actually an auth failure is how the review found
+                // this path misdirecting.
+                CursorWebSocketSendLoop loop = cursorSendLoop;
+                Throwable outage = loop == null ? null : loop.lastReconnectError();
+                LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
+                        closeFlushTimeoutMillis, target, acked,
+                        outage == null ? "" : "; wire is not draining: " + outage.getMessage());
                 throw new LineSenderException("close() drain timed out after ")
                         .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
                         .put(target).put(", ackedFsn=").put(acked)
                         .put("] - server did not acknowledge ")
                         .put(target - acked)
-                        .put(" pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)");
+                        .put(outage == null
+                                ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
+                                : " pending batches; the wire is not draining: " + outage.getMessage());
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }

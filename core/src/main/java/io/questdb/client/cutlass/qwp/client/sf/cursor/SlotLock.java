@@ -120,7 +120,7 @@ public final class SlotLock implements QuietCloseable {
             throw new IllegalArgumentException(
                     "slotDir must contain a parent and slot name: " + slotDir);
         }
-        // SHARED_DIR_MODE, not DIR_MODE_DEFAULT: unlike a slot directory -- which
+        // DIR_MODE_SHARED, not DIR_MODE_DEFAULT: unlike a slot directory -- which
         // one process creates and only that process writes -- this directory is
         // shared by every sender under the same sf_dir, and each of them must
         // CREATE its own lock file inside it. At 0755 the first process to start

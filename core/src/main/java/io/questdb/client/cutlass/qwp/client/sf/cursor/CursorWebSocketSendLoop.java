@@ -376,6 +376,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // successful connect attempt in any mode). Once true, stays true. This is
     // connection-state observability only; reconnect policy is role-based.
     private volatile boolean hasEverConnected;
+    // Cause of the outage the reconnect loop is currently riding out, or null once a
+    // connect succeeds. Written by the I/O thread, read by the producer thread so a
+    // backpressure or drain-timeout failure can NAME the reason the wire is not draining
+    // instead of blaming disk sizing. Was a connectLoop local that never escaped, which
+    // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
+    private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
     // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
     // terminalError latch, so a checkError() caller that observes the latch is
@@ -1599,7 +1605,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         }
         int attempts = 0;
         long lastLogNanos = 0L;
-        Throwable lastReconnectError = initial;
+        lastReconnectError = initial;
         while (running) {
             attempts++;
             totalReconnectAttempts.incrementAndGet();
@@ -1665,6 +1671,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 resetCatchUpCapGapEpisode();
                 lastReconnectError = e;
+                dispatchRetriedEndpointPolicyFailure(
+                        SenderError.Category.SECURITY_ERROR, "ws-upgrade-failed: " + e.getMessage());
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
                     LOG.warn("{} attempt {}: foreground auth/upgrade policy rejected the connection; "
@@ -1703,6 +1711,9 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 }
                 resetCatchUpCapGapEpisode();
                 lastReconnectError = e;
+                dispatchRetriedEndpointPolicyFailure(
+                        SenderError.Category.PROTOCOL_VIOLATION,
+                        "durable-ack-mismatch: " + e.getMessage());
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
                     LOG.warn("{} attempt {}: foreground durable-ack capability is temporarily "
@@ -1821,6 +1832,45 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * failure is then a transient the drainer must ride out, never a producer-fatal
      * terminal (Invariant B).
      */
+    /**
+     * Reports an endpoint-policy rejection a FOREGROUND sender is riding out.
+     * <p>
+     * Retrying is what the store-and-forward contract demands, but until now the retry was
+     * programmatically invisible: dispatchError ran only in the terminal branches, so a
+     * revoked token produced nothing but a throttled slf4j WARN -- in a library that ships
+     * embedded in user applications, frequently with no binding configured. flush() kept
+     * returning success until SF filled, and the failure then surfaced as "cursor ring
+     * backpressured ... sf_max_total_bytes too small", pointing the operator at disk
+     * sizing. That is the same complaint this PR makes to justify keeping STARTUP
+     * terminal; post-start it was merely delayed by SF capacity, not avoided.
+     * <p>
+     * RETRIABLE, not TERMINAL: the handler learns the wire is being rejected while the
+     * producer stays alive and no data is at risk.
+     */
+    private void dispatchRetriedEndpointPolicyFailure(SenderError.Category category, String message) {
+        long fromFsn = engine.ackedFsn() + 1L;
+        dispatchError(new SenderError(
+                category,
+                SenderError.Policy.RETRIABLE,
+                SenderError.NO_STATUS_BYTE,
+                message,
+                SenderError.NO_MESSAGE_SEQUENCE,
+                fromFsn,
+                Math.max(fromFsn, engine.publishedFsn()),
+                null,
+                System.nanoTime()
+        ));
+    }
+
+    /**
+     * Cause of the outage the reconnect loop is riding out, or {@code null} when the wire
+     * is up. Lets a producer-side failure name the real reason rather than blaming disk
+     * sizing -- see the field.
+     */
+    public Throwable lastReconnectError() {
+        return lastReconnectError;
+    }
+
     private boolean endpointPolicyFailureIsTerminal() {
         return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
     }
@@ -2341,6 +2391,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // failures on a foreground sender and rides them out instead, because
         // store-and-forward now owns the buffered data (Invariant B).
         this.hasEverConnected = true;
+        this.lastReconnectError = null;
         if (old != null) {
             try {
                 old.close();
@@ -2552,19 +2603,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (newCap > MAX_SENT_DICT_BYTES) {
             newCap = MAX_SENT_DICT_BYTES;
         }
-        if (sentDictBytesOwned) {
-            sentDictBytesAddr = Unsafe.realloc(
-                    sentDictBytesAddr,
-                    sentDictBytesCapacity,
-                    (int) newCap,
-                    MemoryTag.NATIVE_DEFAULT);
-        } else {
-            long newAddr = Unsafe.malloc((int) newCap, MemoryTag.NATIVE_DEFAULT);
-            if (sentDictBytesLen > 0) {
-                Unsafe.getUnsafe().copyMemory(sentDictBytesAddr, newAddr, sentDictBytesLen);
+        try {
+            if (sentDictBytesOwned) {
+                sentDictBytesAddr = Unsafe.realloc(
+                        sentDictBytesAddr,
+                        sentDictBytesCapacity,
+                        (int) newCap,
+                        MemoryTag.NATIVE_DEFAULT);
+            } else {
+                long newAddr = Unsafe.malloc((int) newCap, MemoryTag.NATIVE_DEFAULT);
+                if (sentDictBytesLen > 0) {
+                    Unsafe.getUnsafe().copyMemory(sentDictBytesAddr, newAddr, sentDictBytesLen);
+                }
+                sentDictBytesAddr = newAddr;
+                sentDictBytesOwned = true;
             }
-            sentDictBytesAddr = newAddr;
-            sentDictBytesOwned = true;
+        } catch (Throwable t) {
+            // Latch for exactly the reason the MAX_SENT_DICT_BYTES arm above does, and it
+            // was asymmetric until now: accumulateSentDict runs AFTER the frame's
+            // sendBinary, so a bare throw unwinds to ioLoop -> fail() -> connectLoop,
+            // which (running still true) reconnects and replays the same frame, which
+            // re-attempts the same allocation. A genuine out-of-memory therefore became an
+            // unbounded reconnect livelock instead of the loud failure the ceiling arm
+            // promises. recordFatal flips running=false so connectLoop winds down and
+            // checkError() surfaces it; the throw still unwinds past the pending copy.
+            recordFatal(t);
+            throw t;
         }
         sentDictBytesCapacity = (int) newCap;
     }

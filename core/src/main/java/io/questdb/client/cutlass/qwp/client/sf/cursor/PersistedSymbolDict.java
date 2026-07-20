@@ -499,8 +499,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
             return;
         }
         closed = true;
+        // Each step in its own try/catch, as CursorSendEngine.close() already does.
+        // `closed` is set first, so a throw from any step short-circuits every retry --
+        // stranding the scratch buffer and the fd for the process's lifetime. Unreachable
+        // with FilesFacade.INSTANCE (munmap and truncate are native calls returning
+        // int/boolean), but the ff seam exists precisely so a test CAN inject a throw,
+        // and a close path must not depend on its own steps never failing.
         if (loadedEntriesAddr != 0L) {
-            Unsafe.free(loadedEntriesAddr, loadedEntriesLen, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.free(loadedEntriesAddr, loadedEntriesLen, MemoryTag.NATIVE_DEFAULT);
+            } catch (Throwable ignored) {
+            }
             // Null after freeing (like scratchAddr below) so a future accessor that
             // reads loadedEntriesAddr()/loadedEntriesLen() post-close cannot
             // dereference freed native memory; the getters are not closed-guarded.
@@ -508,26 +517,40 @@ public final class PersistedSymbolDict implements QuietCloseable {
             loadedEntriesLen = 0;
         }
         if (appendMapAddr != 0L) {
-            ff.munmap(appendMapAddr, appendMapCapacity, MemoryTag.MMAP_DEFAULT);
+            long mapAddr = appendMapAddr;
+            long mapCapacity = appendMapCapacity;
             appendMapAddr = 0L;
             appendMapCapacity = 0L;
             appendMapOffset = 0L;
-            // The active window reserves space past the logical end. Return that tail on
-            // orderly close; after a crash open() treats the zero-filled reserve as
-            // a torn trailing chunk and truncates it to the same appendOffset.
-            if (!ff.truncate(fd, appendOffset)) {
-                LOG.warn("symbol dict {} could not trim mmap reserve to {}; recovery will "
-                                + "discard the zero-filled tail on the next open",
-                        FILE_NAME, appendOffset);
+            try {
+                ff.munmap(mapAddr, mapCapacity, MemoryTag.MMAP_DEFAULT);
+            } catch (Throwable ignored) {
+            }
+            try {
+                // The active window reserves space past the logical end. Return that tail on
+                // orderly close; after a crash open() treats the zero-filled reserve as
+                // a torn trailing chunk and truncates it to the same appendOffset.
+                if (!ff.truncate(fd, appendOffset)) {
+                    LOG.warn("symbol dict {} could not trim mmap reserve to {}; recovery will "
+                                    + "discard the zero-filled tail on the next open",
+                            FILE_NAME, appendOffset);
+                }
+            } catch (Throwable ignored) {
             }
         }
         if (scratchAddr != 0L) {
-            Unsafe.free(scratchAddr, scratchCap, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.free(scratchAddr, scratchCap, MemoryTag.NATIVE_DEFAULT);
+            } catch (Throwable ignored) {
+            }
             scratchAddr = 0L;
             scratchCap = 0;
         }
         if (fd >= 0) {
-            ff.close(fd);
+            try {
+                ff.close(fd);
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -800,12 +823,60 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     || entriesLen + entryBytes > Integer.MAX_VALUE) {
                 break;
             }
+            if (!isConsistentEntryRegion(inputAddr, entriesStart, entryBytes, entryCount)) {
+                break;
+            }
             Unsafe.getUnsafe().copyMemory(inputAddr + entriesStart, dstAddr + entriesLen, entryBytes);
             entriesLen += entryBytes;
             diskPos = chunkEndI + CRC_SIZE;
             count += (int) entryCount;
         }
         return new RecoveryScan(count, (int) entriesLen, diskPos);
+    }
+
+    /**
+     * Whether {@code [start, start + bytes)} holds exactly {@code count} well-formed
+     * {@code [len varint][utf8]} entries, consuming the region exactly.
+     * <p>
+     * The chunk CRC proves the bytes are what was WRITTEN; it says nothing about whether
+     * the header triple is self-consistent. The only write-side guard,
+     * {@code validateRawEntries}, sits behind an {@code assert} -- and this library ships
+     * embedded in user applications, which run without {@code -ea}. So a producer bug or
+     * a torn write that happens to re-checksum could record a chunk whose stored
+     * entryCount disagrees with its entries, shifting the dense id-&gt;symbol map for
+     * everything above it.
+     * <p>
+     * Checking here ends the trusted prefix at that chunk -- the same treatment a CRC
+     * failure gets -- instead of letting decodeLoadedSymbols discover it later and throw
+     * two layers up, which quarantines the whole slot rather than salvaging its intact
+     * prefix. It costs one varint decode per entry on a cold path that already walks
+     * every entry immediately afterwards.
+     */
+    private static boolean isConsistentEntryRegion(long addr, int start, long bytes, long count) {
+        long p = start;
+        long limit = start + bytes;
+        for (long i = 0; i < count; i++) {
+            long len = 0;
+            int shift = 0;
+            boolean terminated = false;
+            while (p < limit) {
+                byte b = Unsafe.getUnsafe().getByte(addr + p++);
+                len |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) {
+                    terminated = true;
+                    break;
+                }
+                shift += 7;
+                if (shift > 35) {
+                    return false; // over-long run: a canonical length varint is <= 5 bytes
+                }
+            }
+            if (!terminated || len < 0 || p + len > limit) {
+                return false;
+            }
+            p += len;
+        }
+        return p == limit;
     }
 
     private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath) {

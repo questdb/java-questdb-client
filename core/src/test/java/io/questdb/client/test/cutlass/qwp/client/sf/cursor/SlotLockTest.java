@@ -154,7 +154,7 @@ public class SlotLockTest {
             String lockDir = parentDir + "/.slot-locks";
             RecordingMkdirFacade ff = new RecordingMkdirFacade();
             try (SlotLock ignored = SlotLock.acquireLogical(ff, slot)) {
-                assertEquals("the shared lock dir must be created umask-governed",
+                assertEquals("the shared lock dir must be created 01777 (sticky), umask-governed",
                         Files.DIR_MODE_SHARED, ff.modeFor(lockDir));
             }
             // The per-slot directory keeps the restrictive mode: one process
