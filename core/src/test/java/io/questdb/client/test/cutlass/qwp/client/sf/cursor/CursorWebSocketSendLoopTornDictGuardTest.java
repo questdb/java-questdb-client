@@ -72,7 +72,11 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
 
     @After
     public void tearDown() {
-        TestUtils.removeTmpDir(sfDir);
+        // Recursive: this test builds the store-and-forward slot layout
+        // (<dir>/default/... plus <dir>/.slot-locks/...), and the flat variant
+        // cannot remove a non-empty subdirectory -- it also discards its result,
+        // so the whole tree survived every run unnoticed.
+        TestUtils.removeTmpDirRec(sfDir);
     }
 
     @Test

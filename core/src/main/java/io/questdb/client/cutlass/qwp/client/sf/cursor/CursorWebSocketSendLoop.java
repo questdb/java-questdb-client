@@ -249,11 +249,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final ReconnectFactory reconnectFactory;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
-    // Retained for constructor symmetry and passed in by callers, but NOT
-    // consulted by the background loop: Invariant B removed the wall-clock
-    // give-up from connectLoop. The budget still bounds the blocking (non-lazy)
-    // initial connect via QwpWebSocketSender -> connectWithRetry, which takes it
-    // as an explicit argument rather than reading this field.
     private final WebSocketResponse response = new WebSocketResponse();
     private final ResponseHandler responseHandler = new ResponseHandler();
     private final CountDownLatch shutdownLatch = new CountDownLatch(1);
@@ -761,10 +756,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // re-registers its dictionary from id 0 as it replays, so seeding the mirror would buy
         // nothing and cost a catch-up frame on every connection -- full-dict slots must stay
         // catch-up-free.
-        // The prefix seed above may be borrowed, while the entry-end index is always
-        // loop-owned native memory. Build/extend both inside one cleanup boundary:
-        // any allocation failure propagates out of the constructor before a caller
-        // can own the half-built loop, so nothing else could release them.
+        // The prefix seed above may still be borrowed from PersistedSymbolDict.
+        // Extending it inside this cleanup boundary is what makes that safe:
+        // ensureSentDictCapacity copy-on-writes a borrowed prefix into loop-OWNED
+        // native memory, so from that point a failure would leak it -- and an
+        // allocation failure here propagates out of the constructor before any
+        // caller can own the half-built loop, leaving nothing else able to
+        // release it. releaseSentDictBytes() in the catch frees exactly that
+        // mirror, and only when this loop owns it.
         try {
             if (engine.recoveredMaxSymbolDeltaStart() > 0L) {
                 int baseline = sentDictCount;
@@ -792,10 +791,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     }
                 }
             }
-            // The entry-ends index is NOT built here. sendDictCatchUp is its only
-            // reader and builds it on demand, so a recovered slot that drains without
-            // ever reconnecting -- the normal case -- never pays the O(n) walk nor
-            // retains the 4-bytes-per-symbol index.
+            // No per-entry offset index is derived here, and none is kept anywhere:
+            // the mirror carries its own framing ([len varint][utf8] per entry), so
+            // sendDictCatchUp -- its only reader -- recovers each entry's span with a
+            // running pointer as it walks. A recovered slot that drains without ever
+            // reconnecting, the normal case, therefore never pays that O(n) walk and
+            // carries no index memory for it.
         } catch (Throwable t) {
             releaseSentDictBytes();
             throw t;
@@ -1575,9 +1576,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // drainers. Foreground senders retry them from asynchronous startup onward
         // so a credential or cluster capability rotation cannot stop the producer. SF
         // exhaustion is surfaced to the PRODUCER as append backpressure, never
-        // here. reconnect_max_duration_millis is intentionally NOT consulted: it
-        // bounds only the blocking (non-lazy) initial connect in
-        // QwpWebSocketSender.buildAndConnect, never this background loop.
+        // here. reconnect_max_duration_millis is intentionally NOT consulted by
+        // THIS loop. Its holders pass it explicitly where it does apply: the
+        // blocking (non-lazy) initial connect hands it to connectWithRetry (see
+        // QwpWebSocketSender.ensureConnected, the SYNC branch), and
+        // BackgroundDrainer converts it into the durable-ack capability-gap
+        // budget. Neither bounds this loop's steady-state reconnect.
         long backoffMillis = reconnectInitialBackoffMillis;
         if (paceFirstAttemptMillis > 0 && running) {
             // NACK-initiated recycle against a reachable server: pace the

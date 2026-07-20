@@ -32,9 +32,18 @@ import java.util.List;
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DELTA_SYMBOL_DICT;
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE;
 
-final class QwpWireTestUtils {
+public final class QwpWireTestUtils {
 
-    static void accumulateDeltaDictionary(byte[] frame, List<String> dictionary) {
+    /**
+     * Folds one frame's symbol-dict delta into {@code dictionary}, exactly as the
+     * server does -- including padding a gap with nulls rather than rejecting it,
+     * so a caller can observe a gap instead of having it hidden. Public so the
+     * store-and-forward send-loop tests in the {@code sf.cursor} package can
+     * reassemble captured catch-up frames through the SAME decoder the
+     * end-to-end tests' server handler uses, rather than hand-rolling a second
+     * one that could drift from it.
+     */
+    public static void accumulateDeltaDictionary(byte[] frame, List<String> dictionary) {
         if (!hasDelta(frame)) {
             return;
         }

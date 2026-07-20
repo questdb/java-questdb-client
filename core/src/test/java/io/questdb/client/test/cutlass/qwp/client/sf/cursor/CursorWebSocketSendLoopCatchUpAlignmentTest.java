@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -166,7 +167,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
-                    seedMirror(loop, TestUtils.repeat("x", 3_000), TestUtils.repeat("y", 3_000));
+                    String symX = TestUtils.repeat("x", 3_000);
+                    String symY = TestUtils.repeat("y", 3_000);
+                    seedMirror(loop, symX, symY);
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the small cap must split the dictionary", 2, client.framesSent);
@@ -174,19 +177,130 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             2, client.multipartFramesSent);
                     assertEquals("the split chunks need one small prefix buffer",
                             1, loop.catchUpFrameGrowthCount());
+                    // Splitting is only correct if the chunks reassemble gap-free.
+                    assertCatchUpReassembles(client, symX, symY);
 
                     client.cap = 7_000;
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the larger cap must combine the dictionary", 3, client.framesSent);
                     assertEquals("combining symbols must not grow the prefix-only buffer",
                             1, loop.catchUpFrameGrowthCount());
+                    assertCatchUpReassembles(client, symX, symY);
 
                     invokeSetWireBaselineWithCatchUp(loop, 0L);
                     assertEquals("the next reconnect sends one combined frame", 4, client.framesSent);
                     assertEquals("the prefix buffer must be reused across reconnects",
                             1, loop.catchUpFrameGrowthCount());
+                    assertCatchUpReassembles(client, symX, symY);
                 } finally {
                     // assertMemoryLeak verifies that close releases the retained buffer.
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSplitCatchUpChunksTileTheDictionaryExactly() throws Exception {
+        // Three chunks rather than two: a start-id error that happens to cancel
+        // out across a single boundary cannot survive two of them, and only a
+        // multi-chunk walk exercises the accumulating "chunkStartId +=
+        // chunkSymbols" drift. Six 100-byte symbols under a cap that fits two
+        // per frame; the reassembly must return all six, in order, with no null.
+        TestUtils.assertMemoryLeak(() -> {
+            String[] symbols = new String[6];
+            for (int i = 0; i < symbols.length; i++) {
+                symbols[i] = TestUtils.repeat(String.valueOf((char) ('a' + i)), 100);
+            }
+            CatchUpCapturingClient client = new CatchUpCapturingClient(250);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, symbols);
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                    assertEquals("the cap must force a three-way split", 3, client.framesSent);
+                    assertCatchUpReassembles(client, symbols);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testEmptyDictionaryReconnectSendsNoCatchUpFrame() throws Exception {
+        // The sentDictCount > 0 half of setWireBaselineWithCatchUp's gate. Every
+        // other test here seeds at least one symbol, so the empty-dictionary
+        // branch -- a delta-enabled connection that has not registered anything
+        // yet, i.e. every reconnect before the first symbol -- was never
+        // exercised. Emitting a zero-entry catch-up frame there would burn a wire
+        // sequence and, via fsnAtZero = replayStart - catchUpFrames, shift the
+        // baseline so the first real frame no longer lands on replayStart.
+        TestUtils.assertMemoryLeak(() -> {
+            // cap 0 ("server advertises no cap") on purpose. Under a positive cap
+            // sendDictCatchUp would walk zero entries and return 0 frames anyway,
+            // so both assertions below would hold even with the sentDictCount > 0
+            // conjunct deleted -- the test would pin nothing. Cap 0 takes the
+            // fast path that sends one whole-dictionary frame unconditionally, so
+            // only the guard keeps the frame count at zero.
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    // Deliberately no seedMirror: sentDictCount stays 0.
+                    invokeSetWireBaselineWithCatchUp(loop, 7L);
+                    assertEquals("an empty dictionary must not ship a catch-up frame",
+                            0, client.framesSent);
+                    assertEquals("the baseline must stay at replayStart when nothing is re-registered",
+                            7L, loop.fsnAtZero());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCatchUpSplitsVariableWidthEntriesWithoutDrift() throws Exception {
+        // Every other split test here uses uniformly-sized symbols, so the chunk
+        // walk always advances by the same stride and a span miscalculation could
+        // cancel out. These entries are 14, 7, 11 and 22 bytes, so each hop is a
+        // different width and the walk has to resume mid-dictionary at an
+        // irregular boundary; the reassembly then pins the result per id.
+        //
+        // The symbols are multi-byte UTF-8 because that is a convenient source of
+        // widths that differ from their char counts, and it exercises the wire
+        // framing end to end -- NOT because sendDictCatchUp could confuse bytes
+        // for chars: that method holds no String, char or length() at all, only
+        // pointer arithmetic over [len varint][utf8]. The byte-vs-char hazard
+        // lives on the persist path and is covered by
+        // PersistedSymbolDictTest.testMultiByteUtf8SymbolsRoundTripAcrossReopen.
+        TestUtils.assertMemoryLeak(() -> {
+            String[] symbols = {
+                    // entry width below = 1-byte length varint + the UTF-8 bytes
+                    "températures",           // 12 chars, 13 bytes -> 14
+                    "東京",                    //  2 chars,  6 bytes ->  7
+                    "sensor🔥",              //  7 chars, 10 bytes -> 11
+                    "ascii_after_multibyte"   // 21 chars, 21 bytes -> 22; a drift shows up here
+            };
+            // Self-check: prove the literals really are multi-byte at runtime, so
+            // the widths stay irregular even if the source file ever loses its
+            // encoding and they collapse to single-byte '?'.
+            for (String s : symbols) {
+                if (!"ascii_after_multibyte".equals(s)) {
+                    assertTrue("expected a multi-byte UTF-8 symbol, got pure ASCII: " + s,
+                            s.getBytes(StandardCharsets.UTF_8).length > s.length());
+                }
+            }
+            CatchUpCapturingClient client = new CatchUpCapturingClient(80);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    seedMirror(loop, symbols);
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                    assertTrue("the cap must split the dictionary", client.framesSent > 1);
+                    assertCatchUpReassembles(client, symbols);
+                } finally {
                     loop.close();
                 }
             }
@@ -931,6 +1045,43 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         return new CursorSendEngine(tmpDir, 16_384);
     }
 
+    /**
+     * Reassembles the frames captured since the last call exactly as the server
+     * would -- through the same {@link QwpWireTestUtils#accumulateDeltaDictionary}
+     * the end-to-end tests' handler uses -- and asserts the result is the seeded
+     * dictionary, dense and in order.
+     * <p>
+     * This is what frame counting cannot do. A catch-up split ships its chunks as
+     * {@code [deltaStart, deltaStart+count)} ranges that must tile {@code [0, n)}
+     * exactly; an off-by-one in the walk's start id keeps the frame COUNT intact
+     * while overlapping a range (an id silently takes its neighbour's symbol) or
+     * skipping one (the server null-pads it, and rows referencing it land a NULL
+     * symbol value). Comparing the reassembled dictionary catches all three
+     * shapes -- overlap, gap and shift -- because it compares content per id, not
+     * just the ranges.
+     */
+    private static void assertCatchUpReassembles(CatchUpCapturingClient client, String... expected) {
+        List<String> rebuilt = new ArrayList<>();
+        for (byte[] frame : client.capturedFrames) {
+            // Tiling correctly is necessary but not sufficient: the split exists to
+            // keep every frame under the server's advertised batch cap, and a
+            // perfectly contiguous split that ignores the cap would otherwise only
+            // be caught indirectly, by a frame-count assertion.
+            if (client.cap > 0) {
+                assertTrue("catch-up frame of " + frame.length
+                        + " bytes exceeds the advertised cap " + client.cap,
+                        frame.length <= client.cap);
+            }
+            QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt);
+        }
+        client.capturedFrames.clear();
+        assertEquals("reassembled dictionary size", expected.length, rebuilt.size());
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals("symbol at id " + i + " (a null here is a gap the server would"
+                    + " turn into a NULL symbol value)", expected[i], rebuilt.get(i));
+        }
+    }
+
     // Populates the loop's native sent-dictionary mirror with {@code symbols} in
     // the on-wire [len varint][utf8] layout, so setWireBaselineWithCatchUp sees a
     // non-empty dictionary to re-register. loop.close() frees it.
@@ -980,6 +1131,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // Mutable so a test can model a rolling-cap cluster: raise it for a node that
         // accepts the dictionary, lower it for a smaller-cap node that cap-gaps.
         private int cap;
+        private final List<byte[]> capturedFrames = new ArrayList<>();
         private final Runnable onCapRead;
         private final boolean throwOnSend;
         private int framesSent;
@@ -1016,6 +1168,7 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         @Override
         public void sendBinary(long dataPtr, int length) {
             recordSend();
+            capture(dataPtr, length, 0L, 0);
         }
 
         @Override
@@ -1027,6 +1180,26 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         ) {
             multipartFramesSent++;
             recordSend();
+            capture(firstPtr, firstLength, secondPtr, secondLength);
+        }
+
+        /**
+         * Keeps the bytes of every frame sent, joining the two slices of a
+         * multipart send back into the single frame the server would see.
+         * Counting frames alone cannot detect the failure that matters here: an
+         * off-by-one in the chunk walk's start id ships the same NUMBER of
+         * frames while overlapping or skipping ids, and the server null-pads a
+         * skipped id into a silent NULL symbol.
+         */
+        private void capture(long firstPtr, int firstLength, long secondPtr, int secondLength) {
+            byte[] frame = new byte[firstLength + secondLength];
+            for (int i = 0; i < firstLength; i++) {
+                frame[i] = Unsafe.getUnsafe().getByte(firstPtr + i);
+            }
+            for (int i = 0; i < secondLength; i++) {
+                frame[firstLength + i] = Unsafe.getUnsafe().getByte(secondPtr + i);
+            }
+            capturedFrames.add(frame);
         }
 
         private void recordSend() {

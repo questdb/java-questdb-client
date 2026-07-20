@@ -598,6 +598,60 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    /**
+     * Fails if {@code symbol} is pure ASCII, i.e. if its UTF-8 encoding is one
+     * byte per char. Guards the multi-byte tests against silently degrading into
+     * ASCII ones should the source file's encoding ever be lost.
+     */
+    private static void assertMultiByte(String symbol) {
+        Assert.assertTrue("expected a multi-byte UTF-8 symbol, got pure ASCII: " + symbol,
+                symbol.getBytes(StandardCharsets.UTF_8).length > symbol.length());
+    }
+
+    @Test
+    public void testMultiByteUtf8SymbolsRoundTripAcrossReopen() throws Exception {
+        // Every other symbol in these suites is ASCII, where a symbol's UTF-8
+        // byte length and its String.length() are equal -- so a length confusion
+        // between the two is invisible to all of them. The side-file's entries
+        // are [len varint][utf8] and recovery walks them by that length, so
+        // sizing any of it from String.length() would desynchronize the walk at
+        // the first multi-byte symbol and shift every id after it.
+        //
+        // Mixes 2-, 3- and 4-byte sequences, and puts a plain ASCII symbol AFTER
+        // them so a shift introduced earlier shows up as a wrong value here
+        // rather than only as a truncated tail.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict");
+            String twoByte = "températures";   // e-acute, 2 bytes
+            String threeByte = "東京";      // Tokyo, 3 bytes each
+            String fourByte = "sensor🔥"; // fire emoji, 4 bytes
+            // Self-check: prove these literals really are multi-byte at runtime.
+            // Without it the test degrades silently if the source ever loses its
+            // encoding -- the literals collapse to ASCII '?', every assertion below
+            // still passes, and the coverage this test exists for is gone. That is
+            // not hypothetical: the pre-existing lone-surrogate test in
+            // DeltaDictRecoveryTest encodes to a single-byte '?' for exactly this
+            // reason, which is why none of the suites covered multi-byte at all.
+            assertMultiByte(twoByte);
+            assertMultiByte(threeByte);
+            assertMultiByte(fourByte);
+            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+                d.appendSymbol(twoByte);
+                d.appendSymbol(threeByte);
+                d.appendSymbol(fourByte);
+                d.appendSymbol("ascii_after_multibyte");
+            }
+            try (PersistedSymbolDict re = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertEquals(4, re.size());
+                ObjList<String> s = re.readLoadedSymbols();
+                Assert.assertEquals(twoByte, s.getQuick(0));
+                Assert.assertEquals(threeByte, s.getQuick(1));
+                Assert.assertEquals(fourByte, s.getQuick(2));
+                Assert.assertEquals("ascii_after_multibyte", s.getQuick(3));
+            }
+        });
+    }
+
     @Test
     public void testInteriorCorruptionIsCaughtNotSilentlyMisattributed() throws Exception {
         // A host-crash interior tear (a lost page reading back as zeroes) or a
