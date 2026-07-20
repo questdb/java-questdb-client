@@ -113,20 +113,51 @@ public final class SlotLock implements QuietCloseable {
     @TestOnly
     public static SlotLock acquireLogical(FilesFacade ff, String slotDir) {
         validateSlotDir(slotDir);
-        Path slotPath = Paths.get(slotDir);
-        Path parentPath = slotPath.getParent();
-        Path slotNamePath = slotPath.getFileName();
-        if (parentPath == null || slotNamePath == null || slotNamePath.toString().isEmpty()) {
+        String[] paths = resolveLogicalLock(slotDir);
+        if (paths == null) {
             throw new IllegalArgumentException(
                     "slotDir must contain a parent and slot name: " + slotDir);
         }
-        String parentDir = parentPath.toString();
-        String slotName = slotNamePath.toString();
-        String logicalLockDir = parentDir + "/" + LOGICAL_LOCK_DIR_NAME;
-        ensureDirectory(ff, logicalLockDir, "logical slot lock dir");
-        String lockPath = logicalLockDir + "/" + slotName + ".lock";
-        String pidPath = logicalLockDir + "/" + slotName + ".lock.pid";
-        return acquireAt(ff, slotDir, lockPath, pidPath);
+        ensureDirectory(ff, paths[0], "logical slot lock dir");
+        return acquireAt(ff, slotDir, paths[1], paths[2]);
+    }
+
+    /**
+     * Best-effort removal of the parent-anchored logical lock files
+     * ({@code <parent>/.slot-locks/<slotName>.lock} and its {@code .lock.pid}
+     * sidecar) for {@code slotDir}, mirroring {@link AckWatermark#removeOrphan}
+     * and {@link PersistedSymbolDict#removeOrphan} for the slot's in-directory
+     * side-files. The fully-drained close that permanently retires a slot calls
+     * this: the logical lock lives OUTSIDE the slot dir (so it survives a slot
+     * rename), so nothing else reclaims it, and without this
+     * {@code <sf_dir>/.slot-locks} accumulates one dead lock+pid pair per
+     * distinct slot name for the lifetime of {@code sf_dir} -- unbounded under
+     * rotating {@code senderId}s.
+     * <p>
+     * The unlink is best-effort and safe: the retiring engine still holds the
+     * slot's directory-local {@link #acquire} lock (the real multi-writer guard)
+     * across this cleanup, and fully-drained retirement performs no rename, so
+     * the logical lock -- which only guards the close/rename/recreate transition
+     * -- is not in use. An orphan drainer momentarily mid-{@link #acquireLogical}
+     * fails its immediately-following candidacy / directory-lock check (the slot
+     * is gone) and backs off. Unlike {@link #acquireLogical}, an unusable
+     * {@code slotDir} is a silent no-op here rather than a throw.
+     */
+    public static void removeOrphanLogical(String slotDir) {
+        removeOrphanLogical(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /** Facade-aware variant of {@link #removeOrphanLogical(String)}. */
+    public static void removeOrphanLogical(FilesFacade ff, String slotDir) {
+        if (slotDir == null || slotDir.isEmpty()) {
+            return;
+        }
+        String[] paths = resolveLogicalLock(slotDir);
+        if (paths == null) {
+            return;
+        }
+        ff.remove(paths[1]);
+        ff.remove(paths[2]);
     }
 
     private static SlotLock acquireAt(FilesFacade ff, String slotDir, String lockPath, String pidPath) {
@@ -165,6 +196,30 @@ public final class SlotLock implements QuietCloseable {
                         "could not create " + description + ": " + path + " rc=" + rc);
             }
         }
+    }
+
+    /**
+     * Resolves the parent-anchored logical lock layout for {@code slotDir}:
+     * {@code [0]} the {@code .slot-locks} directory, {@code [1]} the
+     * {@code <slotName>.lock} path, {@code [2]} the {@code .lock.pid} path.
+     * Returns {@code null} when {@code slotDir} has no usable parent or name.
+     * Shared by {@link #acquireLogical} and {@link #removeOrphanLogical} so the
+     * two can never target different files.
+     */
+    private static String[] resolveLogicalLock(String slotDir) {
+        Path slotPath = Paths.get(slotDir);
+        Path parentPath = slotPath.getParent();
+        Path slotNamePath = slotPath.getFileName();
+        if (parentPath == null || slotNamePath == null || slotNamePath.toString().isEmpty()) {
+            return null;
+        }
+        String logicalLockDir = parentPath + "/" + LOGICAL_LOCK_DIR_NAME;
+        String slotName = slotNamePath.toString();
+        return new String[]{
+                logicalLockDir,
+                logicalLockDir + "/" + slotName + LOCK_FILE_NAME,
+                logicalLockDir + "/" + slotName + LOCK_PID_FILE_NAME
+        };
     }
 
     private static void validateSlotDir(String slotDir) {

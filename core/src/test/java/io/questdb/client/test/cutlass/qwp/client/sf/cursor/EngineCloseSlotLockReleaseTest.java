@@ -38,6 +38,8 @@ import java.lang.reflect.Field;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -84,14 +86,26 @@ public class EngineCloseSlotLockReleaseTest {
     @After
     public void tearDown() {
         if (sfDir == null) return;
-        long find = Files.findFirst(sfDir);
+        rmDirRecursive(sfDir);
+    }
+
+    private static void rmDirRecursive(String dir) {
+        if (!Files.exists(dir)) return;
+        long find = Files.findFirst(dir);
         if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
                     if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(sfDir + "/" + name);
+                        String child = dir + "/" + name;
+                        long probe = Files.findFirst(child);
+                        if (probe > 0) {
+                            Files.findClose(probe);
+                            rmDirRecursive(child);
+                        } else {
+                            Files.remove(child);
+                        }
                     }
                     rc = Files.findNext(find);
                 }
@@ -99,7 +113,7 @@ public class EngineCloseSlotLockReleaseTest {
                 Files.findClose(find);
             }
         }
-        Files.remove(sfDir);
+        Files.remove(dir);
     }
 
     @Test(timeout = 10_000L)
@@ -174,6 +188,35 @@ public class EngineCloseSlotLockReleaseTest {
                         + "try/finally so slotLock.close() always runs. "
                         + "Underlying: " + leaked.getMessage());
             }
+        });
+    }
+
+    @Test(timeout = 10_000L)
+    public void testFullyDrainedCloseRemovesLogicalSlotLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The engine's slot lives one level under sfDir, so the parent-anchored
+            // logical lock lands at <sfDir>/.slot-locks/slot0.lock -- inside the tree
+            // tearDown cleans.
+            String slotDir = sfDir + "/slot0";
+
+            // Simulate the build's transient logical lock: acquire and release it,
+            // leaving the shared-dir lock file behind exactly as a real build does
+            // (close() releases the flock but keeps the file so it survives a rename).
+            SlotLock.acquireLogical(slotDir).close();
+            String lockFile = sfDir + "/.slot-locks/slot0.lock";
+            assertTrue("precondition: a build's logical lock leaves a file behind",
+                    Files.exists(lockFile));
+
+            // A fresh engine that never publishes is fully drained on close, so its
+            // close() runs the retirement cleanup that must reclaim the logical lock.
+            try (CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024)) {
+                assertEquals(slotDir, engine.sfDir());
+            }
+
+            assertFalse("fully-drained engine close must reclaim the orphaned logical "
+                            + "slot lock; otherwise .slot-locks grows unbounded under "
+                            + "rotating senderIds",
+                    Files.exists(lockFile));
         });
     }
 }

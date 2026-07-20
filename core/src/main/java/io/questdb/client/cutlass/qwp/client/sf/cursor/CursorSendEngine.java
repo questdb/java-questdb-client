@@ -728,6 +728,17 @@ public final class CursorSendEngine implements QuietCloseable {
                     PersistedSymbolDict.removeOrphan(sfDir);
                 } catch (Throwable ignored) {
                 }
+                try {
+                    // The logical slot lock lives OUTSIDE the slot dir (in the
+                    // shared .slot-locks dir) so it survives a slot rename; the
+                    // fully-drained retirement that removes this slot's other
+                    // side-files must remove it too, or .slot-locks accumulates a
+                    // dead lock+pid pair per distinct slot name for the lifetime of
+                    // sf_dir. This engine still holds the directory-local lock, so
+                    // the best-effort unlink is safe (see SlotLock.removeOrphanLogical).
+                    SlotLock.removeOrphanLogical(sfDir);
+                } catch (Throwable ignored) {
+                }
             }
         } finally {
             if (slotLock != null) {

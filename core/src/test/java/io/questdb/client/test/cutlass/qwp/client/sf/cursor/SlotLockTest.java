@@ -168,6 +168,40 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testRemoveOrphanLogicalDeletesLockAndPidFiles() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/alpha";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            // acquireLogical anchors the lock under the shared parent .slot-locks dir.
+            String lockFile = parentDir + "/.slot-locks/alpha.lock";
+            String pidFile = parentDir + "/.slot-locks/alpha.lock.pid";
+            try (SlotLock ignored = SlotLock.acquireLogical(slot)) {
+                assertTrue("logical .lock created", Files.exists(lockFile));
+                assertTrue("logical .lock.pid created", Files.exists(pidFile));
+            }
+            // close() releases the flock but deliberately keeps the file (it must
+            // outlast a slot rename); only the fully-drained retirement reclaims it.
+            assertTrue("logical .lock survives close", Files.exists(lockFile));
+            SlotLock.removeOrphanLogical(slot);
+            assertFalse("logical .lock removed on retirement", Files.exists(lockFile));
+            assertFalse("logical .lock.pid removed on retirement", Files.exists(pidFile));
+        });
+    }
+
+    @Test
+    public void testRemoveOrphanLogicalIsSilentNoOpWhenAbsentOrInvalid() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Never-locked slot: nothing to remove, must not throw.
+            SlotLock.removeOrphanLogical(parentDir + "/never-locked");
+            // Unlike acquireLogical (which throws on these), the retirement cleanup
+            // is best-effort and tolerates unusable input silently.
+            SlotLock.removeOrphanLogical(null);
+            SlotLock.removeOrphanLogical("");
+            SlotLock.removeOrphanLogical("slot"); // no parent component
+        });
+    }
+
+    @Test
     public void testTwoDifferentSlotsCoexist() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slotA = parentDir + "/a";
