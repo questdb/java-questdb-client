@@ -299,8 +299,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long sentDictBytesAddr;
     private int sentDictBytesCapacity;
     private int sentDictBytesLen;
-    // False only while an orphan-drainer loop borrows the persisted prefix.
-    // Any growth first performs a copy-on-write; only owned buffers are freed.
+    // False while the mirror is unallocated, and while a loop of EITHER policy borrows
+    // the engine's persisted prefix -- both borrow now; neither consumes it. Any growth
+    // copy-on-writes into loop-owned memory and sets this true; only owned buffers are
+    // freed.
     private boolean sentDictBytesOwned;
     private int sentDictCount;
     // True when replay frames can start above dictionary id zero and therefore
@@ -373,8 +375,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private long fsnAtZero;
     // Sticky flag: false until the very first time a live client is installed
     // (either via the constructor in SYNC/OFF mode or via swapClient on a
-    // successful connect attempt in any mode). Once true, stays true. This is
-    // connection-state observability only; reconnect policy is role-based.
+    // successful connect attempt in any mode). Once true, stays true.
+    // LOAD-BEARING, not observability: it is half of endpointPolicyFailureIsTerminal(),
+    // which latches an auth / upgrade / durable-ack rejection only for an ORPHAN drainer
+    // or a sender that has never connected. Relocate or lazily initialise the write and a
+    // foreground sender's transient auth blip becomes a producer-fatal terminal -- the
+    // exact failure this policy exists to prevent.
     private volatile boolean hasEverConnected;
     // Cause of the outage the reconnect loop is currently riding out, or null once a
     // connect succeeds. Written by the I/O thread, read by the producer thread so a

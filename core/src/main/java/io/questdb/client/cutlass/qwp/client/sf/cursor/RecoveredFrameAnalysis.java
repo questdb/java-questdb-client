@@ -87,7 +87,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
 
         // Only a positively identified deferred QWP frame can belong to an
         // uncommitted tail. Short, foreign or otherwise non-QWP payloads remain
-        // retirement barriers, matching findLastFrameFsnWithoutPayloadFlag.
+        // retirement barriers.
         if (!isQwp || (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0) {
             committedBoundaryFsn = fsn;
             committedCoverage = runningCoverage;
@@ -159,8 +159,6 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
             committedRawCount = 0;
             committedGap = true;
         }
-        runningRawLen = committedRawLen;
-        runningRawCount = committedRawCount;
         if (rawCapacity == committedRawLen) {
             return;
         }

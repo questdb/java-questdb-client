@@ -172,6 +172,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
     // tests inject a fault facade to exercise recovery I/O failures (a truncate
     // that cannot drop a torn tail, a short write) without a real broken disk.
     private final FilesFacade ff;
+    // Slot-qualified path, retained purely so diagnostics can name WHICH dictionary they
+    // are about: one JVM routinely holds many (a foreground sender plus N orphan
+    // drainers), so a warning carrying only the bare filename is unattributable exactly
+    // when it fires.
+    private final String filePath;
     // Production writes directly into segmented append mappings. Wrapping facades retain the
     // positioned-write path by default so fault tests can inject short writes through ff.write;
     // mmap-specific fault facades opt in through FilesFacade.isMmapAllowed().
@@ -209,6 +214,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
 
     private PersistedSymbolDict(
             FilesFacade ff,
+            String filePath,
             int fd,
             long appendOffset,
             int size,
@@ -217,6 +223,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             boolean mappedRecoveryInput
     ) {
         this.ff = ff;
+        this.filePath = filePath;
         this.fd = fd;
         this.mappedAppend = ff.isMmapAllowed();
         this.mappedRecoveryInput = mappedRecoveryInput;
@@ -510,9 +517,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 Unsafe.free(loadedEntriesAddr, loadedEntriesLen, MemoryTag.NATIVE_DEFAULT);
             } catch (Throwable ignored) {
             }
-            // Null after freeing (like scratchAddr below) so a future accessor that
-            // reads loadedEntriesAddr()/loadedEntriesLen() post-close cannot
-            // dereference freed native memory; the getters are not closed-guarded.
+            // Null after freeing (like scratchAddr below) so a CONSTRUCTION-PHASE reader
+            // that runs after close observes 0 rather than a dangling pointer. This is
+            // NOT a cross-thread guard, and the getters' own javadoc is the accurate
+            // statement: they are unsynchronised reads of non-volatile fields, so a
+            // caller on another thread has no guarantee of seeing this write and can
+            // still dereference freed memory. Ordering, not nulling, is what makes the
+            // borrow safe -- every owner closes its loop before the engine.
             loadedEntriesAddr = 0L;
             loadedEntriesLen = 0;
         }
@@ -533,7 +544,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 if (!ff.truncate(fd, appendOffset)) {
                     LOG.warn("symbol dict {} could not trim mmap reserve to {}; recovery will "
                                     + "discard the zero-filled tail on the next open",
-                            FILE_NAME, appendOffset);
+                            filePath, appendOffset);
                 }
             } catch (Throwable ignored) {
             }
@@ -753,7 +764,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 throw new IllegalStateException("could not drop torn/stale symbol dictionary tail");
             }
             return new PersistedSymbolDict(
-                    ff, fd, scan.validLen, scan.count, entriesAddr, entriesLen, mappedInput);
+                    ff, filePath, fd, scan.validLen, scan.count, entriesAddr, entriesLen, mappedInput);
         } catch (Throwable t) {
             if (inputAddr != 0L) {
                 if (mappedInput) {
@@ -921,7 +932,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 Unsafe.free(hdr, HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             }
         }
-        return new PersistedSymbolDict(ff, fd, HEADER_SIZE, 0, 0L, 0, false);
+        return new PersistedSymbolDict(ff, filePath, fd, HEADER_SIZE, 0, 0L, 0, false);
     }
 
     /**

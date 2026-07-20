@@ -657,35 +657,6 @@ public final class SegmentRing implements QuietCloseable {
 
     /** Active segment -- exposed for the I/O thread's "send next batch" path. */
     /**
-     * Walks every published frame in the ring (sealed segments plus the active
-     * segment) and returns the FSN of the LAST frame whose payload does NOT
-     * carry the given flag bit, or {@code -1} when every published frame
-     * carries it (or the ring is empty). All frames above the returned FSN
-     * carry the flag.
-     * <p>
-     * Recovery-time helper: locates the last commit-bearing QWP frame below a
-     * potentially orphaned FLAG_DEFER_COMMIT tail left behind by a producer
-     * that crashed (or closed) mid-transaction. Call before the I/O loop and
-     * producer start appending; the walk is not synchronized against appends
-     * into the active segment. See
-     * {@link MmapSegment#findLastFrameFsnWithoutPayloadFlag} for the
-     * positive-identification contract: frames that do not parse as protocol
-     * messages count as commit-bearing (retirement barriers), never as
-     * trimmable.
-     */
-    public synchronized long findLastFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
-        long best = -1L;
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            long fsn = sealedSegments.get(i).findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
-            if (fsn > best) {
-                best = fsn;
-            }
-        }
-        long fsn = active.findLastFrameFsnWithoutPayloadFlag(flagsOffset, flagMask, headerMagic, minPayloadLen);
-        return Math.max(best, fsn);
-    }
-
-    /**
      * Performs the one ordered recovery fold across sealed segments and the
      * active segment. The returned native suffix remains owned by the caller.
      */

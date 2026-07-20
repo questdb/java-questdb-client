@@ -267,7 +267,7 @@ public final class BackgroundDrainer implements Runnable {
      */
     public WebSocketClient connectWithDurableAckRetry() {
         // run() already set runnerThread; setting it again here is a no-op
-        // on that path but wires up direct @TestOnly calls so requestStop()
+        // on that path but wires up direct callers so requestStop()
         // can unpark them too.
         runnerThread = Thread.currentThread();
         long backoffMillis = reconnectInitialBackoffMillis;
