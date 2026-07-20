@@ -86,7 +86,7 @@ public final class ConfigSchema {
         str("sf_append_deadline_millis", Side.INGRESS);
         str("sf_dir", Side.INGRESS);
         str("sf_durability", Side.INGRESS);
-        str("sf_max_bytes", Side.INGRESS);
+        str("sf_max_segment_bytes", Side.INGRESS);
         str("sf_max_total_bytes", Side.INGRESS);
         str("transaction", Side.INGRESS);
 

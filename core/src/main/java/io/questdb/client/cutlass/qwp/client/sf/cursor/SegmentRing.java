@@ -255,7 +255,7 @@ public final class SegmentRing implements QuietCloseable {
                 return null;
             }
             // Sort by baseSeq ascending. Worst-case segment count is
-            // sf_max_total_bytes / sf_max_bytes -- at the documented ceiling
+            // sf_max_total_bytes / sf_max_segment_bytes -- at the documented ceiling
             // (1 TiB / 64 MiB) that is ~16K entries, where an O(N²) sort spends
             // multiple seconds in compares + shifts before the I/O thread can
             // start. In-place quicksort with median-of-three pivot keeps the

@@ -92,7 +92,7 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesParsing() throws Exception {
+    public void testSfMaxSegmentBytesParsing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -101,7 +101,7 @@ public class SfFromConfigTest {
 
                 int port = server.getPort();
                 String config = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sf_max_bytes=131072;";
+                        + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=131072;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     // Write enough data that segments rotate at ~128 KiB boundary.
                     for (int i = 0; i < 50; i++) {
@@ -139,7 +139,7 @@ public class SfFromConfigTest {
     }
 
     /**
-     * Regression test for the connect-string {@code sf_max_bytes} /
+     * Regression test for the connect-string {@code sf_max_segment_bytes} /
      * {@code sf_max_total_bytes} parser accepting values larger than
      * {@code Integer.MAX_VALUE}. The pre-cursor parser used parseInt which
      * artificially capped the SF size from the connect string at ~2 GiB.
@@ -222,7 +222,7 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
+    public void testSfMaxSegmentBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -233,7 +233,7 @@ public class SfFromConfigTest {
                 // 64m / 4g should parse identically to their byte-count equivalents.
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
-                        + ";sf_max_bytes=64m"
+                        + ";sf_max_segment_bytes=64m"
                         + ";sf_max_total_bytes=4g;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 1L).atNow();
@@ -346,14 +346,14 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesInvalidSizeSuffixRejected() throws Exception {
+    public void testSfMaxSegmentBytesInvalidSizeSuffixRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_bytes=64x;";
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_segment_bytes=64x;";
             try (Sender ignored = Sender.fromConfig(config)) {
                 Assert.fail("expected rejection of unknown unit suffix");
             } catch (LineSenderException expected) {
                 Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("invalid sf_max_bytes"));
+                        expected.getMessage().contains("invalid sf_max_segment_bytes"));
             }
         });
     }

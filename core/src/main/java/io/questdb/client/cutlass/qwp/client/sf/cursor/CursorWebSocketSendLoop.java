@@ -159,7 +159,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // drained from the head every time a STATUS_DURABLE_ACK frame advances
     // any watermark; an entry pops when every (name, seqTxn) it carries is
     // covered by durableTableWatermarks. Bounded in practice by the SF on-disk
-    // cap: once the producer hits sf_max_bytes it blocks, which caps how far
+    // cap: once the producer hits sf_max_segment_bytes it blocks, which caps how far
     // the durable watermark can lag behind the OK watermark.
     private final ArrayDeque<PendingDurableEntry> pendingDurable = new ArrayDeque<>();
     private final ArrayDeque<PendingDurableEntry> pendingDurablePool = new ArrayDeque<>();

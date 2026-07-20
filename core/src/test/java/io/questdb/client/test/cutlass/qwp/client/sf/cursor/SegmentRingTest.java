@@ -530,7 +530,7 @@ public class SegmentRingTest {
 
     /**
      * Open-time sort regression: at the documented {@code sf_max_total_bytes
-     * / sf_max_bytes} ceiling (~16K segments) an O(N²) sort over the
+     * / sf_max_segment_bytes} ceiling (~16K segments) an O(N²) sort over the
      * recovered segments burns multi-second wall time before the I/O thread
      * can start. The previous selection-sort implementation regressed an
      * earlier perf fix on the legacy {@code SegmentLog} path; this test

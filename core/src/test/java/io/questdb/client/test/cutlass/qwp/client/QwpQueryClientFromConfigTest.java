@@ -720,7 +720,7 @@ public class QwpQueryClientFromConfigTest {
                 "sf_append_deadline_millis=30000",
                 "sf_dir=/var/lib/qdb-sf",
                 "sf_durability=memory",
-                "sf_max_bytes=4m",
+                "sf_max_segment_bytes=4m",
                 "sf_max_total_bytes=10g",
                 "transaction=on",
         };
