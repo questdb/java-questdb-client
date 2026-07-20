@@ -35,6 +35,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
@@ -108,7 +109,12 @@ public class BackgroundDrainerOrphanTailTest {
             try (CursorSendEngine engine = new CursorSendEngine(slotPath, SEGMENT_SIZE_BYTES)) {
                 appendDeferredFrame(engine);
             }
-            String parent = slotPath.substring(0, slotPath.lastIndexOf('/'));
+            // Derive the parent with Paths.get (portable: getAbsolutePath yields '\'
+            // separators on Windows, so lastIndexOf('/') returns -1 and substring
+            // throws), then join with a FORWARD slash -- SlotLock.resolveLogicalLock
+            // builds `parentPath + "/" + ".slot-locks"` exactly that way, and the
+            // blocking file must land on the same string acquireLogical will mkdir.
+            String parent = Paths.get(slotPath).getParent().toString();
             String lockDirPath = parent + "/.slot-locks";
             int fd = Files.openRW(lockDirPath);
             assertTrue("could not plant the blocking file", fd > -1);
