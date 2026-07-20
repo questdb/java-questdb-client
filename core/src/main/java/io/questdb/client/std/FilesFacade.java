@@ -91,15 +91,13 @@ public interface FilesFacade {
      * Stat length of the file at {@code path}, in bytes. Default delegates to
      * {@link Files#length(String)}.
      *
-     * <p>Test injection point: {@code MmapSegment.openExisting} maps the file to
-     * this length and scans straight out of the mapping, so a wrapping facade
-     * that returns a value <em>larger</em> than the real file makes the mapping
-     * extend past end-of-file. A read of a page beyond real EOF raises SIGBUS on
-     * <em>every</em> filesystem (which HotSpot translates to a catchable
-     * {@code InternalError} at an {@code Unsafe} intrinsic site) — the same fault
-     * a genuinely unbacked/sparse page raises on ZFS, but reproduced
-     * deterministically on ext4/xfs too. That is what lets recovery's mmap-fault
-     * guard be regression-tested on any CI runner rather than only on ZFS.
+     * <p>Test injection point: {@code MmapSegment.openExisting} treats this
+     * length as the file's extent and preads its recovery scan against it, so a
+     * wrapping facade that returns a value <em>larger</em> than the real file
+     * makes the scan read past end-of-file. Those reads come back short, which
+     * recovery must treat as the boundary of recoverable data — the same
+     * outcome as a file whose size metadata survived a crash its data blocks
+     * did not, reproduced deterministically on any filesystem and CI runner.
      */
     long length(String path);
 

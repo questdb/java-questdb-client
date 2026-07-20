@@ -79,8 +79,8 @@ public class PrReviewRedTests {
     /**
      * Finding C1 / C10 — first-frame CRC corruption silently deletes the segment.
      * <p>
-     * If frame[0] of a recovered .sfa fails CRC validation, scanFrames returns
-     * lastGood=HEADER_SIZE, countFrames returns 0, and SegmentRing.openExisting
+     * If frame[0] of a recovered .sfa fails CRC validation, the recovery scan returns
+     * lastGood=HEADER_SIZE with frameCount=0, and SegmentRing.openExisting
      * unlinks the file as an "empty hot-spare leftover" — destroying every frame
      * that physically followed the corrupt header. The torn-tail WARN inside
      * MmapSegment.openExisting is dropped on the floor.
@@ -128,7 +128,7 @@ public class PrReviewRedTests {
             // Run recovery.
             SegmentRing recovered = SegmentRing.openExisting(tmpDir, 64 * 1024);
             try {
-                // The bug: openExisting sees frameCount=0 (because scanFrames
+                // The bug: openExisting sees frameCount=0 (because the scan
                 // bailed at the corrupt frame[0]) and treats the segment as
                 // an "empty hot-spare leftover" — closing AND UNLINKING the
                 // file. The user's frames 1, 2, 3 are gone forever; the only

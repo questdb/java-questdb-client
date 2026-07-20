@@ -212,7 +212,7 @@ public class MmapSegmentTest {
             // frames are followed by garbage. None cover frame[0] itself
             // being corrupt — yet a single bit-flip on the CRC of frame[0]
             // at rest (bit-rot, partial-page-write at crash) is the
-            // worst-case data-loss trigger: scanFrames bails at HEADER_SIZE
+            // worst-case data-loss trigger: the recovery scan bails at HEADER_SIZE
             // and frameCount drops to 0, even though valid frames still
             // sit on disk past the corrupt header.
             //
@@ -255,7 +255,7 @@ public class MmapSegmentTest {
                         Files.exists(path));
 
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    assertEquals("scanFrames must bail at the corrupt frame[0]",
+                    assertEquals("the recovery scan must bail at the corrupt frame[0]",
                             0L, seg.frameCount());
                     assertEquals("publishedOffset must rewind to the header end",
                             MmapSegment.HEADER_SIZE, seg.publishedOffset());

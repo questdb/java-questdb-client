@@ -197,7 +197,7 @@ public final class SegmentRing implements QuietCloseable {
                             // CAUTION: only unlink when the file is genuinely
                             // empty past the header. If frame[0] failed CRC
                             // (bit-rot, partial-page-write at crash, etc.) but
-                            // valid frames followed, scanFrames returns
+                            // valid frames followed, the recovery scan returns
                             // lastGood=HEADER_SIZE and frameCount=0 -- yet
                             // tornTailBytes is non-zero. Treating that as
                             // "empty hot-spare" would silently destroy every
@@ -269,8 +269,9 @@ public final class SegmentRing implements QuietCloseable {
             // FSNs after recovery. A gap means a segment went missing (a
             // manual deletion) or a sealed segment under-recovered -- its tail
             // was cut short by a sparse/unbacked page or a mid-file media error
-            // (bad sector), the same class of fault scanFrames tolerates on the
-            // active segment but which corrupts the range on a sealed one.
+            // (bad sector), the same unreadable-region boundary the recovery
+            // scan tolerates on the active segment but which corrupts the
+            // range on a sealed one.
             for (int i = 1, n = opened.size(); i < n; i++) {
                 MmapSegment prev = opened.get(i - 1);
                 MmapSegment curr = opened.get(i);

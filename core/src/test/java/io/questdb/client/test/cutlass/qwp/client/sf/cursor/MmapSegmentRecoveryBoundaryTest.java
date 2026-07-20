@@ -40,59 +40,31 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * Regression guard for the recovery-time SIGBUS hazard in {@link MmapSegment}.
+ * Regression guard for recovery when part of a persisted {@code .sfa} is not
+ * readable data: a sparse hole (a truncate-based pre-allocation that never
+ * materialized the tail blocks, as on ZFS), a file shorter than its recorded
+ * length (size metadata that survived a crash its data blocks did not, or a
+ * truncation under recovery), or a failing read (bad sector).
  * <p>
- * On recovery, {@link MmapSegment#openExisting} maps a persisted {@code .sfa}
- * to its stat length and scans frames straight out of the mapping. When a prior
- * session left a sparse segment tail -- a truncate-based pre-allocation that
- * never materialized the tail blocks, as happens on ZFS -- a read of an
- * unbacked page raises the JVM's recoverable
- * {@code InternalError("...unsafe memory access operation...")} (a translated
- * SIGBUS). Recovery must treat that page as the boundary of recoverable data,
- * keep every frame below it, and hand back a usable segment -- not let the
- * error abort recovery of the whole slot (the reported ZFS-CI flake).
+ * {@link MmapSegment#openExisting} reads its entire recovery scan through
+ * {@code pread} into a private buffer — never through the mapping — so each of
+ * those cases is an ordinary read result with one deterministic outcome per
+ * input: a hole reads back as zeros and fails the frame CRC, a region past
+ * real end-of-file gives a short read, and an I/O error gives a failed read.
+ * Recovery must treat all three as the boundary of recoverable data — keep
+ * every frame below it and either hand back a usable segment or throw the
+ * per-file {@link MmapSegmentException} that {@code SegmentRing} skips on —
+ * and the outcome must be the same on every filesystem, JDK, and JIT state.
+ * (Reading the same regions through the mapping would instead raise SIGBUS,
+ * which HotSpot converts to an {@code InternalError} delivered at an imprecise
+ * point under a JIT-compiled caller — the JDK 8 CI flake this suite guards
+ * against reintroducing.)
  * <p>
- * These tests drive the <b>production entry point</b> ({@code openExisting}),
- * not the private scan methods via reflection. That matters for two reasons:
- * <ul>
- *   <li>It exercises the real recovery path end to end.</li>
- *   <li>On pre-21 JDKs the mmap-fault {@code InternalError} is delivered
- *       imprecisely ("a fault occurred in <i>a recent</i> unsafe memory access
- *       operation in compiled Java code") and escapes a <i>reflective</i>
- *       {@code Method.invoke} frame instead of being caught inside the scan --
- *       so a reflection-based test spuriously fails on the shipping JDK 8/11/17
- *       even though the direct-call production path catches it fine.</li>
- * </ul>
- * The fault-delivery mechanism the fix rests on was verified directly on the
- * shipping/CI Java floor -- JDK 8 (Temurin 1.8.0_492) -- not merely inferred
- * from the adjacent pre-21 LTS releases: the whole class passes there in both
- * interpreter ({@code -Xint}) and JIT modes, HotSpot emits the exact pre-21
- * message above, and a <i>direct</i> {@code try/catch} catches the fault in
- * interpreter, C1, and C2 modes. {@code isMmapAccessFault}'s shared
- * {@code "unsafe memory access operation"} fragment matches that message while
- * the JDK 21+-only needle it replaced does not -- the guard is live on JDK 8.
- * The unbacked tail is produced portably by truncating the file down (dropping
- * the tail blocks) and back up to the mapping size (leaving a sparse hole). A
- * hole-faulting filesystem (ZFS) then faults on the read exactly as in
- * production -- the case the fix must survive rather than fold the CRC through
- * the native, JNI-side {@code Crc32c} where a SIGBUS is uncatchable and aborts
- * the JVM. A hole-zero-filling filesystem (ext4) instead reads the hole back as
- * zeroes, which fails the frame CRC; either way recovery must stop at the same
- * boundary and recover the same frames.
- * <p>
- * <b>Fail-on-revert on any filesystem.</b> The sparse-hole tests above only
- * fault on ZFS: on ext4/xfs the within-EOF hole zero-fills, so the scan stops
- * via the CRC-mismatch / bad-magic branch and they stay green even with the
- * mmap-fault guard reverted -- no regression protection on the ext4/xfs CI
- * runners. The two {@code MapPastEof} tests below close that gap portably.
- * They truncate the file <em>down</em> (freeing the tail blocks) and hand
- * {@code openExisting} a {@link FilesFacade} that reports the original, larger
- * length, so the mapping extends past real end-of-file. A read of a page beyond
- * real EOF raises SIGBUS on <em>every</em> filesystem -- the same catchable
- * {@code InternalError} an unbacked ZFS page raises -- so they exercise the
- * real fault path (and fail on revert) on ext4/xfs too, not only on ZFS.
+ * These tests drive the production entry point ({@code openExisting}), not
+ * private scan methods via reflection, so they exercise the real recovery
+ * path end to end.
  */
-public class MmapSegmentRecoveryFaultTest {
+public class MmapSegmentRecoveryBoundaryTest {
 
     private static final long SEGMENT_BYTES = 1L << 20;
 
@@ -110,8 +82,9 @@ public class MmapSegmentRecoveryFaultTest {
 
     /**
      * Clean unbacked tail: a single frame ends exactly on a page boundary and
-     * everything above it is a sparse hole. Recovery must keep the frame and
-     * stop at the boundary, reporting no torn tail (an unwritten hole is not a
+     * everything above it is a sparse hole. The hole preads back as zeros,
+     * which fails the next frame's CRC, so recovery keeps the frame and stops
+     * at the boundary, reporting no torn tail (an unwritten hole is not a
      * torn write).
      */
     @Test
@@ -126,7 +99,7 @@ public class MmapSegmentRecoveryFaultTest {
             long boundary = writeSegment(path, 7L, new int[]{payloadLen});
             assertEquals("frame must fill exactly one page", page, boundary);
             // Drop the tail blocks, then re-extend logically so [page, SEGMENT_BYTES)
-            // is an unbacked hole under the recovery mapping.
+            // is an unbacked hole inside the file's recorded length.
             punchSparseTail(path, page);
 
             try (MmapSegment seg = MmapSegment.openExisting(path)) {
@@ -141,12 +114,10 @@ public class MmapSegmentRecoveryFaultTest {
      * The harder case: a frame whose 8-byte header sits on a backed page but
      * whose payload reaches into the unbacked hole (a torn write leaves a real
      * positive {@code payloadLen} with the payload spanning the boundary). The
-     * CRC fold therefore reads across the backed-to-unbacked edge. Recovery
-     * must reject that frame and keep the one below it -- and, crucially, must
-     * do so via {@code Unsafe} reads: the native, JNI-side {@code Crc32c} over
-     * an unbacked page raises a SIGBUS that HotSpot cannot translate, aborting
-     * the whole JVM (verified: an {@code hs_err} in
-     * {@code Java_io_questdb_client_std_Crc32c_update}).
+     * CRC therefore folds across the backed-to-hole edge: the backed bytes are
+     * real, the hole preads as zeros, the CRC mismatches, and recovery rejects
+     * that frame while keeping the one below it. The surviving non-zero header
+     * bytes at the bail-out position are flagged as a torn tail.
      */
     @Test
     public void testRecoverySurvivesPayloadReachingUnbackedPage() throws Exception {
@@ -156,7 +127,7 @@ public class MmapSegmentRecoveryFaultTest {
             final long boundary = 2 * page;
             // Frame 2's header ends 8 bytes below the boundary (backed); its
             // payload starts 8 bytes below and runs a full page past -- across
-            // the backed->unbacked edge.
+            // the backed->hole edge.
             final long frame2Offset = boundary - 16;
             final int payloadLen2 = (int) page;
             final int payloadLen1 = (int) (frame2Offset - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
@@ -178,18 +149,12 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * M1 regression: the header block (magic/version/baseSeq) is read before
-     * {@code scanFrames}, so an unbacked page 0 faults ahead of the guarded
-     * scan. {@link MmapSegment#openExisting} must surface that as a
-     * {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
-     * catches to skip just this {@code .sfa} -- and never let the raw
-     * {@code InternalError} escape and abort recovery of every sibling segment.
-     * <p>
-     * Portable across filesystems: on a hole-faulting FS (ZFS) the fault is
-     * converted to a {@code MmapSegmentException} in {@code openExisting}'s
-     * catch; on a hole-zero-filling FS (ext4) page 0 reads back as zeroes, so
-     * the magic check fails and throws {@code MmapSegmentException} directly.
-     * Either way the file is skippable, not fatal.
+     * The header block (magic/version/baseSeq) is read before the frame scan,
+     * so a file whose page 0 is a hole must fail cleanly: the header preads
+     * back as zeros, the magic check fails, and {@link MmapSegment#openExisting}
+     * throws {@link MmapSegmentException} -- the per-file signal
+     * {@code SegmentRing} catches to skip just this {@code .sfa} -- rather
+     * than anything that could abort recovery of every sibling segment.
      */
     @Test
     public void testUnbackedHeaderPageIsSkippableNotFatal() throws Exception {
@@ -209,38 +174,19 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * Portable fail-on-revert guard for the recovery mmap-fault handling on the
-     * scan path. Unlike {@link #testRecoveryKeepsFramesBeforeUnbackedTail}
-     * (which only faults on ZFS), this maps the file past real EOF via the
-     * length-injecting facade, so the scan's read of the beyond-EOF page faults
-     * on ext4/xfs too. The fix must <em>recognize</em> that fault and keep
-     * recovery safe -- never a JVM abort, never a raw {@code InternalError}
-     * escaping into {@code SegmentRing}'s recovery loop. Revert the
-     * {@code scanFrames}/{@code openExisting} mmap-fault guard (or fold the CRC
-     * back through native {@code Crc32c}) and this errors or aborts the fork.
-     * <p>
-     * Two handled outcomes are accepted, because which one occurs depends on
-     * whether the recovery methods are JIT-compiled at fault time:
-     * <ul>
-     *   <li><b>Interpreter / C1:</b> {@code scanFrames}'s own
-     *       {@code catch (InternalError)} fires, so the frame below the tear is
-     *       recovered and a usable segment is returned.</li>
-     *   <li><b>C2:</b> once {@code scanFrames} is inlined into
-     *       {@code openExisting}, HotSpot delivers the async unsafe-access
-     *       {@code InternalError} to {@code openExisting}'s outer
-     *       {@code catch (Throwable)} instead of the inlined inner one, which
-     *       converts the file to a skippable {@link MmapSegmentException}.
-     *       Still fully handled -- {@code SegmentRing} skips just this
-     *       {@code .sfa} rather than aborting the slot.</li>
-     * </ul>
-     * (The C2 delivery imprecision is a property of HotSpot's async
-     * unsafe-access fault handling, not of this seam; the seam only makes it
-     * reproducible off ZFS.)
+     * A file shorter than its recorded length: the facade reports twice the
+     * real length, so the scan's pread of the second page comes back short.
+     * Recovery must treat the short read as the boundary of recoverable data
+     * -- keep the frame below it, report no torn tail (nothing readable was
+     * ever written there), and hand back a usable segment. One deterministic
+     * outcome on every filesystem; this is the shape a crash leaves when the
+     * size metadata survives but the tail's data blocks do not, or a
+     * concurrent truncation during recovery.
      */
     @Test
-    public void testScanFaultOnMapPastEofIsHandledAnyFilesystem() throws Exception {
+    public void testScanPastRealEofStopsAtBoundaryAnyFilesystem() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            final String path = tmpDir + "/seg-mappasteof-scan.sfa";
+            final String path = tmpDir + "/seg-pasteof-scan.sfa";
             final long page = Files.PAGE_SIZE;
             // One frame that ends exactly on the first page boundary.
             final int payloadLen = (int) (page - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
@@ -249,51 +195,67 @@ public class MmapSegmentRecoveryFaultTest {
             // Free every block past the first page: the file is now exactly one
             // (fully backed) page, with nothing beyond it on disk.
             truncateTo(path, page);
-            // Report twice the real length so openExisting maps a second,
-            // beyond-EOF page; the scan faults reading it on any filesystem.
-            FilesFacade ff = new MapPastEofFacade(path, 2 * page);
+            // Report twice the real length so the scan preads a second,
+            // beyond-EOF page; the read comes back short on any filesystem.
+            FilesFacade ff = new RecoverySeamFacade(path, 2 * page, -1L);
             try (MmapSegment seg = MmapSegment.openExisting(ff, path)) {
-                // Interpreter / C1: graceful partial recovery.
                 assertEquals("the frame below the beyond-EOF page must be recovered", 1L, seg.frameCount());
                 assertEquals("scan must stop at the beyond-EOF boundary", page, seg.publishedOffset());
-                assertEquals("a beyond-EOF page is not a torn write", 0L, seg.tornTailBytes());
-            } catch (MmapSegmentException skippedUnderC2) {
-                // C2: the inlined fault escaped to openExisting's outer catch and
-                // was converted to a per-file skip. Assert it is the recognized
-                // mmap fault (not some other data error) so a revert -- which
-                // lets a raw InternalError through instead -- still fails here.
-                assertTrue(skippedUnderC2.getMessage(),
-                        skippedUnderC2.getMessage().contains("unsafe memory access operation"));
+                assertEquals("a beyond-EOF region is not a torn write", 0L, seg.tornTailBytes());
             }
         });
     }
 
     /**
-     * Portable fail-on-revert guard for the {@code openExisting} header-block
-     * guard. The file is truncated to empty and the facade reports a full page,
-     * so the very first header read (magic) lands on a beyond-EOF page and
-     * faults on any filesystem. {@code openExisting} must convert that to a
-     * {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
-     * skips on -- not let the raw {@code InternalError} escape and abort recovery
-     * of every sibling. Revert the header-block conversion and this throws
-     * {@code InternalError} instead of {@code MmapSegmentException}.
+     * The degenerate shorter-than-recorded case: the file is truncated to
+     * empty and the facade reports a full page, so the very first header pread
+     * comes back empty. {@link MmapSegment#openExisting} must surface that as
+     * a {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
+     * skips on -- so one lost header never aborts recovery of every sibling.
      */
     @Test
-    public void testHeaderFaultOnMapPastEofIsSkippableAnyFilesystem() throws Exception {
+    public void testHeaderPastRealEofIsSkippableAnyFilesystem() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            final String path = tmpDir + "/seg-mappasteof-header.sfa";
+            final String path = tmpDir + "/seg-pasteof-header.sfa";
             final long page = Files.PAGE_SIZE;
             writeSegment(path, 9L, new int[]{64});
             // Free every block: the file is now empty, so even page 0 (the
-            // header) is beyond EOF under the reported one-page mapping.
+            // header) is beyond real EOF under the reported one-page length.
             truncateTo(path, 0L);
-            FilesFacade ff = new MapPastEofFacade(path, page);
+            FilesFacade ff = new RecoverySeamFacade(path, page, -1L);
             try {
                 MmapSegment.openExisting(ff, path).close();
                 fail("expected MmapSegmentException for a beyond-EOF header page");
             } catch (MmapSegmentException expected) {
                 // ok -- SegmentRing's per-file catch skips just this file
                 // instead of aborting recovery of the whole slot.
+            }
+        });
+    }
+
+    /**
+     * A failing read mid-scan (the bad-sector case): reads below the failure
+     * offset succeed, reads at or past it fail. Recovery must treat the
+     * failure as the boundary of recoverable data -- keep the frames below
+     * it, report no torn tail (the region cannot be probed), and hand back a
+     * usable segment rather than aborting the slot.
+     */
+    @Test
+    public void testReadErrorDuringScanEndsRecoveryAtBoundary() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-read-error.sfa";
+            final long page = Files.PAGE_SIZE;
+            final int payloadLen = (int) (page - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
+            long boundary = writeSegment(path, 13L, new int[]{payloadLen, 64});
+            assertTrue("second frame must sit past the first page", boundary > page);
+            // Reads below `page` succeed (truncated at the bad region's edge,
+            // like a real pread up against a bad sector); reads at or past
+            // `page` fail.
+            FilesFacade ff = new RecoverySeamFacade(path, -1L, page);
+            try (MmapSegment seg = MmapSegment.openExisting(ff, path)) {
+                assertEquals("the frame below the unreadable region must be recovered", 1L, seg.frameCount());
+                assertEquals("scan must stop at the unreadable region", page, seg.publishedOffset());
+                assertEquals("an unreadable region cannot be probed for a torn write", 0L, seg.tornTailBytes());
             }
         });
     }
@@ -329,8 +291,8 @@ public class MmapSegmentRecoveryFaultTest {
      * Turns {@code [keepBytes, SEGMENT_BYTES)} of the file into an unbacked
      * sparse hole: truncate down to {@code keepBytes} (frees the tail blocks),
      * then back up to {@code SEGMENT_BYTES} (re-extends the logical size without
-     * allocating blocks). Recovery maps the full stat length, so the hole is
-     * inside the mapping -- reads of it fault on ZFS and zero-fill on ext4.
+     * allocating blocks). Recovery preads the full stat length, so the hole is
+     * inside the scanned range -- it reads back as zeros on every filesystem.
      */
     private static void punchSparseTail(String path, long keepBytes) {
         int fd = Files.openRW(path);
@@ -346,8 +308,8 @@ public class MmapSegmentRecoveryFaultTest {
     /**
      * Shrinks the file to {@code keepBytes}, freeing every block past it, and
      * leaves it there (no re-extend). Combined with a facade that reports a
-     * larger length, the freed region becomes a beyond-EOF part of the mapping
-     * that faults on read on any filesystem.
+     * larger length, the freed region is past real end-of-file, so recovery's
+     * preads of it come back short on any filesystem.
      */
     private static void truncateTo(String path, long keepBytes) {
         int fd = Files.openRW(path);
@@ -360,19 +322,28 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * A {@link FilesFacade} that reports an inflated stat length for one target
-     * path so {@code openExisting} maps that file past end-of-file (see
-     * {@link FilesFacade#length(String)}); every other call, including
-     * {@code length} for any other path, delegates to the production
-     * {@link FilesFacade#INSTANCE}.
+     * A {@link FilesFacade} exposing the two recovery seams for one target
+     * path; every other call, including calls for any other path, delegates to
+     * the production {@link FilesFacade#INSTANCE}.
+     * <ul>
+     *   <li>{@code reportedLength >= 0}: {@code length(String)} reports this
+     *       value instead of the real stat length, so recovery scans past real
+     *       end-of-file and its preads come back short (see
+     *       {@link FilesFacade#length(String)}).</li>
+     *   <li>{@code failReadsFromOffset >= 0}: reads below the offset succeed
+     *       but are truncated at its edge (like a pread up against a bad
+     *       sector); reads at or past it fail with {@code -1}.</li>
+     * </ul>
      */
-    private static final class MapPastEofFacade implements FilesFacade {
+    private static final class RecoverySeamFacade implements FilesFacade {
+        private final long failReadsFromOffset;
         private final long reportedLength;
         private final String targetPath;
 
-        MapPastEofFacade(String targetPath, long reportedLength) {
+        RecoverySeamFacade(String targetPath, long reportedLength, long failReadsFromOffset) {
             this.targetPath = targetPath;
             this.reportedLength = reportedLength;
+            this.failReadsFromOffset = failReadsFromOffset;
         }
 
         @Override
@@ -442,7 +413,9 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long length(String path) {
-            return targetPath.equals(path) ? reportedLength : INSTANCE.length(path);
+            return reportedLength >= 0 && targetPath.equals(path)
+                    ? reportedLength
+                    : INSTANCE.length(path);
         }
 
         @Override
@@ -477,6 +450,12 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long read(int fd, long addr, long len, long offset) {
+            if (failReadsFromOffset >= 0) {
+                if (offset >= failReadsFromOffset) {
+                    return -1;
+                }
+                len = Math.min(len, failReadsFromOffset - offset);
+            }
             return INSTANCE.read(fd, addr, len, offset);
         }
 
