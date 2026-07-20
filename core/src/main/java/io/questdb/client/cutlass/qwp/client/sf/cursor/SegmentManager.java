@@ -299,9 +299,50 @@ public final class SegmentManager implements QuietCloseable {
                         return;
                     }
                 }
-                // The worker loop has already run its exit block; the thread
-                // is at most a few instructions from terminating and can no
-                // longer touch manager state. Fall through and reap it.
+                // The worker has left its service loop (workerLoopExited) and
+                // is now running only its finite exit cleanups -- the owning
+                // engine's finishClose(), which releases the slot flock and
+                // only THEN publishes closeCompleted. It can no longer wedge in
+                // a service pass, so give it a second bounded join to finish
+                // before reaping. Without this, a bounded-join timeout that
+                // lands mid-finishClose reaps the worker (workerThread=null =>
+                // isWorkerReaped()) while the flock release is still in flight,
+                // so a caller reading isCloseCompleted() observes a stale false
+                // and a spurious flock-release retry gets scheduled. This reuses
+                // the same join-under-monitor pattern as the bounded join above
+                // -- the worker uses a lock-free CAS for exactly-once cleanup
+                // and never blocks on this monitor -- and still reaps on
+                // timeout, so a pathologically slow cleanup cannot hang close().
+                //
+                // Budget with the fixed WORKER_JOIN_TIMEOUT_MILLIS, NOT the
+                // tunable workerJoinTimeoutMillis: the first join bounds a
+                // possibly-wedged SERVICE pass (tests shrink it to force the
+                // timed-out path), but the exit cleanups are finite and must be
+                // allowed to finish regardless of that tuning. In production
+                // both values are equal, so this only matters under a shrunk
+                // test override.
+                boolean cleanupInterrupted = Thread.interrupted();
+                long cleanupDeadlineNanos = System.nanoTime() + WORKER_JOIN_TIMEOUT_MILLIS * 1_000_000L;
+                try {
+                    while (t.isAlive()) {
+                        long remainingMillis = (cleanupDeadlineNanos - System.nanoTime()) / 1_000_000L;
+                        if (remainingMillis <= 0) {
+                            break;
+                        }
+                        try {
+                            t.join(remainingMillis);
+                        } catch (InterruptedException ignored) {
+                            cleanupInterrupted = true;
+                        }
+                    }
+                } finally {
+                    if (cleanupInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                // If the cleanups still have not finished (pathologically slow
+                // syscall), fall through and reap anyway -- identical to the
+                // best-effort behaviour before this second join existed.
             }
             workerThread = null;
         }
