@@ -423,14 +423,44 @@ public class SegmentRecoveryIntegrityTest {
     @Test
     public void testDrainWindowManifestWithoutSegmentsRecoversEmptyAndRemovesManifest() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Clean-drain close unlinks the last segment before the manifest;
-            // a crash between the two leaves this state.
-            writeManifest(3, 7, 9);
+            // Clean-drain close durably collapses the boundaries to
+            // head == active before unlinking, then removes segments and
+            // finally the manifest; a crash between the last unlink and the
+            // manifest removal leaves collapsed boundaries with no files.
+            writeManifest(3, 9, 9);
 
             SegmentRing ring = SegmentRing.openExisting(FilesFacade.INSTANCE, tmpDir, SEGMENT_SIZE);
             Assert.assertNull("segment-less slot must recover as EMPTY", ring);
             Assert.assertFalse("the stale manifest must be discarded",
                     Files.exists(tmpDir + "/" + MANIFEST_NAME));
+        });
+    }
+
+    @Test
+    public void testZeroSegmentFilesWithUncollapsedBoundariesFailsClosed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // headBase(7) < activeBase(9): the manifest durably committed that
+            // segments [7..9] existed and were never declared acked. No
+            // in-protocol crash leaves this next to zero .sfa files -- the
+            // close-time drain collapses boundaries to head == active BEFORE
+            // its first unlink, and a fresh start writes (0,0). Uncollapsed
+            // boundaries with no segment files therefore prove durable data
+            // vanished outside the protocol: recovery must fail closed and
+            // keep the manifest as evidence, not silently start fresh.
+            writeManifest(3, 7, 9);
+            Map<String, byte[]> before = snapshotDir();
+
+            try {
+                SegmentRing ring = SegmentRing.openExisting(FilesFacade.INSTANCE, tmpDir, SEGMENT_SIZE);
+                if (ring != null) {
+                    ring.close();
+                }
+                Assert.fail("recovery must fail closed: manifest boundaries (7,9) reference "
+                        + "durable frames but no segment file survives");
+            } catch (MmapSegmentException expected) {
+                TestUtils.assertContains(expected.getMessage(), "references durable data");
+            }
+            assertDirUnchanged(before);
         });
     }
 

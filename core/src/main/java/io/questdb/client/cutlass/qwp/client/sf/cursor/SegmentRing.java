@@ -276,16 +276,32 @@ public final class SegmentRing implements QuietCloseable {
                     return Recovery.empty();
                 }
                 if (manifest != null) {
-                    // No .sfa files at all. Two legitimate protocols produce
-                    // this: the close-time drain unlinks the last segment
-                    // before it removes the manifest, and a fresh-start crash
-                    // can leave a boundary-less (0,0) manifest behind. In
-                    // both cases nothing recoverable exists, so accept EMPTY
-                    // -- but shout, because a manual wipe of segment files
-                    // looks identical and the operator should know.
-                    LOG.warn("SF manifest exists in {} with no segment files "
-                            + "(clean-drain or fresh-start crash window, or manual "
-                            + "segment removal); discarding it and starting fresh", sfDir);
+                    // No .sfa files at all. Only two protocols legitimately
+                    // produce this, and both leave head == active: the
+                    // close-time drain durably collapses the boundaries
+                    // BEFORE its first unlink, and a fresh-start crash can
+                    // leave a boundary-less (0,0) manifest behind. Uncollapsed
+                    // boundaries therefore prove durable, never-declared-acked
+                    // frames existed in [headBase, activeBase] whose files
+                    // vanished outside the protocol (manual wipe, partial
+                    // restore) -- fail closed and keep the manifest as
+                    // evidence instead of silently starting fresh.
+                    long manifestHeadBase = manifest.headBase();
+                    long manifestActiveBase = manifest.activeBase();
+                    if (manifestHeadBase != manifestActiveBase) {
+                        throw new MmapSegmentException(SfManifest.FILE_NAME + " in " + sfDir
+                                + " references durable data (headBase=" + manifestHeadBase
+                                + ", activeBase=" + manifestActiveBase
+                                + ") but no segment files exist");
+                    }
+                    // Collapsed boundaries: nothing recoverable exists, so
+                    // accept EMPTY -- but shout, because a manual wipe of a
+                    // fully-acked slot looks identical and the operator
+                    // should know.
+                    LOG.warn("SF manifest exists in {} with collapsed boundaries ({}) and "
+                            + "no segment files (clean-drain or fresh-start crash window, or "
+                            + "manual segment removal); discarding it and starting fresh",
+                            sfDir, manifestActiveBase);
                     manifest.close();
                     manifest = null;
                     if (!SfManifest.removeFile(filesFacade, sfDir)) {
