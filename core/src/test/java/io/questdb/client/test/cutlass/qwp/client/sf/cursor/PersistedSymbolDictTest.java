@@ -568,6 +568,54 @@ public class PersistedSymbolDictTest {
         });
     }
 
+    @Test
+    public void testChunkClaimingEntriesInAZeroByteRegionEndsTheTrustedPrefix() throws Exception {
+        // The CRC proves the bytes are what was WRITTEN, never that the chunk header is
+        // self-consistent. Every entry costs at least its own length varint, so entryCount
+        // > 0 inside a zero-byte region is impossible -- yet the scan used to accept it and
+        // leave decodeLoadedSymbols to discover the problem later, as a throw two layers up
+        // instead of a trimmed trusted prefix. Validating it during the scan gives such a
+        // chunk the same treatment a CRC failure already gets.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict");
+            Path f = dir.resolve(".symbol-dict");
+
+            byte[] body = new byte[]{0x01, 0x00}; // entryCount=1, entryBytes=0
+            int crc;
+            long scratch = Unsafe.malloc(body.length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < body.length; i++) {
+                    Unsafe.getUnsafe().putByte(scratch + i, body[i]);
+                }
+                crc = Crc32c.update(Crc32c.INIT, scratch, body.length);
+            } finally {
+                Unsafe.free(scratch, body.length, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            byte[] file = new byte[8 + body.length + 4];
+            file[0] = 'S';
+            file[1] = 'Y';
+            file[2] = 'D';
+            file[3] = '1';
+            file[4] = 3;
+            System.arraycopy(body, 0, file, 8, body.length);
+            int crcAt = 8 + body.length;
+            file[crcAt] = (byte) crc;
+            file[crcAt + 1] = (byte) (crc >>> 8);
+            file[crcAt + 2] = (byte) (crc >>> 16);
+            file[crcAt + 3] = (byte) (crc >>> 24);
+            Files.write(f, file);
+
+            try (PersistedSymbolDict dict = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(dict);
+                Assert.assertEquals("an inconsistent chunk must end the trusted prefix, "
+                        + "not be counted", 0, dict.size());
+            }
+            Assert.assertEquals("the untrusted tail must be truncated away",
+                    8L, Files.size(f));
+        });
+    }
+
     private static int varintSize(int v) {
         int n = 1;
         while ((v >>>= 7) != 0) {

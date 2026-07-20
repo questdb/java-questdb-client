@@ -108,6 +108,10 @@ public final class CursorSendEngine implements QuietCloseable {
     // against the recovered dictionary size to fail clean instead. Computed once
     // in the constructor's recovery branch; -1 elsewhere.
     private long recoveredMaxSymbolId = -1L;
+    // How many times the constructor folded the recovered ring. Observable because
+    // recoveryFramesVisited() cannot be: the full-dict-fallback re-fold REPLACES the
+    // analysis instance, resetting that counter, so a second fold is invisible through it.
+    private int recoveryFoldCount;
     // Highest deltaStart across the recovered COMMITTED frames; 0 when none carries a symbol
     // dictionary. ZERO means every surviving frame is SELF-SUFFICIENT -- it re-registers its
     // dictionary from id 0 -- so the slot replays with no dictionary at all and the send loop
@@ -348,6 +352,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // without requiring a second bounded scan.
                 recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(
                         persistedDictInProgress == null ? 0 : persistedDictInProgress.size());
+                recoveryFoldCount++;
                 // Locate the last commit-bearing frame below a potentially
                 // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
                 // closed) mid-transaction leaves deferred frames with no
@@ -401,6 +406,19 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (persistedDictInProgress != null
                         && recoveredMaxSymbolId >= persistedDictInProgress.size()
                         && recoveredMaxSymbolDeltaStart == 0L) {
+                    // Only a NON-EMPTY discarded dictionary can desynchronise the fold.
+                    // The first fold was keyed to this very size, so when it is 0 the
+                    // re-fold below recomputes the identical baseline-0 result -- and
+                    // that is the OVERWHELMINGLY common case, not the rare one the
+                    // comment used to describe: every frame the shipped client ever
+                    // wrote passes confirmedMaxId = -1, hence deltaStart == 0, hence
+                    // maxDeltaStart == 0; and such a slot has no .symbol-dict, so
+                    // recovery creates a fresh EMPTY one. All three conditions therefore
+                    // hold on the FIRST restart after upgrading, for every non-empty
+                    // slot, and the re-fold was a second O(payload bytes) walk -- with a
+                    // byte-at-a-time varint decode over full-dict frames, which carry the
+                    // whole dictionary -- for no result change at all.
+                    int discardedSize = persistedDictInProgress.size();
                     persistedDictInProgress.close();
                     persistedDictInProgress = null;
                     // Re-fold at baseline 0. The analysis above was keyed to the
@@ -427,11 +445,14 @@ public final class CursorSendEngine implements QuietCloseable {
                     // Re-folding rather than keeping the dictionary preserves the discard's
                     // whole point -- the slot recovers in full-dict mode, exactly as it was
                     // written, with producer, mirror and replay guard all anchored at 0.
-                    recoveredFrameAnalysisInProgress.close();
-                    recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(0);
-                    this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
-                    this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
-                    this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
+                    if (discardedSize > 0) {
+                        recoveredFrameAnalysisInProgress.close();
+                        recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(0);
+                        recoveryFoldCount++;
+                        this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
+                        this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
+                        this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
+                    }
                 }
             } else {
                 // Fresh start with no recovered segments. Any stale
@@ -807,6 +828,11 @@ public final class CursorSendEngine implements QuietCloseable {
         if (len > 0) {
             io.questdb.client.std.Unsafe.getUnsafe().copyMemory(analysis.rawAddr(), target, len);
         }
+    }
+
+    @TestOnly
+    public int recoveryFoldCount() {
+        return recoveryFoldCount;
     }
 
     @TestOnly

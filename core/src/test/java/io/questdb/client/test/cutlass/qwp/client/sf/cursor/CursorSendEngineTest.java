@@ -27,6 +27,8 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
@@ -58,6 +60,85 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class CursorSendEngineTest {
+
+    /**
+     * The full-dict-fallback discard must not re-fold when the dictionary it discards was
+     * EMPTY -- which is the ordinary client-upgrade path, not a rare one.
+     * <p>
+     * Every frame the shipped client ever wrote passes confirmedMaxId = -1, so deltaStart
+     * is 0 and maxDeltaStart is 0; such a slot has no .symbol-dict, so recovery creates a
+     * fresh empty one. All three discard conditions therefore hold on the FIRST restart
+     * after upgrading, for every non-empty slot -- and the first fold was already keyed to
+     * that size-0 baseline, so the re-fold recomputed a bit-identical result over the whole
+     * backlog. Full-dict frames carry the entire dictionary, so that is a second
+     * O(payload bytes) walk with a byte-at-a-time varint decode, inside build().
+     */
+    @Test(timeout = 20_000L)
+    public void testEmptyDictionaryDiscardDoesNotReFoldTheBacklog() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("scaffolding: the discard must actually fire",
+                        reopened.recoveredMaxSymbolDeltaStart() == 0L
+                                && reopened.recoveredMaxSymbolId() >= 0L);
+                assertEquals("an empty discarded dictionary needs no second fold",
+                        1, reopened.recoveryFoldCount());
+            }
+        });
+    }
+
+    /**
+     * The counterpart: discarding a POPULATED dictionary really does desynchronise the
+     * fold from the baseline its consumers derive, so that case must still re-fold.
+     */
+    @Test(timeout = 20_000L)
+    public void testPopulatedDictionaryDiscardStillReFolds() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            // Two persisted entries, below the three the frames define, so
+            // recoveredMaxSymbolId (2) >= size (2) and the discard fires with size > 0.
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertEquals("a populated discard must re-fold at baseline 0",
+                        2, reopened.recoveryFoldCount());
+            }
+        });
+    }
+
+    /** A self-sufficient frame: deltaStart 0, one 1-byte symbol per char. */
+    private static void appendFullDictFrame(CursorSendEngine engine, char... symbols) {
+        int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) 0);               // deltaStart
+            Unsafe.getUnsafe().putByte(p + 1, (byte) symbols.length); // deltaCount
+            long q = p + 2;
+            for (char c : symbols) {
+                Unsafe.getUnsafe().putByte(q, (byte) 1);
+                Unsafe.getUnsafe().putByte(q + 1, (byte) c);
+                q += 2;
+            }
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
 
     /**
      * A recovery-seed baseline mismatch must be quarantinable, not a permanent brick.

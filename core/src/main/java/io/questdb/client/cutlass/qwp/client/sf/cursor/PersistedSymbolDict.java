@@ -670,6 +670,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         boolean mappedInput = ff.isMmapAllowed();
         long inputAddr = 0L;
         long entriesAddr = 0L;
+        int entriesCapacity = 0;
         int entriesLen = 0;
         try {
             if (mappedInput) {
@@ -692,15 +693,25 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     || Unsafe.getUnsafe().getByte(inputAddr + 4) != VERSION) {
                 throw new IllegalStateException("bad magic or unknown symbol dictionary version");
             }
-            // First pass validates chunks and totals only the entry bytes that
-            // survive. Production reads through a file-backed mapping, so this
-            // pass does not allocate an anonymous whole-file copy. The second
-            // pass copies directly into one exact-sized retained allocation.
-            RecoveryScan scan = scanRecoveredChunks(inputAddr, len);
+            // ONE pass: validate each chunk's CRC and, once proven good, copy its
+            // entries straight out. The entry region is by construction a subset of
+            // the file, so `len` is a safe upper bound to allocate against -- it
+            // overshoots only by the chunk headers and CRCs -- and the exact size is
+            // reclaimed by the shrink below. The previous shape walked the file
+            // TWICE, re-decoding both header varints of every chunk on the second
+            // pass purely to size one allocation it could have bounded for free.
+            entriesCapacity = len;
+            entriesAddr = Unsafe.malloc(entriesCapacity, MemoryTag.NATIVE_DEFAULT);
+            RecoveryScan scan = scanAndCopyRecoveredChunks(inputAddr, len, entriesAddr);
             entriesLen = scan.entriesLen;
-            if (entriesLen > 0) {
-                entriesAddr = Unsafe.malloc(entriesLen, MemoryTag.NATIVE_DEFAULT);
-                copyRecoveredEntries(inputAddr, scan.validLen, entriesAddr, entriesLen);
+            if (entriesLen == 0) {
+                Unsafe.free(entriesAddr, entriesCapacity, MemoryTag.NATIVE_DEFAULT);
+                entriesAddr = 0L;
+                entriesCapacity = 0;
+            } else if (entriesLen < entriesCapacity) {
+                entriesAddr = Unsafe.realloc(
+                        entriesAddr, entriesCapacity, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                entriesCapacity = entriesLen;
             }
             if (mappedInput) {
                 ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
@@ -729,7 +740,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 }
             }
             if (entriesAddr != 0L) {
-                Unsafe.free(entriesAddr, entriesLen, MemoryTag.NATIVE_DEFAULT);
+                // capacity, not entriesLen: the shrink may not have happened yet.
+                Unsafe.free(entriesAddr, entriesCapacity, MemoryTag.NATIVE_DEFAULT);
             }
             if (fd >= 0) {
                 ff.close(fd);
@@ -743,25 +755,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
         }
     }
 
-    private static void copyRecoveredEntries(long inputAddr, int validLen, long entriesAddr, int entriesLen) {
-        Varint v = new Varint();
-        int diskPos = HEADER_SIZE;
-        int dstPos = 0;
-        while (diskPos < validLen) {
-            if (!v.decode(inputAddr, diskPos, validLen)
-                    || !v.decode(inputAddr, v.end, validLen)) {
-                throw new IllegalStateException("validated symbol dictionary chunk could not be decoded");
-            }
-            int entryBytes = (int) v.value;
-            int entriesStart = v.end;
-            Unsafe.getUnsafe().copyMemory(inputAddr + entriesStart, entriesAddr + dstPos, entryBytes);
-            dstPos += entryBytes;
-            diskPos = entriesStart + entryBytes + CRC_SIZE;
-        }
-        assert dstPos == entriesLen;
-    }
-
-    private static RecoveryScan scanRecoveredChunks(long inputAddr, int len) {
+    /**
+     * Validates every chunk and copies the entries of each proven-good one into
+     * {@code dstAddr}, in a single pass. {@code dstAddr} must have room for {@code len}
+     * bytes -- the entry region is a subset of the file, so that always suffices.
+     * Stops at the first chunk that is torn, fails its CRC, or is internally
+     * inconsistent, exactly as the two-pass version did, so the trusted prefix is
+     * unchanged.
+     */
+    private static RecoveryScan scanAndCopyRecoveredChunks(long inputAddr, int len, long dstAddr) {
         Varint v = new Varint();
         int count = 0;
         int diskPos = HEADER_SIZE;
@@ -788,10 +790,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
                     chunkEndI - diskPos);
             if (crcCalc != crcStored
                     || entryCount <= 0
+                    // Every entry costs at least its own length varint, so a positive
+                    // entryCount inside a zero-byte region is self-contradictory. The CRC
+                    // proves the bytes are what was WRITTEN, never that the triple is
+                    // consistent, and decodeLoadedSymbols would only discover it later --
+                    // as a throw two layers up rather than a trimmed trusted prefix.
+                    || entryBytes <= 0
                     || (long) count + entryCount > Integer.MAX_VALUE
                     || entriesLen + entryBytes > Integer.MAX_VALUE) {
                 break;
             }
+            Unsafe.getUnsafe().copyMemory(inputAddr + entriesStart, dstAddr + entriesLen, entryBytes);
             entriesLen += entryBytes;
             diskPos = chunkEndI + CRC_SIZE;
             count += (int) entryCount;

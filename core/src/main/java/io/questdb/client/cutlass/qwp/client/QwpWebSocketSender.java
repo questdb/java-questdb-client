@@ -175,6 +175,14 @@ public class QwpWebSocketSender implements Sender {
     // encode. flushPendingRowsSplit uses them both for preflight sizing and to walk
     // the staged body slices without encoding the batch a second time. Cleared and
     // repopulated on every flush; reused to stay zero-GC.
+    // The non-empty tables of the batch currently being flushed, collected ONCE per
+    // flush and then iterated by every pass. Each pass used to re-walk tableBuffers.keys()
+    // and re-probe the hash map per table -- 3 probes per table on a plain flush and 5 on
+    // a split, on the producer's thread. Reused across flushes to stay zero-GC. Held in
+    // lockstep so index i names the same table in both, and in the same order as
+    // splitFrameBodyBytes, which is what lets the split passes index them directly.
+    private final ObjList<QwpTableBuffer> flushTableBuffers = new ObjList<>();
+    private final ObjList<CharSequence> flushTableNames = new ObjList<>();
     private final IntList splitFrameBodyBytes = new IntList();
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     // null means plain text (no TLS)
@@ -3214,8 +3222,14 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    private int countNonEmptyTables(ObjList<CharSequence> keys) {
-        int tableCount = 0;
+    /**
+     * Collects the batch's non-empty tables into {@link #flushTableNames} /
+     * {@link #flushTableBuffers} and returns how many there are. One walk of the key
+     * list and one hash probe per table, for the whole flush.
+     */
+    private int collectNonEmptyTables(ObjList<CharSequence> keys) {
+        flushTableNames.clear();
+        flushTableBuffers.clear();
         for (int i = 0, n = keys.size(); i < n; i++) {
             CharSequence tableName = keys.getQuick(i);
             if (tableName == null) {
@@ -3223,10 +3237,11 @@ public class QwpWebSocketSender implements Sender {
             }
             QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
             if (tableBuffer != null && tableBuffer.getRowCount() > 0) {
-                tableCount++;
+                flushTableNames.add(tableName);
+                flushTableBuffers.add(tableBuffer);
             }
         }
-        return tableCount;
+        return flushTableBuffers.size();
     }
 
     private Endpoint currentEndpoint() {
@@ -3552,7 +3567,7 @@ public class QwpWebSocketSender implements Sender {
         cachedTimestampNanosColumn = null;
 
         ObjList<CharSequence> keys = tableBuffers.keys();
-        int tableCount = countNonEmptyTables(keys);
+        int tableCount = collectNonEmptyTables(keys);
         if (tableCount == 0) {
             pendingBytes = 0;
             currentTableBufferSnapshotBytes = currentTableBuffer == null
@@ -3584,19 +3599,12 @@ public class QwpWebSocketSender implements Sender {
         splitFrameBodyBytes.clear();
         int combinedBodyStart = encoder.getBuffer().getPosition();
         int bodyStart = combinedBodyStart;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
-            }
+        for (int i = 0; i < tableCount; i++) {
+            QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(i);
 
             if (LOG.isDebugEnabled()) {
                 LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}]",
-                        tableName, tableBuffer.getRowCount(), currentBatchMaxSymbolId);
+                        flushTableNames.getQuick(i), tableBuffer.getRowCount(), currentBatchMaxSymbolId);
             }
 
             encoder.addTable(tableBuffer);
@@ -3618,7 +3626,7 @@ public class QwpWebSocketSender implements Sender {
         if (cap > 0 && messageSize > cap) {
             // Keep the completed combined frame staged in the encoder while the
             // split path copies its delta entries and table-body slices.
-            flushPendingRowsSplit(keys, deferCommit, combinedBodyStart, cap);
+            flushPendingRowsSplit(deferCommit, combinedBodyStart, cap);
             return;
         }
 
@@ -3640,7 +3648,7 @@ public class QwpWebSocketSender implements Sender {
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
 
-        resetTableBuffersAfterFlush(keys);
+        resetTableBuffersAfterFlush();
     }
 
     /**
@@ -3671,7 +3679,6 @@ public class QwpWebSocketSender implements Sender {
      *                    last message omits the flag.
      */
     private void flushPendingRowsSplit(
-            ObjList<CharSequence> keys,
             boolean deferCommit,
             int combinedBodyStart,
             int cap
@@ -3695,22 +3702,12 @@ public class QwpWebSocketSender implements Sender {
         // already performed. simBaseline mirrors the publish loop's baseline advance
         // (advanceSentMaxSymbolId), so each size equals the frame the staged-slice
         // assembler will build; this pass mutates no delta/persist state.
-        int nonEmptyCount = 0;
+        int nonEmptyCount = flushTableBuffers.size();
         int simBaseline = symbolDeltaBaseline();
-        int bodyIdx = 0;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
-            }
-            nonEmptyCount++;
+        for (int i = 0; i < nonEmptyCount; i++) {
+            CharSequence tableName = flushTableNames.getQuick(i);
             int messageSize = encoder.getSplitMessageSize(
-                    splitFrameBodyBytes.getQuick(bodyIdx), simBaseline, currentBatchMaxSymbolId);
-            bodyIdx++;
+                    splitFrameBodyBytes.getQuick(i), simBaseline, currentBatchMaxSymbolId);
             if (messageSize > cap) {
                 // The batch stays BUFFERED: this throw precedes every publish, and a
                 // rejected flush must not silently discard the caller's rows (see
@@ -3737,24 +3734,14 @@ public class QwpWebSocketSender implements Sender {
             }
         }
 
-        int sent = 0;
-        bodyIdx = 0;
         int tableBodyOffset = combinedBodyStart;
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
-            }
+        for (int i = 0; i < nonEmptyCount; i++) {
+            CharSequence tableName = flushTableNames.getQuick(i);
 
-            sent++;
-            boolean isLast = (sent == nonEmptyCount);
+            boolean isLast = (i == nonEmptyCount - 1);
             boolean deferThis = deferCommit || !isLast;
 
-            int tableBodyLength = splitFrameBodyBytes.getQuick(bodyIdx++);
+            int tableBodyLength = splitFrameBodyBytes.getQuick(i);
             // Persist before touching activeBuffer. If the write-ahead fails, the
             // caller can retry with both the source rows and active microbatch
             // unchanged. The first frame carries the batch's new symbols; later
@@ -3800,21 +3787,16 @@ public class QwpWebSocketSender implements Sender {
             // committed the whole group.
             lastCommitBoundaryFsn = cursorEngine.publishedFsn();
         }
-        resetTableBuffersAfterFlush(keys);
+        resetTableBuffersAfterFlush();
     }
 
-    private void resetTableBuffersAfterFlush(ObjList<CharSequence> keys) {
-        for (int i = 0, n = keys.size(); i < n; i++) {
-            CharSequence tableName = keys.getQuick(i);
-            if (tableName == null) {
-                continue;
-            }
-            QwpTableBuffer tableBuffer = tableBuffers.get(tableName);
-            if (tableBuffer == null || tableBuffer.getRowCount() == 0) {
-                continue;
-            }
-            tableBuffer.reset();
+    private void resetTableBuffersAfterFlush() {
+        for (int i = 0, n = flushTableBuffers.size(); i < n; i++) {
+            flushTableBuffers.getQuick(i).reset();
         }
+        // Drop the references; the next flush re-collects.
+        flushTableNames.clear();
+        flushTableBuffers.clear();
         currentBatchMaxSymbolId = -1;
         pendingBytes = 0;
         currentTableBufferSnapshotBytes = 0;
