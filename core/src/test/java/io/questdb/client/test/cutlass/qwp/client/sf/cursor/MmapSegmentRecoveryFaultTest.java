@@ -276,18 +276,37 @@ public class MmapSegmentRecoveryFaultTest {
             truncateTo(path, page);
             // Report twice the real length so openExisting maps a second,
             // beyond-EOF page; the scan faults reading it on any filesystem.
+            // A HEALTHY sibling, contiguous below the faulting segment (baseSeq 0..4,
+            // faulting one at 5). Without it the whole slot is one file, so a fault
+            // converted to a per-file skip leaves openExisting returning null and the
+            // assertions below -- nested in `if (ring != null)` -- ran ZERO times, under
+            // a comment claiming that outcome was "also handled". Nothing was checked.
+            // With the sibling the ring is non-null on EVERY delivery path, so the
+            // recovery invariant can be asserted unconditionally: one bad file must
+            // never take the slot down with it.
+            writeSegment(tmpDir + "/seg-sibling.sfa", 0L, new int[]{8, 8, 8, 8, 8});
+
             FilesFacade ff = new MapPastEofFacade(path, 2 * page);
             // Must not throw, on any JDK or JIT tier. Revert the fault handling
             // and a raw InternalError propagates out of here instead.
             try (SegmentRing ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES)) {
-                if (ring != null) {
+                assertNotNull("one faulting .sfa must never take down the whole slot", ring);
+                assertNotNull("the healthy sibling must recover", ring.firstSealed() != null
+                        ? ring.firstSealed() : ring.getActive());
+                if (ring.getActive().baseSeq() == 5L) {
                     // Interpreter / C1, or precise delivery on 21+: scanFrames'
                     // own catch fired and the frame below the tear survived.
                     assertEquals("the frame below the beyond-EOF page must be recovered",
                             1L, ring.getActive().frameCount());
                     assertEquals("scan must stop at the beyond-EOF boundary",
                             page, ring.getActive().publishedOffset());
-                } // else: the fault was converted to a per-file skip -- also handled.
+                } else {
+                    // Late delivery: SegmentRing skipped the faulting file entirely, so
+                    // the sibling is all that is left -- and it must be intact.
+                    assertEquals("the skip must be per-FILE: the sibling keeps every frame",
+                            5L, ring.getActive().frameCount());
+                    assertEquals(0L, ring.getActive().baseSeq());
+                }
             }
         });
     }

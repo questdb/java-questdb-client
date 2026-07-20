@@ -709,6 +709,32 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test
+    public void testSaturatingCapabilityGapBudgetDoesNotQuarantineOnTheFirstSweep() throws Exception {
+        assertMemoryLeak(() -> {
+            // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE
+            // is the natural way to ask for "never give up". A raw millis * 1_000_000L
+            // wraps that NEGATIVE, and because the escalation gate is an OR against the
+            // attempt cap, capabilityGapElapsedNanos (0 on the first sweep) already
+            // clears a negative budget -- so the slot quarantines on sweep ONE, skipping
+            // the whole 16-sweep settle budget. Asking for more tolerance bought none.
+            //
+            // The CursorWebSocketSendLoop twin of this conversion is pinned by
+            // CursorWebSocketSendLoopZeroBackoffTest; this site had no test, despite the
+            // commit that fixed it citing that one as prior art.
+            int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(
+                    () -> new QwpDurableAckMismatchException("h", 1234, "primary"));
+            BackgroundDrainer drainer = newDrainerWithBudgets(factory, Long.MAX_VALUE, 1L, 4L);
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("a saturated budget must leave the attempt cap as the only gate, "
+                            + "so the full settle budget is spent before quarantine",
+                    cap, factory.attempts());
+        });
+    }
+
+    @Test
     public void testTransportErrorResetsCapabilityGapEpisode() throws Exception {
         assertMemoryLeak(() -> {
             // A transport state breaks a consecutive capability-gap episode.
