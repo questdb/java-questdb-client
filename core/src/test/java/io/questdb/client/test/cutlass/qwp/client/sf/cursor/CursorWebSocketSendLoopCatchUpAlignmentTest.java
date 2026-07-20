@@ -1001,6 +1001,43 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         loop.connectLoopForTest(new LineSenderException("test reconnect"), "reconnect", 0L);
     }
 
+    /**
+     * start()'s catch of CatchUpSendException must absorb a transient catch-up send
+     * failure, not let it out of Sender construction.
+     * <p>
+     * A recovered sender re-registers its dictionary with a catch-up on the very first
+     * connect, and in SYNC/OFF startup that runs on the CALLER's thread inside start().
+     * Without the catch, a server that drops during the catch-up turns a transient outage
+     * into a build() failure -- an Invariant B violation, and the one thing
+     * store-and-forward exists to prevent. Delete the block and everything else stays
+     * green: no other test combines a seeded mirror with a failing client through start().
+     * <p>
+     * The failure must also stay non-terminal: the client is dropped so the I/O thread
+     * reconnects and re-sends the catch-up off the caller's thread.
+     */
+    @Test
+    public void testStartAbsorbsATransientCatchUpSendFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                CatchUpCapturingClient client = new CatchUpCapturingClient(0, true);
+                CursorWebSocketSendLoop loop = newForegroundLoop(engine, client);
+                try {
+                    // One mirror entry is enough to make setWireBaselineWithCatchUp ship a
+                    // catch-up, which the client then fails. loop.close() frees addr.
+                    long addr = Unsafe.malloc(2, MemoryTag.NATIVE_DEFAULT);
+                    long p = writeVarint(addr, 1);
+                    Unsafe.getUnsafe().putByte(p, (byte) 'a');
+                    loop.seedSentDictMirrorForTest(addr, 2, 1);
+
+                    loop.start(); // must NOT throw: build() would fail on a transient
+                    loop.checkError(); // and must not have latched a terminal
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, WebSocketClient client) {
         return newLoop(engine, client, 0L);
     }

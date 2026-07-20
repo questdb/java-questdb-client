@@ -542,6 +542,56 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         });
     }
 
+    /**
+     * A torn DELTA slot must KEEP its dictionary: the full-dict-fallback discard is
+     * gated on {@code recoveredMaxSymbolDeltaStart == 0L} and that conjunct is
+     * load-bearing in the negative direction.
+     * <p>
+     * Here the side-file holds [a,b] and the surviving frames register c@2 and d@3 --
+     * so the frames out-reach the dictionary (recoveredMaxSymbolId 3 >= size 2, the
+     * other conjunct) but are NOT self-sufficient. Drop the deltaStart conjunct and
+     * recovery discards the only source of ids 0..1, re-folds at baseline 0, finds
+     * deltaStart 2 above a coverage of 0, marks a gap and quarantines a slot that is
+     * perfectly recoverable.
+     * <p>
+     * Every existing candidate passes either way: the torn-dict tests have frames
+     * covering from id 0, and testRecoverySkipsEntriesAlreadyCoveredByPersistedPrefix
+     * fails the size conjunct first, so neither one is load-bearing there.
+     */
+    @Test
+    public void testTornDeltaSlotKeepsItsDictionaryInsteadOfBeingDiscarded() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = newEngine()) {
+                appendDeltaSymbolFrame(engine, 2, 'c');
+                appendDeltaSymbolFrame(engine, 3, 'd');
+            }
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+
+            try (CursorSendEngine engine = newEngine()) {
+                assertNotNull("a torn DELTA slot must keep its dictionary -- its frames "
+                                + "cannot rebuild the ids below their own delta start",
+                        engine.getPersistedSymbolDict());
+                assertEquals("scaffolding: the frames must out-reach the dictionary, so the "
+                                + "OTHER discard conjunct is satisfied and this test really "
+                                + "pins the deltaStart one",
+                        3L, engine.recoveredMaxSymbolId());
+                assertEquals(2, engine.getPersistedSymbolDict().size());
+
+                GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+                assertEquals("recovery must cover ids 0..3, not fail clean",
+                        4L, engine.addRecoveredSymbolsTo(2, recovered));
+                assertEquals("only the suffix above the persisted prefix is added",
+                        2, recovered.size());
+                assertEquals("c", recovered.getSymbol(0));
+                assertEquals("d", recovered.getSymbol(1));
+            }
+        });
+    }
+
     @Test
     public void testSelfSufficientFrameRepairsAckedRecoveryGap() throws Exception {
         // fsn 0 models the tail of an old delta epoch whose registering frames

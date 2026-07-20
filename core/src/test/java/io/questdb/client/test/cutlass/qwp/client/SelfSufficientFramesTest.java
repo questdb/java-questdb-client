@@ -273,6 +273,90 @@ public class SelfSufficientFramesTest {
         });
     }
 
+    /**
+     * A split that fails at frame k&gt;1 must leave the symbol dictionary consistent for
+     * the retry.
+     * <p>
+     * flushPendingRowsSplit publishes frames one at a time and documents that a failure
+     * partway through leaves frames 1..k-1 on the ring as deferred, with the next flush
+     * re-emitting the whole batch -- at-least-once, absorbed by DEDUP or a durable-ack
+     * await. Nothing exercised the k&gt;1 shape at all: every other failed-publish test
+     * fails at frame 1.
+     * <p>
+     * This is a CHARACTERISATION test, not a mutation guard, and the reason is worth
+     * recording. It confirms the javadoc's claim that "the re-sent frames carry empty
+     * deltas and the write-ahead persist is a pd.size() no-op" -- but it does not
+     * discriminate against reverting that pd.size() key, because frame 1 published
+     * SUCCESSFULLY and advanceSentMaxSymbolId therefore already moved the baseline past
+     * the whole batch. The retry is an early return under either key. That is precisely
+     * why the k&gt;1 path is safe, and it is the fact the test pins.
+     * <p>
+     * The failure is injected at the RING, not the cap: both frames pass the pre-flight
+     * (each is under the advertised cap) but "big"'s frame does not fit a fresh
+     * sf_max_bytes segment, so it fails in sealAndSwapBuffer AFTER "a" was published.
+     */
+    @Test(timeout = 60_000L)
+    public void testMidSplitPublishFailureLeavesTheDictionaryIdempotent() throws Exception {
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-midsplit").toPath();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(3_400);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String pad = new String(new char[100]).replace('\0', 'x');
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_bytes=1024"
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
+                        + ";close_flush_timeout_millis=0;";
+                Sender sender = Sender.fromConfig(cfg);
+                try {
+                    // "a" first (small: fits a segment), "big" second (does not).
+                    sender.table("a").symbol("s", "alpha").longColumn("v", 1L).atNow();
+                    for (int i = 0; i < 28; i++) {
+                        sender.table("big").symbol("s", "bravo")
+                                .stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    }
+
+                    ObjList<String> afterFirst = null;
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.flush();
+                            Assert.fail("the second split frame cannot fit a fresh segment");
+                        } catch (LineSenderException expected) {
+                            // Ring-level failure, not the cap pre-flight.
+                            Assert.assertFalse("must fail at the ring, not the cap pre-flight: "
+                                            + expected.getMessage(),
+                                    expected.getMessage().contains("too large for server batch cap"));
+                        }
+                        ObjList<String> persisted =
+                                ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                        Assert.assertNotNull(persisted);
+                        if (attempt == 0) {
+                            afterFirst = persisted;
+                        } else {
+                            Assert.assertEquals("a mid-split retry must not re-append the "
+                                            + "symbols the failed attempt already persisted",
+                                    afterFirst.size(), persisted.size());
+                        }
+                    }
+                    Assert.assertEquals("both symbols are persisted exactly once",
+                            2, afterFirst.size());
+                } finally {
+                    try {
+                        // close() re-flushes the retained batch, which is permanently
+                        // unflushable at this sf_max_bytes -- not what we assert.
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                    }
+                }
+            }
+        });
+    }
+
     @Test
     public void testOversizedTableSplitStrandsNothing() throws Exception {
         // Regression: flushPendingRowsSplit publishes each table's frame one at a
