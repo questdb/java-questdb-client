@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
@@ -98,6 +99,26 @@ public class CursorSendEngineTest {
                 // Regression — should be ignored.
                 engine.acknowledge(0L);
                 assertEquals(2L, engine.ackedFsn());
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testAppendChecksLatchedDurabilityFailureBeforePublishing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                try {
+                    engine.appendBlocking(buf, 16);
+                    fail("expected latched durability failure");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected == failure);
+                }
+                assertEquals(-1L, engine.publishedFsn());
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
@@ -396,6 +417,53 @@ public class CursorSendEngineTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicRotationWaitsForDurablePredecessor() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE
+                    + 2L * (MmapSegment.FRAME_HEADER_SIZE + 64L);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            CursorSendEngine engine = new CursorSendEngine(
+                    tmpDir, segmentSize, segmentSize * 4L,
+                    TimeUnit.SECONDS.toNanos(5), TimeUnit.HOURS.toNanos(1));
+            try {
+                assertEquals(0L, engine.appendBlocking(buf, 64));
+                assertEquals(1L, engine.appendBlocking(buf, 64));
+                // The third append needs rotation. Its predecessor is dirty and
+                // the periodic deadline is an hour away, so only the explicit
+                // rotation request can make progress.
+                assertEquals(2L, engine.appendBlocking(buf, 64));
+                ObjList<MmapSegment> sealed = engine.getRingForTesting().getSealedSegments();
+                assertEquals(1, sealed.size());
+                assertTrue(sealed.getQuick(0).isPublishedDurable());
+                MmapSegment active = engine.getRingForTesting().getActive();
+                assertFalse(active.isPublishedDurable());
+                engine.close();
+                assertTrue("close must sync the unacknowledged active", active.isPublishedDurable());
+            } finally {
+                engine.close();
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicValidationPrecedesOwnedManagerAllocation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try {
+                new CursorSendEngine(
+                        null,
+                        4096L,
+                        8192L,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        1L);
+                fail("expected periodic memory-mode validation failure");
+            } catch (IllegalArgumentException expected) {
+                assertTrue(expected.getMessage().contains("requires disk store-and-forward mode"));
             }
         });
     }

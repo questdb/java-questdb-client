@@ -118,6 +118,9 @@ public final class SegmentRing implements QuietCloseable {
     // call installHotSpare on a closed ring (whose hotSpare was just
     // zeroed by close()) -- the spare's mmap + fd would never be reclaimed.
     private boolean closed;
+    // First periodic data-barrier failure. The manager latches it and the
+    // producer observes it before its next append.
+    private volatile MmapSegmentException durabilityFailure;
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
     private volatile MmapSegment hotSpare;
@@ -132,7 +135,9 @@ public final class SegmentRing implements QuietCloseable {
     // notices on its next polling tick.
     private Runnable managerWakeup;
     private long nextSeq;
+    private boolean periodicSyncEnabled;
     private volatile long publishedFsn;
+    private volatile boolean syncRequested;
     // Plain (producer-thread-only) flag; set to true the first time we ask
     // the manager for a spare for the current active segment, cleared on
     // every rotation. Coalesces multiple high-water-mark crossings into a
@@ -821,6 +826,7 @@ public final class SegmentRing implements QuietCloseable {
      * {@link #needsHotSpare}) to prepare the next spare.
      */
     public long appendOrFsn(long payloadAddr, int payloadLen) {
+        checkDurability();
         long offset = active.tryAppend(payloadAddr, payloadLen);
         if (offset == -1L) {
             // Active is full. Try to rotate.
@@ -828,12 +834,20 @@ public final class SegmentRing implements QuietCloseable {
             if (spare == null) {
                 return BACKPRESSURE_NO_SPARE;
             }
+            // Periodic mode must make the predecessor's complete published
+            // range durable before the manifest can name its successor. The
+            // manager performs the barrier; the producer uses the existing
+            // backpressure path while it waits.
+            MmapSegment previous = active;
+            if (requestSyncBeforeRotation(previous)) {
+                wakeManager();
+                return BACKPRESSURE_NO_SPARE;
+            }
             // Pin the spare's baseSeq to whatever the active's nextSeq actually
             // is right now. This is the right moment because (a) the active is
             // full, so its frameCount is stable, and (b) the spare hasn't been
             // appended to yet (rebaseSeq enforces that). The segment manager's
             // earlier guess at baseSeq is irrelevant.
-            MmapSegment previous = active;
             long actualBase = previous.baseSeq() + previous.frameCount();
             spare.rebaseSeq(actualBase);
             if (manifest != null) {
@@ -847,13 +861,9 @@ public final class SegmentRing implements QuietCloseable {
                 // segment of appends; runs outside the monitor because the
                 // spare is not yet visible to any other thread.
                 //
-                // Deliberately NOT msync'd here: the sealed predecessor's
-                // data pages. A power loss can therefore tear the sealed
-                // tail after the boundary is committed, and recovery will
-                // fail closed on chainEnd != activeBase. That is the
-                // intended semantics -- page-level durability of frame data
-                // follows the sender's opt-in msync cadence, and recovery
-                // must refuse to guess when the two disagree.
+                // MEMORY mode deliberately does not sync the predecessor's
+                // data pages. PERIODIC mode reached this point only after the
+                // manager covered the predecessor's complete published range.
                 spare.syncHeader();
             }
             // Publish the successor before the volatile active promotion. The
@@ -911,6 +921,51 @@ public final class SegmentRing implements QuietCloseable {
         // publishedFsn last so the I/O thread never observes a half-written frame.
         publishedFsn = fsn;
         return fsn;
+    }
+
+    public void checkDurability() {
+        MmapSegmentException failure = durabilityFailure;
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    synchronized void clearSyncRequestIfActiveDurable() {
+        if (active != null && active.isPublishedDurable()) {
+            syncRequested = false;
+        }
+    }
+
+    synchronized void copyLiveSegmentsForSync(ObjList<MmapSegment> target) {
+        target.clear();
+        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
+            target.add(sealedSegments.get(i));
+        }
+        if (active != null) {
+            target.add(active);
+        }
+    }
+
+    void enablePeriodicSync() {
+        periodicSyncEnabled = true;
+        syncRequested = true;
+    }
+
+    boolean isSyncRequested() {
+        return syncRequested;
+    }
+
+    void recordDurabilityFailure(Throwable failure) {
+        if (durabilityFailure == null) {
+            MmapSegmentException wrapped = failure instanceof MmapSegmentException
+                    ? (MmapSegmentException) failure
+                    : new MmapSegmentException("periodic SF data sync failed", failure);
+            synchronized (this) {
+                if (durabilityFailure == null) {
+                    durabilityFailure = wrapped;
+                }
+            }
+        }
     }
 
     @Override
@@ -1245,8 +1300,21 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     @TestOnly
+    public void recordDurabilityFailureForTesting(Throwable failure) {
+        recordDurabilityFailure(failure);
+    }
+
+    @TestOnly
     public synchronized void releasePinnedSegmentForTest(MmapSegment expected) {
         releasePinnedSegment(expected);
+    }
+
+    private synchronized boolean requestSyncBeforeRotation(MmapSegment previous) {
+        if (periodicSyncEnabled && !previous.isPublishedDurable()) {
+            syncRequested = true;
+            return true;
+        }
+        return false;
     }
 
     /** Releases the I/O cursor pin and wakes trim if it still names {@code expected}. */
@@ -1351,6 +1419,15 @@ public final class SegmentRing implements QuietCloseable {
             target[i] = sealedSegments.get(sealedHead + i);
         }
         return n > target.length ? -1 : n;
+    }
+
+    public void syncAllLiveSegments() {
+        ObjList<MmapSegment> segments = new ObjList<>();
+        copyLiveSegmentsForSync(segments);
+        for (int i = 0, n = segments.size(); i < n; i++) {
+            segments.getQuick(i).syncPublished();
+        }
+        clearSyncRequestIfActiveDurable();
     }
 
     /**

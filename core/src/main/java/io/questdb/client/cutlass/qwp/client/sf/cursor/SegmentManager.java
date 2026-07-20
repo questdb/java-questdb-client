@@ -94,6 +94,9 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
+    // Reused by the manager worker while it checkpoints one ring. The entry
+    // in-service state keeps these segment mappings alive until the pass ends.
+    private final ObjList<MmapSegment> syncScratch = new ObjList<>();
     private final LongSupplier ticks;
     // Reused by the worker for one bounded trim quantum. Keeping the unlinked
     // prefix here until the post-unlink directory barrier succeeds avoids both
@@ -164,6 +167,7 @@ public final class SegmentManager implements QuietCloseable {
     // returns.
     private boolean scratchFreed;
     private boolean scratchHandedToWorker;
+    private volatile long shortestSyncIntervalNanos = Long.MAX_VALUE;
     private boolean workerLoopExited;
     // Total bytes currently allocated across every segment owned by every
     // registered ring (active + sealed + hot-spare). Mutated by the manager
@@ -533,7 +537,7 @@ public final class SegmentManager implements QuietCloseable {
      * the high-water mark — no waiting on the next tick.
      */
     public void register(SegmentRing ring, String dir) {
-        register(ring, dir, null);
+        register(ring, dir, null, 0L);
     }
 
     /**
@@ -546,6 +550,20 @@ public final class SegmentManager implements QuietCloseable {
      * {@code lowestSurvivingBaseSeq - 1}.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark) {
+        register(ring, dir, watermark, 0L);
+    }
+
+    /**
+     * Registers a ring with an optional periodic data-checkpoint interval.
+     * A positive interval requires disk-backed store-and-forward mode.
+     */
+    public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos) {
+        if (syncIntervalNanos < 0L) {
+            throw new IllegalArgumentException("syncIntervalNanos must not be negative");
+        }
+        if (syncIntervalNanos > 0L && dir == null) {
+            throw new IllegalArgumentException("periodic sync requires a segment directory");
+        }
         // Account for bytes the ring already owns when it joins. A recovered
         // ring (post-restart, orphan adoption) can come up at-or-above the cap;
         // without this seed, totalBytes stays at 0 and the per-tick cap check
@@ -559,7 +577,7 @@ public final class SegmentManager implements QuietCloseable {
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
-        RingEntry e = new RingEntry(ring, dir, watermark);
+        RingEntry e = new RingEntry(ring, dir, watermark, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
@@ -568,6 +586,12 @@ public final class SegmentManager implements QuietCloseable {
             }
             rings.add(e);
             totalBytes += ringBytes;
+            if (syncIntervalNanos > 0L) {
+                ring.enablePeriodicSync();
+                if (syncIntervalNanos < shortestSyncIntervalNanos) {
+                    shortestSyncIntervalNanos = syncIntervalNanos;
+                }
+            }
         }
         ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
@@ -606,6 +630,27 @@ public final class SegmentManager implements QuietCloseable {
         synchronized (lock) {
             return !scratchFreed;
         }
+    }
+
+    @TestOnly
+    public boolean serviceRingForTesting(SegmentRing ring) {
+        if (workerThread != null) {
+            throw new IllegalStateException("test service requires a stopped manager");
+        }
+        RingEntry selected = null;
+        synchronized (lock) {
+            for (int i = 0, n = rings.size(); i < n; i++) {
+                RingEntry candidate = rings.getQuick(i);
+                if (candidate.ring == ring) {
+                    selected = candidate;
+                    break;
+                }
+            }
+        }
+        if (selected == null) {
+            throw new IllegalArgumentException("ring is not registered");
+        }
+        return serviceRing(selected);
     }
 
     @TestOnly
@@ -788,13 +833,17 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     private boolean serviceRing0(RingEntry e) {
+        boolean memoryMode = e.dir == null;
+        if (!memoryMode) {
+            servicePeriodicSync(e, ticks.getAsLong());
+        }
+
         // 1. Provision a hot spare if the ring needs one AND we have headroom
         //    under the disk-total cap. Cap check is per-tick; if we're capped
         //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
         //    on this or a subsequent tick frees space. Logged at most once per
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
-        boolean memoryMode = e.dir == null;
         if (e.ring.needsHotSpare()) {
             // Snapshot totalBytes under lock — register/deregister can mutate
             // it from caller threads. Heavy provisioning I/O happens outside
@@ -1123,6 +1172,32 @@ public final class SegmentManager implements QuietCloseable {
         }
     }
 
+    private void servicePeriodicSync(RingEntry e, long now) {
+        if (e.syncIntervalNanos <= 0L
+                || (!e.ring.isSyncRequested() && now - e.nextDataSyncNanos < 0L)) {
+            return;
+        }
+        try {
+            e.ring.copyLiveSegmentsForSync(syncScratch);
+            for (int i = 0, n = syncScratch.size(); i < n; i++) {
+                syncScratch.getQuick(i).syncPublished();
+            }
+            e.ring.clearSyncRequestIfActiveDurable();
+            e.nextDataSyncNanos = now + e.syncIntervalNanos;
+            e.syncFailureLogged = false;
+        } catch (Throwable failure) {
+            e.ring.recordDurabilityFailure(failure);
+            if (!e.syncFailureLogged) {
+                e.syncFailureLogged = true;
+                LOG.error("Periodic SF data sync failed for {}", e.dir, failure);
+            }
+            long retry = Math.min(e.syncIntervalNanos, 1_000_000_000L);
+            e.nextDataSyncNanos = now + retry;
+        } finally {
+            syncScratch.clear();
+        }
+    }
+
     private void workerLoop() {
         try {
             while (running) {
@@ -1148,7 +1223,7 @@ public final class SegmentManager implements QuietCloseable {
                 ringSnapshot.clear();
                 if (!running) break;
                 if (!hasMoreTrimmable) {
-                    LockSupport.parkNanos(pollNanos);
+                    LockSupport.parkNanos(Math.min(pollNanos, shortestSyncIntervalNanos));
                 }
             }
         } finally {
@@ -1200,6 +1275,7 @@ public final class SegmentManager implements QuietCloseable {
     private static final class RingEntry {
         final String dir;
         final SegmentRing ring;
+        final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
         // mode and for callers that didn't supply one. Manager-thread
         // only after register; never closed here (owner closes).
@@ -1213,6 +1289,8 @@ public final class SegmentManager implements QuietCloseable {
         // Prevents a legacy disk registration without a watermark from
         // flooding the log on every manager tick.
         boolean missingWatermarkLogged;
+        long nextDataSyncNanos;
+        boolean syncFailureLogged;
         // Zero-allocation manager-thread-only retry state. The deadline uses
         // the manager's monotonic clock and the delay doubles to a fixed cap.
         long trimRetryAtNanos;
@@ -1230,10 +1308,20 @@ public final class SegmentManager implements QuietCloseable {
         // to DEREGISTERED. The field updater avoids per-entry allocation.
         volatile int state = ENTRY_REGISTERED;
 
-        RingEntry(SegmentRing ring, String dir, AckWatermark watermark) {
+        RingEntry(
+                SegmentRing ring,
+                String dir,
+                AckWatermark watermark,
+                long syncIntervalNanos,
+                long now
+        ) {
             this.ring = ring;
             this.dir = dir;
             this.watermark = watermark;
+            this.syncIntervalNanos = syncIntervalNanos;
+            // Run the first periodic pass immediately. This establishes a
+            // durable baseline for segments recovered from MEMORY mode.
+            this.nextDataSyncNanos = now;
         }
 
         void deregister() {

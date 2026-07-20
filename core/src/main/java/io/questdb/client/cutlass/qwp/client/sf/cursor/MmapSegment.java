@@ -54,9 +54,11 @@ import org.slf4j.LoggerFactory;
  * </pre>
  * The mapping is sized at construction and never grows. When
  * {@link #tryAppend} returns -1 the caller must rotate to a fresh segment.
- * Closing the segment unmaps and closes the fd; data already written is
- * durable under the page cache (and recoverable across JVM restarts) — call
- * {@link #msync} for OS-crash durability.
+ * Closing the segment unmaps and closes the fd. Dirty mapped pages normally
+ * survive a producer-process restart in the OS page cache, but that is not a
+ * host-power-loss guarantee. {@link #msync} preserves the legacy mmap-only
+ * flush API; use the checked {@link #syncPublished()} mapping-plus-fd barrier
+ * for portable power-loss durability.
  */
 public final class MmapSegment implements QuietCloseable {
 
@@ -84,6 +86,10 @@ public final class MmapSegment implements QuietCloseable {
     // segment manager pre-creates spares before the producer knows the exact
     // baseSeq the new active will need.
     private long baseSeq;
+    // Highest published byte offset covered by a successful data barrier.
+    // The manager writes this after msync+fsync; the producer reads it before
+    // allowing rotation to seal the segment.
+    private volatile long durableCursor;
     private int fd;
     // frameCount: number of frames successfully appended. Single writer (the
     // producer thread in tryAppend); read cross-thread by the I/O thread via
@@ -119,6 +125,7 @@ public final class MmapSegment implements QuietCloseable {
         this.baseSeq = baseSeq;
         this.appendCursor = initialCursor;
         this.publishedCursor = initialCursor;
+        this.durableCursor = memoryBacked ? initialCursor : HEADER_SIZE;
         this.frameCount = frameCount;
         this.memoryBacked = memoryBacked;
         this.tornTailBytes = tornTailBytes;
@@ -418,23 +425,62 @@ public final class MmapSegment implements QuietCloseable {
         if (filesFacade.msync(mmapAddress, HEADER_SIZE, false) != 0 || filesFacade.fsync(fd) != 0) {
             throw new MmapSegmentException("could not sync segment header " + path);
         }
+        if (durableCursor < HEADER_SIZE) {
+            durableCursor = HEADER_SIZE;
+        }
     }
 
     public boolean isFull() {
         return capacityRemaining() <= 0;
     }
 
+    public boolean isPublishedDurable() {
+        return durableCursor >= publishedCursor;
+    }
+
     /**
-     * Synchronously flushes dirty pages of {@code [HEADER_SIZE, publishedOffset())}
-     * to disk via {@code msync(MS_SYNC)}. Off the hot path — call only when
-     * the user has opted into OS-crash durability (e.g. {@code sf_msync_on_flush=on}).
+     * Preserves the original explicit mmap-flush behavior for callers that use
+     * this low-level API directly. Periodic durability uses
+     * {@link #syncPublished()}, which adds checked error handling and an fd
+     * barrier.
      */
     public void msync() {
-        if (memoryBacked) return; // no on-disk pages to flush
-        long pub = publishedCursor;
-        if (pub > HEADER_SIZE) {
-            filesFacade.msync(mmapAddress, pub, false);
+        if (memoryBacked) {
+            return;
         }
+        long published = publishedCursor;
+        if (published > HEADER_SIZE) {
+            filesFacade.msync(mmapAddress, published, false);
+        }
+    }
+
+    /**
+     * Synchronously flushes every complete frame published when this method
+     * captures {@link #publishedCursor}. A concurrent producer may publish
+     * more bytes while the barrier runs; those bytes remain outside the
+     * returned durable boundary until a later call.
+     *
+     * @return the captured byte offset covered by the successful barrier
+     */
+    public long syncPublished() {
+        long published = publishedCursor;
+        if (memoryBacked) {
+            durableCursor = published;
+            return published;
+        }
+        if (published <= durableCursor) {
+            return durableCursor;
+        }
+        if (filesFacade.msync(mmapAddress, published, false) != 0) {
+            throw new MmapSegmentException("could not sync segment data " + path);
+        }
+        // FlushViewOfFile alone is not power-loss durable on Windows. Keep the
+        // fd barrier on every platform so this method has one portable contract.
+        if (filesFacade.fsync(fd) != 0) {
+            throw new MmapSegmentException("could not sync segment file " + path);
+        }
+        durableCursor = published;
+        return published;
     }
 
     /**

@@ -819,17 +819,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *   <li>{@link #MEMORY} — never fsync explicitly. Bytes live in the OS
      *       page cache; survive a JVM crash but not an OS crash. Default
      *       and the lowest-latency setting.</li>
-     *   <li>{@link #FLUSH} — fsync the active segment at every
-     *       {@code Sender.flush()} (and at the implicit close-flush). One
-     *       fsync per user flush, regardless of frame count.</li>
-     *   <li>{@link #APPEND} — fsync after every individual frame append.
-     *       Strongest guarantee, slowest path; pay a disk fsync per row.</li>
+     *   <li>{@link #PERIODIC} — checkpoint published frames in the background
+     *       at {@code sf_sync_interval_millis}. The configured interval is a
+     *       target cadence; scheduler and storage latency add to the actual
+     *       power-loss recovery window.</li>
+     *   <li>{@link #FLUSH} — reserved for a future synchronous
+     *       {@code Sender.flush()} barrier; currently rejected by
+     *       {@code build()}.</li>
+     *   <li>{@link #APPEND} — reserved for a future barrier after every frame
+     *       append; currently rejected by {@code build()}.</li>
      * </ul>
      */
     enum SfDurability {
         MEMORY,
         FLUSH,
-        APPEND
+        APPEND,
+        PERIODIC
     }
 
     /**
@@ -972,6 +977,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // syscall cost so smaller segments give finer trim granularity and
         // make the cap arithmetic friendlier (cap / segment >> 2).
         private static final long DEFAULT_SEGMENT_BYTES = 4L * 1024 * 1024;
+        private static final long DEFAULT_SF_SYNC_INTERVAL_MILLIS = 5_000L;
         // Slot identity within sfDir. Each sender owns <sfDir>/<senderId>/ and
         // takes an advisory exclusive lock there. Default "default" is fine for
         // single-sender deployments; multi-sender setups must set this explicitly
@@ -1119,12 +1125,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // there is no separate on/off flag (presence of the directory is the switch).
         // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
         private String sfDir;
-        // Durability contract for SF append/flush. Today only MEMORY is
-        // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
-        // to learn fsync first).
+        // Durability contract for SF append/flush. FLUSH and APPEND remain
+        // deferred follow-ups; PERIODIC uses the segment manager.
         private SfDurability sfDurability = SfDurability.MEMORY;
         private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private long sfSyncIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
         private boolean tlsEnabled;
         private TlsValidationMode tlsValidationMode;
@@ -1443,9 +1449,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 // Setting sfDir enables store-and-forward (mmap'd, recoverable
                 // across sender restarts); omitting it gives memory-only mode
-                // (same lock-free architecture, no disk involvement). The
-                // sf_durability != memory rejection lives in validateParameters
-                // so it is reached by build() and by no-connect validation alike.
+                // (same lock-free architecture, no disk involvement).
+                // Durability-combination validation lives in validateParameters
+                // so build() and no-connect validation apply the same rules.
                 long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_SEGMENT_BYTES
                         : sfMaxBytes;
@@ -1534,15 +1540,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     "could not create sf_dir: " + sfDir + " rc=" + rc);
                         }
                     }
+                    if (sfDurability == SfDurability.PERIODIC
+                            && Files.fsyncParentDir(sfDir) != 0) {
+                        throw new LineSenderException(
+                                "could not sync parent directory for sf_dir: " + sfDir);
+                    }
                     slotPath = sfDir + "/" + senderId;
                 }
                 long actualSfAppendDeadlineNanos =
                         sfAppendDeadlineMillis == PARAMETER_NOT_SET_EXPLICITLY
                                 ? CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS
                                 : sfAppendDeadlineMillis * 1_000_000L;
+                long actualSfSyncIntervalNanos = sfDurability == SfDurability.PERIODIC
+                        ? (sfSyncIntervalMillis == PARAMETER_NOT_SET_EXPLICITLY
+                        ? DEFAULT_SF_SYNC_INTERVAL_MILLIS : sfSyncIntervalMillis) * 1_000_000L
+                        : 0L;
                 CursorSendEngine cursorEngine = new CursorSendEngine(
                         slotPath, actualSfMaxBytes,
-                        actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                        actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
+                        actualSfSyncIntervalNanos);
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                         ? errorInboxCapacity
                         : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1623,7 +1639,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     orphans,
                                     maxBackgroundDrainers,
                                     actualSfMaxBytes,
-                                    actualSfMaxTotalBytes);
+                                    actualSfMaxTotalBytes,
+                                    actualSfSyncIntervalNanos);
                         }
                     }
                     return connected;
@@ -2701,20 +2718,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * directory <i>is</i> the on-switch — there is no separate
          * enable/disable flag. SF is off iff {@code dir} was never set.
          * <p>
-         * Every batch is persisted to disk before it leaves the wire and is
-         * reclaimed as soon as the server acknowledges it. On restart the
-         * sender replays only batches whose acknowledgement had not been
-         * received before the previous sender shut down — typically the last
-         * in-flight batches at close time. Acknowledged batches are not
-         * replayed: their disk space is freed during normal operation by an
-         * automatic per-frame trim that force-rotates the active segment
-         * once every frame in it has been acknowledged.
+         * The sender publishes each batch into a memory-mapped segment before
+         * transmission and reclaims acknowledged segments in the background.
+         * The default {@link SfDurability#MEMORY} mode relies on OS page-cache
+         * writeback: it survives a producer-process restart but not guaranteed
+         * host power loss. {@link SfDurability#PERIODIC} adds checked background
+         * storage barriers at the configured target cadence.
          * <p>
-         * Note that {@link io.questdb.client.cutlass.qwp.client.QwpWebSocketSender#close()}
-         * under SF returns once data is on disk, not on server-ack, so a
-         * sender closed immediately after a flush may still have unacked
-         * batches in flight; those will be replayed by the next sender
-         * against the same directory. WebSocket transport only.
+         * On restart, the sender replays frames after its durable acknowledgement
+         * watermark. An acknowledgement that reached the server but not that
+         * watermark can replay, so applications that require row-level
+         * idempotence should configure server-side deduplication.
+         * WebSocket transport only.
          * <p>
          * The sender takes ownership of the underlying SF storage and closes
          * it when the sender itself is closed.
@@ -2734,7 +2749,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Selects the durability contract for SF appends and flushes. See
-         * {@link SfDurability} for the value semantics.
+         * {@link SfDurability} for the value semantics. The client currently
+         * supports {@link SfDurability#MEMORY} and
+         * {@link SfDurability#PERIODIC}; {@code build()} rejects the reserved
+         * {@code FLUSH} and {@code APPEND} values.
          * <p>
          * Replaces the prior pair of independent {@code sf_fsync} and
          * {@code sf_fsync_on_flush} booleans — they were three states
@@ -2788,6 +2806,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             return this;
         }
 
+        /**
+         * Sets the target background checkpoint cadence for
+         * {@link SfDurability#PERIODIC}. Scheduler and storage latency add to
+         * the configured interval. Defaults to 5000 ms in periodic mode.
+         */
+        public LineSenderBuilder storeAndForwardSyncIntervalMillis(long millis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
+            }
+            if (millis <= 0L || millis > Long.MAX_VALUE / 1_000_000L) {
+                throw new LineSenderException("sf_sync_interval_millis is out of range: ").put(millis);
+            }
+            this.sfSyncIntervalMillis = millis;
+            return this;
+        }
+
         private static boolean charsEqualsRange(CharSequence a, CharSequence b, int bStart, int bEnd) {
             int len = bEnd - bStart;
             if (a.length() != len) {
@@ -2810,10 +2844,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         private static SfDurability parseDurabilityValue(@NotNull StringSink value) {
             if (Chars.equalsIgnoreCase("memory", value)) return SfDurability.MEMORY;
+            if (Chars.equalsIgnoreCase("periodic", value)) return SfDurability.PERIODIC;
             if (Chars.equalsIgnoreCase("flush", value)) return SfDurability.FLUSH;
             if (Chars.equalsIgnoreCase("append", value)) return SfDurability.APPEND;
             throw new LineSenderException("invalid sf_durability [value=").put(value)
-                    .put(", allowed-values=[memory, flush, append]]");
+                    .put(", allowed-values=[memory, periodic, flush, append]]");
         }
 
         private static int parseIntValue(@NotNull StringSink value, @NotNull String name) {
@@ -3370,6 +3405,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sf_durability");
                     storeAndForwardDurability(parseDurabilityValue(sink));
+                } else if (Chars.equals("sf_sync_interval_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_sync_interval_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_sync_interval_millis");
+                    storeAndForwardSyncIntervalMillis(parseLongValue(sink, "sf_sync_interval_millis"));
                 } else if (Chars.equals("close_flush_timeout_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("close_flush_timeout_millis is only supported for WebSocket transport");
@@ -3695,6 +3736,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("sf_max_total_bytes")) {
                     storeAndForwardMaxTotalBytes(wsSize(view, v, "sf_max_total_bytes"));
                 }
+                if (view.has("sf_sync_interval_millis")) {
+                    storeAndForwardSyncIntervalMillis(wsLong(view, v, "sf_sync_interval_millis"));
+                }
 
                 s = view.getStr("sf_dir");
                 if (s != null) {
@@ -3852,6 +3896,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("sf_max_total_bytes", sfMaxTotalBytes);
             m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
             m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);
+            m.put("sf_sync_interval_millis", sfSyncIntervalMillis);
             m.put("close_flush_timeout_millis", closeFlushTimeoutMillis);
             m.put("durable_ack_keepalive_interval_millis", durableAckKeepaliveIntervalMillis);
             m.put("initial_connect_retry", initialConnectMode == null ? null : initialConnectMode.name());
@@ -4057,14 +4102,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (autoFlushIntervalMillis == Integer.MAX_VALUE) {
                     throw new LineSenderException("disabling auto-flush is not supported for WebSocket protocol");
                 }
-                // The cursor send path does not fsync yet, so any sf_durability
-                // other than memory is rejected rather than silently downgraded.
-                // Validating it here (rather than at connect time) lets a
-                // no-connect config check reject it as a full build() does.
-                if (sfDurability != SfDurability.MEMORY) {
+                if ((sfDurability == SfDurability.FLUSH || sfDurability == SfDurability.APPEND)) {
                     throw new LineSenderException(
                             "sf_durability=" + sfDurability.name().toLowerCase()
-                                    + " is not yet supported (deferred follow-up; use sf_durability=memory)");
+                                    + " is not yet supported (use sf_durability=memory or periodic)");
+                }
+                if (sfDurability == SfDurability.PERIODIC && sfDir == null) {
+                    throw new LineSenderException("sf_durability=periodic requires sf_dir");
+                }
+                if (sfSyncIntervalMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        && sfDurability != SfDurability.PERIODIC) {
+                    throw new LineSenderException(
+                            "sf_sync_interval_millis requires sf_durability=periodic");
                 }
             } else {
                 throw new LineSenderException("unsupported protocol ")

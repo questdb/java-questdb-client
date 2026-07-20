@@ -867,6 +867,7 @@ public class QwpWebSocketSender implements Sender {
         if (cursorEngine == null) {
             return targetFsn < 0L;
         }
+        cursorEngine.checkDurability();
         // Surface latched I/O errors before any early-return path, so a
         // caller polling with timeoutMillis <= 0 to drive their own loop
         // sees the terminal throw instead of an indefinite "not yet".
@@ -882,6 +883,7 @@ public class QwpWebSocketSender implements Sender {
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         while (cursorEngine.ackedFsn() < targetFsn) {
+            cursorEngine.checkDurability();
             if (cursorSendLoop != null) {
                 cursorSendLoop.checkError();
             }
@@ -1519,15 +1521,19 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public long flushAndGetSequence() {
         checkNotClosed();
+        if (cursorEngine != null) {
+            cursorEngine.checkDurability();
+        }
         ensureNoInProgressRow();
         ensureConnected();
 
         long beforeFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
 
-        // Cursor SF: SF.append happens on the user thread inside
-        // sealAndSwapBuffer, so by the time we reach here every encoded
-        // batch is durable on its mmap'd segment. No processingCount to
-        // drain, no awaitPendingAcks. Just surface any I/O thread error.
+        // Cursor SF: append happens on the user thread inside
+        // sealAndSwapBuffer, so by the time we reach here every encoded batch
+        // is published in its mmap'd segment. PERIODIC stable-storage barriers
+        // run independently in the manager. No processingCount to drain and no
+        // awaitPendingAcks here; just surface any I/O thread error.
         flushPendingRows(deferCommit);
         if (!deferCommit && hasDeferredMessages) {
             sendCommitMessage();
@@ -2423,6 +2429,25 @@ public class QwpWebSocketSender implements Sender {
             long segmentSizeBytes,
             long sfMaxTotalBytes
     ) {
+        startOrphanDrainers(
+                orphanSlotPaths,
+                maxBackgroundDrainers,
+                segmentSizeBytes,
+                sfMaxTotalBytes,
+                0L);
+    }
+
+    /**
+     * Starts orphan drainers while preserving the foreground sender's periodic
+     * store-and-forward checkpoint interval.
+     */
+    public synchronized void startOrphanDrainers(
+            io.questdb.client.std.ObjList<String> orphanSlotPaths,
+            int maxBackgroundDrainers,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes,
+            long syncIntervalNanos
+    ) {
         if (orphanSlotPaths == null || orphanSlotPaths.size() == 0
                 || maxBackgroundDrainers <= 0) {
             return;
@@ -2459,6 +2484,7 @@ public class QwpWebSocketSender implements Sender {
             io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
                     new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
+                            syncIntervalNanos,
                             factory,
                             reconnectMaxDurationMillis,
                             reconnectInitialBackoffMillis,

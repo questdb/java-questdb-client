@@ -106,6 +106,7 @@ public final class BackgroundDrainer implements Runnable {
     private final long segmentSizeBytes;
     private final long sfMaxTotalBytes;
     private final String slotPath;
+    private final long syncIntervalNanos;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
     private volatile String lastErrorMessage;
@@ -171,9 +172,35 @@ public final class BackgroundDrainer implements Runnable {
             int maxHeadFrameRejections,
             long poisonMinEscalationWindowMillis
     ) {
+        this(slotPath, segmentSizeBytes, sfMaxTotalBytes, 0L, clientFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, requestDurableAck,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis);
+    }
+
+    /**
+     * Master constructor with the periodic SF checkpoint interval inherited
+     * from the sender that adopted the orphan slot.
+     */
+    public BackgroundDrainer(
+            String slotPath,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes,
+            long syncIntervalNanos,
+            CursorWebSocketSendLoop.ReconnectFactory clientFactory,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            boolean requestDurableAck,
+            long durableAckKeepaliveIntervalMillis,
+            int maxHeadFrameRejections,
+            long poisonMinEscalationWindowMillis
+    ) {
         this.slotPath = slotPath;
         this.segmentSizeBytes = segmentSizeBytes;
         this.sfMaxTotalBytes = sfMaxTotalBytes;
+        this.syncIntervalNanos = syncIntervalNanos;
         this.clientFactory = clientFactory;
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -531,7 +558,8 @@ public final class BackgroundDrainer implements Runnable {
             // (no .failed sentinel — contention is expected, not an error).
             try {
                 engine = new CursorSendEngine(slotPath, segmentSizeBytes,
-                        sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                        sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        syncIntervalNanos);
             } catch (IllegalStateException t) {
                 String msg = t.getMessage();
                 if (msg != null && msg.contains("already in use")) {

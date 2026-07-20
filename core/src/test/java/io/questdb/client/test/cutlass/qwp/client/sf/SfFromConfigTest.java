@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -166,6 +167,46 @@ public class SfFromConfigTest {
     }
 
     @Test
+    public void testPeriodicDurabilityDefaultAndExplicitInterval() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String base = "ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfDir + ";sf_durability=periodic;";
+                try (Sender sender = Sender.fromConfig(base)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(5_000_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                }
+
+                try (Sender sender = Sender.fromConfig(base
+                        + "sender_id=explicit;sf_sync_interval_millis=123;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(123_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicDurabilityRequiresDirectory() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (Sender ignored = Sender.fromConfig(
+                    "ws::addr=localhost:1;sf_durability=periodic;")) {
+                Assert.fail("expected periodic mode without sf_dir to fail");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("requires sf_dir"));
+            }
+        });
+    }
+
+    @Test
     public void testSfDurabilityAppendNotYetSupported() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // sf_durability=append/flush are accepted by the parser but rejected
@@ -217,6 +258,20 @@ public class SfFromConfigTest {
             } catch (LineSenderException expected) {
                 Assert.assertTrue(expected.getMessage(),
                         expected.getMessage().contains("WebSocket"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalRequiresPeriodicMode() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_sync_interval_millis=5000;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected interval without periodic mode to fail");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("requires sf_durability=periodic"));
             }
         });
     }

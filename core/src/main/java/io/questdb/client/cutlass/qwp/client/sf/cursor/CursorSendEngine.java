@@ -102,6 +102,7 @@ public final class CursorSendEngine implements QuietCloseable {
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private final String sfDir;
+    private final long syncIntervalNanos;
     // Held for the engine's lifetime in disk mode. {@code null} in memory
     // mode (no slot, no lock). Released by {@link #close()}; the kernel
     // also drops it on hard process exit.
@@ -200,7 +201,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes) {
         this(sfDir, segmentSizeBytes, SegmentManager.UNLIMITED_TOTAL_BYTES,
-                DEFAULT_APPEND_DEADLINE_NANOS);
+                DEFAULT_APPEND_DEADLINE_NANOS, 0L);
     }
 
     /**
@@ -212,7 +213,18 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos) {
-        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes, appendDeadlineNanos);
+        this(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadlineNanos, 0L);
+    }
+
+    /**
+     * Creates an engine with an optional periodic data-checkpoint interval.
+     * A positive interval requires disk-backed store-and-forward mode.
+     */
+    public CursorSendEngine(String sfDir, long segmentSizeBytes,
+                            long maxTotalBytes, long appendDeadlineNanos,
+                            long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
+                appendDeadlineNanos, syncIntervalNanos);
     }
 
     /**
@@ -221,26 +233,35 @@ public final class CursorSendEngine implements QuietCloseable {
      * ownership of the manager. Uses the default append deadline.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager) {
-        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS);
+        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS, 0L);
+    }
+
+    public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                            long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, manager, false,
+                DEFAULT_APPEND_DEADLINE_NANOS, syncIntervalNanos);
     }
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos) {
-        this(sfDir, segmentSizeBytes, manager, ownsManager,
-                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos);
+        this(sfDir, segmentSizeBytes, manager, ownsManager, appendDeadlineNanos, 0L);
     }
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
-                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos) {
+                             boolean ownsManager, long appendDeadlineNanos,
+                             long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, manager, ownsManager,
+                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos, syncIntervalNanos);
+    }
+
+    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
+                             long syncIntervalNanos) {
         // Allocate the bound callback before constructing an owned manager.
         // Field initializers have completed, but no engine-owned native/disk
         // resource exists yet. If callback allocation throws, construction
         // stops without a manager whose native path scratch could be orphaned.
         this.deferredClose = createDeferredClose();
-        if (ownsManager && manager == null) {
-            manager = new SegmentManager(
-                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
-        }
 
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
         //                  cursor architecture, no disk involvement; segments
@@ -248,6 +269,17 @@ public final class CursorSendEngine implements QuietCloseable {
         // sfDir != null  → store-and-forward mode. Segments are mmap'd files
         //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
+        // Validate before an owned manager allocates its native path scratch.
+        if (syncIntervalNanos < 0L) {
+            throw new IllegalArgumentException("syncIntervalNanos must not be negative");
+        }
+        if (memoryMode && syncIntervalNanos > 0L) {
+            throw new IllegalArgumentException("periodic sync requires disk store-and-forward mode");
+        }
+        if (ownsManager && manager == null) {
+            manager = new SegmentManager(
+                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
+        }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
             try {
@@ -259,7 +291,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // recovery and create overlapping FSN ranges. SlotLock.acquire
                 // also creates the slot dir if it doesn't exist yet — no
                 // separate mkdir step needed here.
-                acquiredLock = SlotLock.acquire(sfDir);
+                acquiredLock = SlotLock.acquire(sfDir, syncIntervalNanos > 0L);
             } catch (Throwable t) {
                 // Callback creation and owned-manager construction have already
                 // completed. A slot-lock failure must close the owned manager's
@@ -280,6 +312,7 @@ public final class CursorSendEngine implements QuietCloseable {
         this.filesFacade = manager.filesFacade();
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
+        this.syncIntervalNanos = syncIntervalNanos;
 
         // Track the ring locally until every step succeeds — only commit it
         // to this.ring at the very end. If anything between ring allocation
@@ -458,10 +491,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
             }
 
+            if (syncIntervalNanos > 0L) {
+                ringInProgress.enablePeriodicSync();
+                if (recovered != null) {
+                    // Establish a durable baseline before exposing data that a
+                    // previous MEMORY-mode process may have left in page cache.
+                    ringInProgress.syncAllLiveSegments();
+                }
+            }
             if (ownsManager) {
                 manager.start();
             }
-            manager.register(ringInProgress, sfDir, watermarkInProgress);
+            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos);
             // All construction succeeded — commit the ring and
             // watermark references.
             this.ring = ringInProgress;
@@ -564,11 +605,13 @@ public final class CursorSendEngine implements QuietCloseable {
             if (now >= deadlineNs) {
                 throw new io.questdb.client.cutlass.line.LineSenderException(
                         "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
-                        .put(" ms — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)");
+                        .put(" ms - wire path is not draining (server slow / disconnected, "
+                                + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
             }
             if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
                 lastBackpressureLogNs = now;
-                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O drain — will throw after {} ms",
+                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
+                                + "will throw after {} ms",
                         backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
             }
             LockSupport.parkNanos(50_000L); // 50 µs
@@ -609,6 +652,10 @@ public final class CursorSendEngine implements QuietCloseable {
             }
         }
         return SegmentRing.BACKPRESSURE_NO_SPARE;
+    }
+
+    public void checkDurability() {
+        ring.checkDurability();
     }
 
     @Override
@@ -800,6 +847,16 @@ public final class CursorSendEngine implements QuietCloseable {
      * against a close() that holds the monitor while joining the worker.
      */
     private void finishClose(boolean fullyDrained) {
+        if (!fullyDrained && syncIntervalNanos > 0L) {
+            try {
+                ring.syncAllLiveSegments();
+            } catch (RuntimeException | Error e) {
+                terminalCleanupRetryReady = true;
+                terminalCleanupClaimed.set(false);
+                startFlockReleaseRetry();
+                throw e;
+            }
+        }
         // On a fully-drained close, persist the final acked FSN through the
         // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
         // unlinking any segment file. The manager persists the watermark only
@@ -906,8 +963,18 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @TestOnly
+    public SegmentRing getRingForTesting() {
+        return ring;
+    }
+
+    @TestOnly
     public SlotLock getSlotLockForTesting() {
         return slotLock;
+    }
+
+    @TestOnly
+    public long getSyncIntervalNanosForTesting() {
+        return syncIntervalNanos;
     }
 
     /**

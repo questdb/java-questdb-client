@@ -77,6 +77,14 @@ public final class SlotLock implements QuietCloseable {
      *                               or lock contention.
      */
     public static SlotLock acquire(String slotDir) {
+        return acquire(slotDir, false);
+    }
+
+    /**
+     * Acquires a slot and optionally makes the slot entry durable in its
+     * parent directory before any segment file is created.
+     */
+    public static SlotLock acquire(String slotDir, boolean syncParentDirectory) {
         if (slotDir == null || slotDir.isEmpty()) {
             throw new IllegalArgumentException("slotDir must not be empty");
         }
@@ -86,6 +94,10 @@ public final class SlotLock implements QuietCloseable {
                 throw new IllegalStateException(
                         "could not create slot dir: " + slotDir + " rc=" + rc);
             }
+        }
+        if (syncParentDirectory && Files.fsyncParentDir(slotDir) != 0) {
+            throw new IllegalStateException(
+                    "could not sync parent directory for SF slot: " + slotDir);
         }
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;

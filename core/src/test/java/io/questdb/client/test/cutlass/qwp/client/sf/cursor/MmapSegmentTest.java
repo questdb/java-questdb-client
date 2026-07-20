@@ -56,6 +56,60 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testBarrierChecksMsyncAndFsyncFailures() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                FaultyFilesFacade success = new FaultyFilesFacade();
+                try (MmapSegment segment = MmapSegment.create(
+                        success, tmpDir + "/barrier-ok.sfa", 0L, 4096L)) {
+                    fillPattern(payload, 32, 1);
+                    assertTrue(segment.tryAppend(payload, 32) >= 0L);
+                    assertFalse(segment.isPublishedDurable());
+                    assertEquals(segment.publishedOffset(), segment.syncPublished());
+                    assertTrue(segment.isPublishedDurable());
+                    assertEquals(1, success.msyncCalls);
+                    assertEquals(1, success.fsyncCalls);
+                }
+
+                FaultyFilesFacade msyncFailure = new FaultyFilesFacade();
+                msyncFailure.failOnMsync = true;
+                try (MmapSegment segment = MmapSegment.create(
+                        msyncFailure, tmpDir + "/barrier-msync-fail.sfa", 0L, 4096L)) {
+                    assertTrue(segment.tryAppend(payload, 32) >= 0L);
+                    try {
+                        segment.syncPublished();
+                        fail("expected msync failure");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage().contains("sync segment data"));
+                    }
+                    assertFalse(segment.isPublishedDurable());
+                    assertEquals(1, msyncFailure.msyncCalls);
+                    assertEquals(0, msyncFailure.fsyncCalls);
+                }
+
+                FaultyFilesFacade fsyncFailure = new FaultyFilesFacade();
+                fsyncFailure.failOnFsync = true;
+                try (MmapSegment segment = MmapSegment.create(
+                        fsyncFailure, tmpDir + "/barrier-fsync-fail.sfa", 0L, 4096L)) {
+                    assertTrue(segment.tryAppend(payload, 32) >= 0L);
+                    try {
+                        segment.syncPublished();
+                        fail("expected fsync failure");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage().contains("sync segment file"));
+                    }
+                    assertFalse(segment.isPublishedDurable());
+                    assertEquals(1, fsyncFailure.msyncCalls);
+                    assertEquals(1, fsyncFailure.fsyncCalls);
+                }
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testCapacityRemainingAccountsForFrameEnvelope() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-cap.sfa";
@@ -76,6 +130,27 @@ public class MmapSegmentTest {
                 }
             } finally {
                 Unsafe.free(buf, 50, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testCompatibilityMsyncKeepsLegacyCallPattern() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long payload = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                FaultyFilesFacade filesFacade = new FaultyFilesFacade();
+                try (MmapSegment segment = MmapSegment.create(
+                        filesFacade, tmpDir + "/compat-msync.sfa", 0L, 4096L)) {
+                    assertTrue(segment.tryAppend(payload, 32) >= 0L);
+                    segment.msync();
+                    segment.msync();
+                    assertEquals(2, filesFacade.msyncCalls);
+                    assertEquals(0, filesFacade.fsyncCalls);
+                    assertFalse(segment.isPublishedDurable());
+                }
+            } finally {
+                Unsafe.free(payload, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -538,8 +613,12 @@ public class MmapSegmentTest {
         int allocateCalls;
         int closeCalls;
         boolean failOnAllocate;
+        boolean failOnFsync;
+        boolean failOnMsync;
         boolean failOnOpenCleanRW;
         boolean failOnOpenRWExclusive;
+        int fsyncCalls;
+        int msyncCalls;
         int openCleanRWCalls;
         int openRWExclusiveCalls;
         int removeCalls;
@@ -619,7 +698,8 @@ public class MmapSegmentTest {
 
         @Override
         public int fsync(int fd) {
-            return INSTANCE.fsync(fd);
+            fsyncCalls++;
+            return failOnFsync ? -1 : INSTANCE.fsync(fd);
         }
 
         @Override
@@ -640,6 +720,12 @@ public class MmapSegmentTest {
         @Override
         public int mkdir(String path, int mode) {
             return INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public int msync(long addr, long len, boolean async) {
+            msyncCalls++;
+            return failOnMsync ? -1 : INSTANCE.msync(addr, len, async);
         }
 
         @Override

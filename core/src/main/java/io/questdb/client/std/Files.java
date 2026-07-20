@@ -24,6 +24,7 @@
 
 package io.questdb.client.std;
 
+import java.io.File;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
@@ -438,6 +439,15 @@ public final class Files {
         } finally {
             freePathPtr(ptr);
         }
+    }
+
+    /**
+     * Forces the directory entry naming {@code path} to durable storage by
+     * syncing its absolute parent directory.
+     */
+    public static int fsyncParentDir(String path) {
+        File parent = new File(path).getAbsoluteFile().getParentFile();
+        return parent == null ? 0 : fsyncDir(parent.getPath());
     }
 
     /**

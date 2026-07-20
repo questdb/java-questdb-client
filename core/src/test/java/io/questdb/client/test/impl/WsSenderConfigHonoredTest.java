@@ -63,8 +63,9 @@ public class WsSenderConfigHonoredTest {
         assertHonored("sf_dir=/var/probe", "sf_dir", "/var/probe");
         assertHonored("sf_max_bytes=4096", "sf_max_bytes", 4096L);
         assertHonored("sf_max_total_bytes=8192", "sf_max_total_bytes", 8192L);
-        assertHonored("sf_durability=flush", "sf_durability", "FLUSH");
+        assertHonored("sf_durability=periodic", "sf_durability", "PERIODIC");
         assertHonored("sf_append_deadline_millis=1500", "sf_append_deadline_millis", 1500L);
+        assertHonored("sf_sync_interval_millis=5000", "sf_sync_interval_millis", 5000L);
         assertHonored("close_flush_timeout_millis=2500", "close_flush_timeout_millis", 2500L);
         assertHonored("durable_ack_keepalive_interval_millis=900", "durable_ack_keepalive_interval_millis", 900L);
         assertHonored("initial_connect_retry=async", "initial_connect_retry", "ASYNC");
