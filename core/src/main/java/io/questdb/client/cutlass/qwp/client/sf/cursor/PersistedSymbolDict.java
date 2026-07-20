@@ -180,6 +180,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
     // mmap instead of allocating a second native buffer as large as the file.
     // Test-visible so the peak-memory regression has an observable contract.
     private final boolean mappedRecoveryInput;
+    // Entry count that corresponds EXACTLY to loadedEntriesAddr/loadedEntriesLen,
+    // fixed at open. Distinct from the live `size`, which appends advance -- including
+    // the recovery-time heal in QwpWebSocketSender.healPersistedDictionary, which runs
+    // BEFORE the send loop is constructed. The loop seeds its mirror from the loaded
+    // BYTES, so it must take its count from here; pairing those bytes with the live
+    // size would let sentDictCount claim symbols the mirror does not hold.
+    private final int recoveredSize;
     private long appendMapAddr;
     private long appendMapCapacity;
     private long appendMapOffset;
@@ -215,6 +222,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         this.mappedRecoveryInput = mappedRecoveryInput;
         this.appendOffset = appendOffset;
         this.size = size;
+        this.recoveredSize = size;
         this.loadedEntriesAddr = loadedEntriesAddr;
         this.loadedEntriesLen = loadedEntriesLen;
     }
@@ -571,6 +579,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return addr;
     }
 
+    /**
+     * Number of symbols {@link #open} recovered from disk -- the exact entry count of
+     * {@link #loadedEntriesAddr()} / {@link #loadedEntriesLen()}. Unlike {@link #size()}
+     * this never advances, so a caller seeding from the loaded bytes stays in lockstep
+     * with them even after the producer has appended (the recovery heal does exactly
+     * that, before the send loop is built).
+     */
+    public int recoveredSize() {
+        return recoveredSize;
+    }
+
     @TestOnly
     public boolean usedMappedRecoveryInput() {
         return mappedRecoveryInput;
@@ -593,7 +612,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     @TestOnly
     public ObjList<String> readLoadedSymbols() {
-        ObjList<String> out = new ObjList<>(Math.max(size, 1));
+        ObjList<String> out = new ObjList<>(Math.max(recoveredSize, 1));
         decodeLoadedSymbols(null, out);
         return out;
     }
@@ -606,7 +625,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // mismatch means an internal invariant broke: fail loud like the rest of this
         // file (copyRecoveredEntries throws too) instead of silently under-populating
         // the dictionary, which would shift every id above the short point.
-        for (int i = 0; i < size; i++) {
+        // recoveredSize, not the live size: this decodes the LOADED region, whose entry
+        // count is fixed at open. Appends (including the recovery heal) advance size
+        // without extending that region, so keying off size would over-read.
+        for (int i = 0; i < recoveredSize; i++) {
             long len = 0;
             int shift = 0;
             boolean terminated = false;
@@ -623,8 +645,10 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 }
             }
             if (!terminated || p + len > limit) {
-                throw new IllegalStateException("truncated loaded symbol dictionary entry to "
-                        + FILE_NAME + " [entry=" + i + ", size=" + size + ']');
+                // UnreplayableSlotException so Sender.build() can set the slot aside
+                // instead of rethrowing forever -- see CursorSendEngine's twin throw.
+                throw new UnreplayableSlotException("truncated loaded symbol dictionary entry to "
+                        + FILE_NAME + " [entry=" + i + ", size=" + recoveredSize + ']');
             }
             String symbol = Utf8s.stringFromUtf8Bytes(p, p + len);
             if (target != null) {
@@ -635,7 +659,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             p += len;
         }
         if (p != limit) {
-            throw new IllegalStateException("loaded symbol dictionary has trailing bytes to "
+            throw new UnreplayableSlotException("loaded symbol dictionary has trailing bytes to "
                     + FILE_NAME + " [consumed=" + (p - loadedEntriesAddr) + ", length=" + loadedEntriesLen + ']');
         }
     }

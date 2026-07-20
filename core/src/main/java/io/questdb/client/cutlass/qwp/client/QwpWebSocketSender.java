@@ -804,7 +804,16 @@ public class QwpWebSocketSender implements Sender {
             }
             sender.ensureConnected();
         } catch (Throwable t) {
-            sender.close();
+            // Preserve t's IDENTITY through the rollback. Sender.build() routes on the
+            // exception type -- only UnreplayableSlotException reaches its quarantine
+            // handler -- and close() accumulates cleanup errors and ends in
+            // rethrowTerminal, so letting a close failure propagate here would REPLACE t
+            // and silently demote a recoverable slot back to the permanent build() brick.
+            try {
+                sender.close();
+            } catch (Throwable closeFailure) {
+                t.addSuppressed(closeFailure);
+            }
             throw t;
         }
         return sender;
@@ -3865,6 +3874,84 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Stops emitting delta dictionaries for the rest of this sender's life, after the
+     * per-slot {@code .symbol-dict} has proved unwritable.
+     * <p>
+     * The side-file can stop accepting appends mid-run -- a full disk or an exhausted
+     * quota, where SF's own segments stay writable because they are pre-allocated mmap
+     * files while the dictionary is the one thing still growing. Without a way back,
+     * {@code deltaDictEnabled} is written once at {@code setCursorEngine} and every
+     * later {@code flush()} re-throws forever: a condition store-and-forward is built
+     * to survive becomes total, permanent ingestion loss.
+     * <p>
+     * Full self-sufficient frames need no side file at all -- each carries the whole
+     * dictionary from id 0, which is exactly what recovery and orphan-drain replay
+     * against a fresh server. So degrade instead of dying. The producer's monotonic
+     * baseline stops being consulted ({@link #symbolDeltaBaseline()} returns -1), and
+     * the write-ahead persist becomes a no-op.
+     * <p>
+     * Producer-thread only, like every other reader of {@code deltaDictEnabled}.
+     */
+    private void disableDeltaDict(Throwable cause) {
+        if (!deltaDictEnabled) {
+            return;
+        }
+        deltaDictEnabled = false;
+        LOG.warn("symbol dictionary persistence failed; this sender has switched to full "
+                + "self-sufficient frames for the rest of its life (bandwidth cost only -- "
+                + "no data is at risk, and recovery replays such frames without a side file)",
+                cause);
+    }
+
+    /**
+     * Writes the ids the surviving frames contributed above the persisted prefix back
+     * into {@code .symbol-dict}, immediately, before any new frame can be published.
+     * <p>
+     * {@link #seedGlobalDictionaryFromPersisted} can rebuild the producer dictionary from
+     * TWO sources -- the side-file's intact prefix and the surviving frames' own delta
+     * sections -- and then resumes {@code sentMaxSymbolId} at the combined tip. When the
+     * frames contributed anything, that tip is ABOVE {@code pd.size()}, so every frame
+     * published from here on carries a {@code deltaStart} the side-file cannot describe.
+     * That breaks the write-ahead invariant the whole design rests on: the persisted
+     * dictionary must be a superset of every recoverable frame's references.
+     * <p>
+     * The steady-state write-ahead does NOT close that gap on its own. It persists
+     * {@code [pd.size() .. currentBatchMaxSymbolId]} and returns early when the batch's
+     * highest id is below {@code pd.size()}, so it heals only if -- and only as far as --
+     * a later batch happens to reference the recovered high ids. Meanwhile the frames
+     * that carry those ids are the oldest unacked, so they are the FIRST to be acked and
+     * trimmed. Once they are gone, an ordinary process crash (which store-and-forward
+     * promises to survive; only the original tear needs a host crash) leaves a slot whose
+     * frames reference ids nothing holds: recovery marks a gap and {@code build()}
+     * quarantines it with "resend the affected data".
+     * <p>
+     * Healing here, eagerly and in full, restores the invariant before the window opens.
+     */
+    private void healPersistedDictionary(PersistedSymbolDict pd) {
+        if (pd == null || !deltaDictEnabled) {
+            return;
+        }
+        int from = pd.size();
+        int to = globalSymbolDictionary.size() - 1;
+        if (to < from) {
+            return; // the side-file already covers everything the frames defined
+        }
+        try {
+            pd.appendSymbols(globalSymbolDictionary, from, to);
+        } catch (Throwable t) {
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            // Do NOT fail recovery: the surviving frames still carry these ids in their
+            // own deltas, so THIS session replays correctly either way. Only a future
+            // recovery, after those frames are trimmed, would be affected -- and the
+            // degrade below removes even that exposure by dropping back to frames that
+            // need no side file.
+            disableDeltaDict(t);
+        }
+    }
+
+    /**
      * Appends the symbols this frame introduces ({@code [sentMaxSymbolId+1 ..
      * currentBatchMaxSymbolId]}) to the slot's persisted dictionary BEFORE the
      * frame is published to the ring. This write-ahead ordering keeps the
@@ -3932,7 +4019,16 @@ public class QwpWebSocketSender implements Sender {
             if (t instanceof Error) {
                 throw (Error) t;
             }
-            throw new LineSenderException("failed to persist symbol dictionary before publish", t);
+            // Degrade before throwing, so this failure is survivable rather than terminal:
+            // every LATER flush emits full self-sufficient frames, which need no side file
+            // (see disableDeltaDict). This one flush still has to fail -- beginMessage has
+            // already baked a delta deltaStart into the staged frame, and publishing it
+            // would put ids on the ring that the side-file cannot describe. The throw
+            // precedes every publish, so the caller's rows stay buffered and the next
+            // flush() re-encodes them from id 0.
+            disableDeltaDict(t);
+            throw new LineSenderException("failed to persist symbol dictionary before publish; "
+                    + "this sender has switched to full self-sufficient frames -- retry the flush", t);
         }
     }
 
@@ -4054,6 +4150,10 @@ public class QwpWebSocketSender implements Sender {
         // sentDictCount once those frames have gone out. The first new frame therefore
         // starts its delta exactly at the tip, and the replay guard passes.
         sentMaxSymbolId = globalSymbolDictionary.size() - 1;
+        // ...but the baseline now sits ABOVE pd.size() whenever the frames contributed
+        // ids, so restore the write-ahead invariant right now rather than hoping a later
+        // batch reaches high enough to do it. See healPersistedDictionary.
+        healPersistedDictionary(pd);
     }
 
     /**

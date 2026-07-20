@@ -116,6 +116,74 @@ public class EngineCloseSlotLockReleaseTest {
         Files.remove(dir);
     }
 
+    /**
+     * A close driven by a caller that HOLDS the logical slot lock must not unlink it.
+     * <p>
+     * A fresh slot is "fully drained" by definition ({@code publishedFsn() < 0}), and
+     * {@code Sender.build()} closes the engine from inside its {@code acquireLogical}
+     * scope whenever connect fails -- the ordinary "server isn't up yet" startup. An
+     * unconditional unlink there frees the pathname while build() still holds the flock,
+     * so on POSIX the next acquirer creates a SECOND inode and locks it successfully:
+     * two owners of the lock that exists solely to serialise the quarantine
+     * close-&gt;rename-&gt;recreate window.
+     * <p>
+     * Swap {@code close(false)} for {@code close()} and the second acquireLogical below
+     * succeeds instead of throwing.
+     */
+    @Test(timeout = 10_000L)
+    public void testCloseDoesNotUnlinkALogicalLockItsCallerHolds() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot0";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot0.lock";
+
+            try (SlotLock held = SlotLock.acquireLogical(slotDir)) {
+                assertTrue("scaffolding: the logical lock file must exist once acquired",
+                        Files.exists(logicalLockPath));
+
+                // A fresh slot: publishedFsn() < 0, so close() takes the fully-drained arm.
+                CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+                engine.close(false);
+
+                assertTrue("close(false) must leave the logical lock file alone -- its caller "
+                                + "still holds the flock on it",
+                        Files.exists(logicalLockPath));
+                try {
+                    SlotLock stolen = SlotLock.acquireLogical(slotDir);
+                    stolen.close();
+                    fail("the logical lock was voided while still held: a second acquireLogical "
+                            + "succeeded, so two parties now believe they own the slot");
+                } catch (IllegalStateException expected) {
+                    assertTrue("expected lock contention, got: " + expected.getMessage(),
+                            expected.getMessage().contains("already in use"));
+                }
+            }
+        });
+    }
+
+    /**
+     * The counterpart: a close by a caller that does NOT hold the logical lock still
+     * reclaims it, so {@code .slot-locks} does not accumulate a dead lock+pid pair per
+     * distinct slot name for the lifetime of {@code sf_dir}.
+     */
+    @Test(timeout = 10_000L)
+    public void testFullyDrainedCloseStillReclaimsAnUnheldLogicalLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot1";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot1.lock";
+
+            SlotLock.acquireLogical(slotDir).close(); // materialise the lock file, release it
+            assertTrue(Files.exists(logicalLockPath));
+
+            CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+            engine.close();
+
+            assertFalse("a fully-drained close with no logical-lock holder must reclaim it",
+                    Files.exists(logicalLockPath));
+        });
+    }
+
     @Test(timeout = 10_000L)
     public void testSlotLockReleasedEvenIfRingCloseThrows() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

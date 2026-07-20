@@ -726,7 +726,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // simply starts empty and grows from the frames themselves.
         PersistedSymbolDict pd = engine.getPersistedSymbolDict();
         int persistedPrefixLen = 0;
-        if (pd != null && pd.size() > 0) {
+        if (pd != null && pd.recoveredSize() > 0) {
             int len = pd.loadedEntriesLen();
             if (len > 0) {
                 // Seed by reference. The foreground loop takes ownership after
@@ -739,10 +739,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 sentDictBytesCapacity = len;
                 sentDictBytesLen = len;
                 // Set the count only alongside the bytes so sentDictCount can
-                // never claim symbols the mirror does not hold. A recovered slot
-                // always has loadedEntriesLen > 0 when size > 0, so this is the
-                // same result -- it just makes the coupling explicit.
-                sentDictCount = pd.size();
+                // never claim symbols the mirror does not hold -- and take it from
+                // recoveredSize(), NOT the live size(). They differ: the recovery
+                // heal (QwpWebSocketSender.healPersistedDictionary) appends the
+                // frame-contributed suffix to the file before this loop is built, so
+                // size() would already have run past the loaded byte region.
+                sentDictCount = pd.recoveredSize();
             }
         }
         // ...and then from the surviving frames' own delta sections, exactly as the producer

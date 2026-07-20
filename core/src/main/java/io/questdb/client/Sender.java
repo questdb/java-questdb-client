@@ -1643,7 +1643,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             // rather than loop.
                             if (quarantined || slotPath == null) {
                                 try {
-                                    cursorEngine.close();
+                                    // close(false): we still hold the logical slot lock.
+                                    cursorEngine.close(false);
                                 } catch (Throwable ignored) {
                                     // best-effort
                                 }
@@ -1655,9 +1656,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
                         } catch (Throwable t) {
                             // connect() failed before ownership of cursorEngine
-                            // transferred — close it ourselves.
+                            // transferred — close it ourselves. close(false)
+                            // because logicalSlotLock is still held here: a fresh
+                            // slot is fully drained, so the default close would
+                            // unlink the very lock file this scope holds.
                             try {
-                                cursorEngine.close();
+                                cursorEngine.close(false);
                             } catch (Throwable ignored) {
                                 // best-effort
                             }
@@ -3064,8 +3068,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             final String detail = cause.getMessage();
             // Release the slot lock and the dictionary fd before renaming. connect()'s failure
             // path already closed the engine; close() is idempotent, so make it explicit rather
-            // than depend on that.
-            torn.close();
+            // than depend on that. close(false): build() holds the logical slot lock across this
+            // whole transition -- that is precisely what serialises the rename against a queued
+            // orphan drainer -- so the engine must not unlink it.
+            torn.close(false);
             Runnable hook = quarantineAfterCloseHook;
             if (hook != null) {
                 hook.run();

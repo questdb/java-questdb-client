@@ -409,14 +409,13 @@ public final class CursorSendEngine implements QuietCloseable {
                     // baseline 0 once pd is gone, and checkedRecoveryAnalysis rejects a
                     // baseline that disagrees with the fold. Discarding a dictionary that
                     // held entries (size > 0) therefore desynchronised the two and threw
-                    // IllegalStateException("recovery symbol baseline mismatch") out of
-                    // build(). That is NOT an UnreplayableSlotException, so build()'s
-                    // quarantine handler could not catch it and set the slot aside: with a
-                    // stable senderId every restart re-recovered the same slot and threw
-                    // again, so the application could never construct a Sender -- it could
-                    // not even BUFFER new rows. Exactly the outage quarantineTornSlot
-                    // exists to prevent, on a slot that is fully recoverable (its frames
-                    // carry their whole dictionary inline).
+                    // "recovery symbol baseline mismatch" out of build(). checkedRecoveryAnalysis
+                    // now raises that as an UnreplayableSlotException, so build() would at least
+                    // set the slot aside rather than rethrow forever -- but quarantining is
+                    // still the wrong outcome HERE, because this slot is fully recoverable
+                    // (its frames carry their whole dictionary inline). Re-folding avoids the
+                    // mismatch entirely instead of trading a permanent brick for a needless
+                    // quarantine plus a "resend the affected data" the operator does not owe.
                     //
                     // Reachable on one transient plus one crash: a session whose
                     // .symbol-dict fails to open (EIO, fd exhaustion, a Windows share
@@ -640,7 +639,24 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @Override
-    public synchronized void close() {
+    public void close() {
+        close(true);
+    }
+
+    /**
+     * As {@link #close()}, but {@code reclaimLogicalSlotLock == false} skips the
+     * parent-anchored logical slot-lock unlink at fully-drained retirement.
+     * <p>
+     * A caller that HOLDS that lock must pass {@code false}. {@code Sender.build()}
+     * keeps it across engine construction and connect, and closes the engine from
+     * inside that scope when connect fails -- and a fresh slot is "fully drained" by
+     * definition ({@code publishedFsn() < 0}), so the default path would unlink the
+     * lock file while build() still holds the flock on it. On POSIX that frees the
+     * pathname without releasing the lock, so the next {@code acquireLogical} creates
+     * a SECOND inode and locks it successfully: two parties owning a lock whose only
+     * job is serialising the quarantine close-&gt;rename-&gt;recreate window.
+     */
+    public synchronized void close(boolean reclaimLogicalSlotLock) {
         if (closed) return;
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
@@ -728,16 +744,20 @@ public final class CursorSendEngine implements QuietCloseable {
                     PersistedSymbolDict.removeOrphan(sfDir);
                 } catch (Throwable ignored) {
                 }
-                try {
-                    // The logical slot lock lives OUTSIDE the slot dir (in the
-                    // shared .slot-locks dir) so it survives a slot rename; the
-                    // fully-drained retirement that removes this slot's other
-                    // side-files must remove it too, or .slot-locks accumulates a
-                    // dead lock+pid pair per distinct slot name for the lifetime of
-                    // sf_dir. This engine still holds the directory-local lock, so
-                    // the best-effort unlink is safe (see SlotLock.removeOrphanLogical).
-                    SlotLock.removeOrphanLogical(sfDir);
-                } catch (Throwable ignored) {
+                if (reclaimLogicalSlotLock) {
+                    try {
+                        // The logical slot lock lives OUTSIDE the slot dir (in the
+                        // shared .slot-locks dir) so it survives a slot rename; the
+                        // fully-drained retirement that removes this slot's other
+                        // side-files must remove it too, or .slot-locks accumulates a
+                        // dead lock+pid pair per distinct slot name for the lifetime of
+                        // sf_dir. Holding the directory-local lock is NOT sufficient to
+                        // make this safe -- it says nothing about the LOGICAL lock, which
+                        // a caller higher in the same stack may hold. Only a caller that
+                        // knows it does not hold it may reclaim, hence the flag.
+                        SlotLock.removeOrphanLogical(sfDir);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
         } finally {
@@ -812,7 +832,13 @@ public final class CursorSendEngine implements QuietCloseable {
 
     private RecoveredFrameAnalysis checkedRecoveryAnalysis(int baseline) {
         if (recoveredFrameAnalysis == null || recoveredFrameAnalysis.baseline() != baseline) {
-            throw new IllegalStateException("recovery symbol baseline mismatch [expected="
+            // UnreplayableSlotException, NOT IllegalStateException: Sender.build() routes
+            // on the type, and only this type reaches its quarantine handler. A raw
+            // IllegalStateException escapes build() instead, and because senderId is
+            // stable and a not-fully-drained slot is retained on close, every restart
+            // re-recovers the same slot and rethrows -- the application can never
+            // construct a Sender, so it cannot even BUFFER new rows.
+            throw new UnreplayableSlotException("recovery symbol baseline mismatch [expected="
                     + (recoveredFrameAnalysis == null ? "none" : recoveredFrameAnalysis.baseline())
                     + ", actual=" + baseline + ']');
         }

@@ -1371,13 +1371,15 @@ public class DeltaDictRecoveryTest {
         // CursorSendEngine discards the dictionary here (the frames carry their own, so
         // it is not needed) -- but the recovery analysis was folded with the dictionary's
         // size as its baseline, while seedGlobalDictionaryFromPersisted computes baseline
-        // 0 once pd is gone. checkedRecoveryAnalysis then threw
-        // IllegalStateException("recovery symbol baseline mismatch"), which is NOT an
-        // UnreplayableSlotException, so build()'s quarantine handler could not set the
-        // slot aside. With a stable senderId every restart re-recovered the same slot and
-        // threw again: the application could never construct a Sender, so it could not
-        // even buffer new rows -- on a slot that is perfectly recoverable. The engine now
-        // re-folds at baseline 0 when it discards.
+        // 0 once pd is gone. checkedRecoveryAnalysis then threw "recovery symbol baseline
+        // mismatch" -- and originally as a raw IllegalStateException, which build()'s
+        // quarantine handler could not catch, so with a stable senderId every restart
+        // re-recovered the same slot and threw again: the application could never
+        // construct a Sender, and so could not even buffer new rows. That throw is now an
+        // UnreplayableSlotException, so the worst case is a quarantine rather than a
+        // permanent brick -- but a quarantine is still wrong here, because this slot is
+        // perfectly recoverable. The engine re-folds at baseline 0 when it discards, so
+        // neither outcome occurs.
         assertMemoryLeak(() -> {
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
@@ -1681,6 +1683,82 @@ public class DeltaDictRecoveryTest {
                 java.nio.file.Files.exists(aside.resolve(".failed")));
         Assert.assertTrue("the sender must continue on a live slot",
                 java.nio.file.Files.isDirectory(Paths.get(sfDir, "default")));
+    }
+
+    /**
+     * A recovery that rebuilds ids from the surviving frames must write them back to
+     * {@code .symbol-dict} IMMEDIATELY, not wait for a later batch to happen to reach
+     * that high.
+     * <p>
+     * seedGlobalDictionaryFromPersisted resumes sentMaxSymbolId at prefix + frame-suffix,
+     * so every frame published afterwards carries a deltaStart the side-file cannot
+     * describe. The steady-state write-ahead only persists
+     * {@code [pd.size() .. currentBatchMaxSymbolId]} and returns early when the batch's
+     * highest id is below pd.size() -- so it heals only if, and only as far as, later
+     * traffic references the recovered high ids. Meanwhile the frames carrying those ids
+     * are the oldest unacked and therefore the FIRST to be acked and trimmed. Once they
+     * are gone, an ordinary process crash (which store-and-forward promises to survive)
+     * leaves a slot whose frames reference ids nothing holds -> quarantine, "resend the
+     * affected data".
+     * <p>
+     * So: recover, touch nothing, and require the file to already be whole. Remove
+     * healPersistedDictionary and this drops back to the two torn entries.
+     */
+    @Test(timeout = 60_000L)
+    public void testRecoveryHealsThePersistedDictionaryBeforeAnyNewFrame() throws Exception {
+        assertMemoryLeak(() -> {
+            // Phase 1: three delta frames (a@0, b@1, c@2), nothing acked.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Host-crash tear: drop c@2 from the side-file, keep the frame that defines it.
+            String slotDir = Paths.get(sfDir, "default").toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                torn.appendSymbol("a");
+                torn.appendSymbol("b");
+                Assert.assertEquals(2, torn.size());
+            }
+
+            // Phase 2: recover against a silent server and ingest NOTHING. Nothing is
+            // acked, so the slot is not fully drained and the side-file survives close.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender.fromConfig(cfg).close();
+            }
+
+            // The write-ahead invariant must hold again on disk, with no new traffic.
+            try (PersistedSymbolDict healed = PersistedSymbolDict.open(slotDir)) {
+                Assert.assertNotNull("the healed dictionary must still be readable", healed);
+                ObjList<String> symbols = healed.readLoadedSymbols();
+                Assert.assertEquals("recovery must re-persist the frame-rebuilt suffix "
+                                + "immediately [" + symbols + ']',
+                        3, symbols.size());
+                Assert.assertEquals("a", symbols.getQuick(0));
+                Assert.assertEquals("b", symbols.getQuick(1));
+                Assert.assertEquals("c", symbols.getQuick(2));
+            }
+        });
     }
 
     private static boolean hasSegmentFile(java.nio.file.Path dir) {
