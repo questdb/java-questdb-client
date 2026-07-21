@@ -136,7 +136,12 @@ public final class AckWatermark implements QuietCloseable {
         return open(FilesFacade.INSTANCE, slotDir);
     }
 
-    static AckWatermark open(FilesFacade filesFacade, String slotDir) {
+    /**
+     * Facade-aware variant of {@link #open(String)}. Every filesystem call,
+     * including the lifetime mapping, goes through {@code filesFacade} so
+     * tests can observe or fault-inject the watermark mmap.
+     */
+    public static AckWatermark open(FilesFacade filesFacade, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
         long existing = filesFacade.exists(filePath) ? filesFacade.length(filePath) : -1L;
         int fd;
@@ -156,7 +161,7 @@ public final class AckWatermark implements QuietCloseable {
             LOG.warn("ack watermark {} could not be opened (rc={})", filePath, fd);
             return null;
         }
-        long addr = Files.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+        long addr = filesFacade.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
         if (addr == Files.FAILED_MMAP_ADDRESS) {
             LOG.warn("ack watermark {} could not be mmapped", filePath);
             filesFacade.close(fd);
@@ -253,7 +258,7 @@ public final class AckWatermark implements QuietCloseable {
         }
         isStorageReleased = true;
         if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
-            Files.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
+            filesFacade.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
         }
         if (fd >= 0) {
             filesFacade.close(fd);

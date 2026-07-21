@@ -37,7 +37,6 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -110,10 +109,8 @@ public class SegmentManagerManifestFsyncTest {
         }
     }
 
-    private static AckWatermark openWatermark(FilesFacade ff, String root) throws Exception {
-        Method method = AckWatermark.class.getDeclaredMethod("open", FilesFacade.class, String.class);
-        method.setAccessible(true);
-        return (AckWatermark) method.invoke(null, ff, root);
+    private static AckWatermark openWatermark(FilesFacade ff, String root) {
+        return AckWatermark.open(ff, root);
     }
 
     private static void writeSegmentWithFrames(String path, long baseSeq, int frames) {
