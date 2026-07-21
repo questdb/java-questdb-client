@@ -67,7 +67,8 @@ public final class MmapSegment implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
     // Recovery reads the file through a pread window of this size (or the
     // whole file when smaller). Sized so a typical segment scans in a handful
-    // of preads; frames larger than the window CRC-fold across refills.
+    // of preads; the scan checksums a frame larger than the window in
+    // window-sized chunks.
     private static final long RECOVERY_BUF_BYTES = 1L << 20;
 
     private final String path;
@@ -591,10 +592,11 @@ public final class MmapSegment implements QuietCloseable {
                 if (payloadLen < 0 || pos + FRAME_HEADER_SIZE + payloadLen > fileSize) {
                     break;
                 }
-                // CRC over the (payloadLen, payload) pair, folded window by
-                // window for frames larger than the buffer. Chaining
-                // Crc32c.update calls is bit-identical to one call over the
-                // contiguous range (tryAppend writes the CRC the same way).
+                // CRC over the (payloadLen, payload) pair, computed
+                // incrementally: each Crc32c.update call feeds the next
+                // window-sized chunk into the running value, which is
+                // bit-identical to one call over the contiguous range
+                // (tryAppend writes the CRC the same way).
                 long crcPos = pos + 4;
                 long remaining = 4L + payloadLen;
                 int crc = Crc32c.INIT;

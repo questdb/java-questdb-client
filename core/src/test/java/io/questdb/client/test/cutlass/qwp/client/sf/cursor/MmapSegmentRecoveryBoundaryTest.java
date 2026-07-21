@@ -60,6 +60,10 @@ import static org.junit.Assert.fail;
  * point under a JIT-compiled caller — the JDK 8 CI flake this suite guards
  * against reintroducing.)
  * <p>
+ * The suite also guards the fully-readable side of the same machinery: a file
+ * larger than the scan's pread window, whose recovery slides the window
+ * forward and checks one frame's CRC in chunks spanning several window loads.
+ * <p>
  * These tests drive the production entry point ({@code openExisting}), not
  * private scan methods via reflection, so they exercise the real recovery
  * path end to end.
@@ -114,10 +118,11 @@ public class MmapSegmentRecoveryBoundaryTest {
      * The harder case: a frame whose 8-byte header sits on a backed page but
      * whose payload reaches into the unbacked hole (a torn write leaves a real
      * positive {@code payloadLen} with the payload spanning the boundary). The
-     * CRC therefore folds across the backed-to-hole edge: the backed bytes are
-     * real, the hole preads as zeros, the CRC mismatches, and recovery rejects
-     * that frame while keeping the one below it. The surviving non-zero header
-     * bytes at the bail-out position are flagged as a torn tail.
+     * CRC check therefore reads bytes on both sides of the backed-to-hole
+     * edge: the backed bytes are real, the hole preads as zeros, the CRC
+     * mismatches, and recovery rejects that frame while keeping the one
+     * below it. The surviving non-zero header bytes at the bail-out position
+     * are flagged as a torn tail.
      */
     @Test
     public void testRecoverySurvivesPayloadReachingUnbackedPage() throws Exception {
@@ -261,12 +266,55 @@ public class MmapSegmentRecoveryBoundaryTest {
     }
 
     /**
+     * The multi-window scan: a segment larger than the recovery read window
+     * (1 MiB), holding a frame whose CRC span -- the (payloadLen, payload)
+     * pair -- is itself larger than the window, followed by a small frame.
+     * Verifying the large frame forces the scan to compute its CRC
+     * incrementally -- reloading the window several times and feeding each
+     * chunk into the running value, which chained {@code Crc32c.update} calls
+     * make bit-identical to {@code tryAppend}'s one-pass CRC -- and the small
+     * frame is then verified out of a repositioned window. Every byte is
+     * readable, so recovery must be total: both frames kept, the cursor at
+     * the last appended byte, no torn tail.
+     */
+    @Test
+    public void testScanRecoversFrameLargerThanReadWindow() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-multi-window.sfa";
+            // 3 MiB of payload in a 4 MiB segment: checking the large frame's
+            // CRC reloads the window four times, and the scan as a whole
+            // takes multiple preads. (Sized against
+            // MmapSegment.RECOVERY_BUF_BYTES = 1 MiB; keep the payload larger
+            // than that constant or this test degrades to a single-window
+            // scan.)
+            final int largeLen = 3 * (1 << 20);
+            final long segmentBytes = 4L * (1 << 20);
+            long used = writeSegment(path, 17L, new int[]{largeLen, 64}, segmentBytes);
+
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                assertEquals("both frames must be recovered", 2L, seg.frameCount());
+                assertEquals("scan must recover up to the last appended byte", used, seg.publishedOffset());
+                assertEquals("a fully recovered segment has no torn tail", 0L, seg.tornTailBytes());
+            }
+        });
+    }
+
+    /**
      * Creates a segment at {@code path} and appends one frame per entry in
      * {@code payloadLens} (each filled with non-zero bytes so recovery can tell
      * written data from an unwritten/zeroed hole). Returns the used byte count
      * (the published offset after the last append).
      */
     private static long writeSegment(String path, long baseSeq, int[] payloadLens) {
+        return writeSegment(path, baseSeq, payloadLens, SEGMENT_BYTES);
+    }
+
+    /**
+     * Variant of {@link #writeSegment(String, long, int[])} with an explicit
+     * segment size, for tests whose file must exceed the recovery scan's
+     * 1 MiB pread window.
+     */
+    private static long writeSegment(String path, long baseSeq, int[] payloadLens, long segmentBytes) {
         int maxLen = 0;
         for (int len : payloadLens) {
             maxLen = Math.max(maxLen, len);
@@ -276,7 +324,7 @@ public class MmapSegmentRecoveryBoundaryTest {
             for (int i = 0; i < maxLen; i++) {
                 Unsafe.getUnsafe().putByte(buf + i, (byte) (i | 1)); // all non-zero
             }
-            try (MmapSegment seg = MmapSegment.create(path, baseSeq, SEGMENT_BYTES)) {
+            try (MmapSegment seg = MmapSegment.create(path, baseSeq, segmentBytes)) {
                 for (int len : payloadLens) {
                     assertTrue("append must fit", seg.tryAppend(buf, len) >= 0);
                 }
