@@ -296,6 +296,7 @@ public final class MmapSegment implements QuietCloseable {
         if (fd < 0) {
             throw new MmapSegmentException("openRW failed for " + path);
         }
+        long addr = Files.FAILED_MMAP_ADDRESS;
         try {
             RecoveryScan scan = scanFile(ff, fd, path, fileSize);
             if (scan.tornTailBytes > 0) {
@@ -306,13 +307,16 @@ public final class MmapSegment implements QuietCloseable {
                                 + "Investigate disk health or unexpected writer crash.",
                         path, scan.tornTailBytes, scan.lastGood, fileSize, scan.frameCount);
             }
-            long addr = Files.mmap(fd, fileSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+            addr = Files.mmap(fd, fileSize, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
             if (addr == Files.FAILED_MMAP_ADDRESS) {
                 throw new MmapSegmentException("mmap failed for " + path);
             }
             return new MmapSegment(path, fd, addr, fileSize, scan.baseSeq,
                     scan.lastGood, scan.frameCount, false, scan.tornTailBytes);
         } catch (Throwable t) {
+            if (addr != Files.FAILED_MMAP_ADDRESS) {
+                Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
+            }
             ff.close(fd);
             throw t;
         }
