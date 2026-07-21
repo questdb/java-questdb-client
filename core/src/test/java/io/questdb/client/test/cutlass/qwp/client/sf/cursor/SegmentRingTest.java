@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class SegmentRingTest {
@@ -865,6 +866,129 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Pins findSegmentContaining across the full boundary matrix so the
+     * O(log N) lookup rewrite is provably semantics-preserving: empty ring,
+     * miss below the head segment, exact segment base, mid-segment, last FSN
+     * in a segment, tail sealed segment, active-segment hits, miss above the
+     * published range, and misses below a trimmed live head (sealedHead > 0).
+     * Three frames per segment give every sealed segment a distinct base,
+     * mid and last FSN.
+     */
+    @Test
+    public void testFindSegmentContainingBoundaryMatrix() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 3 * (MmapSegment.FRAME_HEADER_SIZE + 8);
+            long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 8, 0);
+                MmapSegment initial = MmapSegment.createInMemory(0, segSize);
+                try (SegmentRing ring = new SegmentRing(initial, segSize)) {
+                    // Empty ring: no frame published anywhere, every lookup misses.
+                    assertNull(ring.findSegmentContaining(-1));
+                    assertNull(ring.findSegmentContaining(0));
+
+                    for (int i = 0; i < 12; i++) {
+                        if (ring.needsHotSpare()) {
+                            ring.installHotSpare(
+                                    MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                        }
+                        assertEquals(i, ring.appendOrFsn(buf, 8));
+                    }
+                    // Sealed: [0-2], [3-5], [6-8]; active: [9-11].
+                    for (long fsn = 0; fsn < 12; fsn++) {
+                        MmapSegment seg = ring.findSegmentContaining(fsn);
+                        assertNotNull("fsn " + fsn, seg);
+                        assertEquals("fsn " + fsn, fsn / 3 * 3, seg.baseSeq());
+                    }
+                    assertSame(ring.getActive(), ring.findSegmentContaining(9));
+                    assertSame(ring.getActive(), ring.findSegmentContaining(11));
+                    assertNull(ring.findSegmentContaining(-1));
+                    assertNull(ring.findSegmentContaining(12));
+                    assertNull(ring.findSegmentContaining(Long.MIN_VALUE));
+                    assertNull(ring.findSegmentContaining(Long.MAX_VALUE));
+
+                    // Trim the two fully-ACK'd oldest sealed segments: their
+                    // FSNs must now miss while the surviving window (with a
+                    // non-zero sealedHead) still resolves every live FSN.
+                    ring.acknowledge(5);
+                    MmapSegment trimmable;
+                    int removed = 0;
+                    while ((trimmable = ring.firstTrimmable()) != null) {
+                        assertTrue(ring.removeTrimmable(trimmable));
+                        trimmable.close();
+                        removed++;
+                    }
+                    assertEquals(2, removed);
+                    for (long fsn = 0; fsn < 6; fsn++) {
+                        assertNull("trimmed fsn " + fsn, ring.findSegmentContaining(fsn));
+                    }
+                    for (long fsn = 6; fsn < 12; fsn++) {
+                        MmapSegment seg = ring.findSegmentContaining(fsn);
+                        assertNotNull("fsn " + fsn, seg);
+                        assertEquals("fsn " + fsn, fsn / 3 * 3, seg.baseSeq());
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Same lookup pinned over one-frame segments, where every FSN is both a
+     * segment base and a segment's last FSN: 33 sealed segments (odd live
+     * count), then a 17-segment trim leaving an even 16-segment window with
+     * sealedHead well inside the backing list. Complements the three-frame
+     * matrix by exercising both live-window parities and a larger list.
+     */
+    @Test
+    public void testFindSegmentContainingSingleFrameSegments() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
+            long buf = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment initial = MmapSegment.createInMemory(0, segSize);
+                try (SegmentRing ring = new SegmentRing(initial, segSize)) {
+                    for (int i = 0; i < 34; i++) {
+                        assertEquals(i, ring.appendOrFsn(buf, 1));
+                        ring.installHotSpare(
+                                MmapSegment.createInMemory(ring.nextSeqHint(), segSize));
+                    }
+                    // Sealed: FSNs 0..32, one frame each; active: [33].
+                    for (long fsn = 0; fsn <= 33; fsn++) {
+                        MmapSegment seg = ring.findSegmentContaining(fsn);
+                        assertNotNull("fsn " + fsn, seg);
+                        assertEquals("fsn " + fsn, fsn, seg.baseSeq());
+                    }
+                    assertNull(ring.findSegmentContaining(-1));
+                    assertNull(ring.findSegmentContaining(34));
+
+                    ring.acknowledge(16);
+                    MmapSegment trimmable;
+                    int removed = 0;
+                    while ((trimmable = ring.firstTrimmable()) != null) {
+                        assertTrue(ring.removeTrimmable(trimmable));
+                        trimmable.close();
+                        removed++;
+                    }
+                    assertEquals(17, removed);
+                    for (long fsn = 0; fsn < 17; fsn++) {
+                        assertNull("trimmed fsn " + fsn, ring.findSegmentContaining(fsn));
+                    }
+                    for (long fsn = 17; fsn <= 33; fsn++) {
+                        MmapSegment seg = ring.findSegmentContaining(fsn);
+                        assertNotNull("fsn " + fsn, seg);
+                        assertEquals("fsn " + fsn, fsn, seg.baseSeq());
+                    }
+                }
+            } finally {
+                Unsafe.free(buf, 1, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }

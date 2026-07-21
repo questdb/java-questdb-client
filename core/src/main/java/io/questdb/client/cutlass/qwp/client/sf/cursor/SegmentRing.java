@@ -1054,9 +1054,10 @@ public final class SegmentRing implements QuietCloseable {
      * to position the I/O thread's cursor at the first unacked frame for
      * replay.
      * <p>
-     * Walks sealed first (oldest → newest) then the active. The sealed list
-     * is small enough -- and reconnects are rare enough -- that the linear
-     * scan cost doesn't matter.
+     * Binary-searches the sealed list, then falls back to the active
+     * segment: O(log live-sealed) per call, so repositioning stays cheap
+     * even when a producer-outpaces-drain backlog has grown the sealed
+     * list without bound.
      */
     public synchronized MmapSegment findSegmentContaining(long fsn) {
         return findSegmentContaining0(fsn);
@@ -1469,8 +1470,26 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     private MmapSegment findSegmentContaining0(long fsn) {
-        for (int i = sealedHead, n = sealedSegments.size(); i < n; i++) {
-            MmapSegment segment = sealedSegments.get(i);
+        // The sealed list is strictly ascending and contiguous in baseSeq:
+        // rotation seals the predecessor exactly where the promoted spare's
+        // rebased baseSeq starts, and recovery sorts the chain then rejects
+        // any gap via validateContiguous. The only sealed segment that can
+        // cover fsn is therefore the rightmost one whose baseSeq is at or
+        // below fsn -- binary-search for it (unsigned, matching
+        // sortByBaseSeq's key order) instead of walking a list that grows
+        // without bound while the producer outpaces the drain.
+        int lo = sealedHead;
+        int hi = sealedSegments.size() - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (Long.compareUnsigned(sealedSegments.get(mid).baseSeq(), fsn) <= 0) {
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if (hi >= sealedHead) {
+            MmapSegment segment = sealedSegments.get(hi);
             long base = segment.baseSeq();
             if (fsn >= base && fsn < base + segment.frameCount()) {
                 return segment;
