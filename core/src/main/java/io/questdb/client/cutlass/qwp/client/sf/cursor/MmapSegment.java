@@ -554,16 +554,17 @@ public final class MmapSegment implements QuietCloseable {
             return -1L;
         }
         // CRC32C over the (payloadLen, payload) pair. Recovery scans validate
-        // each frame by recomputing this CRC over the on-disk bytes.
+        // each frame by recomputing this CRC over the on-disk bytes. The
+        // payloadLen field (4 bytes at lenAddr) and the payload (at lenAddr+4)
+        // are physically contiguous, so a single CRC pass covers both -- one
+        // native call per frame, byte-identical to the chained form the
+        // recovery scanner recomputes (see scanForRecovery).
         long lenAddr = mmapAddress + offset + 4;
         Unsafe.getUnsafe().putInt(lenAddr, payloadLen);
         if (payloadLen > 0) {
             Unsafe.getUnsafe().copyMemory(payloadAddr, mmapAddress + offset + FRAME_HEADER_SIZE, payloadLen);
         }
-        int crc = Crc32c.update(Crc32c.INIT, lenAddr, 4);
-        if (payloadLen > 0) {
-            crc = Crc32c.update(crc, mmapAddress + offset + FRAME_HEADER_SIZE, payloadLen);
-        }
+        int crc = Crc32c.update(Crc32c.INIT, lenAddr, 4L + payloadLen);
         Unsafe.getUnsafe().putInt(mmapAddress + offset, crc);
         appendCursor = offset + total;
         // Plain read + write of the volatile field. `frameCount++` would
