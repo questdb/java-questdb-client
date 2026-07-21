@@ -332,6 +332,66 @@ public class SegmentRingTest {
     }
 
     @Test
+    public void testResealedTornRecoveredSegmentDoesNotBrickNextRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // End-to-end two-crash regression:
+            //   crash #1 -> torn active with residue up to the file end;
+            //   recovery #1 -> resume in it, fill it, rotate (reseals the
+            //   recovered file with a tail gap the resumed appends never
+            //   overwrote);
+            //   crash #2 -> recovery #2 used to throw "corrupt torn tail in
+            //   sealed SF segment" on EVERY startup, because nothing ever
+            //   sanitized crash #1's residue and the sealed-suffix check
+            //   correctly refuses non-zero sealed tails. openExisting now
+            //   zeroes the residue at recovery #1, so recovery #2 must
+            //   succeed and see the full chain.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
+                    + 12; // reseal gap: a 5th 24-byte frame can never fit
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1 "crashes": two good frames, then garbage from the
+                // torn write all the way to the file end.
+                try (MmapSegment s0 = MmapSegment.create(tmpDir + "/r0.sfa", 0, segSize)) {
+                    s0.tryAppend(buf, 16);
+                    s0.tryAppend(buf, 16);
+                    long addr = s0.address();
+                    for (long off = s0.publishedOffset(); off + 4 <= segSize; off += 4) {
+                        Unsafe.getUnsafe().putInt(addr + off, 0xCAFEBABE);
+                    }
+                    s0.msync();
+                }
+                // Recovery #1 + session 2: resume in the torn segment, fill
+                // it, rotate into a spare. The recovered file is resealed
+                // with its 12-byte gap intact.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull(ring);
+                    assertEquals(2, ring.nextSeqHint());
+                    assertEquals(2, ring.appendOrFsn(buf, 16));
+                    assertEquals(3, ring.appendOrFsn(buf, 16));
+                    ring.installHotSpare(MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize));
+                    assertEquals("append must rotate into the spare",
+                            4, ring.appendOrFsn(buf, 16));
+                    assertEquals(1, ring.getSealedSegments().size());
+                }
+                // Recovery #2 ("crash" #2): must not brick on the resealed
+                // recovered segment.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull("second recovery must survive the resealed segment", ring);
+                    assertEquals(1, ring.getSealedSegments().size());
+                    assertEquals(0, ring.getSealedSegments().get(0).baseSeq());
+                    assertEquals(4, ring.getSealedSegments().get(0).frameCount());
+                    assertEquals(4, ring.getActive().baseSeq());
+                    assertEquals(1, ring.getActive().frameCount());
+                    assertEquals(5, ring.nextSeqHint());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testOpenExistingDetectsFsnGap() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE

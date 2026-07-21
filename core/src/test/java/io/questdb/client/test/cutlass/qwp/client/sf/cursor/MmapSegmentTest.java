@@ -492,6 +492,212 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testRecoveryZeroesTornTailResidueOnDisk() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Recovery must not only REPORT the torn tail, it must sanitize
+            // it: the first open still reports the observed residue (operator
+            // signal), but a second open of the untouched file must find a
+            // clean zero suffix. Pre-fix the residue survived forever.
+            String path = tmpDir + "/seg-zeroed.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long lastGood;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    for (int i = 0; i < 3; i++) {
+                        fillPattern(buf, 16, i);
+                        seg.tryAppend(buf, 16);
+                    }
+                    lastGood = seg.publishedOffset();
+                    long addr = seg.address();
+                    for (long off = lastGood; off + 4 <= 4096; off += 4) {
+                        Unsafe.getUnsafe().putInt(addr + off, 0xCAFEBABE);
+                    }
+                    seg.msync();
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("first recovery must report the observed residue",
+                            4096L - lastGood, seg.tornTailBytes());
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("first recovery must have zeroed the residue on disk",
+                            0L, seg.tornTailBytes());
+                    assertEquals(lastGood, seg.publishedOffset());
+                    assertEquals(3L, seg.frameCount());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testResealGapResidueCannotSurviveRecoveryAppends() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Two-crash reseal regression at segment level. Crash #1 leaves
+            // residue up to the file end; recovery resumes at lastGood; the
+            // resumed writer fills the segment but its last frame stops short
+            // of the file end (the remaining gap cannot fit another frame).
+            // Pre-fix the stale residue survived in that gap, so the segment
+            // -- sealed as-is by rotation -- failed the sealed-suffix-must-
+            // be-zero check on the NEXT recovery, permanently failing startup.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
+                    + 12; // reseal gap: a 5th 24-byte frame can never fit
+            String path = tmpDir + "/seg-reseal.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                // Session 1: two frames, then a crash mid-write near the end
+                // -- garbage from the torn frame all the way to the file end.
+                try (MmapSegment seg = MmapSegment.create(path, 0L, segSize)) {
+                    fillPattern(buf, 16, 0);
+                    seg.tryAppend(buf, 16);
+                    fillPattern(buf, 16, 1);
+                    seg.tryAppend(buf, 16);
+                    long addr = seg.address();
+                    for (long off = seg.publishedOffset(); off + 4 <= segSize; off += 4) {
+                        Unsafe.getUnsafe().putInt(addr + off, 0xCAFEBABE);
+                    }
+                    seg.msync();
+                }
+                // Recovery #1 + session 2: fill the segment to its rotation
+                // point. The 4th frame ends 12 bytes short of the file end --
+                // a region session 2 never overwrites.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(2L, seg.frameCount());
+                    fillPattern(buf, 16, 2);
+                    assertTrue(seg.tryAppend(buf, 16) >= 0);
+                    fillPattern(buf, 16, 3);
+                    assertTrue(seg.tryAppend(buf, 16) >= 0);
+                    assertEquals("next append must not fit (rotation would seal here)",
+                            -1L, seg.tryAppend(buf, 16));
+                    seg.msync();
+                }
+                // Recovery #2: the state a sealed segment presents at the next
+                // startup. Its suffix must be clean or ring recovery bricks.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("all four frames must recover", 4L, seg.frameCount());
+                    assertEquals("no residue may survive in the reseal gap: a sealed "
+                                    + "segment with a non-zero suffix permanently fails "
+                                    + "ring recovery",
+                            0L, seg.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testDiscardedStaleFrameNotResurrectedByLaterRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The frame envelope [crc(len|payload)][len][payload] binds
+            // neither position nor FSN, so a stale frame with a valid CRC
+            // sitting past the tear -- byte-aligned with the resumed writer's
+            // frames, natural with fixed-size records -- would be silently
+            // re-adopted by the next recovery scan at a recycled FSN.
+            // Recovery #1 discarded it; recovery #2 must not bring it back.
+            String path = tmpDir + "/seg-stale.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long frameB;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    fillPattern(buf, 16, 0);
+                    seg.tryAppend(buf, 16);            // frame A, FSN 0
+                    fillPattern(buf, 16, 1);
+                    frameB = seg.tryAppend(buf, 16);   // frame B, FSN 1
+                    fillPattern(buf, 16, 2);
+                    seg.tryAppend(buf, 16);            // frame C, FSN 2
+                    // The crash tears frame B only: flip its CRC. C keeps a
+                    // valid CRC at a frame-aligned offset past the tear.
+                    long addr = seg.address();
+                    int crc = Unsafe.getUnsafe().getInt(addr + frameB);
+                    Unsafe.getUnsafe().putInt(addr + frameB, crc ^ 0x5A5A5A5A);
+                    seg.msync();
+                }
+                // Recovery #1: B fails CRC, so the scan stops at B; B and C
+                // are discarded (and, with sanitization, zeroed).
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("scan must stop at the torn frame", 1L, seg.frameCount());
+                    // The resumed writer re-issues FSN 1 with a fresh payload
+                    // of the old B's exact size -- the byte-aligned case.
+                    fillPattern(buf, 16, 7);
+                    assertEquals(frameB, seg.tryAppend(buf, 16));
+                    seg.msync();
+                }
+                // Recovery #2: pre-fix the scan walked A, B' and then adopted
+                // the STALE C (valid CRC) as a live frame -- data recovery #1
+                // had already discarded, resurrected behind the engine's back.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals("stale frame C must stay discarded, not be "
+                            + "resurrected at a recycled FSN", 2L, seg.frameCount());
+                    assertEquals(0L, seg.tornTailBytes());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testTornTailZeroingSyncFailureAbortsRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Sanitization is load-bearing: if the zeroes cannot be made
+            // durable, recovery must fail closed rather than hand back a
+            // segment whose reseal could permanently fail the next startup.
+            // A failed attempt may still leave zeroes in the page cache;
+            // that is safe (a retry either sees a clean tail or re-zeroes),
+            // so the follow-up open with a healthy facade must succeed.
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String msyncPath = tmpDir + "/seg-zero-msync-fail.sfa";
+                String fsyncPath = tmpDir + "/seg-zero-fsync-fail.sfa";
+                for (String path : new String[]{msyncPath, fsyncPath}) {
+                    try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                        fillPattern(buf, 16, 0);
+                        seg.tryAppend(buf, 16);
+                        long addr = seg.address();
+                        Unsafe.getUnsafe().putInt(addr + seg.publishedOffset(), 0xCAFEBABE);
+                        Unsafe.getUnsafe().putInt(addr + seg.publishedOffset() + 4, 16);
+                        seg.msync();
+                    }
+                }
+
+                FaultyFilesFacade msyncFailure = new FaultyFilesFacade();
+                msyncFailure.failOnMsync = true;
+                try {
+                    MmapSegment.openExisting(msyncFailure, msyncPath).close();
+                    fail("expected recovery to abort when the zeroed tail cannot be msync'd");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("zeroed torn tail"));
+                }
+                assertEquals(1, msyncFailure.msyncCalls);
+                assertEquals(0, msyncFailure.fsyncCalls);
+                try (MmapSegment seg = MmapSegment.openExisting(msyncPath)) {
+                    assertEquals(1L, seg.frameCount());
+                }
+
+                FaultyFilesFacade fsyncFailure = new FaultyFilesFacade();
+                fsyncFailure.failOnFsync = true;
+                try {
+                    MmapSegment.openExisting(fsyncFailure, fsyncPath).close();
+                    fail("expected recovery to abort when the zeroed tail cannot be fsync'd");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("zeroed torn tail"));
+                }
+                assertEquals(1, fsyncFailure.msyncCalls);
+                assertEquals(1, fsyncFailure.fsyncCalls);
+                try (MmapSegment seg = MmapSegment.openExisting(fsyncPath)) {
+                    assertEquals(1L, seg.frameCount());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testRecoverySignalsTornTailWithByteCount() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Recovery must distinguish "writer attempted a frame past lastGood

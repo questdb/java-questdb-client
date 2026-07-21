@@ -111,7 +111,10 @@ public final class MmapSegment implements QuietCloseable {
     // attempted-but-invalid frame write (the suffix contains non-zero bytes).
     // Zero for fresh segments and for cleanly partially-filled
     // segments (uninitialised tail). Set only by openExisting; visible to
-    // recovery callers for diagnostics. Final after construction.
+    // recovery callers for diagnostics. Records the observation BEFORE
+    // sanitization -- openExisting zeroes the on-disk residue, so the file
+    // behind a freshly returned segment never carries it. Final after
+    // construction.
     private final long tornTailBytes;
 
     private MmapSegment(FilesFacade filesFacade, String path, int fd, long mmapAddress, long sizeBytes,
@@ -273,11 +276,18 @@ public final class MmapSegment implements QuietCloseable {
      * <p>
      * If recovery observes a torn tail (the suffix after the last valid frame
      * contains non-zero bytes, indicating an attempted-but-failed frame write
-     * rather than clean unwritten space), a {@code WARN} is emitted with the byte
-     * count and the bytes are exposed via {@link #tornTailBytes()} so
-     * operators can detect silent truncation from corruption or partial
-     * writes. Clean partial fills (writer never attempted to write past the
-     * last valid frame) do not log and report {@code 0}.
+     * rather than clean unwritten space), a {@code WARN} is emitted with the
+     * byte count, the observed size is exposed via {@link #tornTailBytes()},
+     * and the residue is zeroed on disk (with an msync+fsync barrier) before
+     * the segment is returned. Sanitizing restores the invariant every fresh
+     * segment already has -- all bytes past the append cursor are zero.
+     * Without it, residue that resumed appends do not fully overwrite would
+     * survive into a sealed segment, whose recovery treats a non-zero suffix
+     * as fatal corruption (a permanent startup failure), and a byte-aligned
+     * stale frame with a valid CRC could be silently resurrected at a
+     * recycled FSN by a later scan. Clean partial fills (writer never
+     * attempted to write past the last valid frame) do not log, report
+     * {@code 0}, and skip the barrier.
      */
     public static MmapSegment openExisting(String path) {
         return openExisting(FilesFacade.INSTANCE, path);
@@ -344,10 +354,33 @@ public final class MmapSegment implements QuietCloseable {
                                 + " [before=" + fileSize + ", after=" + mappedSize + ']');
             }
             if (scan.tornTailBytes > 0) {
+                // Zero the residue [lastGood, fileSize) and make the zeroes
+                // durable before anyone can append. Resumed appends restart at
+                // lastGood but stop wherever the last payload fits, so stale
+                // residue past that point would otherwise survive a
+                // seal-via-rotation -- and sealed-segment recovery treats a
+                // non-zero suffix as fatal corruption, permanently failing
+                // every subsequent startup. Zeroing also stops a byte-aligned
+                // stale frame with a valid CRC from being resurrected at a
+                // recycled FSN by a later recovery scan (the frame envelope
+                // binds neither position nor FSN). The fsync is load-bearing:
+                // in MEMORY durability mode rotation does not sync the sealed
+                // predecessor's data pages, so an unflushed zero-write plus a
+                // crash would regenerate the exact poisoned state this
+                // sanitization removes. One-time recovery cost, torn tails
+                // only; a failed barrier aborts recovery (fail closed) --
+                // the zeroes may still reach disk via the page cache, which
+                // is safe: a retry either sees them (clean tail) or re-zeroes.
+                Unsafe.getUnsafe().setMemory(addr + scan.lastGood, fileSize - scan.lastGood, (byte) 0);
+                if (ff.msync(addr, fileSize, false) != 0 || ff.fsync(fd) != 0) {
+                    throw new MmapSegmentException(
+                            "could not sync zeroed torn tail in " + path
+                                    + " [errno=" + Os.errno() + ']');
+                }
                 LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
                                 + "(file size {}, frames recovered {}). "
-                                + "Recovery will overwrite this region on next append; "
-                                + "frames past the tear (if any) are discarded. "
+                                + "The residue has been zeroed; frames past the tear "
+                                + "(if any) are discarded. "
                                 + "Investigate disk health or unexpected writer crash.",
                         path, scan.tornTailBytes, scan.lastGood, fileSize, scan.frameCount);
             }
@@ -635,7 +668,10 @@ public final class MmapSegment implements QuietCloseable {
      * recovery observes non-zero bytes past the bail-out point. {@code 0} for
      * fresh segments, memory-backed segments, and cleanly partially-filled
      * recovered segments. Operators / tests can read this to tell silent
-     * truncation (corruption) from a normal partial fill (no incident). Sparse
+     * truncation (corruption) from a normal partial fill (no incident). This
+     * is the pre-sanitization observation: {@link #openExisting} zeroes the
+     * residue on disk before returning, so re-opening the same file reports
+     * {@code 0} and a reseal of this segment presents a clean suffix. Sparse
      * holes read back as zeroes; an actual positioned-read failure aborts
      * recovery instead of being classified as a clean tail.
      */

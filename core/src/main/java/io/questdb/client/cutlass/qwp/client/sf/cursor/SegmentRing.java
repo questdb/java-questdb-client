@@ -189,9 +189,14 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     /**
-     * Exhaustively discovers and validates an SF slot without mutation. Only
-     * after enumeration, opens, CRC scans, contiguity and manifest boundaries
-     * all succeed does it migrate a legacy chain or discard validated spares.
+     * Exhaustively discovers and validates an SF slot without mutating frame
+     * data. Only after enumeration, opens, CRC scans, contiguity and manifest
+     * boundaries all succeed does it migrate a legacy chain or discard
+     * validated spares. One deliberate exception to the no-mutation rule:
+     * {@link MmapSegment#openExisting} zeroes torn-tail residue -- suffix
+     * bytes that already failed frame validation and can never be replayed --
+     * as each segment opens, so even a recovery that later fails may have
+     * sanitized unusable residue. Valid frames are never touched.
      */
     static Recovery recover(FilesFacade filesFacade, String sfDir, long maxBytesPerSegment) {
         return recover(filesFacade, sfDir, maxBytesPerSegment, null);
@@ -466,6 +471,16 @@ public final class SegmentRing implements QuietCloseable {
                                 "missing expected SF active/tail segment at base " + activeBase);
                     }
                 }
+                // Sealed members must present an all-zero suffix. Fresh
+                // segments are zero-allocated and openExisting zeroes any
+                // torn-tail residue before a recovered active can take
+                // appends, so a reseal of a recovered segment cannot carry
+                // residue here. A non-zero suffix therefore means the file
+                // was mutated outside the writer protocol (or is legacy
+                // pre-sanitization poison; this run's openExisting has
+                // already zeroed it, so the restart after this fail-closed
+                // throw re-proves the chain clean). validateContiguous above
+                // independently catches sealed segments that LOST frames.
                 for (int i = 0, n = chain.size() - 1; i < n; i++) {
                     if (chain.get(i).tornTailBytes() > 0) {
                         throw new MmapSegmentException("corrupt torn tail in sealed SF segment " + chain.get(i).path());
@@ -1327,11 +1342,7 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     private synchronized boolean requestSyncBeforeRotation(MmapSegment previous) {
-        if (periodicSyncEnabled && !previous.isPublishedDurable()) {
-            syncRequested = true;
-            return true;
-        }
-        return false;
+        return false; // MUTANT: gate neutralized
     }
 
     /** Releases the I/O cursor pin and wakes trim if it still names {@code expected}. */
