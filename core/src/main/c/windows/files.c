@@ -232,11 +232,36 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsyncDir0
                         OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS);
     if (fd < 0) {
+        // A directory can be crash-consistent yet not openable for write:
+        // some ACL/filesystem configurations refuse a GENERIC_WRITE open of a
+        // directory handle with ERROR_ACCESS_DENIED. Directory-entry durability
+        // on NTFS is provided by metadata journaling ($LogFile), so degrade to
+        // best-effort success here rather than hard-failing the SF durability
+        // path. open_file() already recorded the error via SaveLastError(); a
+        // genuine failure such as a missing directory (ERROR_PATH_NOT_FOUND)
+        // still propagates as fatal.
+        if (GetLastError() == ERROR_ACCESS_DENIED) {
+            return 0;
+        }
         return -1;
     }
     if (!FlushFileBuffers(FD_TO_HANDLE(fd))) {
-        SaveLastError();
+        DWORD err = GetLastError();
         CloseHandle(FD_TO_HANDLE(fd));
+        // FlushFileBuffers is documented for file/volume handles; NTFS refuses
+        // it on a directory handle (typically ERROR_ACCESS_DENIED, and
+        // ERROR_INVALID_FUNCTION on filesystems that do not implement it).
+        // create/rename/unlink of directory entries are made crash consistent
+        // by NTFS metadata journaling, so treat those "not supported"
+        // signatures as best-effort success. This mirrors libgit2/PostgreSQL/
+        // SQLite, which do not rely on directory fsync on Windows, and keeps
+        // the SF manifest-create, slot-lock, and trim/unlink barriers from
+        // hard-failing. Any other error is a real I/O failure and stays fatal.
+        if (err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION) {
+            return 0;
+        }
+        SetLastError(err);
+        SaveLastError();
         return -1;
     }
     CloseHandle(FD_TO_HANDLE(fd));
