@@ -1342,7 +1342,11 @@ public final class SegmentRing implements QuietCloseable {
     }
 
     private synchronized boolean requestSyncBeforeRotation(MmapSegment previous) {
-        return false; // MUTANT: gate neutralized
+        if (periodicSyncEnabled && !previous.isPublishedDurable()) {
+            syncRequested = true;
+            return true;
+        }
+        return false;
     }
 
     /** Releases the I/O cursor pin and wakes trim if it still names {@code expected}. */
