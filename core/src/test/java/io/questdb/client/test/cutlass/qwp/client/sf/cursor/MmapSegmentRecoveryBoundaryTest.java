@@ -273,9 +273,10 @@ public class MmapSegmentRecoveryBoundaryTest {
      * incrementally -- reloading the window several times and feeding each
      * chunk into the running value, which chained {@code Crc32c.update} calls
      * make bit-identical to {@code tryAppend}'s one-pass CRC -- and the small
-     * frame is then verified out of a repositioned window. Every byte is
-     * readable, so recovery must be total: both frames kept, the cursor at
-     * the last appended byte, no torn tail.
+     * frame is then verified out of the window the large frame's final CRC
+     * chunk loaded, a window positioned near the file's end rather than at
+     * offset 0. Every byte is readable, so recovery must be total: both
+     * frames kept, the cursor at the last appended byte, no torn tail.
      */
     @Test
     public void testScanRecoversFrameLargerThanReadWindow() throws Exception {
@@ -295,6 +296,44 @@ public class MmapSegmentRecoveryBoundaryTest {
                 assertEquals("both frames must be recovered", 2L, seg.frameCount());
                 assertEquals("scan must recover up to the last appended byte", used, seg.publishedOffset());
                 assertEquals("a fully recovered segment has no torn tail", 0L, seg.tornTailBytes());
+            }
+        });
+    }
+
+    /**
+     * A failing read partway through a large frame's CRC span: the frame's
+     * header preads fine and the first window-sized CRC chunk succeeds, but
+     * the next chunk hits the unreadable region. A partially checksummed
+     * frame is unverifiable, so recovery must discard it whole -- stop at
+     * its start, keep the intact frame below it, and report no torn tail
+     * (the region cannot be probed). This is the one path where the
+     * incremental multi-window CRC meets an unreadable region; the other
+     * unreadable-region tests all fail on a frame-header read instead.
+     */
+    @Test
+    public void testReadErrorMidFrameCrcSpanEndsRecoveryAtFrameStart() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-read-error-mid-frame.sfa";
+            // A small intact frame, then a 3 MiB frame whose CRC span takes
+            // several window loads (sized against
+            // MmapSegment.RECOVERY_BUF_BYTES = 1 MiB).
+            final int smallLen = 64;
+            final int largeLen = 3 * (1 << 20);
+            final long segmentBytes = 4L * (1 << 20);
+            writeSegment(path, 21L, new int[]{smallLen, largeLen}, segmentBytes);
+            final long largeFrameOffset = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + smallLen;
+            // Fail reads from 2 MiB on: past the large frame's header and its
+            // entire first CRC chunk, but inside its payload -- the failure
+            // lands on the second chunk's read, in the CRC loop, not on a
+            // frame-header read.
+            FilesFacade ff = new RecoverySeamFacade(path, -1L, 2L * (1 << 20));
+            try (MmapSegment seg = MmapSegment.openExisting(ff, path)) {
+                assertEquals("the intact frame below the unreadable region must be recovered",
+                        1L, seg.frameCount());
+                assertEquals("recovery must stop at the start of the partially checksummed frame",
+                        largeFrameOffset, seg.publishedOffset());
+                assertEquals("an unreadable region cannot be probed for a torn write",
+                        0L, seg.tornTailBytes());
             }
         });
     }
