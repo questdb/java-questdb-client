@@ -646,24 +646,9 @@ public final class MmapSegment implements QuietCloseable {
                     }
                 }
             }
-            return new RecoveryScan(baseSeq, pos, count, torn);
+            return new RecoveryScan(baseSeq, count, pos, torn);
         } finally {
             Unsafe.free(buf, bufSize, MemoryTag.NATIVE_DEFAULT);
-        }
-    }
-
-    /** Result of {@link #scanFile}: header fields plus scan outcomes. */
-    private static final class RecoveryScan {
-        final long baseSeq;
-        final long frameCount;
-        final long lastGood;
-        final long tornTailBytes;
-
-        RecoveryScan(long baseSeq, long lastGood, long frameCount, long tornTailBytes) {
-            this.baseSeq = baseSeq;
-            this.lastGood = lastGood;
-            this.frameCount = frameCount;
-            this.tornTailBytes = tornTailBytes;
         }
     }
 
@@ -719,6 +704,21 @@ public final class MmapSegment implements QuietCloseable {
             winOff = pos;
             winLen = got;
             return n <= got;
+        }
+    }
+
+    /** Result of {@link #scanFile}: header fields plus scan outcomes. */
+    private static final class RecoveryScan {
+        final long baseSeq;
+        final long frameCount;
+        final long lastGood;
+        final long tornTailBytes;
+
+        RecoveryScan(long baseSeq, long frameCount, long lastGood, long tornTailBytes) {
+            this.baseSeq = baseSeq;
+            this.frameCount = frameCount;
+            this.lastGood = lastGood;
+            this.tornTailBytes = tornTailBytes;
         }
     }
 }
