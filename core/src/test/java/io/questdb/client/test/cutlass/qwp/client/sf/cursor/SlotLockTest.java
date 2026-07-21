@@ -215,6 +215,49 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testRemoveOrphanLogicalLeavesAHeldLockFileIntact() throws Exception {
+        // removeOrphanLogical must NEVER unlink a lock file another party still holds.
+        // Sender.build() holds the logical lock across its construct -> connect ->
+        // quarantine transition, and a connect failure closes the engine from inside that
+        // scope -- reaching this cleanup while build() is still holding the lock one frame
+        // up. Unlinking it there frees the pathname without releasing the flock, so the
+        // next acquireLogical creates a SECOND inode and locks it: two owners of a lock
+        // whose only job is mutual exclusion. flock is per open-file-description, so a
+        // second open+lock contends even within one process -- which is exactly what makes
+        // the acquire-before-unlink guard observable here.
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/beta";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            String lockFile = parentDir + "/.slot-locks/beta.lock";
+            String pidFile = parentDir + "/.slot-locks/beta.lock.pid";
+            try (SlotLock held = SlotLock.acquireLogical(slot)) {
+                assertTrue("logical .lock created", Files.exists(lockFile));
+
+                // Cleanup fires while `held` still owns the lock. It must find the lock
+                // contended and leave BOTH files on disk.
+                SlotLock.removeOrphanLogical(slot);
+                assertTrue("a held logical .lock must survive removeOrphanLogical",
+                        Files.exists(lockFile));
+                assertTrue("a held logical .lock.pid must survive removeOrphanLogical",
+                        Files.exists(pidFile));
+
+                // And the holder must still be the sole owner: a fresh acquire contends.
+                try {
+                    SlotLock.acquireLogical(slot).close();
+                    fail("a second acquireLogical must contend while the first is held");
+                } catch (IllegalStateException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("already in use"));
+                }
+            }
+            // Once released, retirement reclaims the files as before -- no leak of the
+            // dead lock+pid pair.
+            SlotLock.removeOrphanLogical(slot);
+            assertFalse("logical .lock reclaimed after release", Files.exists(lockFile));
+            assertFalse("logical .lock.pid reclaimed after release", Files.exists(pidFile));
+        });
+    }
+
+    @Test
     public void testRemoveOrphanLogicalIsSilentNoOpWhenAbsentOrInvalid() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Never-locked slot: nothing to remove, must not throw.

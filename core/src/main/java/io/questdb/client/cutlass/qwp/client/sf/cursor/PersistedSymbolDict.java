@@ -286,7 +286,32 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // truncates, and these bytes are the only copy of state the surviving
             // delta frames reference. A null degrades this slot to full
             // self-sufficient frames and preserves the file for a later attempt.
-            return openExisting(ff, filePath, existing);
+            //
+            // The holder catches what openExisting's own catch structurally cannot.
+            // Recovery reads the file through a mapping (Unsafe loads in
+            // scanAndCopyRecoveredChunks), and pre-JDK-21 HotSpot delivers an
+            // unsafe-access fault ASYNCHRONOUSLY -- at the next return or safepoint,
+            // which can be openExisting's own return, in THIS frame. The instance is
+            // fully built by then and owns an fd plus a buffer as large as the file,
+            // but the assignment never happens, so nothing else can release them.
+            // MmapSegment.openExisting takes an inFlight[] for exactly this shape; the
+            // dictionary is at least as exposed, because ensureAppendMap grows the file
+            // with ff.allocate and the reserve truncate is skipped after a crash, so a
+            // sparse tail is routine. Without this, the fault also escapes open()
+            // entirely -- past CursorSendEngine's constructor and out of Sender.build()
+            // -- turning the documented "degrade to full-dictionary frames" into a
+            // sender that cannot be constructed at all.
+            PersistedSymbolDict[] inFlight = new PersistedSymbolDict[1];
+            try {
+                return openExisting(ff, filePath, existing, inFlight);
+            } catch (Throwable t) {
+                if (inFlight[0] != null) {
+                    inFlight[0].close();
+                }
+                LOG.warn("symbol dict {} recovery faulted late; falling back to "
+                        + "full-dictionary frames (file left intact)", filePath, t);
+                return null;
+            }
         }
         // Absent, or a sub-header stub left by a crash inside openFresh: no
         // load-bearing content to lose, so create it.
@@ -693,7 +718,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return size;
     }
 
-    private static PersistedSymbolDict openExisting(FilesFacade ff, String filePath, long fileLen) {
+    /**
+     * @param inFlight single-slot holder the caller must close when this method throws.
+     *                 Set immediately before the return, so a late-delivered mmap access
+     *                 fault -- which pre-JDK-21 HotSpot may raise at this method's RETURN,
+     *                 in the caller's frame, past the catch below -- still leaves the fully
+     *                 built instance (fd plus loaded-entry buffer) reachable by someone.
+     */
+    private static PersistedSymbolDict openExisting(
+            FilesFacade ff, String filePath, long fileLen, PersistedSymbolDict[] inFlight) {
         int fd = ff.openRW(filePath);
         if (fd < 0) {
             LOG.warn("symbol dict {} could not be opened (rc={}); "
@@ -763,8 +796,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (scan.validLen < len && !ff.truncate(fd, scan.validLen)) {
                 throw new IllegalStateException("could not drop torn/stale symbol dictionary tail");
             }
-            return new PersistedSymbolDict(
+            PersistedSymbolDict dict = new PersistedSymbolDict(
                     ff, filePath, fd, scan.validLen, scan.count, entriesAddr, entriesLen, mappedInput);
+            // Publish to the holder BEFORE returning: from here on the caller owns the
+            // cleanup, including when the return itself faults. See the parameter doc.
+            inFlight[0] = dict;
+            return dict;
         } catch (Throwable t) {
             if (inputAddr != 0L) {
                 if (mappedInput) {
@@ -995,9 +1032,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private void commitMappedChunk(long recStart, int hdrLen, int entriesLen, int count) {
         long bodyLen = (long) hdrLen + entriesLen;
         long recLen = bodyLen + CRC_SIZE;
+        // updateUnsafe, NOT the native update: this checksums bytes inside the append
+        // MAPPING. ensureAppendMap grows the file with ff.allocate, whose native fallback
+        // is ftruncate, so the window can cover blocks the filesystem has not committed
+        // (ENOSPC, a quota, a sparse tail left by a crash) -- and touching one raises
+        // SIGBUS. Inside JNI that ABORTS THE JVM with no recovery; at an Unsafe intrinsic
+        // site HotSpot converts it to a catchable InternalError. MmapSegment.scanFrames
+        // already uses updateUnsafe over the same class of mapping for exactly this
+        // reason. Costs nothing measurable and drops a JNI transition per flush.
         Unsafe.getUnsafe().putInt(
                 recStart + bodyLen,
-                Crc32c.update(Crc32c.INIT, recStart, bodyLen));
+                Crc32c.updateUnsafe(Crc32c.INIT, recStart, bodyLen));
         Unsafe.getUnsafe().storeFence();
         appendOffset += recLen;
         size += count;

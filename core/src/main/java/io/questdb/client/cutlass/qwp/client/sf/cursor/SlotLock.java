@@ -168,8 +168,33 @@ public final class SlotLock implements QuietCloseable {
         if (paths == null) {
             return;
         }
-        ff.remove(paths[1]);
-        ff.remove(paths[2]);
+        // Unlink ONLY while holding the lock. Removing a lock file another party holds
+        // is precisely the attack Files.DIR_MODE_SHARED's javadoc describes: the unlink
+        // does not release that party's flock, but it does free the pathname, so the
+        // next acquirer creates a SECOND inode and locks it successfully -- two owners
+        // of a lock whose only job is mutual exclusion.
+        //
+        // The retiring engine's directory-local lock does not stand in for this. It says
+        // nothing about the LOGICAL lock, which Sender.build() holds across its whole
+        // construct -> connect -> quarantine transition, in a frame ABOVE this one: an
+        // ordinary failed connect closes the engine from inside that scope, reaches here,
+        // and used to unlink the very file build() was holding. Acquiring first turns
+        // that into a no-op instead of silent double-ownership.
+        SlotLock guard;
+        try {
+            guard = acquireAt(ff, slotDir, paths[1], paths[2]);
+        } catch (Throwable t) {
+            // Contended (someone holds it, possibly a caller above us) or unopenable.
+            // Leaving the pair on disk is the safe outcome -- a live holder's lock must
+            // outlive our cleanup. The next fully-drained retirement reclaims it.
+            return;
+        }
+        try {
+            ff.remove(paths[1]);
+            ff.remove(paths[2]);
+        } finally {
+            guard.close();
+        }
     }
 
     private static SlotLock acquireAt(FilesFacade ff, String slotDir, String lockPath, String pidPath) {

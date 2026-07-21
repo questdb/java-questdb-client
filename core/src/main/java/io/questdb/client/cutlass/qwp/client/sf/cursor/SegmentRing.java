@@ -354,21 +354,29 @@ public final class SegmentRing implements QuietCloseable {
             // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
             // installs a hot spare, the producer rotates. Same fast path as a
             // mid-life ring.
+            //
+            // Ownership transfers to the ring in ONE step, at the very end. Detaching
+            // the active segment from `opened` any earlier -- as an `opened.remove(last)`
+            // before the ring is fully built did -- puts it beyond the reach of the catch
+            // below while that catch can still fire: `new SegmentRing` and the
+            // `sealedSegments.add` loop both allocate, so an ObjList growth IOOBE or a
+            // native OOM lands there with the active segment referenced by nothing. Its
+            // whole-segment mapping (up to sf_max_bytes) and its fd would leak.
             int last = opened.size() - 1;
-            MmapSegment active = opened.get(last);
-            opened.remove(last);
-            SegmentRing ring = new SegmentRing(active, maxBytesPerSegment);
+            SegmentRing ring = new SegmentRing(opened.get(last), maxBytesPerSegment);
             // Older segments become sealed in baseSeq order.
-            for (int i = 0, n = opened.size(); i < n; i++) {
+            for (int i = 0; i < last; i++) {
                 ring.sealedSegments.add(opened.get(i));
             }
+            // Every segment now belongs to `ring`. Release our references LAST, so a
+            // throw anywhere above still finds all of them in `opened`.
+            opened.clear();
             return ring;
         } catch (Throwable t) {
-            // Close every recovered MmapSegment that's still in `opened`.
-            // After the success path, `opened` no longer contains the active
-            // segment (removed above), but the sealed segments transferred to
-            // ring.sealedSegments are still owned by the ring once it's
-            // returned -- so this catch only fires before the return statement.
+            // Close every recovered MmapSegment that's still in `opened`. On the success
+            // path `opened` was cleared only after the ring took ownership of every
+            // segment, so reaching here always means the ring was never returned and
+            // `opened` is still the sole owner -- including of the active segment.
             for (int i = 0, n = opened.size(); i < n; i++) {
                 try {
                     opened.get(i).close();

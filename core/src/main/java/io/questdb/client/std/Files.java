@@ -80,18 +80,24 @@ public final class Files {
      * create entries in: the store-and-forward root and its logical slot-lock directory.
      * <b>01777 octal -- 0777 plus the sticky bit.</b>
      * <p>
-     * The deployment's umask decides the sharing policy: the usual 022 yields 01755, i.e.
-     * exactly {@link #DIR_MODE_DEFAULT} plus sticky, so the common case is unchanged;
-     * a shared-group deployment (umask 002) gets the 01775 a second uid needs. umask
-     * masks only the rwx bits, never the sticky bit, so the restricted-deletion semantics
-     * survive every umask.
+     * The rwx widening is the load-bearing part and it works: the deployment's umask
+     * decides the sharing policy, so the usual 022 yields 0755 (identical to
+     * {@link #DIR_MODE_DEFAULT}, the common case unchanged) while a shared-group deployment
+     * (umask 002) gets the 0775 a second uid needs to create its own entries here.
      * <p>
-     * The sticky bit is not optional here. Without it, on a multi-tenant host any local
-     * user with write access to the directory can unlink another process's lock file --
-     * which does not release that process's flock, but does free the pathname, so the
-     * next acquirer creates a SECOND inode and locks it successfully. Two owners of a
-     * lock whose entire job is mutual exclusion. Sticky restricts deletion to the file's
-     * owner and closes that.
+     * <b>The sticky bit is best-effort, NOT a guarantee this client relies on.</b> On
+     * Linux {@code mkdir(2)} sets the new directory to {@code (mode & ~umask & 0777)} -- the
+     * {@code & 0777} strips {@code S_ISVTX}, so the bit is silently dropped on the primary
+     * deployment platform (POSIX leaves sticky-on-mkdir unspecified; some platforms honor
+     * it, Linux does not). It is therefore wrong to depend on restricted-deletion semantics
+     * for correctness. Mutual exclusion of the slot lock does NOT rest on it: the safety
+     * comes from never unlinking a lock file this process does not hold
+     * ({@code SlotLock.removeOrphanLogical} acquires the lock before removing it), which
+     * holds regardless of directory permissions. Defending a multi-tenant host against a
+     * hostile local uid unlinking another process's lock would need the sticky bit applied
+     * by an explicit {@code chmod} after {@code mkdir} (and on an already-existing directory
+     * on upgrade, since {@code mkdir} does not touch it) -- there is no {@code chmod} binding
+     * in this class today, so that protection is not provided and must not be assumed.
      * <p>
      * This must be applied to EVERY directory on the path a foreign uid has to create in.
      * Applying it only to {@code .slot-locks} -- while {@code sf_dir} itself stays 0755 --

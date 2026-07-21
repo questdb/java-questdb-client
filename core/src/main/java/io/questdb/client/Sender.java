@@ -1658,7 +1658,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             quarantined = true;
                             cursorEngine = quarantineTornSlot(
                                     cursorEngine, e, sfDir, senderId, slotPath, actualSfMaxBytes,
-                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos, errorHandler);
                         } catch (Throwable t) {
                             // connect() failed before ownership of cursorEngine
                             // transferred — close it ourselves. close(false)
@@ -3065,7 +3065,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private static CursorSendEngine quarantineTornSlot(
                 CursorSendEngine torn, UnreplayableSlotException cause, String sfDir,
                 String senderId, String slotPath,
-                long sfMaxBytes, long sfMaxTotalBytes, long sfAppendDeadlineNanos
+                long sfMaxBytes, long sfMaxTotalBytes, long sfAppendDeadlineNanos,
+                io.questdb.client.SenderErrorHandler errorHandler
         ) {
             // The verdict, and the reason, come from the recovery seed -- the only code that
             // has tried every source of truth. Recomputing them here would mean a second,
@@ -3106,6 +3107,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             LOG.error("{} -- the slot has been set aside at {} and the affected data must be resent; "
                             + "this sender continues on a fresh, empty slot at {}",
                     detail, quarantinePath, slotPath);
+            // build() no longer throws for this -- it starts the producer on a fresh slot so
+            // the outage stays bounded. But abandoning buffered rows is precisely the event a
+            // caller must be able to act on, and LOG.error alone cannot carry it: this client
+            // ships slf4j-api with no binding, so an embedding app with no provider gets a NOP
+            // logger and the loss is announced nowhere. Deliver it programmatically too, so an
+            // errorHandler can alert / page / record it. Dispatched synchronously here because
+            // the async SenderErrorDispatcher belongs to the connected sender, which does not
+            // exist yet at build time. A throwing handler must not turn a contained outage back
+            // into a failed build, so swallow anything it raises.
+            if (errorHandler != null) {
+                try {
+                    errorHandler.onError(new SenderError(
+                            SenderError.Category.PROTOCOL_VIOLATION,
+                            SenderError.Policy.TERMINAL,
+                            SenderError.NO_STATUS_BYTE,
+                            detail + " [slot set aside at " + quarantinePath
+                                    + "; sender continues on a fresh slot at " + slotPath + ']',
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            SenderError.NO_MESSAGE_SEQUENCE,
+                            null,
+                            System.nanoTime()
+                    ));
+                } catch (Throwable handlerFailure) {
+                    LOG.error("sender error handler threw while reporting a quarantined slot: {}",
+                            String.valueOf(handlerFailure));
+                }
+            }
             return new CursorSendEngine(slotPath, sfMaxBytes, sfMaxTotalBytes, sfAppendDeadlineNanos);
         }
 

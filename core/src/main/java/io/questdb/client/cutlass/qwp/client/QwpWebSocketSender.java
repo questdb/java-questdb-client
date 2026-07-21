@@ -306,6 +306,17 @@ public class QwpWebSocketSender implements Sender {
     //         contained in that loop and never reach the producer.
     private Sender.InitialConnectMode initialConnectMode = Sender.InitialConnectMode.OFF;
     private boolean ownsCursorEngine;
+    // Whether close() may let the engine reclaim the parent-anchored LOGICAL slot lock.
+    // False only while an outer frame holds it: Sender.build() acquires it for the whole
+    // construct -> connect -> quarantine transition, and connect()'s own rollback closes
+    // this sender from INSIDE that scope. A fresh slot is "fully drained" by definition
+    // (publishedFsn < 0), so the default close(true) took the reclaim branch and unlinked
+    // the very lock file build() was holding -- on POSIX that frees the pathname without
+    // releasing the flock, so the next acquireLogical creates a SECOND inode and locks it.
+    // build()'s own careful close(false) calls could not prevent it, because connect()
+    // closed the engine first. Reset to true once connect() hands ownership back, so a
+    // later user-initiated close() still retires the lock normally.
+    private boolean reclaimLogicalSlotLockOnClose = true;
     private long pendingBytes;
     // Set true by close() once the SF slot flock has been released (the normal
     // teardown path). Stays false if close() bailed early with the I/O thread
@@ -821,6 +832,10 @@ public class QwpWebSocketSender implements Sender {
             // handler -- and close() accumulates cleanup errors and ends in
             // rethrowTerminal, so letting a close failure propagate here would REPLACE t
             // and silently demote a recoverable slot back to the permanent build() brick.
+            // This rollback always runs inside Sender.build()'s acquireLogical scope, so
+            // the logical slot lock is held one frame up. Closing the engine with the
+            // default reclaim would unlink the lock file build() is still holding.
+            sender.reclaimLogicalSlotLockOnClose = false;
             try {
                 sender.close();
             } catch (Throwable closeFailure) {
@@ -1283,7 +1298,7 @@ public class QwpWebSocketSender implements Sender {
                 if (ownsCursorEngine && cursorEngine != null && cursorSendLoop != null
                         && !cursorSendLoop.delegateEngineClose()) {
                     try {
-                        cursorEngine.close();
+                        cursorEngine.close(reclaimLogicalSlotLockOnClose);
                     } catch (Throwable t) {
                         LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
                         terminalError = captureCloseError(terminalError, t);
@@ -1325,7 +1340,7 @@ public class QwpWebSocketSender implements Sender {
 
             if (ownsCursorEngine && cursorEngine != null) {
                 try {
-                    cursorEngine.close();
+                    cursorEngine.close(reclaimLogicalSlotLockOnClose);
                 } catch (Throwable t) {
                     LOG.error("Error closing owned CursorSendEngine: {}", String.valueOf(t));
                     terminalError = captureCloseError(terminalError, t);
