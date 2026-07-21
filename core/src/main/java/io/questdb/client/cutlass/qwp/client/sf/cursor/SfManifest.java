@@ -145,13 +145,21 @@ final class SfManifest implements QuietCloseable {
                 // bit rot), recovery still fails closed on the
                 // manifest-required flag check.
                 filesFacade.close(fd);
+                // Ownership released: quarantineDebris may throw (when both
+                // rename and remove fail) and the catch below must not close
+                // this fd again -- the OS may already have handed the number
+                // to another thread, and a double-close would silently kill
+                // an unrelated descriptor.
+                fd = -1;
                 quarantineDebris(filesFacade, path, "no valid CRC-protected record");
                 return null;
             }
             return new SfManifest(filesFacade, path, fd, selected.generation,
                     selected.headBase, selected.activeBase);
         } catch (Throwable t) {
-            filesFacade.close(fd);
+            if (fd != -1) {
+                filesFacade.close(fd);
+            }
             throw t;
         } finally {
             Unsafe.free(buffer, RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);

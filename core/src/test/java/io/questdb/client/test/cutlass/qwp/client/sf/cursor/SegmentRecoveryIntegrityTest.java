@@ -465,6 +465,66 @@ public class SegmentRecoveryIntegrityTest {
     }
 
     @Test
+    public void testUnquarantinableCorruptManifestClosesFdExactlyOnce() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Correctly-sized manifest with BOTH records CRC-broken: open()
+            // closes the fd and then tries to quarantine the debris. Make
+            // rename AND remove fail (permission-degraded slot dir) so
+            // quarantineDebris throws after the fd is already closed. The
+            // propagating failure must not close the fd a second time -- the
+            // OS may already have handed that number to another thread, and
+            // a double-close would silently kill an unrelated descriptor.
+            writeManifestBothRecordsCrcBroken();
+            Map<String, byte[]> before = snapshotDir();
+
+            String manifestPath = tmpDir + "/" + MANIFEST_NAME;
+            int[] manifestFd = {-1};
+            int[] manifestFdCloses = {0};
+            FilesFacade facade = new DelegatingFacade() {
+                @Override
+                public int close(int fd) {
+                    if (fd >= 0 && fd == manifestFd[0]) {
+                        manifestFdCloses[0]++;
+                    }
+                    return super.close(fd);
+                }
+
+                @Override
+                public int openRW(String path) {
+                    int fd = super.openRW(path);
+                    if (manifestPath.equals(path)) {
+                        manifestFd[0] = fd;
+                    }
+                    return fd;
+                }
+
+                @Override
+                public boolean remove(String path) {
+                    return !manifestPath.equals(path) && super.remove(path);
+                }
+
+                @Override
+                public int rename(String oldPath, String newPath) {
+                    return manifestPath.equals(oldPath) ? -1 : super.rename(oldPath, newPath);
+                }
+            };
+            try {
+                SegmentRing ring = SegmentRing.openExisting(facade, tmpDir, SEGMENT_SIZE);
+                if (ring != null) {
+                    ring.close();
+                }
+                Assert.fail("recovery must fail when corrupt-manifest quarantine cannot proceed");
+            } catch (MmapSegmentException expected) {
+                TestUtils.assertContains(expected.getMessage(), "could not quarantine");
+            }
+            Assert.assertTrue("manifest was never opened", manifestFd[0] >= 0);
+            Assert.assertEquals("manifest fd must be closed exactly once (a double-close can "
+                    + "kill an unrelated descriptor)", 1, manifestFdCloses[0]);
+            assertDirUnchanged(before);
+        });
+    }
+
+    @Test
     public void testFreshStartCrashBeforeManifestCreationRecoversViaLegacyPath() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Engine crash between creating sf-initial.sfa (unflagged) and
@@ -635,6 +695,39 @@ public class SegmentRecoveryIntegrityTest {
                 Unsafe.getUnsafe().putInt(buf + 60, crc);
                 long offset = (generation & 1L) * 64;
                 Assert.assertEquals(64, Files.write(fd, buf, 64, offset));
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            Files.close(fd);
+        }
+    }
+
+    /**
+     * Writes a correctly-sized (128-byte) manifest whose A and B records are
+     * BOTH structurally plausible (magic, version, boundaries) but fail their
+     * CRC check -- the "no valid CRC-protected record" quarantine trigger.
+     */
+    private void writeManifestBothRecordsCrcBroken() {
+        String path = tmpDir + "/" + MANIFEST_NAME;
+        int fd = Files.openRW(path);
+        Assert.assertTrue("could not create manifest", fd >= 0);
+        try {
+            Assert.assertTrue(Files.truncate(fd, 128));
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (long generation = 1; generation <= 2; generation++) {
+                    Unsafe.getUnsafe().setMemory(buf, 64, (byte) 0);
+                    Unsafe.getUnsafe().putInt(buf, 0x314d4653); // SFM1
+                    Unsafe.getUnsafe().putInt(buf + 4, 1);      // version
+                    Unsafe.getUnsafe().putLong(buf + 8, generation);
+                    Unsafe.getUnsafe().putLong(buf + 16, 0);    // headBase
+                    Unsafe.getUnsafe().putLong(buf + 24, 2);    // activeBase
+                    int crc = Crc32c.update(Crc32c.INIT, buf, 60);
+                    Unsafe.getUnsafe().putInt(buf + 60, crc + 1); // broken CRC
+                    long offset = (generation & 1L) * 64;
+                    Assert.assertEquals(64, Files.write(fd, buf, 64, offset));
+                }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }
