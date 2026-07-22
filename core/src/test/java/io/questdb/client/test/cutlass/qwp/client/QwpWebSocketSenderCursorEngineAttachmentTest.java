@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -119,6 +120,55 @@ public class QwpWebSocketSenderCursorEngineAttachmentTest {
                 sender.close();
                 Assert.assertFalse("rejected attachment must not transfer ownership",
                         engine.isCloseCompleted());
+            } finally {
+                sender.close();
+                engine.close();
+            }
+        });
+    }
+
+    @Test
+    public void testLatchedDurabilityFailureSurfacesThroughSenderFlushAndAwait() throws Exception {
+        assertMemoryLeak(() -> {
+            // The ring gate (SegmentRing.appendOrFsn) guards every publish
+            // path, but an EMPTY flush()/flushAndGetSequence() and a
+            // timeoutMillis <= 0 awaitAckedFsn() poll publish nothing: the
+            // sender-level cursorEngine.checkDurability() call sites are
+            // their ONLY durability act. Without them an empty flush
+            // silently succeeds against an unsyncable slot and a poll loop
+            // spins on "not yet" forever instead of surfacing the latched
+            // barrier failure. Deleting any of the three sender call sites
+            // previously survived the whole suite -- this pins the
+            // user-visible layer (the engine seam has its own pin in
+            // CursorSendEngineTest).
+            CursorSendEngine engine = new CursorSendEngine(null, SEGMENT_SIZE);
+            QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 1);
+            try {
+                sender.setCursorEngine(engine, false);
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                for (int i = 0; i < 2; i++) { // repeatable until cleared, not one-shot
+                    try {
+                        sender.flush();
+                        Assert.fail("empty flush() must surface the latched durability failure, call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        Assert.assertSame("the latched instance itself must surface", failure, expected);
+                    }
+                    try {
+                        sender.flushAndGetSequence();
+                        Assert.fail("empty flushAndGetSequence() must surface the latched durability "
+                                + "failure, call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        Assert.assertSame(failure, expected);
+                    }
+                    try {
+                        sender.awaitAckedFsn(0L, 0L);
+                        Assert.fail("awaitAckedFsn(fsn, 0) must throw instead of polling 'not yet', "
+                                + "call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        Assert.assertSame(failure, expected);
+                    }
+                }
             } finally {
                 sender.close();
                 engine.close();

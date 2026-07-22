@@ -766,6 +766,20 @@ public class SegmentManagerCloseRaceTest {
                 manager.setWorkerJoinTimeoutMillis(200L);
                 manager.close();
 
+                // The discriminating observable: with the second bounded join,
+                // close() blocks until the parked cleanup finishes (released at
+                // +400ms) and reaps a DEAD worker; the pre-fix code reaped on
+                // observing workerLoopExited and returned at ~200ms with the
+                // worker still alive in its cleanup. Assert liveness at the
+                // moment close() returns -- before any join in this test can
+                // mask it. (isWorkerReaped() alone cannot discriminate: both
+                // variants null workerThread.)
+                Assert.assertFalse(
+                        "close() must not return while the worker is still alive in its exit "
+                                + "cleanups -- the second bounded join has to hold close() until "
+                                + "they finish",
+                        worker.isAlive());
+
                 Assert.assertEquals("worker must have been parked in its exit cleanups",
                         0, cleanupEntered.getCount());
                 Assert.assertTrue(
