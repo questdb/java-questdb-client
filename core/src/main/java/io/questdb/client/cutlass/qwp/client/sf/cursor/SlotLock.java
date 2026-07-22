@@ -60,8 +60,12 @@ public final class SlotLock implements QuietCloseable {
     private static final int DEAD_FD_FOR_TESTING = 1_000_000_000;
     private static final String LOCK_FILE_NAME = ".lock";
     private static final String LOCK_PID_FILE_NAME = ".lock.pid";
+    private static final Object RELEASE_RETRY_LOCK = new Object();
+    private static SlotLock releaseRetryHead;
     private final String slotDir;
     private int fd;
+    private boolean isReleaseRetryPending;
+    private SlotLock releaseRetryNext;
 
     private SlotLock(String slotDir, int fd) {
         this.slotDir = slotDir;
@@ -73,8 +77,8 @@ public final class SlotLock implements QuietCloseable {
      * acquires an exclusive {@code flock} on it. On contention, reads the
      * existing PID payload and throws with a descriptive message.
      *
-     * @throws IllegalStateException on dir-create failure, file-open failure,
-     *                               or lock contention.
+     * @throws SfOperationalException       on directory or lock-file setup failure
+     * @throws SlotLockContentionException  on lock contention
      */
     public static SlotLock acquire(String slotDir) {
         return acquire(slotDir, false);
@@ -88,22 +92,28 @@ public final class SlotLock implements QuietCloseable {
         if (slotDir == null || slotDir.isEmpty()) {
             throw new IllegalArgumentException("slotDir must not be empty");
         }
+        // Construction cleanup may have retained locks after explicit unlock
+        // failures. Drive every pending owner before opening a new descriptor.
+        // Path text cannot identify a physical file portably (symlinks and
+        // Windows case aliases are counterexamples), while the pending list is
+        // cold, error-only state and normally empty.
+        retryPendingReleases();
         if (!Files.exists(slotDir)) {
             int rc = Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT);
             if (rc != 0) {
-                throw new IllegalStateException(
+                throw new SfOperationalException(
                         "could not create slot dir: " + slotDir + " rc=" + rc);
             }
         }
         if (syncParentDirectory && Files.fsyncParentDir(slotDir) != 0) {
-            throw new IllegalStateException(
+            throw new SfOperationalException(
                     "could not sync parent directory for SF slot: " + slotDir);
         }
         String lockPath = slotDir + "/" + LOCK_FILE_NAME;
         String pidPath = slotDir + "/" + LOCK_PID_FILE_NAME;
         int fd = Files.openRW(lockPath);
         if (fd < 0) {
-            throw new IllegalStateException(
+            throw new SfOperationalException(
                     "could not open slot lock file: " + lockPath);
         }
         boolean ok = false;
@@ -111,7 +121,7 @@ public final class SlotLock implements QuietCloseable {
             int rc = Files.lock(fd);
             if (rc != 0) {
                 String holder = readHolder(pidPath);
-                throw new IllegalStateException(
+                throw new SlotLockContentionException(
                         "sf slot already in use by another process [slot="
                                 + slotDir + ", holder=" + holder + "]");
             }
@@ -185,9 +195,16 @@ public final class SlotLock implements QuietCloseable {
 
     @Override
     public void close() {
-        // QuietCloseable contract: best-effort, no signal. Callers that
-        // must confirm the release use release() and check the result.
-        release();
+        // QuietCloseable cannot report a failure, so retain this object on an
+        // allocation-free retry list when unlock is unconfirmed. Serialize the
+        // release attempt and publication: an acquire that starts after close
+        // returns must not miss the retained owner. An acquire already racing
+        // an in-progress close may still observe ordinary lock contention.
+        synchronized (RELEASE_RETRY_LOCK) {
+            if (!release()) {
+                retainForReleaseRetryLocked();
+            }
+        }
     }
 
     private static String readHolder(String pidPath) {
@@ -217,11 +234,46 @@ public final class SlotLock implements QuietCloseable {
 
     private static native int release0(int fd);
 
+    private void retainForReleaseRetryLocked() {
+        if (!isReleaseRetryPending) {
+            isReleaseRetryPending = true;
+            releaseRetryNext = releaseRetryHead;
+            releaseRetryHead = this;
+        }
+    }
+
     private synchronized void restoreFdForTesting(int savedFd) {
         if (fd != DEAD_FD_FOR_TESTING) {
             throw new IllegalStateException("slot lock release failure is not injected");
         }
         fd = savedFd;
+    }
+
+    private static void retryPendingReleases() {
+        synchronized (RELEASE_RETRY_LOCK) {
+            SlotLock previous = null;
+            SlotLock lock = releaseRetryHead;
+            while (lock != null) {
+                SlotLock next = lock.releaseRetryNext;
+                // release() reports operational unlock failure as false. Do
+                // not catch Error or unexpected programming failures here:
+                // hiding them as apparent lock contention would misdiagnose
+                // the process and create a new retry contract for VM errors.
+                if (lock.release()) {
+                    if (previous == null) {
+                        releaseRetryHead = next;
+                    } else {
+                        previous.releaseRetryNext = next;
+                    }
+                    lock.isReleaseRetryPending = false;
+                    lock.releaseRetryNext = null;
+                    lock = next;
+                    continue;
+                }
+                previous = lock;
+                lock = next;
+            }
+        }
     }
 
     private static void writePid(String pidPath) {

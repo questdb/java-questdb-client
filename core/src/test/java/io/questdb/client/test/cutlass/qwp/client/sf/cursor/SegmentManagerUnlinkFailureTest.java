@@ -28,6 +28,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
@@ -82,7 +83,7 @@ public class SegmentManagerUnlinkFailureTest {
                 try {
                     manager.register(ring, dir);
                     Assert.fail("register accepted a partially enumerated SF directory");
-                } catch (IllegalStateException expected) {
+                } catch (SfOperationalException expected) {
                     Assert.assertTrue(expected.getMessage().contains("could not fully enumerate"));
                 }
                 Assert.assertTrue("fault did not occur after the lower generation was observed",

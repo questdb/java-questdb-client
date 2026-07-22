@@ -39,6 +39,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -2330,7 +2331,7 @@ public class QwpWebSocketSender implements Sender {
             pool.setListener(listener);
             // ...and direct re-assignment for the ones already running (the
             // pool listener is only applied at submit time, never after).
-            ObjList<io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer> live =
+            ObjList<BackgroundDrainer> live =
                     pool.snapshot();
             for (int i = 0, n = live.size(); i < n; i++) {
                 live.getQuick(i).setListener(listener);
@@ -2473,16 +2474,16 @@ public class QwpWebSocketSender implements Sender {
             // (the factory needs the drainer, the drainer's constructor
             // needs the factory); the ref write happens-before the drainer
             // runs because submit() publishes the task afterwards.
-            final io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[] ref =
-                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer[1];
+            final BackgroundDrainer[] ref =
+                    new BackgroundDrainer[1];
             ReconnectSupplier factory = new ReconnectSupplier(
                     () -> {
-                        io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer d = ref[0];
+                        BackgroundDrainer d = ref[0];
                         return d != null && d.isStopRequested();
                     },
                     "drainer stop requested during connect");
-            io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer drainer =
-                    new io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer(
+            BackgroundDrainer drainer =
+                    new BackgroundDrainer(
                             slot, segmentSizeBytes, sfMaxTotalBytes,
                             syncIntervalNanos,
                             factory,

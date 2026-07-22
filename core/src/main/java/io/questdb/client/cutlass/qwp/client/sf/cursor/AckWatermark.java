@@ -45,8 +45,10 @@ import org.slf4j.LoggerFactory;
  * "everything &lt;= N is durable"), so a single monotonic watermark suffices;
  * no per-frame bitmap is needed.
  * <p>
- * <b>Layout</b> (128 bytes, little-endian, mmap'd for the engine's lifetime):
- * two independently CRC-protected 64-byte records. Each record contains:
+ * <b>Layout</b> (8192 bytes, little-endian, mmap'd for the engine's lifetime):
+ * two independently CRC-protected 64-byte records at offsets 0 and 4096.
+ * Placing each record at the start of a separate 4 KiB slot prevents one
+ * aligned 512-byte or 4 KiB sector tear from damaging both. Each record contains:
  * <pre>
  *   offset 0:   u32 magic = 'AKW1'
  *   offset 4:   u32 version = 1
@@ -84,7 +86,7 @@ public final class AckWatermark implements QuietCloseable {
      * directory enumerators that filter by extension skip it automatically.
      */
     public static final String FILE_NAME = ".ack-watermark";
-    public static final int FILE_SIZE = 128;
+    public static final int FILE_SIZE = 8 * 1024;
     /**
      * Sentinel returned by {@link #read()} when neither watermark record is
      * valid.
@@ -96,6 +98,7 @@ public final class AckWatermark implements QuietCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(AckWatermark.class);
     private static final int MAGIC_OFFSET = 0;
     private static final int RECORD_SIZE = 64;
+    private static final int RECORD_SLOT_SIZE = 4 * 1024;
     private static final int VERSION = 1;
     private final int fd;
     private final FilesFacade filesFacade;
@@ -240,7 +243,7 @@ public final class AckWatermark implements QuietCloseable {
     public void write(long fsn) {
         if (closed) return;
         long nextGeneration = generation + 1L;
-        long recordAddress = mmapAddress + (nextGeneration & 1L) * RECORD_SIZE;
+        long recordAddress = mmapAddress + (nextGeneration & 1L) * RECORD_SLOT_SIZE;
         Unsafe.getUnsafe().setMemory(recordAddress, RECORD_SIZE, (byte) 0);
         Unsafe.getUnsafe().putInt(recordAddress + MAGIC_OFFSET, FILE_MAGIC);
         Unsafe.getUnsafe().putInt(recordAddress + 4, VERSION);
@@ -286,7 +289,7 @@ public final class AckWatermark implements QuietCloseable {
 
     private static Record selectRecord(long address) {
         Record first = readRecord(address);
-        Record second = readRecord(address + RECORD_SIZE);
+        Record second = readRecord(address + RECORD_SLOT_SIZE);
         if (first == null) {
             return second;
         }

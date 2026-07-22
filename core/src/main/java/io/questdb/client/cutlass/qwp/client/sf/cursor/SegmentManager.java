@@ -763,7 +763,7 @@ public final class SegmentManager implements QuietCloseable {
         if (!filesFacade.exists(dir)) return max;
         long find = filesFacade.findFirst(dir);
         if (find < 0) {
-            throw new IllegalStateException("could not enumerate SF segment directory " + dir);
+            throw new SfOperationalException("could not enumerate SF segment directory " + dir);
         }
         if (find == 0) return max;
         try {
@@ -784,7 +784,7 @@ public final class SegmentManager implements QuietCloseable {
                 }
             }
             if (rc < 0) {
-                throw new IllegalStateException("could not fully enumerate SF segment directory " + dir);
+                throw new SfOperationalException("could not fully enumerate SF segment directory " + dir);
             }
         } finally {
             filesFacade.findClose(find);

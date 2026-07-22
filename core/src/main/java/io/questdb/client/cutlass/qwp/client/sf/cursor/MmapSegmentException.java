@@ -30,11 +30,13 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
  * the disk is full (the latter surfaces as backpressure on the producer
  * via {@link io.questdb.client.cutlass.line.LineSenderException}).
  * <p>
- * Recovery distinguishes two flavors: this base type marks <b>operational</b>
+ * Recovery distinguishes three flavors: this base type marks <b>operational</b>
  * failures (open/read/mmap/enumeration errors — the file's contents may be fine,
- * so recovery must fail closed), while the {@link MmapSegmentCorruptionException}
- * subtype marks <b>positively-identified corruption</b> in the file's own
- * bytes, which recovery may quarantine instead of aborting.
+ * so recovery must fail closed); {@link MmapSegmentCorruptionException} marks
+ * <b>positively-identified corruption</b> in one file's own bytes, which
+ * recovery may quarantine when the surviving chain proves safe; and
+ * {@link SfRecoveryException} marks a <b>terminal chain failure</b> that needs
+ * operator intervention.
  */
 public class MmapSegmentException extends RuntimeException {
     public MmapSegmentException(String message) {

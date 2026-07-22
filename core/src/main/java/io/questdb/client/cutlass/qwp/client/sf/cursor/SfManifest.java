@@ -34,17 +34,19 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Crash-safe boundary record for an SF segment chain. Two fixed-size,
- * independently CRC-protected records alternate on update. Recovery selects
- * the valid record with the greatest generation, so a torn update cannot
- * erase the previous committed head/active boundary.
+ * independently CRC-protected records at offsets 0 and 4096 alternate on
+ * update. Recovery selects the valid record with the greatest generation.
+ * The separate 4 KiB slots prevent one aligned 512-byte or 4 KiB sector tear
+ * from erasing both the update and the previous committed boundary.
  */
 final class SfManifest implements QuietCloseable {
     static final String FILE_NAME = "sf-manifest.bin";
     private static final Logger LOG = LoggerFactory.getLogger(SfManifest.class);
     private static final int CRC_OFFSET = 60;
-    private static final long FILE_SIZE = 128;
+    private static final long FILE_SIZE = 8 * 1024;
     private static final int MAGIC = 0x314d4653; // SFM1 little-endian
     private static final int RECORD_SIZE = 64;
+    private static final int RECORD_SLOT_SIZE = 4 * 1024;
     private static final int VERSION = 1;
     private final int fd;
     private final FilesFacade filesFacade;
@@ -125,7 +127,7 @@ final class SfManifest implements QuietCloseable {
         long buffer = Unsafe.malloc(RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
         try {
             Record first = readRecord(filesFacade, fd, buffer, 0);
-            Record second = readRecord(filesFacade, fd, buffer, RECORD_SIZE);
+            Record second = readRecord(filesFacade, fd, buffer, RECORD_SLOT_SIZE);
             Record selected;
             if (first == null) {
                 selected = second;
@@ -234,7 +236,7 @@ final class SfManifest implements QuietCloseable {
         Unsafe.getUnsafe().putLong(writeScratch + 24, newActiveBase);
         int crc = Crc32c.update(Crc32c.INIT, writeScratch, CRC_OFFSET);
         Unsafe.getUnsafe().putInt(writeScratch + CRC_OFFSET, crc);
-        long offset = (nextGeneration & 1L) * RECORD_SIZE;
+        long offset = (nextGeneration & 1L) * RECORD_SLOT_SIZE;
         if (filesFacade.write(fd, writeScratch, RECORD_SIZE, offset) != RECORD_SIZE) {
             throw new MmapSegmentException("short write updating SF manifest " + path);
         }

@@ -383,7 +383,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // the file cannot be opened or mapped.
                 watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
                 if (watermarkInProgress == null) {
-                    throw new IllegalStateException(
+                    throw new SfOperationalException(
                             "could not open required ack watermark for SF slot " + sfDir);
                 }
                 long baseSeed = lowestBase - 1;
@@ -437,7 +437,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     AckWatermark.removeOrphan(filesFacade, sfDir);
                     watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
                     if (watermarkInProgress == null) {
-                        throw new IllegalStateException(
+                        throw new SfOperationalException(
                                 "could not open required ack watermark for SF slot " + sfDir);
                     }
                 }

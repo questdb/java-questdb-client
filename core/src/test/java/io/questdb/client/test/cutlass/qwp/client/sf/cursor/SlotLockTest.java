@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -76,6 +77,8 @@ public class SlotLockTest {
                 try (SlotLock ignored = SlotLock.acquire(slot)) {
                     fail("expected slot contention to throw");
                 } catch (IllegalStateException expected) {
+                    assertTrue("contention must have a typed signal",
+                            expected instanceof SlotLockContentionException);
                     String msg = expected.getMessage();
                     assertTrue("error must mention contention: " + msg,
                             msg.contains("already in use"));
@@ -132,6 +135,106 @@ public class SlotLockTest {
      * confirms and stays confirmed. Swapping in a known-bad descriptor gives
      * the slot-specific native primitive a deterministic unlock failure.
      */
+    @Test
+    public void testFailedCloseRetainsRetryOwnerUntilNextAcquire() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-close";
+            SlotLock lock = SlotLock.acquire(slot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    lock.injectReleaseFailureForTesting();
+            try {
+                // CursorSendEngine construction cleanup uses QuietCloseable.close().
+                // A failed close must retain an owner that a later acquire can
+                // drive, rather than dropping the sole reference and flock fd.
+                lock.close();
+                assertTrue("failed close must retain the injected descriptor",
+                        lock.isReleaseFailureInjectedForTesting());
+                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                    fail("slot must stay locked while the release failure persists");
+                } catch (SlotLockContentionException expected) {
+                    // The retained real flock still protects the slot.
+                }
+
+                releaseFailure.close();
+                try (SlotLock again = SlotLock.acquire(slot)) {
+                    assertEquals("the next acquire must retry the retained release owner",
+                            slot, again.slotDir());
+                } catch (SlotLockContentionException stillHeld) {
+                    fail("failed construction cleanup dropped its retry owner: "
+                            + stillHeld.getMessage());
+                }
+            } finally {
+                releaseFailure.close();
+                lock.release();
+            }
+        });
+    }
+
+    @Test
+    public void testFailedCloseRetainsRetryOwnerWithEquivalentPathAlias() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-close-alias";
+            SlotLock lock = SlotLock.acquire(slot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    lock.injectReleaseFailureForTesting();
+            try {
+                lock.close();
+                assertTrue("failed close must retain the injected descriptor",
+                        lock.isReleaseFailureInjectedForTesting());
+
+                // Restore the real descriptor so the retained owner can make
+                // progress. The trailing separator preserves the caller's
+                // spelling but names the same physical .lock file.
+                releaseFailure.close();
+                String slotAlias = slot + "/";
+                try (SlotLock again = SlotLock.acquire(slotAlias)) {
+                    assertEquals("an equivalent path must drive the retained release owner",
+                            slotAlias, again.slotDir());
+                } catch (SlotLockContentionException stillHeld) {
+                    fail("equivalent path spelling could not find its retry owner: "
+                            + stillHeld.getMessage());
+                }
+            } finally {
+                releaseFailure.close();
+                lock.release();
+            }
+        });
+    }
+
+    @Test
+    public void testPersistentFailedCloseDoesNotBlockDifferentSlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String failedSlot = parentDir + "/persistent-failed-close";
+            SlotLock failedLock = SlotLock.acquire(failedSlot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    failedLock.injectReleaseFailureForTesting();
+            try {
+                failedLock.close();
+                // A repeat close must not enqueue the same intrusive node twice.
+                failedLock.close();
+
+                String independentSlot = parentDir + "/independent";
+                try (SlotLock independent = SlotLock.acquire(independentSlot)) {
+                    assertEquals("a persistent failure on one slot must not block another",
+                            independentSlot, independent.slotDir());
+                }
+
+                releaseFailure.close();
+                String progressSlot = parentDir + "/progress";
+                try (SlotLock ignored = SlotLock.acquire(progressSlot)) {
+                    // Any cold acquisition drives every failed-close owner.
+                }
+                try (SlotLock reacquired = SlotLock.acquire(failedSlot)) {
+                    assertEquals("successful retry must remove the pending list entry",
+                            failedSlot, reacquired.slotDir());
+                }
+            } finally {
+                releaseFailure.close();
+                failedLock.release();
+            }
+        });
+    }
+
     @Test
     public void testFailedUnlockRetainsFdAndReportsFalse() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

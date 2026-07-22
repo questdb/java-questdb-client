@@ -56,12 +56,15 @@ import java.util.concurrent.locks.LockSupport;
  * </ol>
  * <p>
  * On terminal failure (auth-rejection on reconnect, a cluster-wide durable-ack
- * capability gap that exhausts its settle budget, recovery error), the drainer
- * drops a {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot
- * before exiting. Future scans skip the slot until an operator clears the
- * sentinel — bounded automatic retry, then human-in-the-loop. A transient
- * all-replica failover window is NOT terminal: it is retried indefinitely
- * (Invariant B), never quarantined on a wall-clock budget or attempt cap.
+ * capability gap that exhausts its settle budget, corrupt or incomplete durable
+ * recovery state), the drainer drops a
+ * {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot before
+ * exiting. Future scans skip the slot until an operator clears the sentinel —
+ * bounded automatic retry, then human-in-the-loop. Operational setup failures
+ * leave no sentinel so a later orphan scan can retry. JVM/programming Errors
+ * also leave no sentinel and propagate after teardown. A transient all-replica
+ * failover window is NOT terminal: it is retried indefinitely (Invariant B),
+ * never quarantined on a wall-clock budget or attempt cap.
  */
 public final class BackgroundDrainer implements Runnable {
 
@@ -406,9 +409,9 @@ public final class BackgroundDrainer implements Runnable {
                     // retrying cannot clear it, and spinning here would pin
                     // the slot .lock forever with no .failed sentinel and only
                     // a throttled, possibly-null-message WARN as a trace.
-                    // Rethrow: run()'s outer catch quarantines the slot
-                    // (markFailed + FAILED) and its finally releases the lock
-                    // -- quarantine-and-exit, exactly as genuine terminals do.
+                    // Rethrow: run() records the failure without attempting
+                    // allocation-heavy logging or a .failed write, its finally
+                    // releases the lock, and then the Error remains visible.
                     throw (Error) t;
                 }
                 // INVARIANT B: a transport failure -- the whole cluster is
@@ -560,15 +563,31 @@ public final class BackgroundDrainer implements Runnable {
                 engine = new CursorSendEngine(slotPath, segmentSizeBytes,
                         sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
                         syncIntervalNanos);
-            } catch (IllegalStateException t) {
-                String msg = t.getMessage();
-                if (msg != null && msg.contains("already in use")) {
-                    LOG.info("orphan slot already locked, skipping: {} ({})",
-                            slotPath, msg);
-                    outcome = DrainOutcome.LOCKED_BY_OTHER;
-                    return;
-                }
+            } catch (SlotLockContentionException t) {
+                LOG.info("orphan slot already locked, skipping: {} ({})",
+                        slotPath, t.getMessage());
+                outcome = DrainOutcome.LOCKED_BY_OTHER;
+                return;
+            } catch (SfRecoveryException | MmapSegmentCorruptionException t) {
+                // The durable chain itself is proven corrupt or incomplete.
+                // Repeated scans cannot repair it, so preserve the terminal
+                // quarantine path in the outer catch below.
                 throw t;
+            } catch (Exception t) {
+                // Every other pre-publication construction exception is
+                // retryable: setup I/O, resource pressure, unexpected setup
+                // faults, and future operational failures do not prove durable
+                // data corruption. The constructor has closed partial
+                // resources; SlotLock retains and retries any unconfirmed
+                // unlock. Leave no .failed sentinel for the next orphan scan.
+                // Error deliberately escapes to the outer Error path: it is
+                // observable after teardown but cannot quarantine intact data.
+                String msg = t.getMessage();
+                LOG.warn("drainer setup temporarily unavailable for slot {}: {}",
+                        slotPath, msg);
+                lastErrorMessage = msg;
+                outcome = DrainOutcome.FAILED;
+                return;
             }
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
@@ -618,6 +637,16 @@ public final class BackgroundDrainer implements Runnable {
                     try {
                         loop.checkError();
                     } catch (Throwable t) {
+                        // The I/O loop latches a JVM/programming Error inside a
+                        // LineSenderException so checkError() can cross the
+                        // thread boundary. Preserve the original Error contract:
+                        // no wire quarantine, tear down, then propagate it.
+                        if (t instanceof Error) {
+                            throw (Error) t;
+                        }
+                        if (t.getCause() instanceof Error) {
+                            throw (Error) t.getCause();
+                        }
                         if (loop.capabilityGapTerminal() != null) {
                             // Capability gap mid-drain: recycle the wire, NOT
                             // the slot. connectWithDurableAckRetry() owns the
@@ -673,6 +702,18 @@ public final class BackgroundDrainer implements Runnable {
                 // outer condition, which is false for the same reason.
             }
             outcome = DrainOutcome.STOPPED;
+        } catch (Error t) {
+            // Resource pressure and JVM/programming failures prove neither
+            // durable corruption nor a terminal server response. Log the Error
+            // best-effort, but never let a secondary logging failure (especially
+            // under OOME) mask the original Error or prevent teardown.
+            try {
+                LOG.error("drainer failed with Error for slot {}", slotPath, t);
+            } catch (Throwable ignored) {
+            }
+            lastErrorMessage = t.getMessage();
+            outcome = DrainOutcome.FAILED;
+            throw t;
         } catch (Throwable t) {
             String msg = t.getMessage();
             if (slotPath != null) {

@@ -544,6 +544,58 @@ public class SegmentRecoveryIntegrityTest {
         });
     }
 
+    @Test
+    public void testSingleSectorTearLeavesPriorManifestRecordRecoverable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 64;
+            long payload = Unsafe.malloc(65, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment initial = MmapSegment.create(
+                        tmpDir + "/sf-initial.sfa", 0, segmentSize);
+                try {
+                    Assert.assertTrue(initial.tryAppend(payload, 64) >= 0);
+                } finally {
+                    initial.close();
+                }
+
+                SegmentRing ring = SegmentRing.openExisting(
+                        FilesFacade.INSTANCE, tmpDir, segmentSize);
+                Assert.assertNotNull(ring);
+                try {
+                    MmapSegment spare = MmapSegment.create(
+                            tmpDir + "/sf-0000000000000001.sfa", 1, segmentSize);
+                    ring.installHotSpare(spare);
+                    Assert.assertEquals("oversized append must rotate but leave the new active empty",
+                            SegmentRing.PAYLOAD_TOO_LARGE, ring.appendOrFsn(payload, 65));
+                    Assert.assertEquals(0L, ring.publishedFsn());
+                    Assert.assertEquals(1L, ring.getActive().baseSeq());
+                } finally {
+                    ring.close();
+                }
+
+                String manifestPath = tmpDir + "/" + MANIFEST_NAME;
+                int tornBytes = (int) Math.min(512L, Files.length(manifestPath));
+                overwriteRange(manifestPath, 0, tornBytes, (byte) 0xA5);
+
+                SegmentRing recovered = SegmentRing.openExisting(
+                        FilesFacade.INSTANCE, tmpDir, segmentSize);
+                Assert.assertNotNull("one aligned 512-byte tear must leave a manifest record valid",
+                        recovered);
+                try {
+                    Assert.assertEquals("recovery must fall back to the prior committed boundary",
+                            0L, recovered.publishedFsn());
+                    Assert.assertEquals(0L, recovered.getActive().baseSeq());
+                } finally {
+                    recovered.close();
+                }
+                Assert.assertFalse("a surviving record must prevent manifest quarantine",
+                        Files.exists(tmpDir + "/" + MANIFEST_NAME + ".corrupt"));
+            } finally {
+                Unsafe.free(payload, 65, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     // ------------------------------------------------------------------
     // Engine level: enumeration failure must not truncate the durable log.
     // ------------------------------------------------------------------
@@ -651,6 +703,24 @@ public class SegmentRecoveryIntegrityTest {
         }
     }
 
+    /** Overwrites a byte range in an existing file and makes the modeled tear durable. */
+    private static void overwriteRange(String path, long offset, int length, byte value) {
+        int fd = Files.openRW(path);
+        Assert.assertTrue("could not open " + path, fd >= 0);
+        try {
+            long buf = Unsafe.malloc(length, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().setMemory(buf, length, value);
+                Assert.assertEquals(length, Files.write(fd, buf, length, offset));
+                Assert.assertEquals(0, Files.fsync(fd));
+            } finally {
+                Unsafe.free(buf, length, MemoryTag.NATIVE_DEFAULT);
+            }
+        } finally {
+            Files.close(fd);
+        }
+    }
+
     /** Overwrites a single int at {@code offset} in an existing file. */
     private static void overwriteInt(String path, long offset, int value) {
         int fd = Files.openRW(path);
@@ -671,7 +741,7 @@ public class SegmentRecoveryIntegrityTest {
     /**
      * Writes a valid {@code sf-manifest.bin} with one CRC-protected record,
      * mirroring SfManifest's on-disk layout (two alternating 64-byte records
-     * in a 128-byte file; record slot = generation & 1).
+     * at offsets 0 and 4096 in an 8192-byte file).
      */
     private void writeManifest(long generation, long headBase, long activeBase) {
         String path = tmpDir + "/" + MANIFEST_NAME;
@@ -680,8 +750,8 @@ public class SegmentRecoveryIntegrityTest {
         int fd = Files.openRW(path);
         Assert.assertTrue("could not create manifest", fd >= 0);
         try {
-            if (Files.length(path) < 128) {
-                Assert.assertTrue(Files.truncate(fd, 128));
+            if (Files.length(path) < 8192) {
+                Assert.assertTrue(Files.truncate(fd, 8192));
             }
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try {
@@ -693,7 +763,7 @@ public class SegmentRecoveryIntegrityTest {
                 Unsafe.getUnsafe().putLong(buf + 24, activeBase);
                 int crc = Crc32c.update(Crc32c.INIT, buf, 60);
                 Unsafe.getUnsafe().putInt(buf + 60, crc);
-                long offset = (generation & 1L) * 64;
+                long offset = (generation & 1L) * 4096;
                 Assert.assertEquals(64, Files.write(fd, buf, 64, offset));
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
@@ -704,7 +774,7 @@ public class SegmentRecoveryIntegrityTest {
     }
 
     /**
-     * Writes a correctly-sized (128-byte) manifest whose A and B records are
+     * Writes a correctly-sized (8192-byte) manifest whose A and B records are
      * BOTH structurally plausible (magic, version, boundaries) but fail their
      * CRC check -- the "no valid CRC-protected record" quarantine trigger.
      */
@@ -713,7 +783,7 @@ public class SegmentRecoveryIntegrityTest {
         int fd = Files.openRW(path);
         Assert.assertTrue("could not create manifest", fd >= 0);
         try {
-            Assert.assertTrue(Files.truncate(fd, 128));
+            Assert.assertTrue(Files.truncate(fd, 8192));
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (long generation = 1; generation <= 2; generation++) {
@@ -725,7 +795,7 @@ public class SegmentRecoveryIntegrityTest {
                     Unsafe.getUnsafe().putLong(buf + 24, 2);    // activeBase
                     int crc = Crc32c.update(Crc32c.INIT, buf, 60);
                     Unsafe.getUnsafe().putInt(buf + 60, crc + 1); // broken CRC
-                    long offset = (generation & 1L) * 64;
+                    long offset = (generation & 1L) * 4096;
                     Assert.assertEquals(64, Files.write(fd, buf, 64, offset));
                 }
             } finally {
@@ -819,12 +889,12 @@ public class SegmentRecoveryIntegrityTest {
     @Test
     public void testCreationCrashRecordlessManifestSelfHeals() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Same window, later stage: allocate() completed (128 zero bytes)
+            // Same window, later stage: allocate() completed (8192 zero bytes)
             // but the first record write/fsync never landed.
             writeSegmentWithFrames(tmpDir + "/sf-initial.sfa", 0, 3);
             int fd = Files.openCleanRW(tmpDir + "/" + MANIFEST_NAME);
             Assert.assertTrue(fd >= 0);
-            Assert.assertTrue(Files.truncate(fd, 128));
+            Assert.assertTrue(Files.truncate(fd, 8192));
             Files.close(fd);
 
             SegmentRing ring = SegmentRing.openExisting(FilesFacade.INSTANCE, tmpDir, SEGMENT_SIZE);
@@ -849,7 +919,7 @@ public class SegmentRecoveryIntegrityTest {
             SegmentRing.openExisting(FilesFacade.INSTANCE, tmpDir, SEGMENT_SIZE).close();
             int fd = Files.openCleanRW(tmpDir + "/" + MANIFEST_NAME); // truncates
             Assert.assertTrue(fd >= 0);
-            Assert.assertTrue(Files.truncate(fd, 128));
+            Assert.assertTrue(Files.truncate(fd, 8192));
             Files.close(fd);
 
             try {

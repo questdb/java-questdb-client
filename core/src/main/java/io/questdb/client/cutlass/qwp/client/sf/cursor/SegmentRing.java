@@ -273,7 +273,7 @@ public final class SegmentRing implements QuietCloseable {
                     // now unreadable) -- fail without mutating. Without one,
                     // legacy semantics apply: quarantine and start fresh.
                     if (manifest != null) {
-                        throw new MmapSegmentException("every SF segment in " + sfDir
+                        throw new SfRecoveryException("every SF segment in " + sfDir
                                 + " is corrupt but " + SfManifest.FILE_NAME
                                 + " references durable data");
                     }
@@ -294,7 +294,7 @@ public final class SegmentRing implements QuietCloseable {
                     long manifestHeadBase = manifest.headBase();
                     long manifestActiveBase = manifest.activeBase();
                     if (manifestHeadBase != manifestActiveBase) {
-                        throw new MmapSegmentException(SfManifest.FILE_NAME + " in " + sfDir
+                        throw new SfRecoveryException(SfManifest.FILE_NAME + " in " + sfDir
                                 + " references durable data (headBase=" + manifestHeadBase
                                 + ", activeBase=" + manifestActiveBase
                                 + ") but no segment files exist");
@@ -328,7 +328,7 @@ public final class SegmentRing implements QuietCloseable {
             }
             sortByBaseSeq(data, 0, data.size());
             if (manifest == null && requiresManifest) {
-                throw new MmapSegmentException("new-format SF segment exists but "
+                throw new SfRecoveryException("new-format SF segment exists but "
                         + SfManifest.FILE_NAME + " is missing");
             }
 
@@ -384,19 +384,19 @@ public final class SegmentRing implements QuietCloseable {
                     long end = segment.baseSeq() + segment.frameCount();
                     if (segment.baseSeq() < headBase) {
                         if (end > headBase) {
-                            throw new MmapSegmentException("segment overlaps committed SF head boundary");
+                            throw new SfRecoveryException("segment overlaps committed SF head boundary");
                         }
                         continue; // acknowledged stale file after manifest-before-unlink crash
                     }
                     if (segment.baseSeq() > activeBase) {
-                        throw new MmapSegmentException("segment exists beyond committed SF active boundary");
+                        throw new SfRecoveryException("segment exists beyond committed SF active boundary");
                     }
                     chain.add(segment);
                 }
                 if (chain.size() > 0) {
                     validateContiguous(chain);
                     if (chain.get(0).baseSeq() != headBase) {
-                        throw new MmapSegmentException("missing expected SF head segment at base " + headBase);
+                        throw new SfRecoveryException("missing expected SF head segment at base " + headBase);
                     }
                 }
                 active = findActive(all, activeBase);
@@ -438,7 +438,7 @@ public final class SegmentRing implements QuietCloseable {
                         }
                         return Recovery.empty();
                     }
-                    throw new MmapSegmentException("missing expected SF active segment at base " + activeBase);
+                    throw new SfRecoveryException("missing expected SF active segment at base " + activeBase);
                 }
                 if (chain.size() == 0) {
                     if (headBase != activeBase || active.frameCount() != 0 || corruptPaths != null) {
@@ -448,7 +448,7 @@ public final class SegmentRing implements QuietCloseable {
                         // the same provisional baseSeq as a corrupted real
                         // active -- accepting it would quarantine unacked
                         // frames and re-issue their FSNs. Fail closed.
-                        throw new MmapSegmentException(
+                        throw new SfRecoveryException(
                                 "missing SF chain between committed boundaries"
                                         + (corruptPaths != null
                                         ? " (a corrupt segment prevents proving the empty state)" : ""));
@@ -467,7 +467,7 @@ public final class SegmentRing implements QuietCloseable {
                         // empty-chain acceptance above).
                         chain.add(active);
                     } else {
-                        throw new MmapSegmentException(
+                        throw new SfRecoveryException(
                                 "missing expected SF active/tail segment at base " + activeBase);
                     }
                 }
@@ -483,7 +483,7 @@ public final class SegmentRing implements QuietCloseable {
                 // independently catches sealed segments that LOST frames.
                 for (int i = 0, n = chain.size() - 1; i < n; i++) {
                     if (chain.get(i).tornTailBytes() > 0) {
-                        throw new MmapSegmentException("corrupt torn tail in sealed SF segment " + chain.get(i).path());
+                        throw new SfRecoveryException("corrupt torn tail in sealed SF segment " + chain.get(i).path());
                     }
                 }
                 for (int i = 0, n = chain.size(); i < n; i++) {
@@ -738,7 +738,7 @@ public final class SegmentRing implements QuietCloseable {
             MmapSegment current = segments.get(i);
             long expected = previous.baseSeq() + previous.frameCount();
             if (current.baseSeq() != expected) {
-                throw new MmapSegmentException("FSN gap in recovered segments: expected "
+                throw new SfRecoveryException("FSN gap in recovered segments: expected "
                         + expected + " but got " + current.baseSeq());
             }
         }

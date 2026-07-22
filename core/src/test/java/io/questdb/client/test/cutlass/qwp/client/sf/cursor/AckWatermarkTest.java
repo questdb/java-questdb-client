@@ -240,6 +240,38 @@ public class AckWatermarkTest {
     }
 
     @Test
+    public void testSingleSectorTearLeavesPriorRecordRecoverable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                watermark.write(100L);
+                watermark.write(200L);
+                watermark.sync();
+            }
+
+            String path = slotDir + "/" + AckWatermark.FILE_NAME;
+            int fd = Files.openRW(path);
+            assertTrue(fd >= 0);
+            int tornBytes = (int) Math.min(512L, Files.length(path));
+            long tornSector = Unsafe.malloc(tornBytes, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().setMemory(tornSector, tornBytes, (byte) 0xA5);
+                assertEquals(tornBytes, Files.write(fd, tornSector, tornBytes, 0));
+                assertEquals(0, Files.fsync(fd));
+            } finally {
+                Files.close(fd);
+                Unsafe.free(tornSector, tornBytes, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                assertEquals("one aligned 512-byte tear must leave the prior record valid",
+                        100L, watermark.read());
+            }
+        });
+    }
+
+    @Test
     public void testStaleFileWithWrongSizeIsResetOnOpen() throws Exception {
         // A leftover file with an unexpected size (corruption, partial
         // write from an older format, manual tampering) must not poison
