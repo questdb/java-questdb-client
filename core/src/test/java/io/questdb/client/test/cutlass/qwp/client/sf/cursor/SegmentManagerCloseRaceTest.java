@@ -693,6 +693,107 @@ public class SegmentManagerCloseRaceTest {
         return manager.getInServiceRingForTesting();
     }
 
+    /**
+     * Pins the SECOND bounded join in {@link SegmentManager#close()}: when
+     * the first (tunable) join times out but the worker has already left its
+     * service loop ({@code workerLoopExited}) and is running only its finite
+     * exit cleanups, close() must NOT hand off and walk away -- it gives the
+     * cleanups a second, fixed-budget join and reaps the worker once they
+     * finish. Without it, a bounded-join timeout landing mid-cleanup reaps
+     * the worker while an engine's flock release is still in flight, so
+     * callers observe a stale not-yet-closed state and schedule spurious
+     * flock-release retries. Every existing close-race test parks the worker
+     * MID-PASS (first-join territory); none reached this branch.
+     */
+    @Test(timeout = 20_000L)
+    public void testSecondBoundedJoinReapsWorkerFinishingExitCleanups() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
+            String slot = tmpDir + "/second-join-slot";
+            Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
+            SegmentRing ring = new SegmentRing(initial, segSize);
+            SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
+            CountDownLatch cleanupEntered = new CountDownLatch(1);
+            CountDownLatch releaseCleanup = new CountDownLatch(1);
+            AtomicReference<Throwable> err = new AtomicReference<>();
+            Thread releaser = null;
+            try {
+                manager.register(ring, slot);
+                manager.start();
+                // Deferred exit cleanup that parks: once the worker runs it,
+                // workerLoopExited is already true (set before cleanups) and
+                // the thread is alive in its finite exit phase -- exactly the
+                // second-join state.
+                Assert.assertTrue("live worker must accept the exit-cleanup handoff",
+                        manager.deferUntilWorkerExit(() -> {
+                            cleanupEntered.countDown();
+                            try {
+                                if (!releaseCleanup.await(10, TimeUnit.SECONDS)) {
+                                    err.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for test to release the exit cleanup"));
+                                }
+                            } catch (Throwable t) {
+                                err.compareAndSet(null, t);
+                            }
+                        }));
+                Thread worker = readWorkerThread(manager);
+                Assert.assertNotNull(worker);
+
+                // Hold the cleanup past the first join (200ms) and release it
+                // well inside the second join's fixed 5s budget.
+                releaser = new Thread(() -> {
+                    try {
+                        if (!cleanupEntered.await(10, TimeUnit.SECONDS)) {
+                            err.compareAndSet(null, new AssertionError(
+                                    "worker never reached its exit cleanups"));
+                            return;
+                        }
+                        Thread.sleep(400L);
+                    } catch (Throwable t) {
+                        err.compareAndSet(null, t);
+                    } finally {
+                        releaseCleanup.countDown();
+                    }
+                }, "second-join-releaser");
+                releaser.start();
+
+                // close(): running=false, worker exits its loop promptly (it
+                // is idle), sets workerLoopExited, parks in the cleanup. The
+                // first join (200ms) expires against the parked cleanup; the
+                // fall-through must take the second join, which reaps once
+                // the releaser lets the cleanup finish.
+                manager.setWorkerJoinTimeoutMillis(200L);
+                manager.close();
+
+                Assert.assertEquals("worker must have been parked in its exit cleanups",
+                        0, cleanupEntered.getCount());
+                Assert.assertTrue(
+                        "second bounded join must reap a worker that finishes its exit "
+                                + "cleanups inside the fixed budget -- close() returned unreaped",
+                        manager.isWorkerReaped());
+                worker.join(TimeUnit.SECONDS.toMillis(5));
+                Assert.assertFalse("worker must be dead after the second join reaped it",
+                        worker.isAlive());
+                Assert.assertEquals(
+                        "close() must free the path scratch itself after the second join "
+                                + "confirmed termination (no handoff on this branch)",
+                        0L, readPathScratchImpl(manager));
+                if (err.get() != null) {
+                    throw new AssertionError("async participant failed", err.get());
+                }
+            } finally {
+                releaseCleanup.countDown();
+                if (releaser != null) {
+                    releaser.join(TimeUnit.SECONDS.toMillis(10));
+                }
+                Thread.interrupted();
+                manager.close();
+                ring.close();
+            }
+        });
+    }
+
     private static long readPathScratchImpl(SegmentManager manager) {
         return manager.isPathScratchAllocatedForTesting() ? 1L : 0L;
     }

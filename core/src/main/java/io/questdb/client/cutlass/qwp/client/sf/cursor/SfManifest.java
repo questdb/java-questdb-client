@@ -38,8 +38,13 @@ import org.slf4j.LoggerFactory;
  * update. Recovery selects the valid record with the greatest generation.
  * The separate 4 KiB slots prevent one aligned 512-byte or 4 KiB sector tear
  * from erasing both the update and the previous committed boundary.
+ * <p>
+ * Public within this exported-internal package (like {@link MmapSegment} and
+ * {@link SegmentRing}) so the boundary contract -- notably the monotonic
+ * clamp in {@link #update} -- can be pinned by direct unit tests; it is not
+ * part of the supported client API.
  */
-final class SfManifest implements QuietCloseable {
+public final class SfManifest implements QuietCloseable {
     static final String FILE_NAME = "sf-manifest.bin";
     private static final Logger LOG = LoggerFactory.getLogger(SfManifest.class);
     private static final int CRC_OFFSET = 60;
@@ -71,7 +76,7 @@ final class SfManifest implements QuietCloseable {
         this.writeScratch = Unsafe.malloc(RECORD_SIZE, MemoryTag.NATIVE_DEFAULT);
     }
 
-    static SfManifest create(FilesFacade filesFacade, String dir, long headBase, long activeBase) {
+    public static SfManifest create(FilesFacade filesFacade, String dir, long headBase, long activeBase) {
         String path = dir + "/" + FILE_NAME;
         int fd = filesFacade.openRWExclusive(path);
         if (fd < 0) {
@@ -104,7 +109,7 @@ final class SfManifest implements QuietCloseable {
         }
     }
 
-    static SfManifest open(FilesFacade filesFacade, String dir) {
+    public static SfManifest open(FilesFacade filesFacade, String dir) {
         String path = dir + "/" + FILE_NAME;
         if (!filesFacade.exists(path)) {
             return null;
@@ -168,7 +173,7 @@ final class SfManifest implements QuietCloseable {
         }
     }
 
-    long activeBase() {
+    public long activeBase() {
         return activeBase;
     }
 
@@ -184,7 +189,7 @@ final class SfManifest implements QuietCloseable {
         }
     }
 
-    long headBase() {
+    public long headBase() {
         return headBase;
     }
 
@@ -199,7 +204,7 @@ final class SfManifest implements QuietCloseable {
         return filesFacade.remove(path) || !filesFacade.exists(path);
     }
 
-    synchronized void update(long newHeadBase, long newActiveBase) {
+    public synchronized void update(long newHeadBase, long newActiveBase) {
         if (closed) {
             throw new IllegalStateException("SF manifest is closed");
         }

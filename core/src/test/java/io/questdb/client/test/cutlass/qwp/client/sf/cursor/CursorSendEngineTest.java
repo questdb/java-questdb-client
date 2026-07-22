@@ -106,6 +106,35 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testCheckDurabilitySurfacesLatchedFailureToSenderEntryPoints() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // QwpWebSocketSender.flushAndGetSequence()/awaitAckedFsn() call
+            // engine.checkDurability() as their FIRST durability act, so this
+            // delegation seam is what stands between a latched periodic
+            // data-barrier failure and a producer that keeps publishing into
+            // an unsyncable slot. It had zero test references before this
+            // pin. Contract: quiet when clean, throws the LATCHED instance
+            // (not a copy) on every call until the manager's healed pass
+            // clears it -- callers poll it, so it must be repeatable, not
+            // one-shot.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                engine.checkDurability(); // clean: must not throw
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                for (int i = 0; i < 2; i++) {
+                    try {
+                        engine.checkDurability();
+                        fail("latched durability failure must surface on call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        assertTrue("the latched instance itself must surface",
+                                expected == failure);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testAppendChecksLatchedDurabilityFailureBeforePublishing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
