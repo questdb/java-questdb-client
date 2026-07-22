@@ -543,6 +543,86 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * The legacy-migration twin of
+     * {@link #testProvenDeadSealedResidueSanitizedThenHealsAfterOneRestart}:
+     * the SAME proven-dead sealed residue, but already on disk BEFORE the
+     * first recovery ever runs — a pre-manifest slot written by a pre-fix
+     * client. Legacy slots predate the fail-closed sealed-suffix contract,
+     * so migration must zero the residue SILENTLY (no first-sight throw)
+     * and hand the manifest era a chain that already satisfies the
+     * all-zero sealed-suffix invariant — the next restart comes up clean
+     * instead of tripping a spurious {@link SfSanitizedResidueException}
+     * over bytes migration should have healed.
+     */
+    @Test
+    public void testLegacyMigrationSilentlySanitizesProvenDeadSealedResidue() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
+                    + 12; // sealed suffix gap that can never fit a frame
+            String m0Path = tmpDir + "/q0.sfa";
+            String m1Path = tmpDir + "/q1.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 16, 6);
+                MmapSegment s0 = MmapSegment.create(m0Path, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                long gapStart = s0.publishedOffset();
+                s0.close();
+                MmapSegment s1 = MmapSegment.create(m1Path, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+                // Poison the sealed suffix gap BEFORE any recovery: no
+                // manifest exists yet, so this is a legacy slot carrying
+                // pre-fix-client residue into migration.
+                int fd = Files.openRW(m0Path);
+                assertTrue("openRW must succeed", fd >= 0);
+                long junk = Unsafe.malloc(12, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        Unsafe.getUnsafe().putInt(junk + i * 4L, 0xCAFEBABE);
+                    }
+                    assertEquals(12L, Files.write(fd, junk, 12, gapStart));
+                    Files.fsync(fd);
+                } finally {
+                    Unsafe.free(junk, 12, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+                // Migration: contiguity proves the residue dead, so the
+                // legacy chain recovers in ONE pass — silently.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull("legacy migration must not fail closed over "
+                            + "proven-dead sealed residue", ring);
+                    assertEquals(1, ring.getSealedSegments().size());
+                    assertEquals(4, ring.getSealedSegments().get(0).frameCount());
+                    assertEquals(4, ring.getActive().baseSeq());
+                }
+                // The silent heal: residue durably zeroed, frames intact,
+                // slot migrated to the manifest era.
+                try (MmapSegment seg = MmapSegment.openExisting(m0Path)) {
+                    assertEquals("frames must be untouched", 4L, seg.frameCount());
+                    assertEquals("legacy migration must durably zero the dead residue",
+                            0L, seg.tornTailBytes());
+                }
+                assertTrue("legacy migration must create the manifest",
+                        Files.exists(tmpDir + "/sf-manifest.bin"));
+                // The manifest-era invariant holds: the restart's fail-closed
+                // sealed-suffix pass finds nothing to surface. A
+                // SfSanitizedResidueException here means migration skipped
+                // the sanitize and deferred the incident to production's
+                // next restart.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull("restart over the migrated chain must come up clean", ring);
+                    assertEquals(1, ring.getSealedSegments().size());
+                    assertEquals(5, ring.nextSeqHint());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testRingRecoverySanitizesResumedActiveTornTail() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
