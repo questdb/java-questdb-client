@@ -198,6 +198,16 @@ public final class SenderPool implements AutoCloseable {
     // one. Joined by stopStartupRecoveryDriver() on close. Volatile: written
     // under `lock`, read by close() without it.
     private volatile Thread revivedStartupRecoveryThread;
+    // Ownership token for the private (direct-pool) recovery driver duty.
+    // Guarded by `lock`. TRUE while some thread owns runStartupRecoveryLoop;
+    // the loop drops it transactionally on exit (re-checking the latch under
+    // the lock first -- see releaseRecoveryDriverOwnership), and
+    // reviveDirectRecoveryDriverIfNeeded() spawns a successor only when it
+    // is FALSE. Replaces a Thread.isAlive() heuristic whose read raced the
+    // driver's final latch check: a driver observed "alive" could already
+    // have committed to exit, leaving an un-latched scan ownerless until the
+    // next release event or a restart.
+    private boolean recoveryDriverRunning;
     // Driver policy captured for the re-arm path: deferred pools are driven
     // by PoolHousekeeper (never spawn private drivers); direct pools own
     // their (revivable) private driver, built via recoveryThreadFactory.
@@ -544,6 +554,9 @@ public final class SenderPool implements AutoCloseable {
                             : SenderPool::createStartupRecoveryThread;
                     recoveryThread = threadFactory.newThread(this::runStartupRecoveryLoop);
                     recoveryThread.setDaemon(true);
+                    // Ownership precedes start(): the loop's transactional
+                    // exit is the only place the token is dropped.
+                    recoveryDriverRunning = true;
                 }
             }
             this.startupRecoveryThread = recoveryThread;
@@ -609,7 +622,25 @@ public final class SenderPool implements AutoCloseable {
     }
 
     private void runStartupRecoveryLoop() {
-        while (!closed && !recoveryComplete) {
+        while (true) {
+            if (closed || Thread.currentThread().isInterrupted()) {
+                // Unconditional exits: still drop ownership so a later re-arm
+                // on a live pool can spawn a successor (the revive gate
+                // ignores a closing pool anyway).
+                releaseRecoveryDriverOwnership(false);
+                return;
+            }
+            if (recoveryComplete) {
+                // Transactional exit: re-check the latch under `lock` so an
+                // un-latch (recoverRetiredSlotAt's re-arm) cannot slip
+                // between this thread's decision to exit and its ownership
+                // drop -- the lost-wakeup race a Thread.isAlive() probe had.
+                if (releaseRecoveryDriverOwnership(true)) {
+                    return;
+                }
+                // An un-latch landed first: this thread stays the driver.
+                continue;
+            }
             boolean hasImmediateWork;
             try {
                 hasImmediateWork = runStartupRecoveryStep();
@@ -618,15 +649,34 @@ public final class SenderPool implements AutoCloseable {
                 // delegate Error must not permanently kill its only driver.
                 hasImmediateWork = false;
             }
-            if (closed || recoveryComplete) {
-                return;
-            }
-            if (!hasImmediateWork) {
+            if (!hasImmediateWork && !closed && !recoveryComplete) {
                 startupRecoveryWaiter.run();
-                if (Thread.currentThread().isInterrupted()) {
-                    return;
-                }
             }
+        }
+    }
+
+    /**
+     * Drops this thread's private-driver ownership token, transactionally
+     * against the re-arm path. With {@code recheckLatch}, an un-latch that
+     * raced this driver's exit decision is detected under {@code lock} and
+     * ownership is KEPT ({@code false} is returned; the caller keeps
+     * driving). The producer ({@link #recoverRetiredSlotAt}) clears the
+     * latch and reads {@code recoveryDriverRunning} under the same lock, so
+     * exactly one of the two parties always owns the follow-up: either this
+     * driver observes the cleared latch, or the producer observes the
+     * dropped token and spawns a successor. No interleaving leaves an
+     * un-latched scan ownerless.
+     */
+    private boolean releaseRecoveryDriverOwnership(boolean recheckLatch) {
+        lock.lock();
+        try {
+            if (recheckLatch && !closed && !recoveryComplete) {
+                return false;
+            }
+            recoveryDriverRunning = false;
+            return true;
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -2246,28 +2296,28 @@ public final class SenderPool implements AutoCloseable {
      * Deferred pools need nothing: {@code PoolHousekeeper} calls
      * {@link #runStartupRecoveryStep()} on every tick and its gate re-opens
      * with the cleared latch. A direct pool's private driver exits once the
-     * scan completes, so if neither the original nor a previously revived
-     * driver is alive, spawn a fresh one running the same loop -- it drains
-     * the backlog, re-latches, and exits; {@code close()} joins it via
-     * {@link #stopStartupRecoveryDriver}. Caller must hold {@code lock};
-     * {@code Thread.start()} is cheap enough to run under it. Best-effort: a
-     * spawn failure is logged and never propagates into the release callback
-     * that triggered the re-arm (the data stays durable for a restart). A
-     * driver observed alive here can, in principle, be exiting past its final
-     * latch check; that microscopic window degrades to the pre-fix behavior
-     * (the data waits for the next release event or a restart) and is
-     * accepted rather than risking two concurrent drivers on the
-     * driver-owned cursors.
+     * scan completes, so when no thread currently owns the driver duty
+     * ({@code recoveryDriverRunning} false), spawn a successor running the
+     * same loop -- it drains the backlog, re-latches, and exits; close()
+     * joins it via {@link #stopStartupRecoveryDriver}. Ownership is a
+     * lock-guarded token, not a {@code Thread.isAlive()} probe: the loop
+     * drops it transactionally ({@link #releaseRecoveryDriverOwnership}
+     * re-checks the latch under this same lock first), so a driver that is
+     * mid-exit either observes this caller's un-latch and keeps driving, or
+     * has already dropped the token and a successor is spawned here -- no
+     * interleaving leaves the un-latched scan ownerless. Caller must hold
+     * {@code lock}; {@code Thread.start()} is cheap enough to run under it.
+     * Best-effort: a spawn failure is logged and never propagates into the
+     * release callback that triggered the re-arm (the data stays durable
+     * for a restart).
      */
     private void reviveDirectRecoveryDriverIfNeeded() {
         if (deferStartupRecovery || closed) {
             return;
         }
-        if (startupRecoveryThread != null && startupRecoveryThread.isAlive()) {
-            return;
-        }
-        Thread revived = revivedStartupRecoveryThread;
-        if (revived != null && revived.isAlive()) {
+        if (recoveryDriverRunning) {
+            // A live driver's exit re-checks the latch under this lock, so
+            // it is guaranteed to observe the un-latch that brought us here.
             return;
         }
         try {
@@ -2276,10 +2326,11 @@ public final class SenderPool implements AutoCloseable {
                     : SenderPool::createStartupRecoveryThread;
             Thread t = factory.newThread(this::runStartupRecoveryLoop);
             t.setDaemon(true);
+            recoveryDriverRunning = true;
             revivedStartupRecoveryThread = t;
             t.start();
         } catch (Throwable e) {
-            revivedStartupRecoveryThread = null;
+            recoveryDriverRunning = false;
             LOG.warn("could not revive the startup recovery driver ({}); the released slot's "
                     + "data stays durable on disk for a later attempt or restart", e.toString());
         }
