@@ -689,3 +689,16 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
     (void) async;
     return 0;
 }
+
+/* Best-effort page pin. VirtualLock is quota-bound to the process working-set
+ * minimum; callers treat any refusal as a soft downgrade, so no
+ * SaveLastError() -- the refusal is not surfaced as an error. */
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return VirtualLock((LPVOID) (uintptr_t) addr, (SIZE_T) len) ? 0 : -1;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return VirtualUnlock((LPVOID) (uintptr_t) addr, (SIZE_T) len) ? 0 : -1;
+}

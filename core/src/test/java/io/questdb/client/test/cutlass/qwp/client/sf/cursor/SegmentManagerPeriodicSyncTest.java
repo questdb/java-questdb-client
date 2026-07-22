@@ -37,6 +37,7 @@ import org.junit.Test;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -378,10 +379,206 @@ public class SegmentManagerPeriodicSyncTest {
         });
     }
 
+    @Test
+    public void testBarrierPinsPublishedRangeAndUnpinsOnSuccess() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long segmentSize = 4096L;
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            String dir = TestUtils.createTmpDir("qdb-periodic-pin-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentRing ring = null;
+            try {
+                MmapSegment active = MmapSegment.create(
+                        filesFacade, dir + "/active.sfa", 0L, segmentSize);
+                ring = new SegmentRing(active, segmentSize);
+                assertEquals(0L, ring.appendOrFsn(payload, 16));
+
+                active.syncPublished();
+
+                assertEquals("barrier must pin the not-yet-durable range", 1, filesFacade.mlockCalls);
+                assertEquals("successful barrier must release the pin", 1, filesFacade.munlockCalls);
+                // durableCursor starts at HEADER_SIZE, which aligns down to
+                // page 0, so the pin covers [0, published).
+                assertEquals("pin must cover the whole not-yet-durable range",
+                        active.publishedOffset(), filesFacade.lastMlockLen);
+                assertEquals("success path must not re-dirty", 0L, active.redirtyPassesForTest());
+                assertTrue(active.isPublishedDurable());
+            } finally {
+                if (ring != null) {
+                    ring.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testFailedBarrierRedirtiesUnderPinBeforeUnlock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long segmentSize = 4096L;
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            String dir = TestUtils.createTmpDir("qdb-periodic-redirty-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentRing ring = null;
+            try {
+                MmapSegment active = MmapSegment.create(
+                        filesFacade, dir + "/active.sfa", 0L, segmentSize);
+                ring = new SegmentRing(active, segmentSize);
+                assertEquals(0L, ring.appendOrFsn(payload, 16));
+
+                long[] redirtyAtUnlock = new long[1];
+                filesFacade.onMunlock = () -> redirtyAtUnlock[0] = active.redirtyPassesForTest();
+                filesFacade.isFsyncFailureEnabled = true;
+                try {
+                    active.syncPublished();
+                    fail("expected the fsync failure to surface");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage().contains("sync segment file"));
+                }
+
+                assertEquals("failed barrier must re-dirty the covered range",
+                        1L, active.redirtyPassesForTest());
+                assertEquals("failed barrier must still release the pin", 1, filesFacade.munlockCalls);
+                assertEquals("re-dirty must happen BEFORE the pin is released",
+                        1L, redirtyAtUnlock[0]);
+                assertFalse("failed barrier must not advance durability", active.isPublishedDurable());
+            } finally {
+                if (ring != null) {
+                    ring.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testConsumedErrorRetryClearsLatchOnlyOverRedirtiedPages() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long intervalNanos = 100L;
+            final long segmentSize = 4096L;
+            AtomicLong ticks = new AtomicLong();
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            String dir = TestUtils.createTmpDir("qdb-periodic-fsyncgate-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentManager manager = null;
+            SegmentRing ring = null;
+            try {
+                MmapSegment active = MmapSegment.create(
+                        filesFacade, dir + "/active.sfa", 0L, segmentSize);
+                ring = new SegmentRing(active, segmentSize);
+                ring.installHotSpare(MmapSegment.create(
+                        filesFacade, dir + "/spare.sfa", 1L, segmentSize));
+                assertEquals(0L, ring.appendOrFsn(payload, 16));
+
+                manager = new SegmentManager(
+                        segmentSize,
+                        SegmentManager.DEFAULT_POLL_NANOS,
+                        segmentSize * 4L,
+                        filesFacade,
+                        ticks::get);
+                manager.register(ring, dir, null, intervalNanos);
+
+                // First tick: initial sync genuinely succeeds.
+                manager.serviceRingForTesting(ring);
+                assertTrue(active.isPublishedDurable());
+
+                // fsyncgate model: the next barrier's fsync fails once; from
+                // then on the facade behaves like the real kernel after EIO --
+                // pages clean, error consumed -- returning 0 from msync/fsync
+                // WITHOUT persisting anything.
+                assertEquals(1L, ring.appendOrFsn(payload, 16));
+                filesFacade.isFsyncGateModeEnabled = true;
+                ticks.set(intervalNanos);
+                manager.serviceRingForTesting(ring);
+                try {
+                    ring.appendOrFsn(payload, 16);
+                    fail("expected the failed data sync to latch the producer");
+                } catch (MmapSegmentException expected) {
+                }
+                assertEquals("the failed barrier must have re-dirtied its range before any vacuous retry",
+                        1L, active.redirtyPassesForTest());
+
+                // Retry pass: the facade's vacuous 0 is backed by genuinely
+                // re-dirtied pages, so unlatching is honest. Without the
+                // re-dirty (the C-1 mutant) this scenario is exactly the
+                // unsound clear: latch gone, durableCursor advanced, nothing
+                // persisted and no dirty page left for any future barrier.
+                ticks.set(intervalNanos * 2L);
+                manager.serviceRingForTesting(ring);
+                assertTrue(active.isPublishedDurable());
+                assertEquals("producer must resume after the covered retry",
+                        2L, ring.appendOrFsn(payload, 16));
+            } finally {
+                if (manager != null && ring != null) {
+                    manager.deregister(ring);
+                }
+                if (ring != null) {
+                    ring.close();
+                }
+                if (manager != null) {
+                    manager.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
+    @Test
+    public void testMlockRefusalDegradesWithoutAffectingBarrier() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long segmentSize = 4096L;
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            filesFacade.isMlockRefusalEnabled = true;
+            String dir = TestUtils.createTmpDir("qdb-periodic-mlock-refusal-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentRing ring = null;
+            try {
+                MmapSegment active = MmapSegment.create(
+                        filesFacade, dir + "/active.sfa", 0L, segmentSize);
+                ring = new SegmentRing(active, segmentSize);
+                assertEquals(0L, ring.appendOrFsn(payload, 16));
+
+                int msyncBefore = filesFacade.msyncCalls;
+                int fsyncBefore = filesFacade.fsyncCalls;
+                active.syncPublished();
+
+                assertEquals("refused pin must not skip the mapping barrier",
+                        msyncBefore + 1, filesFacade.msyncCalls);
+                assertEquals("refused pin must not skip the fd barrier",
+                        fsyncBefore + 1, filesFacade.fsyncCalls);
+                assertEquals(1, filesFacade.mlockCalls);
+                assertEquals("a refused pin must not be unlocked", 0, filesFacade.munlockCalls);
+                assertTrue("refusal must not affect the barrier outcome", active.isPublishedDurable());
+                assertEquals(0L, active.redirtyPassesForTest());
+                assertEquals("producer must remain unaffected", 1L, ring.appendOrFsn(payload, 16));
+            } finally {
+                if (ring != null) {
+                    ring.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
     private static final class CountingFilesFacade implements FilesFacade {
         private boolean isFsyncFailureEnabled;
+        // fsyncgate model: the first fsync fails; afterwards every msync and
+        // fsync returns 0 WITHOUT delegating to the real syscall -- the
+        // kernel-accurate shape of a vacuous retry after a consumed EIO
+        // (clean pages, seen errseq cursor).
+        private boolean isFsyncGateModeEnabled;
+        private boolean fsyncGateErrorConsumed;
+        private boolean isMlockRefusalEnabled;
         private int fsyncCalls;
         private int msyncCalls;
+        private int mlockCalls;
+        private int munlockCalls;
+        private long lastMlockLen;
+        private Runnable onMunlock;
 
         @Override
         public boolean allocate(int fd, long size) {
@@ -436,6 +633,13 @@ public class SegmentManagerPeriodicSyncTest {
         @Override
         public int fsync(int fd) {
             fsyncCalls++;
+            if (isFsyncGateModeEnabled) {
+                if (!fsyncGateErrorConsumed) {
+                    fsyncGateErrorConsumed = true;
+                    return -1;
+                }
+                return 0;
+            }
             return isFsyncFailureEnabled ? -1 : INSTANCE.fsync(fd);
         }
 
@@ -465,9 +669,30 @@ public class SegmentManagerPeriodicSyncTest {
         }
 
         @Override
+        public int mlock(long addr, long len) {
+            mlockCalls++;
+            lastMlockLen = len;
+            return isMlockRefusalEnabled ? -1 : 0;
+        }
+
+        @Override
         public int msync(long addr, long len, boolean async) {
             msyncCalls++;
+            if (isFsyncGateModeEnabled && fsyncGateErrorConsumed) {
+                // consumed-error semantics: no dirty pages, seen errseq -> 0
+                return 0;
+            }
             return INSTANCE.msync(addr, len, async);
+        }
+
+        @Override
+        public int munlock(long addr, long len) {
+            munlockCalls++;
+            Runnable hook = onMunlock;
+            if (hook != null) {
+                hook.run();
+            }
+            return 0;
         }
 
         @Override

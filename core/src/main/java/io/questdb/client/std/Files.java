@@ -573,6 +573,53 @@ public final class Files {
      */
     public static native int msync(long addr, long len, boolean async);
 
+    // Guards the optional mlock/munlock natives: a packaged native library
+    // built before these symbols existed throws UnsatisfiedLinkError on first
+    // use. Flip to unavailable and report refusal (-1) from then on, so
+    // callers degrade to their unpinned tier instead of crashing.
+    private static volatile boolean mlockLinked = true;
+
+    /**
+     * Best-effort page pin over {@code [addr, addr+len)} of an mmap'd region.
+     * Whole pages containing any part of the range are locked; {@code addr}
+     * should be page-aligned for portability. Returns 0 on success, -1 when
+     * the platform refuses (RLIMIT_MEMLOCK, missing privilege) or the loaded
+     * native library predates the symbol. Callers must treat refusal as a
+     * soft downgrade, never an error.
+     */
+    public static int mlock(long addr, long len) {
+        if (!mlockLinked) {
+            return -1;
+        }
+        try {
+            return mlock0(addr, len);
+        } catch (UnsatisfiedLinkError err) {
+            mlockLinked = false;
+            return -1;
+        }
+    }
+
+    /**
+     * Releases a pin taken by {@link #mlock(long, long)}. Best-effort: a
+     * refusal is ignorable ({@code munmap} implicitly drops any remaining
+     * locks on the range).
+     */
+    public static int munlock(long addr, long len) {
+        if (!mlockLinked) {
+            return -1;
+        }
+        try {
+            return munlock0(addr, len);
+        } catch (UnsatisfiedLinkError err) {
+            mlockLinked = false;
+            return -1;
+        }
+    }
+
+    private static native int mlock0(long addr, long len);
+
+    private static native int munlock0(long addr, long len);
+
     /**
      * Returns a native pointer to the current entry's null-terminated name
      * (UTF-8). Pointer is valid only until the next {@link #findNext(long)}

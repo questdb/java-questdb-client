@@ -31,8 +31,11 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One mmap-backed SF segment file. The user thread (the single producer)
@@ -68,6 +71,10 @@ public final class MmapSegment implements QuietCloseable {
     public static final byte MANIFEST_REQUIRED_FLAG = 1;
     public static final byte VERSION = 1;
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
+    // Deduplicates the process-wide "mlock refused" warning: the refusal is a
+    // soft downgrade (see syncPublished) and must not spam the log once per
+    // barrier when RLIMIT_MEMLOCK or the platform says no.
+    private static final AtomicBoolean MLOCK_REFUSAL_WARNED = new AtomicBoolean();
     private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
@@ -103,6 +110,9 @@ public final class MmapSegment implements QuietCloseable {
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
     private volatile long publishedCursor;
+    // Number of failure-arm re-dirty passes performed by syncPublished.
+    // Cold-path only; volatile so tests observing from another thread see it.
+    private volatile long redirtyPasses;
     // Monotonic in-memory link to the segment that immediately follows this
     // one. SegmentRing publishes it before promoting the successor to active;
     // close deliberately retains it so a cursor can advance after head trim.
@@ -486,6 +496,21 @@ public final class MmapSegment implements QuietCloseable {
      * captures {@link #publishedCursor}. A concurrent producer may publish
      * more bytes while the barrier runs; those bytes remain outside the
      * returned durable boundary until a later call.
+     * <p>
+     * The not-yet-durable range is pinned with a best-effort {@code mlock}
+     * for the duration of the barrier and, on failure, re-dirtied before the
+     * pin is released. Rationale (fsyncgate): after a failed writeback the
+     * kernel marks the affected pages clean and reports the error once per
+     * open file description, so a naive retry would msync+fsync clean pages
+     * and return a vacuous 0 without persisting anything -- and an unpinned
+     * clean page can be reclaimed and later re-faulted from stale disk
+     * content, silently replacing the only good copy of the frames. The pin
+     * guarantees the failure arm re-dirties the genuine in-memory bytes; the
+     * re-dirty guarantees the next barrier performs real writeback and
+     * reports real errors, so the manager's unlatch-on-success stays honest.
+     * A refused mlock (RLIMIT_MEMLOCK, missing capability, stale native
+     * library) never affects the barrier outcome; it only widens the
+     * microseconds-scale window between the failed syscall and the re-dirty.
      *
      * @return the captured byte offset covered by the successful barrier
      */
@@ -498,16 +523,55 @@ public final class MmapSegment implements QuietCloseable {
         if (published <= durableCursor) {
             return durableCursor;
         }
-        if (filesFacade.msync(mmapAddress, published, false) != 0) {
-            throw new MmapSegmentException("could not sync segment data " + path);
+        long lockOffset = durableCursor & -Files.PAGE_SIZE;
+        long lockAddr = mmapAddress + lockOffset;
+        long lockLen = published - lockOffset;
+        boolean locked = filesFacade.mlock(lockAddr, lockLen) == 0;
+        if (!locked && MLOCK_REFUSAL_WARNED.compareAndSet(false, true)) {
+            LOG.warn("mlock refused for SF barrier range in {} (degrading to re-dirty-only retry protection); "
+                    + "raise RLIMIT_MEMLOCK or grant CAP_IPC_LOCK to close the post-failure reclaim window", path);
         }
-        // FlushViewOfFile alone is not power-loss durable on Windows. Keep the
-        // fd barrier on every platform so this method has one portable contract.
-        if (filesFacade.fsync(fd) != 0) {
-            throw new MmapSegmentException("could not sync segment file " + path);
+        boolean durable = false;
+        try {
+            if (filesFacade.msync(mmapAddress, published, false) != 0) {
+                throw new MmapSegmentException("could not sync segment data " + path);
+            }
+            // FlushViewOfFile alone is not power-loss durable on Windows. Keep the
+            // fd barrier on every platform so this method has one portable contract.
+            if (filesFacade.fsync(fd) != 0) {
+                throw new MmapSegmentException("could not sync segment file " + path);
+            }
+            durable = true;
+            durableCursor = published;
+            return published;
+        } finally {
+            if (!durable) {
+                redirtyRange(lockAddr, mmapAddress + published);
+            }
+            if (locked) {
+                filesFacade.munlock(lockAddr, lockLen);
+            }
         }
-        durableCursor = published;
-        return published;
+    }
+
+    /**
+     * Marks every page overlapping {@code [fromAddr, endAddr)} dirty again by
+     * re-storing one byte per page. Every touched offset lies inside the
+     * published prefix (or the immutable header magic after aligning down),
+     * so the same-value store races with nothing; kernel dirty tracking is
+     * value-blind, so the store is a real dirtying event that forces the next
+     * writeback to re-submit the whole page.
+     */
+    private void redirtyRange(long fromAddr, long endAddr) {
+        for (long addr = fromAddr; addr < endAddr; addr += Files.PAGE_SIZE) {
+            Unsafe.getUnsafe().putByte(addr, Unsafe.getUnsafe().getByte(addr));
+        }
+        redirtyPasses++;
+    }
+
+    @TestOnly
+    public long redirtyPassesForTest() {
+        return redirtyPasses;
     }
 
     /**

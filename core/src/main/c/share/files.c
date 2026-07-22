@@ -388,3 +388,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
         (JNIEnv *e, jclass cl, jlong addr, jlong len, jboolean async) {
     return msync((void *) (uintptr_t) addr, (size_t) len, async ? MS_ASYNC : MS_SYNC);
 }
+
+/* Best-effort page pin. Callers treat a refusal (RLIMIT_MEMLOCK, missing
+ * privilege) as a soft downgrade, so no errno capture is required here. */
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return mlock((void *) (uintptr_t) addr, (size_t) len);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return munlock((void *) (uintptr_t) addr, (size_t) len);
+}

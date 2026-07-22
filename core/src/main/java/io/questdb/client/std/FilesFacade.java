@@ -108,12 +108,30 @@ public interface FilesFacade {
 
     int mkdir(String path, int mode);
 
+    /**
+     * Best-effort page pin over {@code [addr, addr+len)} of an mmap'd region.
+     * Returns 0 when the range is locked, non-zero when the platform refuses
+     * (RLIMIT_MEMLOCK, missing privilege, or a native library without the
+     * symbol). Callers must treat refusal as a soft downgrade, never an error.
+     */
+    default int mlock(long addr, long len) {
+        return Files.mlock(addr, len);
+    }
+
     default long mmap(int fd, long len, long offset, int flags, int memoryTag) {
         return Files.mmap(fd, len, offset, flags, memoryTag);
     }
 
     default int msync(long addr, long len, boolean async) {
         return Files.msync(addr, len, async);
+    }
+
+    /**
+     * Releases a pin taken by {@link #mlock(long, long)}. Best-effort;
+     * refusals are ignorable ({@code munmap} implicitly unlocks).
+     */
+    default int munlock(long addr, long len) {
+        return Files.munlock(addr, len);
     }
 
     default void munmap(long address, long len, int memoryTag) {

@@ -1224,9 +1224,12 @@ public final class SegmentManager implements QuietCloseable {
                 syncScratch.getQuick(i).syncPublished();
             }
             e.ring.clearSyncRequestIfActiveDurable();
-            // The pass above covered every live segment's published range, so
-            // any earlier barrier failure has been remedied — unlatch it so a
-            // transient disk fault doesn't permanently brick the producer.
+            // The pass above covered every live segment's published range, and
+            // a failed barrier re-dirties its range under an mlock pin (see
+            // MmapSegment.syncPublished), so a success here is a genuine
+            // re-persist -- not a vacuous retry over pages a failed writeback
+            // marked clean (fsyncgate). Unlatch so a transient disk fault
+            // doesn't permanently brick the producer.
             e.ring.clearDurabilityFailure();
             e.nextDataSyncNanos = now + e.syncIntervalNanos;
             if (e.syncFailureLogged) {
