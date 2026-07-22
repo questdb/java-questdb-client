@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfSanitizedResidueException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Misc;
@@ -515,6 +516,9 @@ public class SegmentRingTest {
                     Misc.free(SegmentRing.openExisting(tmpDir, segSize));
                     throw new AssertionError("poisoned sealed suffix must fail closed on first sight");
                 } catch (MmapSegmentException expected) {
+                    assertTrue("first-sight throw must be the healed-residue refinement so "
+                                    + "unattended callers can retry: " + expected.getClass().getName(),
+                            expected instanceof SfSanitizedResidueException);
                     assertTrue(expected.getMessage(),
                             expected.getMessage().contains("corrupt torn tail in sealed SF segment"));
                 }

@@ -784,10 +784,13 @@ public final class SegmentRing implements QuietCloseable {
      * fails recovery before any mutation, preserving the bytes (potentially
      * the only copy of unreachable valid-CRC frames) for operator
      * extraction. With {@code failClosedOnSight} the incident is still
-     * surfaced as a first-sight startup failure after sanitizing (the
-     * restart then proves the chain clean); without it the chain proceeds
-     * immediately (legacy migration, which predates the sealed-suffix
-     * contract).
+     * surfaced as a first-sight {@link SfSanitizedResidueException} after
+     * sanitizing: the residue is already durably zeroed when it propagates,
+     * so a retry proves the chain clean (attended callers get that via
+     * restart; unattended callers key off the distinct type to retry
+     * instead of quarantining a just-healed slot). Without the flag the
+     * chain proceeds immediately (legacy migration, which predates the
+     * sealed-suffix contract).
      */
     private static void sanitizeSealedResidue(ObjList<MmapSegment> chain, boolean failClosedOnSight) {
         String firstTornPath = null;
@@ -801,7 +804,7 @@ public final class SegmentRing implements QuietCloseable {
             }
         }
         if (failClosedOnSight && firstTornPath != null) {
-            throw new SfRecoveryException("corrupt torn tail in sealed SF segment " + firstTornPath);
+            throw new SfSanitizedResidueException("corrupt torn tail in sealed SF segment " + firstTornPath);
         }
     }
 

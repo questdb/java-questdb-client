@@ -29,8 +29,14 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
  * segment chain is corrupt or incomplete and requires operator intervention.
  * Operational filesystem failures continue to use {@link MmapSegmentException}
  * so callers can retry them without quarantining otherwise recoverable data.
+ * <p>
+ * One refinement is deliberately non-terminal for unattended callers:
+ * {@link SfSanitizedResidueException} marks a first-sight failure thrown
+ * AFTER recovery durably healed the chain, so a single retry validates
+ * clean. Catch sites that quarantine on this type must intercept the
+ * refinement first.
  */
-public final class SfRecoveryException extends MmapSegmentException {
+public class SfRecoveryException extends MmapSegmentException {
 
     public SfRecoveryException(String message) {
         super(message);

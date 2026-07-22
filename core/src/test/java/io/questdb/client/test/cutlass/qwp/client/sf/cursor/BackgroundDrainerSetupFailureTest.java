@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -193,6 +194,116 @@ public class BackgroundDrainerSetupFailureTest {
                     Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
             Assert.assertTrue("corrupt segment evidence must remain on disk",
                     Files.exists(segmentPath));
+        });
+    }
+
+    @Test
+    public void testSealedResidueFirstSightHealsAndDoesNotQuarantine() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A sealed member whose frame accounting is complete but whose
+            // suffix gap carries legacy pre-sanitization poison. Recovery
+            // durably zeroes the residue BEFORE failing closed on first
+            // sight (SegmentRing's sanitize-then-throw), so at the instant
+            // the drainer sees the throw the chain on disk is already
+            // healed. The drainer must retry construction over the healed
+            // chain and reach connect -- not strand the replayable backlog
+            // behind a .failed sentinel that no orphan scan revisits.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
+                    + 12; // sealed suffix gap that can never fit a frame
+            String p0Path = slotPath + "/p0.sfa";
+            String p1Path = slotPath + "/p1.sfa";
+            long gapStart;
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().setMemory(buf, 16, (byte) 5);
+                MmapSegment s0 = MmapSegment.create(p0Path, 0, segSize);
+                for (int i = 0; i < 4; i++) {
+                    s0.tryAppend(buf, 16);
+                }
+                gapStart = s0.publishedOffset();
+                s0.close();
+                MmapSegment s1 = MmapSegment.create(p1Path, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            // Adopt the chain once so the slot carries a manifest, lock and
+            // watermark like any real producer slot (without a manifest the
+            // legacy-migration path sanitizes silently and never fails
+            // closed); close releases the lock.
+            try (CursorSendEngine seed = new CursorSendEngine(slotPath, segSize)) {
+                Assert.assertEquals("highest published FSN must cover frames 0..4",
+                        4L, seed.publishedFsn());
+            }
+
+            // Poison the sealed suffix gap the way a pre-sanitization
+            // client's reseal-after-recovery did.
+            int fd = Files.openRW(p0Path);
+            Assert.assertTrue("openRW must succeed", fd >= 0);
+            long junk = Unsafe.malloc(12, MemoryTag.NATIVE_DEFAULT);
+            try {
+                for (int i = 0; i < 3; i++) {
+                    Unsafe.getUnsafe().putInt(junk + i * 4L, 0xCAFEBABE);
+                }
+                Assert.assertEquals(12L, Files.write(fd, junk, 12, gapStart));
+                Files.fsync(fd);
+            } finally {
+                Unsafe.free(junk, 12, MemoryTag.NATIVE_DEFAULT);
+                Files.close(fd);
+            }
+
+            LinkageError injected = new LinkageError("injected drainer connect error");
+            AtomicInteger connectAttempts = new AtomicInteger();
+            BackgroundDrainer drainer = new BackgroundDrainer(
+                    slotPath,
+                    segSize,
+                    Long.MAX_VALUE,
+                    () -> {
+                        connectAttempts.incrementAndGet();
+                        throw injected;
+                    },
+                    5_000L,
+                    1L,
+                    10L,
+                    true,
+                    200L);
+
+            LinkageError thrown = null;
+            try {
+                drainer.run();
+            } catch (LinkageError e) {
+                thrown = e;
+            }
+
+            // The heal precedes the first-sight throw: frames intact,
+            // residue durably zeroed. This holds with or without the
+            // drainer fix -- it is exactly what makes quarantine wrong.
+            try (MmapSegment sealed = MmapSegment.openExisting(p0Path)) {
+                Assert.assertEquals("frames must be untouched", 4L, sealed.frameCount());
+                Assert.assertEquals("proven-dead residue must be zeroed on disk",
+                        0L, sealed.tornTailBytes());
+            }
+
+            Assert.assertSame("drainer must reach connect over the healed chain",
+                    injected, thrown);
+            Assert.assertEquals("exactly one connect attempt after the healed retry",
+                    1, connectAttempts.get());
+            TestUtils.assertContains(drainer.getLastErrorMessage(),
+                    "injected drainer connect error");
+            Assert.assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            Assert.assertFalse("a just-healed slot must not be quarantined",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            Assert.assertTrue("replayable backlog must remain scanner-eligible",
+                    OrphanScanner.isCandidateOrphan(slotPath));
+            try (CursorSendEngine engine = new CursorSendEngine(slotPath, segSize)) {
+                Assert.assertEquals("backlog must remain fully replayable",
+                        4L, engine.publishedFsn());
+                Assert.assertTrue("drainer teardown must release the slot lock",
+                        OrphanScanner.isCandidateOrphan(slotPath));
+            }
         });
     }
 

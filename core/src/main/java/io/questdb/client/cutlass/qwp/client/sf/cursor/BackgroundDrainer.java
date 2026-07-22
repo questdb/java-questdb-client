@@ -560,9 +560,29 @@ public final class BackgroundDrainer implements Runnable {
             // holds it, the engine constructor throws and we exit silently
             // (no .failed sentinel — contention is expected, not an error).
             try {
-                engine = new CursorSendEngine(slotPath, segmentSizeBytes,
-                        sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
-                        syncIntervalNanos);
+                try {
+                    engine = new CursorSendEngine(slotPath, segmentSizeBytes,
+                            sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                            syncIntervalNanos);
+                } catch (SfSanitizedResidueException first) {
+                    // First sight of proven-dead sealed residue: recovery
+                    // durably zeroed it BEFORE failing closed, so the chain
+                    // on disk is already healed and a .failed sentinel here
+                    // would strand a replayable backlog no scan revisits
+                    // (the sentinel gates isCandidateOrphan and nothing in
+                    // production clears it). Retry once over the healed
+                    // chain; the WARN keeps the incident surfaced. Any
+                    // failure of the retry is genuine and takes the normal
+                    // classification below -- including a repeat of this
+                    // type, which the SfRecoveryException arm then treats
+                    // as the terminal quarantine a non-sticking heal is.
+                    LOG.warn("drainer slot {}: sealed SF residue sanitized during recovery ({}); "
+                                    + "retrying engine construction over the healed chain",
+                            slotPath, first.getMessage());
+                    engine = new CursorSendEngine(slotPath, segmentSizeBytes,
+                            sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                            syncIntervalNanos);
+                }
             } catch (SlotLockContentionException t) {
                 LOG.info("orphan slot already locked, skipping: {} ({})",
                         slotPath, t.getMessage());

@@ -36,7 +36,9 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
  * <b>positively-identified corruption</b> in one file's own bytes, which
  * recovery may quarantine when the surviving chain proves safe; and
  * {@link SfRecoveryException} marks a <b>terminal chain failure</b> that needs
- * operator intervention.
+ * operator intervention (with one self-healed refinement,
+ * {@link SfSanitizedResidueException}, that unattended callers retry once
+ * instead of quarantining).
  */
 public class MmapSegmentException extends RuntimeException {
     public MmapSegmentException(String message) {
