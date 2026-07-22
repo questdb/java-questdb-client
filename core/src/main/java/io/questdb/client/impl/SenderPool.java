@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.IntList;
@@ -933,6 +934,29 @@ public final class SenderPool implements AutoCloseable {
         try {
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
                 return RecoveryDrainOutcome.DRAINED;
+            }
+            // O(1) contention pre-probe (flock only). A slot parked as
+            // CONTENDED is re-probed on every retry cycle for as long as its
+            // live owner runs -- potentially that owner's whole lifetime --
+            // and the full recovery build below (config re-parse, builder
+            // graph, parent-dir fsync barriers in periodic durability, owned
+            // SegmentManager allocation) would exist only to reach
+            // SlotLock.acquire and throw. Ask the flock directly first so
+            // the steady-state cost of a held slot is a few syscalls per
+            // cycle, not a build. Races are benign in both directions: a
+            // free probe can still lose the acquire inside the build (the
+            // contention catch below parks exactly as before), and a held
+            // probe that goes stale is re-observed on the next cycle. An
+            // indeterminate probe (null) falls through to the build, which
+            // owns real error classification.
+            String probedHolder = SlotLock.probeHolder(slotPath);
+            if (probedHolder != null) {
+                if (warnSlotOnce(slotIndex)) {
+                    LOG.warn("startup SF recovery: slot {} is held by another live owner (holder={}); "
+                            + "parking it and continuing with the remaining slots",
+                            slotPath, probedHolder);
+                }
+                return RecoveryDrainOutcome.CONTENDED;
             }
             try {
                 // Recovery delegate: forced OFF-mode initial connect (see

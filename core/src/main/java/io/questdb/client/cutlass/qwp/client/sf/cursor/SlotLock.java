@@ -136,6 +136,57 @@ public final class SlotLock implements QuietCloseable {
     }
 
     /**
+     * Side-effect-light contention probe: reports the current holder of the
+     * slot flock without creating the slot dir or lock file and without
+     * paying a full engine build. Opens the existing {@code .lock} file
+     * (absent means nothing can hold a flock on it), try-locks it
+     * non-blocking, and releases immediately on success.
+     * <p>
+     * Returns a non-null holder description (the {@code .lock.pid} payload,
+     * or {@code "unknown"}) when the flock is currently held by a live
+     * owner; {@code null} when the lock is free or the probe could not
+     * determine state (missing lock file, open failure). Callers must treat
+     * {@code null} as "proceed to a full acquire", which owns real error
+     * classification -- the probe never throws.
+     * <p>
+     * Races are benign in both directions: a free probe can still lose the
+     * subsequent acquire to a concurrent owner (the caller handles that
+     * contention exactly as before), and a held probe that goes stale the
+     * moment the owner exits is simply re-observed on the caller's next
+     * cycle. The probe's momentary hold can make a concurrent acquirer see
+     * spurious contention -- the same class of race two real contenders
+     * already have.
+     */
+    public static String probeHolder(String slotDir) {
+        if (slotDir == null || slotDir.isEmpty()) {
+            return null;
+        }
+        // Same pre-step as acquire(): a lock retained by THIS process after
+        // an unconfirmed unlock would otherwise read as a live holder for as
+        // long as the retry list carries it.
+        retryPendingReleases();
+        String lockPath = slotDir + "/" + LOCK_FILE_NAME;
+        if (!Files.exists(lockPath)) {
+            return null;
+        }
+        int fd = Files.openRW(lockPath);
+        if (fd < 0) {
+            return null;
+        }
+        if (Files.lock(fd) != 0) {
+            String holder = readHolder(slotDir + "/" + LOCK_PID_FILE_NAME);
+            Files.close(fd);
+            return holder;
+        }
+        // The flock was free and is momentarily ours. Route the release
+        // through the standard close() so an unconfirmed unlock is retained
+        // on the retry list exactly like a normal owner's -- a probe must
+        // never leak a held flock.
+        new SlotLock(slotDir, fd).close();
+        return null;
+    }
+
+    /**
      * Replaces the live descriptor with a known-dead value until the returned
      * guard closes. Test-only: exercises release retry paths without exposing
      * mutable descriptor state.

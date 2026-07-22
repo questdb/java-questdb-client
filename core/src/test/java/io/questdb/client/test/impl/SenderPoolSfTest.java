@@ -36,6 +36,8 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
@@ -3838,6 +3840,86 @@ public class SenderPoolSfTest {
             Thread.sleep(10);
         }
         return counter.get() >= target;
+    }
+
+    @Test
+    public void testContendedSlotReprobeUsesFlockProbeNotFullBuild() throws Exception {
+        // A slot whose flock is held by another LIVE owner is parked and
+        // re-probed on every retry cycle -- potentially for the owner's whole
+        // lifetime. The re-probe must ask the flock directly (O(1) probe,
+        // a few syscalls), not pay a full recovery build (config re-parse,
+        // builder graph, parent-dir fsync barriers in periodic durability,
+        // owned SegmentManager allocation) per cycle just to reach
+        // SlotLock.acquire and throw.
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+            String slot0 = slot("default-0");
+
+            // Seed one unacked frame so slot 0 is a candidate orphan. The
+            // group root normally comes from Sender.build(); this test seeds
+            // the slot directly, so create the parent first (mkdir in
+            // SlotLock.acquire is non-recursive).
+            Assert.assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine seed = new CursorSendEngine(slot0, 1 << 20)) {
+                Unsafe.getUnsafe().setMemory(buf, 16, (byte) 1);
+                Assert.assertEquals(0L, seed.appendBlocking(buf, 16));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+            Assert.assertTrue("seeded slot must be a candidate orphan",
+                    OrphanScanner.isCandidateOrphan(slot0));
+
+            AtomicInteger builds = new AtomicInteger();
+            IntFunction<Sender> factory = idx -> {
+                builds.incrementAndGet();
+                // Fidelity with the production build: the recovery build's
+                // fate is decided by the real slot flock, exactly like
+                // defaultRecoverySender's engine construction.
+                SlotLock lock = SlotLock.acquire(slot("default-" + idx));
+                return (Sender) Proxy.newProxyInstance(
+                        Sender.class.getClassLoader(),
+                        new Class[]{Sender.class},
+                        (proxy, method, args) -> {
+                            if ("drain".equals(method.getName())) {
+                                return Boolean.TRUE;
+                            }
+                            if ("close".equals(method.getName())) {
+                                lock.close();
+                                return null;
+                            }
+                            throw new AssertionError(
+                                    "unexpected recovery sender call: " + method.getName());
+                        });
+            };
+
+            SlotLock held = SlotLock.acquire(slot0);
+            try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 5_000, factory)) {
+                // Steady-state re-probe of a parked contended slot: three
+                // full cycles while the flock is held.
+                for (int cycle = 0; cycle < 3; cycle++) {
+                    Assert.assertFalse("a cycle with only a contended slot must defer",
+                            pool.runStartupRecoveryStepForTesting());
+                }
+                Assert.assertEquals("re-probing a contended slot must be a flock probe, "
+                        + "not a full recovery build per cycle", 0, builds.get());
+                Assert.assertTrue("parked slot must keep its durable data",
+                        hasSegmentFile(slot0));
+
+                // The probe must not dampen recovery: once the owner lets
+                // go, the very next cycle pays exactly one real build and
+                // drains the slot.
+                held.close();
+                Assert.assertTrue("released slot must be recovered on the next cycle",
+                        pool.runStartupRecoveryStepForTesting());
+                Assert.assertEquals("released slot must be recovered with exactly one build",
+                        1, builds.get());
+                Assert.assertFalse("final scan step must mark recovery complete",
+                        pool.runStartupRecoveryStepForTesting());
+            } finally {
+                held.close(); // idempotent when already released
+            }
+        });
     }
 
     private static boolean awaitNoSegmentFile(String slotPath, long timeoutMillis)
