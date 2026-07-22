@@ -191,6 +191,18 @@ public final class SenderPool implements AutoCloseable {
     // leave this null.
     private final Object startupRecoverySignal = new Object();
     private final Thread startupRecoveryThread;
+    // Revived direct-pool recovery driver: spawned by recoverRetiredSlotAt()
+    // when a retired slot's late flock release re-arms an already-latched
+    // scan on a pool whose original private driver has exited. Deferred
+    // pools re-arm through the PoolHousekeeper tick instead and never spawn
+    // one. Joined by stopStartupRecoveryDriver() on close. Volatile: written
+    // under `lock`, read by close() without it.
+    private volatile Thread revivedStartupRecoveryThread;
+    // Driver policy captured for the re-arm path: deferred pools are driven
+    // by PoolHousekeeper (never spawn private drivers); direct pools own
+    // their (revivable) private driver, built via recoveryThreadFactory.
+    private final boolean deferStartupRecovery;
+    private final ThreadFactory recoveryThreadFactory;
     // Test-only constructor seam for the failed-retry operation. Production
     // uses waitForStartupRecoveryRetry(), which performs the one-second signal
     // wait; lifecycle tests inject an event barrier without wall-clock checks.
@@ -290,6 +302,13 @@ public final class SenderPool implements AutoCloseable {
     // A RETIRED index whose dir still holds data is deferred the same way on
     // every walk (see the reserved-skip branch in recoverOneSlotStep) so the
     // latch can never strand a retired slot's data while the pool lives.
+    // If the retire lands only AFTER the scan latched (a runtime
+    // discardBroken/reapIdle reclaim), the late flock release re-arms the
+    // scan instead: recoverRetiredSlotAt() rewinds the cursors and clears
+    // recoveryComplete -- volatile, so the un-latch (written under `lock` by
+    // release callbacks and reprobes) is visible to the unlocked driver
+    // gates -- and, for direct pools whose private driver already exited,
+    // revives the driver. Deferred pools re-arm through the housekeeper tick.
     // recoveryFailStreak/-Slot track consecutive failures on one candidate;
     // recoveryWarnedSlots dedups the per-slot WARNs so an indefinitely
     // retried slot logs once per failure episode, not once per retry. All of
@@ -297,7 +316,18 @@ public final class SenderPool implements AutoCloseable {
     private int recoveryInRangeNext;
     private IntList recoveryOutOfRange;
     private int recoveryOutOfRangeNext;
-    private boolean recoveryComplete;
+    private volatile boolean recoveryComplete;
+    // Set by recoverRetiredSlotAt() whenever a released retired slot's dir is
+    // still a candidate orphan, and consumed (under `lock`) by the scan's
+    // end-of-cycle latch decision. Closes the mid-cycle window: a retire AND
+    // its release can both land while the scan is alive but after the cursor
+    // already passed that index (it was LIVE when walked -- no retired-
+    // candidate deferral -- and recoveryComplete was still false at release,
+    // so the post-latch re-arm does not apply). Without this flag such a
+    // cycle could end with zero deferrals and latch past the freed dir's
+    // stranded data. Producer and consumer both run under `lock`, so no
+    // set can slip between the driver's check and its latch write.
+    private volatile boolean recoveryRearmRequested;
     private int recoveryDeferredThisCycle;
     private int recoveryFailStreak;
     private int recoveryFailStreakSlot = -1;
@@ -455,6 +485,8 @@ public final class SenderPool implements AutoCloseable {
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.postFactoryHook = postFactoryHook;
         this.beforeFailedStartupRecoveryJoinHook = beforeFailedRecoveryJoinHook;
+        this.deferStartupRecovery = deferStartupRecovery;
+        this.recoveryThreadFactory = recoveryThreadFactory;
         this.startupRecoveryWaiter = recoveryWaiter != null
                 ? recoveryWaiter
                 : this::waitForStartupRecoveryRetry;
@@ -912,7 +944,26 @@ public final class SenderPool implements AutoCloseable {
             recoveryOutOfRangeNext = 0;
             return false;
         }
-        recoveryComplete = true;
+        // Latch decision under `lock`: a mid-cycle flock release can free a
+        // still-candidate dir AFTER this cycle's cursor passed its index (it
+        // was live/retired at walk time -- no deferral) and BEFORE the latch
+        // (so the post-latch re-arm in recoverRetiredSlotAt does not apply
+        // either). recoverRetiredSlotAt raises recoveryRearmRequested under
+        // the same lock, so consuming it here mutually excludes the race: no
+        // release can slip between this check and the latch write.
+        lock.lock();
+        try {
+            if (recoveryRearmRequested) {
+                recoveryRearmRequested = false;
+                recoveryDeferredThisCycle = 0;
+                recoveryInRangeNext = 0;
+                recoveryOutOfRangeNext = 0;
+                return false;
+            }
+            recoveryComplete = true;
+        } finally {
+            lock.unlock();
+        }
         return false;
     }
 
@@ -1583,19 +1634,30 @@ public final class SenderPool implements AutoCloseable {
     }
 
     private void stopStartupRecoveryDriver() {
-        if (startupRecoveryThread == null || startupRecoveryThread == Thread.currentThread()) {
-            return;
+        if (startupRecoveryThread != null && startupRecoveryThread != Thread.currentThread()) {
+            if (beforeStartupRecoveryJoinHook != null) {
+                beforeStartupRecoveryJoinHook.run();
+            }
+            try {
+                startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            if (afterStartupRecoveryJoinHook != null) {
+                afterStartupRecoveryJoinHook.run();
+            }
         }
-        if (beforeStartupRecoveryJoinHook != null) {
-            beforeStartupRecoveryJoinHook.run();
-        }
-        try {
-            startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        if (afterStartupRecoveryJoinHook != null) {
-            afterStartupRecoveryJoinHook.run();
+        // A revived driver (late-release re-arm on a direct pool; see
+        // reviveDirectRecoveryDriverIfNeeded) is joined with the same bound:
+        // `closed` is already raised, so its loop exits on the next waiter
+        // wake-up, within RECOVERY_RETRY_INTERVAL_MILLIS < STOP_TIMEOUT.
+        Thread revived = revivedStartupRecoveryThread;
+        if (revived != null && revived != Thread.currentThread()) {
+            try {
+                revived.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -2019,7 +2081,10 @@ public final class SenderPool implements AutoCloseable {
      * capacity and no borrow reuses the still-locked dir unless
      * {@link #reprobeRetiredSlots} later observes the deferred cleanup's
      * release and recovers the index. Either way {@code closingSlots} is
-     * decremented.
+     * decremented. A later release that frees a dir still holding unacked
+     * data also re-arms the startup recovery scan (see
+     * {@link #recoverRetiredSlotAt}) so the data is drained in-process
+     * instead of waiting for a restart or a lucky borrow of that index.
      * <p>
      * Caller must hold {@code lock} and is responsible for signalling waiters
      * (only the free path admits a new creation). Shared by
@@ -2137,6 +2202,87 @@ public final class SenderPool implements AutoCloseable {
         LOG.info("SF slot {} recovered: deferred cleanup released the flock after retirement; " +
                         "pool capacity restored, now {} of {} usable [leakedSlots={}]",
                 s.slotIndex(), maxSize - leakedSlots, maxSize, leakedSlots);
+        // The freed dir may still hold unacked durable data: a runtime retire
+        // (discardBroken/reapIdle) can land AFTER the startup scan latched
+        // recoveryComplete, and close() never drains an unowned dir, so
+        // without re-arming the scan that data would wait for a restart or a
+        // lucky borrow of exactly this index. When the latch is already set,
+        // rewind the cursors FIRST, then clear the volatile latch (the write
+        // order publishes the rewound cursors to the next driver's unlocked
+        // gate read), then revive the private driver when this is a direct
+        // pool whose original driver already exited; recoveryComplete==true
+        // here also guarantees no driver is mid-step, so touching the
+        // driver-owned cursors is safe. When the scan is still ALIVE, only
+        // raise recoveryRearmRequested: the cursor may already have passed
+        // this index while it was live/retired, and the flag makes the
+        // end-of-cycle latch decision rewind instead -- the cursors stay
+        // strictly driver-owned. The isCandidateOrphan probe is a bounded
+        // directory scan; holding the pool lock across it mirrors
+        // reprobeRetiredSlots()' delegate probes. The pass-2 work list is
+        // kept and only its cursor rewound, exactly like the end-of-scan
+        // cycle rewind.
+        if (sfDir != null
+                && OrphanScanner.isCandidateOrphan(sfDir + "/" + slotBaseId + "-" + s.slotIndex())) {
+            if (recoveryComplete) {
+                recoveryInRangeNext = 0;
+                recoveryOutOfRangeNext = 0;
+                recoveryDeferredThisCycle = 0;
+                recoveryRearmRequested = false;
+                recoveryComplete = false;
+                LOG.info("SF slot {} released with stranded data still on disk; re-arming the "
+                        + "startup recovery scan to drain it", s.slotIndex());
+                reviveDirectRecoveryDriverIfNeeded();
+            } else {
+                recoveryRearmRequested = true;
+                LOG.info("SF slot {} released with stranded data while the recovery scan is "
+                        + "mid-cycle; flagging a rewind so this cycle cannot latch past it",
+                        s.slotIndex());
+            }
+        }
+    }
+
+    /**
+     * Re-arms a driver for an un-latched scan (see {@link #recoverRetiredSlotAt}).
+     * Deferred pools need nothing: {@code PoolHousekeeper} calls
+     * {@link #runStartupRecoveryStep()} on every tick and its gate re-opens
+     * with the cleared latch. A direct pool's private driver exits once the
+     * scan completes, so if neither the original nor a previously revived
+     * driver is alive, spawn a fresh one running the same loop -- it drains
+     * the backlog, re-latches, and exits; {@code close()} joins it via
+     * {@link #stopStartupRecoveryDriver}. Caller must hold {@code lock};
+     * {@code Thread.start()} is cheap enough to run under it. Best-effort: a
+     * spawn failure is logged and never propagates into the release callback
+     * that triggered the re-arm (the data stays durable for a restart). A
+     * driver observed alive here can, in principle, be exiting past its final
+     * latch check; that microscopic window degrades to the pre-fix behavior
+     * (the data waits for the next release event or a restart) and is
+     * accepted rather than risking two concurrent drivers on the
+     * driver-owned cursors.
+     */
+    private void reviveDirectRecoveryDriverIfNeeded() {
+        if (deferStartupRecovery || closed) {
+            return;
+        }
+        if (startupRecoveryThread != null && startupRecoveryThread.isAlive()) {
+            return;
+        }
+        Thread revived = revivedStartupRecoveryThread;
+        if (revived != null && revived.isAlive()) {
+            return;
+        }
+        try {
+            ThreadFactory factory = recoveryThreadFactory != null
+                    ? recoveryThreadFactory
+                    : SenderPool::createStartupRecoveryThread;
+            Thread t = factory.newThread(this::runStartupRecoveryLoop);
+            t.setDaemon(true);
+            revivedStartupRecoveryThread = t;
+            t.start();
+        } catch (Throwable e) {
+            revivedStartupRecoveryThread = null;
+            LOG.warn("could not revive the startup recovery driver ({}); the released slot's "
+                    + "data stays durable on disk for a later attempt or restart", e.toString());
+        }
     }
 
     // Outcome of one drainCandidateSlotForRecovery attempt, letting the scan
