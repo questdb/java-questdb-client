@@ -112,6 +112,12 @@ public final class BackgroundDrainer implements Runnable {
     private final long syncIntervalNanos;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
+    /**
+     * Engine constructed by {@link #run()}, captured for test observation
+     * only (e.g. asserting the inherited periodic sync interval). May
+     * reference an already-closed engine once the drain ends.
+     */
+    private volatile CursorSendEngine engineForTesting;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -518,6 +524,25 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * Engine this drainer constructed, or {@code null} until {@link #run()}
+     * gets past engine construction. The reference outlives the drain, so
+     * tests can read construction-time state (it may be closed by then).
+     */
+    @TestOnly
+    public CursorSendEngine getEngineForTesting() {
+        return engineForTesting;
+    }
+
+    /**
+     * Periodic SF checkpoint interval this drainer inherited from the
+     * adopting sender at construction time.
+     */
+    @TestOnly
+    public long getSyncIntervalNanosForTesting() {
+        return syncIntervalNanos;
+    }
+
+    /**
      * Stop check for the runner thread's park loops that also folds a
      * pending thread interrupt into the stop protocol. The pool delivers
      * cancellation as an interrupt ({@code shutdownNow}) and pairs it with a
@@ -615,6 +640,7 @@ public final class BackgroundDrainer implements Runnable {
                 outcome = DrainOutcome.FAILED;
                 return;
             }
+            engineForTesting = engine;
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
                 LOG.info("orphan slot already drained: {} (acked={} target={})",

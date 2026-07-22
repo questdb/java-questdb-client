@@ -1729,6 +1729,15 @@ public class QwpWebSocketSender implements Sender {
         return cursorEngine;
     }
 
+    /**
+     * Background orphan-drainer pool, or {@code null} when
+     * {@code drain_orphans} is off or no orphan slot was adopted.
+     */
+    @TestOnly
+    public BackgroundDrainerPool getDrainerPoolForTesting() {
+        return drainerPool;
+    }
+
     @TestOnly
     public SenderErrorDispatcher getErrorDispatcherForTesting() {
         return errorDispatcher;
