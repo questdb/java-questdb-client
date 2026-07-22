@@ -88,17 +88,31 @@ import java.util.function.IntFunction;
  * The schedule is single-threaded on purpose: with one driver the whole
  * iteration is a pure function of the seed, so any failure replays exactly
  * with {@code TestUtils.generateRandom(null, s0, s1)} (seeds are printed by
- * the harness and repeated in the failure message). Iteration 0 is pinned to
- * the worst case -- every slot stranded, slot 0 wedged, and a deterministic
- * two-step prologue that drives the scan into the wedged-retire shape BEFORE
- * any random traffic (a random schedule could otherwise draw a borrow first,
- * adopt slot 0 and never materialize the wedge) -- so the suite cannot go
- * green on an unlucky seed while the bug is present; later iterations
- * randomize freely.
+ * the harness and repeated in the failure message). Two iterations are pinned
+ * so the suite cannot go green on an unlucky seed while either bug shape is
+ * present; the rest randomize freely:
+ * <ul>
+ *   <li><b>Iteration 0 -- scan abandonment.</b> Every slot stranded, slot 0
+ *       wedged, and a deterministic two-step prologue drives the scan into
+ *       the wedged-retire shape BEFORE any random traffic (a random schedule
+ *       could otherwise draw a borrow first, adopt slot 0 and never
+ *       materialize the wedge). Pre-fix, the scan skipped the retired index
+ *       without a deferral and latched {@code recoveryComplete} past the
+ *       stranded data.</li>
+ *   <li><b>Iteration 1 -- post-latch runtime retire (the residual).</b> The
+ *       scan completes LEGITIMATELY over clean dirs first; only then does a
+ *       borrowed sender -- built against the silent sink so its rows stay
+ *       durably unacked -- take the wedged-close discard path
+ *       ({@code reclaimSlot} retires it). Pre-fix, the late flock release
+ *       restored capacity but nothing re-armed the latched scan, so the
+ *       data waited for a restart or a lucky borrow of that index.</li>
+ * </ul>
+ * Random iterations (2+) additionally draw the runtime-wedge op freely, so
+ * runtime retires also interleave with a still-running scan.
  */
 public class SenderPoolSfFuzzTest {
 
-    private static final int ITERATIONS = 4;
+    private static final int ITERATIONS = 5;
     private static final long CONVERGE_BUDGET_MILLIS = 20_000;
 
     @Test
@@ -121,11 +135,13 @@ public class SenderPoolSfFuzzTest {
         try {
             TestUtils.assertMemoryLeak(() -> {
                 int maxSize = 1 + rnd.nextInt(3); // 1..3
-                // Iteration 0 pins the guaranteed-red shape: every slot
-                // stranded so the wedged recovery build below has data behind
-                // it. Later iterations may strand any subset (0 = a plain
-                // clean-scan iteration, still a valid latch/borrow interplay).
-                int stranded = iter == 0 ? maxSize : rnd.nextInt(maxSize + 1);
+                // Iteration 0 pins the guaranteed-red scan-abandonment shape:
+                // every slot stranded so the wedged recovery build below has
+                // data behind it. Iteration 1 pins the residual and needs a
+                // CLEAN start so the scan latches legitimately first. Later
+                // iterations may strand any subset (0 = a plain clean-scan
+                // iteration, still a valid latch/borrow interplay).
+                int stranded = iter == 0 ? maxSize : iter == 1 ? 0 : rnd.nextInt(maxSize + 1);
 
                 // Phase 1: strand unacked data under default-0..(stranded-1).
                 if (stranded > 0) {
@@ -168,6 +184,8 @@ public class SenderPoolSfFuzzTest {
                 for (int i = 0; i < maxSize; i++) {
                     wedge[i] = i < stranded && (iter == 0 ? i == 0 : rnd.nextBoolean());
                 }
+                // Iteration 1's fault is a RUNTIME wedge, not an in-scan one.
+                boolean forceRuntimeWedge = iter == 1;
                 CountingAckHandler handler = new CountingAckHandler();
                 try (TestWebSocketServer ack = new TestWebSocketServer(handler);
                      TestWebSocketServer wedgeSink = new TestWebSocketServer(new SilentHandler())) {
@@ -196,12 +214,27 @@ public class SenderPoolSfFuzzTest {
                             + ";close_flush_timeout_millis=0;";
 
                     boolean[] inRecoveryStep = new boolean[1];
+                    // Latched by the end-of-schedule heal: from that point the
+                    // fault injector is OFF. Without this, a wedge[idx] flag
+                    // whose first recovery build only happens DURING the
+                    // quiescent convergence would forge a brand-new wedge
+                    // after "every fault healed" -- a fault the schedule can
+                    // never heal -- and the scan would (correctly!) refuse to
+                    // complete, failing the audit for the wrong reason.
+                    boolean[] faultsHealed = new boolean[1];
+                    boolean[] wedgeNextBorrow = new boolean[1];
+                    Sender[] lastWedgeBuild = new Sender[1];
                     Sender[] forged = new Sender[maxSize];
                     List<Sender> unhealed = new ArrayList<>();
                     IntFunction<Sender> factory = idx -> {
-                        boolean forgeNow = inRecoveryStep[0] && idx < maxSize
+                        boolean forgeNow = inRecoveryStep[0] && !faultsHealed[0] && idx < maxSize
                                 && wedge[idx] && forged[idx] == null;
-                        Sender real = Sender.builder(forgeNow ? cfgWedge : cfg)
+                        // A runtime-wedge borrow is also built against the
+                        // silent sink (rows must stay durably unacked) but is
+                        // NOT forged closed at build: the op writes through it
+                        // first, then forges and discards.
+                        boolean wedgeBorrow = !inRecoveryStep[0] && wedgeNextBorrow[0];
+                        Sender real = Sender.builder(forgeNow || wedgeBorrow ? cfgWedge : cfg)
                                 .senderId("default-" + idx).build();
                         if (forgeNow) {
                             try {
@@ -211,6 +244,8 @@ public class SenderPoolSfFuzzTest {
                             }
                             forged[idx] = real;
                             unhealed.add(real);
+                        } else if (wedgeBorrow) {
+                            lastWedgeBuild[0] = real;
                         }
                         return real;
                     };
@@ -243,11 +278,49 @@ public class SenderPoolSfFuzzTest {
                                 Assert.assertTrue("iter 0 prologue must leave slot 0 stranded",
                                         hasSegmentFile(sfDir + "/default-0"));
                             }
+                            if (forceRuntimeWedge) {
+                                // Pinned residual prologue: latch the scan
+                                // legitimately FIRST, then retire a live
+                                // borrow whose rows are durably unacked. No
+                                // heal until the end of the schedule, so the
+                                // post-heal re-arm (or its absence) is the
+                                // only thing that decides the audit.
+                                long latchDeadline = System.currentTimeMillis() + 10_000;
+                                while (!pool.isRecoveryCompleteForTesting()
+                                        && System.currentTimeMillis() < latchDeadline) {
+                                    inRecoveryStep[0] = true;
+                                    try {
+                                        pool.runStartupRecoveryStepForTesting();
+                                    } finally {
+                                        inRecoveryStep[0] = false;
+                                    }
+                                }
+                                Assert.assertTrue("iter 1 prologue: scan must latch over clean dirs",
+                                        pool.isRecoveryCompleteForTesting());
+                                wedgeNextBorrow[0] = true;
+                                PooledSender ps = pool.borrow();
+                                wedgeNextBorrow[0] = false;
+                                Assert.assertSame("iter 1 prologue: borrow must create the wedge target",
+                                        lastWedgeBuild[0], ps.getDelegateForTesting());
+                                lastWedgeBuild[0] = null;
+                                for (int r = 0; r < 2; r++) {
+                                    ps.table("fuzz").longColumn("resid", r).atNow();
+                                    ps.flush();
+                                }
+                                Sender delegate = ps.getDelegateForTesting();
+                                ((QwpWebSocketSender) delegate).setClosedForTesting(true);
+                                pool.discardBrokenForTesting(ps);
+                                unhealed.add(delegate);
+                                Assert.assertEquals("iter 1 prologue must retire the runtime wedge",
+                                        1, pool.leakedSlotCount());
+                                Assert.assertTrue("iter 1 prologue must leave its slot stranded",
+                                        hasSegmentFile(sfDir + "/default-0"));
+                            }
                             // The randomized schedule. Single-threaded, so the
                             // iteration replays exactly from the seed.
                             int ops = 8 + rnd.nextInt(12);
                             for (int op = 0; op < ops; op++) {
-                                switch (rnd.nextInt(5)) {
+                                switch (rnd.nextInt(iter >= 2 ? 6 : 5)) {
                                     case 0:
                                     case 1: // bias toward driving the scan
                                         inRecoveryStep[0] = true;
@@ -291,17 +364,50 @@ public class SenderPoolSfFuzzTest {
                                         // held, no borrow can ever own slot 0, so
                                         // post-heal the SCAN is the only possible
                                         // deliverer (fixed) versus nobody (bug).
-                                        if (iter != 0 && !unhealed.isEmpty()) {
+                                        if (iter >= 2 && !unhealed.isEmpty()) {
                                             Sender s = unhealed.remove(rnd.nextInt(unhealed.size()));
                                             ((QwpWebSocketSender) s).setClosedForTesting(false);
                                             s.close();
                                         }
                                         break;
+                                    case 5: { // runtime wedge: retire a live borrow undelivered
+                                        wedgeNextBorrow[0] = true;
+                                        PooledSender ps = null;
+                                        try {
+                                            ps = pool.borrow();
+                                        } catch (LineSenderException e) {
+                                            // Capacity-starved: legal, move on.
+                                            break;
+                                        } finally {
+                                            // Disarm regardless: a reused borrow
+                                            // must not leave the flag armed for
+                                            // an unrelated later creation.
+                                            wedgeNextBorrow[0] = false;
+                                        }
+                                        Sender delegate = ps.getDelegateForTesting();
+                                        if (delegate == lastWedgeBuild[0]) {
+                                            lastWedgeBuild[0] = null;
+                                            ps.table("fuzz").longColumn("wedged", op).atNow();
+                                            ps.flush();
+                                            ((QwpWebSocketSender) delegate).setClosedForTesting(true);
+                                            pool.discardBrokenForTesting(ps);
+                                            unhealed.add(delegate);
+                                        } else {
+                                            // Borrow reused an idle (ack-server)
+                                            // sender; nothing to wedge.
+                                            lastWedgeBuild[0] = null;
+                                            ps.close();
+                                        }
+                                        break;
+                                    }
                                 }
                             }
 
                             // Heal every remaining wedge: the "workers" exit and
-                            // the flocks genuinely drop.
+                            // the flocks genuinely drop. Also switch the fault
+                            // injector off -- no new wedge may be born after
+                            // this point (see faultsHealed).
+                            faultsHealed[0] = true;
                             while (!unhealed.isEmpty()) {
                                 Sender s = unhealed.remove(unhealed.size() - 1);
                                 ((QwpWebSocketSender) s).setClosedForTesting(false);
