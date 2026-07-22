@@ -35,6 +35,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -343,6 +344,16 @@ public class MmapSegmentTest {
                                     + "hot-spare leftover; got " + seg.tornTailBytes(),
                             seg.tornTailBytes() > 0L);
                 }
+                // A second open must see the SAME evidence: openExisting is
+                // observe-only, so the valid-CRC frames past the corrupt
+                // frame[0] -- the only copy of that data -- stay on disk for
+                // operator extraction (chain-level recovery of such a member
+                // fails closed without mutating it).
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(0L, seg.frameCount());
+                    assertEquals("observe-only recovery must preserve the residue",
+                            4096L - MmapSegment.HEADER_SIZE, seg.tornTailBytes());
+                }
                 assertTrue("openExisting must not unlink the corrupt file",
                         Files.exists(path));
             } finally {
@@ -492,12 +503,57 @@ public class MmapSegmentTest {
     }
 
     @Test
-    public void testRecoveryZeroesTornTailResidueOnDisk() throws Exception {
+    public void testOpenExistingObservesTornTailWithoutMutation() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Recovery must not only REPORT the torn tail, it must sanitize
-            // it: the first open still reports the observed residue (operator
-            // signal), but a second open of the untouched file must find a
-            // clean zero suffix. Pre-fix the residue survived forever.
+            // openExisting must be a pure observer: a torn tail can hide
+            // unreachable valid-CRC frames past a mid-file tear -- the only
+            // copy of real payloads -- and whether they may be destroyed is
+            // a chain-level decision (SegmentRing sanitizes the segment it
+            // resumes as active, plus proven-dead sealed residue, and fails
+            // closed preserving the bytes otherwise). Repeated opens must
+            // keep reporting the same observation over identical bytes.
+            String path = tmpDir + "/seg-observe.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            long lastGood;
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    for (int i = 0; i < 3; i++) {
+                        fillPattern(buf, 16, i);
+                        seg.tryAppend(buf, 16);
+                    }
+                    lastGood = seg.publishedOffset();
+                    long addr = seg.address();
+                    for (long off = lastGood; off + 4 <= 4096; off += 4) {
+                        Unsafe.getUnsafe().putInt(addr + off, 0xCAFEBABE);
+                    }
+                    seg.msync();
+                }
+                byte[] before = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
+                for (int open = 0; open < 2; open++) {
+                    try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                        assertEquals("open #" + open + " must report the residue",
+                                4096L - lastGood, seg.tornTailBytes());
+                        assertEquals(3L, seg.frameCount());
+                        assertTrue(seg.hasUnsanitizedTornTail());
+                    }
+                    assertArrayEquals(
+                            "observe-only recovery must not change a single byte (open #" + open + ')',
+                            before, java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path)));
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testSanitizeTornTailZeroesResidueOnDisk() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Once ring recovery proves the residue is not load-bearing it
+            // calls sanitizeTornTail: the open keeps reporting the observed
+            // residue (operator signal), but after sanitization a later open
+            // of the untouched file must find a clean zero suffix and intact
+            // frames.
             String path = tmpDir + "/seg-zeroed.sfa";
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             long lastGood;
@@ -515,11 +571,18 @@ public class MmapSegmentTest {
                     seg.msync();
                 }
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    assertEquals("first recovery must report the observed residue",
+                    assertEquals("recovery must report the observed residue",
                             4096L - lastGood, seg.tornTailBytes());
+                    assertTrue(seg.hasUnsanitizedTornTail());
+                    seg.sanitizeTornTail();
+                    assertEquals("the observation must survive sanitization for diagnostics",
+                            4096L - lastGood, seg.tornTailBytes());
+                    assertFalse(seg.hasUnsanitizedTornTail());
+                    // Idempotent: a second call is a no-op, not a re-zero.
+                    seg.sanitizeTornTail();
                 }
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
-                    assertEquals("first recovery must have zeroed the residue on disk",
+                    assertEquals("sanitize must have zeroed the residue on disk",
                             0L, seg.tornTailBytes());
                     assertEquals(lastGood, seg.publishedOffset());
                     assertEquals(3L, seg.frameCount());
@@ -561,9 +624,12 @@ public class MmapSegmentTest {
                 }
                 // Recovery #1 + session 2: fill the segment to its rotation
                 // point. The 4th frame ends 12 bytes short of the file end --
-                // a region session 2 never overwrites.
+                // a region session 2 never overwrites. Sanitize before the
+                // appends, exactly as SegmentRing.recover does for the
+                // segment it resumes as active.
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
                     assertEquals(2L, seg.frameCount());
+                    seg.sanitizeTornTail();
                     fillPattern(buf, 16, 2);
                     assertTrue(seg.tryAppend(buf, 16) >= 0);
                     fillPattern(buf, 16, 3);
@@ -615,9 +681,11 @@ public class MmapSegmentTest {
                     seg.msync();
                 }
                 // Recovery #1: B fails CRC, so the scan stops at B; B and C
-                // are discarded (and, with sanitization, zeroed).
+                // are discarded, and the resume-as-active sanitization (the
+                // same call SegmentRing.recover makes) zeroes them on disk.
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
                     assertEquals("scan must stop at the torn frame", 1L, seg.frameCount());
+                    seg.sanitizeTornTail();
                     // The resumed writer re-issues FSN 1 with a fresh payload
                     // of the old B's exact size -- the byte-aligned case.
                     fillPattern(buf, 16, 7);
@@ -639,14 +707,15 @@ public class MmapSegmentTest {
     }
 
     @Test
-    public void testTornTailZeroingSyncFailureAbortsRecovery() throws Exception {
+    public void testSanitizeTornTailSyncFailureFailsClosed() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            // Sanitization is load-bearing: if the zeroes cannot be made
-            // durable, recovery must fail closed rather than hand back a
-            // segment whose reseal could permanently fail the next startup.
-            // A failed attempt may still leave zeroes in the page cache;
-            // that is safe (a retry either sees a clean tail or re-zeroes),
-            // so the follow-up open with a healthy facade must succeed.
+            // The sanitize barrier is load-bearing: if the zeroes cannot be
+            // made durable, ring recovery must fail closed rather than expose
+            // a segment whose reseal could permanently fail the next startup.
+            // openExisting itself runs no barrier -- it never writes. A
+            // failed attempt may still leave zeroes in the page cache; that
+            // is safe (a retry either sees a clean tail or re-zeroes), so
+            // the follow-up open with a healthy facade must succeed.
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 String msyncPath = tmpDir + "/seg-zero-msync-fail.sfa";
@@ -664,12 +733,18 @@ public class MmapSegmentTest {
 
                 FaultyFilesFacade msyncFailure = new FaultyFilesFacade();
                 msyncFailure.failOnMsync = true;
-                try {
-                    MmapSegment.openExisting(msyncFailure, msyncPath).close();
-                    fail("expected recovery to abort when the zeroed tail cannot be msync'd");
-                } catch (MmapSegmentException expected) {
-                    assertTrue(expected.getMessage(),
-                            expected.getMessage().contains("zeroed torn tail"));
+                try (MmapSegment seg = MmapSegment.openExisting(msyncFailure, msyncPath)) {
+                    assertEquals("observe-only open must not run the zeroing barrier",
+                            0, msyncFailure.msyncCalls);
+                    try {
+                        seg.sanitizeTornTail();
+                        fail("expected sanitize to abort when the zeroed tail cannot be msync'd");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("zeroed torn tail"));
+                    }
+                    assertTrue("a failed barrier must leave the residue unsanitized",
+                            seg.hasUnsanitizedTornTail());
                 }
                 assertEquals(1, msyncFailure.msyncCalls);
                 assertEquals(0, msyncFailure.fsyncCalls);
@@ -679,17 +754,56 @@ public class MmapSegmentTest {
 
                 FaultyFilesFacade fsyncFailure = new FaultyFilesFacade();
                 fsyncFailure.failOnFsync = true;
-                try {
-                    MmapSegment.openExisting(fsyncFailure, fsyncPath).close();
-                    fail("expected recovery to abort when the zeroed tail cannot be fsync'd");
-                } catch (MmapSegmentException expected) {
-                    assertTrue(expected.getMessage(),
-                            expected.getMessage().contains("zeroed torn tail"));
+                try (MmapSegment seg = MmapSegment.openExisting(fsyncFailure, fsyncPath)) {
+                    try {
+                        seg.sanitizeTornTail();
+                        fail("expected sanitize to abort when the zeroed tail cannot be fsync'd");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("zeroed torn tail"));
+                    }
+                    assertTrue("a failed barrier must leave the residue unsanitized",
+                            seg.hasUnsanitizedTornTail());
                 }
                 assertEquals(1, fsyncFailure.msyncCalls);
                 assertEquals(1, fsyncFailure.fsyncCalls);
                 try (MmapSegment seg = MmapSegment.openExisting(fsyncPath)) {
                     assertEquals(1L, seg.frameCount());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testSanitizeTornTailRefusedAfterAppendsResume() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Zeroing [residueStart, EOF) after appends resumed would destroy
+            // freshly appended frames, so that ordering is rejected outright:
+            // sanitization is a recovery-time-only operation that must run
+            // before the segment takes traffic.
+            String path = tmpDir + "/seg-sanitize-late.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
+                    fillPattern(buf, 16, 0);
+                    seg.tryAppend(buf, 16);
+                    long addr = seg.address();
+                    Unsafe.getUnsafe().putInt(addr + seg.publishedOffset(), 0xCAFEBABE);
+                    seg.msync();
+                }
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertTrue(seg.hasUnsanitizedTornTail());
+                    fillPattern(buf, 16, 1);
+                    assertTrue(seg.tryAppend(buf, 16) >= 0);
+                    try {
+                        seg.sanitizeTornTail();
+                        fail("sanitize after appends must be refused");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("before appends resume"));
+                    }
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);

@@ -41,6 +41,7 @@ import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -342,9 +343,9 @@ public class SegmentRingTest {
             //   crash #2 -> recovery #2 used to throw "corrupt torn tail in
             //   sealed SF segment" on EVERY startup, because nothing ever
             //   sanitized crash #1's residue and the sealed-suffix check
-            //   correctly refuses non-zero sealed tails. openExisting now
-            //   zeroes the residue at recovery #1, so recovery #2 must
-            //   succeed and see the full chain.
+            //   correctly refuses non-zero sealed tails. Recovery #1 now
+            //   sanitizes the segment it resumes as active before any
+            //   append, so recovery #2 must succeed and see the full chain.
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
                     + 12; // reseal gap: a 5th 24-byte frame can never fit
@@ -384,6 +385,190 @@ public class SegmentRingTest {
                     assertEquals(4, ring.getActive().baseSeq());
                     assertEquals(1, ring.getActive().frameCount());
                     assertEquals(5, ring.nextSeqHint());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testMidFileTearInSealedMemberFailsClosedWithoutMutation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Bit-rot mid-file in a SEALED chain member: the scan stops at
+            // the first bad CRC, so frames past the tear -- individually
+            // valid CRCs, real unacked payloads, the ONLY surviving copy --
+            // are classified as torn-tail residue. Recovery must fail closed
+            // on the FSN gap the lost frames create BEFORE any sanitization
+            // decision, leaving every byte on disk for operator extraction,
+            // and must keep doing so identically on retry.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            String m0Path = tmpDir + "/m0.sfa";
+            String m1Path = tmpDir + "/m1.sfa";
+            String m2Path = tmpDir + "/m2.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 16, 3);
+                MmapSegment s0 = MmapSegment.create(m0Path, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+                MmapSegment s1 = MmapSegment.create(m1Path, 4, segSize);
+                for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+                s1.close();
+                MmapSegment s2 = MmapSegment.create(m2Path, 8, segSize);
+                s2.tryAppend(buf, 16);
+                s2.close();
+                // First recovery migrates the legacy chain, creates the
+                // manifest and validates clean: sealed m0+m1, active m2.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull(ring);
+                    assertEquals(2, ring.getSealedSegments().size());
+                }
+                // Bit-rot strikes sealed m0 mid-file: clobber the CRC of its
+                // SECOND frame. Frames 2..3 keep valid CRCs but are
+                // unreachable to the sequential scan.
+                long frame1Offset = MmapSegment.HEADER_SIZE
+                        + MmapSegment.FRAME_HEADER_SIZE + 16;
+                int fd = Files.openRW(m0Path);
+                assertTrue("openRW must succeed", fd >= 0);
+                long bad = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    Unsafe.getUnsafe().putInt(bad, 0xDEADBEEF);
+                    assertEquals(4L, Files.write(fd, bad, 4, frame1Offset));
+                    Files.fsync(fd);
+                } finally {
+                    Unsafe.free(bad, 4, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+                byte[] m0Before = readFileBytes(m0Path);
+                byte[] m1Before = readFileBytes(m1Path);
+                byte[] m2Before = readFileBytes(m2Path);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                        throw new AssertionError(
+                                "mid-file tear in a sealed member must fail recovery");
+                    } catch (MmapSegmentException expected) {
+                        assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("FSN gap"));
+                    }
+                    assertArrayEquals("attempt #" + attempt
+                                    + ": failed recovery must not mutate the torn sealed member",
+                            m0Before, readFileBytes(m0Path));
+                    assertArrayEquals(m1Before, readFileBytes(m1Path));
+                    assertArrayEquals(m2Before, readFileBytes(m2Path));
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testProvenDeadSealedResidueSanitizedThenHealsAfterOneRestart() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Legacy pre-sanitization poison: a sealed member whose frame
+            // accounting is COMPLETE (contiguity + boundaries prove no frame
+            // lost) but whose suffix gap carries residue from a pre-fix
+            // client. The residue is provably dead bytes, so recovery zeroes
+            // it durably, still fails closed on first sight to surface the
+            // incident, and the restart proves the chain clean.
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16)
+                    + 12; // sealed suffix gap that can never fit a frame
+            String m0Path = tmpDir + "/p0.sfa";
+            String m1Path = tmpDir + "/p1.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 16, 5);
+                MmapSegment s0 = MmapSegment.create(m0Path, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                long gapStart = s0.publishedOffset();
+                s0.close();
+                MmapSegment s1 = MmapSegment.create(m1Path, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+                // First recovery creates the manifest over the clean chain.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull(ring);
+                    assertEquals(1, ring.getSealedSegments().size());
+                }
+                // Poison the sealed suffix gap the way a pre-fix client's
+                // reseal-after-recovery did.
+                int fd = Files.openRW(m0Path);
+                assertTrue("openRW must succeed", fd >= 0);
+                long junk = Unsafe.malloc(12, MemoryTag.NATIVE_DEFAULT);
+                try {
+                    for (int i = 0; i < 3; i++) {
+                        Unsafe.getUnsafe().putInt(junk + i * 4L, 0xCAFEBABE);
+                    }
+                    assertEquals(12L, Files.write(fd, junk, 12, gapStart));
+                    Files.fsync(fd);
+                } finally {
+                    Unsafe.free(junk, 12, MemoryTag.NATIVE_DEFAULT);
+                    Files.close(fd);
+                }
+                // Recovery #1: proven-dead residue is sanitized, incident
+                // still fails closed on first sight.
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("poisoned sealed suffix must fail closed on first sight");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("corrupt torn tail in sealed SF segment"));
+                }
+                // The heal: residue durably zeroed, all frames intact.
+                try (MmapSegment seg = MmapSegment.openExisting(m0Path)) {
+                    assertEquals("frames must be untouched", 4L, seg.frameCount());
+                    assertEquals("proven-dead residue must be zeroed on disk",
+                            0L, seg.tornTailBytes());
+                }
+                // Recovery #2: the restart proves the chain clean.
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, segSize)) {
+                    assertNotNull("restart after the sanitizing fail-closed throw must succeed", ring);
+                    assertEquals(1, ring.getSealedSegments().size());
+                    assertEquals(4, ring.getSealedSegments().get(0).frameCount());
+                    assertEquals(4, ring.getActive().baseSeq());
+                    assertEquals(1, ring.getActive().frameCount());
+                    assertEquals(5, ring.nextSeqHint());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRingRecoverySanitizesResumedActiveTornTail() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The funnel guarantee: whatever segment recovery selects as the
+            // resumed active has its torn residue durably zeroed before the
+            // ring is exposed -- even if the session then crashes without a
+            // single append, the reseal/resurrection hazards are gone.
+            String path = tmpDir + "/a0.sfa";
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 16, 9);
+                try (MmapSegment s0 = MmapSegment.create(path, 0, 4096)) {
+                    s0.tryAppend(buf, 16);
+                    s0.tryAppend(buf, 16);
+                    long addr = s0.address();
+                    for (long off = s0.publishedOffset(); off + 4 <= 4096; off += 4) {
+                        Unsafe.getUnsafe().putInt(addr + off, 0xCAFEBABE);
+                    }
+                    s0.msync();
+                }
+                try (SegmentRing ring = SegmentRing.openExisting(tmpDir, 4096)) {
+                    assertNotNull(ring);
+                    assertEquals("the observation must survive for diagnostics",
+                            true, ring.getActive().tornTailBytes() > 0);
+                }
+                // No appends happened; the zeroing must already be durable.
+                try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                    assertEquals(2L, seg.frameCount());
+                    assertEquals("ring recovery must have sanitized the resumed active",
+                            0L, seg.tornTailBytes());
                 }
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
@@ -1051,6 +1236,10 @@ public class SegmentRingTest {
                 Unsafe.free(buf, 1, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    private static byte[] readFileBytes(String path) throws java.io.IOException {
+        return java.nio.file.Files.readAllBytes(Paths.get(path));
     }
 
     private static void fillPattern(long addr, int len, int seed) {

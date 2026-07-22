@@ -194,11 +194,14 @@ public final class SegmentRing implements QuietCloseable {
      * Exhaustively discovers and validates an SF slot without mutating frame
      * data. Only after enumeration, opens, CRC scans, contiguity and manifest
      * boundaries all succeed does it migrate a legacy chain or discard
-     * validated spares. One deliberate exception to the no-mutation rule:
-     * {@link MmapSegment#openExisting} zeroes torn-tail residue -- suffix
-     * bytes that already failed frame validation and can never be replayed --
-     * as each segment opens, so even a recovery that later fails may have
-     * sanitized unusable residue. Valid frames are never touched.
+     * validated spares. Torn-tail residue is handled destroy-last:
+     * {@link MmapSegment#openExisting} only observes it, and recovery zeroes
+     * it exclusively where validation has proven it non-load-bearing -- the
+     * resumed active's tail (about to be reclaimed by appends) and sealed
+     * suffixes whose frame accounting validated complete against the chain.
+     * A tear that cost frames (e.g. a mid-file tear in a sealed member)
+     * fails closed BEFORE any of that, leaving every byte on disk for
+     * operator extraction.
      */
     static Recovery recover(FilesFacade filesFacade, String sfDir, long maxBytesPerSegment) {
         return recover(filesFacade, sfDir, maxBytesPerSegment, null);
@@ -240,7 +243,10 @@ public final class SegmentRing implements QuietCloseable {
         // Files whose own bytes prove corruption (bad magic, sub-header size,
         // negative baseSeq). They are excluded from the chain and quarantined
         // to <name>.corrupt — but only AFTER the surviving chain validates (or
-        // resolves to EMPTY), so a failed recovery never mutates the slot.
+        // resolves to EMPTY), so a failed recovery never mutates the slot
+        // (single exception: proven-dead sealed residue is zeroed just before
+        // the fail-closed first-sight throw in sanitizeSealedResidue -- bytes
+        // the already-validated chain proves no replay can ever need).
         // Whether a quarantined file was load-bearing is decided by the
         // manifest-boundary / contiguity checks below, not by the skip itself.
         // Operational open/stat/read/mmap errors, observed size instability,
@@ -347,6 +353,14 @@ public final class SegmentRing implements QuietCloseable {
                     active = chain.get(chain.size() - 1);
                     headBase = chain.get(0).baseSeq();
                     activeBase = active.baseSeq();
+                    // Legacy sealed members carrying pre-manifest torn
+                    // residue: contiguity just proved their frame accounting
+                    // complete, so the residue is dead bytes. Zero it now
+                    // (silently -- legacy slots predate the fail-closed
+                    // sealed-suffix contract) so the migrated chain presents
+                    // the all-zero sealed suffixes the manifest-era
+                    // invariant requires.
+                    sanitizeSealedResidue(chain, false);
                 } else {
                     active = chooseEmptyInitial(all, sfDir);
                     if (active == null) {
@@ -473,21 +487,21 @@ public final class SegmentRing implements QuietCloseable {
                                 "missing expected SF active/tail segment at base " + activeBase);
                     }
                 }
-                // Sealed members must present an all-zero suffix. Fresh
-                // segments are zero-allocated and openExisting zeroes any
-                // torn-tail residue before a recovered active can take
-                // appends, so a reseal of a recovered segment cannot carry
-                // residue here. A non-zero suffix therefore means the file
-                // was mutated outside the writer protocol (or is legacy
-                // pre-sanitization poison; this run's openExisting has
-                // already zeroed it, so the restart after this fail-closed
-                // throw re-proves the chain clean). validateContiguous above
-                // independently catches sealed segments that LOST frames.
-                for (int i = 0, n = chain.size() - 1; i < n; i++) {
-                    if (chain.get(i).tornTailBytes() > 0) {
-                        throw new SfRecoveryException("corrupt torn tail in sealed SF segment " + chain.get(i).path());
-                    }
-                }
+                // Sealed members must present an all-zero suffix: fresh
+                // segments are zero-allocated and this recovery sanitizes
+                // the resumed active before it takes appends, so a reseal
+                // can never carry residue forward. Reaching this point
+                // proves every sealed member's frame accounting is complete
+                // (validateContiguous plus the head/active boundary matching
+                // above), so any suffix residue here is dead bytes -- legacy
+                // pre-sanitization poison or an out-of-protocol scribble
+                // past the last frame, never lost frames. Zero it durably,
+                // then still fail closed on first sight so the incident is
+                // surfaced; the restart then proves the chain clean. A tear
+                // that DID cost frames never gets here: the contiguity or
+                // boundary checks above throw first, with every byte left
+                // on disk for operator extraction.
+                sanitizeSealedResidue(chain, true);
                 for (int i = 0, n = chain.size(); i < n; i++) {
                     chain.get(i).markManifestRequired();
                 }
@@ -528,6 +542,21 @@ public final class SegmentRing implements QuietCloseable {
             }
             quarantineCorrupt(filesFacade, corruptPaths);
 
+            // The resumed active is the only segment that takes appends and
+            // the only one a later rotation reseals, so recovery zeroes ITS
+            // residue exactly here -- every chain/manifest check has passed
+            // and the ring is about to be exposed. Resumed appends restart
+            // at lastGood but stop wherever the last payload fits, so
+            // unzeroed residue would survive a seal-via-rotation (bricking
+            // the next startup's sealed-suffix check) and a byte-aligned
+            // stale frame with a valid CRC could be resurrected at a
+            // recycled FSN by a later scan. The durable barrier inside
+            // sanitizeTornTail is load-bearing in MEMORY durability mode,
+            // where rotation does not sync the sealed predecessor's data
+            // pages. A failed barrier aborts recovery (fail closed); the
+            // retry re-observes the same residue because openExisting never
+            // mutates.
+            active.sanitizeTornTail();
             for (int i = 1, n = chain.size(); i < n; i++) {
                 chain.get(i - 1).linkSuccessor(chain.get(i));
             }
@@ -743,6 +772,36 @@ public final class SegmentRing implements QuietCloseable {
                 throw new SfRecoveryException("FSN gap in recovered segments: expected "
                         + expected + " but got " + current.baseSeq());
             }
+        }
+    }
+
+    /**
+     * Durably zeroes torn-tail residue on the chain's sealed members (every
+     * element but the last, which is the active). Callers must have already
+     * proven each sealed member's frame accounting complete -- contiguity
+     * plus head/active boundary matching -- which is exactly what makes the
+     * residue provably dead: a tear that cost frames breaks those checks and
+     * fails recovery before any mutation, preserving the bytes (potentially
+     * the only copy of unreachable valid-CRC frames) for operator
+     * extraction. With {@code failClosedOnSight} the incident is still
+     * surfaced as a first-sight startup failure after sanitizing (the
+     * restart then proves the chain clean); without it the chain proceeds
+     * immediately (legacy migration, which predates the sealed-suffix
+     * contract).
+     */
+    private static void sanitizeSealedResidue(ObjList<MmapSegment> chain, boolean failClosedOnSight) {
+        String firstTornPath = null;
+        for (int i = 0, n = chain.size() - 1; i < n; i++) {
+            MmapSegment sealed = chain.get(i);
+            if (sealed.tornTailBytes() > 0) {
+                sealed.sanitizeTornTail();
+                if (firstTornPath == null) {
+                    firstTornPath = sealed.path();
+                }
+            }
+        }
+        if (failClosedOnSight && firstTornPath != null) {
+            throw new SfRecoveryException("corrupt torn tail in sealed SF segment " + firstTornPath);
         }
     }
 
