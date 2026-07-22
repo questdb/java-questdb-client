@@ -582,9 +582,15 @@ public final class BackgroundDrainer implements Runnable {
                 // unlock. Leave no .failed sentinel for the next orphan scan.
                 // Error deliberately escapes to the outer Error path: it is
                 // observable after teardown but cannot quarantine intact data.
-                String msg = t.getMessage();
+                // This path retries on every orphan scan, so the log line is
+                // the ONLY diagnostic a deterministic bug (e.g. an unexpected
+                // NPE, whose getMessage() is null) ever produces: attach the
+                // throwable for the stack trace and carry class+message into
+                // the telemetry surface, mirroring the outer setup-failure
+                // catch below.
+                String msg = t.toString();
                 LOG.warn("drainer setup temporarily unavailable for slot {}: {}",
-                        slotPath, msg);
+                        slotPath, msg, t);
                 lastErrorMessage = msg;
                 outcome = DrainOutcome.FAILED;
                 return;
