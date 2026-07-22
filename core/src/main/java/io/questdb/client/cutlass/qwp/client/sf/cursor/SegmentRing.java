@@ -243,10 +243,18 @@ public final class SegmentRing implements QuietCloseable {
         // Files whose own bytes prove corruption (bad magic, sub-header size,
         // negative baseSeq). They are excluded from the chain and quarantined
         // to <name>.corrupt — but only AFTER the surviving chain validates (or
-        // resolves to EMPTY), so a failed recovery never mutates the slot
-        // (single exception: proven-dead sealed residue is zeroed just before
-        // the fail-closed first-sight throw in sanitizeSealedResidue -- bytes
-        // the already-validated chain proves no replay can ever need).
+        // resolves to EMPTY). The precise invariant: a failed recovery never
+        // mutates COMMITTED CHAIN BYTES. It is not "never mutates the slot"
+        // -- several windows durably mutate before a later step can still
+        // fail: proven-dead sealed residue is zeroed just before the
+        // fail-closed first-sight throw in sanitizeSealedResidue; the
+        // legacy-migration sanitize zeroes proven-dead residue before
+        // SfManifest.create (or any later step) can fail; and validated-
+        // extra cleanup plus corrupt-file quarantine run before the
+        // active-sanitize barrier or ring construction can fail. Every such
+        // window is confined to bytes the already-validated chain proves no
+        // replay can ever need, or to preserve-by-rename quarantines that
+        // keep the bytes on disk.
         // Whether a quarantined file was load-bearing is decided by the
         // manifest-boundary / contiguity checks below, not by the skip itself.
         // Operational open/stat/read/mmap errors, observed size instability,
@@ -555,7 +563,12 @@ public final class SegmentRing implements QuietCloseable {
             // where rotation does not sync the sealed predecessor's data
             // pages. A failed barrier aborts recovery (fail closed); the
             // retry re-observes the same residue because openExisting never
-            // mutates.
+            // mutates. Unlike sealed suffixes, the active's residue is NOT
+            // proven dead -- past a mid-file tear it can hold valid-CRC
+            // frames of real unacked payloads. Zeroing is policy: replay
+            // cannot cross the tear, and preserving the bytes would trade
+            // the two hazards above for data no recovery path can use (see
+            // sanitizeTornTail).
             active.sanitizeTornTail();
             for (int i = 1, n = chain.size(); i < n; i++) {
                 chain.get(i - 1).linkSuccessor(chain.get(i));

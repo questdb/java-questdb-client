@@ -299,11 +299,16 @@ public final class MmapSegment implements QuietCloseable {
      * still hold unreachable frames with valid CRCs -- the only surviving copy
      * of real payloads -- so whether it may be destroyed is a chain-level
      * decision this method cannot make. {@link SegmentRing} recovery invokes
-     * {@link #sanitizeTornTail()} only once the chain has fully validated and
-     * only on residue that validation proves non-load-bearing (the resumed
-     * active's tail, which appends are about to reclaim anyway, and sealed
-     * suffixes whose frame accounting is proven complete); every fail-closed
-     * path leaves the bytes intact on disk for operator extraction. Clean
+     * {@link #sanitizeTornTail()} only once the chain has fully validated,
+     * and the justification differs by role: sealed suffixes are zeroed on
+     * PROOF (frame accounting validated complete, so the residue can hold no
+     * replayable frame -- a tear that cost frames fails closed instead, with
+     * every byte left on disk for operator extraction), while the resumed
+     * active's tail is zeroed by POLICY -- past a mid-file tear it can still
+     * hold valid-CRC frames of real unacked payloads, but they are
+     * unreachable by replay (the FSN sequence breaks at the tear) and
+     * leaving them risks the reseal-brick and stale-frame-resurrection
+     * hazards. Clean
      * partial fills (writer never attempted to write past the last valid
      * frame) do not log and report {@code 0}.
      */
@@ -375,13 +380,17 @@ public final class MmapSegment implements QuietCloseable {
                 // Observe-only: report the residue, never touch it here. A
                 // torn tail may be an interrupted append (dead bytes) OR a
                 // mid-file tear with unreachable valid-CRC frames past it --
-                // the only surviving copy of real payloads. Only chain-level
-                // validation can tell the two apart, so the destroy/preserve
-                // decision belongs to SegmentRing.recover: it invokes
-                // sanitizeTornTail on the segment it resumes as active (and
-                // on proven-dead sealed suffixes) AFTER the chain proves the
-                // residue is not load-bearing, and fails closed with every
-                // byte left on disk in all other cases.
+                // the only surviving copy of real payloads. The
+                // destroy/preserve decision belongs to SegmentRing.recover.
+                // For sealed members chain validation PROVES the residue
+                // dead (complete frame accounting) before sanitizeTornTail
+                // runs, and a tear that cost frames fails closed with every
+                // byte left on disk. For the segment resumed as active no
+                // such proof exists (there is no successor to bound it): its
+                // residue is zeroed by policy once the rest of the chain
+                // validates, because replay cannot cross the tear and
+                // unzeroed residue risks reseal-brick and stale-frame
+                // resurrection.
                 LOG.warn("SF segment {}: torn tail of {} bytes at offset {} "
                                 + "(file size {}, frames recovered {}). "
                                 + "The residue is preserved pending chain validation. "
@@ -752,9 +761,13 @@ public final class MmapSegment implements QuietCloseable {
      * {@link #openExisting}: after a mid-file tear the residue can hold
      * unreachable valid-CRC frames that are the only surviving copy of
      * unacked payloads. The caller ({@link SegmentRing} recovery) must first
-     * prove the residue is not load-bearing -- the resumed active's tail
-     * (reclaimed by appends anyway) or a sealed suffix whose frame accounting
-     * validated complete against the chain. Must run before any append
+     * establish the residue is not load-bearing, and the strength of that
+     * claim differs by role: a sealed suffix is PROVEN dead (frame
+     * accounting validated complete against the chain), while the resumed
+     * active's tail past a mid-file tear is discarded by POLICY, not proof
+     * -- it can hold valid-CRC frames of real unacked payloads that are
+     * unreachable by replay (the FSN sequence breaks at the tear), and
+     * leaving them risks the two hazards above. Must run before any append
      * resumes; appending first would put live frames inside the zeroed range,
      * so that ordering is rejected. Idempotent; no-op when no residue was
      * observed. The fsync is load-bearing: in MEMORY durability mode rotation
