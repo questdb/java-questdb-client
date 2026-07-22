@@ -1754,6 +1754,124 @@ public class SenderPoolSfTest {
     }
 
     @Test
+    public void testRecoveryScanStaysAliveWhileRetiredSlotHoldsStrandedData() throws Exception {
+        // Drain-liveness regression: a slot RETIRED mid-scan (recoverer close()
+        // returned with the flock still held) keeps slotInUse[i] set, so the
+        // next walk over its index took the "reserved => live" skip WITHOUT
+        // counting a deferral and latched recoveryComplete with the slot's
+        // unacked data still on disk. From there the data was stranded until a
+        // restart or a lucky borrow of that exact index -- which steady low
+        // load may never produce (testStartupRetiredSlotRecoveredAfterLate-
+        // FlockRelease passes only because its borrow IS that lucky borrow).
+        // The scan must instead treat a retired index whose dir is still a
+        // candidate orphan as a deferral -- the same rule as a CONTENDED park:
+        // the cycle keeps rewinding, and once the late flock release restores
+        // the index the SCAN itself drains the data, no borrow required. This
+        // test is RED (latches complete) until that deferral is counted.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: strand unacked data under default-0.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int silentPort = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg1 = "ws::addr=localhost:" + silentPort + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=500;";
+                try (SenderPool pool = new SenderPool(cfg1, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE)) {
+                    PooledSender s = pool.borrow();
+                    for (int i = 0; i < 3; i++) {
+                        s.table("recover").longColumn("v", i).atNow();
+                        s.flush();
+                    }
+                    s.close();
+                }
+            }
+            Assert.assertTrue("unacked data must persist under default-0",
+                    hasSegmentFile(slot("default-0")));
+
+            // Phase 2: ack-ing server; the FIRST recovery build of slot 0 is
+            // forged into the wedged shape (closed=true makes the recovery
+            // drain throw and close() a no-op, so the real flock stays held
+            // and slotLockReleased stays false) so the scan's own drain FAILs
+            // and the slot is retired. deferStartupRecovery=true keeps the
+            // scan entirely under this test's control -- no background driver.
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg2 = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+
+                AtomicReference<Sender> forged = new AtomicReference<>();
+                IntFunction<Sender> factory = idx -> {
+                    Sender real = Sender.builder(cfg2).senderId("default-" + idx).build();
+                    if (idx == 0 && forged.compareAndSet(null, real)) {
+                        try {
+                            ((QwpWebSocketSender) real).setClosedForTesting(true);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                    return real;
+                };
+
+                try (SenderPool pool = new SenderPool(cfg2, 0, 1, 500,
+                        Long.MAX_VALUE, Long.MAX_VALUE, factory, true)) {
+                    // Step 1: builds the forged recoverer, fails its drain, and
+                    // retires the slot (leakedSlots=1, slotInUse[0] stays set).
+                    // The FAILED outcome stops the drive without advancing.
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (pool.leakedSlotCount() == 0
+                            && System.currentTimeMillis() < deadline) {
+                        pool.runStartupRecoveryStepForTesting();
+                    }
+                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertEquals("scan must retire the wedged slot",
+                            1, pool.leakedSlotCount());
+
+                    // Re-drive the scan: the retired index is skipped as
+                    // reserved. Pre-fix the first full walk latched
+                    // recoveryComplete; post-fix the still-candidate retired
+                    // dir counts as a deferral and the cycle keeps rewinding.
+                    for (int k = 0; k < 8; k++) {
+                        pool.runStartupRecoveryStepForTesting();
+                    }
+                    Assert.assertTrue("retired dir must still hold the stranded data",
+                            hasSegmentFile(slot("default-0")));
+                    Assert.assertFalse(
+                            "scan must NOT latch recoveryComplete while a retired slot still "
+                                    + "holds stranded durable data -- that abandons the data "
+                                    + "until a restart or a lucky borrow of that exact index",
+                            pool.isRecoveryCompleteForTesting());
+
+                    // The late flock release: the "wedged worker" finishes
+                    // (un-forge + real close). The housekeeper tick re-probes
+                    // retiredSlots and frees the index; the still-alive scan
+                    // must then reserve it and drain the stranded data ITSELF
+                    // -- no borrow anywhere in this phase.
+                    Sender recoverer = forged.get();
+                    ((QwpWebSocketSender) recoverer).setClosedForTesting(false);
+                    recoverer.close();
+                    pool.reapIdle();
+                    Assert.assertEquals("late release must restore the retired capacity",
+                            0, pool.leakedSlotCount());
+
+                    deadline = System.currentTimeMillis() + 10_000;
+                    while (!pool.isRecoveryCompleteForTesting()
+                            && System.currentTimeMillis() < deadline) {
+                        pool.runStartupRecoveryStepForTesting();
+                    }
+                    Assert.assertTrue("scan must complete once the stranded data is drained",
+                            pool.isRecoveryCompleteForTesting());
+                    Assert.assertTrue("the scan itself must have drained the stranded data",
+                            awaitNoSegmentFile(slot("default-0"), 15_000));
+                    Assert.assertTrue("replayed frames must reach the server",
+                            awaitAtLeast(handler.frames, 1, 15_000));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testZeroTimeoutBorrowProbesRetiredSlotBeforeThrowing() throws Exception {
         // Boundary twin of testStartupRetiredSlotRecoveredAfterLateFlockRelease:
         // acquireTimeoutMillis=0 is a valid try-once borrow (builder rejects only

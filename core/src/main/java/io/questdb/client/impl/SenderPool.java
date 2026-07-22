@@ -287,6 +287,9 @@ public final class SenderPool implements AutoCloseable {
     // remaining slots, recoveryDeferredThisCycle records the park, and once
     // both passes finish with parked slots outstanding the cursors rewind for
     // another cycle on a later tick instead of latching recoveryComplete.
+    // A RETIRED index whose dir still holds data is deferred the same way on
+    // every walk (see the reserved-skip branch in recoverOneSlotStep) so the
+    // latch can never strand a retired slot's data while the pool lives.
     // recoveryFailStreak/-Slot track consecutive failures on one candidate;
     // recoveryWarnedSlots dedups the per-slot WARNs so an indefinitely
     // retried slot logs once per failure episode, not once per retry. All of
@@ -649,7 +652,12 @@ public final class SenderPool implements AutoCloseable {
      * can neither target the dir being recovered nor over-allocate past
      * {@code maxSize}. Prewarmed/borrowed slots (already live, holding their
      * flock) are skipped, as are empty slots (a cheap directory probe); only a
-     * slot that actually holds stranded data spends the step's single drain. The
+     * slot that actually holds stranded data spends the step's single drain. A
+     * RETIRED index (a wedged close() kept its flock; see {@link #reclaimSlot}
+     * and the retire branch below) is likewise never drained in place, but
+     * while its dir still holds data it counts as a deferral, so the scan keeps
+     * cycling instead of latching {@code recoveryComplete} past stranded data
+     * that only a restart or a lucky borrow of that index would ever deliver. The
      * out-of-range pass needs no reservation: those indices have no
      * {@code slotInUse} entry and are never allocated by borrow().
      * <p>
@@ -702,26 +710,49 @@ public final class SenderPool implements AutoCloseable {
                 return false;
             }
             int i = recoveryInRangeNext;
+            String slotPath = sfDir + "/" + slotBaseId + "-" + i;
             // Reserve this index unless prewarm (or a concurrent borrow after
             // publication) already holds it live. Count the reservation in
             // recoveringSlots so the borrow() cap check cannot over-allocate
             // while this slot is held for recovery.
             boolean reserved;
+            boolean retired = false;
             lock.lock();
             try {
                 reserved = slotInUse[i];
                 if (!reserved) {
                     slotInUse[i] = true;
                     recoveringSlots++;
+                } else {
+                    retired = isRetiredSlotIndex(i);
                 }
             } finally {
                 lock.unlock();
             }
             if (reserved) {
+                // A reserved index is normally LIVE (prewarm or a concurrent
+                // borrow owns it) and is none of recovery's business. A RETIRED
+                // index is different: its flock is held by this pool's own
+                // wedged former delegate, and any unacked data in its dir is
+                // exactly as stranded as a CONTENDED slot's. Without counting
+                // it as a deferral the scan would latch recoveryComplete and
+                // abandon that data until a restart or a lucky borrow of this
+                // exact index -- which steady low load may never produce. Count
+                // it -- the same rule as a CONTENDED park -- so the end-of-scan
+                // rewind keeps the cycle alive; once the deferred engine
+                // cleanup releases the flock, reprobeRetiredSlots()/the release
+                // callback frees the index and a later cycle reserves and
+                // drains it right here. The isCandidateOrphan probe (a few
+                // syscalls, outside the lock) keeps an already-clean retired
+                // dir from cycling the scan forever, and racing a concurrent
+                // recover/borrow can only over-count -- costing one extra
+                // cheap rewound walk, never a missed candidate.
+                if (retired && OrphanScanner.isCandidateOrphan(slotPath)) {
+                    recoveryDeferredThisCycle++;
+                }
                 recoveryInRangeNext++;
                 continue;
             }
-            String slotPath = sfDir + "/" + slotBaseId + "-" + i;
             if (!OrphanScanner.isCandidateOrphan(slotPath)) {
                 // No stranded data: release the reservation and keep scanning;
                 // an empty slot must not cost a whole step.
@@ -868,8 +899,8 @@ public final class SenderPool implements AutoCloseable {
         }
 
         if (recoveryDeferredThisCycle > 0) {
-            // At least one slot was parked this cycle (contended or
-            // persistently failing). Its data stays durable on disk, so
+            // At least one slot was parked this cycle (contended, persistently
+            // failing, or retired with data still on disk). Its data stays durable on disk, so
             // instead of latching recoveryComplete -- which would abandon it
             // until a restart or a lucky borrow of that index -- rewind the
             // scan and let the driver's retry cadence run another cycle.
@@ -2071,6 +2102,24 @@ public final class SenderPool implements AutoCloseable {
     private void addRetiredSlot(SenderSlot s) {
         s.retiredIndex(retiredSlots.size());
         retiredSlots.add(s);
+    }
+
+    /**
+     * Whether {@code idx} is currently held by a RETIRED slot (see
+     * {@link #reclaimSlot} and the in-range recovery retire branch) rather
+     * than a live one. Lets the recovery scan tell "reserved because
+     * borrowed/prewarmed" apart from "reserved because a wedged close() left
+     * the flock held" for its deferral accounting: only the latter's dir can
+     * hold stranded data no borrow is coming for. Caller must hold
+     * {@code lock}; retiredSlots is bounded by maxSize, so the walk is cheap.
+     */
+    private boolean isRetiredSlotIndex(int idx) {
+        for (int i = 0, n = retiredSlots.size(); i < n; i++) {
+            if (retiredSlots.get(i).slotIndex() == idx) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void recoverRetiredSlotAt(int retiredIndex) {
