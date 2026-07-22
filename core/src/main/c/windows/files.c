@@ -360,18 +360,24 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_length0
                            OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL,
                            NULL);
-    free(wide);
     if (h == INVALID_HANDLE_VALUE) {
+        /* Save the CreateFileW failure code BEFORE free(): any subsequent
+         * API/CRT call (HeapFree can SetLastError) may overwrite the
+         * thread's last-error value -- same pattern as open_file(). */
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     LARGE_INTEGER sz;
     BOOL ok = GetFileSizeEx(h, &sz);
-    CloseHandle(h);
     if (!ok) {
+        /* Save before CloseHandle() can clobber the last-error value. */
         SaveLastError();
+        CloseHandle(h);
         return -1;
     }
+    CloseHandle(h);
     return (jlong) sz.QuadPart;
 }
 
@@ -414,11 +420,13 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
         return -1;
     }
     BOOL ok = CreateDirectoryW(wide, NULL);
-    free(wide);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     return 0;
 }
 
@@ -447,11 +455,13 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_remove0
     } else {
         ok = DeleteFileW(wide);
     }
-    free(wide);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         return JNI_FALSE;
     }
+    free(wide);
     return JNI_TRUE;
 }
 
@@ -469,12 +479,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_rename0
         return -1;
     }
     BOOL ok = MoveFileExW(oldW, newW, MOVEFILE_REPLACE_EXISTING);
-    free(oldW);
-    free(newW);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(oldW);
+        free(newW);
         return -1;
     }
+    free(oldW);
+    free(newW);
     return 0;
 }
 
@@ -512,11 +525,13 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findFirst0
     pattern[pathLen] = '\0';
 
     wchar_t *wide = utf8_to_wide(pattern);
-    free(pattern);
     if (!wide) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(pattern);
         return 0;
     }
+    free(pattern);
 
     qdb_find_t *find = (qdb_find_t *) malloc(sizeof(qdb_find_t));
     if (!find) {
@@ -524,12 +539,14 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findFirst0
         return 0;
     }
     find->handle = FindFirstFileW(wide, &find->data);
-    free(wide);
     if (find->handle == INVALID_HANDLE_VALUE) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         free(find);
         return 0;
     }
+    free(wide);
     find->hasEntry = 1;
     win_findname_to_utf8(find);
     return (jlong) (uintptr_t) find;
