@@ -38,7 +38,6 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -227,12 +226,12 @@ public class CursorSendEngineSlotReacquisitionTest {
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             // Production shape: private, owned manager (ownsManager=true).
             CursorSendEngine engine = new CursorSendEngine(slot, segSize);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Phase 1: let the worker finish the initial spare install so
                 // the hook below can only fire on the rotation-triggered pass.
-                SegmentRing ring = readRing(engine);
+                SegmentRing ring = engine.getRingForTesting();
                 long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (ring.needsHotSpare()) {
                     if (System.nanoTime() > deadlineNs) {
@@ -333,13 +332,13 @@ public class CursorSendEngineSlotReacquisitionTest {
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             // Production shape: private, owned manager (ownsManager=true).
             CursorSendEngine engine = new CursorSendEngine(slot, segSize);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass (see
                 // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
-                SegmentRing ring = readRing(engine);
+                SegmentRing ring = engine.getRingForTesting();
                 long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (ring.needsHotSpare()) {
                     if (System.nanoTime() > deadlineNs) {
@@ -445,13 +444,13 @@ public class CursorSendEngineSlotReacquisitionTest {
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             // Production shape: private, owned manager (ownsManager=true).
             CursorSendEngine engine = new CursorSendEngine(slot, segSize);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass (see
                 // testOwnedEngineCloseRetainsSlotWhileWorkerIsMidServicePass).
-                SegmentRing ring = readRing(engine);
+                SegmentRing ring = engine.getRingForTesting();
                 long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (ring.needsHotSpare()) {
                     if (System.nanoTime() > deadlineNs) {
@@ -562,12 +561,12 @@ public class CursorSendEngineSlotReacquisitionTest {
             AtomicReference<Throwable> hookErr = new AtomicReference<>();
             // Production shape: private, owned manager (ownsManager=true).
             CursorSendEngine engine = new CursorSendEngine(slot, segSize);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass.
-                SegmentRing ring = readRing(engine);
+                SegmentRing ring = engine.getRingForTesting();
                 long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (ring.needsHotSpare()) {
                     if (System.nanoTime() > deadlineNs) {
@@ -711,12 +710,12 @@ public class CursorSendEngineSlotReacquisitionTest {
             // Memory mode: null sfDir, private owned manager — the exact
             // shape non-SF async ingest uses.
             CursorSendEngine engine = new CursorSendEngine(null, segSize);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             long buf = Unsafe.malloc(payloadLen, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Phase 1: wait out the initial spare install so the park hook
                 // can only fire on the rotation-triggered pass.
-                SegmentRing ring = readRing(engine);
+                SegmentRing ring = engine.getRingForTesting();
                 long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 while (ring.needsHotSpare()) {
                     if (System.nanoTime() > deadlineNs) {
@@ -794,7 +793,7 @@ public class CursorSendEngineSlotReacquisitionTest {
         TestUtils.assertMemoryLeak(() -> {
             String slot = tmpDir + "/owned-slot";
             CursorSendEngine engine = new CursorSendEngine(slot, 4L * 1024 * 1024);
-            SegmentManager manager = readManager(engine);
+            SegmentManager manager = engine.getManagerForTesting();
             AtomicBoolean perRingAwaited = new AtomicBoolean();
             try {
                 manager.setBeforeRingQuiescenceAwaitHook(() -> perRingAwaited.set(true));
@@ -827,18 +826,6 @@ public class CursorSendEngineSlotReacquisitionTest {
                 second.close();
             }
         });
-    }
-
-    private static SegmentManager readManager(CursorSendEngine engine) throws Exception {
-        Field field = CursorSendEngine.class.getDeclaredField("manager");
-        field.setAccessible(true);
-        return (SegmentManager) field.get(engine);
-    }
-
-    private static SegmentRing readRing(CursorSendEngine engine) throws Exception {
-        Field field = CursorSendEngine.class.getDeclaredField("ring");
-        field.setAccessible(true);
-        return (SegmentRing) field.get(engine);
     }
 
     private static void rmDirRecursive(String dir) {

@@ -869,9 +869,11 @@ public class QwpWebSocketSender implements Sender {
             return targetFsn < 0L;
         }
         cursorEngine.checkDurability();
-        // Surface latched I/O errors before any early-return path, so a
-        // caller polling with timeoutMillis <= 0 to drive their own loop
-        // sees the terminal throw instead of an indefinite "not yet".
+        // Surface latched errors before any early-return path, so a caller
+        // polling with timeoutMillis <= 0 to drive their own loop sees the
+        // throw instead of an indefinite "not yet". The durability latch
+        // above is transient: it throws while latched, and clears once a
+        // later periodic sync pass fully succeeds so producers can resume.
         if (cursorSendLoop != null) {
             cursorSendLoop.checkError();
         }

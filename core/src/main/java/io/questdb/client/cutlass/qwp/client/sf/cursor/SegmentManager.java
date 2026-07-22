@@ -1224,8 +1224,15 @@ public final class SegmentManager implements QuietCloseable {
                 syncScratch.getQuick(i).syncPublished();
             }
             e.ring.clearSyncRequestIfActiveDurable();
+            // The pass above covered every live segment's published range, so
+            // any earlier barrier failure has been remedied — unlatch it so a
+            // transient disk fault doesn't permanently brick the producer.
+            e.ring.clearDurabilityFailure();
             e.nextDataSyncNanos = now + e.syncIntervalNanos;
-            e.syncFailureLogged = false;
+            if (e.syncFailureLogged) {
+                e.syncFailureLogged = false;
+                LOG.info("Periodic SF data sync recovered for {}", e.dir);
+            }
         } catch (Throwable failure) {
             e.ring.recordDurabilityFailure(failure);
             if (!e.syncFailureLogged) {

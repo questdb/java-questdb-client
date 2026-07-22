@@ -35,6 +35,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.std.Files;
@@ -2941,6 +2942,188 @@ public class SenderPoolSfTest {
                 }
             }
         });
+    }
+
+    @Test
+    public void testDirectRecoveryContendedSlotDoesNotStarveRemainingSlots() throws Exception {
+        // C2 regression, end to end: a slot whose createRecoverer PERSISTENTLY
+        // throws SlotLockContentionException (its flock is held by another live
+        // owner, e.g. a sibling process sharing the slot dir) must not pin the
+        // startup-recovery cursor: pre-fix the driver retried that one slot
+        // every second forever and the higher-index slot's durable orphan data
+        // was never forwarded under idle load. The transient-failure twin
+        // (testDirectRecoveryRetriesTransientFailureAndRemainingSlots) covers a
+        // failure that CLEARS; this covers one that never does.
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                for (int i = 0; i < 2; i++) {
+                    String seedConfig = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir
+                            + ";sender_id=default-" + i + ";close_flush_timeout_millis=0;";
+                    try (Sender seed = Sender.fromConfig(seedConfig)) {
+                        seed.table("recover").longColumn("v", i).atNow();
+                        seed.flush();
+                    }
+                }
+            }
+            Assert.assertTrue("in-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-0")));
+            Assert.assertTrue("out-of-range fixture must contain unacked data",
+                    hasSegmentFile(slot("default-1")));
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String config = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+                CountDownLatch drained = new CountDownLatch(1);
+                IntFunction<Sender> factory = idx -> {
+                    attempts[idx].incrementAndGet();
+                    if (idx == 0) {
+                        // Persistent: never clears for the life of the pool.
+                        throw new SlotLockContentionException(
+                                "sf slot already in use by another process [slot="
+                                        + slot("default-0") + ", holder=pid=test]");
+                    }
+                    Sender delegate = Sender.builder(config).senderId("default-" + idx).build();
+                    return notifyingCloseSender(delegate, drained);
+                };
+
+                try (SenderPool pool = newPoolWithFactory(config, 0, 1, 5_000, factory)) {
+                    Assert.assertTrue(
+                            "a persistently contended slot 0 must not starve slot 1's recovery",
+                            drained.await(15, TimeUnit.SECONDS));
+                    Assert.assertFalse("higher-index slot's orphan data must be delivered",
+                            hasSegmentFile(slot("default-1")));
+                    Assert.assertEquals("recovered slot must be drained exactly once",
+                            1, attempts[1].get());
+                    Assert.assertTrue("contended slot must have been probed", attempts[0].get() >= 1);
+                    Assert.assertTrue("contended slot's durable data must be preserved on disk",
+                            hasSegmentFile(slot("default-0")));
+                    Assert.assertTrue("recovered frame must reach the server", handler.frames.get() >= 1);
+                    Assert.assertFalse("recovery must not report complete while the contended slot holds data",
+                            pool.isRecoveryCompleteForTesting());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testStartupRecoveryParksContendedSlotAndContinuesScan() throws Exception {
+        // C2, white-box and fully step-driven (no live driver, no wall clock):
+        // one recovery step must park a contended in-range slot 0, continue to
+        // the out-of-range slot 1 within the SAME step, keep the parked slot
+        // retryable across scan cycles (never abandoned, never complete), and
+        // WARN about the contended slot exactly once, not once per retry.
+        createCandidateSlot("default-0");
+        createCandidateSlot("default-1");
+        AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+        CountDownLatch drained = new CountDownLatch(1);
+        IntFunction<Sender> factory = idx -> {
+            attempts[idx].incrementAndGet();
+            if (idx == 0) {
+                throw new SlotLockContentionException(
+                        "sf slot already in use by another process [slot="
+                                + slot("default-0") + ", holder=pid=test]");
+            }
+            return successfulRecoverySender(idx, drained);
+        };
+        String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+        Logger poolLogger = (Logger) LoggerFactory.getLogger(SenderPool.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        Level savedLevel = poolLogger.getLevel();
+        poolLogger.setLevel(Level.ALL);
+        poolLogger.addAppender(appender);
+        try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 1, 0, factory)) {
+            // Cycle 1: park the contended slot 0, then drain slot 1 in the
+            // same step (the park must not consume the step's single drain).
+            Assert.assertTrue("step must park the contended slot and drain the next candidate",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals(1, attempts[0].get());
+            Assert.assertEquals("higher-index slot must be recovered despite the parked slot",
+                    1, attempts[1].get());
+            Assert.assertEquals(0, drained.getCount());
+            Assert.assertFalse("cycle with a parked slot must defer, not complete",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertFalse("recovery must not report complete while the contended slot holds data",
+                    pool.isRecoveryCompleteForTesting());
+
+            // Cycle 2: the parked slot is re-probed (retryable, not abandoned).
+            Assert.assertTrue(pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals("parked slot must be re-probed on the next cycle",
+                    2, attempts[0].get());
+            Assert.assertFalse(pool.runStartupRecoveryStepForTesting());
+
+            // Bounded logging: the contended slot warned once, not per retry.
+            long contentionWarns = appender.list.stream().filter(e ->
+                    e.getLevel().isGreaterOrEqual(Level.WARN)
+                            && e.getFormattedMessage().contains("default-0")).count();
+            Assert.assertEquals("contended slot must WARN once per episode, not per retry; captured="
+                    + appender.list, 1, contentionWarns);
+        } finally {
+            poolLogger.detachAppender(appender);
+            poolLogger.setLevel(savedLevel);
+            appender.stop();
+        }
+    }
+
+    @Test
+    public void testStartupRecoveryParksPersistentlyFailingSlotAfterBoundedRetries() throws Exception {
+        // C2, generic-failure flavor, step-driven: a slot whose recovery build
+        // persistently fails with a NON-contention error keeps the existing
+        // retry-in-place behavior for the first attempts (the server-wide
+        // transient heuristic) but must be parked after a bounded streak so it
+        // cannot starve the higher-index in-range slot, and must be re-probed
+        // on the next scan cycle rather than abandoned.
+        createCandidateSlot("default-0");
+        createCandidateSlot("default-1");
+        AtomicInteger[] attempts = {new AtomicInteger(), new AtomicInteger()};
+        CountDownLatch drained = new CountDownLatch(1);
+        IntFunction<Sender> factory = idx -> {
+            attempts[idx].incrementAndGet();
+            if (idx == 0) {
+                throw new LineSenderException("persistent per-slot recovery failure");
+            }
+            return successfulRecoverySender(idx, drained);
+        };
+        String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+
+        try (SenderPool pool = newDeferredPoolWithFactory(config, 0, 2, 0, factory)) {
+            // Attempts 1 and 2: presumed transient, same candidate retried.
+            Assert.assertFalse("first failure must defer the same candidate",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertFalse("second failure must defer the same candidate",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals(2, attempts[0].get());
+            Assert.assertEquals("failing slot must not have blocked past its streak yet",
+                    0, attempts[1].get());
+
+            // Attempt 3 exhausts the streak: the slot is parked and the scan
+            // may continue to the next candidate.
+            Assert.assertTrue("streak exhaustion must park the slot and continue the scan",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals(3, attempts[0].get());
+            Assert.assertTrue("higher-index slot must be recovered despite the parked slot",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals("higher-index slot must be drained exactly once",
+                    1, attempts[1].get());
+            Assert.assertEquals(0, drained.getCount());
+
+            // End of cycle: parked slot outstanding -> defer, not complete.
+            Assert.assertFalse("cycle with a parked slot must defer, not complete",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertFalse("recovery must not report complete while the parked slot holds data",
+                    pool.isRecoveryCompleteForTesting());
+
+            // Next cycle: the parked slot is re-probed with a fresh streak.
+            Assert.assertFalse("re-probed slot restarts its bounded retry streak",
+                    pool.runStartupRecoveryStepForTesting());
+            Assert.assertEquals(4, attempts[0].get());
+        }
     }
 
     @Test

@@ -77,11 +77,16 @@ static jint open_file(const char *utf8Path,
     }
     HANDLE h = CreateFileW(wide, desiredAccess, shareMode, NULL,
                            creationDisposition, flagsAndAttributes, NULL);
-    free(wide);
     if (h == INVALID_HANDLE_VALUE) {
+        // Save the CreateFileW failure code BEFORE free(): the thread's
+        // last-error value may be overwritten by any subsequent API/CRT call
+        // (HeapFree can SetLastError), and callers such as fsyncDir0 rely on
+        // the saved value being the CreateFileW error.
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     return HANDLE_TO_FD(h);
 }
 
@@ -237,10 +242,12 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsyncDir0
         // directory handle with ERROR_ACCESS_DENIED. Directory-entry durability
         // on NTFS is provided by metadata journaling ($LogFile), so degrade to
         // best-effort success here rather than hard-failing the SF durability
-        // path. open_file() already recorded the error via SaveLastError(); a
-        // genuine failure such as a missing directory (ERROR_PATH_NOT_FOUND)
-        // still propagates as fatal.
-        if (GetLastError() == ERROR_ACCESS_DENIED) {
+        // path. Consult the error open_file() saved at the CreateFileW failure
+        // point rather than the live GetLastError(): the intervening free()
+        // and return path inside open_file() are not guaranteed to preserve
+        // the thread's last-error value. A genuine failure such as a missing
+        // directory (ERROR_PATH_NOT_FOUND) still propagates as fatal.
+        if (GetSavedLastError() == ERROR_ACCESS_DENIED) {
             return 0;
         }
         return -1;

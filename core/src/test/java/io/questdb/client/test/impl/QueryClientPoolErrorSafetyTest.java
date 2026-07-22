@@ -34,13 +34,10 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 // Error-safety of the three QueryClientPool creation paths the teardown-hardening
@@ -327,22 +324,11 @@ public class QueryClientPoolErrorSafetyTest {
         };
     }
 
-    private static void awaitCreationWaiter(QueryClientPool pool) throws Exception {
-        Field lockField = QueryClientPool.class.getDeclaredField("lock");
-        Field conditionField = QueryClientPool.class.getDeclaredField("creationFinished");
-        lockField.setAccessible(true);
-        conditionField.setAccessible(true);
-        ReentrantLock lock = (ReentrantLock) lockField.get(pool);
-        Condition creationFinished = (Condition) conditionField.get(pool);
+    private static void awaitCreationWaiter(QueryClientPool pool) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         while (System.nanoTime() < deadline) {
-            lock.lock();
-            try {
-                if (lock.hasWaiters(creationFinished)) {
-                    return;
-                }
-            } finally {
-                lock.unlock();
+            if (pool.hasCreationWaiterForTesting()) {
+                return;
             }
             Thread.yield();
         }

@@ -366,7 +366,7 @@ public class SlotLockReleasedContractTest {
 
                 wss = QwpWebSocketSender.createForTesting("localhost", 1);
                 wss.setCursorEngine(engine, true);
-                setField(wss, "cursorSendLoop", loop);
+                wss.setCursorSendLoopForTesting(loop);
 
                 // Drive the real early-bail close() on a thread whose pending
                 // interrupt lands in loop.close()'s shutdownLatch.await().

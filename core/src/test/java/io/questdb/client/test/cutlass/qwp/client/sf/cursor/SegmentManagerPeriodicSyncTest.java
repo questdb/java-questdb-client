@@ -114,6 +114,80 @@ public class SegmentManagerPeriodicSyncTest {
         });
     }
 
+    @Test
+    public void testTransientSyncFailureClearsOnNextSuccess() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final long intervalNanos = 100L;
+            final long segmentSize = 4096L;
+            AtomicLong ticks = new AtomicLong();
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            String dir = TestUtils.createTmpDir("qdb-periodic-recovery-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentManager manager = null;
+            SegmentRing ring = null;
+            try {
+                MmapSegment active = MmapSegment.create(
+                        filesFacade, dir + "/active.sfa", 0L, segmentSize);
+                ring = new SegmentRing(active, segmentSize);
+                ring.installHotSpare(MmapSegment.create(
+                        filesFacade, dir + "/spare.sfa", 1L, segmentSize));
+                assertEquals(0L, ring.appendOrFsn(payload, 16));
+
+                manager = new SegmentManager(
+                        segmentSize,
+                        SegmentManager.DEFAULT_POLL_NANOS,
+                        segmentSize * 4L,
+                        filesFacade,
+                        ticks::get);
+                manager.register(ring, dir, null, intervalNanos);
+
+                // First tick: initial sync succeeds.
+                manager.serviceRingForTesting(ring);
+                assertTrue(active.isPublishedDurable());
+
+                // One transient fsync failure on the next periodic barrier.
+                assertEquals(1L, ring.appendOrFsn(payload, 16));
+                filesFacade.isFsyncFailureEnabled = true;
+                ticks.set(intervalNanos);
+                manager.serviceRingForTesting(ring);
+                try {
+                    ring.appendOrFsn(payload, 16);
+                    fail("expected the failed data sync to reach the producer");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected.getMessage().contains("sync segment file"));
+                }
+                assertEquals("failed append must not enter the ring", 1L, ring.publishedFsn());
+
+                // Disk recovers; the manager's retry (scheduled at
+                // now + min(interval, 1s)) succeeds on the next tick.
+                filesFacade.isFsyncFailureEnabled = false;
+                ticks.set(intervalNanos * 2L);
+                int msyncBefore = filesFacade.msyncCalls;
+                int fsyncBefore = filesFacade.fsyncCalls;
+                manager.serviceRingForTesting(ring);
+                assertTrue("retry barrier must have run msync", filesFacade.msyncCalls > msyncBefore);
+                assertTrue("retry barrier must have run fsync", filesFacade.fsyncCalls > fsyncBefore);
+
+                // A transient failure must not brick the producer: the retry
+                // covered the published range, so appends resume.
+                assertEquals(2L, ring.appendOrFsn(payload, 16));
+                assertEquals(2L, ring.publishedFsn());
+            } finally {
+                if (manager != null && ring != null) {
+                    manager.deregister(ring);
+                }
+                if (ring != null) {
+                    ring.close();
+                }
+                if (manager != null) {
+                    manager.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
     private static final class CountingFilesFacade implements FilesFacade {
         private boolean isFsyncFailureEnabled;
         private int fsyncCalls;

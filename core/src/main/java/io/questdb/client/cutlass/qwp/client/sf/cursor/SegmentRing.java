@@ -118,8 +118,10 @@ public final class SegmentRing implements QuietCloseable {
     // call installHotSpare on a closed ring (whose hotSpare was just
     // zeroed by close()) -- the spare's mmap + fd would never be reclaimed.
     private boolean closed;
-    // First periodic data-barrier failure. The manager latches it and the
-    // producer observes it before its next append.
+    // Latest periodic data-barrier failure. The manager latches it and the
+    // producer observes it before its next append; the manager clears it
+    // again once a subsequent periodic sync pass succeeds, so a transient
+    // disk fault does not permanently brick the producer.
     private volatile MmapSegmentException durabilityFailure;
     // hotSpare: written by segment manager (installHotSpare), read+cleared by
     // producer thread on rotation. Volatile so the producer sees fresh installs.
@@ -958,6 +960,22 @@ public final class SegmentRing implements QuietCloseable {
         MmapSegmentException failure = durabilityFailure;
         if (failure != null) {
             throw failure;
+        }
+    }
+
+    /**
+     * Clears a latched periodic data-barrier failure. Called by the segment
+     * manager after a subsequent periodic sync pass over every live segment
+     * succeeds: the published range the failed barrier was meant to cover is
+     * durable now, so the producer may resume. The monitor serializes the
+     * clear with {@link #recordDurabilityFailure(Throwable)}; the volatile
+     * write publishes it to producer threads calling {@link #checkDurability()}.
+     */
+    void clearDurabilityFailure() {
+        if (durabilityFailure != null) {
+            synchronized (this) {
+                durabilityFailure = null;
+            }
         }
     }
 
