@@ -63,9 +63,11 @@ import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.IntFunction;
 
 /**
@@ -1606,9 +1608,11 @@ public class SenderPoolSfTest {
                 // get a fresh slot (default-1), proving capacity dropped by one.
                 SenderPool pool = newPoolWithFactory(cfg2, 0, 2, 500, factory);
                 try {
-                    // The forge must actually have reached recovery's build.
-                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
-                    // The retire branch must have fired during construction.
+                    Assert.assertTrue(
+                            "background recovery must build and retire the still-locked slot",
+                            awaitCondition(
+                                    () -> forged.get() != null && pool.leakedSlotCount() == 1,
+                                    10_000));
                     Assert.assertEquals("recovery must retire the still-locked slot as leaked",
                             1, pool.leakedSlotCount());
                     Assert.assertTrue("retired slot 0 must stay reserved",
@@ -1713,7 +1717,11 @@ public class SenderPoolSfTest {
                 };
 
                 try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 500, factory)) {
-                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertTrue(
+                            "background recovery must build and retire slot 0",
+                            awaitCondition(
+                                    () -> forged.get() != null && pool.leakedSlotCount() == 1,
+                                    10_000));
                     Assert.assertEquals("precondition: startup recovery must retire the slot",
                             1, pool.leakedSlotCount());
 
@@ -1909,7 +1917,7 @@ public class SenderPoolSfTest {
                 try (SenderPool pool = new SenderPool(cfg, 0, 1, 500,
                         Long.MAX_VALUE, Long.MAX_VALUE, factory, true)) {
                     // Phase 1: the scan completes legitimately (clean dirs).
-                    pool.runStartupRecoveryToCompletionForTesting();
+                    pool.runStartupRecoveryWithinBudgetForTesting();
                     Assert.assertTrue("precondition: scan must have latched complete",
                             pool.isRecoveryCompleteForTesting());
 
@@ -1968,17 +1976,93 @@ public class SenderPoolSfTest {
     }
 
     @Test
-    public void testRevivedDirectDriverDrainsRuntimeRetiredSlotAfterLateRelease() throws Exception {
-        // Direct-pool twin of
-        // testRuntimeRetireAfterScanCompleteRearmsRecoveryOnFlockRelease: a
-        // direct pool (deferStartupRecovery=false) finishes its inline scan at
-        // construction and lets its private recovery driver die. A runtime
-        // retire after that leaves NO driver to pick up the re-armed scan
-        // when the flock releases -- the un-latch alone is not enough. Pin
-        // the revival: the release must respawn the direct pool's private
-        // driver, which drains the freed dir with NO test-side stepping and
-        // no borrow. RED (segments never clear) until release revives the
-        // driver.
+    public void testDiscardBrokenCleanFlockReleaseRearmsRecoveryScan() throws Exception {
+        // The mirror of testRuntimeRetireAfterScanCompleteRearmsRecovery-
+        // OnFlockRelease on the MORE COMMON reclaim shape: discardBroken of
+        // a sender whose server went silent, but whose close() tears down
+        // cleanly -- workers stop, the flock drops, reclaimSlot frees the
+        // index directly (no retire, no release listener). The dir still
+        // holds durably-unacked rows, the scan is latched, close() never
+        // drains an unowned dir: pre-fix NOTHING re-drained it and the data
+        // waited for a restart or a lucky borrow of exactly this index. Pin
+        // the fix: the freed arm must probe the dir and re-arm the scan
+        // (un-latch + rewind) just like the retired-slot release does. RED
+        // at the un-latch assertion until reclaimSlot's freed arm re-arms.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler);
+                 TestWebSocketServer silentSink = new TestWebSocketServer(new SilentHandler())) {
+                int ackPort = ack.getPort();
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                silentSink.start();
+                Assert.assertTrue(silentSink.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ackPort + ";sf_dir=" + sfDir + ";";
+                // The broken sender: alive workers streaming into a silent
+                // sink (rows stay durably unacked); close-flush OFF so its
+                // clean close() drops the flock WITHOUT delivering.
+                String cfgBroken = "ws::addr=localhost:" + silentSink.getPort() + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+
+                boolean[] brokenNextBuild = new boolean[1];
+                IntFunction<Sender> factory = idx ->
+                        Sender.builder(brokenNextBuild[0] ? cfgBroken : cfg)
+                                .senderId("default-" + idx).build();
+
+                try (SenderPool pool = new SenderPool(cfg, 0, 1, 500,
+                        Long.MAX_VALUE, Long.MAX_VALUE, factory, true)) {
+                    // Phase 1: the scan completes legitimately (clean dirs).
+                    pool.runStartupRecoveryWithinBudgetForTesting();
+                    Assert.assertTrue("precondition: scan must have latched complete",
+                            pool.isRecoveryCompleteForTesting());
+
+                    // Phase 2: borrow, write durably against the silent sink,
+                    // then discard broken. close() is NOT forged: it tears
+                    // down cleanly and releases the flock, so reclaimSlot
+                    // takes the freed arm -- no retire, no leaked capacity.
+                    brokenNextBuild[0] = true;
+                    PooledSender ps = pool.borrow();
+                    brokenNextBuild[0] = false;
+                    for (int i = 0; i < 3; i++) {
+                        ps.table("clean").longColumn("v", i).atNow();
+                        ps.flush();
+                    }
+                    pool.discardBrokenForTesting(ps);
+                    Assert.assertEquals(
+                            "clean release must take the freed arm, not retire",
+                            0, pool.leakedSlotCount());
+                    Assert.assertTrue("freed dir must still hold the stranded data",
+                            hasSegmentFile(slot("default-0")));
+                    Assert.assertFalse(
+                            "a clean flock release that frees a dir with stranded data must "
+                                    + "re-arm the recovery scan -- otherwise the data waits for a "
+                                    + "restart or a lucky borrow of that exact index",
+                            pool.isRecoveryCompleteForTesting());
+
+                    // Phase 3: the ordinary driver cadence must now drain the
+                    // dir and re-latch -- no borrow anywhere in this phase.
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (!pool.isRecoveryCompleteForTesting()
+                            && System.currentTimeMillis() < deadline) {
+                        pool.runStartupRecoveryStepForTesting();
+                    }
+                    Assert.assertTrue("re-armed scan must complete once the data is drained",
+                            pool.isRecoveryCompleteForTesting());
+                    Assert.assertTrue("the re-armed scan must deliver the stranded data",
+                            awaitNoSegmentFile(slot("default-0"), 15_000));
+                    Assert.assertTrue("replayed frames must reach the server",
+                            awaitAtLeast(handler.frames, 1, 15_000));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testLongLivedDirectDriverDrainsRuntimeRetiredSlotAfterLateRelease() throws Exception {
+        // A direct SF pool owns exactly one recovery thread for its lifetime.
+        // It parks after a clean scan, then a late flock release re-arms the
+        // cursors and unparks that SAME thread -- no constructor-inline drive,
+        // no replacement thread, no test-side step, reap or borrow.
         TestUtils.assertMemoryLeak(() -> {
             CountingAckHandler handler = new CountingAckHandler();
             try (TestWebSocketServer ack = new TestWebSocketServer(handler);
@@ -1996,13 +2080,24 @@ public class SenderPoolSfTest {
                 IntFunction<Sender> factory = idx ->
                         Sender.builder(wedgeNextBuild[0] ? cfgWedge : cfg)
                                 .senderId("default-" + idx).build();
+                AtomicInteger driverCreations = new AtomicInteger();
+                AtomicReference<Thread> driverRef = new AtomicReference<>();
+                ThreadFactory threadFactory = runnable -> {
+                    driverCreations.incrementAndGet();
+                    Thread driver = new Thread(runnable, "test-long-lived-recovery-driver");
+                    driverRef.set(driver);
+                    return driver;
+                };
 
-                // deferStartupRecovery=false: the inline scan over the clean
-                // dir completes at construction; no private driver survives.
-                try (SenderPool pool = new SenderPool(cfg, 0, 1, 500,
-                        Long.MAX_VALUE, Long.MAX_VALUE, factory, false)) {
-                    Assert.assertTrue("precondition: inline scan must have latched complete",
-                            pool.isRecoveryCompleteForTesting());
+                try (SenderPool pool = newPoolWithRecoveryControls(
+                        cfg, 0, 1, 500, factory, threadFactory, null, null)) {
+                    Thread driver = pool.getStartupRecoveryThreadForTesting();
+                    Assert.assertSame(driverRef.get(), driver);
+                    Assert.assertTrue("initial background scan must latch complete",
+                            awaitCondition(pool::isRecoveryCompleteForTesting, 10_000));
+                    Assert.assertTrue("direct recovery driver must park, not exit", driver.isAlive());
+                    Assert.assertEquals("construction must create exactly one recovery driver",
+                            1, driverCreations.get());
 
                     wedgeNextBuild[0] = true;
                     PooledSender ps = pool.borrow();
@@ -2019,27 +2114,113 @@ public class SenderPoolSfTest {
                     Assert.assertTrue("retired dir must hold the stranded data",
                             hasSegmentFile(slot("default-0")));
 
-                    // Late release without delivery. From here the pool must
-                    // recover the data ENTIRELY on its own: no recovery-step
-                    // calls, no reapIdle, no borrow -- the revived private
-                    // driver is the only possible deliverer.
                     ((QwpWebSocketSender) delegate).setClosedForTesting(false);
                     delegate.close();
 
                     Assert.assertTrue(
-                            "the revived direct driver must drain the freed dir on its own -- "
-                                    + "no steps, no reap, no borrow",
+                            "the parked direct driver must drain the freed dir on its own",
                             awaitNoSegmentFile(slot("default-0"), 15_000));
                     Assert.assertTrue("replayed frames must reach the server",
                             awaitAtLeast(handler.frames, 1, 15_000));
-                    long deadline = System.currentTimeMillis() + 10_000;
-                    while (!pool.isRecoveryCompleteForTesting()
-                            && System.currentTimeMillis() < deadline) {
-                        Thread.sleep(10);
-                    }
-                    Assert.assertTrue("the revived driver must re-latch completion",
-                            pool.isRecoveryCompleteForTesting());
+                    Assert.assertTrue("the same driver must re-latch completion",
+                            awaitCondition(pool::isRecoveryCompleteForTesting, 10_000));
+                    Assert.assertSame("re-arm must keep the original driver",
+                            driver, pool.getStartupRecoveryThreadForTesting());
+                    Assert.assertTrue("the original driver must remain parked and alive",
+                            driver.isAlive());
+                    Assert.assertEquals("re-arm must not create another recovery driver",
+                            1, driverCreations.get());
                     Assert.assertEquals(0, pool.leakedSlotCount());
+                }
+                Assert.assertFalse("pool close must stop the one recovery driver",
+                        driverRef.get().isAlive());
+            }
+        });
+    }
+
+    @Test
+    public void testDirectRecoveryRearmBeforeParkKeepsWakePermit() throws Exception {
+        // Deterministically put the sole driver between its completion check
+        // and park(), then re-arm first. A notify-style wake could be lost in
+        // this window; LockSupport retains one permit, so the subsequent park
+        // returns immediately and the SAME driver drains the new candidate.
+        TestUtils.assertMemoryLeak(() -> {
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler);
+                 TestWebSocketServer silentSink = new TestWebSocketServer(new SilentHandler())) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                silentSink.start();
+                Assert.assertTrue(silentSink.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";";
+                String cfgBroken = "ws::addr=localhost:" + silentSink.getPort() + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+
+                AtomicBoolean brokenNextBuild = new AtomicBoolean();
+                IntFunction<Sender> factory = idx ->
+                        Sender.builder(brokenNextBuild.get() ? cfgBroken : cfg)
+                                .senderId("default-" + idx).build();
+                AtomicBoolean firstWait = new AtomicBoolean(true);
+                AtomicBoolean releasePark = new AtomicBoolean();
+                AtomicInteger driverCreations = new AtomicInteger();
+                CountDownLatch beforePark = new CountDownLatch(1);
+                Runnable recoveryWaiter = () -> {
+                    if (firstWait.compareAndSet(true, false)) {
+                        beforePark.countDown();
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!releasePark.get()
+                                && !Thread.currentThread().isInterrupted()
+                                && System.nanoTime() < deadline) {
+                            io.questdb.client.std.Compat.onSpinWait();
+                        }
+                        if (!releasePark.get()) {
+                            throw new AssertionError("timed out before completion park");
+                        }
+                    }
+                    LockSupport.park();
+                };
+                ThreadFactory threadFactory = runnable -> {
+                    driverCreations.incrementAndGet();
+                    return new Thread(runnable, "test-rearm-before-park");
+                };
+
+                SenderPool pool = null;
+                try {
+                    pool = newPoolWithRecoveryControls(
+                            cfg, 0, 1, 500, factory, threadFactory, recoveryWaiter, null);
+                    SenderPool recoveryPool = pool;
+                    Assert.assertTrue("driver must reach the completion-park boundary",
+                            beforePark.await(10, TimeUnit.SECONDS));
+                    Assert.assertTrue("initial scan must have latched complete",
+                            recoveryPool.isRecoveryCompleteForTesting());
+
+                    brokenNextBuild.set(true);
+                    PooledSender ps = recoveryPool.borrow();
+                    brokenNextBuild.set(false);
+                    ps.table("wake").longColumn("v", 1).atNow();
+                    ps.flush();
+                    recoveryPool.discardBrokenForTesting(ps);
+                    Assert.assertTrue("clean release must leave a candidate on disk",
+                            hasSegmentFile(slot("default-0")));
+                    Assert.assertFalse("release must re-arm before the driver parks",
+                            recoveryPool.isRecoveryCompleteForTesting());
+
+                    // The callback already called unpark(). Let the driver
+                    // reach park only now; it must consume the retained permit.
+                    releasePark.set(true);
+                    Assert.assertTrue("retained wake permit must drive recovery immediately",
+                            awaitNoSegmentFile(slot("default-0"), 15_000));
+                    Assert.assertTrue("replayed frame must reach the server",
+                            awaitAtLeast(handler.frames, 1, 15_000));
+                    Assert.assertTrue("same driver must re-latch completion",
+                            awaitCondition(recoveryPool::isRecoveryCompleteForTesting, 10_000));
+                    Assert.assertEquals("re-arm must never create a second driver",
+                            1, driverCreations.get());
+                } finally {
+                    releasePark.set(true);
+                    if (pool != null) {
+                        pool.close();
+                    }
                 }
             }
         });
@@ -2189,9 +2370,9 @@ public class SenderPoolSfTest {
         // already dropped and a probe would have restored capacity and admitted
         // a creation. Deterministic: no housekeeper runs in this test, so
         // borrow() is the only reprobe driver. Recovery is driven manually via
-        // the deferred-pool step helper because the inline path reuses
-        // acquireTimeoutMillis as its recovery budget -- 0 would skip recovery
-        // outright. This test is RED until the probe is hoisted above the
+        // a deferred pool so no private background thread can race the borrow
+        // boundary this test isolates. This test is RED until the probe is
+        // hoisted above the
         // timeout check.
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: strand unacked data under default-0 so startup recovery
@@ -2326,7 +2507,11 @@ public class SenderPoolSfTest {
                 };
 
                 try (SenderPool pool = newPoolWithFactory(cfg2, 0, 1, 100, factory)) {
-                    Assert.assertNotNull("recovery must have built slot 0", forged.get());
+                    Assert.assertTrue(
+                            "background recovery must build and retire slot 0",
+                            awaitCondition(
+                                    () -> forged.get() != null && pool.leakedSlotCount() == 1,
+                                    10_000));
                     Assert.assertEquals("precondition: startup recovery must retire the slot",
                             1, pool.leakedSlotCount());
 
@@ -2856,7 +3041,7 @@ public class SenderPoolSfTest {
 
                     primary.close();
                     primaryReturned.set(true);
-                    pool.runStartupRecoveryToCompletionForTesting();
+                    pool.runStartupRecoveryWithinBudgetForTesting();
 
                     Assert.assertEquals("same live pool must retry the out-of-range candidate", 2,
                             recoveryAttempts.get());
@@ -3041,7 +3226,7 @@ public class SenderPoolSfTest {
     }
 
     @Test
-    public void testDirectRecoveryContinuesAfterFiniteBudgetExhaustion() throws Exception {
+    public void testDirectBackgroundRecoveryDrainsAllCandidates() throws Exception {
         createCandidateSlot("default-0");
         createCandidateSlot("default-1");
         CountDownLatch drained = new CountDownLatch(2);
@@ -3053,7 +3238,7 @@ public class SenderPoolSfTest {
         String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
 
         try (SenderPool pool = newPoolWithFactory(config, 0, 1, 0, factory)) {
-            Assert.assertTrue("direct pool must continue recovery after its inline budget expires",
+            Assert.assertTrue("direct background driver must drain every candidate",
                     drained.await(5, TimeUnit.SECONDS));
             Assert.assertEquals("in-range candidate must be recovered", 1, attempts[0].get());
             Assert.assertEquals("out-of-range candidate must be recovered", 1, attempts[1].get());
@@ -3555,36 +3740,48 @@ public class SenderPoolSfTest {
     }
 
     @Test
-    public void testLongMaxStartupRecoveryBudgetDoesNotOverflow() throws Exception {
+    public void testDirectRecoveryRunsOnlyInBackground() throws Exception {
         createCandidateSlot("default-0");
-        AtomicInteger attempts = new AtomicInteger();
+        CountDownLatch factoryEntered = new CountDownLatch(1);
+        CountDownLatch releaseFactory = new CountDownLatch(1);
+        AtomicReference<Thread> factoryThread = new AtomicReference<>();
         IntFunction<Sender> factory = idx -> {
-            attempts.incrementAndGet();
+            factoryThread.set(Thread.currentThread());
+            factoryEntered.countDown();
+            try {
+                if (!releaseFactory.await(10, TimeUnit.SECONDS)) {
+                    throw new AssertionError("timed out waiting to release recovery factory");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("recovery factory interrupted", e);
+            }
             return successfulRecoverySender(idx, new CountDownLatch(0));
         };
         String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+        Thread constructorThread = Thread.currentThread();
 
         try (SenderPool pool = newPoolWithFactory(config, 0, 1, Long.MAX_VALUE, factory)) {
-            Assert.assertEquals("Long.MAX_VALUE must leave a positive inline recovery budget",
-                    1, attempts.get());
-            Assert.assertTrue("the inline scan must complete", pool.isRecoveryCompleteForTesting());
+            Assert.assertTrue("background recovery must enter its sender factory",
+                    factoryEntered.await(10, TimeUnit.SECONDS));
+            Assert.assertNotSame("constructor thread must never run startup recovery",
+                    constructorThread, factoryThread.get());
+            Assert.assertTrue("direct SF pool must own one background driver",
+                    pool.getStartupRecoveryThreadForTesting().isAlive());
+            releaseFactory.countDown();
+            Assert.assertTrue("background scan must complete after the factory is released",
+                    awaitCondition(pool::isRecoveryCompleteForTesting, 10_000));
+        } finally {
+            releaseFactory.countDown();
         }
     }
 
     @Test
-    public void testStartupRecoveryIsBoundedByASharedBudget() throws Exception {
-        // Regression for the startup-recovery budget (M1).
-        // recoverOneSlotStep() runs synchronously in the SenderPool
-        // constructor. A previous run can strand unacked data in EVERY in-range
-        // slot, and if the server is reachable but does not ack, each slot's
-        // drain blocks for the full acquireTimeoutMillis. Without a shared,
-        // whole-scan budget (and a short-circuit on the first drain that fails
-        // to ack) construction blocks for (maxSize - minSize) *
-        // acquireTimeoutMillis -- here 4 * 1s = 4s -- so QuestDB.build() stalls
-        // proportionally to the recovery backlog. The fix caps the TOTAL
-        // recovery at ~one acquireTimeoutMillis and stops scanning the moment a
-        // drain fails to ack, so construction must return well inside that
-        // ceiling no matter how many slots are stranded.
+    public void testDirectStartupRecoveryDoesNotBlockConstruction() throws Exception {
+        // Direct SF recovery is exclusively background work. A previous run
+        // can strand unacked data in every managed slot and a reachable server
+        // can fail to acknowledge every drain, but construction must not pay
+        // any recovery drain budget: it starts one driver and returns.
         final long acquireTimeoutMillis = 1_000L;
         final int maxSize = 4;
 
@@ -3618,11 +3815,9 @@ public class SenderPoolSfTest {
             }
 
             // Phase 2: restart against a STILL-silent (reachable but
-            // never-acking) server. Construction triggers startup recovery over
-            // all four stranded slots. close_flush_timeout=0 makes each
-            // recoverer's close() a fast close, so the measured window isolates
-            // the drain budget: pre-fix it is maxSize * acquireTimeoutMillis;
-            // post-fix it is bounded by ~one acquireTimeoutMillis.
+            // never-acking) server. The private recovery thread may begin
+            // immediately, but construction must return without waiting for
+            // its connect/drain attempt.
             try (TestWebSocketServer silent2 = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent2.getPort();
                 silent2.start();
@@ -3634,16 +3829,11 @@ public class SenderPoolSfTest {
                 SenderPool pool = new SenderPool(cfg, 0, maxSize, acquireTimeoutMillis, Long.MAX_VALUE, Long.MAX_VALUE);
                 long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
                 try {
-                    // Headline guarantee: total recovery is bounded by the
-                    // shared budget, NOT maxSize * acquireTimeoutMillis. The 3x
-                    // ceiling leaves generous CI margin over the ~1x post-fix
-                    // cost while still decisively failing the pre-fix 4x stall.
                     Assert.assertTrue(
-                            "startup recovery must be bounded by a shared budget, not per-slot: took "
-                                    + elapsedMillis + "ms with acquireTimeout=" + acquireTimeoutMillis
-                                    + "ms over " + maxSize + " stranded slots (pre-fix ~"
-                                    + (maxSize * acquireTimeoutMillis) + "ms)",
-                            elapsedMillis < 3 * acquireTimeoutMillis);
+                            "direct construction must not block on startup recovery: took "
+                                    + elapsedMillis + "ms with acquireTimeout="
+                                    + acquireTimeoutMillis + "ms",
+                            elapsedMillis < acquireTimeoutMillis);
 
                     // Durability, not loss: the silent server never acked, so
                     // the stranded data is deferred (still on disk for a later
@@ -3814,12 +4004,15 @@ public class SenderPoolSfTest {
                             "deferred construction must not block on recovery: took " + elapsedMillis
                                     + "ms with acquireTimeout=" + acquireTimeoutMillis + "ms",
                             elapsedMillis < acquireTimeoutMillis);
+                    Assert.assertNull("deferred pool must not own a private recovery thread",
+                            pool.getStartupRecoveryThreadForTesting());
 
-                    // Recovery has not been driven yet, so every stranded slot is
-                    // still on disk -- proving construction skipped inline recovery.
+                    // Recovery has not been driven yet, so every stranded slot
+                    // is still on disk -- proving construction left recovery to
+                    // the external housekeeper.
                     for (int i = 0; i < maxSize; i++) {
                         Assert.assertTrue(
-                                "deferred construction must NOT recover inline: default-" + i,
+                                "deferred construction must leave recovery undriven: default-" + i,
                                 hasSegmentFile(slot("default-" + i)));
                     }
 
@@ -3828,7 +4021,7 @@ public class SenderPoolSfTest {
                     // lost) for a later attempt -- exercising the deferred path's
                     // concurrency-safe slot reservation too.
                     long recoverStart = System.nanoTime();
-                    pool.runStartupRecoveryToCompletionForTesting();
+                    pool.runStartupRecoveryWithinBudgetForTesting();
                     long recoverMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - recoverStart);
                     Assert.assertTrue(
                             "driven recovery must be bounded by the shared budget: took " + recoverMillis
@@ -3848,10 +4041,10 @@ public class SenderPoolSfTest {
 
     @Test
     public void testDeferredStartupRecoveryDeliversWhenDriven() throws Exception {
-        // Deferring recovery off the constructor must not lose it: once driven
-        // (by the housekeeper in production; explicitly here) against an acking
-        // server, a deferred pool recovers its stranded managed slots exactly as
-        // the inline path would. The drive is also idempotent.
+        // A deferred pool must not lose recovery: once driven (by the
+        // housekeeper in production; explicitly here) against an acking server,
+        // it recovers the same stranded managed slots as the direct background
+        // driver. The manual drive is also idempotent.
         TestUtils.assertMemoryLeak(() -> {
             // Phase 1: seed unacked data into default-0 (silent server).
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
@@ -3883,7 +4076,7 @@ public class SenderPoolSfTest {
                             hasSegmentFile(slot("default-0")));
 
                     // Drive it (what the housekeeper does on its first tick).
-                    pool.runStartupRecoveryToCompletionForTesting();
+                    pool.runStartupRecoveryWithinBudgetForTesting();
                     Assert.assertTrue("driven recovery must empty default-0",
                             awaitNoSegmentFile(slot("default-0"), 15_000));
                     Assert.assertTrue("recovered frames must reach the server",
@@ -3892,7 +4085,7 @@ public class SenderPoolSfTest {
                             Files.exists(slot("default-0") + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
 
                     // Idempotent: a second drive is a no-op and must not throw.
-                    pool.runStartupRecoveryToCompletionForTesting();
+                    pool.runStartupRecoveryWithinBudgetForTesting();
                     Assert.assertFalse("default-0 stays recovered", hasSegmentFile(slot("default-0")));
 
                     // Pool still usable for normal borrows.
@@ -4154,13 +4347,22 @@ public class SenderPoolSfTest {
                 SenderPool pool = null;
                 try {
                     pool = newPoolWithFactory(config, 0, maxSize, 2_000, factory);
+                    SenderPool recoveryPool = pool;
+                    Assert.assertTrue(
+                            "background recovery must build the stranded slot",
+                            awaitCondition(() -> engineRef.get() != null, 10_000));
                     CursorSendEngine engine = engineRef.get();
                     SegmentManager manager = managerRef.get();
-                    Assert.assertNotNull("startup recovery must build the stranded slot", engine);
                     if (strandedIndex < maxSize) {
+                        Assert.assertTrue(
+                                "in-range recoverer must retire after its close times out",
+                                awaitCondition(() -> recoveryPool.leakedSlotCount() == 1, 10_000));
                         Assert.assertEquals("in-range recoverer must remain retired while worker is live",
                                 1, pool.leakedSlotCount());
                     } else {
+                        Assert.assertTrue(
+                                "out-of-range scan must finish after the recoverer close returns",
+                                awaitCondition(recoveryPool::isRecoveryCompleteForTesting, 10_000));
                         Assert.assertEquals("out-of-range recovery must not consume pool capacity",
                                 0, pool.leakedSlotCount());
                     }
@@ -4266,6 +4468,18 @@ public class SenderPoolSfTest {
             Thread.sleep(10);
         }
         return counter.get() >= target;
+    }
+
+    private static boolean awaitCondition(BooleanSupplier condition, long timeoutMillis)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return true;
+            }
+            Thread.sleep(10);
+        }
+        return condition.getAsBoolean();
     }
 
     @Test
@@ -4425,8 +4639,8 @@ public class SenderPoolSfTest {
     }
 
     // Uses the @TestOnly 8-arg constructor (deferStartupRecovery=true) so a test
-    // can build a pool whose SF startup recovery is NOT run inline -- mirroring
-    // the pooled QuestDB handle, which defers it to the housekeeper.
+    // can build a pool with no private recovery thread -- mirroring the pooled
+    // QuestDB handle, which delegates recovery to the housekeeper.
     // senderFactory=null -> the real defaultSender().
     private static SenderPool newDeferredPool(String cfg, int min, int max, long acquireMs) {
         return new SenderPool(cfg, min, max, acquireMs, Long.MAX_VALUE, Long.MAX_VALUE, null, true);

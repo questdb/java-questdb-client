@@ -107,8 +107,11 @@ import java.util.function.IntFunction;
  *       restored capacity but nothing re-armed the latched scan, so the
  *       data waited for a restart or a lucky borrow of that index.</li>
  * </ul>
- * Random iterations (2+) additionally draw the runtime-wedge op freely, so
- * runtime retires also interleave with a still-running scan.
+ * Random iterations (2+) additionally draw the runtime-fault op freely, and
+ * each draw discards its borrow either through the wedged close (flock kept,
+ * slot retired, healed at end of schedule) or through a CLEAN release (workers
+ * stop, the flock drops, {@code reclaimSlot}'s freed arm must re-arm the scan
+ * itself), so both discard shapes interleave with a still-running scan.
  */
 public class SenderPoolSfFuzzTest {
 
@@ -370,7 +373,7 @@ public class SenderPoolSfFuzzTest {
                                             s.close();
                                         }
                                         break;
-                                    case 5: { // runtime wedge: retire a live borrow undelivered
+                                    case 5: { // runtime fault: discard a live borrow undelivered
                                         wedgeNextBorrow[0] = true;
                                         PooledSender ps = null;
                                         try {
@@ -389,9 +392,22 @@ public class SenderPoolSfFuzzTest {
                                             lastWedgeBuild[0] = null;
                                             ps.table("fuzz").longColumn("wedged", op).atNow();
                                             ps.flush();
-                                            ((QwpWebSocketSender) delegate).setClosedForTesting(true);
-                                            pool.discardBrokenForTesting(ps);
-                                            unhealed.add(delegate);
+                                            if (rnd.nextBoolean()) {
+                                                // Wedged close: the flock is
+                                                // kept, the slot retires;
+                                                // healed at end of schedule.
+                                                ((QwpWebSocketSender) delegate).setClosedForTesting(true);
+                                                pool.discardBrokenForTesting(ps);
+                                                unhealed.add(delegate);
+                                            } else {
+                                                // Clean release: close() tears
+                                                // down fine, the flock drops,
+                                                // rows stay durably unacked.
+                                                // reclaimSlot's freed arm must
+                                                // re-arm the scan or the
+                                                // post-close audit reds.
+                                                pool.discardBrokenForTesting(ps);
+                                            }
                                         } else {
                                             // Borrow reused an idle (ack-server)
                                             // sender; nothing to wedge.
