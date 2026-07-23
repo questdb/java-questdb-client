@@ -36,7 +36,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -133,8 +132,8 @@ public class SegmentManagerWatermarkDeregisterRaceTest {
                 // closed=true, masking the original bug's plain-boolean guard.
                 // Releasing the mmap/fd directly leaves the object in the stale
                 // state that a racing worker is allowed to observe.
-                releaseWatermarkStorageButLeaveObjectWritable(watermark);
-                watermarkStorageReleased = true;
+                watermarkStorageReleased =
+                        releaseWatermarkStorageButLeaveObjectWritable(watermark);
                 resumeWorker.countDown();
                 if (hookErr.get() != null) {
                     throw new AssertionError("install hook failed", hookErr.get());
@@ -154,32 +153,18 @@ public class SegmentManagerWatermarkDeregisterRaceTest {
                 } catch (Throwable ignored) {
                     // best-effort
                 }
-                if (!watermarkStorageReleased) {
-                    try {
-                        watermark.close();
-                    } catch (Throwable ignored) {
-                        // best-effort
-                    }
+                try {
+                    watermark.close();
+                } catch (Throwable ignored) {
+                    // best-effort
                 }
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
 
-    private static void releaseWatermarkStorageButLeaveObjectWritable(AckWatermark watermark) throws Exception {
-        Field mmapAddressF = AckWatermark.class.getDeclaredField("mmapAddress");
-        mmapAddressF.setAccessible(true);
-        long mmapAddress = mmapAddressF.getLong(watermark);
-        if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
-            Files.munmap(mmapAddress, AckWatermark.FILE_SIZE, MemoryTag.MMAP_DEFAULT);
-        }
-
-        Field fdF = AckWatermark.class.getDeclaredField("fd");
-        fdF.setAccessible(true);
-        int fd = fdF.getInt(watermark);
-        if (fd >= 0) {
-            Files.close(fd);
-        }
+    private static boolean releaseWatermarkStorageButLeaveObjectWritable(AckWatermark watermark) {
+        return watermark.releaseStorageButKeepWritableForTesting();
     }
 
     private static void rmDirRecursive(String dir) {

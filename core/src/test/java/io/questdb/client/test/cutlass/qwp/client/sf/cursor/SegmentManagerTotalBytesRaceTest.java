@@ -33,7 +33,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -193,15 +192,8 @@ public class SegmentManagerTotalBytesRaceTest {
         }
     }
 
-    private static long readTotalBytes(SegmentManager mgr) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("totalBytes");
-        f.setAccessible(true);
-        Field lockF = SegmentManager.class.getDeclaredField("lock");
-        lockF.setAccessible(true);
-        Object lock = lockF.get(mgr);
-        synchronized (lock) {
-            return f.getLong(mgr);
-        }
+    private static long readTotalBytes(SegmentManager mgr) {
+        return mgr.getTotalBytesForTesting();
     }
 
     private static void rmDirRecursive(String dir) {
@@ -226,9 +218,7 @@ public class SegmentManagerTotalBytesRaceTest {
         Files.remove(dir);
     }
 
-    private static Thread workerThread(SegmentManager mgr) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("workerThread");
-        f.setAccessible(true);
-        return (Thread) f.get(mgr);
+    private static Thread workerThread(SegmentManager mgr) {
+        return mgr.getWorkerThreadForTesting();
     }
 }

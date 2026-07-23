@@ -29,7 +29,7 @@ import org.slf4j.Logger;
 public class PlainSocket implements Socket {
     private final Logger log;
     private final NetworkFacade nf;
-    private int fd = -1;
+    private volatile int fd = -1;
 
     public PlainSocket(NetworkFacade nf, Logger log) {
         this.nf = nf;
@@ -37,10 +37,19 @@ public class PlainSocket implements Socket {
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
         if (fd != -1) {
             nf.close(fd, log);
             fd = -1;
+        }
+    }
+
+    @Override
+    public synchronized void closeTraffic() {
+        if (fd != -1 && nf.shutdown(fd) != 0) {
+            throw new IllegalStateException(
+                    "could not shut down socket traffic [fd=" + fd + ", errno=" + nf.errno() + ']'
+            );
         }
     }
 
