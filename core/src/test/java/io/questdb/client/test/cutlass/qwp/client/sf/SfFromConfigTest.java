@@ -277,6 +277,78 @@ public class SfFromConfigTest {
     }
 
     @Test
+    public void testSfSyncIntervalRejectsZero() throws Exception {
+        // A realistic operator typo: sf_sync_interval_millis=0. The setter
+        // rejects it at parse time (millis <= 0), before build() cross-checks
+        // periodic mode, so the out-of-range message is what surfaces.
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_durability=periodic;sf_sync_interval_millis=0;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected sf_sync_interval_millis=0 to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("sf_sync_interval_millis is out of range"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalOverflowBoundary() throws Exception {
+        // Pin the exact millis->nanos overflow guard: millis * 1_000_000 must
+        // not overflow a long. The largest accepted value is
+        // Long.MAX_VALUE / 1_000_000; one millisecond more must be rejected.
+        // Both sides are asserted so a later change to the operator (> vs >=)
+        // or the 1_000_000 divisor cannot regress silently.
+        final long maxValidMillis = Long.MAX_VALUE / 1_000_000L;
+        TestUtils.assertMemoryLeak(() -> {
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Accept side: the boundary value is honored and converts to
+                // nanos without overflow.
+                String accepted = "ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfDir + ";sf_durability=periodic"
+                        + ";sf_sync_interval_millis=" + maxValidMillis + ";";
+                try (Sender sender = Sender.fromConfig(accepted)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(maxValidMillis * 1_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                }
+            }
+
+            // Reject side: one millisecond past the boundary is out of range.
+            String rejected = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_durability=periodic;sf_sync_interval_millis="
+                    + (maxValidMillis + 1) + ";";
+            try (Sender ignored = Sender.fromConfig(rejected)) {
+                Assert.fail("expected the overflow-boundary value to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("sf_sync_interval_millis is out of range"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalRejectsOnNonWebSocketTransport() throws Exception {
+        // The config-string parser rejects sf_sync_interval_millis on any
+        // non-WebSocket schema before the value is parsed.
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "http::addr=localhost:1;sf_sync_interval_millis=123;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected sf_sync_interval_millis on http to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains(
+                                "sf_sync_interval_millis is only supported for WebSocket transport"));
+            }
+        });
+    }
+
+    @Test
     public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             AckHandler handler = new AckHandler();
