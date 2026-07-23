@@ -64,6 +64,8 @@ public class TestWebSocketServer implements Closeable {
     // client-side pool actually closed the connections it opened.
     private final AtomicInteger liveConnections = new AtomicInteger();
     private final int port;
+    private final AtomicInteger roleRejectCount = new AtomicInteger();
+    private final CountDownLatch roleRejectLatch = new CountDownLatch(1);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
@@ -165,6 +167,10 @@ public class TestWebSocketServer implements Closeable {
         this.port = serverSocket.getLocalPort();
     }
 
+    public boolean awaitRoleReject(long timeout, TimeUnit unit) throws InterruptedException {
+        return roleRejectLatch.await(timeout, unit);
+    }
+
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
         return startLatch.await(timeout, unit);
     }
@@ -219,6 +225,13 @@ public class TestWebSocketServer implements Closeable {
      */
     public int liveConnectionCount() {
         return liveConnections.get();
+    }
+
+    /**
+     * Number of HTTP 421 role-reject responses sent over the server's lifetime.
+     */
+    public int roleRejectCount() {
+        return roleRejectCount.get();
     }
 
     /**
@@ -586,6 +599,8 @@ public class TestWebSocketServer implements Closeable {
                         "\r\n";
                 out.write(sb.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
+                roleRejectCount.incrementAndGet();
+                roleRejectLatch.countDown();
                 return false;
             }
 

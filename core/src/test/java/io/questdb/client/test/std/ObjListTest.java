@@ -28,6 +28,8 @@ import io.questdb.client.std.ObjList;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Field;
+
 /**
  *
  */
@@ -56,6 +58,21 @@ public class ObjListTest {
 
         Assert.assertEquals(list(), remove(list("a", "b", "c"), 0, 20));
         Assert.assertEquals(list(), remove(list("a", "b", "c"), 4, 10));
+    }
+
+    @Test
+    public void testRemoveFromToClearsFinalBackingSlot() throws Exception {
+        ObjList<Object> values = new ObjList<>(16);
+        for (int i = 0; i < 16; i++) {
+            values.add(new Object());
+        }
+
+        values.remove(0, 0);
+
+        Field bufferField = ObjList.class.getDeclaredField("buffer");
+        bufferField.setAccessible(true);
+        Object[] buffer = (Object[]) bufferField.get(values);
+        Assert.assertNull(buffer[buffer.length - 1]);
     }
 
     private static <T> ObjList<T> remove(ObjList<T> o, int from, int to) {

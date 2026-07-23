@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -34,6 +35,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -75,6 +77,8 @@ public class SlotLockTest {
                 try (SlotLock ignored = SlotLock.acquire(slot)) {
                     fail("expected slot contention to throw");
                 } catch (IllegalStateException expected) {
+                    assertTrue("contention must have a typed signal",
+                            expected instanceof SlotLockContentionException);
                     String msg = expected.getMessage();
                     assertTrue("error must mention contention: " + msg,
                             msg.contains("already in use"));
@@ -97,6 +101,161 @@ public class SlotLockTest {
                 // explicit no-op; close happens via try-with-resources
             }
             // After release, a fresh acquire should succeed.
+            try (SlotLock again = SlotLock.acquire(slot)) {
+                assertEquals(slot, again.slotDir());
+            }
+        });
+    }
+
+    @Test
+    public void testReleaseConfirmsAndIsIdempotent() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/verified-release";
+            SlotLock lock = SlotLock.acquire(slot);
+            assertTrue("first release must confirm success", lock.release());
+            // Idempotent: an already-released lock keeps reporting true —
+            // callers gating a "slot reusable" signal on it must never see
+            // a spurious false after a confirmed release.
+            assertTrue("repeat release must stay true", lock.release());
+            // close() after release() is a safe no-op (QuietCloseable path).
+            lock.close();
+            // Confirmed release means the slot is genuinely acquirable.
+            try (SlotLock again = SlotLock.acquire(slot)) {
+                assertEquals(slot, again.slotDir());
+            }
+        });
+    }
+
+    /**
+     * The {@code release() == false} branch: when the OS reports an explicit
+     * unlock failure, release must (a) return {@code false} so owners gating a
+     * "slot reusable" signal never see a lie, (b) retain the fd because the
+     * non-consuming unlock can safely be retried, and (c) keep returning
+     * {@code false} while the failure persists. Once unlock succeeds, release
+     * confirms and stays confirmed. Swapping in a known-bad descriptor gives
+     * the slot-specific native primitive a deterministic unlock failure.
+     */
+    @Test
+    public void testFailedCloseRetainsRetryOwnerUntilNextAcquire() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-close";
+            SlotLock lock = SlotLock.acquire(slot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    lock.injectReleaseFailureForTesting();
+            try {
+                // CursorSendEngine construction cleanup uses QuietCloseable.close().
+                // A failed close must retain an owner that a later acquire can
+                // drive, rather than dropping the sole reference and flock fd.
+                lock.close();
+                assertTrue("failed close must retain the injected descriptor",
+                        lock.isReleaseFailureInjectedForTesting());
+                try (SlotLock ignored = SlotLock.acquire(slot)) {
+                    fail("slot must stay locked while the release failure persists");
+                } catch (SlotLockContentionException expected) {
+                    // The retained real flock still protects the slot.
+                }
+
+                releaseFailure.close();
+                try (SlotLock again = SlotLock.acquire(slot)) {
+                    assertEquals("the next acquire must retry the retained release owner",
+                            slot, again.slotDir());
+                } catch (SlotLockContentionException stillHeld) {
+                    fail("failed construction cleanup dropped its retry owner: "
+                            + stillHeld.getMessage());
+                }
+            } finally {
+                releaseFailure.close();
+                lock.release();
+            }
+        });
+    }
+
+    @Test
+    public void testFailedCloseRetainsRetryOwnerWithEquivalentPathAlias() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-close-alias";
+            SlotLock lock = SlotLock.acquire(slot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    lock.injectReleaseFailureForTesting();
+            try {
+                lock.close();
+                assertTrue("failed close must retain the injected descriptor",
+                        lock.isReleaseFailureInjectedForTesting());
+
+                // Restore the real descriptor so the retained owner can make
+                // progress. The trailing separator preserves the caller's
+                // spelling but names the same physical .lock file.
+                releaseFailure.close();
+                String slotAlias = slot + "/";
+                try (SlotLock again = SlotLock.acquire(slotAlias)) {
+                    assertEquals("an equivalent path must drive the retained release owner",
+                            slotAlias, again.slotDir());
+                } catch (SlotLockContentionException stillHeld) {
+                    fail("equivalent path spelling could not find its retry owner: "
+                            + stillHeld.getMessage());
+                }
+            } finally {
+                releaseFailure.close();
+                lock.release();
+            }
+        });
+    }
+
+    @Test
+    public void testPersistentFailedCloseDoesNotBlockDifferentSlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String failedSlot = parentDir + "/persistent-failed-close";
+            SlotLock failedLock = SlotLock.acquire(failedSlot);
+            SlotLock.ReleaseFailureForTesting releaseFailure =
+                    failedLock.injectReleaseFailureForTesting();
+            try {
+                failedLock.close();
+                // A repeat close must not enqueue the same intrusive node twice.
+                failedLock.close();
+
+                String independentSlot = parentDir + "/independent";
+                try (SlotLock independent = SlotLock.acquire(independentSlot)) {
+                    assertEquals("a persistent failure on one slot must not block another",
+                            independentSlot, independent.slotDir());
+                }
+
+                releaseFailure.close();
+                String progressSlot = parentDir + "/progress";
+                try (SlotLock ignored = SlotLock.acquire(progressSlot)) {
+                    // Any cold acquisition drives every failed-close owner.
+                }
+                try (SlotLock reacquired = SlotLock.acquire(failedSlot)) {
+                    assertEquals("successful retry must remove the pending list entry",
+                            failedSlot, reacquired.slotDir());
+                }
+            } finally {
+                releaseFailure.close();
+                failedLock.release();
+            }
+        });
+    }
+
+    @Test
+    public void testFailedUnlockRetainsFdAndReportsFalse() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/failed-release";
+            SlotLock lock = SlotLock.acquire(slot);
+            try (SlotLock.ReleaseFailureForTesting ignored = lock.injectReleaseFailureForTesting()) {
+                assertFalse("release must report false when explicit unlock fails",
+                        lock.release());
+                assertTrue("failed unlock must retain the injected fd for a safe retry",
+                        lock.isReleaseFailureInjectedForTesting());
+                assertFalse("repeat release must stay false while unlock keeps failing",
+                        lock.release());
+                // While the release is unconfirmed the real flock remains held.
+                try (SlotLock ignoredLock = SlotLock.acquire(slot)) {
+                    fail("slot must not be acquirable while the original flock fd is still open");
+                } catch (IllegalStateException expected) {
+                    // good - unconfirmed release really means "still locked".
+                }
+            }
+            assertTrue("release must confirm once explicit unlock succeeds", lock.release());
+            assertTrue("confirmed release must stay confirmed", lock.release());
             try (SlotLock again = SlotLock.acquire(slot)) {
                 assertEquals(slot, again.slotDir());
             }

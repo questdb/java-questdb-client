@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.std.QuietCloseable;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -144,6 +145,11 @@ public final class SenderConnectionDispatcher implements QuietCloseable {
      */
     public long getTotalDelivered() {
         return totalDelivered.get();
+    }
+
+    @TestOnly
+    public Thread getWorkerThreadForTesting() {
+        return dispatcherThread;
     }
 
     /**

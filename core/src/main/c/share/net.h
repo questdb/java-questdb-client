@@ -82,6 +82,14 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_send
 
 /*
  * Class:     io_questdb_client_network_Net
+ * Method:    shutdown
+ * Signature: (I)I
+ */
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
+        (JNIEnv *, jclass, jint);
+
+/*
+ * Class:     io_questdb_client_network_Net
  * Method:    getSndBuf
  * Signature: (I)I
  */

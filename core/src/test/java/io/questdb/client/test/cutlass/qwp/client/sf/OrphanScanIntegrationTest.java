@@ -25,6 +25,9 @@
 package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.ObjList;
@@ -144,6 +147,107 @@ public class OrphanScanIntegrationTest {
                         "drain_orphans=true should have drained + removed the "
                                 + "ghost slot; primary's own slot is sender_id-filtered",
                         0, postRun.size());
+            }
+        });
+    }
+
+    /**
+     * The orphan drainer must inherit the adopting sender's PERIODIC
+     * store-and-forward checkpoint interval end to end:
+     * {@code Sender.build → startOrphanDrainers → BackgroundDrainer →
+     * CursorSendEngine}. A {@code 0} anywhere along that chain would make
+     * the drainer silently replay a PERIODIC slot without periodic
+     * checkpoints — no error, no log — which is exactly the mutation this
+     * test exists to catch.
+     */
+    @Test
+    public void testOrphanDrainerInheritsForegroundPeriodicSyncInterval() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1: fabricate an orphan slot holding unacked backlog
+            // (same recipe as
+            // testScanFindsOrphanFromPriorSenderUnderSameGroupRoot).
+            SilentHandler ghostSilent = new SilentHandler();
+            try (TestWebSocketServer ghostServer = new TestWebSocketServer(ghostSilent)) {
+                ghostServer.start();
+                Assert.assertTrue(ghostServer.awaitStart(5, TimeUnit.SECONDS));
+
+                String ghostCfg = "ws::addr=localhost:" + ghostServer.getPort()
+                        + ";sf_dir=" + sfDir + ";sender_id=ghost;close_flush_timeout_millis=0;";
+                try (Sender ghost = Sender.fromConfig(ghostCfg)) {
+                    ghost.table("foo").longColumn("v", 7L).atNow();
+                    ghost.flush();
+                    Assert.assertTrue("ghost frame must reach the wire before close",
+                            ghostSilent.awaitFrame(5, TimeUnit.SECONDS));
+                }
+            }
+            Assert.assertEquals("ghost slot must be a candidate orphan",
+                    1, OrphanScanner.scan(sfDir, "primary").size());
+
+            // Phase 2: adopt with a PERIODIC-durability sender. The server
+            // never acks, so the adopted slot can never finish draining —
+            // the drainer (and its engine) stay pinned in the pool snapshot
+            // while we assert the inheritance chain. The asserts below fail
+            // on the VALUE, not on a timeout, when inheritance breaks.
+            try (TestWebSocketServer primaryServer = new TestWebSocketServer(new SilentHandler())) {
+                primaryServer.start();
+                Assert.assertTrue(primaryServer.awaitStart(5, TimeUnit.SECONDS));
+
+                String primaryCfg = "ws::addr=localhost:" + primaryServer.getPort()
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary"
+                        + ";sf_durability=periodic"
+                        + ";sf_sync_interval_millis=123"
+                        + ";drain_orphans=true;";
+                try (Sender primary = Sender.fromConfig(primaryCfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) primary;
+                    // Anchor: the foreground engine carries the configured
+                    // interval (already pinned by SfFromConfigTest; repeated
+                    // here so both ends of the inheritance are asserted on
+                    // the same sender instance).
+                    Assert.assertEquals(123_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+
+                    BackgroundDrainerPool pool = ws.getDrainerPoolForTesting();
+                    Assert.assertNotNull("a candidate orphan under drain_orphans=true "
+                            + "must have built the drainer pool", pool);
+
+                    // The drainer constructs its engine on its own thread —
+                    // await it. Once seen it cannot leave the snapshot: with
+                    // no acks the drain never completes.
+                    BackgroundDrainer drainer = null;
+                    long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (System.nanoTime() < deadlineNanos) {
+                        ObjList<BackgroundDrainer> snap = pool.snapshot();
+                        if (snap.size() > 0 && snap.get(0).getEngineForTesting() != null) {
+                            drainer = snap.get(0);
+                            break;
+                        }
+                        Thread.sleep(10);
+                    }
+                    Assert.assertNotNull(
+                            "orphan drainer must construct its engine within the deadline",
+                            drainer);
+                    Assert.assertEquals("exactly one orphan slot was fabricated",
+                            1, pool.snapshot().size());
+
+                    // The carried finding: sender → drainer leg.
+                    Assert.assertEquals(
+                            "drainer must inherit the adopting sender's "
+                                    + "sf_sync_interval_millis",
+                            123_000_000L, drainer.getSyncIntervalNanosForTesting());
+                    // Drainer → engine leg: the interval actually reached the
+                    // engine that performs the periodic checkpoints.
+                    Assert.assertEquals(
+                            "drainer's engine must inherit the adopting sender's "
+                                    + "sf_sync_interval_millis",
+                            123_000_000L,
+                            drainer.getEngineForTesting().getSyncIntervalNanosForTesting());
+
+                    // Fast teardown: the drainer can never finish against the
+                    // silent server — stop it now so close() spends the
+                    // graceful-drain window on unwinding, not waiting.
+                    drainer.requestStop();
+                }
             }
         });
     }

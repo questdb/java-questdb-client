@@ -4,7 +4,7 @@ import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 
 /**
- * Crash-durable ingest with store-and-forward ({@code sf_dir}).
+ * Process-restart and periodic power-loss protection with store-and-forward.
  * <p>
  * Ingestion is asynchronous in every mode: {@code flush()} hands rows to a
  * background send engine that delivers them and tracks the server's
@@ -17,7 +17,10 @@ import io.questdb.client.Sender;
  *   <li><b>Store-and-forward</b> ({@code sf_dir} set): the engine backs its
  *       buffer with memory-mapped files, so unacked rows survive a producer
  *       <i>process restart</i> -- on the next startup it recovers the tail from
- *       disk and replays it once the server is reachable.</li>
+ *       disk and replays it once the server is reachable. Add
+ *       {@code sf_durability=periodic} for background power-loss checkpoints;
+ *       the configured interval is a target cadence and storage latency adds
+ *       to the actual recovery window.</li>
  * </ul>
  * {@code request_durable_ack=on} (Enterprise + replication) makes the ack wait
  * for the durable upload to object storage rather than the ordinary WAL commit.
@@ -28,6 +31,8 @@ public class WsStoreAndForwardExample {
         try (QuestDB db = QuestDB.connect(
                 "ws::addr=localhost:9000;"
                         + "sf_dir=/var/lib/questdb/sf;"
+                        + "sf_durability=periodic;"
+                        + "sf_sync_interval_millis=5000;"
                         + "request_durable_ack=on;")) {
 
             try (Sender sender = db.borrowSender()) {
