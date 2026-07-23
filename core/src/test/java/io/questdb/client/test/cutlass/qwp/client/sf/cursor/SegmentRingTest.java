@@ -39,6 +39,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -228,6 +229,64 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 100, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testDurabilityFrontierSurvivesSealedListCompaction() throws Exception {
+        // The periodic durability frontier (firstNonDurableSealed) is an
+        // absolute index into sealedSegments, so the prefix compaction that
+        // fires once the dead head grows past 64 -- shifting every live entry
+        // down by sealedHead -- must shift the frontier with it. Drive >64
+        // rotations, then trim a 64-segment prefix to force at least one
+        // compaction, and assert the periodic copy still offers EVERY still-
+        // live (here non-durable) sealed segment plus the active. A frontier
+        // not shifted with the compaction would drift past the live entries
+        // and under-count -- silently skipping un-fsynced segments.
+        TestUtils.assertMemoryLeak(() -> {
+            // One frame per segment: each retried append rotates.
+            long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/c0.sfa", 0, segSize);
+                try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
+                    final int sealedTarget = 68;
+                    for (int i = 0; i < sealedTarget; i++) {
+                        long r;
+                        while ((r = ring.appendOrFsn(buf, 16)) >= 0) {
+                            // fill the active until it is full
+                        }
+                        assertEquals(SegmentRing.BACKPRESSURE_NO_SPARE, r);
+                        ring.installHotSpare(MmapSegment.create(
+                                tmpDir + "/c" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
+                        assertTrue("retry must rotate", ring.appendOrFsn(buf, 16) >= 0);
+                    }
+                    assertEquals(sealedTarget, ring.getSealedSegments().size());
+
+                    // Trim the FSN 0..63 prefix (one frame per segment) so
+                    // sealedHead crosses the 64-entry compaction threshold.
+                    SegmentRing.resetTrimMovedReferences();
+                    ring.acknowledge(63);
+                    ObjList<MmapSegment> trimmed = ring.drainTrimmable();
+                    assertNotNull(trimmed);
+                    for (int i = 0, n = trimmed.size(); i < n; i++) {
+                        trimmed.getQuick(i).close();
+                    }
+                    assertTrue("compaction must have fired",
+                            SegmentRing.getTrimMovedReferences() > 0);
+
+                    int liveSealed = ring.getSealedSegments().size();
+                    assertTrue("some sealed segments must remain live",
+                            liveSealed > 0 && liveSealed < sealedTarget);
+                    // Load-bearing: the frontier tracked the compaction shift,
+                    // so the periodic copy still covers every live sealed
+                    // segment plus the active. Under-counting here would mean a
+                    // live segment is never fsynced by the periodic path.
+                    assertEquals(liveSealed + 1, ring.pendingSyncSegmentCountForTest());
+                }
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -645,8 +704,7 @@ public class SegmentRingTest {
                 }
                 try (SegmentRing ring = SegmentRing.openExisting(tmpDir, 4096)) {
                     assertNotNull(ring);
-                    assertEquals("the observation must survive for diagnostics",
-                            true, ring.getActive().tornTailBytes() > 0);
+                    assertTrue("the observation must survive for diagnostics", ring.getActive().tornTailBytes() > 0);
                 }
                 // No appends happened; the zeroing must already be durable.
                 try (MmapSegment seg = MmapSegment.openExisting(path)) {
@@ -1052,9 +1110,7 @@ public class SegmentRingTest {
             assertAdversarialSortWithinBound("organ-pipe", organPipe, bound);
 
             long[] allDuplicates = new long[n];
-            for (int i = 0; i < n; i++) {
-                allDuplicates[i] = 42;
-            }
+            Arrays.fill(allDuplicates, 42);
             assertAdversarialSortWithinBound("all-duplicates", allDuplicates, bound);
 
             long[] fewDistinct = new long[n];

@@ -100,6 +100,19 @@ public final class SegmentRing implements QuietCloseable {
     // Logical head of sealedSegments. Head removal nulls one entry and advances
     // this index; occasional compaction bounds unused prefix slots.
     private int sealedHead;
+    // Frontier index into sealedSegments: every sealed segment in
+    // [sealedHead, firstNonDurableSealed) has been proven durable by an earlier
+    // periodic pass and never needs re-scanning -- publishedCursor is frozen at
+    // seal and durableCursor only advances, so durability never regresses. The
+    // periodic sync (copyPendingSyncSegments) skips this proven-durable prefix,
+    // keeping the steady-state copy-under-monitor O(1) instead of O(live-sealed)
+    // work that would otherwise grow with a producer-outpaces-drain backlog.
+    // Rotation seals only already-durable predecessors (the
+    // requestSyncBeforeRotation gate), so the sole source of non-durable sealed
+    // segments is a crash-recovery resume; those are covered because the
+    // frontier starts at 0. Maintained entirely under this monitor, in the same
+    // coordinate space as sealedHead (shifted by compaction, reset on clear).
+    private int firstNonDurableSealed;
     // High-water byte offset within the active segment at which we proactively
     // ask the segment manager to provision a spare (if one isn't already
     // installed). Computed once as 3/4 of segment capacity -- leaves the manager
@@ -668,29 +681,23 @@ public final class SegmentRing implements QuietCloseable {
         }
         if (DEFAULT_MEMBERSHIP_MODE == RetainedSegmentMembershipMode.LINEAR) {
             if (observer == null) {
-                return new RetainedSegmentMembership() {
-                    @Override
-                    public boolean contains(MmapSegment segment) {
-                        for (int i = 0, n = chain.size(); i < n; i++) {
-                            if (chain.get(i) == segment) {
-                                return true;
-                            }
-                        }
-                        return false;
-                    }
-                };
-            }
-            return new RetainedSegmentMembership() {
-                @Override
-                public boolean contains(MmapSegment segment) {
+                return segment -> {
                     for (int i = 0, n = chain.size(); i < n; i++) {
-                        observer.onMembershipOperation();
                         if (chain.get(i) == segment) {
                             return true;
                         }
                     }
                     return false;
+                };
+            }
+            return segment -> {
+                for (int i = 0, n = chain.size(); i < n; i++) {
+                    observer.onMembershipOperation();
+                    if (chain.get(i) == segment) {
+                        return true;
+                    }
                 }
+                return false;
             };
         }
 
@@ -699,19 +706,11 @@ public final class SegmentRing implements QuietCloseable {
             retained.put(chain.get(i), Boolean.TRUE);
         }
         if (observer == null) {
-            return new RetainedSegmentMembership() {
-                @Override
-                public boolean contains(MmapSegment segment) {
-                    return retained.containsKey(segment);
-                }
-            };
+            return retained::containsKey;
         }
-        return new RetainedSegmentMembership() {
-            @Override
-            public boolean contains(MmapSegment segment) {
-                observer.onMembershipOperation();
-                return retained.containsKey(segment);
-            }
+        return segment -> {
+            observer.onMembershipOperation();
+            return retained.containsKey(segment);
         };
     }
 
@@ -1070,6 +1069,46 @@ public final class SegmentRing implements QuietCloseable {
         }
     }
 
+    /**
+     * Copies the live segments that may still need a durability barrier: every
+     * sealed segment from the {@link #firstNonDurableSealed} frontier onward,
+     * plus the active segment. First advances the frontier past any sealed
+     * segments an earlier pass (or rotation's pre-seal barrier) has since made
+     * durable. Used by the periodic sync path in place of
+     * {@link #copyLiveSegmentsForSync}: the proven-durable prefix would
+     * otherwise be re-copied under this monitor and re-scanned every tick as
+     * no-op {@link MmapSegment#syncPublished()} early-returns -- O(live-sealed)
+     * work that grows without bound under a producer-outpaces-drain backlog.
+     * The frontier is a conservative lower bound (it only ever advances past
+     * segments observed durable, and durability never regresses), so this can
+     * never skip a segment that still needs a barrier.
+     */
+    synchronized void copyPendingSyncSegments(ObjList<MmapSegment> target) {
+        target.clear();
+        // Invariant maintained by every mutation site (rotation append, trim's
+        // removeSealedHead, compaction shift, close). A frontier that drifted
+        // above size would silently skip un-fsynced segments, so guard it in
+        // tests; the clamp below keeps production safe if it is ever violated.
+        assert firstNonDurableSealed >= sealedHead && firstNonDurableSealed <= sealedSegments.size()
+                : "durability frontier out of range: firstNonDurableSealed=" + firstNonDurableSealed
+                + " sealedHead=" + sealedHead + " size=" + sealedSegments.size();
+        int i = firstNonDurableSealed;
+        if (i < sealedHead) {
+            i = sealedHead;
+        }
+        int n = sealedSegments.size();
+        while (i < n && sealedSegments.get(i).isPublishedDurable()) {
+            i++;
+        }
+        firstNonDurableSealed = i;
+        for (; i < n; i++) {
+            target.add(sealedSegments.get(i));
+        }
+        if (active != null) {
+            target.add(active);
+        }
+    }
+
     void enablePeriodicSync() {
         periodicSyncEnabled = true;
         syncRequested = true;
@@ -1115,6 +1154,7 @@ public final class SegmentRing implements QuietCloseable {
         }
         sealedSegments.clear();
         sealedHead = 0;
+        firstNonDurableSealed = 0;
         for (int i = 0, n = pendingTrims.size(); i < n; i++) {
             pendingTrims.getQuick(i).close();
         }
@@ -1211,7 +1251,6 @@ public final class SegmentRing implements QuietCloseable {
         return lastSeq <= ackedFsn ? segment : null;
     }
 
-    /** Active segment -- exposed for the I/O thread's "send next batch" path. */
     /**
      * Walks every published frame in the ring (sealed segments plus the active
      * segment) and returns the FSN of the LAST frame whose payload does NOT
@@ -1419,6 +1458,20 @@ public final class SegmentRing implements QuietCloseable {
         return pendingTrims.size();
     }
 
+    /**
+     * Number of live segments the periodic path would barrier this tick,
+     * advancing the durability frontier exactly as a real tick does. In the
+     * steady state (every sealed segment proven durable) this collapses to 1
+     * -- the active segment -- proving the proven-durable sealed prefix is no
+     * longer copied/scanned under the monitor.
+     */
+    @TestOnly
+    public synchronized int pendingSyncSegmentCountForTest() {
+        ObjList<MmapSegment> scratch = new ObjList<>();
+        copyPendingSyncSegments(scratch);
+        return scratch.size();
+    }
+
     @TestOnly
     public synchronized MmapSegment pinSegmentContainingForTest(long fsn) {
         return pinSegmentContaining(fsn);
@@ -1618,16 +1671,30 @@ public final class SegmentRing implements QuietCloseable {
             int liveCount = sealedSegments.size() - sealedHead;
             trimMovedReferences += liveCount;
             sealedSegments.remove(0, sealedHead - 1);
+            // The durable-prefix frontier lives in the same index space as the
+            // entries we just shifted down by sealedHead; move it with them.
+            // The invariant firstNonDurableSealed >= sealedHead keeps this >= 0.
+            firstNonDurableSealed -= sealedHead;
+            if (firstNonDurableSealed < 0) {
+                firstNonDurableSealed = 0;
+            }
             sealedHead = 0;
         }
     }
 
     private void removeSealedHead() {
         sealedSegments.setQuick(sealedHead++, null);
+        // If the removed head WAS the frontier (a non-durable but already-ACKed
+        // recovery-resumed segment can be trimmed before its first barrier),
+        // keep the frontier at or ahead of the live head.
+        if (firstNonDurableSealed < sealedHead) {
+            firstNonDurableSealed = sealedHead;
+        }
         int size = sealedSegments.size();
         if (sealedHead == size) {
             sealedSegments.clear();
             sealedHead = 0;
+            firstNonDurableSealed = 0;
         } else if (sealedHead >= 64 && sealedHead >= size - sealedHead) {
             compactSealedSegments();
         }

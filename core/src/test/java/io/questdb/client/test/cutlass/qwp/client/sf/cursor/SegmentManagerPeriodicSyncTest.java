@@ -306,6 +306,87 @@ public class SegmentManagerPeriodicSyncTest {
     }
 
     @Test
+    public void testPeriodicFrontierSkipsSealedPrefixOnceDurable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Recovery resumes a non-durable sealed segment (durableCursor at
+            // the header) plus a non-durable active. The first periodic copy
+            // must offer BOTH -- the sealed one still needs a barrier. Once a
+            // pass has made them durable, the durability frontier advances and
+            // later copies must offer ONLY the active: the proven-durable
+            // sealed prefix is never re-copied/re-scanned under the ring
+            // monitor. This guards the O(1)-steady-state contract that
+            // replaced the old O(live-sealed) copyLiveSegmentsForSync pass.
+            final long intervalNanos = 100L;
+            final long segmentSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            AtomicLong ticks = new AtomicLong();
+            CountingFilesFacade filesFacade = new CountingFilesFacade();
+            String dir = TestUtils.createTmpDir("qdb-periodic-frontier-");
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            SegmentManager manager = null;
+            SegmentRing ring = null;
+            try {
+                // Sealed chain member (full: FSNs 0..1) + active (FSN 2).
+                try (MmapSegment s0 = MmapSegment.create(
+                        filesFacade, dir + "/r0.sfa", 0L, segmentSize)) {
+                    s0.tryAppend(payload, 16);
+                    s0.tryAppend(payload, 16);
+                    s0.msync();
+                }
+                try (MmapSegment s1 = MmapSegment.create(
+                        filesFacade, dir + "/r1.sfa", 2L, segmentSize)) {
+                    s1.tryAppend(payload, 16);
+                    s1.msync();
+                }
+                ring = SegmentRing.openExisting(filesFacade, dir, segmentSize);
+                assertTrue(ring != null);
+                assertEquals(1, ring.getSealedSegments().size());
+
+                manager = new SegmentManager(
+                        segmentSize,
+                        SegmentManager.DEFAULT_POLL_NANOS,
+                        segmentSize * 8L,
+                        filesFacade,
+                        ticks::get);
+                manager.register(ring, dir, null, intervalNanos);
+
+                // Before any successful barrier the recovered sealed segment is
+                // non-durable, so the frontier cannot advance past it: the copy
+                // must offer sealed + active.
+                assertEquals("non-durable recovered sealed segment must be offered for sync",
+                        2, ring.pendingSyncSegmentCountForTest());
+
+                // Run the pass (enablePeriodicSync requested it): both segments
+                // are barriered and become durable.
+                manager.serviceRingForTesting(ring);
+
+                // The sealed segment is still live (nothing ACKed, so no trim)
+                // but now durable, so the frontier skips it: only the active is
+                // offered. count == 1 with a still-present sealed segment proves
+                // the skip.
+                assertEquals("durable sealed segment must remain live (no trim without ACKs)",
+                        1, ring.getSealedSegments().size());
+                assertEquals("durable sealed prefix must be skipped by the periodic copy",
+                        1, ring.pendingSyncSegmentCountForTest());
+                // Idempotent: re-running the frontier advance changes nothing.
+                assertEquals(1, ring.pendingSyncSegmentCountForTest());
+            } finally {
+                if (manager != null && ring != null) {
+                    manager.deregister(ring);
+                }
+                if (ring != null) {
+                    ring.close();
+                }
+                if (manager != null) {
+                    manager.close();
+                }
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+                TestUtils.removeTmpDir(dir);
+            }
+        });
+    }
+
+    @Test
     public void testTransientSyncFailureClearsOnNextSuccess() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final long intervalNanos = 100L;

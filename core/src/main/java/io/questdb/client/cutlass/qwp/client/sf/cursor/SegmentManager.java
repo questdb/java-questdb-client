@@ -34,6 +34,7 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -1094,9 +1095,7 @@ public final class SegmentManager implements QuietCloseable {
                 batchSize = e.ring.stagePendingTrims(
                         trimBatch, MAX_TRIMS_PER_RING_PASS, durableAck);
             } catch (Throwable t) {
-                for (int i = 0; i < trimBatch.length; i++) {
-                    trimBatch[i] = null;
-                }
+                Arrays.fill(trimBatch, null);
                 recordTrimFailure(e, TRIM_RETRY_UNLINK, now, t);
                 return false;
             }
@@ -1219,17 +1218,20 @@ public final class SegmentManager implements QuietCloseable {
             return;
         }
         try {
-            e.ring.copyLiveSegmentsForSync(syncScratch);
+            e.ring.copyPendingSyncSegments(syncScratch);
             for (int i = 0, n = syncScratch.size(); i < n; i++) {
                 syncScratch.getQuick(i).syncPublished();
             }
             e.ring.clearSyncRequestIfActiveDurable();
-            // The pass above covered every live segment's published range, and
-            // a failed barrier re-dirties its range under an mlock pin (see
-            // MmapSegment.syncPublished), so a success here is a genuine
-            // re-persist -- not a vacuous retry over pages a failed writeback
-            // marked clean (fsyncgate). Unlatch so a transient disk fault
-            // doesn't permanently brick the producer.
+            // The pass above covered every not-yet-durable live range -- the
+            // proven-durable sealed prefix is skipped precisely because its
+            // syncPublished would early-return (see copyPendingSyncSegments),
+            // so any latched failure necessarily belongs to a range we just
+            // re-barriered. A failed barrier re-dirties its range under an
+            // mlock pin (see MmapSegment.syncPublished), so a success here is a
+            // genuine re-persist -- not a vacuous retry over pages a failed
+            // writeback marked clean (fsyncgate). Unlatch so a transient disk
+            // fault doesn't permanently brick the producer.
             e.ring.clearDurabilityFailure();
             e.nextDataSyncNanos = now + e.syncIntervalNanos;
             if (e.syncFailureLogged) {
