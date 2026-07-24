@@ -635,6 +635,54 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testStoreAndForwardMaxSegmentBytes() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET);
+
+        Assert.assertSame(builder, builder.storeAndForwardMaxSegmentBytes(64 * 1024L));
+        Assert.assertEquals(
+                64 * 1024L,
+                ((Number) builder.wsConfigSnapshotForTest().get("sf_max_segment_bytes")).longValue()
+        );
+    }
+
+    @Test
+    public void testStoreAndForwardMaxSegmentBytesRejectsNonPositiveValues() {
+        long[] rejected = {0L, -1L};
+        for (long value : rejected) {
+            try {
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .storeAndForwardMaxSegmentBytes(value);
+                Assert.fail("expected storeAndForwardMaxSegmentBytes(" + value + ") to fail");
+            } catch (LineSenderException expected) {
+                Assert.assertEquals(
+                        "sf_max_segment_bytes must be positive: " + value,
+                        expected.getMessage()
+                );
+            }
+        }
+    }
+
+    @Test
+    public void testStoreAndForwardMaxSegmentBytesRejectedForNonWebSocketTransports() {
+        Sender.Transport[] rejected = {
+                Sender.Transport.HTTP,
+                Sender.Transport.TCP,
+                Sender.Transport.UDP
+        };
+        for (Sender.Transport transport : rejected) {
+            try {
+                Sender.builder(transport).storeAndForwardMaxSegmentBytes(64 * 1024L);
+                Assert.fail("expected " + transport + " to reject storeAndForwardMaxSegmentBytes");
+            } catch (LineSenderException expected) {
+                Assert.assertEquals(
+                        "store_and_forward is only supported for WebSocket transport",
+                        expected.getMessage()
+                );
+            }
+        }
+    }
+
+    @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
         // Regression test: connect() must not hardcode autoFlush to 0.
         assertMemoryLeak(() -> {
