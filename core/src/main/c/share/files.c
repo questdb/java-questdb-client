@@ -65,6 +65,13 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRW0
     return (jint) fd;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRWExclusive0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_CREAT | O_EXCL | O_RDWR, 0644), fd);
+    return (jint) fd;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openAppend0
         (JNIEnv *e, jclass cl, jlong lpszName) {
     int fd;
@@ -121,6 +128,21 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsync
         (JNIEnv *e, jclass cl, jint fd) {
     int res;
     RESTARTABLE(fsync((int) fd), res);
+    return res;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsyncDir0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    int fd;
+    RESTARTABLE(open((const char *) (uintptr_t) lpszName, O_RDONLY), fd);
+    if (fd < 0) {
+        return -1;
+    }
+    int res;
+    RESTARTABLE(fsync(fd), res);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
     return res;
 }
 
@@ -234,6 +256,18 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_length0
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_lock
         (JNIEnv *e, jclass cl, jint fd) {
     return flock((int) fd, LOCK_EX | LOCK_NB);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_cutlass_qwp_client_sf_cursor_SlotLock_release0
+        (JNIEnv *e, jclass cl, jint fd) {
+    if (flock((int) fd, LOCK_UN) != 0) {
+        return -1;
+    }
+    /* Unlock success confirms that the slot is reusable. close() is one-shot:
+     * POSIX leaves descriptor state unspecified on EINTR, so retrying its
+     * numeric value could close an unrelated descriptor after reuse. */
+    (void) close((int) fd);
+    return 0;
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
@@ -353,4 +387,16 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munmap0
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
         (JNIEnv *e, jclass cl, jlong addr, jlong len, jboolean async) {
     return msync((void *) (uintptr_t) addr, (size_t) len, async ? MS_ASYNC : MS_SYNC);
+}
+
+/* Best-effort page pin. Callers treat a refusal (RLIMIT_MEMLOCK, missing
+ * privilege) as a soft downgrade, so no errno capture is required here. */
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return mlock((void *) (uintptr_t) addr, (size_t) len);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return munlock((void *) (uintptr_t) addr, (size_t) len);
 }

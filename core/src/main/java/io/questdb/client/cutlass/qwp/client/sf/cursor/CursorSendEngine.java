@@ -26,11 +26,17 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongConsumer;
 
 /**
  * Facade that bundles a {@link SegmentRing} with a {@link SegmentManager} and
@@ -62,41 +68,20 @@ public final class CursorSendEngine implements QuietCloseable {
      * Default deadline for {@link #appendBlocking}: 30 seconds.
      */
     public static final long DEFAULT_APPEND_DEADLINE_NANOS = 30_000_000_000L;
-    /**
-     * Default retry budget for {@link #closeEventually()}: initial backoff,
-     * attempt cap and backoff cap. With these defaults a stuck engine is
-     * retried for roughly five minutes of scheduled delay (plus whatever
-     * time each {@link #close()} attempt spends blocked on the quiescence
-     * barrier) before it is abandoned.
-     */
-    public static final long DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS = 10_000_000L; // 10 ms
-    public static final int DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS = 40;
-    public static final long DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS = 10_000_000_000L; // 10 s
-    // Number of engines (process-wide) whose deferred close exhausted its
-    // retry budget and was abandoned: their ring, watermark and slot lock
-    // leak until process exit. Observability + test hook; never reset.
-    private static final java.util.concurrent.atomic.AtomicLong DEFERRED_CLOSE_ABANDONED_COUNT =
-            new java.util.concurrent.atomic.AtomicLong();
-    // Single shared daemon that owns every deferred close retry. One thread
-    // bounds the process footprint no matter how many engines are stuck:
-    // each task performs ONE close() attempt and reschedules itself with
-    // exponential backoff — it never loops or parks in-thread — so E stuck
-    // engines cost E queued tasks, not E threads. Attempts serialize, which
-    // is acceptable for a degraded-mode path whose per-attempt blocking is
-    // bounded by the manager's worker-join timeout.
-    private static final java.util.concurrent.ScheduledExecutorService DEFERRED_CLOSE_EXECUTOR =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(runnable -> {
-                Thread thread = new Thread(runnable, "qdb-cursor-engine-close");
-                thread.setDaemon(true);
-                return thread;
-            });
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger(CursorSendEngine.class);
-    // Deferred-close retry tuning. volatile: the @TestOnly setter may run on
-    // a different thread than the scheduler that reads them.
-    private static volatile long deferredCloseInitialBackoffNanos = DEFERRED_CLOSE_DEFAULT_INITIAL_BACKOFF_NANOS;
-    private static volatile int deferredCloseMaxAttempts = DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS;
-    private static volatile long deferredCloseMaxBackoffNanos = DEFERRED_CLOSE_DEFAULT_MAX_BACKOFF_NANOS;
+    private static final ThreadFactory DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY =
+            runnable -> new Thread(runnable, "qdb-sf-flock-release-retry");
+    private static final long FLOCK_RELEASE_RETRY_BASE_PARK_NANOS = 100_000_000L; // 100 ms
+    private static final Object FLOCK_RELEASE_RETRY_LOCK = new Object();
+    private static final long FLOCK_RELEASE_RETRY_MAX_PARK_NANOS = 5_000_000_000L; // 5 s
+    private static final ArrayDeque<CursorSendEngine> FLOCK_RELEASE_RETRY_QUEUE = new ArrayDeque<>();
+    private static volatile Runnable afterFlockReleaseRetryFailureHook;
+    private static volatile Runnable beforeDeferredCloseCreationHook;
+    private static volatile LongConsumer flockReleaseRetryParkOverride;
+    private static Thread flockReleaseRetryThread;
+    private static volatile ThreadFactory flockReleaseRetryThreadFactory =
+            DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY;
     private final long appendDeadlineNanos;
     // Number of times appendBlocking observed BACKPRESSURE_NO_SPARE on its first
     // ring.appendOrFsn attempt. One increment per blocking-call that had to wait
@@ -104,6 +89,11 @@ public final class CursorSendEngine implements QuietCloseable {
     // writer; volatile because the user may sample it from any thread.
     private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
             new java.util.concurrent.atomic.AtomicLong();
+    // Constructed before an owned manager acquires its native path scratch, so
+    // callback allocation failure cannot orphan manager resources. A timed-out
+    // close can then hand it to either manager path without allocating.
+    private final Runnable deferredClose;
+    private final FilesFacade filesFacade;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
     // case close() also stops the manager. When the manager is shared across
@@ -112,6 +102,7 @@ public final class CursorSendEngine implements QuietCloseable {
     private final SegmentRing ring;
     private final long segmentSizeBytes;
     private final String sfDir;
+    private final long syncIntervalNanos;
     // Held for the engine's lifetime in disk mode. {@code null} in memory
     // mode (no slot, no lock). Released by {@link #close()}; the kernel
     // also drops it on hard process exit.
@@ -138,33 +129,67 @@ public final class CursorSendEngine implements QuietCloseable {
     // range with a cumulative self-acknowledge once everything below is
     // server-acked (CursorWebSocketSendLoop.tryRetireOrphanTail).
     private long recoveredOrphanTipFsn = -1L;
-    // Engine-owned mmap'd watermark file. {@code null} in memory mode and
-    // in disk mode if open() failed (we proceed without it; recovery just
-    // falls back to lowestBase - 1). Lifetime tied to the engine: opened
-    // in the constructor, closed by {@link #close()}. The segment manager
-    // writes through this on every tick where ackedFsn has advanced.
+    // Engine-owned mmap'd watermark file. {@code null} only in memory mode;
+    // disk mode fails construction unless the watermark is usable because
+    // segment-derived recovery cannot distinguish acknowledged residue from
+    // replayable frames. Lifetime tied to the engine: opened in the
+    // constructor, closed by {@link #close()}. The segment manager writes
+    // through this on every tick where ackedFsn has advanced.
     private final AckWatermark watermark;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
     private volatile boolean closed;
-    // True once close() has run its full cleanup sequence. Stays false when
-    // a close attempt could not confirm manager-worker quiescence and had to
-    // leak the ring/watermark/slot lock — in that case a later close() call
-    // retries the cleanup (the worker may have exited by then). Guarded by
-    // the synchronized close() method and isCloseCompleted() accessor.
-    private boolean closeCompleted;
-    // Deferred-close retry state. Initialized under closeEventually()'s
-    // monitor before the first task is submitted (task submission
-    // happens-before publishes them to the scheduler thread); thereafter
-    // touched only by the single deferred-close scheduler thread.
-    private int deferredCloseAttempts;
-    private long deferredCloseBackoffNanos;
-    // True once the shared daemon has accepted ownership of incomplete close
-    // retries. Guarded by synchronized closeEventually(). Stays true after
-    // the retry budget is exhausted — abandonment is terminal for the daemon,
-    // though close() may still be invoked directly.
-    private boolean deferredCloseScheduled;
+    // True once close() has run its full cleanup sequence INCLUDING a
+    // CONFIRMED slot-flock release — finishClose() publishes this strictly
+    // after SlotLock.release() reports success, never before. Pool threads
+    // treat the flip as "the slot dir is reusable" and free the slot index
+    // the moment they observe it (QwpWebSocketSender.isSlotLockReleased ->
+    // SenderPool.reprobeRetiredSlots), so publishing before the release
+    // would let a replacement engine's SlotLock.acquire collide with the
+    // still-open fd. Stays false when a close attempt could not confirm
+    // manager-worker quiescence (or the flock release itself failed) and had
+    // to leak the ring/watermark/slot lock — in that case a later close()
+    // call retries the cleanup (the worker may have exited by then).
+    // volatile: latched by finishClose(), but read lock-free by
+    // isCloseCompleted() from pool threads re-probing a retired slot (see the
+    // getter for why it must not synchronize).
+    private volatile boolean closeCompleted;
+    // Invoked after closeCompleted publishes a confirmed flock release. Used
+    // by an owning sender pool to wake capacity-starved borrowers immediately.
+    private volatile Runnable slotLockReleaseListener;
+    // Test-only hook run by finishClose() between the terminal cleanup and
+    // the flock release. Lets a test park the releasing thread inside the
+    // cleanup/release window and assert that closeCompleted stays false —
+    // i.e. that completion is never observable while the flock is still
+    // held. volatile: finishClose may run on the manager worker's exit
+    // thread while the hook is installed from a test thread.
+    private volatile Runnable beforeFlockReleaseHook;
+    // Ensures this engine has at most one entry in the shared flock-release
+    // retry driver. The error path only: ordinary closes never enqueue work.
+    private final AtomicBoolean flockReleaseRetryStarted = new AtomicBoolean();
+    // Published before deferredClose is registered. The manager lock provides
+    // the callback handoff fence; volatile also covers a direct test/retry read.
+    private volatile boolean fullyDrainedForDeferredClose;
+    // Exactly-once claim on the terminal cleanup (finishClose). Contended by
+    // close() and a worker-exit handoff (completeDeferredClose); whoever wins
+    // the CAS runs the cleanup, the loser never touches ring/watermark/flock.
+    // Deliberately NOT the engine monitor: a retried close() holds the
+    // monitor while joining the manager worker, and the worker cannot die
+    // until its exit-path cleanup finishes — monitor-based exclusion would
+    // stall that close() for its full join budget (test-visible livelock).
+    // With the CAS the worker's cleanup never blocks, so the join returns as
+    // soon as the pass ends.
+    private final AtomicBoolean terminalCleanupClaimed = new AtomicBoolean();
+    // True only after a quiescent close reached the final watermark barrier
+    // and that barrier failed. It permits the shared retry driver to claim
+    // terminal cleanup; false while cleanup is merely waiting for manager
+    // quiescence, where an independent retry would race the live worker.
+    private volatile boolean terminalCleanupRetryReady;
+    // Published only after ring/watermark/unlink cleanup is finished. A close
+    // that loses terminalCleanupClaimed may retry the flock only after this
+    // becomes true, otherwise it could expose the slot while cleanup is live.
+    private volatile boolean terminalResourcesCleaned;
     // Producer-thread-only: timestamp of the last "we're backpressured" log
     // line, used to throttle. Plain long is fine.
     private long lastBackpressureLogNs;
@@ -176,7 +201,7 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes) {
         this(sfDir, segmentSizeBytes, SegmentManager.UNLIMITED_TOTAL_BYTES,
-                DEFAULT_APPEND_DEADLINE_NANOS);
+                DEFAULT_APPEND_DEADLINE_NANOS, 0L);
     }
 
     /**
@@ -188,9 +213,18 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes,
                             long maxTotalBytes, long appendDeadlineNanos) {
-        this(sfDir, segmentSizeBytes,
-                new SegmentManager(segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes),
-                true, appendDeadlineNanos);
+        this(sfDir, segmentSizeBytes, maxTotalBytes, appendDeadlineNanos, 0L);
+    }
+
+    /**
+     * Creates an engine with an optional periodic data-checkpoint interval.
+     * A positive interval requires disk-backed store-and-forward mode.
+     */
+    public CursorSendEngine(String sfDir, long segmentSizeBytes,
+                            long maxTotalBytes, long appendDeadlineNanos,
+                            long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
+                appendDeadlineNanos, syncIntervalNanos);
     }
 
     /**
@@ -199,17 +233,53 @@ public final class CursorSendEngine implements QuietCloseable {
      * ownership of the manager. Uses the default append deadline.
      */
     public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager) {
-        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS);
+        this(sfDir, segmentSizeBytes, manager, false, DEFAULT_APPEND_DEADLINE_NANOS, 0L);
+    }
+
+    public CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                            long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, manager, false,
+                DEFAULT_APPEND_DEADLINE_NANOS, syncIntervalNanos);
     }
 
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long appendDeadlineNanos) {
+        this(sfDir, segmentSizeBytes, manager, ownsManager, appendDeadlineNanos, 0L);
+    }
+
+    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                             boolean ownsManager, long appendDeadlineNanos,
+                             long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, manager, ownsManager,
+                SegmentManager.UNLIMITED_TOTAL_BYTES, appendDeadlineNanos, syncIntervalNanos);
+    }
+
+    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
+                             long syncIntervalNanos) {
+        // Allocate the bound callback before constructing an owned manager.
+        // Field initializers have completed, but no engine-owned native/disk
+        // resource exists yet. If callback allocation throws, construction
+        // stops without a manager whose native path scratch could be orphaned.
+        this.deferredClose = createDeferredClose();
+
         // sfDir == null  → memory-only mode (non-SF async ingest). Same
         //                  cursor architecture, no disk involvement; segments
         //                  live in malloc'd native memory.
         // sfDir != null  → store-and-forward mode. Segments are mmap'd files
         //                  under sfDir, recoverable across sender restarts.
         boolean memoryMode = sfDir == null;
+        // Validate before an owned manager allocates its native path scratch.
+        if (syncIntervalNanos < 0L) {
+            throw new IllegalArgumentException("syncIntervalNanos must not be negative");
+        }
+        if (memoryMode && syncIntervalNanos > 0L) {
+            throw new IllegalArgumentException("periodic sync requires disk store-and-forward mode");
+        }
+        if (ownsManager && manager == null) {
+            manager = new SegmentManager(
+                    segmentSizeBytes, SegmentManager.DEFAULT_POLL_NANOS, maxTotalBytes);
+        }
         SlotLock acquiredLock = null;
         if (!memoryMode) {
             try {
@@ -221,13 +291,11 @@ public final class CursorSendEngine implements QuietCloseable {
                 // recovery and create overlapping FSN ranges. SlotLock.acquire
                 // also creates the slot dir if it doesn't exist yet — no
                 // separate mkdir step needed here.
-                acquiredLock = SlotLock.acquire(sfDir);
+                acquiredLock = SlotLock.acquire(sfDir, syncIntervalNanos > 0L);
             } catch (Throwable t) {
-                // The delegating constructors evaluate `new SegmentManager(...)`
-                // BEFORE this body runs, so on a pre-try throw (e.g. slot lock
-                // collision) an owned manager is already alive and would leak
-                // its native path-scratch sink -- 256 bytes per failed
-                // construction attempt. Close it before propagating.
+                // Callback creation and owned-manager construction have already
+                // completed. A slot-lock failure must close the owned manager's
+                // native path scratch before propagating.
                 if (ownsManager) {
                     try {
                         manager.close();
@@ -241,8 +309,10 @@ public final class CursorSendEngine implements QuietCloseable {
         this.sfDir = sfDir;
         this.segmentSizeBytes = segmentSizeBytes;
         this.manager = manager;
+        this.filesFacade = manager.filesFacade();
         this.ownsManager = ownsManager;
         this.appendDeadlineNanos = appendDeadlineNanos;
+        this.syncIntervalNanos = syncIntervalNanos;
 
         // Track the ring locally until every step succeeds — only commit it
         // to this.ring at the very end. If anything between ring allocation
@@ -255,9 +325,11 @@ public final class CursorSendEngine implements QuietCloseable {
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
             // already on disk and corrupting ACK translation, trim, and replay.
-            SegmentRing recovered = memoryMode ? null
-                    : SegmentRing.openExisting(sfDir, segmentSizeBytes);
-            this.wasRecoveredFromDisk = recovered != null;
+            SegmentRing.Recovery recovery = memoryMode ? null
+                    : SegmentRing.recover(filesFacade, sfDir, segmentSizeBytes);
+            SegmentRing recovered = recovery == null ? null : recovery.ring();
+            this.wasRecoveredFromDisk = recovery != null
+                    && recovery.status() == SegmentRing.RecoveryStatus.RECOVERED;
             if (recovered != null) {
                 ringInProgress = recovered;
                 // Seed ackedFsn to one below the lowest segment's baseSeq.
@@ -304,14 +376,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 //   - trim ran before persist: segments are gone (so
                 //     lowestBase is higher than watermark), watermark
                 //     is stale; max picks lowestBase - 1.
-                // open() returns null on any setup failure so a missing
-                // mmap doesn't take down the engine -- we just fall
-                // back to the bare lowestBase - 1 seed.
-                watermarkInProgress = AckWatermark.open(sfDir);
+                // Segment-derived state cannot tell whether frames in the
+                // lowest surviving segment were acknowledged. Starting
+                // without the watermark would therefore expose acknowledged
+                // residue for replay, so disk recovery must fail closed when
+                // the file cannot be opened or mapped.
+                watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
+                if (watermarkInProgress == null) {
+                    throw new SfOperationalException(
+                            "could not open required ack watermark for SF slot " + sfDir);
+                }
                 long baseSeed = lowestBase - 1;
-                long watermarkFsn = watermarkInProgress != null
-                        ? watermarkInProgress.read()
-                        : AckWatermark.INVALID;
+                long watermarkFsn = watermarkInProgress.read();
                 // Reject watermarks past publishedFsn: a correctly
                 // operating prior session cannot have produced one, so
                 // a value above the on-disk frame ceiling is corruption
@@ -352,53 +428,81 @@ public final class CursorSendEngine implements QuietCloseable {
                             recoveredCommitBoundaryFsn, publishedFsn);
                 }
             } else {
-                // Fresh start with no recovered segments.
+                // Fresh start with no recovered segments. Any stale
+                // watermark from a prior fully-drained session refers
+                // to a lifecycle now gone -- unlink it before opening
+                // so the new session's first read() correctly reports
+                // INVALID (magic=0 on a freshly zero-filled file).
+                if (!memoryMode) {
+                    AckWatermark.removeOrphan(filesFacade, sfDir);
+                    watermarkInProgress = AckWatermark.open(filesFacade, sfDir);
+                    if (watermarkInProgress == null) {
+                        throw new SfOperationalException(
+                                "could not open required ack watermark for SF slot " + sfDir);
+                    }
+                }
                 MmapSegment initial;
                 String initialPath = null;
+                SfManifest initialManifest = null;
                 if (memoryMode) {
                     initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
                 } else {
+                    // Created WITHOUT the manifest-required flag: the flag is
+                    // a durable promise that sf-manifest.bin exists, so it
+                    // must only be stamped after the manifest itself is on
+                    // disk. Stamping it at create time would leave a crash
+                    // window (initial durable, manifest not yet created)
+                    // whose recovery hard-fails with "segment requires
+                    // missing manifest" even though nothing was lost.
                     initialPath = sfDir + "/sf-initial.sfa";
-                    // Defense in depth: recovery returning null now guarantees
-                    // no recognizable segment data remained (unreadable files
-                    // and enumeration failures fail closed; empty leftovers
-                    // were unlinked; corrupt-tailed ones quarantined). If a
-                    // file still exists at this path, some invariant broke --
-                    // and MmapSegment.create's openCleanRW uses truncating
-                    // semantics (O_CREAT|O_TRUNC / CREATE_ALWAYS), so creating
-                    // over it would silently destroy whatever it holds.
-                    // Checked BEFORE the watermark unlink below so a guard
-                    // trip preserves maximal forensic state for postmortem.
-                    if (Files.exists(initialPath)) {
-                        throw new MmapSegmentException(
-                                "refusing to overwrite existing " + initialPath
-                                        + " on fresh start -- recovery reported no data, yet the"
-                                        + " file exists; creating over it would truncate its"
-                                        + " contents");
-                    }
-                    // Any stale watermark from a prior fully-drained session
-                    // refers to a lifecycle now gone -- unlink it before
-                    // opening so the new session's first read() correctly
-                    // reports INVALID (magic=0 on a freshly zero-filled file).
-                    AckWatermark.removeOrphan(sfDir);
-                    watermarkInProgress = AckWatermark.open(sfDir);
-                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+                    initial = MmapSegment.create(filesFacade, initialPath, 0L, segmentSizeBytes);
                 }
                 try {
-                    ringInProgress = new SegmentRing(initial, segmentSizeBytes);
+                    if (!memoryMode) {
+                        // Ordering is load-bearing for crash recovery:
+                        //   1. initial segment durable (header + dirent),
+                        //   2. manifest created (its own create fsyncs),
+                        //   3. flag stamped on the segment.
+                        // A crash after (1) recovers via the legacy
+                        // (manifest-less) path; after (2) via the manifest
+                        // path with an unflagged-but-valid empty active;
+                        // after (3) it is the steady state. Every window
+                        // self-heals without operator action.
+                        initial.syncHeader();
+                        if (filesFacade.fsyncDir(sfDir) != 0) {
+                            throw new MmapSegmentException(
+                                    "could not sync fresh SF segment directory " + sfDir);
+                        }
+                        initialManifest = SfManifest.create(filesFacade, sfDir, 0L, 0L);
+                        initial.markManifestRequired();
+                    }
+                    ringInProgress = new SegmentRing(initial, segmentSizeBytes, initialManifest);
+                    initialManifest = null;
                 } catch (Throwable t) {
                     initial.close();
+                    if (initialManifest != null) {
+                        initialManifest.close();
+                        SfManifest.removeFile(filesFacade, sfDir);
+                    }
                     if (initialPath != null) {
-                        Files.remove(initialPath);
+                        filesFacade.remove(initialPath);
                     }
                     throw t;
                 }
             }
 
+            if (syncIntervalNanos > 0L) {
+                ringInProgress.enablePeriodicSync();
+                if (recovered != null) {
+                    // Establish a durable baseline before exposing data that a
+                    // previous MEMORY-mode process may have left in page cache.
+                    ringInProgress.syncAllLiveSegments();
+                }
+            }
             if (ownsManager) {
                 manager.start();
             }
-            manager.register(ringInProgress, sfDir, watermarkInProgress);
+            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos);
             // All construction succeeded — commit the ring and
             // watermark references.
             this.ring = ringInProgress;
@@ -465,6 +569,10 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.getActive();
     }
 
+    MmapSegment pinActiveSegment() {
+        return ring.pinActiveSegment();
+    }
+
     /**
      * Append the payload, blocking up to {@link #appendDeadlineNanos} when
      * the cursor ring is at its memory/disk cap and waiting for ACK-driven
@@ -497,11 +605,13 @@ public final class CursorSendEngine implements QuietCloseable {
             if (now >= deadlineNs) {
                 throw new io.questdb.client.cutlass.line.LineSenderException(
                         "cursor ring backpressured for ").put(appendDeadlineNanos / 1_000_000L)
-                        .put(" ms — wire path is not draining (server slow / disconnected, or sf_max_total_bytes too small)");
+                        .put(" ms - wire path is not draining (server slow / disconnected, "
+                                + "periodic disk sync is slow, or sf_max_total_bytes is too small)");
             }
             if (now - lastBackpressureLogNs >= BACKPRESSURE_LOG_THROTTLE_NANOS) {
                 lastBackpressureLogNs = now;
-                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O drain — will throw after {} ms",
+                LOG.warn("cursor producer backpressured ({} stalls so far); waiting for I/O or periodic disk sync; "
+                                + "will throw after {} ms",
                         backpressureStallCount.get(), appendDeadlineNanos / 1_000_000L);
             }
             LockSupport.parkNanos(50_000L); // 50 µs
@@ -544,91 +654,239 @@ public final class CursorSendEngine implements QuietCloseable {
         return SegmentRing.BACKPRESSURE_NO_SPARE;
     }
 
+    public void checkDurability() {
+        ring.checkDurability();
+    }
+
     @Override
     public synchronized void close() {
         if (closed && closeCompleted) return;
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
         // closed, its accessors aren't safe to read. The active segment is
-        // never trimmed by drainTrimmable (only sealed segments are), so
+        // never trim-eligible (only sealed segments are), so
         // when everything published has been acked we have to unlink the
         // residual .sfa files here. Without this, the next sender (or a
         // drainer adopting this slot) would replay already-acked data
         // against potentially-fresh server state — duplicate writes when
         // the server has no dedup state for those messageSequences.
         // Memory mode has no files to unlink.
-        // The whole close sequence runs under try/finally so the slot lock
-        // is released whenever it is safe to do so, even if manager/ring
-        // close or unlink throws — otherwise a kernel-held flock outlives
-        // the engine and the next sender for the same slot collides on a
-        // lock the dead engine never released. The one deliberate exception
-        // is a manager worker that failed to quiesce: releasing the lock
-        // then would let a replacement engine acquire the slot while the
-        // stale worker can still create/unlink segment paths inside it.
-        boolean workerQuiescent = false;
+        //
+        // Cleanup is gated on worker quiescence: releasing the ring,
+        // watermark, segment files or the slot lock while the manager worker
+        // is still mid service pass would let a replacement engine acquire
+        // the slot and have its files unlinked by the stale worker —
+        // store-and-forward data loss after restart. When the bounded worker
+        // join times out on an owned manager, cleanup OWNERSHIP TRANSFERS to
+        // the worker's exit path (deferUntilWorkerExit): the worker is
+        // provably the last thread able to touch the slot directory, so it
+        // releases everything the moment its in-flight pass finishes instead
+        // of leaking the slot until process exit.
+        //
+        // "Fully drained" includes BOTH the obvious case (every published
+        // FSN has been acked) AND the never-published case (publishedFsn
+        // < 0). The latter matters because a drainer adopting an empty
+        // orphan slot — segments filtered as empty by recovery, engine
+        // recreates a fresh sf-initial.sfa — would otherwise leave that
+        // fresh empty file behind, the next scanner finds it, adopts the
+        // slot again, and the cycle repeats forever (M6).
+        // Own try/catch so sabotaged/broken ring state cannot skip the
+        // quiescence barrier below or the slot-lock release in finishClose.
+        boolean drained = false;
         try {
-            // "Fully drained" includes BOTH the obvious case (every published
-            // FSN has been acked) AND the never-published case (publishedFsn
-            // < 0). The latter matters because a drainer adopting an empty
-            // orphan slot — segments filtered as empty by recovery, engine
-            // recreates a fresh sf-initial.sfa — would otherwise leave that
-            // fresh empty file behind, the next scanner finds it, adopts the
-            // slot again, and the cycle repeats forever (M6).
-            // Own try/catch so sabotaged/broken ring state cannot skip the
-            // quiescence barrier below or the slot-lock release in finally.
-            boolean fullyDrained = false;
+            drained = sfDir != null
+                    && (ring.publishedFsn() < 0
+                    || ring.ackedFsn() >= ring.publishedFsn());
+        } catch (Throwable ignored) {
+        }
+        final boolean fullyDrained = drained;
+        fullyDrainedForDeferredClose = fullyDrained;
+        // Each cleanup step in its own try/catch so a single failure
+        // doesn't strand later cleanups — mirrors the constructor's
+        // catch block. Without this, a throw from manager.deregister
+        // or manager.close() would leave the ring mmap'd and any
+        // residual .sfa files on disk, where the next sender can
+        // adopt them and replay already-acked data.
+        try {
+            manager.deregister(ring);
+        } catch (Throwable ignored) {
+        }
+        // Quiescence barrier. deregister alone only removes the entry
+        // from the registry — the worker may still be mid service pass
+        // for this ring (creating a spare file, trimming, unlinking).
+        boolean workerQuiescent = false;
+        if (ownsManager) {
+            // Stopping and reaping a private manager is a stronger barrier
+            // than waiting for this ring alone. Do it directly so a stuck
+            // worker consumes at most one workerJoinTimeoutMillis budget,
+            // rather than one here and a second one in manager.close().
             try {
-                fullyDrained = sfDir != null
-                        && (ring.publishedFsn() < 0
-                        || ring.ackedFsn() >= ring.publishedFsn());
+                manager.close();
             } catch (Throwable ignored) {
             }
-            // Each cleanup step in its own try/catch so a single failure
-            // doesn't strand later cleanups — mirrors the constructor's
-            // catch block. Without this, a throw from manager.deregister
-            // or manager.close() would leave the ring mmap'd and any
-            // residual .sfa files on disk, where the next sender can
-            // adopt them and replay already-acked data.
             try {
-                manager.deregister(ring);
+                workerQuiescent = manager.isWorkerReaped();
             } catch (Throwable ignored) {
             }
-            // Quiescence barrier. deregister alone only removes the entry
-            // from the registry — the worker may still be mid service pass
-            // for this ring (creating a spare file, trimming, unlinking).
-            // Releasing the ring, watermark, segment files, or the slot lock
-            // while that pass is in flight lets the stale worker unlink a
-            // path that a replacement engine — which can acquire the slot
-            // the moment the lock is released — is actively writing through:
-            // store-and-forward data loss after restart. Wait for confirmed
-            // quiescence before touching anything the worker can reach.
+        } else {
+            // A shared manager must keep serving its other rings, so wait
+            // only for the deregistered ring's current pass to finish.
             try {
                 workerQuiescent = manager.awaitRingQuiescence(ring);
             } catch (Throwable ignored) {
             }
-            if (ownsManager) {
-                try {
-                    manager.close();
-                } catch (Throwable ignored) {
-                }
-                if (!workerQuiescent) {
-                    // manager.close() joins the worker; a reaped (or
-                    // never-started) worker is an even stronger barrier
-                    // than per-ring quiescence.
-                    try {
-                        workerQuiescent = manager.isWorkerReaped();
-                    } catch (Throwable ignored) {
-                    }
-                }
+        }
+        if (!workerQuiescent && ownsManager) {
+            // Ownership handoff: manager.close() already stopped the worker
+            // loop (running=false), so the worker exits as soon as its
+            // in-flight pass finishes — it is merely slow, or wedged in a
+            // syscall. Either way it is the last thread able to touch the
+            // slot, so hand it the terminal cleanup instead of leaking the
+            // slot until process exit. completeDeferredClose and a retried
+            // close() race through the terminalCleanupClaimed CAS, so the
+            // cleanup runs exactly once and the worker never blocks on the
+            // engine monitor a retried close() holds while joining it.
+            boolean handedOff = false;
+            boolean registrationFailed = false;
+            try {
+                handedOff = manager.deferOwnedEngineCloseUntilWorkerExit(deferredClose);
+            } catch (Throwable ignored) {
+                // Unexpected monitor/VM failure carries no worker-liveness
+                // information. Ordinary handoff cannot allocate: both the
+                // callback and the manager's single slot were preallocated.
+                registrationFailed = true;
             }
-            if (!workerQuiescent) {
-                LOG.error("SF manager worker did not quiesce during engine close; leaking the "
-                        + "ring, watermark and slot lock so a stale worker cannot corrupt a "
-                        + "future engine on slot {}. The kernel releases the slot flock on "
-                        + "process exit; close() may be invoked again to retry cleanup once "
-                        + "the worker has exited.", sfDir == null ? "<memory>" : sfDir);
+            if (handedOff) {
+                LOG.error("SF manager worker did not quiesce during engine close; ring, watermark "
+                        + "and slot-lock release are handed to the worker's exit path and run the "
+                        + "moment its in-flight service pass finishes. The slot stays locked (and "
+                        + "isCloseCompleted() false) until then, so no replacement engine can race "
+                        + "the stale worker on slot {}", sfDir == null ? "<memory>" : sfDir);
                 return;
             }
+            if (registrationFailed) {
+                // The handoff never registered and the worker was never
+                // observed — it must be presumed live and mid service pass.
+                // Retain every worker-reachable resource (ring, watermark,
+                // segment files, slot flock) and leave terminalCleanupClaimed
+                // unclaimed and closeCompleted false, exactly like the
+                // shared-manager leak branch: manager.close() above already
+                // stopped the worker loop, so a retried close() converges via
+                // isWorkerReaped() once the in-flight pass ends. The kernel
+                // releases the slot flock on process exit regardless.
+                LOG.error("SF worker-exit handoff registration failed during engine close; "
+                        + "leaking the ring, watermark and slot lock so a possibly-live "
+                        + "worker cannot corrupt a future engine on slot {}. close() may be "
+                        + "invoked again to retry cleanup once the worker has exited.",
+                        sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            // Handoff rejected: the worker loop exited between the failed
+            // bounded join and the registration attempt (both sides share the
+            // manager's lock, so this observation is exact). A worker past
+            // its loop can never touch slot paths again — inline cleanup is
+            // as safe as a reaped worker.
+            workerQuiescent = true;
+        }
+        if (!workerQuiescent) {
+            // A shared manager keeps serving sibling rings, so it cannot use
+            // the whole-worker exit handoff above. Transfer cleanup to this
+            // ring's current pass instead. Registration and pass completion
+            // share the manager lock: true means the worker owns cleanup;
+            // false means the pass already finished and inline cleanup is safe.
+            boolean handedOff = false;
+            boolean registrationFailed = false;
+            try {
+                handedOff = manager.deferUntilRingQuiescent(ring, deferredClose);
+            } catch (Throwable ignored) {
+                registrationFailed = true;
+            }
+            if (handedOff) {
+                LOG.error("SF manager worker did not quiesce during engine close; ring, watermark "
+                        + "and slot-lock release are handed to the current ring pass and run the "
+                        + "moment that pass finishes. The slot stays locked (and "
+                        + "isCloseCompleted() false) until then, so no replacement engine can "
+                        + "race the stale worker on slot {}",
+                        sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            if (registrationFailed) {
+                LOG.error("SF ring-pass cleanup handoff registration failed during engine close; "
+                        + "leaking the ring, watermark and slot lock so a possibly-live worker "
+                        + "cannot corrupt a future engine on slot {}. The kernel releases the "
+                        + "flock on process exit.", sfDir == null ? "<memory>" : sfDir);
+                return;
+            }
+            workerQuiescent = true;
+        }
+        if (!terminalCleanupClaimed.compareAndSet(false, true)) {
+            // A worker-exit handoff or earlier close owns the one-time
+            // ring/watermark cleanup. Once that work is published complete,
+            // this close may still retry an unconfirmed flock release.
+            retryFlockReleaseIfReady();
+            return;
+        }
+        finishClose(fullyDrained);
+    }
+
+    /**
+     * Terminal cleanup: closes the ring and watermark, unlinks drained
+     * segment files, releases the slot flock, and — only once the release
+     * is <b>confirmed</b> — latches {@link #closeCompleted}. Publish order
+     * is load-bearing: pools free the slot index the instant they observe
+     * {@code closeCompleted} (via {@code isSlotLockReleased()}), so it must
+     * never be visible while the flock is still held, or a replacement
+     * engine races the release and fails acquisition on a live slot.
+     * The caller must hold the engine monitor and
+     * must have established that the manager worker can no longer touch the
+     * slot directory (reaped, provably exited, or running this on its own
+     * exit path) AND have won the {@link #terminalCleanupClaimed} CAS — the
+     * claim token, not the engine monitor, is the exclusion between a
+     * worker-exit handoff and a retried close(), so ring/watermark/flock are
+     * never double-released and the worker's cleanup can never deadlock
+     * against a close() that holds the monitor while joining the worker.
+     */
+    private void finishClose(boolean fullyDrained) {
+        if (!fullyDrained && syncIntervalNanos > 0L) {
+            try {
+                ring.syncAllLiveSegments();
+            } catch (RuntimeException | Error e) {
+                terminalCleanupRetryReady = true;
+                terminalCleanupClaimed.set(false);
+                startFlockReleaseRetry();
+                throw e;
+            }
+        }
+        // On a fully-drained close, persist the final acked FSN through the
+        // still-mapped watermark BEFORE closing the ring/watermark and BEFORE
+        // unlinking any segment file. The manager persists the watermark only
+        // on its own tick, so it may lag the final ack. If any part of this
+        // covering barrier fails, retain the ring, watermark and slot flock:
+        // publishing the slot would let a successor recover acknowledged
+        // residue from a stale durable watermark. The shared retry driver owns
+        // convergence after the one-shot public close reports the failure.
+        if (fullyDrained && watermark != null) {
+            try {
+                long finalAckedFsn = ring.ackedFsn();
+                if (finalAckedFsn >= 0) {
+                    watermark.write(finalAckedFsn);
+                    watermark.sync();
+                    if (filesFacade.fsyncDir(sfDir) != 0) {
+                        throw new IllegalStateException(
+                                "could not fsync SF slot directory before segment cleanup");
+                    }
+                }
+            } catch (RuntimeException | Error e) {
+                terminalCleanupRetryReady = true;
+                terminalCleanupClaimed.set(false);
+                startFlockReleaseRetry();
+                throw e;
+            }
+        }
+        terminalCleanupRetryReady = false;
+
+        try {
+            RuntimeException durabilityFailure = null;
             try {
                 ring.close();
             } catch (Throwable ignored) {
@@ -647,57 +905,363 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
-            if (fullyDrained) {
+            if (fullyDrained && watermark != null) {
+                boolean segmentsRemoved = false;
                 try {
-                    unlinkAllSegmentFiles(sfDir);
+                    segmentsRemoved = unlinkAllSegmentFiles(filesFacade, sfDir);
                 } catch (Throwable ignored) {
                 }
-                try {
-                    AckWatermark.removeOrphan(sfDir);
-                } catch (Throwable ignored) {
+                // Remove the watermark ONLY once every segment unlink is
+                // durable. Until the directory fsync succeeds, stable storage
+                // may still contain acknowledged segments and therefore still
+                // needs the durable watermark.
+                if (segmentsRemoved) {
+                    if (filesFacade.fsyncDir(sfDir) != 0) {
+                        durabilityFailure = new IllegalStateException(
+                                "could not fsync SF slot directory after segment cleanup");
+                    } else {
+                        AckWatermark.removeOrphan(filesFacade, sfDir);
+                    }
+                } else {
+                    LOG.warn("close-time segment cleanup incomplete on slot {}; retaining the ack "
+                            + "watermark so residual acknowledged segments stay covered -- the next "
+                            + "engine on this slot recovers them as fully acked and retries the "
+                            + "unlink on its own close", sfDir);
                 }
             }
-            closeCompleted = true;
+            if (durabilityFailure != null) {
+                throw durabilityFailure;
+            }
         } finally {
-            // Gate on quiescence: releasing the flock while a stale worker
-            // can still touch this slot directory hands the slot to a new
-            // engine that the worker may then corrupt. Leaking the fd is
-            // the safe failure mode — the kernel drops it on process exit.
-            if (workerQuiescent && slotLock != null) {
+            // The final watermark covering barrier has succeeded, so terminal
+            // resources can be released even if later best-effort cleanup or
+            // its post-unlink directory sync failed. The durable watermark
+            // still covers any segment a host crash restores.
+            //
+            // ORDER MATTERS: explicitly release the flock, verify it, and
+            // only then publish closeCompleted. Pools read isCloseCompleted()
+            // as "the slot dir is reusable" and free the slot index the moment
+            // it flips. SlotLock closes the fd once after confirmed unlock,
+            // but that close result cannot safely control publication because
+            // POSIX may consume the fd even when close reports failure.
+            Runnable hook = beforeFlockReleaseHook;
+            if (hook != null) {
                 try {
-                    slotLock.close();
+                    hook.run();
                 } catch (Throwable ignored) {
-                    // best-effort; flock is also released by kernel on process exit
+                    // test-only; must never block the release
                 }
             }
+            terminalResourcesCleaned = true;
+            retryFlockReleaseIfReady();
+        }
+    }
+
+    @TestOnly
+    public SegmentManager getManagerForTesting() {
+        return manager;
+    }
+
+    @TestOnly
+    public SegmentRing getRingForTesting() {
+        return ring;
+    }
+
+    @TestOnly
+    public SlotLock getSlotLockForTesting() {
+        return slotLock;
+    }
+
+    @TestOnly
+    public long getSyncIntervalNanosForTesting() {
+        return syncIntervalNanos;
+    }
+
+    /**
+     * Installs a hook invoked after each failed shared-driver flock release.
+     * Test-only: makes persistent retry progress observable without sleeps.
+     */
+    @TestOnly
+    public static void setAfterFlockReleaseRetryFailureHook(Runnable hook) {
+        afterFlockReleaseRetryFailureHook = hook;
+    }
+
+    /**
+     * Installs a constructor fault hook immediately before the bound deferred
+     * close callback is created. Test-only: proves callback allocation failure
+     * occurs before an owned manager acquires native resources.
+     */
+    @TestOnly
+    public static void setBeforeDeferredCloseCreationHook(Runnable hook) {
+        beforeDeferredCloseCreationHook = hook;
+    }
+
+    /**
+     * Replaces the shared retry driver's inter-round park with a callback
+     * receiving the park duration the driver would have used. Test-only:
+     * makes the retry cadence inspectable and rounds coordinatable without
+     * wall-clock waits.
+     */
+    @TestOnly
+    public static void setFlockReleaseRetryParkOverride(LongConsumer override) {
+        flockReleaseRetryParkOverride = override;
+    }
+
+    /**
+     * Overrides creation of the single shared flock-release retry thread.
+     * Test-only: makes thread creation/start failure and persistent retry
+     * scalability deterministic without relying on scheduler timing.
+     */
+    @TestOnly
+    public static void setFlockReleaseRetryThreadFactory(ThreadFactory factory) {
+        synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+            if (flockReleaseRetryThread != null || !FLOCK_RELEASE_RETRY_QUEUE.isEmpty()) {
+                throw new IllegalStateException("flock-release retry driver is active");
+            }
+            flockReleaseRetryThreadFactory = factory == null
+                    ? DEFAULT_FLOCK_RELEASE_RETRY_THREAD_FACTORY
+                    : factory;
         }
     }
 
     /**
-     * Transfers an incomplete close to a shared single-thread daemon owner.
-     * This lets I/O and drainer executors terminate even when a manager
-     * service pass is permanently stalled. The deferred owner retains this
-     * engine, and thus its flock and native mappings, until a retry
-     * completes — or until the retry budget
-     * ({@link #DEFERRED_CLOSE_DEFAULT_MAX_ATTEMPTS} attempts with
-     * exponential backoff) is exhausted, at which point the engine is
-     * abandoned: its resources stay leaked until process exit (the kernel
-     * releases the flock), {@link #getAbandonedDeferredCloseCount()} is
-     * incremented, and one ERROR is logged. {@link #close()} may still be
-     * invoked directly after abandonment.
+     * Installs a hook that {@link #finishClose} runs between the terminal
+     * cleanup and the slot-flock release. Test-only: makes the otherwise
+     * microsecond-wide cleanup/release window deterministic so tests can
+     * assert {@link #isCloseCompleted()} stays false until the release is
+     * confirmed.
      */
-    public synchronized void closeEventually() {
-        if (closeCompleted || deferredCloseScheduled) {
+    @TestOnly
+    public void setBeforeFlockReleaseHook(Runnable hook) {
+        this.beforeFlockReleaseHook = hook;
+    }
+
+    /**
+     * Runs on a safe manager-worker handoff path when {@link #close()} moved
+     * cleanup ownership to either a shared manager's ring-pass completion or
+     * an owned manager's worker exit.
+     * Deliberately does NOT take the engine monitor: a retried close() can
+     * hold it while joining this very worker, and the thread cannot die until
+     * this method returns — the {@link #terminalCleanupClaimed} CAS provides
+     * the exactly-once exclusion instead, so the worker always exits promptly
+     * and the racing close() converges via {@code isWorkerReaped()}.
+     */
+    private void completeDeferredClose() {
+        if (!terminalCleanupClaimed.compareAndSet(false, true)) {
+            // A retried close() (or an earlier duplicate handoff) already ran
+            // the terminal cleanup.
             return;
         }
-        deferredCloseScheduled = true;
-        deferredCloseAttempts = 0;
-        deferredCloseBackoffNanos = deferredCloseInitialBackoffNanos;
-        try {
-            DEFERRED_CLOSE_EXECUTOR.execute(this::deferredCloseAttempt);
-        } catch (Throwable t) {
-            deferredCloseScheduled = false;
-            throw t;
+        finishClose(fullyDrainedForDeferredClose);
+        LOG.info("deferred SF engine resource cleanup completed after manager-worker quiescence; "
+                        + "slot release confirmed: {} [slot={}]",
+                closeCompleted, sfDir == null ? "<memory>" : sfDir);
+    }
+
+    private Runnable createDeferredClose() {
+        Runnable hook = beforeDeferredCloseCreationHook;
+        if (hook != null) {
+            hook.run();
+        }
+        return this::completeDeferredClose;
+    }
+
+    private boolean retryFlockReleaseIfReady() {
+        if (closeCompleted) {
+            return true;
+        }
+        if (!terminalResourcesCleaned) {
+            if (!terminalCleanupRetryReady
+                    || !terminalCleanupClaimed.compareAndSet(false, true)) {
+                return false;
+            }
+            try {
+                finishClose(fullyDrainedForDeferredClose);
+            } catch (Throwable ignored) {
+                return false;
+            }
+            return closeCompleted;
+        }
+        boolean released;
+        if (slotLock != null) {
+            try {
+                released = slotLock.release();
+            } catch (Throwable ignored) {
+                released = false;
+            }
+        } else {
+            released = true;
+        }
+        if (released) {
+            closeCompleted = true;
+            Runnable listener = slotLockReleaseListener;
+            if (listener != null) {
+                try {
+                    listener.run();
+                } catch (Throwable ignored) {
+                    // A notification failure must not invalidate a confirmed release.
+                }
+            }
+            return true;
+        }
+        startFlockReleaseRetry();
+        return false;
+    }
+
+    private static void runFlockReleaseRetryDriver() {
+        // Capped exponential backoff: a persistent unlock failure must not
+        // burn a fixed 10 rounds of native release syscalls per second
+        // forever, but a transient failure must still recover promptly. The
+        // ramp doubles per fully-failed round from 100 ms up to 5 s.
+        long parkNanos = FLOCK_RELEASE_RETRY_BASE_PARK_NANOS;
+        while (true) {
+            final int roundSize;
+            synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                roundSize = FLOCK_RELEASE_RETRY_QUEUE.size();
+                if (roundSize == 0) {
+                    flockReleaseRetryThread = null;
+                    return;
+                }
+            }
+            boolean hasFailures = false;
+            boolean hasSuccesses = false;
+            for (int i = 0; i < roundSize; i++) {
+                final CursorSendEngine engine;
+                synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                    engine = FLOCK_RELEASE_RETRY_QUEUE.pollFirst();
+                }
+                if (engine.retryFlockReleaseIfReady()) {
+                    engine.flockReleaseRetryStarted.set(false);
+                    hasSuccesses = true;
+                } else {
+                    synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+                        FLOCK_RELEASE_RETRY_QUEUE.addLast(engine);
+                    }
+                    hasFailures = true;
+                    Runnable hook = afterFlockReleaseRetryFailureHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
+            }
+            if (hasSuccesses) {
+                // Progress: the failure condition is clearing, so retry the
+                // remaining engines on the base cadence again.
+                parkNanos = FLOCK_RELEASE_RETRY_BASE_PARK_NANOS;
+            }
+            if (hasFailures) {
+                // Interruption must not abandon a retained flock, but clear
+                // the flag so subsequent parks still throttle retries.
+                Thread.interrupted();
+                LongConsumer parkOverride = flockReleaseRetryParkOverride;
+                if (parkOverride != null) {
+                    parkOverride.accept(parkNanos);
+                } else {
+                    LockSupport.parkNanos(parkNanos);
+                }
+                parkNanos = Math.min(parkNanos * 2, FLOCK_RELEASE_RETRY_MAX_PARK_NANOS);
+            }
+        }
+    }
+
+    private void startFlockReleaseRetry() {
+        if (!flockReleaseRetryStarted.compareAndSet(false, true)) {
+            return;
+        }
+        Throwable startFailure = null;
+        synchronized (FLOCK_RELEASE_RETRY_LOCK) {
+            FLOCK_RELEASE_RETRY_QUEUE.addLast(this);
+            if (flockReleaseRetryThread != null) {
+                // The driver may be parked on a ramped backoff; wake it so a
+                // freshly failed release gets its first driver retry promptly
+                // instead of inheriting older engines' full backoff.
+                LockSupport.unpark(flockReleaseRetryThread);
+            } else {
+                try {
+                    Thread retryThread = flockReleaseRetryThreadFactory.newThread(
+                            CursorSendEngine::runFlockReleaseRetryDriver);
+                    if (retryThread == null) {
+                        throw new IllegalStateException("retry thread factory returned null");
+                    }
+                    retryThread.setDaemon(true);
+                    flockReleaseRetryThread = retryThread;
+                    retryThread.start();
+                } catch (Throwable t) {
+                    startFailure = t;
+                    flockReleaseRetryThread = null;
+                    CursorSendEngine queued;
+                    while ((queued = FLOCK_RELEASE_RETRY_QUEUE.pollFirst()) != null) {
+                        queued.flockReleaseRetryStarted.set(false);
+                    }
+                }
+            }
+        }
+        if (startFailure == null) {
+            LOG.error("SF terminal cleanup or slot flock release failed during engine close; "
+                            + "keeping closeCompleted=false and retrying on the shared driver so "
+                            + "retired capacity recovers after the transient failure [slot={}]",
+                    sfDir == null ? "<memory>" : sfDir);
+        } else {
+            // A later explicit close() or a pool's retired-slot probe
+            // (ensureFlockReleaseRetryScheduled) can still retry without
+            // repeating the one-time ring/watermark cleanup. The failed queue
+            // is cleared so the driver does not retain engines it cannot
+            // service.
+            LOG.error("Could not start SF flock-release retry driver; a retried close() "
+                            + "or pool re-probe re-arms the retry [slot={}, error={}]",
+                    sfDir == null ? "<memory>" : sfDir, String.valueOf(startFailure));
+        }
+    }
+
+    /**
+     * Whether {@link #close()} completed all cleanup, including a
+     * <b>confirmed</b> release of the SF slot lock — the flip is published
+     * strictly after explicit unlock succeeds, so observing {@code true}
+     * guarantees the slot dir is acquirable by a replacement engine. A false
+     * value after close means manager-worker quiescence could not be
+     * confirmed (or the flock release itself failed) and the
+     * worker-reachable resources were retained deliberately — either handed to the worker's exit path (owned manager),
+     * which flips this to true the moment the worker's in-flight pass
+     * finishes, or leaked until a retried close() (shared manager). Owners
+     * must not reuse the slot while this is false; pools may re-probe it to
+     * recover a retired slot's capacity once it flips.
+     * <p>
+     * Deliberately unsynchronized ({@code closeCompleted} is volatile): pools
+     * probe this under their own capacity lock, and the deferred cleanup can
+     * hold the engine monitor through munmap/unlink syscalls — a synchronized
+     * getter would stall the pool's hot borrow path behind them.
+     */
+    public boolean isCloseCompleted() {
+        return closeCompleted;
+    }
+
+    /**
+     * Registers a callback for confirmed SF slot-lock release. If release
+     * already completed, invokes the callback before returning.
+     */
+    public void setSlotLockReleaseListener(Runnable listener) {
+        slotLockReleaseListener = listener;
+        if (listener != null && closeCompleted) {
+            listener.run();
+        }
+    }
+
+    /**
+     * Re-arms the shared terminal retry for an engine whose final watermark
+     * barrier or confirmed flock release is still pending and no longer
+     * scheduled because the retry driver thread failed to start (e.g. OOM at
+     * thread creation). A close still waiting for worker quiescence cannot be
+     * retried here because terminal cleanup may not race that worker.
+     * {@code Sender.close()} is one-shot by contract, so pool probes
+     * ({@code QwpWebSocketSender.isSlotLockReleased()}) call this to keep a
+     * retired slot's capacity recoverable instead of lost until process
+     * exit. Cheap unless the engine is in that orphan state (volatile reads,
+     * then one failed CAS when the retry is already scheduled), so probes
+     * may call it under their capacity lock.
+     */
+    public void ensureFlockReleaseRetryScheduled() {
+        if (!closeCompleted && (terminalResourcesCleaned || terminalCleanupRetryReady)) {
+            startFlockReleaseRetry();
         }
     }
 
@@ -708,32 +1272,15 @@ public final class CursorSendEngine implements QuietCloseable {
         return ring.findSegmentContaining(fsn);
     }
 
+    MmapSegment pinSegmentContaining(long fsn) {
+        return ring.pinSegmentContaining(fsn);
+    }
+
     /**
      * Pass-through to {@link SegmentRing#firstSealed()}.
      */
     public MmapSegment firstSealed() {
         return ring.firstSealed();
-    }
-
-    /**
-     * Number of engines (process-wide) whose deferred close exhausted its
-     * retry budget and was abandoned, leaking their ring, watermark and
-     * slot lock until process exit. Cumulative; never reset.
-     */
-    public static long getAbandonedDeferredCloseCount() {
-        return DEFERRED_CLOSE_ABANDONED_COUNT.get();
-    }
-
-    /**
-     * Tunes the deferred-close retry budget. Affects engines armed by
-     * {@link #closeEventually()} after this call. Tests must restore the
-     * {@code DEFERRED_CLOSE_DEFAULT_*} values when done.
-     */
-    @TestOnly
-    public static void setDeferredCloseTuning(long initialBackoffNanos, long maxBackoffNanos, int maxAttempts) {
-        deferredCloseInitialBackoffNanos = initialBackoffNanos;
-        deferredCloseMaxBackoffNanos = maxBackoffNanos;
-        deferredCloseMaxAttempts = maxAttempts;
     }
 
     /**
@@ -747,20 +1294,18 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * True only after close released every engine-owned resource, including
-     * the SF slot flock. A false result means close deliberately retained the
-     * ring/watermark/lock because the manager worker did not quiesce; owners
-     * must preserve this engine and retry later.
-     */
-    public synchronized boolean isCloseCompleted() {
-        return closeCompleted;
-    }
-
-    /**
      * Pass-through to {@link SegmentRing#nextSealedAfter(MmapSegment)}.
      */
     public MmapSegment nextSealedAfter(MmapSegment current) {
         return ring.nextSealedAfter(current);
+    }
+
+    MmapSegment advancePinnedSegment(MmapSegment current) {
+        return ring.advancePinnedSegment(current);
+    }
+
+    void releasePinnedSegment(MmapSegment current) {
+        ring.releasePinnedSegment(current);
     }
 
     /**
@@ -830,78 +1375,138 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
-     * One deferred-close retry. Performs a single {@link #close()} attempt;
-     * on failure reschedules itself with exponential backoff until the
-     * retry budget is exhausted, then abandons the engine (terminal for the
-     * daemon: resources leak until process exit). Runs on the shared
-     * single-thread deferred-close daemon and never loops or parks, so one
-     * stuck engine cannot pin a thread and E stuck engines cannot pin E
-     * threads.
+     * Ascending removal rank of a segment file name for
+     * {@link #unlinkAllSegmentFiles(String)}. {@code sf-initial.sfa} is
+     * always the fresh-start segment at baseSeq 0, so it ranks first.
+     * Spare files carry a monotonic generation ({@code sf-<gen:016x>.sfa})
+     * assigned in creation == rotation == baseSeq order, so the parsed
+     * generation ranks them. Anything else with the extension is not a
+     * live segment and ranks last.
      */
-    private void deferredCloseAttempt() {
-        try {
-            close();
-        } catch (Throwable ignored) {
-            // Retain ownership; the retry budget below decides what's next.
+    private static long segmentCleanupRank(String name) {
+        if ("sf-initial.sfa".equals(name)) {
+            return Long.MIN_VALUE;
         }
-        // The daemon owns cleanup independently of caller cancellation. Clear
-        // a stray interrupt so it cannot poison the joins/waits of the next
-        // attempt on this shared thread.
-        Thread.interrupted();
-        if (isCloseCompleted()) {
-            return;
+        if (name.length() == 23 && name.startsWith("sf-")) {
+            try {
+                return Long.parseUnsignedLong(name.substring(3, 19), 16);
+            } catch (NumberFormatException ignored) {
+                // fall through to the unrecognized-name rank
+            }
         }
-        if (++deferredCloseAttempts >= deferredCloseMaxAttempts) {
-            DEFERRED_CLOSE_ABANDONED_COUNT.incrementAndGet();
-            LOG.error("abandoning deferred close after {} attempts: the SF manager worker never "
-                    + "quiesced; ring, watermark and slot lock for {} stay leaked until process "
-                    + "exit (the kernel releases the flock). close() may still be invoked "
-                    + "directly to retry cleanup.", deferredCloseAttempts, sfDir == null ? "<memory>" : sfDir);
-            return;
-        }
-        long delayNanos = deferredCloseBackoffNanos;
-        deferredCloseBackoffNanos = Math.min(delayNanos * 2, deferredCloseMaxBackoffNanos);
-        try {
-            DEFERRED_CLOSE_EXECUTOR.schedule(
-                    this::deferredCloseAttempt, delayNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
-        } catch (Throwable t) {
-            DEFERRED_CLOSE_ABANDONED_COUNT.incrementAndGet();
-            LOG.error("could not reschedule deferred close for {}; ring, watermark and slot lock "
-                    + "stay leaked until process exit", sfDir == null ? "<memory>" : sfDir, t);
-        }
+        return Long.MAX_VALUE;
     }
 
     /**
-     * Unlinks every {@code .sfa} file under {@code dir}. Called only on
-     * clean shutdown when the ring confirms every published FSN has been
-     * acked — at that moment the slot has no recoverable work and the
-     * files are pure noise that would mislead the next sender's recovery.
-     * Best-effort: logs and continues on failures, since we're already on
-     * the close path.
+     * Unlinks every {@code .sfa} file under {@code dir}, then the SF
+     * manifest. Called only on clean shutdown when the ring confirms every
+     * published FSN has been acked — at that moment the slot has no
+     * recoverable work and the files are pure noise that would mislead the
+     * next sender's recovery.
+     * <p>
+     * Crash safety comes from a single durable manifest update committed
+     * BEFORE the first unlink: collapsing the boundaries to
+     * {@code head == active} declares every frame below the active base
+     * trimmed, so any subset of surviving files recovers cleanly (stale
+     * files are discarded, a surviving active recovers as the whole chain,
+     * zero files with a leftover manifest is the recognized drain window
+     * and recovers as EMPTY). Removal still runs in ascending segment order
+     * and STOPS at the first failure; the retained ack watermark (== the
+     * final acked FSN) covers every surviving frame, so a successor replays
+     * nothing. Legacy slots without a manifest keep the pre-manifest
+     * argument: ascending-order removal preserves a contiguous top slice
+     * that passes FSN-contiguity.
+     *
+     * @return {@code true} only when enumeration succeeded and every
+     * {@code .sfa} file was confirmed removed — the caller keeps the ack
+     * watermark on {@code false} so residual acknowledged segments stay
+     * covered.
      */
-    private static void unlinkAllSegmentFiles(String dir) {
-        if (!io.questdb.client.std.Files.exists(dir)) return;
-        long find = io.questdb.client.std.Files.findFirst(dir);
+    private static boolean unlinkAllSegmentFiles(FilesFacade filesFacade, String dir) {
+        if (!filesFacade.exists(dir)) return true;
+        long find = filesFacade.findFirst(dir);
         if (find < 0) {
             LOG.warn("close-time unlink could not enumerate {}; "
                     + "any residual sf-*.sfa files will be picked up by the next recovery", dir);
-            return;
+            return false;
         }
-        if (find == 0) return;
+        if (find == 0) return true;
+        ArrayList<String> names = new ArrayList<>();
+        int rc = 1;
         try {
-            int rc = 1;
             while (rc > 0) {
                 String name = io.questdb.client.std.Files.utf8ToString(
-                        io.questdb.client.std.Files.findName(find));
-                rc = io.questdb.client.std.Files.findNext(find);
-                if (name == null || !name.endsWith(".sfa")) continue;
-                String path = dir + "/" + name;
-                if (!io.questdb.client.std.Files.remove(path)) {
-                    LOG.warn("Failed to unlink fully-acked segment {} on close", path);
+                        filesFacade.findName(find));
+                rc = filesFacade.findNext(find);
+                if (name != null && name.endsWith(".sfa")) {
+                    names.add(name);
                 }
             }
         } finally {
-            io.questdb.client.std.Files.findClose(find);
+            filesFacade.findClose(find);
         }
+        if (rc < 0) {
+            // A partial listing must not drive any unlink: removing only the
+            // files we happened to see could delete the segment holding the
+            // highest frame while a lower one survives, leaving residual
+            // state the retained watermark can no longer vouch for.
+            LOG.warn("close-time unlink could not fully enumerate {}; "
+                    + "leaving all segment files for the next recovery", dir);
+            return false;
+        }
+        names.sort((a, b) -> {
+            int byRank = Long.compare(segmentCleanupRank(a), segmentCleanupRank(b));
+            return byRank != 0 ? byRank : a.compareTo(b);
+        });
+        // Manifest-aware drain protocol. Before removing anything, durably
+        // collapse the committed boundaries to head == active. From that
+        // moment EVERY crash state is a valid recovery input:
+        //   - surviving data below the active base is "stale below head"
+        //     (acked by definition here) and is discarded by recovery;
+        //   - a surviving active-base segment recovers as the whole chain;
+        //   - empty spares are validated extras;
+        //   - zero segment files with the manifest still present is the
+        //     recognized drain window and recovers as EMPTY.
+        // Without this barrier, deleting the file the manifest calls "head"
+        // would make the next startup fail on a slot that lost nothing.
+        // The manifest itself is removed last, after every segment unlink.
+        SfManifest manifest = null;
+        try {
+            try {
+                manifest = SfManifest.open(filesFacade, dir);
+            } catch (Throwable t) {
+                LOG.warn("close-time unlink could not read the SF manifest in {}; leaving "
+                        + "all files for the next recovery", dir, t);
+                return false;
+            }
+            if (manifest != null && !names.isEmpty()) {
+                try {
+                    long activeBase = manifest.activeBase();
+                    manifest.update(activeBase, activeBase);
+                } catch (Throwable t) {
+                    LOG.warn("close-time unlink could not commit drain boundaries in {}; "
+                            + "leaving all files for the next recovery", dir, t);
+                    return false;
+                }
+            }
+            for (int i = 0, n = names.size(); i < n; i++) {
+                String path = dir + "/" + names.get(i);
+                if (!filesFacade.remove(path)) {
+                    LOG.warn("Failed to unlink fully-acked segment {} on close; stopping so the "
+                            + "residual files stay a watermark-covered, manifest-consistent range", path);
+                    return false;
+                }
+            }
+        } finally {
+            if (manifest != null) {
+                manifest.close();
+            }
+        }
+        if (!SfManifest.removeFile(filesFacade, dir)) {
+            // Safe to proceed: a manifest with zero segment files is the
+            // recognized drain window and recovers as EMPTY.
+            LOG.warn("could not remove SF manifest in {} after full segment cleanup", dir);
+        }
+        return true;
     }
 }

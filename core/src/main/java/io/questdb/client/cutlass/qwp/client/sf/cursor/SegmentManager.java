@@ -34,8 +34,12 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongSupplier;
 
 /**
  * Background worker that keeps every registered {@link SegmentRing} supplied
@@ -49,27 +53,32 @@ import java.util.concurrent.locks.LockSupport;
  * in a JVM). Polls each ring on a configurable tick (default 1 ms) — short
  * enough that a producer rarely sees {@link SegmentRing#BACKPRESSURE_NO_SPARE}
  * in the steady state, long enough that an idle JVM doesn't burn CPU.
- * <p>
- * <b>baseSeq race window:</b> the spare is created with
- * {@code baseSeq = ring.nextSeqHint()} as observed by the manager. If the
- * producer thread appends more frames before the rotation actually fires,
- * the spare's baseSeq will be stale and {@link SegmentRing#appendOrFsn} will
- * throw on the mismatch check. In practice this is benign — by the time
- * {@link SegmentRing#needsHotSpare()} returns true the producer has very
- * little room left in the active segment, and the manager polls fast enough
- * to install before the producer fills the rest. Hardening to make the race
- * impossible (lazy header write at rotation time) is a separate refinement
- * deferred to PR2.
  */
 public final class SegmentManager implements QuietCloseable {
 
     public static final long DEFAULT_POLL_NANOS = 1_000_000L; // 1 ms
     public static final long DISK_FULL_LOG_THROTTLE_NANOS = 30_000_000_000L; // 30 s
     public static final long UNLIMITED_TOTAL_BYTES = Long.MAX_VALUE;
+    private static final int ENTRY_DEREGISTERED = 3;
+    private static final int ENTRY_DEREGISTERED_IN_SERVICE = 2;
+    private static final int ENTRY_IN_SERVICE = 1;
+    private static final int ENTRY_REGISTERED = 0;
+    private static final AtomicReferenceFieldUpdater<RingEntry, Runnable> ENTRY_CLEANUP_UPDATER =
+            AtomicReferenceFieldUpdater.newUpdater(RingEntry.class, Runnable.class, "quiescenceCleanup");
+    private static final AtomicIntegerFieldUpdater<RingEntry> ENTRY_STATE_UPDATER =
+            AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
+    private static final int MAX_TRIMS_PER_RING_PASS = 64;
+    private static final long TRIM_RETRY_INITIAL_NANOS = 4_000_000L;
+    private static final long TRIM_RETRY_MAX_NANOS = 1_024_000_000L;
+    private static final int TRIM_RETRY_NONE = 0;
+    private static final int TRIM_RETRY_POST_BARRIER = 3;
+    private static final int TRIM_RETRY_PRE_BARRIER = 1;
+    private static final int TRIM_RETRY_UNLINK = 2;
     private static final long WORKER_JOIN_TIMEOUT_MILLIS = 5_000L;
 
     private final AtomicLong fileGeneration = new AtomicLong();
+    private final FilesFacade filesFacade;
     private final Object lock = new Object();
     private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
@@ -86,23 +95,25 @@ public final class SegmentManager implements QuietCloseable {
     private final ObjList<RingEntry> ringSnapshot = new ObjList<>();
     private final ObjList<RingEntry> rings = new ObjList<>();
     private final long segmentSizeBytes;
-    // Test seam: runs after each snapshotted entry's service attempt, including
-    // a stale entry skipped before claim. Null in production; tests use it to
-    // observe completion of the exact snapshot entry without timing.
-    private volatile Runnable afterServiceHook;
-    // Test seam: runs on the closer thread inside close(), after the pending
-    // caller interrupt has been cleared and immediately before EACH join
-    // attempt on the worker thread. Null in production.
-    // SegmentManagerCloseRaceTest uses it to positively observe (a) that the
-    // closer reached the join path with a cleared interrupt while the worker
-    // was still live, and (b) that an interrupt delivered mid-join loops back
-    // into another join attempt instead of abandoning the reap — without any
-    // wall-clock coordination.
-    private volatile Runnable beforeJoinAttemptHook;
-    // Test seam: runs after workerLoop selects a snapshotted entry but before
-    // serviceRing atomically checks registered and claims inService. Null in
-    // production; tests pause precisely in the stale-snapshot-before-claim gap.
-    private volatile Runnable beforeServiceClaimHook;
+    // Reused by the manager worker while it checkpoints one ring. The entry
+    // in-service state keeps these segment mappings alive until the pass ends.
+    private final ObjList<MmapSegment> syncScratch = new ObjList<>();
+    private final LongSupplier ticks;
+    // Reused by the worker for one bounded trim quantum. Keeping the unlinked
+    // prefix here until the post-unlink directory barrier succeeds avoids both
+    // per-pass allocation and publishing logical removal before it is durable.
+    private final MmapSegment[] trimBatch = new MmapSegment[MAX_TRIMS_PER_RING_PASS];
+    // Test seam: runs after a deferred ring-pass cleanup returns. Null in
+    // production; public sender/pool lifecycle tests use it to observe exact
+    // callback completion without sleeps or polling.
+    private volatile Runnable afterRingCleanupHook;
+    // Test seam: runs at the top of deferUntilWorkerExit, before the
+    // worker-liveness check. Null in production; registration-failure tests
+    // throw from it to simulate an allocation failure (OOM building the
+    // cleanup lambda or growing exitCleanups) while the worker is still
+    // live. Callers must treat such a throw as "worker state unknown",
+    // never as the exact false return meaning the worker loop has exited.
+    private volatile Runnable beforeExitCleanupRegistrationHook;
     // Test seam: runs on the worker thread just before the install path's
     // synchronized(lock) entry (the one that performs installHotSpare + the
     // totalBytes += segmentSize commit). Null in production; tests use it to
@@ -110,23 +121,41 @@ public final class SegmentManager implements QuietCloseable {
     // but before ownership/accounting commit. Callers may inject a deregister
     // or hold this stale worker snapshot while caller-side cleanup runs.
     private volatile Runnable beforeInstallSyncHook;
+    // Test seam: records entry into the per-ring quiescence wait. Null in
+    // production; owned-engine close tests use it to prove they take only the
+    // stronger whole-manager join path, not two sequential timeout budgets.
+    private volatile Runnable beforeRingQuiescenceAwaitHook;
     // Test seam: runs on the worker thread just before the trim block's
     // synchronized(lock) entry. Null in production; only
     // SegmentManagerTrimDeregisterRaceTest installs it, to deterministically
     // inject a deregister(ring) call into the exact race window that the
-    // registered flag check inside the trim block closes for watermark writes
-    // and totalBytes accounting.
+    // entry-state check inside the trim block closes for watermark writes and
+    // totalBytes accounting.
     private volatile Runnable beforeTrimSyncHook;
-    // Entry currently being serviced by the worker thread, or null when the
-    // worker is between service passes (or not running). Guarded by
-    // {@link #lock}; cleared with lock.notifyAll() so awaitRingQuiescence can
-    // block until an in-flight pass for a just-deregistered ring finishes.
-    private RingEntry inService;
+    // Test seam invoked exactly when a retry transition/recovery is logged.
+    // Null in production; persistent-failure tests use it to prove log bounds
+    // without binding to a particular SLF4J backend.
+    private volatile Runnable retryLogHook;
+    // Entry the worker is claiming or servicing, or null between passes.
+    // Volatile publication lets teardown find the entry after deregister()
+    // removes it from rings. RingEntry.state is the authoritative barrier:
+    // the worker publishes this reference before its REGISTERED->IN_SERVICE
+    // CAS and only touches ring resources after that CAS succeeds.
+    private volatile RingEntry inService;
+    // Cleanup actions handed to the worker's exit block by an owning engine
+    // whose close() found the worker still mid service pass after the bounded
+    // join timed out (see deferUntilWorkerExit). Guarded by {@link #lock};
+    // consumed exactly once by the worker-loop finally, which runs them
+    // OUTSIDE `lock`: they perform syscalls (munmap/unlink/flock release),
+    // and no caller-facing lock may ever be held while running third-party
+    // cleanup code.
+    private ObjList<Runnable> exitCleanups;
+    // A private manager belongs to exactly one CursorSendEngine. Its callback
+    // is preallocated by that engine and stored directly here, so the critical
+    // timed-out-close handoff never allocates an ObjList or grows a backing
+    // array. Guarded by lock and consumed on worker-loop exit outside lock.
+    private Runnable ownedEngineExitCleanup;
     private long lastDiskFullLogNs;
-    // Number of callers currently waiting for inService to clear. Guarded by
-    // lock; serviceRing uses it to avoid a monitor-wide notifyAll on every
-    // polling pass when no quiescence barrier exists.
-    private int quiescenceWaiterCount;
     private volatile boolean running;
     // pathScratch free-exactly-once coordination between a timed-out close()
     // and the worker's exit path. All three are guarded by {@link #lock}.
@@ -139,6 +168,7 @@ public final class SegmentManager implements QuietCloseable {
     // returns.
     private boolean scratchFreed;
     private boolean scratchHandedToWorker;
+    private volatile long shortestSyncIntervalNanos = Long.MAX_VALUE;
     private boolean workerLoopExited;
     // Total bytes currently allocated across every segment owned by every
     // registered ring (active + sealed + hot-spare). Mutated by the manager
@@ -155,11 +185,11 @@ public final class SegmentManager implements QuietCloseable {
     private volatile Thread workerThread;
 
     public SegmentManager(long segmentSizeBytes) {
-        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, DEFAULT_POLL_NANOS, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     public SegmentManager(long segmentSizeBytes, long pollNanos) {
-        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES);
+        this(segmentSizeBytes, pollNanos, UNLIMITED_TOTAL_BYTES, FilesFacade.INSTANCE, System::nanoTime);
     }
 
     /**
@@ -185,6 +215,22 @@ public final class SegmentManager implements QuietCloseable {
      *                         hold an initial active plus one hot spare.
      */
     public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes) {
+        this(segmentSizeBytes, pollNanos, maxTotalBytes, FilesFacade.INSTANCE, System::nanoTime);
+    }
+
+    @TestOnly
+    public SegmentManager(long segmentSizeBytes, long pollNanos, long maxTotalBytes, FilesFacade filesFacade) {
+        this(segmentSizeBytes, pollNanos, maxTotalBytes, filesFacade, System::nanoTime);
+    }
+
+    @TestOnly
+    public SegmentManager(
+            long segmentSizeBytes,
+            long pollNanos,
+            long maxTotalBytes,
+            FilesFacade filesFacade,
+            LongSupplier ticks
+    ) {
         // The pathScratch field initializer has already allocated its native
         // buffer by the time this body runs, so a validation throw must free
         // it or every failed construction leaks 256 bytes of native memory
@@ -199,9 +245,15 @@ public final class SegmentManager implements QuietCloseable {
                     "maxTotalBytes (" + maxTotalBytes + ") must allow at least one segment of "
                             + segmentSizeBytes + " bytes");
         }
+        this.filesFacade = filesFacade;
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
         this.maxTotalBytes = maxTotalBytes;
+        this.ticks = ticks;
+    }
+
+    FilesFacade filesFacade() {
+        return filesFacade;
     }
 
     @Override
@@ -221,10 +273,6 @@ public final class SegmentManager implements QuietCloseable {
                     long remainingMillis = (deadlineNanos - System.nanoTime()) / 1_000_000L;
                     if (remainingMillis <= 0) {
                         break;
-                    }
-                    Runnable joinHook = beforeJoinAttemptHook;
-                    if (joinHook != null) {
-                        joinHook.run();
                     }
                     try {
                         t.join(remainingMillis);
@@ -252,9 +300,50 @@ public final class SegmentManager implements QuietCloseable {
                         return;
                     }
                 }
-                // The worker loop has already run its exit block; the thread
-                // is at most a few instructions from terminating and can no
-                // longer touch manager state. Fall through and reap it.
+                // The worker has left its service loop (workerLoopExited) and
+                // is now running only its finite exit cleanups -- the owning
+                // engine's finishClose(), which releases the slot flock and
+                // only THEN publishes closeCompleted. It can no longer wedge in
+                // a service pass, so give it a second bounded join to finish
+                // before reaping. Without this, a bounded-join timeout that
+                // lands mid-finishClose reaps the worker (workerThread=null =>
+                // isWorkerReaped()) while the flock release is still in flight,
+                // so a caller reading isCloseCompleted() observes a stale false
+                // and a spurious flock-release retry gets scheduled. This reuses
+                // the same join-under-monitor pattern as the bounded join above
+                // -- the worker uses a lock-free CAS for exactly-once cleanup
+                // and never blocks on this monitor -- and still reaps on
+                // timeout, so a pathologically slow cleanup cannot hang close().
+                //
+                // Budget with the fixed WORKER_JOIN_TIMEOUT_MILLIS, NOT the
+                // tunable workerJoinTimeoutMillis: the first join bounds a
+                // possibly-wedged SERVICE pass (tests shrink it to force the
+                // timed-out path), but the exit cleanups are finite and must be
+                // allowed to finish regardless of that tuning. In production
+                // both values are equal, so this only matters under a shrunk
+                // test override.
+                boolean cleanupInterrupted = Thread.interrupted();
+                long cleanupDeadlineNanos = System.nanoTime() + WORKER_JOIN_TIMEOUT_MILLIS * 1_000_000L;
+                try {
+                    while (t.isAlive()) {
+                        long remainingMillis = (cleanupDeadlineNanos - System.nanoTime()) / 1_000_000L;
+                        if (remainingMillis <= 0) {
+                            break;
+                        }
+                        try {
+                            t.join(remainingMillis);
+                        } catch (InterruptedException ignored) {
+                            cleanupInterrupted = true;
+                        }
+                    }
+                } finally {
+                    if (cleanupInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                // If the cleanups still have not finished (pathologically slow
+                // syscall), fall through and reap anyway -- identical to the
+                // best-effort behaviour before this second join existed.
             }
             workerThread = null;
         }
@@ -268,6 +357,103 @@ public final class SegmentManager implements QuietCloseable {
                 scratchFreed = true;
                 pathScratch.close();
             }
+        }
+    }
+
+    /**
+     * Hands the single owning engine's preallocated close callback to the
+     * worker exit block. Registration only assigns a reference under
+     * {@link #lock}; it cannot allocate in the timed-out teardown path.
+     * Returns {@code false} only after the worker loop has exited (or when it
+     * never started), so the caller may then clean up inline safely.
+     */
+    public boolean deferOwnedEngineCloseUntilWorkerExit(Runnable cleanup) {
+        synchronized (lock) {
+            if (workerLoopExited || workerThread == null) {
+                return false;
+            }
+            if (ownedEngineExitCleanup != null && ownedEngineExitCleanup != cleanup) {
+                throw new IllegalStateException("owned manager already has an engine-exit cleanup");
+            }
+            ownedEngineExitCleanup = cleanup;
+            return true;
+        }
+    }
+
+    /**
+     * Hands a cleanup action to the current service pass for {@code ring}.
+     * The worker runs it outside the manager lock immediately after that pass
+     * finishes. Returns {@code false} when no pass for the ring remains in
+     * flight, in which case the caller already owns a quiescent ring and must
+     * run the cleanup itself.
+     * <p>
+     * Registration and pass completion coordinate through the entry's atomic
+     * state and callback fields, so there is no gap without an owner: either
+     * this method attaches the cleanup while the pass remains active, the
+     * worker claims an attached cleanup while completing, or this method
+     * observes completed state and rejects the handoff. A repeated registration
+     * for the same pass returns {@code true} without replacing its existing
+     * owner.
+     */
+    public boolean deferUntilRingQuiescent(SegmentRing ring, Runnable cleanup) {
+        RingEntry e = inService;
+        if (e == null || e.ring != ring || !e.isInService()) {
+            return false;
+        }
+        Runnable existing = ENTRY_CLEANUP_UPDATER.get(e);
+        if (existing == null && ENTRY_CLEANUP_UPDATER.compareAndSet(e, null, cleanup)) {
+            if (e.isInService()) {
+                return true;
+            }
+            // Completion changed the state before observing the callback.
+            // Remove our callback and clean inline, unless the worker already
+            // claimed it (in which case that worker remains the owner).
+            return !ENTRY_CLEANUP_UPDATER.compareAndSet(e, cleanup, null);
+        }
+        // A callback already attached to this pass is an owner. The sole
+        // production caller always supplies the engine's preallocated bound
+        // callback; duplicates intentionally do not replace it.
+        return true;
+    }
+
+    /**
+     * Hands a cleanup action to the worker thread's exit block, to run
+     * strictly after the worker loop has finished its final service pass --
+     * i.e. after the last point where the worker can create, write or unlink
+     * anything under a registered ring's slot directory. Returns {@code false}
+     * when the worker loop has already exited (or the worker never started):
+     * the caller must run the cleanup itself, which is equally safe for the
+     * same reason -- no further worker access to the slot is possible.
+     * <p>
+     * This is the slot-ownership transfer used by an owning engine's close()
+     * when the bounded worker join timed out: instead of retiring the slot
+     * until process exit, ring/watermark/flock release moves to the worker,
+     * which is provably the last thread able to touch the slot directory.
+     * The registration here and the exit block's {@code workerLoopExited}
+     * flip share {@link #lock}, so the cleanup runs exactly once: either it
+     * is registered before the flip and the worker runs it, or the flip won
+     * and this method rejects the handoff.
+     * <p>
+     * May throw on allocation failure (the lambda at the call site, the
+     * {@code ObjList}, or its growth). A throw carries NO liveness
+     * information: the worker was never observed, so the caller must treat
+     * it as "worker possibly still live" and retain resources — never as
+     * the exact {@code false} return above.
+     */
+    public boolean deferUntilWorkerExit(Runnable cleanup) {
+        Runnable hook = beforeExitCleanupRegistrationHook;
+        if (hook != null) {
+            hook.run();
+        }
+        synchronized (lock) {
+            if (workerLoopExited || workerThread == null) {
+                return false;
+            }
+            if (exitCleanups == null) {
+                exitCleanups = new ObjList<>();
+            }
+            exitCleanups.add(cleanup);
+            return true;
         }
     }
 
@@ -293,6 +479,10 @@ public final class SegmentManager implements QuietCloseable {
      * mirroring {@link #close()}.
      */
     public boolean awaitRingQuiescence(SegmentRing ring) {
+        Runnable hook = beforeRingQuiescenceAwaitHook;
+        if (hook != null) {
+            hook.run();
+        }
         Thread t = workerThread;
         if (t == null || t == Thread.currentThread()) {
             return true;
@@ -300,26 +490,28 @@ public final class SegmentManager implements QuietCloseable {
         long deadlineNanos = System.nanoTime() + workerJoinTimeoutMillis * 1_000_000L;
         boolean interrupted = Thread.interrupted();
         try {
+            RingEntry e = inService;
+            if (e == null || e.ring != ring || !e.isInService()) {
+                return true;
+            }
             synchronized (lock) {
-                if (inService != null && inService.ring == ring) {
-                    quiescenceWaiterCount++;
-                    try {
-                        while (inService != null && inService.ring == ring) {
-                            long remainingNanos = deadlineNanos - System.nanoTime();
-                            if (remainingNanos <= 0) {
-                                return false;
-                            }
-                            try {
-                                // Round up so a sub-millisecond remainder still waits
-                                // instead of spinning through wait(0) == wait-forever.
-                                lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
-                            } catch (InterruptedException ignored) {
-                                interrupted = true;
-                            }
+                e.quiescenceWaiters++;
+                try {
+                    while (e.isInService()) {
+                        long remainingNanos = deadlineNanos - System.nanoTime();
+                        if (remainingNanos <= 0) {
+                            return false;
                         }
-                    } finally {
-                        quiescenceWaiterCount--;
+                        try {
+                            // Round up so a sub-millisecond remainder still waits
+                            // instead of spinning through wait(0) == wait-forever.
+                            lock.wait(Math.max(1L, remainingNanos / 1_000_000L));
+                        } catch (InterruptedException ignored) {
+                            interrupted = true;
+                        }
                     }
+                } finally {
+                    e.quiescenceWaiters--;
                 }
             }
             return true;
@@ -327,13 +519,6 @@ public final class SegmentManager implements QuietCloseable {
             if (interrupted) {
                 Thread.currentThread().interrupt();
             }
-        }
-    }
-
-    @TestOnly
-    public boolean hasWorkerLoopExited() {
-        synchronized (lock) {
-            return workerLoopExited;
         }
     }
 
@@ -373,7 +558,7 @@ public final class SegmentManager implements QuietCloseable {
                     // single subtraction covers both the initial seed
                     // and the net manager activity (provisions minus
                     // trims) for this ring.
-                    e.registered = false;
+                    e.deregister();
                     totalBytes -= ring.totalSegmentBytes();
                     rings.remove(i);
                     return;
@@ -394,7 +579,7 @@ public final class SegmentManager implements QuietCloseable {
      * the high-water mark — no waiting on the next tick.
      */
     public void register(SegmentRing ring, String dir) {
-        register(ring, dir, null);
+        register(ring, dir, null, 0L);
     }
 
     /**
@@ -407,6 +592,20 @@ public final class SegmentManager implements QuietCloseable {
      * {@code lowestSurvivingBaseSeq - 1}.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark) {
+        register(ring, dir, watermark, 0L);
+    }
+
+    /**
+     * Registers a ring with an optional periodic data-checkpoint interval.
+     * A positive interval requires disk-backed store-and-forward mode.
+     */
+    public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos) {
+        if (syncIntervalNanos < 0L) {
+            throw new IllegalArgumentException("syncIntervalNanos must not be negative");
+        }
+        if (syncIntervalNanos > 0L && dir == null) {
+            throw new IllegalArgumentException("periodic sync requires a segment directory");
+        }
         // Account for bytes the ring already owns when it joins. A recovered
         // ring (post-restart, orphan adoption) can come up at-or-above the cap;
         // without this seed, totalBytes stays at 0 and the per-tick cap check
@@ -418,27 +617,9 @@ public final class SegmentManager implements QuietCloseable {
         // spare at sf-0000000000000000.sfa — and openCleanRW would truncate the
         // user's existing active file out from under the I/O loop, scrambling
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
-        //
-        // A ring produced by SegmentRing.openExisting already carries the
-        // generation maximum from the full directory scan recovery just
-        // performed -- prefer it over re-enumerating the directory here.
-        // The recovered value cannot be stale: the engine holds the slot
-        // lock, and no spare can be minted into this slot before this call
-        // wires the ring up. It also cannot be too low after a deregister/
-        // re-register cycle: advanceFileGeneration only ever ratchets the
-        // counter upwards. Rings not built by recovery (fresh start, tests)
-        // report FILE_GENERATION_UNKNOWN and keep the legacy rescan.
-        long minNextGeneration;
-        if (dir == null) {
-            minNextGeneration = -1L;
-        } else {
-            long recoveredMax = ring.maxRecoveredFileGeneration();
-            minNextGeneration = (recoveredMax != SegmentRing.FILE_GENERATION_UNKNOWN
-                    ? recoveredMax
-                    : scanMaxGeneration(dir)) + 1L;
-        }
+        long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
-        RingEntry e = new RingEntry(ring, dir, watermark);
+        RingEntry e = new RingEntry(ring, dir, watermark, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
@@ -447,6 +628,12 @@ public final class SegmentManager implements QuietCloseable {
             }
             rings.add(e);
             totalBytes += ringBytes;
+            if (syncIntervalNanos > 0L) {
+                ring.enablePeriodicSync();
+                if (syncIntervalNanos < shortestSyncIntervalNanos) {
+                    shortestSyncIntervalNanos = syncIntervalNanos;
+                }
+            }
         }
         ring.setManagerWakeup(managerWakeup);
         // Nudge the worker so it picks up the new ring on its very next
@@ -463,13 +650,59 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
-    public void setAfterServiceHook(Runnable hook) {
-        this.afterServiceHook = hook;
+    public SegmentRing getInServiceRingForTesting() {
+        RingEntry entry = inService;
+        return entry == null ? null : entry.ring;
     }
 
     @TestOnly
-    public void setBeforeJoinAttemptHook(Runnable hook) {
-        this.beforeJoinAttemptHook = hook;
+    public long getTotalBytesForTesting() {
+        synchronized (lock) {
+            return totalBytes;
+        }
+    }
+
+    @TestOnly
+    public Thread getWorkerThreadForTesting() {
+        return workerThread;
+    }
+
+    @TestOnly
+    public boolean isPathScratchAllocatedForTesting() {
+        synchronized (lock) {
+            return !scratchFreed;
+        }
+    }
+
+    @TestOnly
+    public boolean serviceRingForTesting(SegmentRing ring) {
+        if (workerThread != null) {
+            throw new IllegalStateException("test service requires a stopped manager");
+        }
+        RingEntry selected = null;
+        synchronized (lock) {
+            for (int i = 0, n = rings.size(); i < n; i++) {
+                RingEntry candidate = rings.getQuick(i);
+                if (candidate.ring == ring) {
+                    selected = candidate;
+                    break;
+                }
+            }
+        }
+        if (selected == null) {
+            throw new IllegalArgumentException("ring is not registered");
+        }
+        return serviceRing(selected);
+    }
+
+    @TestOnly
+    public void setAfterRingCleanupHook(Runnable hook) {
+        this.afterRingCleanupHook = hook;
+    }
+
+    @TestOnly
+    public void setBeforeExitCleanupRegistrationHook(Runnable hook) {
+        this.beforeExitCleanupRegistrationHook = hook;
     }
 
     @TestOnly
@@ -478,13 +711,18 @@ public final class SegmentManager implements QuietCloseable {
     }
 
     @TestOnly
-    public void setBeforeServiceClaimHook(Runnable hook) {
-        this.beforeServiceClaimHook = hook;
+    public void setBeforeRingQuiescenceAwaitHook(Runnable hook) {
+        this.beforeRingQuiescenceAwaitHook = hook;
     }
 
     @TestOnly
     public void setBeforeTrimSyncHook(Runnable hook) {
         this.beforeTrimSyncHook = hook;
+    }
+
+    @TestOnly
+    public void setRetryLogHook(Runnable hook) {
+        this.retryLogHook = hook;
     }
 
     @TestOnly
@@ -519,32 +757,38 @@ public final class SegmentManager implements QuietCloseable {
     /**
      * Returns the highest hex-encoded generation across {@code sf-<gen>.sfa}
      * files in {@code dir}, or {@code -1} if none exist. Skips files that
-     * don't match the pattern (e.g. the legacy {@code sf-initial.sfa});
-     * name matching is delegated to {@link SegmentRing#parseFileGeneration}
-     * so this fallback scan and the recovery scan can never disagree.
-     * Fallback only: {@link #register(SegmentRing, String, AckWatermark)}
-     * calls this just for rings that don't carry a recovery-scanned maximum.
+     * don't match the pattern (e.g. the legacy {@code sf-initial.sfa}).
      */
-    private static long scanMaxGeneration(String dir) {
+    private long scanMaxGeneration(String dir) {
         long max = -1L;
-        if (!Files.exists(dir)) return max;
-        long find = Files.findFirst(dir);
+        if (!filesFacade.exists(dir)) return max;
+        long find = filesFacade.findFirst(dir);
         if (find < 0) {
-            LOG.warn("scanMaxGeneration could not enumerate {}; "
-                    + "next spare may collide with an existing on-disk segment", dir);
-            return max;
+            throw new SfOperationalException("could not enumerate SF segment directory " + dir);
         }
         if (find == 0) return max;
         try {
             int rc = 1;
             while (rc > 0) {
-                String name = Files.utf8ToString(Files.findName(find));
-                rc = Files.findNext(find);
-                long gen = SegmentRing.parseFileGeneration(name);
-                if (gen > max) max = gen;
+                String name = Files.utf8ToString(filesFacade.findName(find));
+                rc = filesFacade.findNext(find);
+                if (name == null || !name.startsWith("sf-") || !name.endsWith(".sfa")) {
+                    continue;
+                }
+                String hex = name.substring(3, name.length() - 4);
+                if (hex.length() != 16) continue;
+                try {
+                    long gen = Long.parseUnsignedLong(hex, 16);
+                    if (gen > max) max = gen;
+                } catch (NumberFormatException ignored) {
+                    // sf-initial.sfa or non-hex — skip
+                }
+            }
+            if (rc < 0) {
+                throw new SfOperationalException("could not fully enumerate SF segment directory " + dir);
             }
         } finally {
-            Files.findClose(find);
+            filesFacade.findClose(find);
         }
         return max;
     }
@@ -586,46 +830,62 @@ public final class SegmentManager implements QuietCloseable {
         return displayPath;
     }
 
-    private void serviceRing(RingEntry e) {
-        Runnable serviceClaimHook = beforeServiceClaimHook;
-        if (serviceClaimHook != null) {
-            serviceClaimHook.run();
+    private boolean serviceRing(RingEntry e) {
+        // Publish before the CAS so deregister + await can always find the
+        // entry. The state CAS is the ownership decision: if deregister won,
+        // this stale snapshot pass skips the ring without touching it.
+        inService = e;
+        if (!ENTRY_STATE_UPDATER.compareAndSet(e, ENTRY_REGISTERED, ENTRY_IN_SERVICE)) {
+            inService = null;
+            return false;
         }
-        // Claim the entry as in-service so deregister-side quiescence
-        // barriers (awaitRingQuiescence) can wait for this pass to finish.
-        // A stale snapshot entry deregistered before the pass starts is
-        // skipped entirely: the deregistering thread may already be
-        // releasing the ring / watermark / slot resources, so the worker
-        // must not touch them at all. The registered check and the
-        // in-service claim are atomic under `lock` — deregister flips
-        // `registered` under the same lock, so it either prevents this
-        // pass or the barrier observes it via `inService`.
-        synchronized (lock) {
-            if (!e.registered) {
-                return;
-            }
-            inService = e;
-        }
+        boolean hasMoreTrimmable;
         try {
-            serviceRing0(e);
+            hasMoreTrimmable = serviceRing0(e);
         } finally {
-            synchronized (lock) {
-                inService = null;
-                if (quiescenceWaiterCount > 0) {
-                    lock.notifyAll();
+            e.finishService();
+            Runnable cleanup = e.quiescenceCleanup == null
+                    ? null
+                    : ENTRY_CLEANUP_UPDATER.getAndSet(e, null);
+            inService = null;
+            // A normal pass performs only the two state CAS operations above.
+            // The manager monitor is entered here only for an actual close
+            // waiter; the recheck under lock prevents lost wakeups.
+            if (e.quiescenceWaiters > 0) {
+                synchronized (lock) {
+                    if (e.quiescenceWaiters > 0) {
+                        lock.notifyAll();
+                    }
+                }
+            }
+            if (cleanup != null) {
+                try {
+                    cleanup.run();
+                } catch (Throwable t) {
+                    LOG.error("deferred engine cleanup failed after manager-worker ring pass", t);
+                } finally {
+                    Runnable hook = afterRingCleanupHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
                 }
             }
         }
+        return hasMoreTrimmable;
     }
 
-    private void serviceRing0(RingEntry e) {
+    private boolean serviceRing0(RingEntry e) {
+        boolean memoryMode = e.dir == null;
+        if (!memoryMode) {
+            servicePeriodicSync(e, ticks.getAsLong());
+        }
+
         // 1. Provision a hot spare if the ring needs one AND we have headroom
         //    under the disk-total cap. Cap check is per-tick; if we're capped
         //    here, the ring stays in BACKPRESSURE_NO_SPARE until trim (step 2)
         //    on this or a subsequent tick frees space. Logged at most once per
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
-        boolean memoryMode = e.dir == null;
         if (e.ring.needsHotSpare()) {
             // Snapshot totalBytes under lock — register/deregister can mutate
             // it from caller threads. Heavy provisioning I/O happens outside
@@ -662,13 +922,20 @@ public final class SegmentManager implements QuietCloseable {
                         // via its long-ptr overload, bypassing the byte[] + native
                         // malloc that the String overload would incur on every
                         // rotation.
-                        spare = MmapSegment.create(FilesFacade.INSTANCE,
+                        spare = MmapSegment.create(filesFacade,
                                 pathScratch.ptr(), path,
-                                e.ring.nextSeqHint(), segmentSizeBytes);
+                                e.ring.nextSeqHint(), segmentSizeBytes, true);
                     }
                     Runnable installHook = beforeInstallSyncHook;
                     if (installHook != null) {
                         installHook.run();
+                    }
+                    if (!memoryMode) {
+                        spare.syncHeader();
+                        if (filesFacade.fsyncDir(e.dir) != 0) {
+                            throw new MmapSegmentException(
+                                    "could not sync hot-spare directory " + e.dir);
+                        }
                     }
                     // Install + commit atomically under the manager lock.
                     // If `e.ring` was deregistered between the snapshot
@@ -683,7 +950,7 @@ public final class SegmentManager implements QuietCloseable {
                     // observe the spare in the ring (and subtract it) or
                     // run before installation (so no install happens).
                     synchronized (lock) {
-                        if (e.registered) {
+                        if (e.isRegistered()) {
                             e.ring.installHotSpare(spare);
                             totalBytes += segmentSizeBytes;
                             installed = true;
@@ -700,84 +967,287 @@ public final class SegmentManager implements QuietCloseable {
                         } catch (Throwable ignored) {
                         }
                     }
-                    // Remove the file even when spare is null (i.e. when
-                    // MmapSegment.create itself threw): MmapSegment.create's
-                    // catch already best-effort removes, but if anything
-                    // before mmap (e.g. an exception thrown by the JVM
-                    // between openCleanRW and the try block) leaves a file
-                    // on disk, this is the second-line defense. Repeated
-                    // unlink on an already-removed path is a harmless no-op.
-                    if (path != null) {
-                        Files.remove(path);
+                    // Only remove the file when the spare object exists, i.e.
+                    // MmapSegment.create succeeded and ownership is ours but
+                    // installation was rejected (ring deregistered/closed).
+                    // When create() itself threw, its catch already removed
+                    // anything it put on disk -- and with exclusive create
+                    // (O_EXCL) a failure can also mean the path was ALREADY
+                    // occupied by a file some other lifecycle owns, which a
+                    // blanket unlink here would destroy.
+                    if (path != null && spare != null) {
+                        filesFacade.remove(path);
                     }
                 }
             }
         }
 
-        // 2. Trim any segments that the ring says are fully acked. For
-        //    memory-mode rings, "trim" is just close() (Unsafe.free) — no
-        //    file to unlink.
-        //
-        //    The watermark write and totalBytes commit are registration-gated
-        //    under `lock` so stale worker snapshots cannot touch the
-        //    engine-owned watermark or mutate accounting after deregister()
-        //    returns. drainTrimmable still runs for stale snapshots: it
-        //    transfers ownership of fully-acked sealed segments to this
-        //    worker, preserving the old close + unlink behavior.
-        //
-        //    munmap + unlink stay outside the lock — they can be slow
-        //    and shouldn't block register/deregister or sibling rings.
-        ObjList<MmapSegment> trim;
+        // 2. Trim fully ACKed segments. The ring first transfers one bounded,
+        //    unpinned prefix out of live traversal and into hidden pending
+        //    ownership. Only then may this worker unmap it. Disk mode keeps the
+        //    pending prefix until unlink + directory fsync are durable; memory
+        //    mode commits each successfully freed prefix immediately. No
+        //    syscall runs under the manager lock.
         Runnable hook = beforeTrimSyncHook;
         if (hook != null) {
             hook.run();
         }
-        synchronized (lock) {
-            boolean registered = e.registered;
-            // Persist the current ackedFsn watermark BEFORE the trim runs.
-            // On host crash between the persist and the unlinks below, the
-            // segments survive and the watermark is correct. On crash AFTER
-            // the unlinks but before next tick, the segments are gone and
-            // the watermark is stale, but recovery clamps with
-            // max(lowestSurvivingBaseSeq - 1, watermark) so either ordering
-            // is safe. Memory-mode rings (and callers that didn't supply a
-            // watermark) skip the write.
-            // Persist only on advance to avoid pointless mmap stores when
-            // ackedFsn is steady. The store is a single 8-byte put against
-            // an already-mapped region -- no syscall, no allocation -- but
-            // the gate keeps the dirty-page footprint minimal under
-            // steady-state load with no new acks arriving.
-            if (registered && e.watermark != null) {
-                long currentAck = e.ring.ackedFsn();
-                if (currentAck > e.lastPersistedAck) {
-                    e.watermark.write(currentAck);
-                    e.lastPersistedAck = currentAck;
+        int pendingCount = e.ring.pendingTrimCount();
+        MmapSegment first = pendingCount == 0 ? e.ring.firstTrimmable() : null;
+        if (pendingCount == 0 && first == null) {
+            // Preserve the cheap mmap-only watermark cadence for ACKs that do
+            // not yet cover a complete, unpinned sealed segment.
+            synchronized (lock) {
+                if (e.isRegistered() && e.watermark != null) {
+                    long currentAck = e.ring.ackedFsn();
+                    if (currentAck > e.lastPersistedAck) {
+                        e.watermark.write(currentAck);
+                        e.lastPersistedAck = currentAck;
+                    }
                 }
             }
-            trim = e.ring.drainTrimmable();
-            if (registered && trim != null) {
-                for (int i = 0, n = trim.size(); i < n; i++) {
-                    // fileBytes(), not sizeBytes(): must mirror the register-time
-                    // seed (SegmentRing.totalSegmentBytes), which accounts the
-                    // on-disk footprint — recovered segments map only their
-                    // validated prefix but occupy the full file length on disk.
-                    totalBytes -= trim.get(i).fileBytes();
+            return false;
+        }
+
+        if (memoryMode) {
+            int batchSize = pendingCount > 0
+                    ? e.ring.copyPendingTrims(trimBatch)
+                    : e.ring.stagePendingTrims(
+                            trimBatch, MAX_TRIMS_PER_RING_PASS, e.ring.ackedFsn());
+            int closed = 0;
+            Throwable closeFailure = null;
+            while (closed < batchSize) {
+                try {
+                    trimBatch[closed].close();
+                    closed++;
+                } catch (Throwable t) {
+                    closeFailure = t;
+                    break;
                 }
+            }
+            if (closed > 0) {
+                synchronized (lock) {
+                    long removedBytes = e.ring.commitPendingTrims(trimBatch, closed);
+                    if (e.isRegistered()) {
+                        totalBytes -= removedBytes;
+                    }
+                }
+            }
+            for (int i = 0; i < batchSize; i++) {
+                trimBatch[i] = null;
+            }
+            if (closeFailure != null) {
+                LOG.warn("Failed to trim memory segment", closeFailure);
+                return false;
+            }
+            return e.ring.firstTrimmable() != null;
+        }
+
+        // A deferred disk retry does no sync, unlink, or logging work. Signed
+        // subtraction is the standard wrap-safe deadline comparison because
+        // the bounded delay is many orders of magnitude below half the long
+        // range, even when the monotonic clock wraps.
+        long now = ticks.getAsLong();
+        if (e.trimRetryDelayNanos != 0 && now - e.trimRetryAtNanos < 0) {
+            return false;
+        }
+
+        // Every attempt repeats the cheap covering barrier. Besides keeping
+        // the latest cumulative ACK durable, this preserves the same strict
+        // pre-unlink/post-unlink directory ordering on pending retries.
+        if (e.watermark == null) {
+            if (!e.missingWatermarkLogged) {
+                e.missingWatermarkLogged = true;
+                LOG.warn("Cannot durably trim acknowledged segments in {} without an ack watermark", e.dir);
+            }
+            return false;
+        }
+        long durableAck;
+        synchronized (lock) {
+            if (!e.isRegistered()) {
+                return false;
+            }
+            durableAck = e.ring.ackedFsn();
+            if (durableAck > e.lastPersistedAck) {
+                e.watermark.write(durableAck);
+                e.lastPersistedAck = durableAck;
             }
         }
-        if (trim != null) {
-            for (int i = 0, n = trim.size(); i < n; i++) {
-                MmapSegment s = trim.get(i);
-                String path = s.path();
-                try {
-                    s.close();
-                    if (path != null && !Files.remove(path)) {
-                        LOG.warn("Failed to unlink trimmed segment {}", path);
-                    }
-                } catch (Throwable t) {
-                    LOG.warn("Failed to trim segment {}", path == null ? "<memory>" : path, t);
-                }
+        try {
+            e.watermark.sync();
+            if (filesFacade.fsyncDir(e.dir) != 0) {
+                recordTrimFailure(e, TRIM_RETRY_PRE_BARRIER, now, null);
+                return false;
             }
+        } catch (Throwable t) {
+            recordTrimFailure(e, TRIM_RETRY_PRE_BARRIER, now, t);
+            return false;
+        }
+
+        int batchSize;
+        if (pendingCount > 0) {
+            batchSize = e.ring.copyPendingTrims(trimBatch);
+        } else {
+            try {
+                // Under the ring monitor: advance the manifest past the last
+                // eligible member, then atomically hide the batch. No I/O pin
+                // can appear between the eligibility check and live removal.
+                batchSize = e.ring.stagePendingTrims(
+                        trimBatch, MAX_TRIMS_PER_RING_PASS, durableAck);
+            } catch (Throwable t) {
+                Arrays.fill(trimBatch, null);
+                recordTrimFailure(e, TRIM_RETRY_UNLINK, now, t);
+                return false;
+            }
+            if (batchSize == 0) {
+                return false;
+            }
+        }
+
+        boolean trimFailed = false;
+        Throwable trimFailure = null;
+        int unlinked = 0;
+        while (unlinked < batchSize) {
+            MmapSegment trimming = trimBatch[unlinked];
+            String path = trimming.path();
+            try {
+                trimming.close();
+                if (!filesFacade.remove(path) && filesFacade.exists(path)) {
+                    trimFailed = true;
+                    break;
+                }
+                unlinked++;
+            } catch (Throwable t) {
+                trimFailed = true;
+                trimFailure = t;
+                break;
+            }
+        }
+
+        if (unlinked > 0) {
+            try {
+                if (filesFacade.fsyncDir(e.dir) != 0) {
+                    for (int i = 0; i < batchSize; i++) {
+                        trimBatch[i] = null;
+                    }
+                    recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, null);
+                    return false;
+                }
+            } catch (Throwable t) {
+                for (int i = 0; i < batchSize; i++) {
+                    trimBatch[i] = null;
+                }
+                recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, t);
+                return false;
+            }
+            try {
+                synchronized (lock) {
+                    long removedBytes = e.ring.commitPendingTrims(trimBatch, unlinked);
+                    if (e.isRegistered()) {
+                        totalBytes -= removedBytes;
+                    }
+                }
+            } catch (Throwable t) {
+                for (int i = 0; i < batchSize; i++) {
+                    trimBatch[i] = null;
+                }
+                recordTrimFailure(e, TRIM_RETRY_POST_BARRIER, now, t);
+                return false;
+            }
+        }
+        for (int i = 0; i < batchSize; i++) {
+            trimBatch[i] = null;
+        }
+        if (trimFailed) {
+            recordTrimFailure(e, TRIM_RETRY_UNLINK, now, trimFailure);
+            return false;
+        }
+        recordTrimSuccess(e);
+        return e.ring.firstTrimmable() != null;
+    }
+
+    private void recordTrimFailure(RingEntry e, int failureKind, long now, Throwable failure) {
+        long delay = e.trimRetryDelayNanos == 0
+                ? TRIM_RETRY_INITIAL_NANOS
+                : Math.min(e.trimRetryDelayNanos << 1, TRIM_RETRY_MAX_NANOS);
+        e.trimRetryAtNanos = now + delay;
+        e.trimRetryDelayNanos = delay;
+        if (e.trimRetryFailureKind != failureKind) {
+            e.trimRetryFailureKind = failureKind;
+            if (failure == null) {
+                LOG.warn("Durable segment trim failed in {} during {} (retry delayed)",
+                        e.dir, trimFailureName(failureKind));
+            } else {
+                LOG.warn("Durable segment trim failed in {} during {} (retry delayed)",
+                        e.dir, trimFailureName(failureKind), failure);
+            }
+            Runnable hook = retryLogHook;
+            if (hook != null) {
+                hook.run();
+            }
+        }
+    }
+
+    private void recordTrimSuccess(RingEntry e) {
+        if (e.trimRetryDelayNanos != 0) {
+            e.trimRetryAtNanos = 0;
+            e.trimRetryDelayNanos = 0;
+            e.trimRetryFailureKind = TRIM_RETRY_NONE;
+            LOG.info("Durable segment trim recovered in {}", e.dir);
+            Runnable hook = retryLogHook;
+            if (hook != null) {
+                hook.run();
+            }
+        }
+    }
+
+    private static String trimFailureName(int failureKind) {
+        switch (failureKind) {
+            case TRIM_RETRY_PRE_BARRIER:
+                return "covering barrier";
+            case TRIM_RETRY_UNLINK:
+                return "segment unlink";
+            default:
+                return "directory commit barrier";
+        }
+    }
+
+    private void servicePeriodicSync(RingEntry e, long now) {
+        if (e.syncIntervalNanos <= 0L
+                || (!e.ring.isSyncRequested() && now - e.nextDataSyncNanos < 0L)) {
+            return;
+        }
+        try {
+            e.ring.copyPendingSyncSegments(syncScratch);
+            for (int i = 0, n = syncScratch.size(); i < n; i++) {
+                syncScratch.getQuick(i).syncPublished();
+            }
+            e.ring.clearSyncRequestIfActiveDurable();
+            // The pass above covered every not-yet-durable live range -- the
+            // proven-durable sealed prefix is skipped precisely because its
+            // syncPublished would early-return (see copyPendingSyncSegments),
+            // so any latched failure necessarily belongs to a range we just
+            // re-barriered. A failed barrier re-dirties its range under an
+            // mlock pin (see MmapSegment.syncPublished), so a success here is a
+            // genuine re-persist -- not a vacuous retry over pages a failed
+            // writeback marked clean (fsyncgate). Unlatch so a transient disk
+            // fault doesn't permanently brick the producer.
+            e.ring.clearDurabilityFailure();
+            e.nextDataSyncNanos = now + e.syncIntervalNanos;
+            if (e.syncFailureLogged) {
+                e.syncFailureLogged = false;
+                LOG.info("Periodic SF data sync recovered for {}", e.dir);
+            }
+        } catch (Throwable failure) {
+            e.ring.recordDurabilityFailure(failure);
+            if (!e.syncFailureLogged) {
+                e.syncFailureLogged = true;
+                LOG.error("Periodic SF data sync failed for {}", e.dir, failure);
+            }
+            long retry = Math.min(e.syncIntervalNanos, 1_000_000_000L);
+            e.nextDataSyncNanos = now + retry;
+        } finally {
+            syncScratch.clear();
         }
     }
 
@@ -793,12 +1263,11 @@ public final class SegmentManager implements QuietCloseable {
                         ringSnapshot.add(rings.getQuick(i));
                     }
                 }
+                boolean hasMoreTrimmable = false;
                 for (int i = 0, n = ringSnapshot.size(); i < n; i++) {
                     if (!running) break;
-                    serviceRing(ringSnapshot.getQuick(i));
-                    Runnable serviceHook = afterServiceHook;
-                    if (serviceHook != null) {
-                        serviceHook.run();
+                    if (serviceRing(ringSnapshot.getQuick(i))) {
+                        hasMoreTrimmable = true;
                     }
                 }
                 // Drop strong refs so a deregistered ring becomes collectable
@@ -806,18 +1275,51 @@ public final class SegmentManager implements QuietCloseable {
                 // to pollNanos after deregister).
                 ringSnapshot.clear();
                 if (!running) break;
-                LockSupport.parkNanos(pollNanos);
+                if (!hasMoreTrimmable) {
+                    LockSupport.parkNanos(Math.min(pollNanos, shortestSyncIntervalNanos));
+                }
             }
         } finally {
             // If a timed-out close() abandoned the reap, it handed
             // pathScratch ownership to this thread (see close()). Freeing it
             // here reclaims the native buffer even when the worker outlives
             // every close() attempt — nobody else retries manager cleanup.
+            ObjList<Runnable> cleanups;
+            Runnable ownedEngineCleanup;
             synchronized (lock) {
                 workerLoopExited = true;
                 if (scratchHandedToWorker && !scratchFreed) {
                     scratchFreed = true;
                     pathScratch.close();
+                }
+                cleanups = exitCleanups;
+                exitCleanups = null;
+                ownedEngineCleanup = ownedEngineExitCleanup;
+                ownedEngineExitCleanup = null;
+            }
+            // Deferred engine cleanups run OUTSIDE
+            // `lock`: they perform syscalls (munmap, unlink, flock release)
+            // and must never execute under a lock that close()/register/
+            // deregister callers contend on. Running them after the loop body
+            // is what makes the handoff safe: this thread can no longer touch
+            // any slot path. They must also never block on a caller-held
+            // monitor — a retried engine.close() joins this thread while
+            // holding the engine monitor, which is why the engine side uses a
+            // lock-free claim (CAS), not synchronization, for exactly-once.
+            if (ownedEngineCleanup != null) {
+                try {
+                    ownedEngineCleanup.run();
+                } catch (Throwable t) {
+                    LOG.error("deferred owned-engine cleanup failed on manager-worker exit", t);
+                }
+            }
+            if (cleanups != null) {
+                for (int i = 0, n = cleanups.size(); i < n; i++) {
+                    try {
+                        cleanups.getQuick(i).run();
+                    } catch (Throwable t) {
+                        LOG.error("deferred engine cleanup failed on manager-worker exit", t);
+                    }
                 }
             }
         }
@@ -826,6 +1328,7 @@ public final class SegmentManager implements QuietCloseable {
     private static final class RingEntry {
         final String dir;
         final SegmentRing ring;
+        final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
         // mode and for callers that didn't supply one. Manager-thread
         // only after register; never closed here (owner closes).
@@ -836,16 +1339,77 @@ public final class SegmentManager implements QuietCloseable {
         // Survives across multiple serviceRing ticks and avoids a
         // write-storm when ackedFsn is steady.
         long lastPersistedAck = -1L;
-        // Guarded by SegmentManager.lock. A worker snapshot may retain this
-        // entry after deregister() removes it from rings; registered=false is
-        // the O(1) ownership check that prevents post-deregister writes through
-        // the engine-owned watermark, hot-spare installs, and accounting.
-        boolean registered = true;
+        // Prevents a legacy disk registration without a watermark from
+        // flooding the log on every manager tick.
+        boolean missingWatermarkLogged;
+        long nextDataSyncNanos;
+        boolean syncFailureLogged;
+        // Zero-allocation manager-thread-only retry state. The deadline uses
+        // the manager's monotonic clock and the delay doubles to a fixed cap.
+        long trimRetryAtNanos;
+        long trimRetryDelayNanos;
+        int trimRetryFailureKind;
+        // Updated lock-free by deferUntilRingQuiescent and pass completion.
+        // The field updater avoids one AtomicReference allocation per ring.
+        volatile Runnable quiescenceCleanup;
+        // Waiters mutate this under SegmentManager.lock; pass completion reads
+        // it before taking the otherwise-cold notification path.
+        volatile int quiescenceWaiters;
+        // REGISTERED -> IN_SERVICE -> REGISTERED on a normal pass.
+        // Deregistration changes either registered state to its corresponding
+        // deregistered state; completion then changes DEREGISTERED_IN_SERVICE
+        // to DEREGISTERED. The field updater avoids per-entry allocation.
+        volatile int state = ENTRY_REGISTERED;
 
-        RingEntry(SegmentRing ring, String dir, AckWatermark watermark) {
+        RingEntry(
+                SegmentRing ring,
+                String dir,
+                AckWatermark watermark,
+                long syncIntervalNanos,
+                long now
+        ) {
             this.ring = ring;
             this.dir = dir;
             this.watermark = watermark;
+            this.syncIntervalNanos = syncIntervalNanos;
+            // Run the first periodic pass immediately. This establishes a
+            // durable baseline for segments recovered from MEMORY mode.
+            this.nextDataSyncNanos = now;
+        }
+
+        void deregister() {
+            while (true) {
+                int current = state;
+                int next = current == ENTRY_IN_SERVICE
+                        ? ENTRY_DEREGISTERED_IN_SERVICE
+                        : ENTRY_DEREGISTERED;
+                if (current == ENTRY_DEREGISTERED || current == ENTRY_DEREGISTERED_IN_SERVICE
+                        || ENTRY_STATE_UPDATER.compareAndSet(this, current, next)) {
+                    return;
+                }
+            }
+        }
+
+        void finishService() {
+            while (true) {
+                int current = state;
+                int next = current == ENTRY_DEREGISTERED_IN_SERVICE
+                        ? ENTRY_DEREGISTERED
+                        : ENTRY_REGISTERED;
+                if (ENTRY_STATE_UPDATER.compareAndSet(this, current, next)) {
+                    return;
+                }
+            }
+        }
+
+        boolean isInService() {
+            int current = state;
+            return current == ENTRY_IN_SERVICE || current == ENTRY_DEREGISTERED_IN_SERVICE;
+        }
+
+        boolean isRegistered() {
+            int current = state;
+            return current == ENTRY_REGISTERED || current == ENTRY_IN_SERVICE;
         }
     }
 }

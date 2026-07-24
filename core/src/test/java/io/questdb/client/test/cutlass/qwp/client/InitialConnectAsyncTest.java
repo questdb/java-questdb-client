@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
@@ -43,8 +44,10 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
@@ -206,6 +209,78 @@ public class InitialConnectAsyncTest {
     }
 
     @Test
+    public void testAsyncMetricsDistinguishInitialSendFromReconnectReplay() throws Exception {
+        ReplayMetricsHandler handler = new ReplayMetricsHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + sfDirOpt() + ";initial_connect_retry=async"
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=200"
+                    + ";close_flush_timeout_millis=2000;";
+            Sender sender = Sender.fromConfig(cfg);
+            try {
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                handler.bind(wss, server);
+
+                // Publish before the server starts accepting. The frame has
+                // never been on any wire, so its eventual first delivery must
+                // increase sent, but not replayed.
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                awaitAtLeastOneConnectAttempt(wss);
+                Assert.assertEquals("the server must not handshake before start", 0, server.handshakeCount());
+
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the initial frame must be ACKed",
+                        handler.awaitInitialAck(5, TimeUnit.SECONDS));
+                awaitMetricAtLeast("initial ACK", wss::getTotalAcks, 1L);
+                Assert.assertEquals("exactly one frame must be sent initially",
+                        1L, wss.getTotalFramesSent());
+                long replayedAfterInitialDelivery = wss.getTotalFramesReplayed();
+
+                // The second frame reaches the established connection, but the
+                // fixture closes that connection without ACKing it. It must then
+                // arrive again on a genuinely new connection and count once as
+                // replayed.
+                sender.table("foo").longColumn("v", 2L).atNow();
+                sender.flush();
+                Assert.assertTrue("the fixture must close after the unacked frame",
+                        handler.awaitDisconnect(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the reconnect must reach the gated server",
+                        server.awaitRoleReject(5, TimeUnit.SECONDS));
+
+                // Publish another frame while reconnect is blocked at a role
+                // reject, then reopen the gate. This frame has never been sent
+                // and must not inflate the replay counter after reconnect.
+                sender.table("foo").longColumn("v", 3L).atNow();
+                sender.flush();
+                server.setRejectWithRole(null);
+
+                Assert.assertTrue("the unacked frame must be replayed",
+                        handler.awaitReplay(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the outage-queued frame must be delivered",
+                        handler.awaitOutageQueuedDelivery(5, TimeUnit.SECONDS));
+                awaitMetricAtLeast("replayed frame", wss::getTotalFramesReplayed, 1L);
+                awaitMetricAtLeast("post-reconnect ACKs", wss::getTotalAcks, 3L);
+
+                Assert.assertTrue("replay must arrive on a new WebSocket connection",
+                        handler.wasReplayOnNewConnection());
+                Assert.assertTrue("the server must observe a reconnect",
+                        server.handshakeCount() >= 2);
+                Assert.assertEquals("initial delivery is not a replay",
+                        0L, replayedAfterInitialDelivery);
+                Assert.assertEquals("three first sends plus one genuine resend",
+                        4L, wss.getTotalFramesSent());
+                Assert.assertEquals("only the genuine resend is replayed",
+                        1L, wss.getTotalFramesReplayed());
+            } finally {
+                closeQuietly(sender);
+            }
+        }
+    }
+
+    @Test
     public void testAsyncReturnsImmediatelyWithNoServer() {
         // No server. With async mode, fromConfig must return fast — the
         // I/O thread will keep retrying in the background until cap, but
@@ -345,6 +420,17 @@ public class InitialConnectAsyncTest {
      * before the budget expired would satisfy it even if the loop then
      * exited.
      */
+    private static void awaitMetricAtLeast(String label, LongSupplier metric, long expected) {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (metric.getAsLong() < expected) {
+            if (System.nanoTime() > deadlineNanos) {
+                throw new AssertionError(label + " did not reach " + expected
+                        + " within 5s; current=" + metric.getAsLong());
+            }
+            io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
     private static void awaitReconnectAttemptsAdvance(QwpWebSocketSender wss) {
         long snapshot = wss.getTotalReconnectAttempts();
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -472,6 +558,83 @@ public class InitialConnectAsyncTest {
         public void onError(@NotNull SenderError err) {
             if (ref.compareAndSet(null, err)) {
                 latch.countDown();
+            }
+        }
+    }
+
+    private static class ReplayMetricsHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch disconnect = new CountDownLatch(1);
+        private final CountDownLatch initialAck = new CountDownLatch(1);
+        private final CountDownLatch outageQueuedDelivery = new CountDownLatch(1);
+        private final AtomicLong received = new AtomicLong();
+        private final CountDownLatch replay = new CountDownLatch(1);
+        private final AtomicBoolean replayOnNewConnection = new AtomicBoolean();
+        private TestWebSocketServer.ClientHandler initialClient;
+        private volatile TestWebSocketServer server;
+        private volatile QwpWebSocketSender sender;
+
+        boolean awaitDisconnect(long timeout, TimeUnit unit) throws InterruptedException {
+            return disconnect.await(timeout, unit);
+        }
+
+        boolean awaitInitialAck(long timeout, TimeUnit unit) throws InterruptedException {
+            return initialAck.await(timeout, unit);
+        }
+
+        boolean awaitOutageQueuedDelivery(long timeout, TimeUnit unit) throws InterruptedException {
+            return outageQueuedDelivery.await(timeout, unit);
+        }
+
+        boolean awaitReplay(long timeout, TimeUnit unit) throws InterruptedException {
+            return replay.await(timeout, unit);
+        }
+
+        void bind(QwpWebSocketSender sender, TestWebSocketServer server) {
+            this.sender = sender;
+            this.server = server;
+        }
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long ordinal = received.incrementAndGet();
+            try {
+                if (ordinal == 1L) {
+                    initialClient = client;
+                    client.sendBinary(AckHandler.buildAck(0L));
+                    initialAck.countDown();
+                } else if (ordinal == 2L) {
+                    // Receipt alone can race the sender's post-send metric
+                    // increments. Wait until sendBinary returned before closing,
+                    // proving this frame completed a send and must be replayed.
+                    awaitSentFrames(2L);
+                    server.setRejectWithRole("REPLICA");
+                    client.sendClose(WebSocketCloseCode.GOING_AWAY, "test reconnect");
+                    disconnect.countDown();
+                } else if (ordinal == 3L) {
+                    replayOnNewConnection.set(client != initialClient);
+                    client.sendBinary(AckHandler.buildAck(0L));
+                    replay.countDown();
+                } else if (ordinal == 4L) {
+                    client.sendBinary(AckHandler.buildAck(1L));
+                    outageQueuedDelivery.countDown();
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        boolean wasReplayOnNewConnection() {
+            return replayOnNewConnection.get();
+        }
+
+        private void awaitSentFrames(long expected) {
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (sender.getTotalFramesSent() < expected) {
+                if (System.nanoTime() > deadlineNanos) {
+                    throw new AssertionError("sent-frame metric did not reach " + expected
+                            + " before disconnect; current=" + sender.getTotalFramesSent());
+                }
+                io.questdb.client.std.Compat.onSpinWait();
             }
         }
     }

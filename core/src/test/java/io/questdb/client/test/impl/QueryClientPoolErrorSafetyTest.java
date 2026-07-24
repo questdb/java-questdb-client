@@ -230,16 +230,31 @@ public class QueryClientPoolErrorSafetyTest {
     // the dispatch thread for up to SHUTDOWN_JOIN_MILLIS; cancelIfCurrent's
     // contract is that this lock is "held only briefly") -- and still reclaim
     // everything: the client's NATIVE_DEFAULT scratch and the creation slot.
-    // RED (teardown dropped in the restructure): the scratch leaks and the
-    //      baseline assertion fails.
-    // GREEN: shutdown() runs after the lock is released -> no leak, accounting
-    //        restored, acquire() surfaces the closed pool.
+    // RED (rendering a throwing before-close hook's failure also throws after
+    //      close ownership is won): QueryWorker suppresses that second failure,
+    //      the pool releases its creation reservation, and the client's native
+    //      scratch remains live.
+    // GREEN: close() suppresses the test-witness failure without rendering it,
+    //        completes production teardown, and only then lets the pool release
+    //        the reservation.
     @Test(timeout = 30_000)
     public void closedMidCreationTearsDownFreshWorkerWithoutLeak() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             CountDownLatch inConnect = new CountDownLatch(1);
             CountDownLatch releaseConnect = new CountDownLatch(1);
+            AtomicInteger closeHookCalls = new AtomicInteger();
+            AtomicReference<QwpQueryClient> createdClient = new AtomicReference<>();
             Consumer<QwpQueryClient> connectHook = client -> {
+                createdClient.set(client);
+                client.setBeforeCloseHookForTest(() -> {
+                    closeHookCalls.incrementAndGet();
+                    throw new AssertionError("injected query close hook failure") {
+                        @Override
+                        public String toString() {
+                            throw new AssertionError("injected throwable rendering failure");
+                        }
+                    };
+                });
                 inConnect.countDown();
                 try {
                     if (!releaseConnect.await(10, TimeUnit.SECONDS)) {
@@ -268,25 +283,35 @@ public class QueryClientPoolErrorSafetyTest {
                 Assert.assertTrue("acquirer never reached connect()",
                         inConnect.await(10, TimeUnit.SECONDS));
 
-                // Close the pool while the worker build is in flight (the fresh
-                // worker never entered `all`, so close()'s snapshot skips it),
-                // then let the build finish: acquire() must observe `closed`,
-                // tear the worker down on its own thread and throw.
-                pool.close();
+                // Close the pool while the worker build is in flight. close()
+                // now waits for the internal creation reservation, so run it
+                // concurrently and wait until it parks on that reservation
+                // before releasing connect().
+                Thread closer = new Thread(pool::close, "mid-creation-pool-closer");
+                closer.start();
+                awaitCreationWaiter(pool);
+
+                // Let the build finish: acquire() must observe `closed`, tear
+                // the worker down on its own thread and throw. close() returns
+                // only after that teardown releases the reservation.
                 releaseConnect.countDown();
                 acquirer.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
                 Assert.assertFalse("acquirer did not finish", acquirer.isAlive());
+                Assert.assertFalse("pool close did not finish", closer.isAlive());
 
                 Assert.assertTrue(
                         "acquire() must surface the closed pool, got: " + acquireOutcome.get(),
                         acquireOutcome.get() instanceof QueryException
                                 && String.valueOf(acquireOutcome.get().getMessage()).contains("closed"));
+                Assert.assertEquals("pool released the creation reservation after teardown",
+                        0, inFlightCreations(pool));
                 long after = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
                 Assert.assertEquals(
-                        "closed-mid-creation acquire() leaked the fresh worker's NATIVE_DEFAULT scratch",
+                        "throwing close hook prevented fresh worker teardown before reservation release",
                         baseline, after);
-                Assert.assertEquals("in-flight creation accounting must be restored",
-                        0, inFlightCreations(pool));
+                createdClient.get().close();
+                Assert.assertEquals("close hook must be one-shot", 1, closeHookCalls.get());
             } finally {
                 pool.close();
             }
@@ -297,6 +322,17 @@ public class QueryClientPoolErrorSafetyTest {
         return client -> {
             throw new AssertionError("injected native connect failure");
         };
+    }
+
+    private static void awaitCreationWaiter(QueryClientPool pool) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            if (pool.hasCreationWaiterForTesting()) {
+                return;
+            }
+            Thread.yield();
+        }
+        Assert.fail("pool close did not wait on the creation reservation");
     }
 
     // connectHook that connects nothing: fromConfig() has already committed the

@@ -230,6 +230,28 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_configureNonBlocking
     return res;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_shutdown
+        (JNIEnv *e, jclass cl, jint fd) {
+    // Unlike POSIX, a Winsock shutdown() does not unblock a recv() that is
+    // already in progress on another thread. Cancel any outstanding I/O on the
+    // handle first so a worker parked in a blocking recv() wakes up. CancelIoEx
+    // does not close the socket, so the descriptor stays allocated and the fd
+    // cannot be reused underneath the worker before close() releases it. A
+    // FALSE return with ERROR_NOT_FOUND (nothing was pending) is expected here
+    // and deliberately ignored.
+    CancelIoEx((HANDLE) (SOCKET) fd, NULL);
+    const int result = shutdown((SOCKET) fd, SD_BOTH);
+    if (result == SOCKET_ERROR) {
+        const int error = WSAGetLastError();
+        if (error == WSAENOTCONN) {
+            return 0;
+        }
+        WSASetLastError(error);
+        SaveLastError();
+    }
+    return result;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_network_Net_recv
         (JNIEnv *e, jclass cl, jint fd, jlong addr, jint len) {
     const int n = recv((SOCKET) fd, (char *) addr, len, 0);

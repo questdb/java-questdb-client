@@ -32,6 +32,8 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -80,6 +82,75 @@ public class SenderPoolErrorSafetyTest {
             Assert.assertTrue(
                     "prewarm leaked an already-built delegate: its close() was never called on an Error",
                     firstClosed.get());
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void elasticBorrowClosesDelegateWhenPostFactoryInitializationFails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AssertionError failure = new AssertionError("injected post-factory failure");
+            AtomicInteger closeCalls = new AtomicInteger();
+            try (SenderPool pool = new SenderPool(
+                    CFG, 0, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE,
+                    slotIndex -> closeCountingSender(closeCalls, null), false,
+                    () -> {
+                        throw failure;
+                    })) {
+                try {
+                    pool.borrow();
+                    Assert.fail("borrow must propagate the post-factory failure");
+                } catch (AssertionError actual) {
+                    Assert.assertSame("borrow must preserve throwable identity", failure, actual);
+                }
+                Assert.assertEquals("failed elastic creation must close its delegate", 1, closeCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void preWarmClosesDelegateWhenPostFactoryInitializationFails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AssertionError failure = new AssertionError("injected post-factory failure");
+            AtomicInteger closeCalls = new AtomicInteger();
+            try {
+                new SenderPool(
+                        CFG, 1, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE,
+                        slotIndex -> closeCountingSender(closeCalls, null), false,
+                        () -> {
+                            throw failure;
+                        });
+                Assert.fail("prewarm must propagate the post-factory failure");
+            } catch (AssertionError actual) {
+                Assert.assertSame("prewarm must preserve throwable identity", failure, actual);
+            }
+            Assert.assertEquals("failed prewarm creation must close its delegate", 1, closeCalls.get());
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void recoveryClosesDelegateWhenPostFactoryInitializationFails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AssertionError failure = new AssertionError("injected post-factory failure");
+            AssertionError closeFailure = new AssertionError("injected close failure");
+            AtomicInteger closeCalls = new AtomicInteger();
+            try (SenderPool pool = new SenderPool(
+                    CFG, 0, 1, 1_000, Long.MAX_VALUE, Long.MAX_VALUE,
+                    slotIndex -> closeCountingSender(closeCalls, closeFailure), false,
+                    () -> {
+                        throw failure;
+                    })) {
+                Method createRecoverer = SenderPool.class.getDeclaredMethod("createRecoverer", int.class);
+                createRecoverer.setAccessible(true);
+                try {
+                    createRecoverer.invoke(pool, -1);
+                    Assert.fail("recovery creation must propagate the post-factory failure");
+                } catch (InvocationTargetException e) {
+                    Assert.assertSame("recovery must preserve throwable identity", failure, e.getCause());
+                    Assert.assertArrayEquals("close failure must remain secondary",
+                            new Throwable[]{closeFailure}, failure.getSuppressed());
+                }
+                Assert.assertEquals("failed recovery creation must close its delegate", 1, closeCalls.get());
+            }
         });
     }
 
@@ -230,6 +301,42 @@ public class SenderPoolErrorSafetyTest {
                 }
             }
         });
+    }
+
+    private static Sender closeCountingSender(AtomicInteger closeCalls, Throwable closeFailure) {
+        return (Sender) Proxy.newProxyInstance(
+                Sender.class.getClassLoader(),
+                new Class[]{Sender.class},
+                (proxy, method, args) -> {
+                    if ("close".equals(method.getName())) {
+                        closeCalls.incrementAndGet();
+                        if (closeFailure != null) {
+                            throw closeFailure;
+                        }
+                        return null;
+                    }
+                    if ("toString".equals(method.getName())) {
+                        return "CloseCountingSender";
+                    }
+                    if ("hashCode".equals(method.getName())) {
+                        return System.identityHashCode(proxy);
+                    }
+                    if ("equals".equals(method.getName())) {
+                        return proxy == args[0];
+                    }
+                    Class<?> rt = method.getReturnType();
+                    if (rt == boolean.class) return false;
+                    if (rt == byte.class) return (byte) 0;
+                    if (rt == short.class) return (short) 0;
+                    if (rt == int.class) return 0;
+                    if (rt == long.class) return 0L;
+                    if (rt == float.class) return 0f;
+                    if (rt == double.class) return 0d;
+                    if (rt == char.class) return (char) 0;
+                    if (rt == void.class) return null;
+                    if (rt.isInstance(proxy)) return proxy;
+                    return null;
+                });
     }
 
     private static Sender fakeSender(AtomicBoolean closedFlag) {

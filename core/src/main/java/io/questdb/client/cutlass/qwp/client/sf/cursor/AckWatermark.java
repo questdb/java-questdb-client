@@ -24,10 +24,13 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.QuietCloseable;
 import io.questdb.client.std.Unsafe;
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,191 +45,267 @@ import org.slf4j.LoggerFactory;
  * "everything &lt;= N is durable"), so a single monotonic watermark suffices;
  * no per-frame bitmap is needed.
  * <p>
- * <b>Layout</b> (16 bytes, little-endian, mmap'd for the engine's lifetime):
+ * <b>Layout</b> (8192 bytes, little-endian, mmap'd for the engine's lifetime):
+ * two independently CRC-protected 64-byte records at offsets 0 and 4096.
+ * Placing each record at the start of a separate 4 KiB slot prevents one
+ * aligned 512-byte or 4 KiB sector tear from damaging both. Each record contains:
  * <pre>
- *   offset 0:  u32 magic = 'AKW1' (set once on first write)
- *   offset 4:  u32 reserved (zero)
- *   offset 8:  i64 fsn
+ *   offset 0:   u32 magic = 'AKW1'
+ *   offset 4:   u32 version = 1
+ *   offset 8:   i64 generation
+ *   offset 16:  i64 fsn
+ *   offset 24:  reserved (zero-filled through offset 59)
+ *   offset 60:  u32 CRC32C of bytes [0, 60)
  * </pre>
+ * {@link #write(long)} rewrites the record not selected by the current
+ * generation and stores its CRC last. Recovery selects the valid record with
+ * the greatest generation. A torn update therefore falls back to the older
+ * valid record; if neither record validates, recovery conservatively uses the
+ * segment-derived seed.
  * <p>
- * <b>Zero-alloc, zero-syscall writes:</b> {@link #open(String)} opens the
- * file and maps the 16 bytes once. {@link #write(long)} is a single
- * 8-byte aligned {@code Unsafe.putLong} into the mapped region. No
- * malloc/free, no read/write syscalls, no rename, on the manager's hot
- * tick path. An 8-byte aligned store is hardware-atomic on x86_64 and
- * arm64, and disk-atomic within one sector (the file is 16 bytes —
- * trivially within one sector), so a torn FSN across a crash boundary
- * is not a concern.
+ * <b>Zero-alloc, store-only ACK writes:</b> {@link #open(String)} maps both
+ * records once. Ordinary ACK-only manager updates mutate the inactive record
+ * in the mapping and require no malloc/free, read/write syscalls, or rename.
  * <p>
- * <b>Why no CRC:</b> the watermark is an optimization. If the on-disk
- * value is somehow corrupted (filesystem bug, hardware fault), the
- * recovery path's {@code max(lowestBase - 1, watermark)} clamp absorbs
- * the inconsistency: a stale-low watermark just means more re-replay, a
- * stale-high watermark is impossible because no write produces an FSN
- * higher than the segments on disk could account for. CRC adds
- * complexity (multi-store with fence + read-side validate) for
- * marginal additional safety.
+ * <b>fsync cadence:</b> ordinary ACK-only manager updates call
+ * {@link #write(long)} and stay syscall-free. Each non-empty background disk-trim
+ * quantum calls {@link #sync()} once (one mmap msync and one fd fsync), fsyncs
+ * the slot directory before unlinking, and fsyncs it again after the batch. A
+ * fully drained close uses the same covering order so the durable watermark
+ * guards any acknowledged segment that a host crash restores.
  * <p>
- * <b>fsync cadence:</b> intentionally NOT performed. Host crash falls
- * back to recovery's {@code lowestBase - 1} seed (same as before this
- * feature, no regression), at the cost of a bounded re-replay window
- * for whatever durable-acks landed since the last successful page
- * cache flush.
- * <p>
- * <b>Lifecycle:</b> single-writer (the {@link SegmentManager} worker
- * thread) after construction. Read once at engine startup (any thread,
- * before the manager observes the entry). Close releases the mapping
- * and fd. Not thread-safe for concurrent writers.
+ * <b>Lifecycle:</b> single-writer (the {@link SegmentManager} worker thread)
+ * after construction. Read once at engine startup (any thread, before the
+ * manager observes the entry). Close releases the mapping and fd. Not
+ * thread-safe for concurrent writers.
  */
 public final class AckWatermark implements QuietCloseable {
 
     /**
-     * Filename of the watermark within the slot directory.
-     * Dot-prefixed so directory enumerators that filter by extension
-     * (segment recovery, OrphanScanner) skip it automatically.
+     * Filename of the watermark within the slot directory. Dot-prefixed so
+     * directory enumerators that filter by extension skip it automatically.
      */
     public static final String FILE_NAME = ".ack-watermark";
-    public static final int FILE_SIZE = 16;
+    public static final int FILE_SIZE = 8 * 1024;
     /**
-     * Sentinel returned by {@link #read()} when the watermark file is
-     * present but has not yet been written to (the magic field is zero
-     * because the OS zero-filled the freshly created file).
+     * Sentinel returned by {@link #read()} when neither watermark record is
+     * valid.
      */
     public static final long INVALID = Long.MIN_VALUE;
     static final int FILE_MAGIC = 0x31574B41; // 'AKW1' little-endian
-    private static final int FSN_OFFSET = 8;
+    private static final int CRC_OFFSET = 60;
+    private static final int FSN_OFFSET = 16;
     private static final Logger LOG = LoggerFactory.getLogger(AckWatermark.class);
     private static final int MAGIC_OFFSET = 0;
+    private static final int RECORD_SIZE = 64;
+    private static final int RECORD_SLOT_SIZE = 4 * 1024;
+    private static final int VERSION = 1;
     private final int fd;
+    private final FilesFacade filesFacade;
     private final long mmapAddress;
     private boolean closed;
-    // Stamped once per process either at open() (if the file already
-    // has the magic from a prior session) or on the first write() that
-    // observes it unset. After the flag flips, write() degenerates to
-    // a single 8-byte putLong against the mapped FSN slot -- no memory
-    // load of magic on the hot path. Manager-thread-only after
-    // construction; no synchronisation needed.
-    private boolean magicWritten;
+    private long fsn;
+    private long generation;
+    private boolean isStorageReleased;
 
-    private AckWatermark(int fd, long mmapAddress, boolean magicAlreadyWritten) {
+    private AckWatermark(FilesFacade filesFacade, int fd, long mmapAddress,
+                         long generation, long fsn) {
         this.fd = fd;
+        this.filesFacade = filesFacade;
+        this.fsn = fsn;
+        this.generation = generation;
         this.mmapAddress = mmapAddress;
-        this.magicWritten = magicAlreadyWritten;
     }
 
     @Override
     public void close() {
         if (closed) return;
         closed = true;
-        if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
-            Files.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
-        }
-        if (fd >= 0) {
-            Files.close(fd);
-        }
+        releaseStorage();
     }
 
     /**
-     * Opens (creating if absent) the watermark file in {@code slotDir}
-     * and maps it for the engine's lifetime. Returns {@code null} on
-     * any setup failure (open fail, mmap fail, unexpected size) — the
-     * caller falls back to the no-watermark behaviour, no exception
-     * escapes. Idempotent at the engine layer: a stale file from a
-     * prior session is reused as-is; the first {@link #write(long)}
-     * stamps the magic and the new FSN atomically.
+     * Opens (creating if absent) the watermark file in {@code slotDir} and
+     * maps it for the engine's lifetime. Returns {@code null} on any setup
+     * failure, leaving the caller to choose whether its durability contract
+     * permits operation without one.
+     * <p>
+     * Wrong-sized files, including the legacy 16-byte non-CRC format, are
+     * reset. Trusting a legacy FSN would retain the torn-write ambiguity this
+     * format removes; resetting it causes conservative replay from the
+     * segment-derived seed instead.
      */
     public static AckWatermark open(String slotDir) {
+        return open(FilesFacade.INSTANCE, slotDir);
+    }
+
+    /**
+     * Facade-aware variant of {@link #open(String)}. Every filesystem call,
+     * including the lifetime mapping, goes through {@code filesFacade} so
+     * tests can observe or fault-inject the watermark mmap.
+     */
+    public static AckWatermark open(FilesFacade filesFacade, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        // Decide by size: existing-and-correct -> openRW preserves the
-        // previous session's watermark (defeating which is the whole
-        // point of NOT calling openCleanRW unconditionally); missing or
-        // wrong-sized -> openCleanRW + allocate creates a fresh
-        // FILE_SIZE-byte file (zero magic, read() reports INVALID until
-        // the first write).
-        long existing = Files.exists(filePath) ? Files.length(filePath) : -1L;
+        long existing = filesFacade.exists(filePath) ? filesFacade.length(filePath) : -1L;
         int fd;
         if (existing == FILE_SIZE) {
-            fd = Files.openRW(filePath);
+            fd = filesFacade.openRW(filePath);
         } else {
-            fd = Files.openCleanRW(filePath);
-            if (fd >= 0 && !Files.allocate(fd, FILE_SIZE)) {
-                // FilesFacade.allocate contract on a false return:
-                // close the fd AND unlink the partial file.
-                Files.close(fd);
-                Files.remove(filePath);
+            fd = filesFacade.openCleanRW(filePath);
+            if (fd >= 0 && !filesFacade.allocate(fd, FILE_SIZE)) {
+                // FilesFacade.allocate contract on a false return: close the
+                // fd and unlink the partial file.
+                filesFacade.close(fd);
+                filesFacade.remove(filePath);
                 fd = -1;
             }
         }
         if (fd < 0) {
-            LOG.warn("ack watermark {} could not be opened (rc={}); proceeding without it",
-                    filePath, fd);
+            LOG.warn("ack watermark {} could not be opened (rc={})", filePath, fd);
             return null;
         }
-        long addr = Files.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
+        long addr = filesFacade.mmap(fd, FILE_SIZE, 0, Files.MAP_RW, MemoryTag.MMAP_DEFAULT);
         if (addr == Files.FAILED_MMAP_ADDRESS) {
-            LOG.warn("ack watermark {} could not be mmapped; proceeding without it", filePath);
-            Files.close(fd);
+            LOG.warn("ack watermark {} could not be mmapped", filePath);
+            filesFacade.close(fd);
             return null;
         }
-        // Inspect the existing magic once at open time. If it's already
-        // set (cross-session reopen, e.g. recovery after a clean
-        // shutdown), the first write() can skip the magic store
-        // entirely and degenerate to a single 8-byte FSN put.
-        int magic = Unsafe.getUnsafe().getInt(addr + MAGIC_OFFSET);
-        return new AckWatermark(fd, addr, magic == FILE_MAGIC);
+        Record selected = selectRecord(addr);
+        return selected == null
+                ? new AckWatermark(filesFacade, fd, addr, 0L, INVALID)
+                : new AckWatermark(filesFacade, fd, addr, selected.generation, selected.fsn);
     }
 
     /**
-     * Best-effort removal of a stale watermark file. Used by the
-     * engine startup path when no segments are recovered — a stale
-     * watermark file with no segments behind it is meaningless and
-     * would only confuse the next session's seed.
+     * Releases the native storage while deliberately leaving the logical
+     * closed flag clear. Test-only: recreates a stale racing writer without
+     * reflective access to descriptor and mapping internals.
+     */
+    @TestOnly
+    public boolean releaseStorageButKeepWritableForTesting() {
+        return releaseStorage();
+    }
+
+    /**
+     * Best-effort removal of a stale watermark file. Used by the engine
+     * startup path when no segments are recovered.
      */
     public static void removeOrphan(String slotDir) {
-        Files.remove(slotDir + "/" + FILE_NAME);
+        removeOrphan(FilesFacade.INSTANCE, slotDir);
+    }
+
+    static boolean removeOrphan(FilesFacade filesFacade, String slotDir) {
+        return filesFacade.remove(slotDir + "/" + FILE_NAME);
     }
 
     /**
-     * Single-load read of the current FSN. Returns {@link #INVALID} if
-     * the file has never been written (magic field is zero, i.e. the
-     * file was freshly created by {@link #open(String)} and no
-     * {@link #write(long)} has run yet against this slot).
+     * Returns the FSN from the greatest-generation valid record, or
+     * {@link #INVALID} when neither record validates.
      */
     public long read() {
         if (closed) return INVALID;
-        int magic = Unsafe.getUnsafe().getInt(mmapAddress + MAGIC_OFFSET);
-        if (magic != FILE_MAGIC) {
-            // Either freshly created (all zeros) or some kind of corruption.
-            // Either way, fall back to the segment-derived seed.
-            return INVALID;
+        Record selected = selectRecord(mmapAddress);
+        if (selected == null) {
+            fsn = INVALID;
+            generation = 0L;
+        } else {
+            fsn = selected.fsn;
+            generation = selected.generation;
         }
-        return Unsafe.getUnsafe().getLong(mmapAddress + FSN_OFFSET);
+        return fsn;
     }
 
     /**
-     * Atomically updates the persisted FSN. Single 8-byte aligned
-     * store to the mapped region. The first write also stamps the
-     * magic so the next session's {@link #read()} can distinguish
-     * "valid watermark" from "freshly created file".
+     * Flushes the mapped bytes and then the backing fd. The caller must sync
+     * the slot directory after this succeeds so a newly-created watermark's
+     * directory entry is durable before segment deletion begins.
+     */
+    public void sync() {
+        if (closed) {
+            throw new IllegalStateException("ack watermark is closed");
+        }
+        if (filesFacade.msync(mmapAddress, FILE_SIZE, false) != 0) {
+            throw new IllegalStateException("could not msync ack watermark");
+        }
+        if (filesFacade.fsync(fd) != 0) {
+            throw new IllegalStateException("could not fsync ack watermark");
+        }
+    }
+
+    /**
+     * Updates the inactive record and selects it in memory only after its CRC
+     * has been stored. The next {@link #sync()} makes the complete update
+     * durable before any covered segment is deleted.
      * <p>
-     * Caller responsibility: monotonic ordering. The manager's tick
-     * loop should only call this when {@code fsn} has advanced past
-     * the last write.
+     * Caller responsibility: monotonic ordering. The manager's tick loop only
+     * calls this when {@code fsn} has advanced past the last write.
      */
     public void write(long fsn) {
         if (closed) return;
-        // Steady-state hot path: a single 8-byte aligned putLong, no
-        // memory load of the magic. Order matters only on the very
-        // first write of a fresh file: FSN first so the next reader
-        // that observes the magic (set immediately below) also
-        // observes a valid FSN -- no fence needed because the same
-        // thread reads both in program order, and crash recovery
-        // resumes a fresh process that sees whatever disk-level state
-        // the kernel flushed.
-        Unsafe.getUnsafe().putLong(mmapAddress + FSN_OFFSET, fsn);
-        if (!magicWritten) {
-            Unsafe.getUnsafe().putInt(mmapAddress + MAGIC_OFFSET, FILE_MAGIC);
-            magicWritten = true;
+        long nextGeneration = generation + 1L;
+        long recordAddress = mmapAddress + (nextGeneration & 1L) * RECORD_SLOT_SIZE;
+        Unsafe.getUnsafe().setMemory(recordAddress, RECORD_SIZE, (byte) 0);
+        Unsafe.getUnsafe().putInt(recordAddress + MAGIC_OFFSET, FILE_MAGIC);
+        Unsafe.getUnsafe().putInt(recordAddress + 4, VERSION);
+        Unsafe.getUnsafe().putLong(recordAddress + 8, nextGeneration);
+        Unsafe.getUnsafe().putLong(recordAddress + FSN_OFFSET, fsn);
+        int crc = Crc32c.update(Crc32c.INIT, recordAddress, CRC_OFFSET);
+        Unsafe.getUnsafe().putInt(recordAddress + CRC_OFFSET, crc);
+        generation = nextGeneration;
+        this.fsn = fsn;
+    }
+
+    private boolean releaseStorage() {
+        if (isStorageReleased) {
+            return false;
+        }
+        isStorageReleased = true;
+        if (mmapAddress != 0L && mmapAddress != Files.FAILED_MMAP_ADDRESS) {
+            filesFacade.munmap(mmapAddress, FILE_SIZE, MemoryTag.MMAP_DEFAULT);
+        }
+        if (fd >= 0) {
+            filesFacade.close(fd);
+        }
+        return true;
+    }
+
+    private static Record readRecord(long address) {
+        if (Unsafe.getUnsafe().getInt(address + MAGIC_OFFSET) != FILE_MAGIC
+                || Unsafe.getUnsafe().getInt(address + 4) != VERSION) {
+            return null;
+        }
+        int expectedCrc = Unsafe.getUnsafe().getInt(address + CRC_OFFSET);
+        int actualCrc = Crc32c.update(Crc32c.INIT, address, CRC_OFFSET);
+        if (expectedCrc != actualCrc) {
+            return null;
+        }
+        long generation = Unsafe.getUnsafe().getLong(address + 8);
+        long fsn = Unsafe.getUnsafe().getLong(address + FSN_OFFSET);
+        if (generation <= 0 || fsn < -1L) {
+            return null;
+        }
+        return new Record(generation, fsn);
+    }
+
+    private static Record selectRecord(long address) {
+        Record first = readRecord(address);
+        Record second = readRecord(address + RECORD_SLOT_SIZE);
+        if (first == null) {
+            return second;
+        }
+        if (second == null || first.generation > second.generation) {
+            return first;
+        }
+        return second;
+    }
+
+    private static final class Record {
+        private final long fsn;
+        private final long generation;
+
+        private Record(long generation, long fsn) {
+            this.fsn = fsn;
+            this.generation = generation;
         }
     }
 }

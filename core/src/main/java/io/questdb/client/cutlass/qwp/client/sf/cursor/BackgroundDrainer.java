@@ -56,12 +56,15 @@ import java.util.concurrent.locks.LockSupport;
  * </ol>
  * <p>
  * On terminal failure (auth-rejection on reconnect, a cluster-wide durable-ack
- * capability gap that exhausts its settle budget, recovery error), the drainer
- * drops a {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot
- * before exiting. Future scans skip the slot until an operator clears the
- * sentinel — bounded automatic retry, then human-in-the-loop. A transient
- * all-replica failover window is NOT terminal: it is retried indefinitely
- * (Invariant B), never quarantined on a wall-clock budget or attempt cap.
+ * capability gap that exhausts its settle budget, corrupt or incomplete durable
+ * recovery state), the drainer drops a
+ * {@link OrphanScanner#FAILED_SENTINEL_NAME} sentinel into the slot before
+ * exiting. Future scans skip the slot until an operator clears the sentinel —
+ * bounded automatic retry, then human-in-the-loop. Operational setup failures
+ * leave no sentinel so a later orphan scan can retry. JVM/programming Errors
+ * also leave no sentinel and propagate after teardown. A transient all-replica
+ * failover window is NOT terminal: it is retried indefinitely (Invariant B),
+ * never quarantined on a wall-clock budget or attempt cap.
  */
 public final class BackgroundDrainer implements Runnable {
 
@@ -106,9 +109,15 @@ public final class BackgroundDrainer implements Runnable {
     private final long segmentSizeBytes;
     private final long sfMaxTotalBytes;
     private final String slotPath;
+    private final long syncIntervalNanos;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
-    private CursorSendEngine engineForTesting;
+    /**
+     * Engine constructed by {@link #run()}, captured for test observation
+     * only (e.g. asserting the inherited periodic sync interval). May
+     * reference an already-closed engine once the drain ends.
+     */
+    private volatile CursorSendEngine engineForTesting;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -172,9 +181,35 @@ public final class BackgroundDrainer implements Runnable {
             int maxHeadFrameRejections,
             long poisonMinEscalationWindowMillis
     ) {
+        this(slotPath, segmentSizeBytes, sfMaxTotalBytes, 0L, clientFactory,
+                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
+                reconnectMaxBackoffMillis, requestDurableAck,
+                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
+                poisonMinEscalationWindowMillis);
+    }
+
+    /**
+     * Master constructor with the periodic SF checkpoint interval inherited
+     * from the sender that adopted the orphan slot.
+     */
+    public BackgroundDrainer(
+            String slotPath,
+            long segmentSizeBytes,
+            long sfMaxTotalBytes,
+            long syncIntervalNanos,
+            CursorWebSocketSendLoop.ReconnectFactory clientFactory,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            boolean requestDurableAck,
+            long durableAckKeepaliveIntervalMillis,
+            int maxHeadFrameRejections,
+            long poisonMinEscalationWindowMillis
+    ) {
         this.slotPath = slotPath;
         this.segmentSizeBytes = segmentSizeBytes;
         this.sfMaxTotalBytes = sfMaxTotalBytes;
+        this.syncIntervalNanos = syncIntervalNanos;
         this.clientFactory = clientFactory;
         this.reconnectMaxDurationMillis = reconnectMaxDurationMillis;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -380,9 +415,9 @@ public final class BackgroundDrainer implements Runnable {
                     // retrying cannot clear it, and spinning here would pin
                     // the slot .lock forever with no .failed sentinel and only
                     // a throttled, possibly-null-message WARN as a trace.
-                    // Rethrow: run()'s outer catch quarantines the slot
-                    // (markFailed + FAILED) and its finally releases the lock
-                    // -- quarantine-and-exit, exactly as genuine terminals do.
+                    // Rethrow: run() records the failure without attempting
+                    // allocation-heavy logging or a .failed write, its finally
+                    // releases the lock, and then the Error remains visible.
                     throw (Error) t;
                 }
                 // INVARIANT B: a transport failure -- the whole cluster is
@@ -489,6 +524,25 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * Engine this drainer constructed, or {@code null} until {@link #run()}
+     * gets past engine construction. The reference outlives the drain, so
+     * tests can read construction-time state (it may be closed by then).
+     */
+    @TestOnly
+    public CursorSendEngine getEngineForTesting() {
+        return engineForTesting;
+    }
+
+    /**
+     * Periodic SF checkpoint interval this drainer inherited from the
+     * adopting sender at construction time.
+     */
+    @TestOnly
+    public long getSyncIntervalNanosForTesting() {
+        return syncIntervalNanos;
+    }
+
+    /**
      * Stop check for the runner thread's park loops that also folds a
      * pending thread interrupt into the stop protocol. The pool delivers
      * cancellation as an interrupt ({@code shutdownNow}) and pairs it with a
@@ -531,20 +585,62 @@ public final class BackgroundDrainer implements Runnable {
             // holds it, the engine constructor throws and we exit silently
             // (no .failed sentinel — contention is expected, not an error).
             try {
-                engine = engineForTesting != null
-                        ? engineForTesting
-                        : new CursorSendEngine(slotPath, segmentSizeBytes,
-                                sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
-            } catch (IllegalStateException t) {
-                String msg = t.getMessage();
-                if (msg != null && msg.contains("already in use")) {
-                    LOG.info("orphan slot already locked, skipping: {} ({})",
-                            slotPath, msg);
-                    outcome = DrainOutcome.LOCKED_BY_OTHER;
-                    return;
+                try {
+                    engine = new CursorSendEngine(slotPath, segmentSizeBytes,
+                            sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                            syncIntervalNanos);
+                } catch (SfSanitizedResidueException first) {
+                    // First sight of proven-dead sealed residue: recovery
+                    // durably zeroed it BEFORE failing closed, so the chain
+                    // on disk is already healed and a .failed sentinel here
+                    // would strand a replayable backlog no scan revisits
+                    // (the sentinel gates isCandidateOrphan and nothing in
+                    // production clears it). Retry once over the healed
+                    // chain; the WARN keeps the incident surfaced. Any
+                    // failure of the retry is genuine and takes the normal
+                    // classification below -- including a repeat of this
+                    // type, which the SfRecoveryException arm then treats
+                    // as the terminal quarantine a non-sticking heal is.
+                    LOG.warn("drainer slot {}: sealed SF residue sanitized during recovery ({}); "
+                                    + "retrying engine construction over the healed chain",
+                            slotPath, first.getMessage());
+                    engine = new CursorSendEngine(slotPath, segmentSizeBytes,
+                            sfMaxTotalBytes, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                            syncIntervalNanos);
                 }
+            } catch (SlotLockContentionException t) {
+                LOG.info("orphan slot already locked, skipping: {} ({})",
+                        slotPath, t.getMessage());
+                outcome = DrainOutcome.LOCKED_BY_OTHER;
+                return;
+            } catch (SfRecoveryException | MmapSegmentCorruptionException t) {
+                // The durable chain itself is proven corrupt or incomplete.
+                // Repeated scans cannot repair it, so preserve the terminal
+                // quarantine path in the outer catch below.
                 throw t;
+            } catch (Exception t) {
+                // Every other pre-publication construction exception is
+                // retryable: setup I/O, resource pressure, unexpected setup
+                // faults, and future operational failures do not prove durable
+                // data corruption. The constructor has closed partial
+                // resources; SlotLock retains and retries any unconfirmed
+                // unlock. Leave no .failed sentinel for the next orphan scan.
+                // Error deliberately escapes to the outer Error path: it is
+                // observable after teardown but cannot quarantine intact data.
+                // This path retries on every orphan scan, so the log line is
+                // the ONLY diagnostic a deterministic bug (e.g. an unexpected
+                // NPE, whose getMessage() is null) ever produces: attach the
+                // throwable for the stack trace and carry class+message into
+                // the telemetry surface, mirroring the outer setup-failure
+                // catch below.
+                String msg = t.toString();
+                LOG.warn("drainer setup temporarily unavailable for slot {}: {}",
+                        slotPath, msg, t);
+                lastErrorMessage = msg;
+                outcome = DrainOutcome.FAILED;
+                return;
             }
+            engineForTesting = engine;
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
                 LOG.info("orphan slot already drained: {} (acked={} target={})",
@@ -593,6 +689,16 @@ public final class BackgroundDrainer implements Runnable {
                     try {
                         loop.checkError();
                     } catch (Throwable t) {
+                        // The I/O loop latches a JVM/programming Error inside a
+                        // LineSenderException so checkError() can cross the
+                        // thread boundary. Preserve the original Error contract:
+                        // no wire quarantine, tear down, then propagate it.
+                        if (t instanceof Error) {
+                            throw (Error) t;
+                        }
+                        if (t.getCause() instanceof Error) {
+                            throw (Error) t.getCause();
+                        }
                         if (loop.capabilityGapTerminal() != null) {
                             // Capability gap mid-drain: recycle the wire, NOT
                             // the slot. connectWithDurableAckRetry() owns the
@@ -648,6 +754,18 @@ public final class BackgroundDrainer implements Runnable {
                 // outer condition, which is false for the same reason.
             }
             outcome = DrainOutcome.STOPPED;
+        } catch (Error t) {
+            // Resource pressure and JVM/programming failures prove neither
+            // durable corruption nor a terminal server response. Log the Error
+            // best-effort, but never let a secondary logging failure (especially
+            // under OOME) mask the original Error or prevent teardown.
+            try {
+                LOG.error("drainer failed with Error for slot {}", slotPath, t);
+            } catch (Throwable ignored) {
+            }
+            lastErrorMessage = t.getMessage();
+            outcome = DrainOutcome.FAILED;
+            throw t;
         } catch (Throwable t) {
             String msg = t.getMessage();
             if (slotPath != null) {
@@ -707,15 +825,10 @@ public final class BackgroundDrainer implements Runnable {
                 // between the failed close() and now: then it is safe (and
                 // necessary) to close the engine here.
                 if (ioThreadStopped || !loop.delegateEngineClose()) {
-                    // Make one bounded attempt. If manager quiescence times
-                    // out, transfer ownership so this pool task can terminate.
                     try {
+                        // engine.close() releases the slot lock too.
                         engine.close();
                     } catch (Throwable ignored) {
-                        // The deferred owner retries below when needed.
-                    }
-                    if (!engine.isCloseCompleted()) {
-                        engine.closeEventually();
                     }
                 } else {
                     LOG.warn("drainer slot {}: engine close delegated to the I/O thread; "
@@ -726,15 +839,6 @@ public final class BackgroundDrainer implements Runnable {
             // the pool's executor may have scheduled onto this same thread.
             runnerThread = null;
         }
-    }
-
-    /**
-     * Replaces the engine created by {@link #run()} so tests can drive the
-     * production teardown path with a controlled manager.
-     */
-    @TestOnly
-    public void setEngineForTesting(CursorSendEngine engineForTesting) {
-        this.engineForTesting = engineForTesting;
     }
 
     /**

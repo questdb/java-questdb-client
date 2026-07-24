@@ -35,7 +35,6 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -43,7 +42,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -186,11 +184,8 @@ public class SegmentManagerTrimDeregisterRaceTest {
                                     + "`totalBytes -= sz` on a stillRegistered re-check "
                                     + "under the same lock that covers deregister.",
                             0L, observed);
-                    assertFalse("stale SegmentManager snapshot skipped drainTrimmable() "
-                                    + "after deregister and left a fully-acked sealed "
-                                    + "segment on disk. The registration guard should "
-                                    + "protect watermark/accounting only; trim ownership "
-                                    + "transfer must still close and unlink " + activePath,
+                    assertTrue("deregister before the durable barrier must preserve the segment "
+                                    + "for owner-side quiescent cleanup " + activePath,
                             Files.exists(activePath));
                 } finally {
                     mgr.setBeforeTrimSyncHook(null);
@@ -227,15 +222,8 @@ public class SegmentManagerTrimDeregisterRaceTest {
         }
     }
 
-    private static long readTotalBytes(SegmentManager mgr) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("totalBytes");
-        f.setAccessible(true);
-        Field lockF = SegmentManager.class.getDeclaredField("lock");
-        lockF.setAccessible(true);
-        Object lock = lockF.get(mgr);
-        synchronized (lock) {
-            return f.getLong(mgr);
-        }
+    private static long readTotalBytes(SegmentManager mgr) {
+        return mgr.getTotalBytesForTesting();
     }
 
     private static void rmDirRecursive(String dir) {
@@ -260,9 +248,7 @@ public class SegmentManagerTrimDeregisterRaceTest {
         Files.remove(dir);
     }
 
-    private static Thread workerThread(SegmentManager mgr) throws Exception {
-        Field f = SegmentManager.class.getDeclaredField("workerThread");
-        f.setAccessible(true);
-        return (Thread) f.get(mgr);
+    private static Thread workerThread(SegmentManager mgr) {
+        return mgr.getWorkerThreadForTesting();
     }
 }

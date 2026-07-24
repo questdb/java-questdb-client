@@ -249,6 +249,15 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Shuts down socket traffic without releasing the descriptor or freeing
+     * buffers that a concurrent I/O worker may still access. The owner must
+     * call {@link #close()} after joining the worker to complete cleanup.
+     */
+    public void closeTraffic() {
+        socket.closeTraffic();
+    }
+
+    /**
      * Connects to a WebSocket server.
      *
      * @param host the server hostname
