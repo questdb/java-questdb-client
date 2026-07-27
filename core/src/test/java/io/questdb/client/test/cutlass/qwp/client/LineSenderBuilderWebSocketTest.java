@@ -649,16 +649,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     public void testStoreAndForwardMaxSegmentBytesRejectsNonPositiveValues() {
         long[] rejected = {0L, -1L};
         for (long value : rejected) {
-            try {
-                Sender.builder(Sender.Transport.WEBSOCKET)
-                        .storeAndForwardMaxSegmentBytes(value);
-                Assert.fail("expected storeAndForwardMaxSegmentBytes(" + value + ") to fail");
-            } catch (LineSenderException expected) {
-                Assert.assertEquals(
-                        "sf_max_segment_bytes must be positive: " + value,
-                        expected.getMessage()
-                );
-            }
+            assertThrows("sf_max_segment_bytes must be positive: " + value,
+                    () -> Sender.builder(Sender.Transport.WEBSOCKET).storeAndForwardMaxSegmentBytes(value));
         }
     }
 
@@ -670,15 +662,8 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 Sender.Transport.UDP
         };
         for (Sender.Transport transport : rejected) {
-            try {
-                Sender.builder(transport).storeAndForwardMaxSegmentBytes(64 * 1024L);
-                Assert.fail("expected " + transport + " to reject storeAndForwardMaxSegmentBytes");
-            } catch (LineSenderException expected) {
-                Assert.assertEquals(
-                        "store_and_forward is only supported for WebSocket transport",
-                        expected.getMessage()
-                );
-            }
+            assertThrows("store_and_forward is only supported for WebSocket transport",
+                    () -> Sender.builder(transport).storeAndForwardMaxSegmentBytes(64 * 1024L));
         }
     }
 
