@@ -2775,14 +2775,14 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * (4 MiB). Smaller segments mean faster trim of acked data; larger
          * segments mean fewer rotations.
          */
-        public LineSenderBuilder storeAndForwardMaxSegmentBytes(long maxBytes) {
+        public LineSenderBuilder storeAndForwardMaxSegmentBytes(long maxSegmentBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
             }
-            if (maxBytes <= 0) {
-                throw new LineSenderException("sf_max_segment_bytes must be positive: ").put(maxBytes);
+            if (maxSegmentBytes <= 0) {
+                throw new LineSenderException("sf_max_segment_bytes must be positive: ").put(maxSegmentBytes);
             }
-            this.sfMaxSegmentBytes = maxBytes;
+            this.sfMaxSegmentBytes = maxSegmentBytes;
             return this;
         }
 
