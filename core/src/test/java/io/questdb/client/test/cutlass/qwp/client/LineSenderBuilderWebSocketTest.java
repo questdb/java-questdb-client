@@ -858,6 +858,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWsConfigString_withSfMaxBytes_fails() {
+        // sf_max_bytes is the spelling this key carries in the 1.2.1-1.3.5 jars.
+        // sf_max_segment_bytes replaces it with no alias, so the old spelling
+        // rejects as an unknown key rather than silently configuring nothing.
+        assertBadConfig("ws::addr=localhost:9000;sf_max_bytes=4096;",
+                "unknown configuration key: sf_max_bytes");
+    }
+
+    @Test
     public void testWsConfigString_withEgressOnlyKeysSilentlyAccepted() {
         // connect-string.md "Query client keys" and "Multi-host failover": these
         // keys configure the QwpQueryClient (egress) only. A ws:: / wss:: connect
