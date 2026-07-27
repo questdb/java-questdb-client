@@ -38,7 +38,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 /**
  * Tests for WebSocket transport support in the Sender.builder() API.
  * These tests verify the builder configuration and validation,
- * not actual WebSocket connectivity (which requires a running server).
+ * not actual WebSocket connectivity (that requires a running server).
  */
 public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
