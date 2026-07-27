@@ -219,7 +219,7 @@ public final class MmapSegment implements QuietCloseable {
         // the JVM).
         if (!ff.allocate(fd, sizeBytes)) {
             ff.close(fd);
-            // Unlink the partially-created file so a sf_max_bytes-sized
+            // Unlink the partially-created file so a sf_max_segment_bytes-sized
             // empty file does not survive the failure. Under sustained
             // disk-full pressure with the manager polling, hundreds would
             // otherwise accumulate.

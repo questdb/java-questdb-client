@@ -1128,7 +1128,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Durability contract for SF append/flush. FLUSH and APPEND remain
         // deferred follow-ups; PERIODIC uses the segment manager.
         private SfDurability sfDurability = SfDurability.MEMORY;
-        private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private long sfMaxSegmentBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfSyncIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
@@ -1452,9 +1452,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // (same lock-free architecture, no disk involvement).
                 // Durability-combination validation lives in validateParameters
                 // so build() and no-connect validation apply the same rules.
-                long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
+                long actualSfMaxSegmentBytes = sfMaxSegmentBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_SEGMENT_BYTES
-                        : sfMaxBytes;
+                        : sfMaxSegmentBytes;
                 // Default cap depends on backing: RAM (memory mode) is tight
                 // by default; disk (SF mode) is cheap so the default is
                 // generous enough that normal traffic never hits it.
@@ -1462,7 +1462,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_MAX_BYTES_MEMORY
                         : DEFAULT_MAX_BYTES_SF;
                 long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
-                        ? Math.max(defaultMaxTotal, actualSfMaxBytes * 2)
+                        ? Math.max(defaultMaxTotal, actualSfMaxSegmentBytes * 2)
                         : sfMaxTotalBytes;
                 long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
                         ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
@@ -1556,7 +1556,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_SF_SYNC_INTERVAL_MILLIS : sfSyncIntervalMillis) * 1_000_000L
                         : 0L;
                 CursorSendEngine cursorEngine = new CursorSendEngine(
-                        slotPath, actualSfMaxBytes,
+                        slotPath, actualSfMaxSegmentBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
                         actualSfSyncIntervalNanos);
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
@@ -1638,7 +1638,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             connected.startOrphanDrainers(
                                     orphans,
                                     maxBackgroundDrainers,
-                                    actualSfMaxBytes,
+                                    actualSfMaxSegmentBytes,
                                     actualSfMaxTotalBytes,
                                     actualSfSyncIntervalNanos);
                         }
@@ -2770,19 +2770,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Maximum bytes per segment file before rotation. Defaults to
-         * {@code DEFAULT_SEGMENT_BYTES}
-         * (4 MiB). Smaller segments mean faster trim of acked data; larger
-         * segments mean fewer rotations.
+         * Maximum bytes per segment file before rotation, the builder form of
+         * the {@code sf_max_segment_bytes} connect-string key. Smaller segments
+         * mean faster trim of acked data; larger segments mean fewer rotations.
+         * Default: {@code 4 MiB}. WebSocket transport only.
+         *
+         * @param maxSegmentBytes per-segment cap in bytes; must be positive
          */
-        public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
+        public LineSenderBuilder storeAndForwardMaxSegmentBytes(long maxSegmentBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
             }
-            if (maxBytes <= 0) {
-                throw new LineSenderException("sf_max_bytes must be positive: ").put(maxBytes);
+            if (maxSegmentBytes <= 0) {
+                throw new LineSenderException("sf_max_segment_bytes must be positive: ").put(maxSegmentBytes);
             }
-            this.sfMaxBytes = maxBytes;
+            this.sfMaxSegmentBytes = maxSegmentBytes;
             return this;
         }
 
@@ -3387,12 +3389,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sender_id");
                     senderId(sink.toString());
-                } else if (Chars.equals("sf_max_bytes", sink)) {
+                } else if (Chars.equals("sf_max_segment_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
+                        throw new LineSenderException("sf_max_segment_bytes is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "sf_max_bytes");
-                    storeAndForwardMaxBytes(parseSizeValue(sink, "sf_max_bytes"));
+                    pos = getValue(configurationString, pos, sink, "sf_max_segment_bytes");
+                    storeAndForwardMaxSegmentBytes(parseSizeValue(sink, "sf_max_segment_bytes"));
                 } else if (Chars.equals("sf_max_total_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_max_total_bytes is only supported for WebSocket transport");
@@ -3730,8 +3732,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
-                if (view.has("sf_max_bytes")) {
-                    storeAndForwardMaxBytes(wsSize(view, v, "sf_max_bytes"));
+                if (view.has("sf_max_segment_bytes")) {
+                    storeAndForwardMaxSegmentBytes(wsSize(view, v, "sf_max_segment_bytes"));
                 }
                 if (view.has("sf_max_total_bytes")) {
                     storeAndForwardMaxTotalBytes(wsSize(view, v, "sf_max_total_bytes"));
@@ -3892,7 +3894,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("request_durable_ack", requestDurableAck);
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
-            m.put("sf_max_bytes", sfMaxBytes);
+            m.put("sf_max_segment_bytes", sfMaxSegmentBytes);
             m.put("sf_max_total_bytes", sfMaxTotalBytes);
             m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
             m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);

@@ -1004,7 +1004,7 @@ public class SegmentRingTest {
 
     /**
      * Open-time sort regression: at the documented {@code sf_max_total_bytes
-     * / sf_max_bytes} ceiling (~16K segments), an O(N²) sort over the
+     * / sf_max_segment_bytes} ceiling (~16K segments), an O(N²) sort over the
      * recovered segments delays the I/O thread. This test guards the sort
      * with a deterministic comparison count.
      * <p>
