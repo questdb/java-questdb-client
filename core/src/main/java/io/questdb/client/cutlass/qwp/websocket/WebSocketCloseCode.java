@@ -85,16 +85,6 @@ public final class WebSocketCloseCode {
      */
     public static final int RESERVED = 1004;
     /**
-     * Role-change close (4001). QWP application-defined code in the RFC 6455
-     * Section 7.4.2 private-use range: the server closed because its role
-     * changed (primary demoted); reconnect-eligible, not a verdict on the
-     * bytes. Deliberately distinct from {@link #NORMAL_CLOSURE} so the
-     * client's verbatim CLOSE echo proves to the server that the client
-     * received the server's CLOSE (and, by TCP ordering, everything before
-     * it -- the final durable ack included).
-     */
-    public static final int ROLE_CHANGE = 4001;
-    /**
      * TLS handshake (1015).
      * Reserved value. MUST NOT be sent in a Close frame.
      * Used to indicate that the connection was closed due to TLS handshake failure.
@@ -144,8 +134,6 @@ public final class WebSocketCloseCode {
                 return "Internal Error";
             case TLS_HANDSHAKE:
                 return "TLS Handshake";
-            case ROLE_CHANGE:
-                return "Role Change (QWP)";
             default:
                 if (code >= 3000 && code < 4000) {
                     return "Library/Framework Code (" + code + ")";
