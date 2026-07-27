@@ -2770,10 +2770,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Maximum bytes per segment file before rotation. Defaults to
-         * {@code DEFAULT_SEGMENT_BYTES}
-         * (4 MiB). Smaller segments mean faster trim of acked data; larger
-         * segments mean fewer rotations.
+         * Maximum bytes per segment file before rotation, the builder form of
+         * the {@code sf_max_segment_bytes} connect-string key. Smaller segments
+         * mean faster trim of acked data; larger segments mean fewer rotations.
+         * Default: {@code 4 MiB}. WebSocket transport only.
+         *
+         * @param maxSegmentBytes per-segment cap in bytes; must be positive
          */
         public LineSenderBuilder storeAndForwardMaxSegmentBytes(long maxSegmentBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
