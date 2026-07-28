@@ -1848,8 +1848,7 @@ public class SenderPoolSfTest {
                 String name = Files.utf8ToString(Files.findName(find));
                 rc = Files.findNext(find);
                 if (name != null
-                        && name.endsWith(".sfa")
-                        && !name.startsWith(".qwp-v2-guard-")) {
+                        && name.endsWith(".sfa")) {
                     return true;
                 }
             }

@@ -118,26 +118,23 @@ public class MmapSegmentTest {
     }
 
     @Test
-    public void testCurrentReaderStillOpensLegacyV1Segment() throws Exception {
+    public void testSegmentWithAnUnknownVersionIsRefused() throws Exception {
+        // The version byte survives the barrier removal precisely so a real future
+        // format change can be refused rather than misread. Task 14 relies on it.
         TestUtils.assertMemoryLeak(() -> {
-            String path = tmpDir + "/seg-v1.sfa";
-            long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
+            String path = tmpDir + "/seg-bad-version.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096)) {
+                assertEquals(7L, seg.baseSeq());
+            }
+            try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
+                file.seek(4L);
+                file.writeByte(MmapSegment.VERSION + 1);
+            }
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 7L, 4096)) {
-                    assertEquals(MmapSegment.VERSION, seg.version());
-                    assertTrue(seg.tryAppend(buf, 8) >= 0L);
-                }
-                try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
-                    file.seek(4L);
-                    file.writeByte(MmapSegment.LEGACY_VERSION);
-                }
-                try (MmapSegment legacy = MmapSegment.openExisting(path)) {
-                    assertEquals(MmapSegment.LEGACY_VERSION, legacy.version());
-                    assertEquals(7L, legacy.baseSeq());
-                    assertEquals(1L, legacy.frameCount());
-                }
-            } finally {
-                Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
+                MmapSegment.openExisting(path).close();
+                fail("openExisting should reject an unknown version");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("unsupported version"));
             }
         });
     }

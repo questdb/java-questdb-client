@@ -358,17 +358,7 @@ public final class OrphanScanner {
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
                 rc = Files.findNext(find);
-                // The legacy-reader barriers are named .sfa on purpose (a rolled-back v1
-                // reader must not skip them), but they are a barrier, not data. Counting
-                // them here would call a slot that never held a byte an orphan with
-                // unacked data: CursorSendEngine plants them FIRST, before recovery or
-                // any segment is created, and its cleanup does not unlink them, so a
-                // construction that fails afterwards (ENOSPC on the initial segment)
-                // leaves a directory holding nothing else. A drainer would then adopt it,
-                // fail its own build under the same disk pressure, and quarantine an
-                // empty slot with a permanent .failed sentinel plus an ERROR for an
-                // operator to chase.
-                if (name != null && name.endsWith(".sfa") && !SegmentRing.isLegacyReaderGuard(name)) {
+                if (name != null && name.endsWith(".sfa")) {
                     return true;
                 }
             }

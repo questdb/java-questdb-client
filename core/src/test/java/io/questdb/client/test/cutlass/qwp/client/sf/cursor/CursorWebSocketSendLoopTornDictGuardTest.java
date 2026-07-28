@@ -121,8 +121,7 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
         int n = 0;
         if (files != null) {
             for (File f : files) {
-                if (f.getName().endsWith(".sfa")
-                        && !f.getName().startsWith(".qwp-v2-guard-")) {
+                if (f.getName().endsWith(".sfa")) {
                     n++;
                 }
             }

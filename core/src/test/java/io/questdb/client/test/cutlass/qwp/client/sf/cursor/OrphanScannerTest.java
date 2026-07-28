@@ -90,34 +90,6 @@ public class OrphanScannerTest {
     }
 
     @Test
-    public void testSlotHoldingOnlyLegacyReaderGuardsIsNotAnOrphan() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // The rollback barriers are named .sfa deliberately -- a rolled-back v1
-            // reader must not skip them -- but they are a barrier, not data. A slot
-            // holding nothing else has never had a byte written to it and must not be
-            // adopted: CursorSendEngine plants the guards FIRST, before recovery or the
-            // initial segment, and its failure path does not unlink them, so an ENOSPC
-            // partway through construction leaves exactly this directory. Counting the
-            // guards sent a drainer to adopt it, which fails under the same disk
-            // pressure and quarantines the empty slot with a permanent .failed sentinel.
-            String slot = sfDir + "/guards-only";
-            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-            touchFile(slot + "/.qwp-v2-guard-a.sfa");
-            touchFile(slot + "/.qwp-v2-guard-b.sfa");
-
-            ObjList<String> orphans = OrphanScanner.scan(sfDir, "default");
-            assertEquals(0, orphans.size());
-
-            // ...but a real segment alongside them still is: the exclusion must be by
-            // guard name, not "ignore dot-prefixed .sfa" or "ignore the first two".
-            touchFile(slot + "/sf-0001.sfa");
-            orphans = OrphanScanner.scan(sfDir, "default");
-            assertEquals(1, orphans.size());
-            assertEquals(slot, orphans.get(0));
-        });
-    }
-
-    @Test
     public void testEmptySlotDirIsNotAnOrphan() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Per spec, empty slot dirs are cheap and stay forever — they
