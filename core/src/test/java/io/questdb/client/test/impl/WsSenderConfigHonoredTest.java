@@ -61,6 +61,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("request_durable_ack=on", "request_durable_ack", true);
         assertHonored("sender_id=probe-1", "sender_id", "probe-1");
         assertHonored("sf_dir=/var/probe", "sf_dir", "/var/probe");
+        assertHonored("sf_dir_shared=on", "sf_dir_shared", true);
         assertHonored("sf_max_bytes=4096", "sf_max_bytes", 4096L);
         assertHonored("sf_max_total_bytes=8192", "sf_max_total_bytes", 8192L);
         assertHonored("sf_durability=flush", "sf_durability", "FLUSH");

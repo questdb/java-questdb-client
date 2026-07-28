@@ -96,6 +96,19 @@ public final class SlotLock implements QuietCloseable {
     }
 
     /**
+     * Acquires the stable logical lock for {@code slotDir}, creating its
+     * {@code .slot-locks} parent at {@link Files#DIR_MODE_DEFAULT}. Convenience
+     * overload for callers with no sharing policy of their own to thread
+     * through. The WebSocket sender's builder instead calls
+     * {@link #acquireLogical(String, int)} with the mode resolved from its
+     * {@code sf_dir_shared} setting, so a sender's own {@code sf_dir} and its
+     * {@code .slot-locks} are always gated together.
+     */
+    public static SlotLock acquireLogical(String slotDir) {
+        return acquireLogical(slotDir, Files.DIR_MODE_DEFAULT);
+    }
+
+    /**
      * Acquires the stable logical lock for {@code slotDir}. Unlike the
      * directory-local {@code .lock}, this lock is anchored in the parent SF
      * directory, so renaming the slot cannot move the lock inode away from the
@@ -106,31 +119,34 @@ public final class SlotLock implements QuietCloseable {
      * unreplayable slot's close -&gt; rename -&gt; recreate transition, preventing a
      * queued orphan drainer from adopting the renamed inode and later touching
      * the fresh directory through the old pathname.
+     *
+     * @param dirMode mode for the {@code .slot-locks} parent directory if it
+     *                does not already exist -- {@link Files#DIR_MODE_DEFAULT}
+     *                or {@link Files#DIR_MODE_SHARED}. Every sender under one
+     *                {@code sf_dir} must pass the SAME mode: unlike a slot
+     *                directory (one creator, one writer), every sender has to
+     *                CREATE its own lock file here, so at {@code DIR_MODE_DEFAULT}
+     *                the first process to start owns it and a sender running as
+     *                a different uid cannot create its lock file, failing
+     *                build() before it can open the slot. This must match the
+     *                mode {@code sf_dir} itself was created with -- widening
+     *                only one of the two breaks multi-uid sharing (see
+     *                {@link Files#DIR_MODE_SHARED}).
      */
-    public static SlotLock acquireLogical(String slotDir) {
-        return acquireLogical(FilesFacade.INSTANCE, slotDir);
+    public static SlotLock acquireLogical(String slotDir, int dirMode) {
+        return acquireLogical(FilesFacade.INSTANCE, slotDir, dirMode);
     }
 
     /** Facade-aware variant used to exercise logical-lock I/O failures. */
     @TestOnly
-    public static SlotLock acquireLogical(FilesFacade ff, String slotDir) {
+    public static SlotLock acquireLogical(FilesFacade ff, String slotDir, int dirMode) {
         validateSlotDir(slotDir);
         String[] paths = resolveLogicalLock(slotDir);
         if (paths == null) {
             throw new IllegalArgumentException(
                     "slotDir must contain a parent and slot name: " + slotDir);
         }
-        // DIR_MODE_SHARED, not DIR_MODE_DEFAULT: unlike a slot directory -- which
-        // one process creates and only that process writes -- this directory is
-        // shared by every sender under the same sf_dir, and each of them must
-        // CREATE its own lock file inside it. At 0755 the first process to start
-        // owns it and a sender running as a different uid cannot create its lock
-        // file at all, so build() throws before it can open the slot. Passing
-        // 0777 hands the sharing policy to the deployment's umask, which is what
-        // already governs sf_dir itself: an unset umask leaves this identical to
-        // the old 0755, while a shared-group deployment (umask 002) gets the
-        // group-writable directory it needs.
-        ensureDirectory(ff, paths[0], "logical slot lock dir", Files.DIR_MODE_SHARED);
+        ensureDirectory(ff, paths[0], "logical slot lock dir", dirMode);
         return acquireAt(ff, slotDir, paths[1], paths[2]);
     }
 

@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpVersionMismatchException;
+import io.questdb.client.std.Files;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -99,6 +100,13 @@ public final class BackgroundDrainer implements Runnable {
      */
     private static final long STOP_CHECK_PARK_CHUNK_NANOS = 50_000_000L; // 50 ms
     private final CursorWebSocketSendLoop.ReconnectFactory clientFactory;
+    /**
+     * Mode for the {@code .slot-locks} directory {@link SlotLock#acquireLogical(String, int)}
+     * creates, resolved by the owner sender from {@code sf_dir_shared} and
+     * forwarded here so an orphan drainer's lock-dir creation always matches
+     * the mode the foreground sender created {@code sf_dir} itself with.
+     */
+    private final int dirMode;
     private final long durableAckKeepaliveIntervalMillis;
     private final long reconnectInitialBackoffMillis;
     private final long reconnectMaxBackoffMillis;
@@ -156,14 +164,18 @@ public final class BackgroundDrainer implements Runnable {
                 durableAckKeepaliveIntervalMillis,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
-                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS);
+                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
+                Files.DIR_MODE_DEFAULT);
     }
 
     /**
      * Master constructor — also accepts the poison-frame detector threshold
      * ({@code max_frame_rejections}) forwarded to the drain loop's
      * {@link CursorWebSocketSendLoop}: the drainer replays the owner sender's
-     * SF data, so it must honor the same configured threshold.
+     * SF data, so it must honor the same configured threshold. {@code dirMode}
+     * is the owner sender's resolved {@code sf_dir_shared} mode; the shorter
+     * overload above defaults it to {@link Files#DIR_MODE_DEFAULT} for callers
+     * (chiefly tests) with no sharing policy of their own to thread through.
      */
     public BackgroundDrainer(
             String slotPath,
@@ -177,7 +189,8 @@ public final class BackgroundDrainer implements Runnable {
             long durableAckKeepaliveIntervalMillis,
             int maxHeadFrameRejections,
             long poisonMinEscalationWindowMillis,
-            long catchUpCapGapMinEscalationWindowMillis
+            long catchUpCapGapMinEscalationWindowMillis,
+            int dirMode
     ) {
         this.slotPath = slotPath;
         this.segmentSizeBytes = segmentSizeBytes;
@@ -191,6 +204,7 @@ public final class BackgroundDrainer implements Runnable {
         this.maxHeadFrameRejections = maxHeadFrameRejections;
         this.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
         this.catchUpCapGapMinEscalationWindowMillis = catchUpCapGapMinEscalationWindowMillis;
+        this.dirMode = dirMode;
     }
 
     /**
@@ -203,7 +217,8 @@ public final class BackgroundDrainer implements Runnable {
     @TestOnly
     public BackgroundDrainer() {
         this(null, 0L, 0L, null, 0L, 0L, 0L, false, 0L,
-                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, 0L, 0L);
+                CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS, 0L, 0L,
+                Files.DIR_MODE_DEFAULT);
     }
 
     /**
@@ -543,7 +558,7 @@ public final class BackgroundDrainer implements Runnable {
             // cannot provide this guarantee by itself.
             if (slotPath != null) {
                 try {
-                    logicalSlotLock = SlotLock.acquireLogical(slotPath);
+                    logicalSlotLock = SlotLock.acquireLogical(slotPath, dirMode);
                 } catch (IllegalStateException t) {
                     if (isLockContention(t)) {
                         LOG.info("orphan logical slot already locked, skipping: {} ({})",

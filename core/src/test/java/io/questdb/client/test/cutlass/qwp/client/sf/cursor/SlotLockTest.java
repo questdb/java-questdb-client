@@ -153,7 +153,7 @@ public class SlotLockTest {
             String slot = parentDir + "/mode-check";
             String lockDir = parentDir + "/.slot-locks";
             RecordingMkdirFacade ff = new RecordingMkdirFacade();
-            try (SlotLock ignored = SlotLock.acquireLogical(ff, slot)) {
+            try (SlotLock ignored = SlotLock.acquireLogical(ff, slot, Files.DIR_MODE_SHARED)) {
                 assertEquals("the shared lock dir must be created 01777 (sticky), umask-governed",
                         Files.DIR_MODE_SHARED, ff.modeFor(lockDir));
             }
@@ -180,7 +180,7 @@ public class SlotLockTest {
             String lockDir = parentDir + "/.slot-locks";
             LockDirectoryFailureFacade ff = new LockDirectoryFailureFacade(lockDir);
             try {
-                SlotLock.acquireLogical(ff, slot);
+                SlotLock.acquireLogical(ff, slot, Files.DIR_MODE_SHARED);
                 fail("expected logical lock directory creation failure");
             } catch (IllegalStateException expected) {
                 assertEquals("could not create logical slot lock dir: " + lockDir + " rc=-1",

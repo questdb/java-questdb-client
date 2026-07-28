@@ -1145,6 +1145,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // there is no separate on/off flag (presence of the directory is the switch).
         // null sfDir → memory-only async ingest (same lock-free architecture, no disk).
         private String sfDir;
+        // Off by default: sf_dir and its .slot-locks sibling are created at
+        // Files.DIR_MODE_DEFAULT unless this opts them both into
+        // Files.DIR_MODE_SHARED. See sfDirShared(boolean) for the umask caveat.
+        private boolean sfDirShared;
         // Durability contract for SF append/flush. Today only MEMORY is
         // implemented; FLUSH and APPEND are deferred follow-ups (cursor needs
         // to learn fsync first).
@@ -1546,15 +1550,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // directory itself, but Files.mkdir is non-recursive — so we
                 // must ensure the parent group root exists first.
                 String slotPath;
+                // Resolved once and reused for both sf_dir itself and its
+                // .slot-locks sibling (SlotLock.acquireLogical below, and the
+                // orphan-drainer dispatch further down): the two must move
+                // together, since umask can only clear bits and widening one
+                // without the other breaks multi-uid sharing (see
+                // Files.DIR_MODE_SHARED's javadoc). Off (DIR_MODE_DEFAULT)
+                // unless sf_dir_shared=on opts both into DIR_MODE_SHARED.
+                int dirMode = Files.DIR_MODE_DEFAULT;
                 if (sfDir == null) {
                     slotPath = null;
                 } else {
+                    dirMode = sfDirShared ? Files.DIR_MODE_SHARED : Files.DIR_MODE_DEFAULT;
                     if (!Files.exists(sfDir)) {
-                        // DIR_MODE_SHARED, matching .slot-locks: a second uid has to create
-                        // its own slot directory in here, so restricting this to 0755 makes
-                        // the shared lock directory pointless (see Files.DIR_MODE_SHARED).
-                        // Under the usual umask 022 this is still 0755, plus sticky.
-                        int rc = Files.mkdir(sfDir, Files.DIR_MODE_SHARED);
+                        int rc = Files.mkdir(sfDir, dirMode);
                         // mkdir is non-zero on failure, but "already exists"
                         // is one such failure. Multiple SF senders sharing one
                         // sf_dir can be built concurrently (the pool calls
@@ -1583,7 +1592,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // on the fresh slot through the original pathname.
                 try (SlotLock logicalSlotLock = slotPath == null
                         ? null
-                        : SlotLock.acquireLogical(slotPath)) {
+                        : SlotLock.acquireLogical(slotPath, dirMode)) {
                     CursorSendEngine cursorEngine = new CursorSendEngine(
                             slotPath, actualSfMaxBytes,
                             actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
@@ -1707,7 +1716,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     orphans,
                                     maxBackgroundDrainers,
                                     actualSfMaxBytes,
-                                    actualSfMaxTotalBytes);
+                                    actualSfMaxTotalBytes,
+                                    dirMode);
                         }
                     }
                     return connected;
@@ -2809,6 +2819,22 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Creates {@code sf_dir} and its {@code .slot-locks} directory with permissions a
+         * second uid can create entries in ({@link Files#DIR_MODE_SHARED}). Off by default:
+         * that mode is 01777 and {@code mkdir(2)} applies {@code mode & ~umask & 0777}, so
+         * under umask 000 -- a systemd unit with no {@code UMask=}, many container
+         * entrypoints -- the store-and-forward root becomes world-writable, and it holds
+         * unencrypted buffered rows this client replays onto the server.
+         * <p>
+         * Both directories are widened together: umask can only clear bits, so widening only
+         * {@code .slot-locks} leaves a second uid unable to create its slot directory.
+         */
+        public LineSenderBuilder sfDirShared(boolean shared) {
+            this.sfDirShared = shared;
+            return this;
+        }
+
+        /**
          * Enables store-and-forward and sets its directory. Setting the SF
          * directory <i>is</i> the on-switch — there is no separate
          * enable/disable flag. SF is off iff {@code dir} was never set.
@@ -3578,6 +3604,18 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sf_dir");
                     storeAndForwardDir(sink.toString());
+                } else if (Chars.equals("sf_dir_shared", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("sf_dir_shared is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "sf_dir_shared");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        sfDirShared(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        sfDirShared(false);
+                    } else {
+                        throw new LineSenderException("invalid sf_dir_shared [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
                 } else if (Chars.equals("sender_id", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sender_id is only supported for WebSocket transport");
@@ -3941,6 +3979,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (s != null) {
                     storeAndForwardDir(s);
                 }
+                s = view.getStr("sf_dir_shared");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on")) {
+                        sfDirShared(true);
+                    } else if (s.equalsIgnoreCase("off")) {
+                        sfDirShared(false);
+                    } else {
+                        throw new LineSenderException("invalid sf_dir_shared [value=").put(s).put(", allowed-values=[on, off]]");
+                    }
+                }
                 s = view.getStr("sender_id");
                 if (s != null) {
                     senderId(s);
@@ -4089,6 +4137,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("request_durable_ack", requestDurableAck);
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
+            m.put("sf_dir_shared", sfDirShared);
             m.put("sf_max_bytes", sfMaxBytes);
             m.put("sf_max_total_bytes", sfMaxTotalBytes);
             m.put("sf_durability", sfDurability == null ? null : sfDurability.name());

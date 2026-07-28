@@ -86,6 +86,7 @@ public final class ConfigSchema {
         str("sender_id", Side.INGRESS);
         str("sf_append_deadline_millis", Side.INGRESS);
         str("sf_dir", Side.INGRESS);
+        str("sf_dir_shared", Side.INGRESS);
         str("sf_durability", Side.INGRESS);
         str("sf_max_bytes", Side.INGRESS);
         str("sf_max_total_bytes", Side.INGRESS);

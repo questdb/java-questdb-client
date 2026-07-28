@@ -106,6 +106,13 @@ public final class Files {
      * its slot directory. build() then fails one level before the problem this mode
      * exists to solve. Do NOT use it for a directory only its creator writes to; the slot
      * directory itself stays {@link #DIR_MODE_DEFAULT}.
+     * <p>
+     * NOTE: {@link #mkdir} passes this straight to POSIX {@code mkdir}, so the effective
+     * mode is {@code mode & ~umask & 0777}. Under umask 000 -- a systemd unit with no
+     * {@code UMask=}, many container entrypoints -- this yields 0777, and Linux strips
+     * {@code S_ISVTX}, so there is no restricted deletion either. It is therefore opt-in
+     * via the {@code sf_dir_shared} connect-string key; the default is
+     * {@link #DIR_MODE_DEFAULT}.
      */
     public static final int DIR_MODE_SHARED = 1023;
 
