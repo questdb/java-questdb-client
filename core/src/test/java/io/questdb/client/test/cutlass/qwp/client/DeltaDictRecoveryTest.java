@@ -1392,16 +1392,21 @@ public class DeltaDictRecoveryTest {
             // dictionary's path here would throw instead of degrading. The
             // facade fault instead reproduces the case openClean() still
             // tolerates -- a transient failure with nothing at the path to lose.
-            Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
-                    io.questdb.client.std.Files.DIR_MODE_DEFAULT));
-            UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
-            CursorSendEngine phase1Engine = new CursorSendEngine(
-                    slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Constructed only after the server is up: if start()/awaitStart()
+                // ever failed, an engine built ahead of that check would leak its
+                // slot lock and native memory past this try, and assertMemoryLeak
+                // would then report that leak instead of the real failure.
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
                 try (Sender s1 = QwpWebSocketSender.connect(
                         "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
@@ -1481,19 +1486,24 @@ public class DeltaDictRecoveryTest {
             // any artifact at the dictionary's path here would throw instead of
             // degrading. The facade fault instead reproduces the case openClean()
             // still tolerates -- a transient failure with nothing at the path to lose.
-            Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
-                    io.questdb.client.std.Files.DIR_MODE_DEFAULT));
-            UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
-            CursorSendEngine phase1Engine = new CursorSendEngine(
-                    slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
-
+            //
             // Phase 1: silent server (no acks). Sender 1 writes new-symbol rows in
             // full-dict mode and close-fast, leaving unacked self-sufficient frames.
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Constructed only after the server is up: if start()/awaitStart()
+                // ever failed, an engine built ahead of that check would leak its
+                // slot lock and native memory past this try, and assertMemoryLeak
+                // would then report that leak instead of the real failure.
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
                 try (Sender s1 = QwpWebSocketSender.connect(
                         "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {

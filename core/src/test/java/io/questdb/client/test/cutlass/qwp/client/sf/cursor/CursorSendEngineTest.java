@@ -364,6 +364,29 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testConstructorRefusesFreshSlotWhoseDictionaryPathIsARealDirectory() throws Exception {
+        // C9-A end-to-end, through a REAL EISDIR on the real FilesFacade -- not
+        // PersistedSymbolDict in isolation, and not a stubbed facade. openCleanRW
+        // is open(O_CREAT|O_TRUNC|O_RDWR, 0644), which fails with EISDIR against
+        // an existing directory, so this reproduces the real failure mode
+        // (a Windows share lock, an EIO, or anything else occupying the path that
+        // a plain open() cannot clear) and proves the refusal actually propagates
+        // out of the constructor's catch (Throwable) cleanup-and-rethrow, rather
+        // than being swallowed there.
+        TestUtils.assertMemoryLeak(() -> {
+            assertEquals(0, Files.mkdir(tmpDir + "/.symbol-dict", Files.DIR_MODE_DEFAULT));
+            try {
+                new CursorSendEngine(tmpDir, 4096);
+                fail("expected construction to refuse a fresh slot whose dictionary "
+                        + "path is blocked by an existing directory");
+            } catch (LineSenderException expected) {
+                assertTrue("expected the truncate-refusal message, got: " + expected.getMessage(),
+                        expected.getMessage().contains("cannot be truncated"));
+            }
+        });
+    }
+
+    @Test
     public void testMemoryModeSkipsDirAndStillWorks() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // sfDir == null → memory-only ring. No files, no mkdir, no path.
