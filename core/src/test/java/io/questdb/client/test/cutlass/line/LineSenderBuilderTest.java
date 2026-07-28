@@ -44,6 +44,7 @@ import static org.junit.Assert.fail;
 public class LineSenderBuilderTest {
     private static final String AUTH_TOKEN_KEY1 = "UvuVb1USHGRRT08gEnwN2zGZrvM4MsLQ5brgF6SVkAw=";
     private static final String LOCALHOST = "localhost";
+    private static final String TLS_ROOTS_INSECURE_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
     private static final char[] TRUSTSTORE_PASSWORD = "questdb".toCharArray();
     private static final String TRUSTSTORE_PATH = "/keystore/server.keystore";
 
@@ -187,6 +188,9 @@ public class LineSenderBuilderTest {
             assertConfStrError("http::addr=localhost;tls_roots=/some/path;", "custom trust store configured, but TLS was not enabled");
             assertConfStrOk("https::addr=localhost;tls_roots=/some/path;protocol_version=2;");
             assertConfStrError("http::addr=localhost;tls_roots_password=hunter123;", "tls_roots_password was configured, but tls_roots is missing");
+            assertConfStrError("tcps::addr=localhost;tls_roots=/ca.pem;tls_verify=unsafe_off;", TLS_ROOTS_INSECURE_ERROR);
+            assertConfStrError("https::addr=localhost;tls_verify=unsafe_off;tls_roots=/ca.pem;protocol_version=2;", TLS_ROOTS_INSECURE_ERROR);
+            assertConfStrError("tcps::addr=localhost;tls_roots=/ca.p12;tls_roots_password=secret;tls_verify=unsafe_off;", TLS_ROOTS_INSECURE_ERROR);
             assertConfStrError("tcp::addr=localhost;user=foo;", "token cannot be empty nor null");
             assertConfStrError("tcp::addr=localhost;username=foo;", "token cannot be empty nor null");
             assertConfStrError("tcp::addr=localhost;token=foo;", "TCP token is configured, but user is missing");
@@ -305,6 +309,25 @@ public class LineSenderBuilderTest {
     public void testCustomTruststorePasswordCannotBeNull() {
         assertThrows("trust store password cannot be null",
                 () -> Sender.builder(Sender.Transport.TCP).advancedTls().customTrustStore(TRUSTSTORE_PATH, null));
+    }
+
+    @Test
+    public void testCustomTruststoreAndDisabledValidationCannotBeCombinedViaRetainedSettings() {
+        Sender.LineSenderBuilder customRootsBuilder = Sender.builder(Sender.Transport.TCP).enableTls();
+        Sender.LineSenderBuilder.AdvancedTlsSettings customRootsSettings = customRootsBuilder.advancedTls();
+        customRootsSettings.customTrustStore(TRUSTSTORE_PATH, TRUSTSTORE_PASSWORD);
+        assertThrows(
+                "TLS validation cannot be disabled when a custom trust store is configured",
+                customRootsSettings::disableCertificateValidation
+        );
+
+        Sender.LineSenderBuilder insecureBuilder = Sender.builder(Sender.Transport.TCP).enableTls();
+        Sender.LineSenderBuilder.AdvancedTlsSettings insecureSettings = insecureBuilder.advancedTls();
+        insecureSettings.disableCertificateValidation();
+        assertThrows(
+                "custom trust store cannot be configured when TLS validation is disabled",
+                () -> insecureSettings.customTrustStore(TRUSTSTORE_PATH, TRUSTSTORE_PASSWORD)
+        );
     }
 
     @Test

@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.network;
 
+import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.network.TlsTrustStore;
 import org.junit.Assert;
 import org.junit.Test;
@@ -43,6 +44,37 @@ import java.security.cert.X509Certificate;
 public class TlsTrustStoreTest {
 
     private static final String RESOURCE_PREFIX = "/io/questdb/client/test/network/";
+    private static final String TLS_ROOTS_INSECURE_ERROR = "custom trust store cannot be combined with disabled TLS validation";
+
+    @Test
+    public void testClientTlsConfigurationRejectsCustomRootsWithDisabledValidation() {
+        try {
+            new ClientTlsConfiguration(
+                    "/ca.pem",
+                    null,
+                    ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE
+            );
+            Assert.fail("expected custom roots with disabled validation to be rejected");
+        } catch (IllegalArgumentException e) {
+            Assert.assertEquals(TLS_ROOTS_INSECURE_ERROR, e.getMessage());
+        }
+    }
+
+    @Test
+    public void testCreateSslEngineRejectsCustomRootsWithDisabledValidation() throws Exception {
+        try {
+            TlsTrustStore.createSslEngine(
+                    "/ca.pem",
+                    null,
+                    true,
+                    "localhost",
+                    TlsTrustStoreTest.class
+            );
+            Assert.fail("expected custom roots with disabled validation to be rejected");
+        } catch (IllegalArgumentException e) {
+            Assert.assertEquals(TLS_ROOTS_INSECURE_ERROR, e.getMessage());
+        }
+    }
 
     @Test
     public void testJksTrustStoreStillSupported() throws Exception {

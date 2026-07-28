@@ -79,8 +79,9 @@ public final class TlsTrustStore {
             String peerHost,
             Class<?> resourceAnchor
     ) throws CertificateException, IOException, KeyManagementException, KeyStoreException, NoSuchAlgorithmException {
-        // custom roots with validation disabled would silently skip hostname verification below
-        assert trustStorePath == null || !insecure;
+        if (trustStorePath != null && insecure) {
+            throw new IllegalArgumentException("custom trust store cannot be combined with disabled TLS validation");
+        }
         SSLContext sslContext;
         if (trustStorePath != null) {
             sslContext = SSLContext.getInstance("TLS");

@@ -40,6 +40,8 @@ import org.junit.Test;
  */
 public class QwpQueryClientFromConfigTest {
 
+    private static final String TLS_ROOTS_INSECURE_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
+
     @Test
     public void testAddrAcceptsHostWithoutPort() {
         // Host-only accepted; port defaults to the public DEFAULT_WS_PORT constant.
@@ -981,6 +983,18 @@ public class QwpQueryClientFromConfigTest {
     @Test
     public void testTlsRootsWithPasswordAccepted() {
         assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;");
+    }
+
+    @Test
+    public void testTlsRootsWithUnsafeOffRejected() {
+        assertReject(
+                "wss::addr=db:9000;tls_roots=/etc/qdb/ca.pem;tls_verify=unsafe_off;",
+                TLS_ROOTS_INSECURE_ERROR
+        );
+        assertReject(
+                "wss::addr=db:9000;tls_verify=unsafe_off;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;",
+                TLS_ROOTS_INSECURE_ERROR
+        );
     }
 
     @Test

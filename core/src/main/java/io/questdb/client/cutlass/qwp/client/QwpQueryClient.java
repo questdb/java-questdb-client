@@ -140,6 +140,7 @@ public class QwpQueryClient implements QuietCloseable {
     private static final long DEFAULT_FAILOVER_MAX_BACKOFF_MS = 1_000L;
     private static final long DEFAULT_FAILOVER_MAX_DURATION_MS = 30_000L;
     private static final int DEFAULT_IO_BUFFER_POOL_SIZE = 4;
+    private static final String TLS_ROOTS_INSECURE_CONFIG_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
     /**
      * How long {@link #connect()} waits to read the {@code SERVER_INFO} frame
      * from each endpoint before giving up and moving to the next. 5 seconds is
@@ -549,6 +550,9 @@ public class QwpQueryClient implements QuietCloseable {
         }
         if (tlsRoots == null && tlsRootsPassword != null) {
             throw new IllegalArgumentException("tls_roots_password requires tls_roots");
+        }
+        if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+            throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
         }
         // Mirror fromConfig's effective values: a missing bound takes its
         // default, so the ordering is enforced even when only one key is set

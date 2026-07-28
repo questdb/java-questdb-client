@@ -934,6 +934,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
+        private static final String TLS_ROOTS_INSECURE_CONFIG_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
         // close() drain timeout. Default applied at build() time. 0 or -1
         // means "fast close" (skip the drain entirely); any positive value
         // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
@@ -3576,6 +3577,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (trustStorePath == null && trustStorePassword != null) {
                 throw new LineSenderException("tls_roots_password was configured, but tls_roots is missing");
             }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
+            }
             if (protocol == PROTOCOL_HTTP || protocol == PROTOCOL_WEBSOCKET) {
                 if (user != null) {
                     httpUsernamePassword(user, password);
@@ -3835,6 +3839,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (tlsRoots == null && tlsRootsPassword != null) {
                 throw new IllegalArgumentException("tls_roots_password requires tls_roots");
             }
+            if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+                throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
+            }
         }
 
         /**
@@ -3970,6 +3977,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (!tlsEnabled && tlsValidationMode != TlsValidationMode.DEFAULT) {
                 throw new LineSenderException("TLS validation disabled, but TLS was not enabled");
+            }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException("custom trust store cannot be combined with disabled TLS validation");
             }
             if (keyId != null && bufferCapacity < MIN_BUFFER_SIZE) {
                 throw new LineSenderException("Requested buffer too small ")
@@ -4172,6 +4182,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (Chars.isBlank(trustStorePath)) {
                     throw new LineSenderException("trust store path cannot be empty nor null");
                 }
+                if (tlsValidationMode == TlsValidationMode.INSECURE) {
+                    throw new LineSenderException("custom trust store cannot be configured when TLS validation is disabled");
+                }
 
                 LineSenderBuilder.this.trustStorePath = trustStorePath;
                 LineSenderBuilder.this.trustStorePassword = trustStorePassword;
@@ -4190,6 +4203,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
              * @return an instance of LineSenderBuilder for further configuration
              */
             public LineSenderBuilder disableCertificateValidation() {
+                if (LineSenderBuilder.this.trustStorePath != null) {
+                    throw new LineSenderException("TLS validation cannot be disabled when a custom trust store is configured");
+                }
                 LineSenderBuilder.this.tlsValidationMode = TlsValidationMode.INSECURE;
                 return LineSenderBuilder.this;
             }
