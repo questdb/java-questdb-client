@@ -1159,7 +1159,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                         + " bytes exceeds the advertised cap " + client.cap,
                         frame.length <= client.cap);
             }
-            QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt);
+            // allowGap=true: this assertion exists to PROVE the chunks tile [0, n)
+            // with no hole, so a gap must be observable here rather than thrown.
+            QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt, true);
         }
         client.capturedFrames.clear();
         assertEquals("reassembled dictionary size", expected.length, rebuilt.size());

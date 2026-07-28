@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -396,7 +397,23 @@ public class DeltaDictCatchUpTest {
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
-            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            try {
+                QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            } catch (QwpWireTestUtils.DictionaryGapException gap) {
+                // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
+                // apply the frame. ACKing here is what let a client sequence a real
+                // server rejects pass green.
+                try {
+                    long nackSequence = nextSeq.getAndIncrement();
+                    if (newConnection) {
+                        ackSequenceStarts.add(nackSequence);
+                    }
+                    client.sendBinary(QwpWireTestUtils.buildNack(nackSequence, WebSocketResponse.STATUS_DICTIONARY_GAP));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                return;
+            }
             if (connNumber == 2) {
                 if (QwpWireTestUtils.tableCount(data) == 0) {
                     sawZeroTableFrameOnConn2 = true;
@@ -534,7 +551,23 @@ public class DeltaDictCatchUpTest {
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
-            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            try {
+                QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            } catch (QwpWireTestUtils.DictionaryGapException gap) {
+                // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
+                // apply the frame. ACKing here is what let a client sequence a real
+                // server rejects pass green.
+                try {
+                    long nackSequence = nextSeq.getAndIncrement();
+                    if (newConnection) {
+                        ackSequenceStarts.add(nackSequence);
+                    }
+                    client.sendBinary(QwpWireTestUtils.buildNack(nackSequence, WebSocketResponse.STATUS_DICTIONARY_GAP));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                return;
+            }
             if (connNumber == 2 && QwpWireTestUtils.tableCount(data) == 0) {
                 zeroTableFramesOnConn2++;
             }
