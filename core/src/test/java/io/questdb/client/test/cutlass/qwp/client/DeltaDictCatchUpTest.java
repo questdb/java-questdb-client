@@ -236,7 +236,7 @@ public class DeltaDictCatchUpTest {
                 // is no longer governed by the orphan budget.
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
                         + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50"
-                        + ";catchup_cap_gap_min_escalation_window_millis=0;")) {
+                        + ";catch_up_cap_gap_min_escalation_window_millis=0;")) {
                     sender.table("t").symbol("s", bigSymbol).longColumn("v", 1L).atNow();
                     sender.flush();
                     waitFor(() -> server.handshakeCount() >= 20, 10_000);

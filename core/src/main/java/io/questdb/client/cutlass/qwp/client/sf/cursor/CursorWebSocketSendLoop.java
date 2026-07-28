@@ -158,7 +158,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * 5 minutes -- the same figure as {@link #DEFAULT_RECONNECT_MAX_DURATION_MILLIS},
      * this codebase's existing notion of how long a transient outage may plausibly
      * last. Configurable per sender via the
-     * {@code catchup_cap_gap_min_escalation_window_millis} connect-string key or
+     * {@code catch_up_cap_gap_min_escalation_window_millis} connect-string key or
      * {@code LineSenderBuilder.catchUpCapGapMinEscalationWindowMillis(long)}; {@code 0}
      * restores count-only escalation for orphan drainers.
      */

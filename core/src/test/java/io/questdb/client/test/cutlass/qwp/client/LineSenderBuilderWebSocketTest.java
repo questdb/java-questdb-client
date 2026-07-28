@@ -224,7 +224,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testCatchUpCapGapMinEscalationWindowBuilderNegativeRejected() {
-        assertThrows("catchup_cap_gap_min_escalation_window_millis must be >= 0: -1",
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis must be >= 0: -1",
                 () -> Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
                         .catchUpCapGapMinEscalationWindowMillis(-1));
@@ -232,7 +232,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testCatchUpCapGapMinEscalationWindowBuilderNotSupportedForTcp() {
-        assertThrows("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
                 () -> Sender.builder(Sender.Transport.TCP)
                         .address(LOCALHOST)
                         .catchUpCapGapMinEscalationWindowMillis(300_000));
@@ -240,29 +240,33 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
     @Test
     public void testCatchUpCapGapMinEscalationWindowConfigStringNegativeRejected() {
-        assertThrows("catchup_cap_gap_min_escalation_window_millis must be >= 0: -1",
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis must be >= 0: -1",
                 () -> Sender.builder("ws::addr=localhost:9000;"
-                        + "catchup_cap_gap_min_escalation_window_millis=-1;"));
+                        + "catch_up_cap_gap_min_escalation_window_millis=-1;"));
     }
 
     @Test
     public void testCatchUpCapGapMinEscalationWindowConfigStringNotSupportedForTcp() {
-        assertThrows("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
                 () -> Sender.builder("tcp::addr=localhost:9009;"
-                        + "catchup_cap_gap_min_escalation_window_millis=300000;"));
+                        + "catch_up_cap_gap_min_escalation_window_millis=300000;"));
     }
 
     @Test
-    public void testCatchUpCapGapMinEscalationWindowDefaultsToFiveMinutes() {
-        Assert.assertEquals(300_000L,
+    public void testCatchUpCapGapMinEscalationWindowUnsetInSnapshot() {
+        // wsConfigSnapshotForTest puts the raw field, not the resolved default (see
+        // WsSenderConfigHonoredTest#testSnapshotReportsTheRawUnsetSentinel), so an
+        // unset key stays -1 regardless of construction path; the resolved default
+        // (5 minutes) lives in CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS.
+        Assert.assertEquals(-1L,
                 Sender.builder(Sender.Transport.WEBSOCKET)
                         .address(LOCALHOST)
                         .wsConfigSnapshotForTest()
-                        .get("catchup_cap_gap_min_escalation_window_millis"));
-        Assert.assertEquals(300_000L,
+                        .get("catch_up_cap_gap_min_escalation_window_millis"));
+        Assert.assertEquals(-1L,
                 Sender.builder("ws::addr=localhost:9000;")
                         .wsConfigSnapshotForTest()
-                        .get("catchup_cap_gap_min_escalation_window_millis"));
+                        .get("catch_up_cap_gap_min_escalation_window_millis"));
     }
 
     @Test

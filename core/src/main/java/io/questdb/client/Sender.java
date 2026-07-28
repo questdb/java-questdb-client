@@ -1817,10 +1817,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          */
         public LineSenderBuilder catchUpCapGapMinEscalationWindowMillis(long millis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
-                throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
+                throw new LineSenderException("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
             }
             if (millis < 0) {
-                throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis must be >= 0: ").put(millis);
+                throw new LineSenderException("catch_up_cap_gap_min_escalation_window_millis must be >= 0: ").put(millis);
             }
             this.catchUpCapGapMinEscalationWindowMillis = millis;
             return this;
@@ -3683,12 +3683,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "poison_min_escalation_window_millis");
                     poisonMinEscalationWindowMillis(parseLongValue(sink, "poison_min_escalation_window_millis"));
-                } else if (Chars.equals("catchup_cap_gap_min_escalation_window_millis", sink)) {
+                } else if (Chars.equals("catch_up_cap_gap_min_escalation_window_millis", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("catchup_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
+                        throw new LineSenderException("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "catchup_cap_gap_min_escalation_window_millis");
-                    catchUpCapGapMinEscalationWindowMillis(parseLongValue(sink, "catchup_cap_gap_min_escalation_window_millis"));
+                    pos = getValue(configurationString, pos, sink, "catch_up_cap_gap_min_escalation_window_millis");
+                    catchUpCapGapMinEscalationWindowMillis(parseLongValue(sink, "catch_up_cap_gap_min_escalation_window_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -3962,8 +3962,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("poison_min_escalation_window_millis")) {
                     poisonMinEscalationWindowMillis(wsLong(view, v, "poison_min_escalation_window_millis"));
                 }
-                if (view.has("catchup_cap_gap_min_escalation_window_millis")) {
-                    catchUpCapGapMinEscalationWindowMillis(wsLong(view, v, "catchup_cap_gap_min_escalation_window_millis"));
+                if (view.has("catch_up_cap_gap_min_escalation_window_millis")) {
+                    catchUpCapGapMinEscalationWindowMillis(wsLong(view, v, "catch_up_cap_gap_min_escalation_window_millis"));
                 }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
@@ -4152,10 +4152,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_background_drainers", maxBackgroundDrainers);
             m.put("max_frame_rejections", maxFrameRejections);
             m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
-            m.put("catchup_cap_gap_min_escalation_window_millis",
-                    catchUpCapGapMinEscalationWindowMillis == PARAMETER_NOT_SET_EXPLICITLY
-                            ? CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS
-                            : catchUpCapGapMinEscalationWindowMillis);
+            m.put("catch_up_cap_gap_min_escalation_window_millis", catchUpCapGapMinEscalationWindowMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);

@@ -339,7 +339,7 @@ public class QwpWebSocketSender implements Sender {
             CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS;
     // Minimum wall-clock dwell a symbol-dict catch-up cap gap must persist before an
     // orphan drainer may quarantine its slot (connect-string key
-    // catchup_cap_gap_min_escalation_window_millis). Foreground senders retry forever. See
+    // catch_up_cap_gap_min_escalation_window_millis). Foreground senders retry forever. See
     // CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS.
     private long catchUpCapGapMinEscalationWindowMillis =
             CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
