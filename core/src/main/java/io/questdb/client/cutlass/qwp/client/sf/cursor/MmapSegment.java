@@ -299,6 +299,54 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
+     * True when {@code t} is the JVM's recoverable signal for a fault while
+     * accessing a memory-mapped region -- a SIGBUS/SIGSEGV that HotSpot
+     * translates into an {@code InternalError} at an {@code Unsafe} intrinsic
+     * site instead of aborting the process. It surfaces when a mapped page is
+     * not backed by real file blocks: a sparse {@code .sfa} tail on a
+     * filesystem whose pre-allocation leaves holes (e.g. ZFS, where a
+     * truncate-based {@code allocate} does not materialize blocks), or a file
+     * truncated under the mapping. Recovery treats this as an I/O boundary --
+     * the same way MappedByteBuffer readers do -- not a fatal VM error.
+     * <p>
+     * The message is matched on the fragment {@code "unsafe memory access
+     * operation"}, which is common to both HotSpot wordings and NOT
+     * version-stable as a whole: pre-21 JDKs (including the shipping/CI JDK 8)
+     * emit {@code "a fault occurred in a recent unsafe memory access operation
+     * in compiled Java code"}, while JDK 21+ shortened it to {@code "a fault
+     * occurred in an unsafe memory access operation"}. Matching the shared
+     * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
+     * still being specific enough that a genuine VirtualMachineError (real OOM,
+     * StackOverflow) is never swallowed.
+     * <p>
+     * <b>Delivery is NOT precise before JDK 21, so callers must guard too.</b>
+     * Pre-21 HotSpot records the fault and raises the {@code InternalError} at
+     * the next return or safepoint check rather than at the faulting
+     * instruction, so it can surface in a CALLER's frame -- past every handler
+     * in this class. Observed on JDK 8/17: a fault taken inside
+     * {@link #scanFrames} arrives only after {@link #openExisting} has already
+     * returned its segment, so neither the scan's own catch nor
+     * {@code openExisting}'s outer catch ever sees it. JDK-8283699 made
+     * delivery precise in 21+, which is why the same case is fully contained
+     * there. The in-class catches therefore handle the common (precise) case
+     * only; {@link SegmentRing#openExisting} applies this same predicate at the
+     * per-file boundary so a late-delivered fault still skips one {@code .sfa}
+     * instead of aborting recovery of the whole slot. Public because
+     * {@code QwpWebSocketSender}'s persist handlers (the write-ahead append
+     * and the recovery-time heal, both over {@code Crc32c.updateUnsafe}) apply
+     * this same exemption ahead of their own {@code Error} rethrow, so a
+     * recognised fault degrades the sender instead of escaping as a raw
+     * {@code InternalError}.
+     */
+    public static boolean isMmapAccessFault(Throwable t) {
+        if (!(t instanceof InternalError)) {
+            return false;
+        }
+        String msg = t.getMessage();
+        return msg != null && msg.contains("unsafe memory access operation");
+    }
+
+    /**
      * Opens an existing segment file for recovery. mmaps it RW, validates the
      * header magic / version, then scans frames forward verifying each CRC.
      * The first bad CRC (or a frame whose declared length runs past the file
@@ -607,50 +655,6 @@ public final class MmapSegment implements QuietCloseable {
      */
     public long tornTailBytes() {
         return tornTailBytes;
-    }
-
-    /**
-     * True when {@code t} is the JVM's recoverable signal for a fault while
-     * accessing a memory-mapped region -- a SIGBUS/SIGSEGV that HotSpot
-     * translates into an {@code InternalError} at an {@code Unsafe} intrinsic
-     * site instead of aborting the process. It surfaces when a mapped page is
-     * not backed by real file blocks: a sparse {@code .sfa} tail on a
-     * filesystem whose pre-allocation leaves holes (e.g. ZFS, where a
-     * truncate-based {@code allocate} does not materialize blocks), or a file
-     * truncated under the mapping. Recovery treats this as an I/O boundary --
-     * the same way MappedByteBuffer readers do -- not a fatal VM error.
-     * <p>
-     * The message is matched on the fragment {@code "unsafe memory access
-     * operation"}, which is common to both HotSpot wordings and NOT
-     * version-stable as a whole: pre-21 JDKs (including the shipping/CI JDK 8)
-     * emit {@code "a fault occurred in a recent unsafe memory access operation
-     * in compiled Java code"}, while JDK 21+ shortened it to {@code "a fault
-     * occurred in an unsafe memory access operation"}. Matching the shared
-     * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
-     * still being specific enough that a genuine VirtualMachineError (real OOM,
-     * StackOverflow) is never swallowed.
-     * <p>
-     * <b>Delivery is NOT precise before JDK 21, so callers must guard too.</b>
-     * Pre-21 HotSpot records the fault and raises the {@code InternalError} at
-     * the next return or safepoint check rather than at the faulting
-     * instruction, so it can surface in a CALLER's frame -- past every handler
-     * in this class. Observed on JDK 8/17: a fault taken inside
-     * {@link #scanFrames} arrives only after {@link #openExisting} has already
-     * returned its segment, so neither the scan's own catch nor
-     * {@code openExisting}'s outer catch ever sees it. JDK-8283699 made
-     * delivery precise in 21+, which is why the same case is fully contained
-     * there. The in-class catches therefore handle the common (precise) case
-     * only; {@link SegmentRing#openExisting} applies this same predicate at the
-     * per-file boundary so a late-delivered fault still skips one {@code .sfa}
-     * instead of aborting recovery of the whole slot. Package-private for that
-     * caller.
-     */
-    static boolean isMmapAccessFault(Throwable t) {
-        if (!(t instanceof InternalError)) {
-            return false;
-        }
-        String msg = t.getMessage();
-        return msg != null && msg.contains("unsafe memory access operation");
     }
 
     /**

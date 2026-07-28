@@ -46,6 +46,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderProgressHandler;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
@@ -3911,7 +3912,14 @@ public class QwpWebSocketSender implements Sender {
         try {
             pd.appendSymbols(globalSymbolDictionary, from, to);
         } catch (Throwable t) {
-            if (t instanceof Error) {
+            // A recognised mmap access fault is NOT a JVM failure to propagate: it is how
+            // an unbacked or sparse append page surfaces, and commitMappedChunk uses
+            // Crc32c.updateUnsafe precisely so it arrives catchable here. Rethrowing it
+            // raw skips disableDeltaDict, and from healPersistedDictionary it escapes
+            // Sender.build() as neither UnreplayableSlotException nor LineSenderException,
+            // so the slot is neither quarantined nor reported and every restart re-faults
+            // the same page.
+            if (t instanceof Error && !MmapSegment.isMmapAccessFault(t)) {
                 throw (Error) t;
             }
             // Do NOT fail recovery: the surviving frames still carry these ids in their
@@ -3987,8 +3995,15 @@ public class QwpWebSocketSender implements Sender {
             // around flush() also catches a disk-full during the write-ahead persist. The
             // persist ran before publish and pd.size() did not advance on the failure, so
             // the still-buffered rows re-persist the same range idempotently on retry.
-            // A JVM Error is never a persist failure; let it propagate.
-            if (t instanceof Error) {
+            // A JVM Error is never a persist failure; let it propagate -- except a
+            // recognised mmap access fault, which is NOT a JVM failure to propagate: it
+            // is how an unbacked or sparse append page surfaces, and commitMappedChunk
+            // uses Crc32c.updateUnsafe precisely so it arrives catchable here. Rethrowing
+            // it raw skips disableDeltaDict, and from healPersistedDictionary it escapes
+            // Sender.build() as neither UnreplayableSlotException nor LineSenderException,
+            // so the slot is neither quarantined nor reported and every restart re-faults
+            // the same page.
+            if (t instanceof Error && !MmapSegment.isMmapAccessFault(t)) {
                 throw (Error) t;
             }
             // Degrade before throwing, so this failure is survivable rather than terminal:
