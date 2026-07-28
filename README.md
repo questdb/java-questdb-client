@@ -364,6 +364,19 @@ try (QuestDB db = QuestDB.connect("wss::addr=localhost:9000;username=admin;passw
 }
 ```
 
+**Custom PEM certificate authority:**
+
+```java
+try (QuestDB db = QuestDB.connect(
+        "wss::addr=localhost:9000;tls_roots=/path/to/ca.pem;")) {
+    // ... use db ...
+}
+```
+
+`tls_roots` accepts a PEM certificate or bundle directly. For an existing JKS
+or PKCS#12 trust store, also set `tls_roots_password`; the password switches the
+file interpretation from PEM to a Java trust store.
+
 **Disable certificate validation (not for production):**
 
 ```java
@@ -412,8 +425,8 @@ schema::key1=value1;key2=value2;
 | `password` / `pass`  |              | Basic-auth password                                                 |
 | `token`              |              | Bearer token (sent as an `Authorization` header on the WS upgrade)  |
 | `tls_verify`         | `on`         | TLS certificate validation (`on` or `unsafe_off`)                   |
-| `tls_roots`          |              | Path to a custom truststore                                         |
-| `tls_roots_password` |              | Truststore password                                                 |
+| `tls_roots`          |              | Path to a PEM certificate/bundle, or a JKS/PKCS#12 trust store       |
+| `tls_roots_password` |              | Optional JKS/PKCS#12 password; omit when `tls_roots` is PEM          |
 | `connect_timeout`    | _(OS)_       | TCP connect + TLS handshake timeout, in milliseconds                |
 | `auth_timeout_ms`    | `15000`      | Authentication/upgrade request timeout, in milliseconds             |
 

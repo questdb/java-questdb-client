@@ -184,7 +184,8 @@ public class LineSenderBuilderTest {
             assertConfStrError("badschema::addr=bar;", "invalid schema [schema=badschema, supported-schemas=[http, https, tcp, tcps, ws, wss, udp]]");
             assertConfStrError("http::addr=localhost:-1;", "invalid port [port=-1]");
             assertConfStrError("http::auto_flush=on;", "addr is missing");
-            assertConfStrError("http::addr=localhost;tls_roots=/some/path;", "tls_roots was configured, but tls_roots_password is missing");
+            assertConfStrError("http::addr=localhost;tls_roots=/some/path;", "custom trust store configured, but TLS was not enabled");
+            assertConfStrOk("https::addr=localhost;tls_roots=/some/path;protocol_version=2;");
             assertConfStrError("http::addr=localhost;tls_roots_password=hunter123;", "tls_roots_password was configured, but tls_roots is missing");
             assertConfStrError("tcp::addr=localhost;user=foo;", "token cannot be empty nor null");
             assertConfStrError("tcp::addr=localhost;username=foo;", "token cannot be empty nor null");
@@ -307,7 +308,26 @@ public class LineSenderBuilderTest {
     }
 
     @Test
+    public void testCustomPemRootsDoNotRequirePassword() throws Exception {
+        assertMemoryLeak(() -> {
+            try (Sender ignored = Sender.builder(Sender.Transport.HTTP)
+                    .enableTls()
+                    .advancedTls().customTrustStore("/path/to/ca.pem")
+                    .address(LOCALHOST)
+                    .protocolVersion(2)
+                    .build()) {
+                // Building the lazy HTTP sender proves the fluent TLS
+                // configuration accepts a passwordless PEM roots path.
+            }
+        });
+    }
+
+    @Test
     public void testCustomTruststorePathCannotBeBlank() {
+        assertThrows("trust store path cannot be empty nor null",
+                () -> Sender.builder(Sender.Transport.TCP).advancedTls().customTrustStore(""));
+        assertThrows("trust store path cannot be empty nor null",
+                () -> Sender.builder(Sender.Transport.TCP).advancedTls().customTrustStore((String) null));
         assertThrows("trust store path cannot be empty nor null",
                 () -> Sender.builder(Sender.Transport.TCP).advancedTls().customTrustStore("", TRUSTSTORE_PASSWORD));
         assertThrows("trust store path cannot be empty nor null",

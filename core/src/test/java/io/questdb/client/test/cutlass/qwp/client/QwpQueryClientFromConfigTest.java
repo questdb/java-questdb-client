@@ -974,7 +974,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTlsRootsPasswordWithoutPathRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_roots_password=secret;",
-                "tls_roots and tls_roots_password must be provided together"
+                "tls_roots_password requires tls_roots"
         );
     }
 
@@ -984,11 +984,8 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testTlsRootsWithoutPasswordRejected() {
-        assertReject(
-                "wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;",
-                "tls_roots and tls_roots_password must be provided together"
-        );
+    public void testPemTlsRootsWithoutPasswordAccepted() {
+        assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.pem;");
     }
 
     @Test

@@ -1030,6 +1030,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWssConfigString_tlsRootsPasswordWithoutRoots_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots_password=secret;",
+                "tls_roots_password requires tls_roots"
+        );
+    }
+
+    @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");

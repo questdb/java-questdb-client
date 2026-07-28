@@ -345,9 +345,10 @@ public class QwpQueryClient implements QuietCloseable {
      *   <li>{@code tls_verify=on|unsafe_off} -- TLS certificate validation. Default is {@code on}.
      *       Only allowed with the {@code wss::} schema. {@code unsafe_off} disables hostname and
      *       certificate chain validation; use only for testing.</li>
-     *   <li>{@code tls_roots=<path>} -- path to a custom trust store (PKCS12 or JKS). Must be
-     *       paired with {@code tls_roots_password}. Only allowed with {@code wss::}.</li>
-     *   <li>{@code tls_roots_password=<secret>} -- password for the custom trust store.</li>
+     *   <li>{@code tls_roots=<path>} -- path to a PEM certificate file or bundle. Only allowed
+     *       with {@code wss::}.</li>
+     *   <li>{@code tls_roots_password=<secret>} -- optional password. When present,
+     *       {@code tls_roots} is read as a JKS or PKCS#12 trust store instead of PEM.</li>
      *   <li>{@code zone=<id>} -- client zone identifier (opaque, case-insensitive;
      *       e.g. {@code eu-west-1a}). When set with {@code target=any|replica},
      *       failover prefers endpoints whose server-advertised {@code zone_id}
@@ -462,7 +463,11 @@ public class QwpQueryClient implements QuietCloseable {
             client.withCompression(compression, compressionLevel);
             if (tls) {
                 if (tlsRoots != null) {
-                    client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
+                    if (tlsRootsPassword == null) {
+                        client.withTrustStore(tlsRoots);
+                    } else {
+                        client.withTrustStore(tlsRoots, tlsRootsPassword.toCharArray());
+                    }
                 } else if (tlsValidation != null && tlsValidation == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
                     client.withInsecureTls();
                 } else {
@@ -542,8 +547,8 @@ public class QwpQueryClient implements QuietCloseable {
             throw new IllegalArgumentException(
                     "tls_verify/tls_roots/tls_roots_password require the wss:: schema");
         }
-        if ((tlsRoots == null) != (tlsRootsPassword == null)) {
-            throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
+        if (tlsRoots == null && tlsRootsPassword != null) {
+            throw new IllegalArgumentException("tls_roots_password requires tls_roots");
         }
         // Mirror fromConfig's effective values: a missing bound takes its
         // default, so the ordering is enforced even when only one key is set
@@ -1215,7 +1220,8 @@ public class QwpQueryClient implements QuietCloseable {
 
     /**
      * Enables TLS with certificate validation disabled. Intended for testing only --
-     * production code should use {@link #withTls} or {@link #withTrustStore}.
+     * production code should use {@link #withTls} or
+     * {@link #withTrustStore(String)}.
      * Must be called before {@link #connect}.
      */
     public QwpQueryClient withInsecureTls() {
@@ -1286,7 +1292,27 @@ public class QwpQueryClient implements QuietCloseable {
     }
 
     /**
-     * Enables TLS with full certificate validation against the given custom trust store.
+     * Enables TLS with full certificate validation against the custom root
+     * certificates in the given PEM file or bundle.
+     * Must be called before {@link #connect}.
+     *
+     * @param pemRootsPath filesystem path to a PEM certificate file or bundle
+     */
+    public QwpQueryClient withTrustStore(String pemRootsPath) {
+        checkPreConnect("withTrustStore");
+        if (pemRootsPath == null) {
+            throw new IllegalArgumentException("pemRootsPath must not be null");
+        }
+        this.tlsEnabled = true;
+        this.tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+        this.trustStorePath = pemRootsPath;
+        this.trustStorePassword = null;
+        return this;
+    }
+
+    /**
+     * Enables TLS with full certificate validation against the given
+     * password-protected JKS or PKCS#12 trust store.
      * Must be called before {@link #connect}.
      *
      * @param trustStorePath     filesystem path to a PKCS12 or JKS trust store
