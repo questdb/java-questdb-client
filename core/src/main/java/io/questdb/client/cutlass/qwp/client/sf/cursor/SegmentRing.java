@@ -161,11 +161,14 @@ public final class SegmentRing implements QuietCloseable {
      * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
      * created initial segment.
      * <p>
-     * Recovery is best-effort: a single bad-magic file is silently skipped
-     * (logged-then-ignored is the right call here; a stray unrelated file in
-     * the SF dir shouldn't take the whole sender down). A failure to open
-     * an otherwise-valid segment IS fatal -- the caller's data integrity
-     * depends on every segment being readable.
+     * A single {@code .sfa} that cannot be opened (bad magic, bad header, an
+     * mmap-access fault) does not abort the scan of its siblings, but it does
+     * cost the whole slot: the file is renamed to {@code <path>.corrupt} and,
+     * once every file has been scanned, {@link UnreplayableSlotException} is
+     * thrown if any file was skipped. Its frame range cannot be shown
+     * already-acked, so the only sound response is to refuse the slot rather
+     * than seed the ack cursor (or the successor-baseSeq contiguity check)
+     * past data that may never have been sent.
      */
     public static SegmentRing openExisting(String sfDir, long maxBytesPerSegment) {
         return openExisting(FilesFacade.INSTANCE, sfDir, maxBytesPerSegment);
@@ -202,6 +205,11 @@ public final class SegmentRing implements QuietCloseable {
         // not leave fds + mmaps owned by `opened` orphaned. Close every
         // recovered segment and rethrow so the engine surfaces the failure.
         try {
+            // Count of .sfa files this recovery could not open and set aside.
+            // A skip breaks the contiguity check's premise below -- see the
+            // refusal after that loop -- so recovery must know the count even
+            // though the contiguity check itself never sees the skipped file.
+            int skippedSegmentCount = 0;
             try {
                 int rc = 1;
                 // Reused across files: MmapSegment.openExisting publishes the segment
@@ -282,7 +290,26 @@ public final class SegmentRing implements QuietCloseable {
                                     && !MmapSegment.isMmapAccessFault(t)) {
                                 throw t;
                             }
-                            LOG.warn("openExisting: skipping {} -- {}", path, t.toString());
+                            // Rename the skipped file so a later recovery cannot sort a
+                            // reused FSN range against it. A skipped NEWEST segment lets
+                            // nextSeq reuse the FSNs it owns; on the next recovery the two
+                            // sort onto overlapping baseSeqs and throw MmapSegmentException
+                            // -- not UnreplayableSlotException, so build() is not
+                            // quarantined, it just fails identically forever. This is the
+                            // same treatment the empty-with-torn-tail branch already
+                            // applies a few lines above.
+                            String quarantinePath = path + ".corrupt";
+                            skippedSegmentCount++;
+                            // A skip now costs the whole slot (see the refusal below), so
+                            // this is an error, not a warning.
+                            if (Files.rename(path, quarantinePath) == 0) {
+                                LOG.error("openExisting: skipping {} -- {} -- quarantined to {}",
+                                        path, t.toString(), quarantinePath);
+                            } else {
+                                LOG.error("openExisting: skipping {} -- {} -- could not rename to {};"
+                                                + " a later recovery may see a reused FSN range",
+                                        path, t.toString(), quarantinePath);
+                            }
                         } finally {
                             // Close any seg whose ownership wasn't transferred
                             // (either to opened, or via the empty-branch close
@@ -313,6 +340,13 @@ public final class SegmentRing implements QuietCloseable {
                 Files.findClose(find);
             }
             if (opened.size() == 0) {
+                // Every .sfa in the directory was skipped -- the extreme case of the
+                // refusal below, where NO segment survived to even attempt the
+                // contiguity check. Returning null here would tell the caller "no
+                // prior slot", so it would start a fresh ring at baseSeq=0 and every
+                // frame the skipped files held is lost with no record beyond the
+                // .corrupt files on disk.
+                refuseIfSegmentsSkipped(skippedSegmentCount, sfDir);
                 return null;
             }
             // Sort by baseSeq ascending. Worst-case segment count is
@@ -347,6 +381,14 @@ public final class SegmentRing implements QuietCloseable {
                                     + " check disk health");
                 }
             }
+            // The ack seed derives from the oldest surviving segment's baseSeq, on the
+            // premise that anything below it was trimmed and trim is ack-driven. A skipped
+            // segment breaks that premise, and its own baseSeq is unreadable -- it lives
+            // at header offset 8, inside the read the catch above wrapped -- so we cannot
+            // show its frames were delivered. Refuse the slot, typed so Sender.build()
+            // sets it aside for an operator with its bytes intact rather than seeding the
+            // ack past frames that were never sent.
+            refuseIfSegmentsSkipped(skippedSegmentCount, sfDir);
             // The newest segment becomes the active. Even if it's full, that's OK:
             // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
             // installs a hot spare, the producer rotates. Same fast path as a
@@ -851,6 +893,21 @@ public final class SegmentRing implements QuietCloseable {
                 || (sealedHead >= SEALED_PREFIX_COMPACTION_THRESHOLD
                 && sealedHead >= size - sealedHead)) {
             compactSealedPrefix();
+        }
+    }
+
+    /**
+     * Throws {@link UnreplayableSlotException} when the per-file scan above had to
+     * skip any unreadable {@code .sfa}. No-op when {@code skippedSegmentCount} is
+     * zero.
+     */
+    private static void refuseIfSegmentsSkipped(int skippedSegmentCount, String sfDir) {
+        if (skippedSegmentCount > 0) {
+            throw new UnreplayableSlotException(
+                    "recovery skipped " + skippedSegmentCount + " unreadable segment(s) in "
+                            + sfDir + "; their frame ranges cannot be shown already-acked, so"
+                            + " the slot cannot be replayed without risking silent loss --"
+                            + " the affected data must be resent");
         }
     }
 

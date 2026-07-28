@@ -262,6 +262,10 @@ public final class CursorSendEngine implements QuietCloseable {
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
             // already on disk and corrupting ACK translation, trim, and replay.
+            // May throw UnreplayableSlotException when recovery had to skip an
+            // unreadable segment -- the catch (Throwable) below cleans up and
+            // lets it propagate so Sender.build() can quarantine the slot
+            // instead of seeding the ack past frames that were never sent.
             SegmentRing recovered = memoryMode ? null
                     : SegmentRing.openExisting(sfDir, segmentSizeBytes);
             this.wasRecoveredFromDisk = recovered != null;

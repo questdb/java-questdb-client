@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
@@ -39,6 +40,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -229,14 +231,18 @@ public class MmapSegmentRecoveryFaultTest {
      * <ul>
      *   <li><b>Interpreter / C1:</b> {@code scanFrames}'s own
      *       {@code catch (InternalError)} fires, so the frame below the tear is
-     *       recovered and a usable segment is returned.</li>
+     *       recovered and a usable segment is returned -- no skip, recovery
+     *       succeeds normally.</li>
      *   <li><b>C2:</b> once {@code scanFrames} is inlined into
      *       {@code openExisting}, HotSpot delivers the async unsafe-access
      *       {@code InternalError} to {@code openExisting}'s outer
      *       {@code catch (Throwable)} instead of the inlined inner one, which
      *       converts the file to a skippable {@link MmapSegmentException}.
-     *       Still fully handled -- {@code SegmentRing} skips just this
-     *       {@code .sfa} rather than aborting the slot.</li>
+     *       {@code SegmentRing} still catches it at the per-file boundary, but a
+     *       skip now refuses the WHOLE slot ({@link UnreplayableSlotException})
+     *       rather than quietly returning a ring built from the healthy
+     *       sibling alone -- the faulting file's frame range cannot be shown
+     *       already-acked.</li>
      * </ul>
      * (The C2 delivery imprecision is a property of HotSpot's async
      * unsafe-access fault handling, not of this seam; the seam only makes it
@@ -277,36 +283,49 @@ public class MmapSegmentRecoveryFaultTest {
             truncateTo(path, page);
             // Report twice the real length so openExisting maps a second,
             // beyond-EOF page; the scan faults reading it on any filesystem.
-            // A HEALTHY sibling, contiguous below the faulting segment (baseSeq 0..4,
-            // faulting one at 5). Without it the whole slot is one file, so a fault
-            // converted to a per-file skip leaves openExisting returning null and the
-            // assertions below -- nested in `if (ring != null)` -- ran ZERO times, under
-            // a comment claiming that outcome was "also handled". Nothing was checked.
-            // With the sibling the ring is non-null on EVERY delivery path, so the
-            // recovery invariant can be asserted unconditionally: one bad file must
-            // never take the slot down with it.
-            writeSegment(tmpDir + "/seg-sibling.sfa", 0L, new int[]{8, 8, 8, 8, 8});
+            // A healthy sibling, contiguous below the faulting segment (baseSeq
+            // 0..4, faulting one at 5), so recovery has something to refuse
+            // OTHER than an empty directory in the late-delivery branch below.
+            String siblingPath = tmpDir + "/seg-sibling.sfa";
+            writeSegment(siblingPath, 0L, new int[]{8, 8, 8, 8, 8});
 
             FilesFacade ff = new MapPastEofFacade(path, 2 * page);
-            // Must not throw, on any JDK or JIT tier. Revert the fault handling
-            // and a raw InternalError propagates out of here instead.
-            try (SegmentRing ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES)) {
-                assertNotNull("one faulting .sfa must never take down the whole slot", ring);
-                assertNotNull("the healthy sibling must recover", ring.firstSealed() != null
-                        ? ring.firstSealed() : ring.getActive());
-                if (ring.getActive().baseSeq() == 5L) {
-                    // Interpreter / C1, or precise delivery on 21+: scanFrames'
-                    // own catch fired and the frame below the tear survived.
-                    assertEquals("the frame below the beyond-EOF page must be recovered",
-                            1L, ring.getActive().frameCount());
-                    assertEquals("scan must stop at the beyond-EOF boundary",
-                            page, ring.getActive().publishedOffset());
-                } else {
-                    // Late delivery: SegmentRing skipped the faulting file entirely, so
-                    // the sibling is all that is left -- and it must be intact.
-                    assertEquals("the skip must be per-FILE: the sibling keeps every frame",
-                            5L, ring.getActive().frameCount());
-                    assertEquals(0L, ring.getActive().baseSeq());
+            // Must not throw an untyped/raw error on any JDK or JIT tier -- only
+            // ever a recovered ring (precise delivery) or the typed refusal
+            // (late-but-handled delivery). Revert the fault handling and a raw
+            // InternalError propagates out of here instead.
+            SegmentRing ring = null;
+            try {
+                ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES);
+            } catch (UnreplayableSlotException refused) {
+                // Late delivery: SegmentRing caught the fault (directly, or via
+                // MmapSegment.openExisting's own conversion) at the per-file
+                // boundary and skipped the faulting file -- which now refuses
+                // the WHOLE slot rather than quietly recovering the sibling
+                // alone, since the faulting file's frame range cannot be shown
+                // already-acked. The sibling's data is not lost: it stays on
+                // disk, unrenamed, and the faulting file is quarantined to
+                // .corrupt for a postmortem.
+                assertTrue(refused.getMessage(), refused.getMessage().contains("skipped"));
+                assertFalse("the unreadable segment must be renamed aside", Files.exists(path));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(path + ".corrupt"));
+                assertTrue("the healthy sibling must be untouched", Files.exists(siblingPath));
+                return;
+            }
+            try {
+                // Interpreter / C1, or precise delivery on 21+: scanFrames' own
+                // catch fired and the frame below the tear survived -- no skip
+                // occurred at all, so recovery succeeds normally.
+                assertNotNull("precise delivery must still recover a usable ring", ring);
+                assertEquals("the frame below the beyond-EOF page must be recovered",
+                        5L, ring.getActive().baseSeq());
+                assertEquals(1L, ring.getActive().frameCount());
+                assertEquals("scan must stop at the beyond-EOF boundary",
+                        page, ring.getActive().publishedOffset());
+            } finally {
+                if (ring != null) {
+                    ring.close();
                 }
             }
         });
@@ -317,9 +336,11 @@ public class MmapSegmentRecoveryFaultTest {
      * the boundary that owns the guarantee. The faulting file is truncated to
      * empty while the facade reports a full page, so its very first header read
      * (magic) lands on a beyond-EOF page and faults on any filesystem; a healthy
-     * sibling sits beside it in the same directory. Recovery must skip ONLY the
-     * faulting {@code .sfa} and still return the sibling's frames -- never let
-     * the fault abort the slot, and never abort the JVM.
+     * sibling sits beside it in the same directory. Recovery must skip the
+     * faulting {@code .sfa}, quarantine it to {@code .corrupt}, and refuse the
+     * whole slot ({@link UnreplayableSlotException}) rather than quietly
+     * returning a ring built from the sibling alone -- never let the fault
+     * abort the slot with an untyped error, and never abort the JVM.
      * <p>
      * As with {@link #testScanFaultOnMapPastEofIsHandledAnyFilesystem}, this
      * drives {@link SegmentRing#openExisting} rather than
@@ -327,7 +348,7 @@ public class MmapSegmentRecoveryFaultTest {
      * unsafe-access fault in the caller's frame, so only the per-file arm in
      * {@code SegmentRing} can convert it on the shipping JDK 8 target. Revert
      * that arm (or the header-block conversion) and a raw {@code InternalError}
-     * escapes here and takes the sibling's data down with it.
+     * escapes here instead of the typed refusal.
      */
     @Test
     public void testHeaderFaultOnMapPastEofIsSkippableAnyFilesystem() throws Exception {
@@ -350,13 +371,17 @@ public class MmapSegmentRecoveryFaultTest {
             // The sibling is untouched and must survive the neighbour's fault.
             writeSegment(healthy, 0L, new int[]{64, 64});
             FilesFacade ff = new MapPastEofFacade(faulting, page);
-            try (SegmentRing ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES)) {
-                assertNotNull("the healthy sibling must still recover", ring);
-                assertEquals("only the faulting segment may be skipped",
-                        0L, ring.getActive().baseSeq());
-                assertEquals("the sibling's frames must all survive",
-                        2L, ring.getActive().frameCount());
+            try {
+                Misc.free(SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
+                fail("expected recovery to refuse rather than silently drop the "
+                        + "faulting segment's range");
+            } catch (UnreplayableSlotException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
             }
+            assertFalse("the unreadable segment must be renamed aside", Files.exists(faulting));
+            assertTrue("the renamed file must survive for a postmortem",
+                    Files.exists(faulting + ".corrupt"));
+            assertTrue("the healthy sibling must be untouched", Files.exists(healthy));
         });
     }
 
@@ -371,13 +396,17 @@ public class MmapSegmentRecoveryFaultTest {
      * BEFORE entering its own try block, exactly reproducing the pre-21 case
      * where the error reaches {@code SegmentRing} unconverted.
      * <p>
-     * Recovery must skip that one {@code .sfa} and still return the sibling's
-     * frames. Drop the {@code isMmapAccessFault} arm and the error reaches the
-     * outer catch, which closes every recovered segment and rethrows -- the
-     * whole-slot abort this guards against.
+     * Recovery must skip that one {@code .sfa} -- rename it to {@code .corrupt}
+     * and refuse the whole slot with {@link UnreplayableSlotException} rather
+     * than quietly returning a ring built from the sibling alone, since the
+     * faulting file's frame range cannot be shown already-acked. Drop the
+     * {@code isMmapAccessFault} arm and the error reaches the outer catch,
+     * which closes every recovered segment and rethrows an untyped exception
+     * instead -- {@code build()} would then fail the slot forever rather than
+     * quarantine it.
      */
     @Test
-    public void testSegmentRingSkipsUnconvertedMmapFaultAndRecoversSiblings() throws Exception {
+    public void testSegmentRingRefusesSlotOnUnconvertedMmapFault() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String faulting = tmpDir + "/seg-lateflt-faulting.sfa";
             final String healthy = tmpDir + "/seg-lateflt-sibling.sfa";
@@ -385,13 +414,17 @@ public class MmapSegmentRecoveryFaultTest {
             writeSegment(healthy, 0L, new int[]{64, 64});
             FilesFacade ff = new ThrowingLengthFacade(faulting, new InternalError(
                     "a fault occurred in a recent unsafe memory access operation in compiled Java code"));
-            try (SegmentRing ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES)) {
-                assertNotNull("the healthy sibling must still recover", ring);
-                assertEquals("only the faulting segment may be skipped",
-                        0L, ring.getActive().baseSeq());
-                assertEquals("the sibling's frames must all survive",
-                        2L, ring.getActive().frameCount());
+            try {
+                Misc.free(SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
+                fail("expected recovery to refuse rather than silently drop the "
+                        + "faulting segment's range");
+            } catch (UnreplayableSlotException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
             }
+            assertFalse("the unreadable segment must be renamed aside", Files.exists(faulting));
+            assertTrue("the renamed file must survive for a postmortem",
+                    Files.exists(faulting + ".corrupt"));
+            assertTrue("the healthy sibling must be untouched", Files.exists(healthy));
         });
     }
 

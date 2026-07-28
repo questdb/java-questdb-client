@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Misc;
@@ -40,6 +41,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -358,19 +360,29 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * A skip now costs the whole slot: a bad-magic stray file used to be
+     * silently ignored, with the one good segment recovering fine. Its frame
+     * range cannot be shown already-acked, so recovery must instead refuse via
+     * {@link UnreplayableSlotException} and quarantine the stray file to
+     * {@code .corrupt} rather than quietly returning a ring built from the good
+     * segment alone.
+     */
     @Test
-    public void testOpenExistingSkipsBadMagicFile() throws Exception {
+    public void testOpenExistingRefusesSlotContainingAStrayBadMagicFile() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 // One good segment.
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/good.sfa", 0, segSize);
+                String goodPath = tmpDir + "/good.sfa";
+                MmapSegment s0 = MmapSegment.create(goodPath, 0, segSize);
                 s0.tryAppend(buf, 16);
                 s0.close();
-                // One stray .sfa with no proper header — must be ignored.
-                int fd = Files.openCleanRW(tmpDir + "/stray.sfa");
+                // One stray .sfa with no proper header.
+                String strayPath = tmpDir + "/stray.sfa";
+                int fd = Files.openCleanRW(strayPath);
                 long hdr = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
                 try {
                     Unsafe.getUnsafe().putLong(hdr, 0xBADBADBADBADBADBL);
@@ -381,11 +393,110 @@ public class SegmentRingTest {
                     Unsafe.free(hdr, 8, MemoryTag.NATIVE_DEFAULT);
                 }
 
-                try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
-                    assertNotNull(recovered);
-                    assertEquals(0, recovered.getActive().baseSeq());
-                    assertEquals(0, recovered.getSealedSegments().size());
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError(
+                            "expected recovery to refuse rather than silently drop the stray file");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
                 }
+                assertFalse("the unreadable stray file must be renamed aside", Files.exists(strayPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(strayPath + ".corrupt"));
+                assertTrue("the good segment must be untouched", Files.exists(goodPath));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Skipped OLDEST segment: {@code firstSealed()} would normally return the
+     * second-oldest survivor, and {@code CursorSendEngine} seeds
+     * {@code ackedFsn = lowestBase - 1} on the premise "anything trimmed off the
+     * ring's bottom must have been acked, because trim is ack-driven". A
+     * segment can leave the bottom because of a read fault instead of an ACK,
+     * so that premise is false -- recovery must refuse rather than hand back a
+     * ring whose sealed list quietly starts one segment higher than what
+     * really produced acked data.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenOldestSegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String oldestPath = tmpDir + "/skip-oldest-0.sfa";
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/skip-oldest-1.sfa", 4, segSize);
+                for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+                s1.close();
+
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-oldest-2.sfa", 8, segSize);
+                s2.tryAppend(buf, 16);
+                s2.close();
+
+                corruptMagic(oldestPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError(
+                            "expected recovery to refuse rather than silently drop the oldest segment");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                }
+                assertFalse("the unreadable oldest segment must be renamed aside",
+                        Files.exists(oldestPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(oldestPath + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Skipped NEWEST segment: {@code nextSeq = active.baseSeq() + active.frameCount()}
+     * would derive from the highest surviving baseSeq, reusing the FSN range
+     * the skipped file owned. Left unrenamed, the next recovery would sort the
+     * two segments onto overlapping baseSeqs and throw {@code MmapSegmentException}
+     * -- untyped, so {@code build()} is not quarantined and fails identically
+     * forever. Recovery must refuse up front instead.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenNewestSegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-newest-0.sfa", 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String newestPath = tmpDir + "/skip-newest-1.sfa";
+                MmapSegment s1 = MmapSegment.create(newestPath, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptMagic(newestPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError(
+                            "expected recovery to refuse rather than let a later recovery reuse the "
+                                    + "skipped segment's FSN range");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                }
+                assertFalse("the unreadable newest segment must be renamed aside",
+                        Files.exists(newestPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(newestPath + ".corrupt"));
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
@@ -688,6 +799,27 @@ public class SegmentRingTest {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    /**
+     * Overwrites the 4-byte {@code FILE_MAGIC} field at offset 0 with a value
+     * that cannot match {@link MmapSegment#FILE_MAGIC}, leaving every other
+     * byte -- including real frame data -- untouched. Forces
+     * {@link MmapSegment#openExisting} to throw at the magic check, landing in
+     * {@code SegmentRing}'s per-file skip arm without going anywhere near the
+     * "empty leftover" branch a torn-tail CRC failure would hit instead.
+     */
+    private static void corruptMagic(String path) {
+        int fd = Files.openRW(path);
+        assertTrue("openRW failed", fd >= 0);
+        long buf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putInt(buf, 0xBADBAD00);
+            Files.write(fd, buf, 4, 0);
+        } finally {
+            Unsafe.free(buf, 4, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
     }
 
     private static void fillPattern(long addr, int len, int seed) {
