@@ -27,6 +27,7 @@ package io.questdb.client.test.impl;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
@@ -40,6 +41,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Proves {@code sf_dir} is never created world-writable by default, and that
@@ -85,6 +87,59 @@ public class SfDirPermissionsTest {
     }
 
     /**
+     * End-to-end version of {@link #testSfDirAndLockDirAreGatedTogether}: a real
+     * {@code Sender.builder(cfg).build()} against a real {@link TestWebSocketServer}
+     * (the same harness {@code SenderPoolSfTest} already uses), asserting the
+     * ACTUAL on-disk POSIX permissions {@code Files.mkdir} left behind -- not a
+     * recorded {@code int}. This exercises the real call sequence in
+     * {@code Sender.build()} ({@code Files.mkdir(sfDir, dirMode)} then
+     * {@code SlotLock.acquireLogical(slotPath, dirMode)}), so it catches a
+     * regression the component-level test above cannot: one that reorders
+     * {@code dirMode}'s resolution relative to the {@code mkdir} call, or
+     * reintroduces "restrict {@code sf_dir} but not {@code .slot-locks}" in a
+     * way that only manifests once {@code build()} actually runs.
+     * <p>
+     * The "{@code sf_dir_shared=on} is observably wider" assertion is gated on
+     * the ambient umask: {@code mkdir(2)} applies {@code mode & ~umask & 0777},
+     * so {@code DIR_MODE_SHARED} (01777) and {@code DIR_MODE_DEFAULT} (0755)
+     * collapse to the IDENTICAL 0755 under the common umask 022 -- verified
+     * empirically on this suite's own CI/dev umask. The two directories always
+     * matching EACH OTHER, and the default case never being world-writable, are
+     * asserted unconditionally: those hold regardless of the ambient umask.
+     */
+    @Test
+    public void testSfDirAndLockDirPermissionsMatchEndToEnd() throws Exception {
+        Assume.assumeFalse(System.getProperty("os.name").toLowerCase().contains("win"));
+        TestUtils.assertMemoryLeak(() -> {
+            boolean umaskShowsWidening = ambientUmaskPreservesGroupOrOtherWrite();
+
+            String defaultSfDir = buildRealSenderAndReturnSfDir(false);
+            Set<PosixFilePermission> defaultSfPerms = statPerms(defaultSfDir);
+            Set<PosixFilePermission> defaultLockPerms = statPerms(defaultSfDir + "/.slot-locks");
+
+            String sharedSfDir = buildRealSenderAndReturnSfDir(true);
+            Set<PosixFilePermission> sharedSfPerms = statPerms(sharedSfDir);
+            Set<PosixFilePermission> sharedLockPerms = statPerms(sharedSfDir + "/.slot-locks");
+
+            Assert.assertEquals("sf_dir and .slot-locks must have identical permissions (default)",
+                    defaultSfPerms, defaultLockPerms);
+            Assert.assertEquals("sf_dir and .slot-locks must have identical permissions (sf_dir_shared=on)",
+                    sharedSfPerms, sharedLockPerms);
+
+            Assert.assertFalse("default sf_dir must never be world-writable",
+                    defaultSfPerms.contains(PosixFilePermission.OTHERS_WRITE));
+            Assert.assertFalse("default .slot-locks must never be world-writable",
+                    defaultLockPerms.contains(PosixFilePermission.OTHERS_WRITE));
+
+            if (umaskShowsWidening) {
+                Assert.assertNotEquals(
+                        "sf_dir_shared=on must be observably wider than the default under this umask",
+                        defaultSfPerms, sharedSfPerms);
+            }
+        });
+    }
+
+    /**
      * The mode {@code Sender.build()} resolves for {@code sf_dir} itself
      * ({@code sfDirShared ? DIR_MODE_SHARED : DIR_MODE_DEFAULT}), read back via
      * the same connect-string-snapshot facade {@code WsSenderConfigHonoredTest}
@@ -94,6 +149,47 @@ public class SfDirPermissionsTest {
         Map<String, Object> snapshot = Sender.builder("ws::addr=h:9000;" + kv).wsConfigSnapshotForTest();
         boolean shared = Boolean.TRUE.equals(snapshot.get("sf_dir_shared"));
         return shared ? Files.DIR_MODE_SHARED : Files.DIR_MODE_DEFAULT;
+    }
+
+    private static Set<PosixFilePermission> statPerms(String path) throws Exception {
+        return java.nio.file.Files.getPosixFilePermissions(Paths.get(path));
+    }
+
+    /**
+     * Probes whether THIS process's umask lets a widened request bit survive
+     * {@code mkdir}: creates a throwaway directory at {@link Files#DIR_MODE_SHARED}
+     * and checks whether group- or others-write made it through. False under the
+     * common umask 022 (both bits get cleared regardless of the requested mode);
+     * true under a looser umask (002, 000).
+     */
+    private boolean ambientUmaskPreservesGroupOrOtherWrite() throws Exception {
+        String probe = temp.newFolder("umask-probe-" + System.nanoTime()).getAbsolutePath() + "/probe";
+        Assert.assertEquals(0, Files.mkdir(probe, Files.DIR_MODE_SHARED));
+        Set<PosixFilePermission> perms = statPerms(probe);
+        return perms.contains(PosixFilePermission.GROUP_WRITE) || perms.contains(PosixFilePermission.OTHERS_WRITE);
+    }
+
+    /**
+     * Builds and immediately closes a real {@code Sender} against a real local
+     * {@link TestWebSocketServer}, with {@code sf_dir_shared} set per {@code shared}.
+     * No rows are written -- {@code Files.mkdir(sfDir, ...)} and
+     * {@code SlotLock.acquireLogical} both run well before {@code connect()}'s
+     * retry loop, so a bare WS upgrade is enough to exercise them.
+     *
+     * @return the {@code sf_dir} path passed to the connect string
+     */
+    private String buildRealSenderAndReturnSfDir(boolean shared) throws Exception {
+        String sfDir = temp.newFolder("e2e-" + (shared ? "shared-" : "default-") + System.nanoTime())
+                .getAbsolutePath() + "/sf";
+        try (TestWebSocketServer server = new TestWebSocketServer(new NoOpServerHandler())) {
+            server.start();
+            Assert.assertTrue("test WS server never started", server.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";"
+                    + (shared ? "sf_dir_shared=on;" : "");
+            Sender sender = Sender.builder(cfg).build();
+            sender.close();
+        }
+        return sfDir;
     }
 
     /**
@@ -117,6 +213,10 @@ public class SfDirPermissionsTest {
             }
         });
         return recordedMode[0];
+    }
+
+    /** Never invoked in this test -- a real WS upgrade completes before any row would be flushed. */
+    private static final class NoOpServerHandler implements TestWebSocketServer.WebSocketServerHandler {
     }
 
     /** Records the mode each directory was created with, then delegates. */
