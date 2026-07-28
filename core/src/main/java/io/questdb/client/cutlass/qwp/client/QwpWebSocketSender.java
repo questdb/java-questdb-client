@@ -725,45 +725,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Compatibility overload retained for callers compiled before the
-     * catch-up cap-gap dwell was added to the master signature.
-     */
-    public static QwpWebSocketSender connect(
-            List<Endpoint> endpoints,
-            ClientTlsConfiguration tlsConfig,
-            int autoFlushRows,
-            int autoFlushBytes,
-            long autoFlushIntervalNanos,
-            String authorizationHeader,
-            boolean requestDurableAck,
-            CursorSendEngine cursorEngine,
-            long closeFlushTimeoutMillis,
-            long reconnectMaxDurationMillis,
-            long reconnectInitialBackoffMillis,
-            long reconnectMaxBackoffMillis,
-            Sender.InitialConnectMode initialConnectMode,
-            SenderErrorHandler errorHandler,
-            int errorInboxCapacity,
-            long durableAckKeepaliveIntervalMillis,
-            long authTimeoutMs,
-            int connectTimeoutMs,
-            SenderConnectionListener connectionListener,
-            int connectionListenerInboxCapacity,
-            int maxFrameRejections,
-            long poisonMinEscalationWindowMillis
-    ) {
-        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, authorizationHeader, requestDurableAck,
-                cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
-                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
-                initialConnectMode, errorHandler, errorInboxCapacity,
-                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
-                connectionListener, connectionListenerInboxCapacity,
-                maxFrameRejections, poisonMinEscalationWindowMillis,
-                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS);
-    }
-
-    /**
      * Master connect overload — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in

@@ -664,11 +664,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Compatibility policy-aware constructor. New production call sites should
-     * use the {@link ReconnectPolicy} overload below, which names the foreground
-     * versus orphan ownership distinction directly.
+     * Implementation constructor. The {@link ReconnectPolicy} overload is the public
+     * entry point; it names the foreground versus orphan ownership distinction directly
+     * and maps it onto the {@link CatchUpCapGapPolicy} this constructor takes.
      */
-    public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
+    private CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
                                    ReconnectFactory reconnectFactory,
                                    long reconnectInitialBackoffMillis,

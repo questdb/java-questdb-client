@@ -160,31 +160,6 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
-     * Compatibility constructor retained for callers compiled before the
-     * catch-up cap-gap dwell was added to the master signature.
-     */
-    public BackgroundDrainer(
-            String slotPath,
-            long segmentSizeBytes,
-            long sfMaxTotalBytes,
-            CursorWebSocketSendLoop.ReconnectFactory clientFactory,
-            long reconnectMaxDurationMillis,
-            long reconnectInitialBackoffMillis,
-            long reconnectMaxBackoffMillis,
-            boolean requestDurableAck,
-            long durableAckKeepaliveIntervalMillis,
-            int maxHeadFrameRejections,
-            long poisonMinEscalationWindowMillis
-    ) {
-        this(slotPath, segmentSizeBytes, sfMaxTotalBytes, clientFactory,
-                reconnectMaxDurationMillis, reconnectInitialBackoffMillis,
-                reconnectMaxBackoffMillis, requestDurableAck,
-                durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
-                poisonMinEscalationWindowMillis,
-                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS);
-    }
-
-    /**
      * Master constructor — also accepts the poison-frame detector threshold
      * ({@code max_frame_rejections}) forwarded to the drain loop's
      * {@link CursorWebSocketSendLoop}: the drainer replays the owner sender's

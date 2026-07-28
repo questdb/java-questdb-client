@@ -341,7 +341,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
                 },
                 0, 1,
                 false, 0L, 3, 0L, 0L,
-                CursorWebSocketSendLoop.CatchUpCapGapPolicy.TERMINAL_AFTER_SETTLE_BUDGET);
+                CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
     }
 
     private static CursorWebSocketSendLoop newForegroundLoop(CursorSendEngine engine) {
