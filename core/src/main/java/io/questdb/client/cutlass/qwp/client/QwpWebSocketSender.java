@@ -1147,7 +1147,24 @@ public class QwpWebSocketSender implements Sender {
                     //    rows -> mmap'd / malloc'd ring). After this, the
                     //    cursor engine's publishedFsn reflects the final
                     //    target the I/O loop must drive ackedFsn up to.
-                    flushPendingRows(deferCommit);
+                    //    A pre-flight rejection means this batch cannot fit
+                    //    the current cap however it is split. It is
+                    //    RETAINED by design so it can go out once a
+                    //    larger-cap node is reached -- but on close there is
+                    //    no later flush, and letting the throw escape here
+                    //    skips sendCommitMessage, sealAndSwapBuffer and
+                    //    drainOnClose, abandoning every row an earlier
+                    //    successful flush already published. The message
+                    //    that path emits tells the caller to close the
+                    //    sender to discard the batch, so honour that:
+                    //    discard it, remember the error, and let the rest of
+                    //    close() run. rethrowTerminal below still surfaces it.
+                    try {
+                        flushPendingRows(deferCommit);
+                    } catch (BatchTooLargeForCapException e) {
+                        resetTableBuffersAfterFlush();
+                        terminalError = captureCloseError(terminalError, e);
+                    }
                     if (!deferCommit && hasDeferredMessages) {
                         sendCommitMessage();
                     }
@@ -3715,7 +3732,7 @@ public class QwpWebSocketSender implements Sender {
                 // never fit, so say that here rather than let a caller read the repeat
                 // rejections as a transient and keep appending to a batch that only
                 // grows.
-                throw new LineSenderException("single table batch too large for server batch cap")
+                throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
                         .put(", serverMaxBatchSize=").put(cap).put(']')
