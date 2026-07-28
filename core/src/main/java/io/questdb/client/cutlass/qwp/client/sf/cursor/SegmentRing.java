@@ -379,6 +379,23 @@ public final class SegmentRing implements QuietCloseable {
             // in lexicographic (== baseSeq-hex) order and a naive first-element
             // pivot would degrade back to O(N²) on exactly that common case.
             sortByBaseSeq(opened, 0, opened.size());
+            // The ack seed derives from the oldest surviving segment's baseSeq, on the
+            // premise that anything below it was trimmed and trim is ack-driven. A skipped
+            // segment breaks that premise, and its own baseSeq is unreadable -- it lives
+            // at header offset 8, inside the read the catch above wrapped -- so we cannot
+            // show its frames were delivered. Refuse the slot, typed so Sender.build()
+            // sets it aside for an operator with its bytes intact rather than seeding the
+            // ack past frames that were never sent.
+            //
+            // MUST run before the contiguity check below: a skipped INTERIOR segment
+            // opens an FSN gap between its surviving neighbours, and that check throws
+            // the untyped MmapSegmentException first if it runs first. That escapes both
+            // the constructor-time and connect()-time UnreplayableSlotException catches
+            // in Sender.build(), and repeats identically forever -- the skipped file is
+            // already renamed to .corrupt, so every retry recomputes skippedSegmentCount
+            // as 0 and hits the same gap. Checking the skip tally first means any skip
+            // refuses before the gap it may have opened is ever examined.
+            refuseIfSegmentsSkipped(skippedSegmentCount, sfDir);
             // Sanity: the recovered segments must form a contiguous FSN range.
             // Detect gaps so they don't silently produce duplicate or missing
             // FSNs after recovery. A gap means a segment went missing (a
@@ -401,14 +418,6 @@ public final class SegmentRing implements QuietCloseable {
                                     + " check disk health");
                 }
             }
-            // The ack seed derives from the oldest surviving segment's baseSeq, on the
-            // premise that anything below it was trimmed and trim is ack-driven. A skipped
-            // segment breaks that premise, and its own baseSeq is unreadable -- it lives
-            // at header offset 8, inside the read the catch above wrapped -- so we cannot
-            // show its frames were delivered. Refuse the slot, typed so Sender.build()
-            // sets it aside for an operator with its bytes intact rather than seeding the
-            // ack past frames that were never sent.
-            refuseIfSegmentsSkipped(skippedSegmentCount, sfDir);
             // The newest segment becomes the active. Even if it's full, that's OK:
             // the next appendOrFsn returns BACKPRESSURE_NO_SPARE, the manager
             // installs a hot spare, the producer rotates. Same fast path as a

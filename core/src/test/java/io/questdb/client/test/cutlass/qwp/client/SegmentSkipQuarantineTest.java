@@ -40,6 +40,8 @@ import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * Critical-review pin-down for the {@code Sender.build()} half of the C5 fix: a slot whose
  * recovery had to skip an unreadable segment must be quarantined -- the same whole-directory
@@ -78,64 +80,67 @@ public class SegmentSkipQuarantineTest {
 
     @Test(timeout = 30_000L)
     public void testConstructionTimeSkipQuarantinesTheWholeSlotAndProducerContinues() throws Exception {
-        java.nio.file.Path liveSlot = writeMultiSegmentSlotWithCorruptedOldest();
+        assertMemoryLeak(() -> {
+            java.nio.file.Path liveSlot = writeMultiSegmentSlotWithCorruptedOldest();
 
-        // Phase 2: a fresh server. The recovering sender's CONSTRUCTOR now hits an unreadable
-        // oldest segment. build() must not throw -- the slot must be quarantined and the
-        // producer must keep working on a fresh one.
-        AtomicBoolean sawBinary = new AtomicBoolean();
-        try (TestWebSocketServer good = new TestWebSocketServer(new MarkerHandler(sawBinary))) {
-            int port = good.getPort();
-            good.start();
-            Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
-            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                    + ";close_flush_timeout_millis=0;";
-            try (Sender s2 = Sender.fromConfig(cfg)) {
-                s2.table("foo").stringColumn("p", "after-quarantine").longColumn("v", 1).atNow();
-                s2.flush();
-                long deadline = System.currentTimeMillis() + 10_000;
-                while (System.currentTimeMillis() < deadline && !sawBinary.get()) {
-                    Thread.sleep(20);
+            // Phase 2: a fresh server. The recovering sender's CONSTRUCTOR now hits an
+            // unreadable oldest segment. build() must not throw -- the slot must be
+            // quarantined and the producer must keep working on a fresh one.
+            AtomicBoolean sawBinary = new AtomicBoolean();
+            try (TestWebSocketServer good = new TestWebSocketServer(new MarkerHandler(sawBinary))) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("foo").stringColumn("p", "after-quarantine").longColumn("v", 1).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && !sawBinary.get()) {
+                        Thread.sleep(20);
+                    }
                 }
+                Assert.assertTrue("the producer must keep producing after the construction-time "
+                        + "refusal, not brick build()", sawBinary.get());
             }
-            Assert.assertTrue("the producer must keep producing after the construction-time "
-                    + "refusal, not brick build()", sawBinary.get());
-        }
 
-        // The tainted directory was renamed aside WHOLESALE -- the same treatment
-        // DeltaDictRecoveryTest proves for the dictionary-refusal case -- not a narrower
-        // workaround that leaves it sitting at the original path.
-        java.nio.file.Path quarantined = Paths.get(sfDir, "default.unreplayable-0");
-        Assert.assertTrue("the tainted slot must be quarantined wholesale, not left in place",
-                java.nio.file.Files.isDirectory(quarantined));
-        Assert.assertTrue("the quarantined copy must carry the .failed sentinel so the orphan "
-                        + "drainer never re-adopts it (OrphanScanner also excludes it by the "
-                        + "\"unreplayable-\" infix, independent of this sentinel)",
-                java.nio.file.Files.exists(quarantined.resolve(".failed")));
-        Assert.assertTrue("the originally-corrupted segment must still carry its own .corrupt "
-                        + "rename inside the quarantined copy -- both C5 mechanisms fired",
-                java.nio.file.Files.exists(quarantined.resolve("sf-initial.sfa.corrupt")));
+            // The tainted directory was renamed aside WHOLESALE -- the same treatment
+            // DeltaDictRecoveryTest proves for the dictionary-refusal case -- not a narrower
+            // workaround that leaves it sitting at the original path.
+            java.nio.file.Path quarantined = Paths.get(sfDir, "default.unreplayable-0");
+            Assert.assertTrue("the tainted slot must be quarantined wholesale, not left in place",
+                    java.nio.file.Files.isDirectory(quarantined));
+            Assert.assertTrue("the quarantined copy must carry the .failed sentinel so the orphan "
+                            + "drainer never re-adopts it (OrphanScanner also excludes it by the "
+                            + "\"unreplayable-\" infix, independent of this sentinel)",
+                    java.nio.file.Files.exists(quarantined.resolve(".failed")));
+            Assert.assertTrue("the originally-corrupted segment must still carry its own .corrupt "
+                            + "rename inside the quarantined copy -- both C5 mechanisms fired",
+                    java.nio.file.Files.exists(quarantined.resolve("sf-initial.sfa.corrupt")));
 
-        // The critical regression check: the live slot is a GENUINELY FRESH directory, not the
-        // tainted one left in place with the corrupt file merely invisible to a re-scan. Before
-        // this fix, a second SegmentRing.openExisting on the ORIGINAL directory would silently
-        // recover a ring missing the oldest segment (the corrupt-renamed file no longer matches
-        // ".sfa"), seeding ackedFsn past its frames. Here there is no "original directory" left
-        // to re-scan at all -- sf-initial.sfa in the LIVE slot must be a fresh baseSeq=0 segment
-        // holding only what sender 2 wrote, not a continuation of sender 1's FSN sequence.
-        Assert.assertTrue("the live slot must exist as a fresh directory",
-                java.nio.file.Files.isDirectory(liveSlot));
-        java.nio.file.Path liveInitial = liveSlot.resolve("sf-initial.sfa");
-        Assert.assertTrue("the live slot must have its own fresh sf-initial.sfa",
-                java.nio.file.Files.exists(liveInitial));
-        try (MmapSegment seg = MmapSegment.openExisting(liveInitial.toString())) {
-            Assert.assertEquals("a genuinely fresh ring must restart FSNs at 0, not continue "
-                            + "sender 1's sequence -- continuing would mean the live slot is "
-                            + "really the tainted one, just relabelled",
-                    0L, seg.baseSeq());
-            Assert.assertEquals("the fresh slot must hold only sender 2's one row",
-                    1L, seg.frameCount());
-        }
+            // The critical regression check: the live slot is a GENUINELY FRESH directory, not
+            // the tainted one left in place with the corrupt file merely invisible to a
+            // re-scan. Before this fix, a second SegmentRing.openExisting on the ORIGINAL
+            // directory would silently recover a ring missing the oldest segment (the
+            // corrupt-renamed file no longer matches ".sfa"), seeding ackedFsn past its
+            // frames. Here there is no "original directory" left to re-scan at all --
+            // sf-initial.sfa in the LIVE slot must be a fresh baseSeq=0 segment holding only
+            // what sender 2 wrote, not a continuation of sender 1's FSN sequence.
+            Assert.assertTrue("the live slot must exist as a fresh directory",
+                    java.nio.file.Files.isDirectory(liveSlot));
+            java.nio.file.Path liveInitial = liveSlot.resolve("sf-initial.sfa");
+            Assert.assertTrue("the live slot must have its own fresh sf-initial.sfa",
+                    java.nio.file.Files.exists(liveInitial));
+            try (MmapSegment seg = MmapSegment.openExisting(liveInitial.toString())) {
+                Assert.assertEquals("a genuinely fresh ring must restart FSNs at 0, not continue "
+                                + "sender 1's sequence -- continuing would mean the live slot is "
+                                + "really the tainted one, just relabelled",
+                        0L, seg.baseSeq());
+                Assert.assertEquals("the fresh slot must hold only sender 2's one row",
+                        1L, seg.frameCount());
+            }
+        });
     }
 
     /**
@@ -154,36 +159,38 @@ public class SegmentSkipQuarantineTest {
      */
     @Test(timeout = 30_000L)
     public void testConstructionTimeQuarantineFailsLoudlyWhenAllSlotNamesSaturated() throws Exception {
-        java.nio.file.Path liveSlot = writeMultiSegmentSlotWithCorruptedOldest();
-        for (int i = 0; i < 64; i++) {
-            java.nio.file.Files.createDirectories(Paths.get(sfDir, "default.unreplayable-" + i));
-        }
-
-        String cfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
-        Sender s = null;
-        try {
-            s = Sender.fromConfig(cfg);
-            Assert.fail("build() must throw when the unreplayable slot cannot be set aside");
-        } catch (LineSenderException expected) {
-            Assert.assertTrue("unexpected message: " + expected.getMessage(),
-                    expected.getMessage().contains("too many quarantined slots already under")
-                            && expected.getMessage().contains("moved or removed by hand"));
-        } finally {
-            if (s != null) {
-                s.close();
+        assertMemoryLeak(() -> {
+            java.nio.file.Path liveSlot = writeMultiSegmentSlotWithCorruptedOldest();
+            for (int i = 0; i < 64; i++) {
+                java.nio.file.Files.createDirectories(Paths.get(sfDir, "default.unreplayable-" + i));
             }
-        }
-        // The tainted slot's bytes must survive on disk for a manual resend -- the guard
-        // fails loudly rather than dropping data, exactly like the connect()-time case.
-        // Unlike the dictionary-refusal case (nothing renamed, so a plain .sfa count is
-        // enough), the per-file skip arm ALREADY renamed the corrupted segment to
-        // .corrupt as part of THIS SAME failed attempt -- before quarantineTornSlot ever
-        // ran out of candidate names -- so its frame data survives under that name, not
-        // as a .sfa file.
-        Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(liveSlot));
-        Assert.assertTrue("the corrupted segment's frame data must be preserved under its "
-                        + "renamed name",
-                java.nio.file.Files.exists(liveSlot.resolve("sf-initial.sfa.corrupt")));
+
+            String cfg = "ws::addr=localhost:1;sf_dir=" + sfDir + ";";
+            Sender s = null;
+            try {
+                s = Sender.fromConfig(cfg);
+                Assert.fail("build() must throw when the unreplayable slot cannot be set aside");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue("unexpected message: " + expected.getMessage(),
+                        expected.getMessage().contains("too many quarantined slots already under")
+                                && expected.getMessage().contains("moved or removed by hand"));
+            } finally {
+                if (s != null) {
+                    s.close();
+                }
+            }
+            // The tainted slot's bytes must survive on disk for a manual resend -- the guard
+            // fails loudly rather than dropping data, exactly like the connect()-time case.
+            // Unlike the dictionary-refusal case (nothing renamed, so a plain .sfa count is
+            // enough), the per-file skip arm ALREADY renamed the corrupted segment to
+            // .corrupt as part of THIS SAME failed attempt -- before quarantineTornSlot ever
+            // ran out of candidate names -- so its frame data survives under that name, not
+            // as a .sfa file.
+            Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(liveSlot));
+            Assert.assertTrue("the corrupted segment's frame data must be preserved under its "
+                            + "renamed name",
+                    java.nio.file.Files.exists(liveSlot.resolve("sf-initial.sfa.corrupt")));
+        });
     }
 
     /**

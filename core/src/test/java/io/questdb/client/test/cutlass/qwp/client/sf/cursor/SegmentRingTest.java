@@ -504,6 +504,57 @@ public class SegmentRingTest {
     }
 
     /**
+     * Skipped INTERIOR segment: three segments at baseSeq 0/4/8, the MIDDLE one
+     * unreadable. Unlike the oldest/newest cases, skipping an interior segment also
+     * opens an FSN gap between its surviving neighbours (baseSeq 0 with 4 frames,
+     * then baseSeq 8 -- expected 4). If the contiguity check below ran before the
+     * skip-tally refusal, that gap would throw the untyped {@code MmapSegmentException}
+     * first, escaping BOTH {@code UnreplayableSlotException} catches in
+     * {@code Sender.build()} (the constructor-time one and the connect()-time one) and
+     * repeating identically forever: the interior file is already renamed to
+     * {@code .corrupt}, so every retry recomputes {@code skippedSegmentCount} as 0 and
+     * hits the same gap again. The skip-tally refusal must run first.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenInteriorSegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-interior-0.sfa", 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String interiorPath = tmpDir + "/skip-interior-1.sfa";
+                MmapSegment s1 = MmapSegment.create(interiorPath, 4, segSize);
+                for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+                s1.close();
+
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-interior-2.sfa", 8, segSize);
+                s2.tryAppend(buf, 16);
+                s2.close();
+
+                corruptMagic(interiorPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("expected recovery to refuse rather than throw the "
+                            + "untyped FSN-gap exception the interior skip opens");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                }
+                assertFalse("the unreadable interior segment must be renamed aside",
+                        Files.exists(interiorPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(interiorPath + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
      * The extreme case of the same defect: every {@code .sfa} in the directory
      * is unreadable, so {@code opened.size() == 0} after the scan. That branch
      * predates this task and used to return {@code null} unconditionally --
