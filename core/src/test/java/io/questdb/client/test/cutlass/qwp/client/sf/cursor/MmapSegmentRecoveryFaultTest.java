@@ -40,6 +40,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -419,6 +420,30 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
+     * C11 regression guard: {@code openExisting}'s catch releases the mapping
+     * and fd itself and rethrows. Leaving the holder populated would hand the
+     * caller a segment whose resources are already gone, so the caller's
+     * close() would unmap a range the allocator may have reused and close a
+     * recycled descriptor -- a double release. The catch must clear the
+     * holder as its first statement so a caller's holder-based cleanup can
+     * never see the same segment twice.
+     */
+    @Test
+    public void testFailedOpenDoesNotLeaveASegmentInTheHolder() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/bad-header.sfa";
+            writeGarbageHeader(path);
+            MmapSegment[] inFlight = new MmapSegment[1];
+            try {
+                MmapSegment.openExisting(FilesFacade.INSTANCE, path, inFlight);
+                fail("expected the bad header to be rejected");
+            } catch (MmapSegmentException expected) {
+                assertNull("a failed open must not leave a segment in the holder", inFlight[0]);
+            }
+        });
+    }
+
+    /**
      * True when the running JVM delivers an unsafe-access fault at the faulting
      * instruction, so a handler around the read is guaranteed to see it.
      * JDK-8283699 made delivery precise in 21; before that HotSpot records the
@@ -458,6 +483,28 @@ public class MmapSegmentRecoveryFaultTest {
         String msg = e.getMessage();
         assertTrue("a late-delivered fault must still be the recognized mmap access fault: " + msg,
                 msg != null && msg.contains("unsafe memory access operation"));
+    }
+
+    /**
+     * Writes 64 bytes of {@code 0xFF} to a fresh file at {@code path} -- long
+     * enough to pass the file-length-vs-{@code HEADER_SIZE} check but wrong from
+     * the first 4 bytes onward, so {@code openExisting}'s magic check rejects it
+     * before ever touching frame data.
+     */
+    private static void writeGarbageHeader(String path) {
+        final int len = 64;
+        int fd = Files.openCleanRW(path);
+        assertTrue("openCleanRW failed", fd >= 0);
+        long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < len; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0xFF);
+            }
+            assertEquals((long) len, Files.write(fd, buf, len, 0));
+        } finally {
+            Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
     }
 
     /**

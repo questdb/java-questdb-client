@@ -398,8 +398,12 @@ public final class MmapSegment implements QuietCloseable {
      * already acquired -- and nothing is left holding them. The holder gives the
      * caller's {@code finally} something to close. Callers MUST clear {@code inFlight[0]}
      * wherever they transfer ownership, or they will close a segment they just handed on.
+     * <p>
+     * Public (rather than package-private) so the holder contract -- {@code inFlight[0] ==
+     * null} on every throwing path -- is directly testable from the {@code test.} sibling
+     * package, matching {@link #isMmapAccessFault(Throwable)}'s existing public-for-test seam.
      */
-    static MmapSegment openExisting(FilesFacade ff, String path, MmapSegment[] inFlight) {
+    public static MmapSegment openExisting(FilesFacade ff, String path, MmapSegment[] inFlight) {
         long fileSize = ff.length(path);
         if (fileSize < HEADER_SIZE) {
             throw new MmapSegmentException("file shorter than header: " + path + " size=" + fileSize);
@@ -454,6 +458,15 @@ public final class MmapSegment implements QuietCloseable {
             }
             return segment;
         } catch (Throwable t) {
+            // Relinquish the holder BEFORE releasing anything: this catch frees the
+            // mapping and the fd itself and then rethrows, so the caller's holder-based
+            // cleanup must not see the same segment and release it a second time.
+            // PersistedSymbolDict.openExisting avoids this by returning null instead of
+            // rethrowing, which makes its two cleanup paths mutually exclusive by
+            // construction; here they overlap unless the holder is cleared.
+            if (inFlight != null) {
+                inFlight[0] = null;
+            }
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
             }
