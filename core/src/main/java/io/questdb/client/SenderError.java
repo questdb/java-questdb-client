@@ -203,6 +203,13 @@ public final class SenderError {
          */
         NOT_WRITABLE,
         /**
+         * A delta symbol dictionary began above the server's per-connection dictionary.
+         * Wire {@code 0x0D}. Unlike {@link #PARSE_ERROR} this is a function of server
+         * state, not of the frame's bytes, so the same frame succeeds after the
+         * connection's dictionary catch-up has run.
+         */
+        DICTIONARY_GAP,
+        /**
          * A frame the server (or an intermediary) deterministically rejects: the
          * poison-frame detector observed the same head-of-line frame fail
          * {@link io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_MAX_HEAD_FRAME_REJECTIONS}

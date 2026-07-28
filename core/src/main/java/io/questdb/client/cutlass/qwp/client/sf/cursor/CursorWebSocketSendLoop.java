@@ -918,6 +918,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Category.WRITE_ERROR;
             case WebSocketResponse.STATUS_NOT_WRITABLE:
                 return SenderError.Category.NOT_WRITABLE;
+            case WebSocketResponse.STATUS_DICTIONARY_GAP:
+                return SenderError.Category.DICTIONARY_GAP;
             default:
                 return SenderError.Category.UNKNOWN;
         }
@@ -1047,9 +1049,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public static SenderError.Policy defaultPolicyFor(SenderError.Category category) {
         switch (category) {
-            case WRITE_ERROR:     // transient server state (disk pressure, suspended table)
-            case INTERNAL_ERROR:  // transient by definition; deterministic repeats poison-escalate
-            case UNKNOWN:         // fail open: status byte from a newer server
+            case WRITE_ERROR:        // transient server state (disk pressure, suspended table)
+            case INTERNAL_ERROR:     // transient by definition; deterministic repeats poison-escalate
+            case DICTIONARY_GAP:     // server state, not frame bytes: re-register and replay
+            case UNKNOWN:            // fail open: status byte from a newer server
                 return SenderError.Policy.RETRIABLE;
             case NOT_WRITABLE:    // read-only replica / demoting primary: rotate endpoints
                 return SenderError.Policy.RETRIABLE_OTHER;
