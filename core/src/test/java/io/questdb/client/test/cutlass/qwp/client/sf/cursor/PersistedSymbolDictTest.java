@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
@@ -885,6 +886,36 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testOpenCleanRefusesWhenAnExistingFileCannotBeTruncated() throws Exception {
+        // openFresh returning null WITHOUT truncating leaves a previous generation's
+        // dictionary on disk while this session runs full-dict from id 0. The next
+        // recovery reads a side-file whose ids describe a different id space from the
+        // surviving frames, and no existing guard can tell: no gap, valid CRC, both
+        // bounds checks pass, and the catch-up registers the wrong strings.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-clean-refuse");
+            try (PersistedSymbolDict first = PersistedSymbolDict.openClean(dir.toString())) {
+                first.appendSymbol("a");
+                first.appendSymbol("b");
+            }
+            DelegatingFilesFacade ff = new DelegatingFilesFacade() {
+                @Override
+                public int openCleanRW(String path) {
+                    return -1;
+                }
+            };
+            try {
+                PersistedSymbolDict.openClean(ff, dir.toString());
+                Assert.fail("expected openClean to refuse rather than leave a stale dictionary");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be truncated"));
+            }
+            // Refusing is not deleting: the bytes stay for an operator.
+            Assert.assertTrue(Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
+        });
+    }
+
+    @Test
     public void testOpenFailuresDoNotCreateOrDestroyDictionaryFiles() throws Exception {
         assertMemoryLeak(() -> {
             Path freshDir = newFolder("qwp-symdict-fresh-open-failure");
@@ -907,6 +938,22 @@ public class PersistedSymbolDictTest {
             existingFf.assertAllOpenedDescriptorsClosed();
             Assert.assertArrayEquals("failed recovery open must preserve the load-bearing file",
                     before, Files.readAllBytes(file));
+        });
+    }
+
+    @Test
+    public void testOpenToleratesAnAbsentDictionary() throws Exception {
+        // The recovery entry point must keep its existing tolerance: with no file there
+        // is nothing stale to inherit, so degrading to full-dict frames is safe.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-empty-slot");
+            DelegatingFilesFacade ff = new DelegatingFilesFacade() {
+                @Override
+                public int openCleanRW(String path) {
+                    return -1;
+                }
+            };
+            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
         });
     }
 

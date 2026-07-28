@@ -1383,34 +1383,40 @@ public class DeltaDictRecoveryTest {
         assertMemoryLeak(() -> {
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
-            // Phase 1: force full-dict fallback with a planted directory, so the frames
-            // land self-sufficient (deltaStart=0) and no side-file is written.
-            java.nio.file.Files.createDirectories(dict);
-            java.nio.file.Path blocker = dict.resolve("blocker");
-            java.nio.file.Files.createFile(blocker);
+            // Phase 1: force full-dict fallback via an injected FilesFacade whose
+            // openCleanRW always fails, so the frames land self-sufficient
+            // (deltaStart=0) and no side-file is ever written. NOT a planted
+            // blocker: openClean() now REFUSES a fresh slot whose existing
+            // dictionary cannot be truncated (see PersistedSymbolDictTest's
+            // truncate-refusal coverage), so leaving any artifact at the
+            // dictionary's path here would throw instead of degrading. The
+            // facade fault instead reproduces the case openClean() still
+            // tolerates -- a transient failure with nothing at the path to lose.
+            Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                    io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+            UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+            CursorSendEngine phase1Engine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
             try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-                String cfg = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir
-                        + ";close_flush_timeout_millis=0;";
-                try (Sender s1 = Sender.fromConfig(cfg)) {
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
                     }
                 }
-                Assert.assertTrue("full-dict fallback: .symbol-dict must stay a directory",
-                        java.nio.file.Files.isDirectory(dict));
+                Assert.assertFalse("full-dict fallback: no dictionary must ever be created",
+                        java.nio.file.Files.exists(dict));
             }
 
-            // Swap the planted directory for the POPULATED side-file the earlier delta
-            // session left behind. Fewer entries than the frames reference, so the
-            // discard's recoveredMaxSymbolId >= size() guard fires with size() > 0 --
+            // Populate the side-file a LATER delta session would have left behind.
+            // Fewer entries than the frames reference, so the discard's
+            // recoveredMaxSymbolId >= size() guard fires with size() > 0 --
             // the case that bricked build().
-            java.nio.file.Files.delete(blocker);
-            java.nio.file.Files.delete(dict);
             final int survivingEntries = 3;
             Assert.assertTrue(survivingEntries < DISTINCT_SYMBOLS);
             try (PersistedSymbolDict survivor = PersistedSymbolDict.openClean(slot.toString())) {
@@ -1467,12 +1473,20 @@ public class DeltaDictRecoveryTest {
         assertMemoryLeak(() -> {
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
-            // Force full-dict fallback in phase 1: plant a non-empty DIRECTORY where
-            // the dictionary file belongs, so openCleanRW fails and delta encoding
-            // stays disabled -- the frames are then written self-sufficient.
-            java.nio.file.Files.createDirectories(dict);
-            java.nio.file.Path blocker = dict.resolve("blocker");
-            java.nio.file.Files.createFile(blocker);
+            // Force full-dict fallback in phase 1 via an injected FilesFacade whose
+            // openCleanRW always fails, so delta encoding stays disabled and the
+            // frames are written self-sufficient. NOT a planted blocker: openClean()
+            // now REFUSES a fresh slot whose existing dictionary cannot be truncated
+            // (see PersistedSymbolDictTest's truncate-refusal coverage), so leaving
+            // any artifact at the dictionary's path here would throw instead of
+            // degrading. The facade fault instead reproduces the case openClean()
+            // still tolerates -- a transient failure with nothing at the path to lose.
+            Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                    io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+            UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+            CursorSendEngine phase1Engine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
 
             // Phase 1: silent server (no acks). Sender 1 writes new-symbol rows in
             // full-dict mode and close-fast, leaving unacked self-sufficient frames.
@@ -1480,26 +1494,23 @@ public class DeltaDictRecoveryTest {
                 int port = silent.getPort();
                 silent.start();
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-                String cfg = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir
-                        + ";close_flush_timeout_millis=0;";
-                try (Sender s1 = Sender.fromConfig(cfg)) {
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
                     for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                         s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                         s1.flush();
                     }
                 }
-                // The planted directory is untouched -- the dictionary never opened,
-                // so the frames were written full-dict with no side-file.
-                Assert.assertTrue("full-dict fallback: .symbol-dict must stay a directory",
-                        java.nio.file.Files.isDirectory(dict));
+                // No dictionary was ever created -- openCleanRW failed against
+                // nothing on disk, so the frames were written full-dict with no
+                // side-file.
+                Assert.assertFalse("full-dict fallback: no dictionary must ever be created",
+                        java.nio.file.Files.exists(dict));
             }
 
-            // Drop the planted directory so recovery opens a FRESH EMPTY .symbol-dict
-            // where it belongs -- exactly the state a full-dict-fallback slot recovers
-            // into (frames on disk, no dictionary behind them).
-            java.nio.file.Files.delete(blocker);
-            java.nio.file.Files.delete(dict);
+            // Recovery opens a FRESH EMPTY .symbol-dict where the (never-created)
+            // side-file belongs -- exactly the state a full-dict-fallback slot
+            // recovers into (frames on disk, no dictionary behind them).
 
             // Phase 2: recover. build() must SUCCEED (not throw the torn-dict guard),
             // and the self-sufficient frames replay against a fresh server gap-free.
@@ -1663,6 +1674,22 @@ public class DeltaDictRecoveryTest {
         @Override
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             // never acks -- sender leaves everything unacked in the slot
+        }
+    }
+
+    /**
+     * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
+     * leaving a file behind at its path -- the fault shape a transient failure
+     * (EIO, fd exhaustion) has on a slot with nothing there to lose. Used instead
+     * of a planted blocker to force full-dict fallback in phase 1: a blocker left
+     * on disk is exactly what openClean() now REFUSES to start on top of (see
+     * PersistedSymbolDictTest's truncate-refusal coverage), so it can no longer
+     * simulate the "nothing to lose" case this facade represents.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
         }
     }
 

@@ -464,9 +464,17 @@ public final class CursorSendEngine implements QuietCloseable {
                     // mapping and silently misattributes symbols on the next
                     // reconnect. openClean() truncates any survivor to empty rather
                     // than trusting a best-effort delete that may have failed (e.g. a
-                    // Windows share lock); if the clean open itself fails,
-                    // persistedSymbolDict stays null and the sender falls back to full
-                    // self-sufficient frames, which is also safe.
+                    // Windows share lock). If the file is simply ABSENT and creating it
+                    // fails, persistedSymbolDict stays null and the sender falls back to
+                    // full self-sufficient frames -- safe for this session, since there
+                    // is no prior generation's id space to lose. But if a dictionary
+                    // DOES survive here and cannot be truncated, that fallback is only
+                    // safe for THIS session: the next recovery would seed its catch-up
+                    // from the stale file and replay this generation's frames on top,
+                    // misattributing symbols with no detectable gap. So openClean()
+                    // refuses that case outright (throws LineSenderException) instead of
+                    // degrading to null; the catch (Throwable) below cleans up and lets
+                    // it propagate.
                     persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir);
                 }
                 MmapSegment initial;

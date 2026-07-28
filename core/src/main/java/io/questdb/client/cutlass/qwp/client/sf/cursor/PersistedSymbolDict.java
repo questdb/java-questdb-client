@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Crc32c;
@@ -314,8 +315,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
         }
         // Absent, or a sub-header stub left by a crash inside openFresh: no
-        // load-bearing content to lose, so create it.
-        return openFresh(ff, filePath);
+        // load-bearing content to lose, so create it. mustTruncate=false: this
+        // is the RECOVERY entry point, and there is nothing here to protect --
+        // an absent/stub file has no id space to preserve, so a create failure
+        // still just degrades to null (full self-sufficient frames), same as
+        // every other recovery I/O failure above.
+        return openFresh(ff, filePath, false);
     }
 
     /**
@@ -330,9 +335,15 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * would leave the producer's ids diverged from the dictionary the send loop
      * replays and silently misattribute symbols on the next reconnect. Truncating
      * (rather than relying on an unlink succeeding first) closes the gap even when
-     * the delete is refused -- e.g. a Windows share lock. Returns {@code null} on
-     * I/O failure, so the caller falls back to full self-sufficient frames exactly
-     * as {@link #open} does.
+     * the delete is refused -- e.g. a Windows share lock. Returns {@code null} when
+     * the slot has no dictionary at all and a fresh one cannot be created either,
+     * so the caller falls back to full self-sufficient frames exactly as
+     * {@link #open} does. But when a file DOES survive and cannot be truncated,
+     * returning null instead of refusing would proceed anyway: this session would
+     * run full-dict from id 0 while the survivor -- describing a prior
+     * generation's id space -- stays on disk, and the next recovery would trust
+     * it and misattribute symbols with no detectable gap. So that case throws
+     * {@link LineSenderException} instead of degrading -- see {@link #openFresh}.
      */
     public static PersistedSymbolDict openClean(String slotDir) {
         return openClean(FilesFacade.INSTANCE, slotDir);
@@ -342,7 +353,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * Facade-aware variant of {@link #openClean(String)}.
      */
     public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir) {
-        return openFresh(ff, slotDir + "/" + FILE_NAME);
+        return openFresh(ff, slotDir + "/" + FILE_NAME, true);
     }
 
     /**
@@ -927,9 +938,38 @@ public final class PersistedSymbolDict implements QuietCloseable {
         return p == limit;
     }
 
-    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath) {
+    /**
+     * @param mustTruncate {@code true} for the fresh-slot path ({@link #openClean}),
+     *                      where an existing file MUST be cleared -- a survivor that
+     *                      cannot be truncated describes a prior generation's id
+     *                      space, and proceeding anyway would leave it on disk while
+     *                      this session writes rows against a fresh id space from 0.
+     *                      The next recovery cannot tell the two apart: ids overlap,
+     *                      the CRC is valid, and the catch-up would register the
+     *                      wrong strings under ids this generation's rows reference.
+     *                      So this case throws {@link LineSenderException} rather
+     *                      than degrading to null. {@code false} for the recovery
+     *                      path ({@link #open}), which only ever reaches this method
+     *                      when the file is absent or a headerless stub -- nothing
+     *                      load-bearing to lose -- so a create failure there still
+     *                      just degrades to null like every other recovery I/O
+     *                      failure.
+     */
+    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath, boolean mustTruncate) {
         int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
+            if (mustTruncate && ff.exists(filePath)) {
+                // A fresh slot MUST start with an empty dictionary. Proceeding without one
+                // leaves the previous generation's entries on disk while this session
+                // writes rows against a fresh id space from 0, and the next recovery
+                // cannot distinguish the two: the ids overlap, the CRC is valid, and the
+                // catch-up registers the wrong strings under ids this generation's rows
+                // reference. Refuse the slot; the bytes stay on disk for an operator.
+                throw new LineSenderException("symbol dict ").put(filePath)
+                        .put(" already exists and cannot be truncated (rc=").put(fd)
+                        .put("); refusing to start on a slot whose dictionary describes a")
+                        .put(" different id space -- move or remove it by hand");
+            }
             LOG.warn("symbol dict {} could not be created (rc={}); proceeding without it", filePath, fd);
             return null;
         }

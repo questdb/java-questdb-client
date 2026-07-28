@@ -27,8 +27,10 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Rule;
@@ -119,18 +121,29 @@ public class SelfSufficientFramesTest {
 
     @Test
     public void testDiskModeFallsBackToFullDictWhenPersistedDictUnopenable() throws Exception {
-        // When the per-slot .symbol-dict cannot be opened in disk mode,
+        // When the per-slot .symbol-dict cannot be created in disk mode,
         // isDeltaDictEnabled() is false and the sender must fall back to
         // self-sufficient frames: every batch re-ships the WHOLE dictionary from
         // id 0. A recovered / orphan-drained slot then has no dictionary to
         // rebuild deltas from, so a monotonic delta would dangle ids on the fresh
-        // server -- the full-dict frame is the safe degradation. Force the open
-        // failure by planting a DIRECTORY where the dictionary file belongs:
-        // openRW / openCleanRW on a directory fails, so open() returns null.
+        // server -- the full-dict frame is the safe degradation.
+        //
+        // Force the open failure through an injected FilesFacade whose
+        // openCleanRW always fails, rather than planting a directory where the
+        // dictionary file belongs: openClean() now REFUSES a fresh slot whose
+        // existing dictionary cannot be truncated (see PersistedSymbolDictTest's
+        // truncate-refusal coverage), so a planted blocker would throw instead of
+        // degrading. The facade fault instead reproduces the case openClean()
+        // still tolerates -- a transient failure (EIO, fd exhaustion) with
+        // nothing at the path to lose. Sender.fromConfig has no seam for a custom
+        // FilesFacade, so this bypasses it and builds the engine directly, the
+        // same entry point DeltaDictRecoveryTest's dictionary-fault-injection
+        // tests use.
+        // newFolder already creates sfDir itself, so -- unlike
+        // DeltaDictRecoveryTest's bare sfDir path -- no extra mkdir is needed
+        // before constructing the engine directly on the slot beneath it.
         Path sfDir = temporaryFolder.newFolder("qwp-sf-fallback").toPath();
-        Path dictPath = sfDir.resolve("default").resolve(".symbol-dict");
-        Files.createDirectories(dictPath);             // a directory, not a file
-        Files.createFile(dictPath.resolve("blocker")); // non-empty: cannot be unlinked/rmdir'd
+        String slot = sfDir.resolve("default").toString();
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -138,8 +151,12 @@ public class SelfSufficientFramesTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
-                try (Sender sender = Sender.fromConfig(config)) {
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine)) {
                     sender.table("foo").symbol("s", "alpha").longColumn("v", 1L).atNow();
                     sender.flush();
                     waitFor(() -> handler.batches.size() >= 1, 5_000);
@@ -149,10 +166,11 @@ public class SelfSufficientFramesTest {
                     waitFor(() -> handler.batches.size() >= 2, 5_000);
                 }
 
-                // The planted directory is untouched -- the dictionary never
-                // opened, so delta encoding stayed disabled.
-                Assert.assertTrue("planted .symbol-dict directory must remain (open failed)",
-                        Files.isDirectory(dictPath));
+                // No dictionary was ever created -- openCleanRW failed against
+                // nothing on disk, so delta encoding stayed disabled with
+                // nothing left behind.
+                Assert.assertFalse("dictionary must not exist: creation failed cleanly",
+                        Files.exists(sfDir.resolve("default").resolve(".symbol-dict")));
 
                 Assert.assertEquals("expected 2 captured batches", 2, handler.batches.size());
                 byte[] b1 = handler.batches.get(0);
@@ -620,6 +638,22 @@ public class SelfSufficientFramesTest {
 
     private static int readVarint(byte[] buf, int offset) {
         return QwpWireTestUtils.readVarint(buf, new int[]{offset});
+    }
+
+    /**
+     * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
+     * leaving a file behind at its path -- the fault shape a transient failure
+     * (EIO, fd exhaustion) has on a slot with nothing there to lose. Used instead
+     * of a planted directory blocker: a blocker left on disk is exactly what
+     * openClean() now REFUSES to start on top of (see PersistedSymbolDictTest's
+     * truncate-refusal coverage), so it can no longer simulate the "nothing to
+     * lose" case this facade represents.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
+        }
     }
 
     private static void waitFor(BoolCondition cond, long timeoutMillis) {
