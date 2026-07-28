@@ -1593,9 +1593,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 try (SlotLock logicalSlotLock = slotPath == null
                         ? null
                         : SlotLock.acquireLogical(slotPath, dirMode)) {
-                    CursorSendEngine cursorEngine = new CursorSendEngine(
-                            slotPath, actualSfMaxBytes,
-                            actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                    // The constructor's own recovery seed can throw UnreplayableSlotException
+                    // too (SegmentRing.openExisting refuses a slot when it had to skip an
+                    // unreadable segment -- see C5): its frame range cannot be shown
+                    // already-acked, so recovery sets the slot aside rather than risk seeding
+                    // the ack cursor past frames that were never delivered. That verdict gets
+                    // the exact same quarantine-and-continue treatment as the connect()-time
+                    // verdict below -- constructing cursorEngine is not inside the loop below,
+                    // so a throw here would otherwise escape build() entirely, uncaught.
+                    // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
+                    // (not just the unreadable segment file) before building the replacement
+                    // at the original slotPath, so the replacement starts on a genuinely empty
+                    // directory with nothing left to skip -- it cannot throw the same way
+                    // twice, which is what makes looping unnecessary here.
+                    boolean quarantined = false;
+                    CursorSendEngine cursorEngine;
+                    try {
+                        cursorEngine = new CursorSendEngine(
+                                slotPath, actualSfMaxBytes,
+                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos);
+                    } catch (UnreplayableSlotException e) {
+                        if (slotPath == null) {
+                            throw e;
+                        }
+                        quarantined = true;
+                        cursorEngine = quarantineTornSlot(
+                                null, e, sfDir, senderId, slotPath, actualSfMaxBytes,
+                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos, errorHandler);
+                    }
                     int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                             ? errorInboxCapacity
                             : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1613,7 +1638,6 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // UnreplayableSlotException only once neither source holds the missing ids.
                     // Quarantining on anything weaker would set aside slots that recovery can
                     // still rescue, so build() waits for that verdict rather than pre-judging it.
-                    boolean quarantined = false;
                     while (connected == null) {
                         try {
                             connected = QwpWebSocketSender.connect(
@@ -3055,34 +3079,42 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Sets a recovered slot whose symbol dictionary cannot cover its surviving frames
-         * aside, and returns a fresh engine on an empty slot so the producer can keep
-         * producing.
+         * Sets a slot aside that either connect() (a symbol dictionary that cannot cover its
+         * surviving frames) or the {@code CursorSendEngine} constructor itself (recovery had
+         * to skip an unreadable segment -- see C5) declared unreplayable, and returns a fresh
+         * engine on an empty slot so the producer can keep producing.
          * <p>
-         * Such a slot is unreplayable BY THIS PRODUCER: its frames reference symbol ids the
-         * recovered dictionary lost (a host/power crash tore the unsynced side-file), so a
-         * producer seeded from the short dictionary would hand those ids to different
-         * symbols and silently misattribute values. Detecting that is correct and
-         * load-bearing -- but simply THROWING is not a safe response. {@code senderId}
-         * defaults to a stable name, so a restarted process re-adopts the same slot; the
-         * engine's close retains a slot that is not fully drained; and so every subsequent
-         * {@code build()} would re-recover the same slot and throw again -- forever, until
-         * an operator deleted the directory by hand. The application could not construct a
-         * Sender at all, and so could not even BUFFER new rows. That trades a bounded,
-         * already-lost batch for an unbounded outage of everything after it, which inverts
-         * the one guarantee store-and-forward exists to give.
+         * {@code torn} is the live engine to release, or {@code null} when the verdict came
+         * from the constructor and no engine was ever built -- there is nothing to
+         * {@link CursorSendEngine#close(boolean)} in that case, only the directory to rename.
+         * <p>
+         * Such a slot is unreplayable BY THIS PRODUCER: either its frames reference symbol ids
+         * the recovered dictionary lost (a host/power crash tore the unsynced side-file), so a
+         * producer seeded from the short dictionary would hand those ids to different symbols
+         * and silently misattribute values -- or recovery could not show a skipped segment's
+         * frames were already acked, so replaying would risk seeding the ack cursor past data
+         * that was never delivered. Detecting either is correct and load-bearing -- but simply
+         * THROWING is not a safe response. {@code senderId} defaults to a stable name, so a
+         * restarted process re-adopts the same slot; the engine's close retains a slot that is
+         * not fully drained; and so every subsequent {@code build()} would re-recover the same
+         * slot and throw again -- forever, until an operator deleted the directory by hand. The
+         * application could not construct a Sender at all, and so could not even BUFFER new
+         * rows. That trades a bounded, already-lost batch for an unbounded outage of everything
+         * after it, which inverts the one guarantee store-and-forward exists to give.
          * <p>
          * So: rename the slot aside instead, and mark it {@code .failed}. The verdict is
          * authoritative -- the recovery seed already tried every source of truth (the
-         * persisted prefix AND the surviving frames' own deltas), and the orphan drainer's
-         * own replay guard uses that same walk, so there is nothing a drainer could rebuild
-         * that the seed did not. {@code markFailed} (below) therefore quarantines the copy
-         * for a human rather than leaving a drainer to retry an unreplayable slot forever;
-         * a full-dictionary-fallback slot never reaches here, because its dictionary is
-         * discarded at recovery and it never throws. The bytes are preserved on disk for
-         * forensics and a manual resend, and the new name -- NOT the sender's own slot name
-         * -- keeps a restarted sender from re-adopting it. The producer, meanwhile, starts
-         * on a clean empty slot and never notices.
+         * persisted prefix AND the surviving frames' own deltas, or the per-segment scan for
+         * the C5 case), and the orphan drainer's own replay guard uses that same walk, so there
+         * is nothing a drainer could rebuild that the seed did not. {@code markFailed} (below)
+         * therefore quarantines the copy for a human rather than leaving a drainer to retry an
+         * unreplayable slot forever; a full-dictionary-fallback slot never reaches here, because
+         * its dictionary is discarded at recovery and it never throws. The bytes are preserved
+         * on disk for forensics and a manual resend, and the new name -- NOT the sender's own
+         * slot name -- keeps a restarted sender from re-adopting it (and, for the C5 case, also
+         * keeps a later recovery from ever re-scanning the individually-renamed {@code .corrupt}
+         * segment inside it). The producer, meanwhile, starts on a clean empty slot and never
+         * notices.
          * <p>
          * If the rename fails (a Windows share lock, a read-only mount) there is no way to
          * free the slot name without destroying data, so fall back to the old behaviour and
@@ -3102,8 +3134,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // path already closed the engine; close() is idempotent, so make it explicit rather
             // than depend on that. close(false): build() holds the logical slot lock across this
             // whole transition -- that is precisely what serialises the rename against a queued
-            // orphan drainer -- so the engine must not unlink it.
-            torn.close(false);
+            // orphan drainer -- so the engine must not unlink it. torn is null when the verdict
+            // came from the constructor itself: no engine was ever built, so there is nothing to
+            // close.
+            if (torn != null) {
+                torn.close(false);
+            }
             Runnable hook = quarantineAfterCloseHook;
             if (hook != null) {
                 hook.run();

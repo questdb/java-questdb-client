@@ -161,11 +161,14 @@ public final class SegmentRing implements QuietCloseable {
      * fresh ring with {@link #SegmentRing(MmapSegment, long)} and a freshly
      * created initial segment.
      * <p>
-     * A single {@code .sfa} that cannot be opened (bad magic, bad header, an
-     * mmap-access fault) does not abort the scan of its siblings, but it does
+     * A single {@code .sfa} that cannot contribute its frames -- it fails to
+     * open at all (bad magic, bad header, an mmap-access fault), or it opens
+     * fine but frame[0] itself is corrupt with a non-empty tail (a torn write,
+     * as opposed to a genuinely empty hot-spare leftover, which is unlinked
+     * with no loss) -- does not abort the scan of its siblings, but it does
      * cost the whole slot: the file is renamed to {@code <path>.corrupt} and,
      * once every file has been scanned, {@link UnreplayableSlotException} is
-     * thrown if any file was skipped. Its frame range cannot be shown
+     * thrown if any file was skipped this way. Its frame range cannot be shown
      * already-acked, so the only sound response is to refuse the slot rather
      * than seed the ack cursor (or the successor-baseSeq contiguity check)
      * past data that may never have been sent.
@@ -251,7 +254,24 @@ public final class SegmentRing implements QuietCloseable {
                                 seg = null;
                                 inFlight[0] = null;
                                 if (torn > 0) {
-                                    Files.rename(path, path + ".corrupt");
+                                    // Same hole as the catch arm below, just reached via a
+                                    // different path: frame[0] itself is corrupt, so this
+                                    // segment contributes ZERO frames to `opened` even though
+                                    // MmapSegment.openExisting returned successfully -- its
+                                    // whole content is lost, not merely reduced. If this was
+                                    // the oldest segment, the contiguity check never sees the
+                                    // gap (it only compares survivors), so without counting
+                                    // this as a skip too, ackedFsn would still get seeded past
+                                    // frames nothing proves were ever delivered.
+                                    skippedSegmentCount++;
+                                    if (Files.rename(path, path + ".corrupt") == 0) {
+                                        LOG.error("openExisting: quarantining {} -- frame[0] "
+                                                + "corrupt with a non-empty tail -- quarantined "
+                                                + "to {}.corrupt", path, path);
+                                    } else {
+                                        LOG.error("could not rename unreadable segment {}; "
+                                                + "a later recovery may see a reused FSN range", path);
+                                    }
                                 } else {
                                     Files.remove(path);
                                 }

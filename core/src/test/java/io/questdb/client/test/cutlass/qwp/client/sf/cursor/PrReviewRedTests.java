@@ -26,8 +26,10 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Misc;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -87,6 +89,16 @@ public class PrReviewRedTests {
      * <p>
      * Trigger: a single bit flip on the CRC field of frame[0] (bit rot, partial
      * page write at crash, etc.).
+     * <p>
+     * C5 strengthened this beyond "preserved on disk": a torn frame[0] is the SAME
+     * kind of skip a corrupt header or an mmap fault is (this segment contributes
+     * ZERO frames to the recovered ring even though the file preserves them under
+     * a new name), so it now also counts toward the per-recovery skip tally and
+     * {@code SegmentRing.openExisting} REFUSES the slot (a typed, quarantinable
+     * {@code UnreplayableSlotException}) instead of quietly returning as if the
+     * directory were empty. The single segment here IS the whole slot, so this is
+     * the "every segment skipped" case: recovery must not silently start a fresh
+     * ring at baseSeq=0 over data it could not read.
      */
     @Test
     public void testC1_recoveryMustNotUnlinkSegmentWithCorruptFirstFrame() throws Exception {
@@ -125,35 +137,28 @@ public class PrReviewRedTests {
             Assert.assertTrue("setup: file should still exist after CRC clobber",
                     Files.exists(segPath));
 
-            // Run recovery.
-            SegmentRing recovered = SegmentRing.openExisting(tmpDir, 64 * 1024);
+            // Run recovery. Since this is the ONLY segment in the slot, and it
+            // cannot contribute any frames, recovery must refuse rather than
+            // silently proceed as though the directory held nothing at all.
             try {
-                // The bug: openExisting sees frameCount=0 (because scanFrames
-                // bailed at the corrupt frame[0]) and treats the segment as
-                // an "empty hot-spare leftover" — closing AND UNLINKING the
-                // file. The user's frames 1, 2, 3 are gone forever; the only
-                // record was a WARN log line that's already been emitted.
-                //
-                // Spec / desired behavior: a segment with non-zero contents
-                // past the header (tornTailBytes > 0) must be preserved or
-                // quarantined to <path>.corrupt for postmortem. Silent unlink
-                // is the data-loss bug the spec calls out.
-                // Spec: a segment with non-zero contents past the header
-                // (tornTailBytes > 0) must be preserved at its original path
-                // OR quarantined to <path>.corrupt so a postmortem can
-                // recover the surviving frames.
-                boolean preserved = Files.exists(segPath) || Files.exists(segPath + ".corrupt");
-                Assert.assertTrue(
-                        "FINDING C1: SegmentRing.openExisting silently unlinked a segment "
-                                + "whose first frame failed CRC. Three valid frames followed the "
-                                + "corrupt header; recovery destroyed all of them with only a "
-                                + "WARN log. Mission-critical data loss path.",
-                        preserved);
-            } finally {
-                if (recovered != null) {
-                    recovered.close();
-                }
+                Misc.free(SegmentRing.openExisting(tmpDir, 64 * 1024));
+                Assert.fail("FINDING C1 (C5-strengthened): expected recovery to refuse "
+                        + "rather than silently treat the unreadable segment as an empty slot");
+            } catch (UnreplayableSlotException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("skipped"));
             }
+            // The original C1 spec, unchanged: a segment with non-zero contents past
+            // the header (tornTailBytes > 0) must be preserved at its original path
+            // OR quarantined to <path>.corrupt so a postmortem can recover the
+            // surviving frames. Silent unlink is the data-loss bug the spec calls out.
+            boolean preserved = Files.exists(segPath) || Files.exists(segPath + ".corrupt");
+            Assert.assertTrue(
+                    "FINDING C1: SegmentRing.openExisting silently unlinked a segment "
+                            + "whose first frame failed CRC. Three valid frames followed the "
+                            + "corrupt header; recovery destroyed all of them with only a "
+                            + "WARN log. Mission-critical data loss path.",
+                    preserved);
         });
     }
 

@@ -541,12 +541,70 @@ public class SegmentRingTest {
                             "expected recovery to refuse rather than silently start a fresh ring "
                                     + "at baseSeq=0 over an unreadable slot");
                 } catch (UnreplayableSlotException expected) {
-                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                    // Pin the exact count, not just the word "skipped" -- both files here are
+                    // corrupted, so a miscounting regression (e.g. only the last-seen skip
+                    // survives, or a double-count from a retry) must fail this assertion even
+                    // though "skipped" alone would still match.
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 2 unreadable segment(s)"));
                 }
                 assertFalse(Files.exists(path0));
                 assertFalse(Files.exists(path1));
                 assertTrue(Files.exists(path0 + ".corrupt"));
                 assertTrue(Files.exists(path1 + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * The empty-with-torn-tail branch (frame[0] itself fails CRC, so
+     * {@code MmapSegment.openExisting} returns successfully but with
+     * {@code frameCount() == 0} and {@code tornTailBytes() > 0}) is a second, separate
+     * path into the same hole this task closes: it quarantines the file to
+     * {@code .corrupt} and moves on WITHOUT incrementing {@code skippedSegmentCount},
+     * because that branch predates this task and sits outside the {@code catch
+     * (Throwable)} arm entirely. If this is the OLDEST segment, the contiguity check
+     * never sees a gap (it only compares files that opened successfully), so recovery
+     * would otherwise seed {@code ackedFsn} past frames nothing shows were delivered --
+     * the same silent loss, reached through a different branch. Corrupts frame[0]'s CRC
+     * directly (the same technique {@code PrReviewRedTests} uses for the pre-existing
+     * "must not silently unlink" guarantee), which is a genuinely different code path
+     * from {@link #corruptMagic}: a bad magic byte fails inside
+     * {@code MmapSegment.openExisting} and hits the {@code catch (Throwable)} arm; a bad
+     * frame[0] CRC lets {@code MmapSegment.openExisting} return normally and hits this
+     * "empty leftover" branch instead.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String oldestPath = tmpDir + "/torn-oldest-0.sfa";
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/torn-oldest-1.sfa", 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptFrameZeroCrc(oldestPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("expected recovery to refuse rather than silently "
+                            + "seed ackedFsn past the torn oldest segment's frames");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 1 unreadable segment(s)"));
+                }
+                assertFalse("the torn segment must be renamed aside", Files.exists(oldestPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(oldestPath + ".corrupt"));
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
             }
@@ -849,6 +907,28 @@ public class SegmentRingTest {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    /**
+     * Overwrites frame[0]'s 4-byte CRC field with a value statistically guaranteed to
+     * mismatch, leaving the frame's length field and payload -- and every later frame --
+     * untouched. {@code MmapSegment.openExisting} still returns normally (the header is
+     * fine), but {@code scanFrames} bails at frame[0], so {@code frameCount() == 0} and
+     * {@code tornTailBytes() > 0} -- the SAME technique {@code PrReviewRedTests} uses for
+     * the "must not silently unlink" guarantee, but landing in {@code SegmentRing}'s
+     * empty-with-torn-tail branch rather than its {@code catch (Throwable)} arm.
+     */
+    private static void corruptFrameZeroCrc(String path) {
+        int fd = Files.openRW(path);
+        assertTrue("openRW failed", fd >= 0);
+        long buf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putInt(buf, 0xDEADBEEF);
+            Files.write(fd, buf, 4, MmapSegment.HEADER_SIZE);
+        } finally {
+            Unsafe.free(buf, 4, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
     }
 
     /**
