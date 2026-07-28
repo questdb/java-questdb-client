@@ -503,6 +503,56 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * The extreme case of the same defect: every {@code .sfa} in the directory
+     * is unreadable, so {@code opened.size() == 0} after the scan. That branch
+     * predates this task and used to return {@code null} unconditionally --
+     * the caller reads {@code null} as "no prior slot" and starts a fresh ring
+     * at baseSeq=0, silently discarding every frame every skipped file held,
+     * with no operator-visible signal beyond a log line. This is not the
+     * brief's literal diff (which only guards the post-contiguity path,
+     * reachable only when at least one segment survives); it is the same
+     * silent-loss bug in its most extreme form, so the fix folds a refusal
+     * into the {@code opened.size() == 0} branch too.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenEverySegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String path0 = tmpDir + "/skip-all-0.sfa";
+                MmapSegment s0 = MmapSegment.create(path0, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String path1 = tmpDir + "/skip-all-1.sfa";
+                MmapSegment s1 = MmapSegment.create(path1, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptMagic(path0);
+                corruptMagic(path1);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError(
+                            "expected recovery to refuse rather than silently start a fresh ring "
+                                    + "at baseSeq=0 over an unreadable slot");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                }
+                assertFalse(Files.exists(path0));
+                assertFalse(Files.exists(path1));
+                assertTrue(Files.exists(path0 + ".corrupt"));
+                assertTrue(Files.exists(path1 + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testAcknowledgeIsMonotonic() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
