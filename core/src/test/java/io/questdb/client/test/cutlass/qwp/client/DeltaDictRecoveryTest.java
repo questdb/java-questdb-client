@@ -1560,6 +1560,7 @@ public class DeltaDictRecoveryTest {
         private int dataFrameCount;
         private TestWebSocketServer.ClientHandler droppedClient;
         private boolean firstDataFrameDropped;
+        private boolean hasUnresolvedSequence;
         private volatile int lastDataDeltaStart = -1;
 
         private DictReconstructingHandler() {
@@ -1605,6 +1606,16 @@ public class DeltaDictRecoveryTest {
                 currentClient = client;
                 dict.clear(); // fresh server dictionary per connection
                 nextSeq.set(0);
+                hasUnresolvedSequence = false;
+            }
+            if (hasUnresolvedSequence) {
+                // A real server marks the connection's pipeline broken on the first
+                // rejected frame and answers every later frame with silence -- no ACK,
+                // no NACK -- until the connection resets (QwpIngressUpgradeProcessor's
+                // hasUnresolvedSequence gate). Responding here would let the client
+                // believe frames were processed that a real server dropped, and a
+                // cumulative ACK could then leapfrog the rejected sequence.
+                return;
             }
             try {
                 QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
@@ -1612,6 +1623,7 @@ public class DeltaDictRecoveryTest {
                 // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
                 // apply the frame. ACKing here is what let a client sequence a real
                 // server rejects pass green.
+                hasUnresolvedSequence = true;
                 try {
                     long nackSequence = nextSeq.getAndIncrement();
                     if (newConnection) {

@@ -372,6 +372,7 @@ public class DeltaDictCatchUpTest {
         private final List<Long> ackSequenceStarts = new CopyOnWriteArrayList<>();
         private final List<List<String>> dictsByConn = new CopyOnWriteArrayList<>();
         private TestWebSocketServer.ClientHandler currentClient;
+        private boolean hasUnresolvedSequence;
         private final AtomicLong nextSeq = new AtomicLong(0);
 
         List<Long> ackSequenceStarts() {
@@ -394,6 +395,16 @@ public class DeltaDictCatchUpTest {
                 connectionsAccepted.incrementAndGet();
                 dictsByConn.add(new ArrayList<>()); // fresh dictionary per connection
                 nextSeq.set(0);
+                hasUnresolvedSequence = false;
+            }
+            if (hasUnresolvedSequence) {
+                // A real server marks the connection's pipeline broken on the first
+                // rejected frame and answers every later frame with silence -- no ACK,
+                // no NACK -- until the connection resets (QwpIngressUpgradeProcessor's
+                // hasUnresolvedSequence gate). Responding here would let the client
+                // believe frames were processed that a real server dropped, and a
+                // cumulative ACK could then leapfrog the rejected sequence.
+                return;
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
@@ -403,6 +414,7 @@ public class DeltaDictCatchUpTest {
                 // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
                 // apply the frame. ACKing here is what let a client sequence a real
                 // server rejects pass green.
+                hasUnresolvedSequence = true;
                 try {
                     long nackSequence = nextSeq.getAndIncrement();
                     if (newConnection) {
@@ -464,8 +476,10 @@ public class DeltaDictCatchUpTest {
     private static class CapShrinkHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger connectionsAccepted = new AtomicInteger();
         private final List<Long> ackSequenceStarts = new CopyOnWriteArrayList<>();
+        private final List<String> dict = new ArrayList<>();
         private final AtomicLong nextSeq = new AtomicLong(0);
         private TestWebSocketServer.ClientHandler currentClient;
+        private boolean hasUnresolvedSequence;
         private volatile TestWebSocketServer server;
 
         List<Long> ackSequenceStarts() {
@@ -482,7 +496,36 @@ public class DeltaDictCatchUpTest {
             if (newConnection) {
                 currentClient = client;
                 connectionsAccepted.incrementAndGet();
+                dict.clear(); // fresh server dictionary per connection
                 nextSeq.set(0);
+                hasUnresolvedSequence = false;
+            }
+            if (hasUnresolvedSequence) {
+                // A real server marks the connection's pipeline broken on the first
+                // rejected frame and answers every later frame with silence -- no ACK,
+                // no NACK -- until the connection resets (QwpIngressUpgradeProcessor's
+                // hasUnresolvedSequence gate). Responding here would let the client
+                // believe frames were processed that a real server dropped, and a
+                // cumulative ACK could then leapfrog the rejected sequence.
+                return;
+            }
+            try {
+                QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            } catch (QwpWireTestUtils.DictionaryGapException gap) {
+                // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
+                // apply the frame. ACKing here is what let a client sequence a real
+                // server rejects pass green.
+                hasUnresolvedSequence = true;
+                try {
+                    long nackSequence = nextSeq.getAndIncrement();
+                    if (newConnection) {
+                        ackSequenceStarts.add(nackSequence);
+                    }
+                    client.sendBinary(QwpWireTestUtils.buildNack(nackSequence, WebSocketResponse.STATUS_DICTIONARY_GAP));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                return;
             }
             try {
                 long ackSequence = nextSeq.getAndIncrement();
@@ -523,6 +566,7 @@ public class DeltaDictCatchUpTest {
         private final AtomicLong nextSeq = new AtomicLong(0);
         private boolean conn1Dropped;
         private TestWebSocketServer.ClientHandler currentClient;
+        private boolean hasUnresolvedSequence;
 
         SplitCatchUpHandler(int dropConn1AtDictSize) {
             this.dropConn1AtDictSize = dropConn1AtDictSize;
@@ -548,6 +592,16 @@ public class DeltaDictCatchUpTest {
                 connectionsAccepted.incrementAndGet();
                 dictsByConn.add(new ArrayList<>()); // fresh dictionary per connection
                 nextSeq.set(0);
+                hasUnresolvedSequence = false;
+            }
+            if (hasUnresolvedSequence) {
+                // A real server marks the connection's pipeline broken on the first
+                // rejected frame and answers every later frame with silence -- no ACK,
+                // no NACK -- until the connection resets (QwpIngressUpgradeProcessor's
+                // hasUnresolvedSequence gate). Responding here would let the client
+                // believe frames were processed that a real server dropped, and a
+                // cumulative ACK could then leapfrog the rejected sequence.
+                return;
             }
             int connNumber = dictsByConn.size();
             List<String> dict = dictsByConn.get(connNumber - 1);
@@ -557,6 +611,7 @@ public class DeltaDictCatchUpTest {
                 // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
                 // apply the frame. ACKing here is what let a client sequence a real
                 // server rejects pass green.
+                hasUnresolvedSequence = true;
                 try {
                     long nackSequence = nextSeq.getAndIncrement();
                     if (newConnection) {
