@@ -1746,6 +1746,40 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testTableOptionsRenameInvalidatesCachedDatagramEstimate() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            StringBuilder longName = new StringBuilder();
+            for (int i = 0; i < 120; i++) {
+                longName.append('t');
+            }
+            int maxDatagramSize = 1024;
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t").tableOptions().designatedTimestamp("a");
+                sender.longColumn("x", 1).atNow();
+                sender.flush();
+                Assert.assertEquals(1, nf.packets.size());
+
+                // rowCount == 0 after the flush, so re-declaring a different (much
+                // longer) name is accepted; the cached base estimate sized for "a"
+                // must not survive the rename
+                sender.table("t").tableOptions().designatedTimestamp(longName);
+                sender.longColumn("x", 2).atNow();
+                long estimate = sender.committedDatagramEstimateForTest();
+                sender.flush();
+
+                Assert.assertEquals(2, nf.packets.size());
+                int actual = nf.packets.get(1).length;
+                Assert.assertTrue(
+                        "committed estimate must cover the actual datagram [estimate=" + estimate + ", actual=" + actual + ']',
+                        estimate >= actual
+                );
+                assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+            }
+        });
+    }
+
+    @Test
     public void testTableOptionsRetainedReferenceRetargetsOnNextTableOptionsCall() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();

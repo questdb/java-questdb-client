@@ -52,6 +52,14 @@ public final class QwpConstants {
     public static final byte FLAG_GORILLA = 0x04;
     /**
      * Flag bit: per-table options trailer enabled.
+     * <p>
+     * The client sets this flag whenever a table option is declared, without
+     * gating on the negotiated capability (UDP has no handshake, and
+     * store-and-forward frames must replay to arbitrary servers). This relies
+     * on the server-side forward-compat guarantee: pre-table-options servers
+     * validate only magic, version and payload length (unknown flag bits are
+     * ignored) and iterate exactly the header-declared table count, so trailer
+     * bytes after the last table body are never read.
      */
     public static final byte FLAG_TABLE_OPTIONS = 0x20;
     /**

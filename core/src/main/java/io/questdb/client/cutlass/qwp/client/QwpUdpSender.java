@@ -1550,15 +1550,17 @@ public class QwpUdpSender implements Sender {
             }
             String previousName = tableBuffer.getDesignatedTimestampName();
             tableBuffer.setDesignatedTimestampName(columnName);
-            if (previousName == null) {
-                if (currentTableHeadroomState != null) {
-                    currentTableHeadroomState.invalidateBaseEstimate();
-                }
-                if (trackDatagramEstimate && committedDatagramEstimate > 0) {
-                    committedDatagramEstimate += QwpColumnWriter.getSingleTableOptionsTrailerSize(
-                            tableBuffer.getDesignatedTimestampName()
-                    );
-                }
+            // The cached base estimate folds in the trailer size, which depends on
+            // the name length, so every accepted set/change must invalidate it. The
+            // committedDatagramEstimate bump stays under previousName == null: a name
+            // change requires rowCount == 0, where the committed estimate is already 0.
+            if (currentTableHeadroomState != null) {
+                currentTableHeadroomState.invalidateBaseEstimate();
+            }
+            if (previousName == null && trackDatagramEstimate && committedDatagramEstimate > 0) {
+                committedDatagramEstimate += QwpColumnWriter.getSingleTableOptionsTrailerSize(
+                        tableBuffer.getDesignatedTimestampName()
+                );
             }
             return this;
         }

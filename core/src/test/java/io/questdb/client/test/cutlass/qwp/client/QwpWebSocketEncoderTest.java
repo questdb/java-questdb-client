@@ -1403,6 +1403,86 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testTableOptionsTrailerOnConsecutiveSplitMessages() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer first = new QwpTableBuffer("first");
+                 QwpTableBuffer second = new QwpTableBuffer("second");
+                 QwpTableBuffer third = new QwpTableBuffer("third")) {
+                first.setDesignatedTimestampName("ts");
+                first.getOrCreateColumn("x", TYPE_LONG, false).addLong(1);
+                first.nextRow();
+                second.getOrCreateColumn("x", TYPE_LONG, false).addLong(2);
+                second.nextRow();
+                third.setDesignatedTimestampName("event_ts");
+                third.getOrCreateColumn("x", TYPE_LONG, false).addLong(3);
+                third.nextRow();
+
+                // mirrors flushPendingRowsSplit: one single-table message per
+                // table on the same reused encoder
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+
+                encoder.beginMessage(1, dict, -1, -1);
+                encoder.addTable(first);
+                int size1 = encoder.finishMessage();
+                long address1 = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(
+                        FLAG_TABLE_OPTIONS,
+                        (byte) (Unsafe.getUnsafe().getByte(address1 + HEADER_OFFSET_FLAGS) & FLAG_TABLE_OPTIONS)
+                );
+                Assert.assertEquals(size1 - HEADER_SIZE, Unsafe.getUnsafe().getInt(address1 + 8));
+                byte[] expectedTrailer1 = {
+                        4,
+                        TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME,
+                        2, 't', 's',
+                        5, 0, 0, 0
+                };
+                long trailerAddress1 = address1 + size1 - expectedTrailer1.length;
+                for (int i = 0; i < expectedTrailer1.length; i++) {
+                    Assert.assertEquals(
+                            "message 1 trailer byte " + i,
+                            expectedTrailer1[i],
+                            Unsafe.getUnsafe().getByte(trailerAddress1 + i)
+                    );
+                }
+
+                // a table without options must not inherit the previous
+                // message's flag or trailer
+                encoder.beginMessage(1, dict, -1, -1);
+                encoder.addTable(second);
+                int size2 = encoder.finishMessage();
+                long address2 = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(0, Unsafe.getUnsafe().getByte(address2 + HEADER_OFFSET_FLAGS) & FLAG_TABLE_OPTIONS);
+                Assert.assertEquals(size2 - HEADER_SIZE, Unsafe.getUnsafe().getInt(address2 + 8));
+
+                encoder.beginMessage(1, dict, -1, -1);
+                encoder.addTable(third);
+                int size3 = encoder.finishMessage();
+                long address3 = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(
+                        FLAG_TABLE_OPTIONS,
+                        (byte) (Unsafe.getUnsafe().getByte(address3 + HEADER_OFFSET_FLAGS) & FLAG_TABLE_OPTIONS)
+                );
+                Assert.assertEquals(size3 - HEADER_SIZE, Unsafe.getUnsafe().getInt(address3 + 8));
+                byte[] expectedTrailer3 = {
+                        10,
+                        TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME,
+                        8, 'e', 'v', 'e', 'n', 't', '_', 't', 's',
+                        11, 0, 0, 0
+                };
+                long trailerAddress3 = address3 + size3 - expectedTrailer3.length;
+                for (int i = 0; i < expectedTrailer3.length; i++) {
+                    Assert.assertEquals(
+                            "message 3 trailer byte " + i,
+                            expectedTrailer3[i],
+                            Unsafe.getUnsafe().getByte(trailerAddress3 + i)
+                    );
+                }
+            }
+        });
+    }
+
+    @Test
     public void testVersionByteInHeader() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
