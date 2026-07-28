@@ -81,6 +81,7 @@ public class QwpUdpSender implements Sender {
     private final SegmentedNativeBufferWriter payloadWriter;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
     private final CharSequenceObjHashMap<TableHeadroomState> tableHeadroomStates;
+    private final TableOptionsImpl tableOptions = new TableOptionsImpl();
     private final boolean trackDatagramEstimate;
     private QwpTableBuffer.ColumnBuffer cachedTimestampColumn;
     private QwpTableBuffer.ColumnBuffer cachedTimestampNanosColumn;
@@ -592,6 +593,13 @@ public class QwpUdpSender implements Sender {
     }
 
     @Override
+    public TableOptions tableOptions() {
+        checkNotClosed();
+        checkTableSelected();
+        return tableOptions.of(currentTableBuffer);
+    }
+
+    @Override
     public Sender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
         checkNotClosed();
         checkTableSelected();
@@ -866,6 +874,15 @@ public class QwpUdpSender implements Sender {
         throw new LineSenderException("unsupported long array type");
     }
 
+    private void appendTableOptionsForUdp(QwpTableBuffer tableBuffer) {
+        if (tableBuffer.getDesignatedTimestampName() == null) {
+            return;
+        }
+        int trailerStart = payloadWriter.getPosition();
+        columnWriter.encodeTableOptions(tableBuffer);
+        payloadWriter.putInt(payloadWriter.getPosition() - trailerStart);
+    }
+
     private void atMicros(long timestampMicros) {
         try {
             stageDesignatedTimestampValue(timestampMicros, false);
@@ -1007,6 +1024,7 @@ public class QwpUdpSender implements Sender {
                 false,
                 false
         );
+        appendTableOptionsForUdp(tableBuffer);
         payloadWriter.finish();
         return payloadWriter.getPosition();
     }
@@ -1015,6 +1033,7 @@ public class QwpUdpSender implements Sender {
         payloadWriter.reset();
         columnWriter.setBuffer(payloadWriter);
         columnWriter.encodeTable(tableBuffer, false, false);
+        appendTableOptionsForUdp(tableBuffer);
         payloadWriter.finish();
         return payloadWriter.getPosition();
     }
@@ -1106,6 +1125,9 @@ public class QwpUdpSender implements Sender {
                 estimate += 1;
             }
         }
+        estimate += QwpColumnWriter.getSingleTableOptionsTrailerSize(
+                currentTableBuffer.getDesignatedTimestampName()
+        );
         if (currentTableHeadroomState != null) {
             currentTableHeadroomState.cacheBaseEstimate(currentTableBuffer.getColumnCount(), estimate);
         }
@@ -1218,17 +1240,17 @@ public class QwpUdpSender implements Sender {
 
     private void sendCommittedPrefix(CharSequence tableName, QwpTableBuffer tableBuffer) {
         int payloadLength = encodeCommittedPrefixPayloadForUdp(tableBuffer);
-        sendEncodedPayload(tableName, payloadLength);
+        sendEncodedPayload(tableName, tableBuffer, payloadLength);
     }
 
-    private void sendEncodedPayload(CharSequence tableName, int payloadLength) {
+    private void sendEncodedPayload(CharSequence tableName, QwpTableBuffer tableBuffer, int payloadLength) {
         headerBuffer.reset();
         headerBuffer.putByte((byte) 'Q');
         headerBuffer.putByte((byte) 'W');
         headerBuffer.putByte((byte) 'P');
         headerBuffer.putByte((byte) '1');
         headerBuffer.putByte(VERSION);
-        headerBuffer.putByte((byte) 0);
+        headerBuffer.putByte(tableBuffer.getDesignatedTimestampName() == null ? 0 : FLAG_TABLE_OPTIONS);
         headerBuffer.putShort((short) 1);
         headerBuffer.putInt(payloadLength);
 
@@ -1251,7 +1273,7 @@ public class QwpUdpSender implements Sender {
 
     private void sendWholeTableBuffer(CharSequence tableName, QwpTableBuffer tableBuffer) {
         int payloadLength = encodeTablePayloadForUdp(tableBuffer);
-        sendEncodedPayload(tableName, payloadLength);
+        sendEncodedPayload(tableName, tableBuffer, payloadLength);
         tableBuffer.reset();
     }
 
@@ -1483,6 +1505,11 @@ public class QwpUdpSender implements Sender {
             return cachedBaseEstimateColumnCount == currentSchemaColumnCount ? cachedBaseEstimate : -1;
         }
 
+        void invalidateBaseEstimate() {
+            cachedBaseEstimate = -1;
+            cachedBaseEstimateColumnCount = -1;
+        }
+
         long predictNextRowGrowth() {
             if (committedSampleCount < 2) {
                 return 0;
@@ -1507,6 +1534,38 @@ public class QwpUdpSender implements Sender {
             if (committedSampleCount < Integer.MAX_VALUE) {
                 committedSampleCount++;
             }
+        }
+    }
+
+    private final class TableOptionsImpl implements TableOptions {
+        private QwpTableBuffer tableBuffer;
+
+        @Override
+        public TableOptions designatedTimestamp(CharSequence columnName) {
+            checkNotClosed();
+            if (tableBuffer != currentTableBuffer) {
+                throw new LineSenderException(
+                        "table options reference is stale; call tableOptions() after table()"
+                );
+            }
+            String previousName = tableBuffer.getDesignatedTimestampName();
+            tableBuffer.setDesignatedTimestampName(columnName);
+            if (previousName == null) {
+                if (currentTableHeadroomState != null) {
+                    currentTableHeadroomState.invalidateBaseEstimate();
+                }
+                if (trackDatagramEstimate && committedDatagramEstimate > 0) {
+                    committedDatagramEstimate += QwpColumnWriter.getSingleTableOptionsTrailerSize(
+                            tableBuffer.getDesignatedTimestampName()
+                    );
+                }
+            }
+            return this;
+        }
+
+        private TableOptions of(QwpTableBuffer tableBuffer) {
+            this.tableBuffer = tableBuffer;
+            return this;
         }
     }
 }

@@ -59,6 +59,7 @@ public final class PooledSender implements Sender {
 
     private final long generation;
     private final SenderSlot slot;
+    private final PooledTableOptions tableOptions = new PooledTableOptions();
 
     PooledSender(SenderSlot slot, long generation) {
         this.slot = slot;
@@ -360,6 +361,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public TableOptions tableOptions() {
+        return tableOptions.of(slot.live(generation).tableOptions());
+    }
+
+    @Override
     public Sender timestampColumn(CharSequence name, long value, ChronoUnit unit) {
         slot.live(generation).timestampColumn(name, value, unit);
         return this;
@@ -398,5 +404,21 @@ public final class PooledSender implements Sender {
 
     SenderSlot slot() {
         return slot;
+    }
+
+    private final class PooledTableOptions implements TableOptions {
+        private TableOptions delegate;
+
+        @Override
+        public TableOptions designatedTimestamp(CharSequence columnName) {
+            slot.live(generation);
+            delegate.designatedTimestamp(columnName);
+            return this;
+        }
+
+        private TableOptions of(TableOptions delegate) {
+            this.delegate = delegate;
+            return this;
+        }
     }
 }

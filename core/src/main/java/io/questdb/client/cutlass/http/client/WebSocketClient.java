@@ -83,6 +83,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     private static final String QWP_DURABLE_ACK_ENABLED_VALUE = "enabled";
     private static final String QWP_DURABLE_ACK_HEADER_NAME = "X-QWP-Durable-Ack:";
     private static final String QWP_MAX_BATCH_SIZE_HEADER_NAME = "X-QWP-Max-Batch-Size:";
+    private static final String QWP_TABLE_OPTIONS_HEADER_NAME = "X-QWP-Table-Options:";
     private static final String QWP_VERSION_HEADER_NAME = "X-QWP-Version:";
     private static final ThreadLocal<MessageDigest> SHA1_DIGEST = ThreadLocal.withInitial(() -> {
         try {
@@ -162,6 +163,7 @@ public abstract class WebSocketClient implements QuietCloseable {
     // the wire said without re-clamping so a misconfigured server is observable.
     private int serverNegotiatedZstdLevel;
     private int serverQwpVersion = 1;
+    private boolean serverTableOptionsSupported;
     private String upgradeRejectRole;
     // Server-advertised zone identifier from the most recent rejected upgrade,
     // captured from the X-QuestDB-Zone response header on a 421. Null when the
@@ -411,6 +413,14 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Returns true when the server advertised support for the designated
+     * timestamp name table option in {@code X-QWP-Table-Options}.
+     */
+    public boolean isServerTableOptionsSupported() {
+        return serverTableOptionsSupported;
+    }
+
+    /**
      * Receives and processes WebSocket frames.
      *
      * @param handler frame handler callback
@@ -614,6 +624,7 @@ public abstract class WebSocketClient implements QuietCloseable {
         upgradeRejectRole = null;
         upgradeRejectZone = null;
         upgradeStatusCode = 0;
+        serverTableOptionsSupported = false;
 
         // Generate random key
         byte[] keyBytes = new byte[16];
@@ -820,6 +831,35 @@ public abstract class WebSocketClient implements QuietCloseable {
             }
         }
         return 1;
+    }
+
+    private static boolean extractTableOptionsSupport(String response) {
+        int headerLen = QWP_TABLE_OPTIONS_HEADER_NAME.length();
+        int responseLen = response.length();
+        for (int i = 0; i <= responseLen - headerLen; i++) {
+            if (response.regionMatches(true, i, QWP_TABLE_OPTIONS_HEADER_NAME, 0, headerLen)) {
+                int valueStart = i + headerLen;
+                int lineEnd = response.indexOf('\r', valueStart);
+                if (lineEnd < 0) {
+                    lineEnd = responseLen;
+                }
+                String value = response.substring(valueStart, lineEnd);
+                int tokenStart = 0;
+                while (tokenStart <= value.length()) {
+                    int comma = value.indexOf(',', tokenStart);
+                    int tokenEnd = comma < 0 ? value.length() : comma;
+                    if ("1".equals(value.substring(tokenStart, tokenEnd).trim())) {
+                        return true;
+                    }
+                    if (comma < 0) {
+                        break;
+                    }
+                    tokenStart = comma + 1;
+                }
+                return false;
+            }
+        }
+        return false;
     }
 
     private static String extractRoleHeader(String response) {
@@ -1359,6 +1399,10 @@ public abstract class WebSocketClient implements QuietCloseable {
         // Extract X-QWP-Max-Batch-Size (optional). Older servers omit it; the
         // sender falls back to its locally configured byte budget in that case.
         serverMaxBatchSize = extractMaxBatchSize(response);
+
+        // Extract the supported per-table option tags. Tag 1 is the
+        // designated timestamp column name hint.
+        serverTableOptionsSupported = extractTableOptionsSupport(response);
 
         // Extract X-QWP-Content-Encoding (optional). Surfaces what level the
         // server actually applied -- which may differ from what this client

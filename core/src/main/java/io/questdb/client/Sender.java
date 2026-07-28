@@ -743,6 +743,25 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     Sender table(CharSequence table);
 
     /**
+     * Returns create-time options for the currently selected table.
+     * <p>
+     * Call this after {@link #table(CharSequence)}. QWP senders retain options
+     * per table for the sender's lifetime. ILP transports cannot express table
+     * options.
+     * <p>
+     * The returned instance is a single per-sender object that this method and
+     * {@link #table(CharSequence)} re-target at the currently selected table.
+     * Do not retain the reference across table selections; use it immediately
+     * and obtain a fresh one after selecting a table.
+     *
+     * @return options for the currently selected table
+     * @throws LineSenderException if the transport is ILP or no table is selected
+     */
+    default TableOptions tableOptions() {
+        throw new LineSenderException("table options are not supported by ILP");
+    }
+
+    /**
      * Add a column with a non-designated timestamp value.
      *
      * @param name  name of the column
@@ -835,6 +854,32 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         FLUSH,
         APPEND,
         PERIODIC
+    }
+
+    /**
+     * Create-time options for the table selected by {@link Sender#table(CharSequence)}.
+     */
+    interface TableOptions {
+
+        /**
+         * Sets the designated timestamp column name to use if the selected
+         * table is auto-created by QWP ingestion.
+         * <p>
+         * Supporting servers use this hint only while creating a missing table
+         * and silently ignore it for existing tables. Older QWP servers also
+         * silently ignore it and create the conventional {@code timestamp}
+         * column instead.
+         * <p>
+         * The hint is sticky per table. It may be re-declared with a different
+         * name while the table has no buffered rows; changing it while rows
+         * are buffered throws.
+         *
+         * @param columnName non-empty column name of at most 127 UTF-8 bytes
+         * @return this instance for method chaining
+         * @throws LineSenderException if the name is invalid or these options
+         *                             no longer refer to the selected table
+         */
+        TableOptions designatedTimestamp(CharSequence columnName);
     }
 
     /**

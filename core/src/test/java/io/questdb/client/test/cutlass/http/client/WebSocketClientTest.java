@@ -128,6 +128,30 @@ public class WebSocketClientTest {
         Assert.assertEquals(16 * 1024 * 1024, invokeExtractMaxBatchSize(response));
     }
 
+    @Test
+    public void testExtractTableOptionsSupportAbsentHeaderReturnsFalse() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Version: 1\r\n"
+                + "\r\n";
+        Assert.assertFalse(invokeExtractTableOptionsSupport(response));
+    }
+
+    @Test
+    public void testExtractTableOptionsSupportFindsDesignatedTimestampTag() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Table-Options: 2, 1\r\n"
+                + "\r\n";
+        Assert.assertTrue(invokeExtractTableOptionsSupport(response));
+    }
+
+    @Test
+    public void testExtractTableOptionsSupportRejectsOtherTags() throws Exception {
+        String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "X-QWP-Table-Options: 2\r\n"
+                + "\r\n";
+        Assert.assertFalse(invokeExtractTableOptionsSupport(response));
+    }
+
     /**
      * A frame handler may close() the client from inside its callback:
      * CursorWebSocketSendLoop's NACK-recycle path (handleServerRejection /
@@ -391,6 +415,12 @@ public class WebSocketClientTest {
         Method m = WebSocketClient.class.getDeclaredMethod("extractMaxBatchSize", String.class);
         m.setAccessible(true);
         return (int) m.invoke(null, response);
+    }
+
+    private static boolean invokeExtractTableOptionsSupport(String response) throws Exception {
+        Method m = WebSocketClient.class.getDeclaredMethod("extractTableOptionsSupport", String.class);
+        m.setAccessible(true);
+        return (boolean) m.invoke(null, response);
     }
 
     private static void setUpgradedTrue(Object obj) throws Exception {

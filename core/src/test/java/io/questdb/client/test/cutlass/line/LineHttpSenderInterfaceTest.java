@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.junit.Assert;
 import org.junit.Test;
@@ -70,6 +71,18 @@ public class LineHttpSenderInterfaceTest {
             Assert.assertTrue(
                     "sender must keep accepting rows after reset",
                     sender.bufferView().size() > 0);
+        }
+    }
+
+    @Test
+    public void testTableOptionsThrows() {
+        try (Sender sender = Sender.fromConfig("http::addr=127.0.0.1:1;auto_flush=off;protocol_version=1;")) {
+            try {
+                sender.table("t").tableOptions();
+                Assert.fail("Expected LineSenderException");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage().contains("table options are not supported by ILP"));
+            }
         }
     }
 }

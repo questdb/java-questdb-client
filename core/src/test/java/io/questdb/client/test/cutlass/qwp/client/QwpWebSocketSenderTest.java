@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -555,6 +556,19 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testOptionsOnlyRowIsDiscardedOnTableSwitch() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                sender.table("first").tableOptions().designatedTimestamp("ts");
+                sender.table("second");
+
+                Assert.assertEquals(0, sender.getTableBuffer("first").getRowCount());
+                Assert.assertEquals(0, sender.getTableBuffer("second").getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testPendingBytesMatchesGroundTruthAcrossTableSwitches() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
@@ -687,6 +701,70 @@ public class QwpWebSocketSenderTest {
                 Assert.fail("Expected LineSenderException");
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage().contains("table()"));
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsBeforeTableThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                try {
+                    sender.tableOptions();
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("table()"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsChainingReturnsSameInstance() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                Sender.TableOptions options = sender.table("t").tableOptions();
+
+                Assert.assertSame(options, options.designatedTimestamp("ts"));
+                Assert.assertSame(options, sender.tableOptions());
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsRetainedReferenceRetargetsOnNextTableOptionsCall() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                Sender.TableOptions retained = sender.table("a").tableOptions();
+                Assert.assertSame(retained, sender.table("b").tableOptions());
+
+                // the retained reference is the re-stamped per-sender flyweight:
+                // the call lands on the currently selected table, not on "a"
+                retained.designatedTimestamp("ts");
+                Assert.assertEquals("ts", sender.getTableBuffer("b").getDesignatedTimestampName());
+                Assert.assertNull(sender.getTableBuffer("a").getDesignatedTimestampName());
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsStaleReferenceRejectedUntilTableReselected() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                Sender.TableOptions options = sender.table("a").tableOptions();
+                options.designatedTimestamp("ts");
+
+                sender.table("b");
+                try {
+                    options.designatedTimestamp("other_ts");
+                    Assert.fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("stale"));
+                }
+
+                sender.table("a");
+                Assert.assertSame(options, options.designatedTimestamp("ts"));
+                Assert.assertEquals("ts", sender.getTableBuffer("a").getDesignatedTimestampName());
             }
         });
     }

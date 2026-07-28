@@ -1259,6 +1259,39 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testPreTableOptionsEncodingIsByteIdenticalWhenNameIsAbsent() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+
+                int size = encoder.encode(buffer);
+                byte[] expected = {
+                        'Q', 'W', 'P', '1',
+                        VERSION,
+                        FLAG_GORILLA,
+                        1, 0,
+                        16, 0, 0, 0,
+                        1, 't',
+                        1,
+                        1,
+                        1, 'x', TYPE_LONG,
+                        0,
+                        42, 0, 0, 0, 0, 0, 0, 0
+                };
+
+                Assert.assertEquals(expected.length, size);
+                long address = encoder.getBuffer().getBufferPtr();
+                for (int i = 0; i < expected.length; i++) {
+                    Assert.assertEquals("byte " + i, expected[i], Unsafe.getUnsafe().getByte(address + i));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testReset() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1280,6 +1313,91 @@ public class QwpWebSocketEncoderTest {
 
                 // Sizes should be similar (same schema)
                 Assert.assertEquals(size1, size2);
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsTrailerEncoding() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer buffer = new QwpTableBuffer("t")) {
+                buffer.setDesignatedTimestampName("ts");
+                QwpTableBuffer.ColumnBuffer col = buffer.getOrCreateColumn("x", TYPE_LONG, false);
+                col.addLong(42);
+                buffer.nextRow();
+
+                int size = encoder.encode(buffer);
+                long address = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(
+                        FLAG_TABLE_OPTIONS,
+                        (byte) (Unsafe.getUnsafe().getByte(address + HEADER_OFFSET_FLAGS) & FLAG_TABLE_OPTIONS)
+                );
+                Assert.assertEquals(size - HEADER_SIZE, Unsafe.getUnsafe().getInt(address + 8));
+
+                byte[] expectedTrailer = {
+                        4,
+                        TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME,
+                        2, 't', 's',
+                        5, 0, 0, 0
+                };
+                long trailerAddress = address + size - expectedTrailer.length;
+                for (int i = 0; i < expectedTrailer.length; i++) {
+                    Assert.assertEquals(
+                            "trailer byte " + i,
+                            expectedTrailer[i],
+                            Unsafe.getUnsafe().getByte(trailerAddress + i)
+                    );
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsTrailerEncodingWithMixedPresence() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 QwpTableBuffer first = new QwpTableBuffer("first");
+                 QwpTableBuffer second = new QwpTableBuffer("second");
+                 QwpTableBuffer third = new QwpTableBuffer("third")) {
+                first.getOrCreateColumn("x", TYPE_LONG, false).addLong(1);
+                first.nextRow();
+                second.setDesignatedTimestampName("ts");
+                second.getOrCreateColumn("x", TYPE_LONG, false).addLong(2);
+                second.nextRow();
+                third.getOrCreateColumn("x", TYPE_LONG, false).addLong(3);
+                third.nextRow();
+
+                encoder.beginMessage(3, new GlobalSymbolDictionary(), -1, -1);
+                encoder.addTable(first);
+                encoder.addTable(second);
+                encoder.addTable(third);
+                int size = encoder.finishMessage();
+
+                long address = encoder.getBuffer().getBufferPtr();
+                Assert.assertEquals(
+                        FLAG_TABLE_OPTIONS,
+                        (byte) (Unsafe.getUnsafe().getByte(address + HEADER_OFFSET_FLAGS) & FLAG_TABLE_OPTIONS)
+                );
+                Assert.assertEquals(3, Unsafe.getUnsafe().getShort(address + 6));
+                Assert.assertEquals(size - HEADER_SIZE, Unsafe.getUnsafe().getInt(address + 8));
+
+                byte[] expectedTrailer = {
+                        0,
+                        4,
+                        TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME,
+                        2, 't', 's',
+                        0,
+                        7, 0, 0, 0
+                };
+                long trailerAddress = address + size - expectedTrailer.length;
+                for (int i = 0; i < expectedTrailer.length; i++) {
+                    Assert.assertEquals(
+                            "trailer byte " + i,
+                            expectedTrailer[i],
+                            Unsafe.getUnsafe().getByte(trailerAddress + i)
+                    );
+                }
             }
         });
     }
