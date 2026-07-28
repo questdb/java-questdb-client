@@ -48,6 +48,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -258,6 +259,38 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     loop.close();
                 }
             }
+        });
+    }
+
+    @Test
+    public void testCatchUpChunksBelowTheDefaultReceiveBufferWhenNoCapIsAdvertised() throws Exception {
+        // getServerMaxBatchSize() == 0 means "not advertised", not "unbounded". The
+        // transport still closes anything larger than the server's receive buffer -- the
+        // default is 131072 -- with 1009, which is correctly non-terminal for a
+        // catch-up-only connection, so the reconnect ships the identical frame forever.
+        TestUtils.assertMemoryLeak(() -> {
+            List<byte[]> frames = captureCatchUpFrames(/*advertisedCap*/ 0, /*symbols*/ 20_000);
+            assertTrue("a large dictionary must still chunk without an advertised cap",
+                    frames.size() > 1);
+            for (byte[] frame : frames) {
+                assertTrue("catch-up frame of " + frame.length
+                                + " bytes would be refused by a default receive buffer",
+                        frame.length <= CursorWebSocketSendLoop.uncappedCatchUpPackingLimit());
+            }
+            assertCatchUpReassembles(frames, 20_000);
+        });
+    }
+
+    @Test
+    public void testUncappedServerDoesNotInventACapGapForALargeSymbol() throws Exception {
+        // The solo-frame limit must NOT be tightened with the packing limit. An entry
+        // that already shipped inside a data frame was bounded by effectiveAutoFlushBytes,
+        // so declaring it a cap gap here would create a new terminal for data the
+        // producer sent successfully.
+        TestUtils.assertMemoryLeak(() -> {
+            List<byte[]> frames = captureCatchUpFramesWithOneLargeSymbol(
+                    /*advertisedCap*/ 0, /*largeSymbolBytes*/ 256 * 1024);
+            assertFalse("a large symbol must not be reported as a cap gap", frames.isEmpty());
         });
     }
 
@@ -1133,6 +1166,55 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     /**
+     * Seeds a fresh dictionary of {@code symbolCount} distinct ordinary symbols, runs a
+     * catch-up against a client that advertises {@code advertisedCap}, and returns the
+     * captured frames. Self-contained -- the engine and loop it builds are opened and
+     * closed entirely within this call, so the caller only sees the heap-copied frame
+     * bytes {@link CatchUpCapturingClient#capture} produces.
+     */
+    private List<byte[]> captureCatchUpFrames(int advertisedCap, int symbolCount) throws Exception {
+        String[] symbols = new String[symbolCount];
+        for (int i = 0; i < symbolCount; i++) {
+            symbols[i] = "sym" + i;
+        }
+        CatchUpCapturingClient client = new CatchUpCapturingClient(advertisedCap);
+        try (CursorSendEngine engine = newEngine()) {
+            CursorWebSocketSendLoop loop = newLoop(engine, client);
+            try {
+                seedMirror(loop, symbols);
+                invokeSetWireBaselineWithCatchUp(loop, 0L);
+            } finally {
+                loop.close();
+            }
+        }
+        return client.capturedFrames;
+    }
+
+    /**
+     * As {@link #captureCatchUpFrames}, but the dictionary holds a single entry of
+     * {@code largeSymbolBytes} bytes -- large enough to exceed the packing limit on its
+     * own, so the walk ships it as its own oversized solo chunk (the accepted residual;
+     * Task 13 files the halve-and-retry follow-up) instead of ever reaching the
+     * cap-gap terminal.
+     */
+    private List<byte[]> captureCatchUpFramesWithOneLargeSymbol(
+            int advertisedCap, int largeSymbolBytes
+    ) throws Exception {
+        String largeSymbol = TestUtils.repeat("x", largeSymbolBytes);
+        CatchUpCapturingClient client = new CatchUpCapturingClient(advertisedCap);
+        try (CursorSendEngine engine = newEngine()) {
+            CursorWebSocketSendLoop loop = newLoop(engine, client);
+            try {
+                seedMirror(loop, largeSymbol);
+                invokeSetWireBaselineWithCatchUp(loop, 0L);
+            } finally {
+                loop.close();
+            }
+        }
+        return client.capturedFrames;
+    }
+
+    /**
      * Reassembles the frames captured since the last call through the same
      * {@link QwpWireTestUtils#accumulateDeltaDictionary} the end-to-end tests'
      * handler uses -- with {@code allowGap=true}, so a hole surfaces as a null
@@ -1149,6 +1231,27 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
      * dictionary catches all three shapes -- overlap, gap and shift -- because it
      * compares content per id, not just the ranges.
      */
+    /**
+     * As {@link #assertCatchUpReassembles(CatchUpCapturingClient, String...)}, but for
+     * {@link #captureCatchUpFrames} / {@link #captureCatchUpFramesWithOneLargeSymbol},
+     * which return the captured frames directly instead of a client -- and where the
+     * caller only knows the dictionary's SIZE, not each generated symbol's literal text.
+     * Proves the frames tile {@code [0, expectedCount)} exactly, gap-free.
+     */
+    private static void assertCatchUpReassembles(List<byte[]> frames, int expectedCount) {
+        List<String> rebuilt = new ArrayList<>();
+        for (byte[] frame : frames) {
+            // allowGap=true: this assertion exists to PROVE the chunks tile [0, n)
+            // with no hole, so a gap must be observable here rather than thrown.
+            QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt, true);
+        }
+        assertEquals("reassembled dictionary size", expectedCount, rebuilt.size());
+        for (int i = 0; i < expectedCount; i++) {
+            assertTrue("symbol at id " + i + " must not be a gap (a null here is a gap a "
+                    + "real server would REJECT)", rebuilt.get(i) != null);
+        }
+    }
+
     private static void assertCatchUpReassembles(CatchUpCapturingClient client, String... expected) {
         List<String> rebuilt = new ArrayList<>();
         for (byte[] frame : client.capturedFrames) {

@@ -163,6 +163,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * restores count-only escalation for orphan drainers.
      */
     public static final long DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS = 300_000L;
+    /**
+     * Packing ceiling for a dictionary catch-up when the server advertises no batch cap
+     * (an older build that omits X-QWP-Max-Batch-Size, or one whose derived cap collapsed
+     * to zero). "Not advertised" is not "unbounded": the transport still closes anything
+     * larger than the server's receive buffer with 1009, and a catch-up-only close is
+     * deliberately non-terminal, so an unchunked catch-up reconnects into the identical
+     * frame forever. Deliberately well below the 131072 default receive buffer, since the
+     * real value cannot be known when it is not advertised.
+     * <p>
+     * This bounds MULTI-ENTRY packing only. The cap-gap terminal is measured against a
+     * separate, generous limit -- see sendDictCatchUp -- so that a single entry which
+     * already shipped inside a data frame is never reclassified as unsendable.
+     */
+    static final int UNCAPPED_CATCHUP_PACKING_LIMIT = 64 * 1024;
     private static final Logger LOG = LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
     // Settle budget for the symbol-dict catch-up cap gap: how many cap-gap attempts
     // -- catch-ups that reached a fresh server and found a single dictionary entry
@@ -1097,6 +1111,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     @TestOnly
     public static int maxSentDictBytes() {
         return MAX_SENT_DICT_BYTES;
+    }
+
+    @TestOnly
+    public static int uncappedCatchUpPackingLimit() {
+        return UNCAPPED_CATCHUP_PACKING_LIMIT;
     }
 
     /**
@@ -2697,33 +2716,32 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      */
     private int sendDictCatchUp() {
         int cap = client.getServerMaxBatchSize();
-        long fullFrameLen = QwpConstants.HEADER_SIZE
-                + NativeBufferWriter.varintSize(0)
-                + NativeBufferWriter.varintSize(sentDictCount)
-                + (long) sentDictBytesLen;
-        if (cap <= 0 && fullFrameLen <= MAX_SENT_DICT_BYTES) {
-            sendCatchUpChunk(0, sentDictCount, sentDictBytesAddr, sentDictBytesLen);
-            resetCatchUpCapGapEpisode();
-            return 1;
-        }
-        // The frame ceiling a catch-up chunk must not exceed: the server's
-        // advertised cap, or -- when the server advertises none (cap <= 0) --
-        // MAX_SENT_DICT_BYTES so sendCatchUpChunk's int frameLen (HEADER_SIZE +
-        // varints + symbolsLen) cannot overflow on a pathological multi-GB
-        // dictionary (unreachable at real cardinality; defensive). Used by the
-        // single-entry terminal below, which measures the real solo frame.
-        int frameLimit = cap > 0 ? cap : MAX_SENT_DICT_BYTES;
+        // Two limits, deliberately different when the server advertises no cap.
+        //
+        // packingLimit bounds a multi-entry chunk. With no advertised cap the receive
+        // buffer is unknown, so this stays conservative (UNCAPPED_CATCHUP_PACKING_LIMIT,
+        // well under the 131072 default receive buffer) and a dictionary of ordinary
+        // symbols always chunks into frames a server will accept.
+        //
+        // soloFrameLimit bounds the CAP-GAP terminal below and must not be tightened the
+        // same way: an entry that already went out inside a data frame was bounded by
+        // effectiveAutoFlushBytes, not by our fallback, so tightening it would invent a
+        // new terminal for data the producer sent successfully. When a cap IS advertised
+        // the two coincide, which is what the homogeneous-cluster argument below rests on.
+        //
+        // No unsplit fast path: when the dictionary fits, the walk below emits exactly
+        // one frame anyway, so the special case only ever removed the bound.
+        int packingLimit = cap > 0 ? cap : UNCAPPED_CATCHUP_PACKING_LIMIT;
+        int soloFrameLimit = cap > 0 ? cap : MAX_SENT_DICT_BYTES;
         // Symbol-bytes budget for PACKING several entries into one chunk, leaving
         // room for the 12-byte header and the two delta-section varints. Kept
         // deliberately conservative (reserving 16 for the varints): it only makes a
-        // multi-entry chunk split marginally earlier, never over the cap. It must
+        // multi-entry chunk split marginally earlier, never over the limit. It must
         // NOT gate the single-entry terminal -- that reserve is larger than the
         // minimal data-frame overhead, so an entry the producer already shipped
         // under this cap could exceed the reserve yet still fit its own catch-up
-        // frame; the terminal tests the real solo frame against frameLimit instead.
-        int budget = cap > 0
-                ? Math.max(1, cap - QwpConstants.HEADER_SIZE - 16)
-                : MAX_SENT_DICT_BYTES - QwpConstants.HEADER_SIZE - 16;
+        // frame; the terminal tests the real solo frame against soloFrameLimit instead.
+        int budget = Math.max(1, packingLimit - QwpConstants.HEADER_SIZE - 16);
         int framesSent = 0;
         int chunkStartId = 0;
         long chunkStartAddr = sentDictBytesAddr;
@@ -2765,7 +2783,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     + NativeBufferWriter.varintSize(chunkStartId + chunkSymbols)
                     + NativeBufferWriter.varintSize(1)
                     + entryBytes;
-            if (soloFrameLen > frameLimit) {
+            if (soloFrameLen > soloFrameLimit) {
                 // Cap gap: this entry cannot be re-registered under the fresh
                 // server's advertised cap. A HOMOGENEOUS cluster never reaches here
                 // (an entry that fit its data frame under a cap always fits its bare
