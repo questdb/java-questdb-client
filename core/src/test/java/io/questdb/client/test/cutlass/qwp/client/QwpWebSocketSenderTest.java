@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
 import io.questdb.client.std.Decimal128;
 import io.questdb.client.std.Decimal256;
@@ -340,10 +341,12 @@ public class QwpWebSocketSenderTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-                // Memory-only engine with a 33-byte budget and a 1 ns append
+                // Memory-only engine with the smallest viable segment budget (just
+                // enough for the header plus one minimal frame) and a 1 ns append
                 // deadline guarantees every appendBlocking() call trips the
                 // backpressure deadline and throws.
-                CursorSendEngine engine = new CursorSendEngine(null, 33, 33, 1L);
+                long minSegmentBytes = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1;
+                CursorSendEngine engine = new CursorSendEngine(null, minSegmentBytes, minSegmentBytes, 1L);
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
                         "localhost", port, null, Integer.MAX_VALUE, 0, 0L, null,
                         false, engine, 0L)) {

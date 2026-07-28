@@ -58,14 +58,26 @@ import org.slf4j.LoggerFactory;
  * <b>Layout</b> (little-endian):
  * <pre>
  *   offset 0: u32 magic = 'SYD1'
- *   offset 4: u8  version = 3
+ *   offset 4: u8  version = 1
  *   offset 5: 3 bytes reserved (zero)
- *   offset 8: chunks, each
+ *   offset 8: u64 generation
+ *   offset 16: chunks, each
  *             [entryCount: varint][entryBytes: varint][entries][crc32c: u32]
  *             where entries = [len: varint][utf8] repeated entryCount times,
  *             occupying exactly entryBytes bytes, and the CRC-32C covers the
  *             two header varints AND the entry region.
  * </pre>
+ * <b>{@code generation}</b> ties this dictionary to the producer lineage that
+ * wrote it -- the same value {@link MmapSegment} stamps into every segment of
+ * that lineage. The only check a recovered dictionary previously got was a
+ * size heuristic: nothing compared its persisted strings against the strings
+ * the surviving frames actually carry at overlapping ids, so a dictionary left
+ * by an earlier generation could register its symbols under ids a later
+ * generation's rows reference, with no gap, a valid CRC and both bounds checks
+ * satisfied. {@link #open} now refuses (returns {@code null}) a dictionary
+ * whose generation disagrees with the caller's expectation -- falling back to
+ * full self-sufficient frames, which is always safe -- instead of trusting a
+ * survivor that merely happens to be the right size.
  * A <b>chunk</b> is one append -- i.e. exactly the set of symbols one frame
  * introduces, since the producer persists a frame's new symbols in a single call
  * before publishing it. Symbol id {@code i} is the {@code i}-th entry across all
@@ -146,7 +158,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
     public static final String FILE_NAME = ".symbol-dict";
     static final int CRC_SIZE = 4; // u32 CRC-32C trailing every chunk
     static final int FILE_MAGIC = 0x31445953; // 'SYD1' little-endian
-    static final int HEADER_SIZE = 8;
+    static final int HEADER_SIZE = 16;
     // One bounded, segment-sized append window avoids the allocate/unmap/mmap
     // cycle every 64 KiB without geometrically reserving up to 2x a large
     // dictionary. close() truncates the unused tail back to appendOffset.
@@ -166,7 +178,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * {@link #ensureScratch} never silently under-allocates.
      */
     static final int MAX_SCRATCH_BYTES = Integer.MAX_VALUE - 8;
-    static final byte VERSION = 3; // v3 moved the CRC-32C from per-entry to per-chunk
+    static final byte VERSION = 1;
     private static final Logger LOG = LoggerFactory.getLogger(PersistedSymbolDict.class);
     private final int fd;
     // Filesystem seam. Production is FilesFacade.INSTANCE (straight to Files);
@@ -241,22 +253,32 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * CRC-valid chunks are loaded into memory (see {@link #loadedEntriesAddr()}).
      * <p>
      * Returns {@code null} on any I/O or parse failure -- including an existing file
-     * that cannot be read, carries an unknown version, or fails its checksums. The
-     * caller then falls back to full-dictionary (self-sufficient) frames for this
-     * slot, so a broken side-file degrades gracefully rather than aborting the
-     * sender. Crucially, a {@code null} return NEVER destroys the file: see the
-     * class-level "Never recreate over an existing file" note.
+     * that cannot be read, carries an unknown version or a generation that disagrees
+     * with {@code expectedGeneration}, or fails its checksums. The caller then falls
+     * back to full-dictionary (self-sufficient) frames for this slot, so a broken
+     * side-file degrades gracefully rather than aborting the sender. Crucially, a
+     * {@code null} return NEVER destroys the file: see the class-level "Never
+     * recreate over an existing file" note.
+     *
+     * @param expectedGeneration the producer lineage the caller expects this dictionary
+     *                           to belong to -- the same value {@link MmapSegment} carries
+     *                           in the segments this slot recovered. A recovered dictionary
+     *                           whose stamped generation disagrees is a survivor from a
+     *                           DIFFERENT lineage: trusting it would register its symbols
+     *                           under ids this generation's rows reference, so it is
+     *                           discarded (degrading to full self-sufficient frames) rather
+     *                           than trusted on a size heuristic alone.
      */
-    public static PersistedSymbolDict open(String slotDir) {
-        return open(FilesFacade.INSTANCE, slotDir);
+    public static PersistedSymbolDict open(String slotDir, long expectedGeneration) {
+        return open(FilesFacade.INSTANCE, slotDir, expectedGeneration);
     }
 
     /**
-     * Facade-aware variant of {@link #open(String)}. Production passes
+     * Facade-aware variant of {@link #open(String, long)}. Production passes
      * {@link FilesFacade#INSTANCE}; tests inject a fault facade to drive recovery
      * I/O failures (e.g. a truncate that cannot drop a torn tail).
      */
-    public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
+    public static PersistedSymbolDict open(FilesFacade ff, String slotDir, long expectedGeneration) {
         String filePath = slotDir + "/" + FILE_NAME;
         boolean exists = ff.exists(filePath);
         long existing = exists ? ff.length(filePath) : -1L;
@@ -304,7 +326,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // sender that cannot be constructed at all.
             PersistedSymbolDict[] inFlight = new PersistedSymbolDict[1];
             try {
-                return openExisting(ff, filePath, existing, inFlight);
+                return openExisting(ff, filePath, existing, expectedGeneration, inFlight);
             } catch (Throwable t) {
                 if (inFlight[0] != null) {
                     inFlight[0].close();
@@ -320,7 +342,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // an absent/stub file has no id space to preserve, so a create failure
         // still just degrades to null (full self-sufficient frames), same as
         // every other recovery I/O failure above.
-        return openFresh(ff, filePath, false);
+        return openFresh(ff, filePath, false, expectedGeneration);
     }
 
     /**
@@ -344,16 +366,21 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * generation's id space -- stays on disk, and the next recovery would trust
      * it and misattribute symbols with no detectable gap. So that case throws
      * {@link LineSenderException} instead of degrading -- see {@link #openFresh}.
+     *
+     * @param generation the producer lineage this freshly-started slot belongs to --
+     *                   the same value the caller stamps into its fresh initial
+     *                   {@link MmapSegment}, so the dictionary and the frames that
+     *                   will reference its ids agree from the outset.
      */
-    public static PersistedSymbolDict openClean(String slotDir) {
-        return openClean(FilesFacade.INSTANCE, slotDir);
+    public static PersistedSymbolDict openClean(String slotDir, long generation) {
+        return openClean(FilesFacade.INSTANCE, slotDir, generation);
     }
 
     /**
-     * Facade-aware variant of {@link #openClean(String)}.
+     * Facade-aware variant of {@link #openClean(String, long)}.
      */
-    public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir) {
-        return openFresh(ff, slotDir + "/" + FILE_NAME, true);
+    public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir, long generation) {
+        return openFresh(ff, slotDir + "/" + FILE_NAME, true, generation);
     }
 
     /**
@@ -736,8 +763,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                 in the caller's frame, past the catch below -- still leaves the fully
      *                 built instance (fd plus loaded-entry buffer) reachable by someone.
      */
-    private static PersistedSymbolDict openExisting(
-            FilesFacade ff, String filePath, long fileLen, PersistedSymbolDict[] inFlight) {
+    private static PersistedSymbolDict openExisting(FilesFacade ff, String filePath, long fileLen,
+                                                     long expectedGeneration, PersistedSymbolDict[] inFlight) {
         int fd = ff.openRW(filePath);
         if (fd < 0) {
             LOG.warn("symbol dict {} could not be opened (rc={}); "
@@ -770,6 +797,28 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (Unsafe.getUnsafe().getInt(inputAddr) != FILE_MAGIC
                     || Unsafe.getUnsafe().getByte(inputAddr + 4) != VERSION) {
                 throw new IllegalStateException("bad magic or unknown symbol dictionary version");
+            }
+            // The only check a recovered dictionary previously got was a size heuristic;
+            // nothing compared its persisted strings against what the surviving frames
+            // actually reference at overlapping ids. A dictionary stamped with a DIFFERENT
+            // generation is a survivor from a prior producer lineage -- trusting it would
+            // register its symbols under ids this generation's rows reference, with no gap,
+            // a valid CRC and both bounds checks satisfied. Discarding (falling back to full
+            // self-sufficient frames) is always safe, so that is the disposition for every
+            // ambiguity here -- return null directly rather than throw, since this is an
+            // ordinary refusal, not an I/O or parse failure.
+            long fileGeneration = Unsafe.getUnsafe().getLong(inputAddr + 8);
+            if (fileGeneration != expectedGeneration) {
+                LOG.warn("symbol dict {} belongs to generation {} but this slot is {}; "
+                                + "discarding it and falling back to full-dictionary frames",
+                        filePath, fileGeneration, expectedGeneration);
+                if (mappedInput) {
+                    ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
+                } else {
+                    Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
+                }
+                ff.close(fd);
+                return null;
             }
             // ONE pass: validate each chunk's CRC and, once proven good, copy its
             // entries straight out. The entry region is by construction a subset of
@@ -954,8 +1003,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                      load-bearing to lose -- so a create failure there still
      *                      just degrades to null like every other recovery I/O
      *                      failure.
+     * @param generation the producer lineage to stamp into the freshly-created header --
+     *                    the caller's expected/derived generation in both the
+     *                    {@code mustTruncate} and non-{@code mustTruncate} cases, so a
+     *                    dictionary created here always already agrees with its caller.
      */
-    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath, boolean mustTruncate) {
+    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath, boolean mustTruncate,
+                                                 long generation) {
         int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
             if (mustTruncate && ff.exists(filePath)) {
@@ -981,6 +1035,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putByte(hdr + 5, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 6, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 7, (byte) 0);
+            Unsafe.getUnsafe().putLong(hdr + 8, generation);
             long written = ff.write(fd, hdr, HEADER_SIZE, 0);
             if (written != HEADER_SIZE) {
                 int fdToClose = fd;
@@ -992,8 +1047,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
             }
         } catch (Throwable t) {
             // Unreachable with FilesFacade.INSTANCE (Files.write is native and returns
-            // -1 rather than throwing; the Unsafe puts target a valid 8-byte buffer and
-            // an 8-byte malloc cannot realistically OOM), but the ff seam exists so
+            // -1 rather than throwing; the Unsafe puts target a valid 16-byte buffer and
+            // a 16-byte malloc cannot realistically OOM), but the ff seam exists so
             // tests CAN inject a throwing facade -- close the fd and drop the stub so
             // neither leaks.
             if (fd >= 0) { // the header-write branch relinquished fd to -1 before closing

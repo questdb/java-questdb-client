@@ -455,9 +455,16 @@ public final class SegmentManager implements QuietCloseable {
                         // via its long-ptr overload, bypassing the byte[] + native
                         // malloc that the String overload would incur on every
                         // rotation.
+                        //
+                        // The spare's generation must match every other segment in this
+                        // lineage, so read it off the CURRENT active rather than deriving a
+                        // new one: the active already carries whatever the fresh-slot path
+                        // (or, for a recovered ring, SegmentRing.openExisting's agreement
+                        // check) established for this slot.
                         spare = MmapSegment.create(FilesFacade.INSTANCE,
                                 pathScratch.ptr(), path,
-                                e.ring.nextSeqHint(), segmentSizeBytes);
+                                e.ring.nextSeqHint(), segmentSizeBytes,
+                                e.ring.getActive().generation());
                     }
                     Runnable installHook = beforeInstallSyncHook;
                     if (installHook != null) {

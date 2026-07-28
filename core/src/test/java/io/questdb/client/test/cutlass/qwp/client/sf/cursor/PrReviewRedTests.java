@@ -48,6 +48,7 @@ import java.nio.file.Paths;
  */
 public class PrReviewRedTests {
 
+    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -105,7 +106,7 @@ public class PrReviewRedTests {
         TestUtils.assertMemoryLeak(() -> {
             String segPath = tmpDir + "/sf-data.sfa";
             // Build a segment with several real frames so we have something to lose.
-            MmapSegment seg = MmapSegment.create(segPath, 0L, 64 * 1024);
+            MmapSegment seg = MmapSegment.create(segPath, 0L, 64 * 1024, GEN);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (int i = 0; i < 32; i++) {
@@ -180,7 +181,7 @@ public class PrReviewRedTests {
     @Test
     public void testC2_acknowledgeMustClampAtPublishedFsn() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            MmapSegment seg = MmapSegment.create(tmpDir + "/c2.sfa", 0L, 64 * 1024);
+            MmapSegment seg = MmapSegment.create(tmpDir + "/c2.sfa", 0L, 64 * 1024, GEN);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try {
                 for (int i = 0; i < 32; i++) {

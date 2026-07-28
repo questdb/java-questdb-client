@@ -208,7 +208,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
             // A populated dictionary is what makes the loop ship a catch-up. The frames
             // carry no symbols, so recoveredMaxSymbolId stays -1 and the full-dict
             // discard cannot fire on it.
-            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir, readSegmentGeneration())) {
                 assertNotNull(pd);
                 pd.appendSymbol("a");
                 pd.appendSymbol("b");
@@ -565,7 +565,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
                 appendDeltaSymbolFrame(engine, 2, 'c');
                 appendDeltaSymbolFrame(engine, 3, 'd');
             }
-            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir, readSegmentGeneration())) {
                 assertNotNull(pd);
                 pd.appendSymbol("a");
                 pd.appendSymbol("b");
@@ -838,6 +838,27 @@ public class CursorWebSocketSendLoopOrphanTailTest {
 
     private CursorSendEngine newEngine() {
         return new CursorSendEngine(tmpDir, 16384);
+    }
+
+    /**
+     * Reads the u64 generation {@code newEngine()}'s fresh-slot path stamped into
+     * {@code sf-initial.sfa} (offset 24 -- see MmapSegment's header layout). A test
+     * that populates {@code .symbol-dict} out-of-band via {@code openClean} between
+     * an engine's close and its recovery must stamp the SAME generation the
+     * surviving segment carries, or the second engine's recovery would (correctly)
+     * discard the dictionary as belonging to a different lineage.
+     */
+    private long readSegmentGeneration() throws java.io.IOException {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(tmpDir + "/sf-initial.sfa", "r")) {
+            raf.seek(24);
+            byte[] buf = new byte[8];
+            raf.readFully(buf);
+            long v = 0;
+            for (int i = 0; i < 8; i++) {
+                v |= (long) (buf[i] & 0xFFL) << (8 * i);
+            }
+            return v;
+        }
     }
 
     private CursorWebSocketSendLoop newLoop(CursorSendEngine engine, List<AckingClient> clients) {

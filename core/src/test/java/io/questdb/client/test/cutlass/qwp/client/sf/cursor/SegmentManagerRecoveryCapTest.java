@@ -50,6 +50,10 @@ import java.nio.file.Paths;
  */
 public class SegmentManagerRecoveryCapTest {
 
+    // Every prepopulated segment must share this generation -- they are recovered
+    // together by SegmentRing.openExisting, which refuses a slot whose segments
+    // disagree.
+    private static final long GEN = 1L;
     private static final long SEGMENT_SIZE = 64 * 1024;
     private String slotDir;
 
@@ -127,7 +131,7 @@ public class SegmentManagerRecoveryCapTest {
                 try (MmapSegment seg = MmapSegment.create(
                         dir + "/sf-pre-" + i + ".sfa",
                         i, // baseSeq=0,1,2 each holding 1 frame → contiguous
-                        SEGMENT_SIZE)) {
+                        SEGMENT_SIZE, GEN)) {
                     Assert.assertTrue("setup append should succeed",
                             seg.tryAppend(buf, 64) >= 0);
                 }

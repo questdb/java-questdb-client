@@ -399,13 +399,30 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
         }
     }
 
-    private static void replacePersistedDictionaryWithTwoSymbolPrefix(Path slot) {
-        try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString())) {
+    private static void replacePersistedDictionaryWithTwoSymbolPrefix(Path slot) throws IOException {
+        // Stamped with the surviving segment's own generation so the recovery
+        // exercised right after this call still trusts this rewritten dictionary as
+        // belonging to the same lineage -- see readSegmentGeneration.
+        try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString(), readSegmentGeneration(slot))) {
             Assert.assertNotNull(torn);
             torn.appendSymbol("a");
             torn.appendSymbol("b");
             Assert.assertEquals(2, torn.size());
         }
+    }
+
+    /**
+     * Reads the u64 generation {@code populateThreeFrameSlot}'s fresh-slot path
+     * stamped into {@code sf-initial.sfa} (offset 24 -- see MmapSegment's header
+     * layout).
+     */
+    private static long readSegmentGeneration(Path slot) throws IOException {
+        byte[] bytes = Files.readAllBytes(slot.resolve("sf-initial.sfa"));
+        long v = 0;
+        for (int i = 0; i < 8; i++) {
+            v |= (long) (bytes[24 + i] & 0xFFL) << (8 * i);
+        }
+        return v;
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {

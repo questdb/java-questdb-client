@@ -29,6 +29,7 @@ import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
+import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
 
@@ -73,6 +74,14 @@ public final class CursorSendEngine implements QuietCloseable {
     // writer; volatile because the user may sample it from any thread.
     private final java.util.concurrent.atomic.AtomicLong backpressureStallCount =
             new java.util.concurrent.atomic.AtomicLong();
+    // The producer lineage this slot belongs to: derived fresh (see the constructor's
+    // fresh-start branch) or read from the recovered ring's agreed generation
+    // (SegmentRing.recoveredGeneration()). Held for the slot's lifetime -- every
+    // segment SegmentManager rotates in for this ring carries the same value (read
+    // off the current active at rotation time), and it is what seeds/validates the
+    // persisted symbol dictionary via PersistedSymbolDict.openClean/open.
+    // MmapSegment.MISSING_GENERATION in memory mode, where neither concept applies.
+    private final long generation;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
     // case close() also stops the manager. When the manager is shared across
@@ -257,6 +266,7 @@ public final class CursorSendEngine implements QuietCloseable {
         AckWatermark watermarkInProgress = null;
         PersistedSymbolDict persistedDictInProgress = null;
         RecoveredFrameAnalysis recoveredFrameAnalysisInProgress = null;
+        long generationInProgress = MmapSegment.MISSING_GENERATION;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -319,10 +329,17 @@ public final class CursorSendEngine implements QuietCloseable {
                 // mmap doesn't take down the engine -- we just fall
                 // back to the bare lowestBase - 1 seed.
                 watermarkInProgress = AckWatermark.open(sfDir);
+                // Every segment SegmentRing.openExisting recovered agreed on this
+                // generation (it refuses the slot otherwise -- see its per-file
+                // check), so it is the producer lineage this recovery belongs to.
+                generationInProgress = recovered.recoveredGeneration();
                 // Load the persisted symbol dictionary so delta-encoded frames
                 // in this recovered slot can be re-registered on the fresh
-                // server before replay. Null on open failure -> delta disabled.
-                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
+                // server before replay. Null on open failure, OR when a
+                // survivor's stamped generation disagrees with the one above
+                // (a prior lineage's dictionary sharing this slot) -> delta
+                // disabled.
+                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir, generationInProgress);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress != null
                         ? watermarkInProgress.read()
@@ -459,6 +476,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (!memoryMode) {
                     AckWatermark.removeOrphan(sfDir);
                     watermarkInProgress = AckWatermark.open(sfDir);
+                    // Stamp a fresh generation id for this lineage. Every segment this
+                    // slot ever writes -- the initial segment below, and every rotation
+                    // spare SegmentManager creates afterwards -- carries this same value,
+                    // and the dictionary below is stamped with it too, so a later
+                    // recovery can tell a dictionary or segment belonging to a stale,
+                    // prior generation sharing this directory from one belonging to this
+                    // session. 0 (MISSING_GENERATION) is reserved, hence the retry loop;
+                    // the mix (not a raw timestamp) spreads the low bits a producer-count
+                    // comparison would otherwise leave clustered.
+                    do {
+                        generationInProgress = Os.currentTimeMicros() * 0x9E3779B97F4A7C15L;
+                    } while (generationInProgress == MmapSegment.MISSING_GENERATION);
                     // A fresh slot MUST start with an EMPTY symbol dictionary.
                     // Unlike the ack watermark above -- a discardable optimization a
                     // max() clamp protects -- the dictionary is load-bearing: a
@@ -479,7 +508,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     // refuses that case outright (throws LineSenderException) instead of
                     // degrading to null; the catch (Throwable) below cleans up and lets
                     // it propagate.
-                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir);
+                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir, generationInProgress);
                 }
                 MmapSegment initial;
                 String initialPath = null;
@@ -487,7 +516,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     initial = MmapSegment.createInMemory(0L, segmentSizeBytes);
                 } else {
                     initialPath = sfDir + "/sf-initial.sfa";
-                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes);
+                    initial = MmapSegment.create(initialPath, 0L, segmentSizeBytes, generationInProgress);
                 }
                 try {
                     ringInProgress = new SegmentRing(initial, segmentSizeBytes);
@@ -504,12 +533,13 @@ public final class CursorSendEngine implements QuietCloseable {
                 manager.start();
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress);
-            // All construction succeeded — commit the ring, watermark and
-            // symbol-dictionary references.
+            // All construction succeeded — commit the ring, watermark,
+            // symbol-dictionary and generation references.
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
             this.persistedSymbolDict = persistedDictInProgress;
             this.recoveredFrameAnalysis = recoveredFrameAnalysisInProgress;
+            this.generation = generationInProgress;
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own

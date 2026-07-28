@@ -72,6 +72,7 @@ import static org.junit.Assert.assertTrue;
  */
 public class SegmentManagerTotalBytesRaceTest {
 
+    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -98,7 +99,7 @@ public class SegmentManagerTotalBytesRaceTest {
                 String dir = tmpDir + "/single-ring";
                 assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                 String activePath = dir + "/sf-initial.sfa";
-                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
+                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize, GEN);
                 SegmentRing ring = new SegmentRing(seg0, segSize);
 
                 try {

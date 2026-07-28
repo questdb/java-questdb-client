@@ -101,6 +101,7 @@ import static org.junit.Assert.fail;
  */
 public class MmapSegmentRecoveryFaultTest {
 
+    private static final long GEN = 1L;
     private static final long SEGMENT_BYTES = 1L << 20;
 
     private String tmpDir;
@@ -556,7 +557,7 @@ public class MmapSegmentRecoveryFaultTest {
             for (int i = 0; i < maxLen; i++) {
                 Unsafe.getUnsafe().putByte(buf + i, (byte) (i | 1)); // all non-zero
             }
-            try (MmapSegment seg = MmapSegment.create(path, baseSeq, SEGMENT_BYTES)) {
+            try (MmapSegment seg = MmapSegment.create(path, baseSeq, SEGMENT_BYTES, GEN)) {
                 for (int len : payloadLens) {
                     assertTrue("append must fit", seg.tryAppend(buf, len) >= 0);
                 }

@@ -44,14 +44,20 @@ import org.slf4j.LoggerFactory;
  * <p>
  * On-disk layout — header and frame format:
  * <pre>
- *   [u32 magic 'SF01'] [u8 ver]   [u8 flags=0] [u16 reserved=0]
- *   [u64 baseSeq]       [u64 createdMicros]                       24-byte header
+ *   [u32 magic 'SF01'] [u8 ver=2] [u8 flags=0] [u16 reserved=0]
+ *   [u64 baseSeq]      [u64 createdMicros]     [u64 generation]   32-byte header
  *   frame, frame, ...                                              each frame:
  *                                                                  [u32 crc32c]
  *                                                                  [u32 payloadLen]
  *                                                                  [payloadLen bytes]
  *   crc32c covers (payloadLen, payload).
  * </pre>
+ * {@code generation} ties every segment in one producer lineage together: it is
+ * the same value across the initial segment and every spare a rotation ever
+ * installs, and {@link SegmentRing#openExisting} refuses a slot whose recovered
+ * segments disagree on it -- two producer generations sharing one slot
+ * directory, with overlapping ids that describe different strings, which no
+ * other guard (gap check, CRC, bounds) can see. See {@link #generation()}.
  * The mapping is sized at construction and never grows. When
  * {@link #tryAppend} returns -1 the caller must rotate to a fresh segment.
  * Closing the segment unmaps and closes the fd; data already written is
@@ -62,8 +68,10 @@ public final class MmapSegment implements QuietCloseable {
 
     public static final int FILE_MAGIC = 0x31304653; // 'SF01' little-endian
     public static final int FRAME_HEADER_SIZE = 8;   // u32 crc + u32 payloadLen
-    public static final int HEADER_SIZE = 24;
-    public static final byte VERSION = 1;
+    public static final int HEADER_SIZE = 32;
+    /** Reserved generation value; never assigned by {@link CursorSendEngine}'s derivation. */
+    public static final long MISSING_GENERATION = 0L;
+    public static final byte VERSION = 2;
     private static final Logger LOG = LoggerFactory.getLogger(MmapSegment.class);
 
     private final String path;
@@ -89,6 +97,11 @@ public final class MmapSegment implements QuietCloseable {
     // give one-sided fencing only — the writer is NOT synchronized on the
     // ring monitor. volatile is the cheapest correct fix.
     private volatile long frameCount;
+    // Identifies the producer lineage this segment belongs to: the same value
+    // across the initial segment and every spare a rotation installs. Final --
+    // unlike baseSeq, nothing ever re-stamps a segment's generation after
+    // creation. See the class javadoc and generation().
+    private final long generation;
     private long mmapAddress;
     // publishedCursor: written by producer, read by consumer (I/O thread). Volatile
     // because the consumer must see writes in publication order — once the
@@ -103,7 +116,7 @@ public final class MmapSegment implements QuietCloseable {
 
     private MmapSegment(String path, int fd, long mmapAddress, long sizeBytes,
                         long baseSeq, long initialCursor, long frameCount,
-                        boolean memoryBacked, long tornTailBytes) {
+                        boolean memoryBacked, long tornTailBytes, long generation) {
         this.path = path;
         this.fd = fd;
         this.mmapAddress = mmapAddress;
@@ -114,22 +127,23 @@ public final class MmapSegment implements QuietCloseable {
         this.frameCount = frameCount;
         this.memoryBacked = memoryBacked;
         this.tornTailBytes = tornTailBytes;
+        this.generation = generation;
     }
 
     /**
-     * Convenience overload of {@link #create(FilesFacade, String, long, long)}
+     * Convenience overload of {@link #create(FilesFacade, String, long, long, long)}
      * that uses {@link FilesFacade#INSTANCE} (production default). Tests that
      * need to fault-inject filesystem failures (ENOSPC at openCleanRW or
      * allocate) should call the facade-aware overload directly.
      */
-    public static MmapSegment create(String path, long baseSeq, long sizeBytes) {
-        return create(FilesFacade.INSTANCE, path, baseSeq, sizeBytes);
+    public static MmapSegment create(String path, long baseSeq, long sizeBytes, long generation) {
+        return create(FilesFacade.INSTANCE, path, baseSeq, sizeBytes, generation);
     }
 
     /**
      * Creates a fresh segment file at {@code path}, pre-allocating exactly
      * {@code sizeBytes} bytes of real disk blocks and mmapping the whole
-     * region RW. Writes the 24-byte header and positions the cursor
+     * region RW. Writes the 32-byte header and positions the cursor
      * immediately after it. Throws {@link MmapSegmentException} on any I/O
      * failure (file already exists, openCleanRW failed, ENOSPC during
      * pre-allocation, mmap rejected).
@@ -142,25 +156,30 @@ public final class MmapSegment implements QuietCloseable {
      * {@code posix_fallocate} / {@code F_PREALLOCATE} is not supported, the
      * native fallback to {@code ftruncate} reintroduces the SIGBUS risk for
      * that filesystem only.
+     *
+     * @param generation the producer lineage this segment belongs to -- the same
+     *                   value the caller passes for every other segment (initial
+     *                   plus every rotation spare) in this slot. See {@link #generation()}.
      */
-    public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes) {
+    public static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes, long generation) {
         long pathPtr = ff.allocNativePath(path);
         try {
-            return create(ff, pathPtr, path, baseSeq, sizeBytes);
+            return create(ff, pathPtr, path, baseSeq, sizeBytes, generation);
         } finally {
             ff.freeNativePath(pathPtr);
         }
     }
 
     /**
-     * Variant of {@link #create(FilesFacade, String, long, long)} that takes a
+     * Variant of {@link #create(FilesFacade, String, long, long, long)} that takes a
      * pre-encoded native UTF-8 path pointer plus a parallel String for use in
      * exception messages and {@link #path()}. The pointer must be a
      * null-terminated UTF-8 path, typically built into a reused
      * {@code DirectUtf8Sink} by the rotation hot path so it does not incur a
      * per-call {@code byte[]} + native-malloc the way the String overload does.
      */
-    public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes) {
+    public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq,
+                                     long sizeBytes, long generation) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
@@ -196,8 +215,9 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 24, generation);
             return new MmapSegment(displayPath, fd, addr, sizeBytes, baseSeq,
-                    HEADER_SIZE, 0, false, 0L);
+                    HEADER_SIZE, 0, false, 0L, generation);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 Files.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -213,10 +233,14 @@ public final class MmapSegment implements QuietCloseable {
 
     /**
      * Creates a memory-backed segment with the same on-the-wire layout as
-     * {@link #create(String, long, long)} but without any file. Used by the
+     * {@link #create(String, long, long, long)} but without any file. Used by the
      * non-SF async ingest path: cursor's lock-free append architecture is
      * still the right answer, but durability is "in JVM memory" — no disk
      * involvement. The segment is freed via {@link #close()} (Unsafe.free).
+     * <p>
+     * Stamps {@link #MISSING_GENERATION}: a memory-backed segment is never
+     * reopened via {@link #openExisting}, so the lineage check that field
+     * exists for never runs against it -- only the header layout needs to match.
      */
     public static MmapSegment createInMemory(long baseSeq, long sizeBytes) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
@@ -234,8 +258,9 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 24, MISSING_GENERATION);
             return new MmapSegment(null, -1, addr, sizeBytes, baseSeq,
-                    HEADER_SIZE, 0, true, 0L);
+                    HEADER_SIZE, 0, true, 0L, MISSING_GENERATION);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
@@ -383,6 +408,7 @@ public final class MmapSegment implements QuietCloseable {
                 throw new MmapSegmentException(
                         "bad baseSeq in " + path + ": " + baseSeq);
             }
+            long generation = Unsafe.getUnsafe().getLong(addr + 24);
             FrameScan scan = scanFrames(addr, fileSize);
             long lastGood = scan.lastGood;
             long count = scan.frameCount;
@@ -396,7 +422,7 @@ public final class MmapSegment implements QuietCloseable {
                         path, tornTail, lastGood, fileSize, count);
             }
             MmapSegment segment = new MmapSegment(path, fd, addr, fileSize, baseSeq,
-                    lastGood, count, false, tornTail);
+                    lastGood, count, false, tornTail, generation);
             if (inFlight != null) {
                 inFlight[0] = segment;
             }
@@ -588,6 +614,18 @@ public final class MmapSegment implements QuietCloseable {
      */
     public long frameCount() {
         return frameCount;
+    }
+
+    /**
+     * The producer lineage this segment belongs to -- the value passed to
+     * {@link #create} (or {@link #createInMemory}) at construction, or read back
+     * from the header at offset 24 by {@link #openExisting}. Every segment written
+     * by one producer generation (the initial segment and every rotation spare)
+     * carries the same value; {@link SegmentRing#openExisting} refuses a slot whose
+     * recovered segments disagree.
+     */
+    public long generation() {
+        return generation;
     }
 
     /**

@@ -121,6 +121,11 @@ public final class SegmentRing implements QuietCloseable {
     private Runnable managerWakeup;
     private long nextSeq;
     private volatile long publishedFsn;
+    // The generation every recovered segment agreed on -- see openExisting's
+    // per-file check below. MISSING_GENERATION for a ring built via the plain
+    // constructor (a fresh start with no recovered segments to agree on
+    // anything); read-only after construction for a recovered ring.
+    private long recoveredGeneration = MmapSegment.MISSING_GENERATION;
     // Plain (producer-thread-only) flag; set to true the first time we ask
     // the manager for a spare for the current active segment, cleared on
     // every rotation. Coalesces multiple high-water-mark crossings into a
@@ -396,6 +401,26 @@ public final class SegmentRing implements QuietCloseable {
             // as 0 and hits the same gap. Checking the skip tally first means any skip
             // refuses before the gap it may have opened is ever examined.
             refuseIfSegmentsSkipped(skippedSegmentCount, sfDir);
+            // Segments from two producer generations can come to share one slot
+            // directory -- a crash between generations, an orphan adoption racing a
+            // fresh start, an operator merging leftovers -- and their FSN ranges can
+            // still line up perfectly, so the contiguity check below cannot see it.
+            // A slot-level sidecar could not see it either: it only records "the
+            // dictionary predates the last fresh start", not "these segments disagree
+            // with EACH OTHER". The generation every segment carries makes that a
+            // direct comparison. Runs before the contiguity check for the same reason
+            // the skip-tally refusal does: joining that disposition rather than
+            // inventing a parallel path.
+            long recoveredGeneration = opened.get(0).generation();
+            for (int i = 1, n = opened.size(); i < n; i++) {
+                long g = opened.get(i).generation();
+                if (g != recoveredGeneration) {
+                    throw new UnreplayableSlotException(
+                            "segments in " + sfDir + " disagree on generation (" + recoveredGeneration
+                                    + " vs " + g + "); two producer lineages appear to share this slot"
+                                    + " -- the affected data must be resent");
+                }
+            }
             // Sanity: the recovered segments must form a contiguous FSN range.
             // Detect gaps so they don't silently produce duplicate or missing
             // FSNs after recovery. A gap means a segment went missing (a
@@ -432,6 +457,7 @@ public final class SegmentRing implements QuietCloseable {
             // whole-segment mapping (up to sf_max_bytes) and its fd would leak.
             int last = opened.size() - 1;
             SegmentRing ring = new SegmentRing(opened.get(last), maxBytesPerSegment);
+            ring.recoveredGeneration = recoveredGeneration;
             // Older segments become sealed in baseSeq order.
             for (int i = 0; i < last; i++) {
                 ring.sealedSegments.add(opened.get(i));
@@ -793,6 +819,19 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long publishedFsn() {
         return publishedFsn;
+    }
+
+    /**
+     * The generation every segment {@link #openExisting} recovered agreed on, or
+     * {@link MmapSegment#MISSING_GENERATION} for a ring built fresh via
+     * {@link #SegmentRing(MmapSegment, long)} (nothing was recovered to agree on
+     * anything). {@code CursorSendEngine} passes this to
+     * {@link PersistedSymbolDict#open(FilesFacade, String, long)} so the recovered
+     * dictionary is trusted only if it belongs to the same producer lineage as the
+     * frames that reference its ids.
+     */
+    public long recoveredGeneration() {
+        return recoveredGeneration;
     }
 
     /**
