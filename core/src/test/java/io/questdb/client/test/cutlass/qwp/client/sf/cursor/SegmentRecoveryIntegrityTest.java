@@ -984,7 +984,7 @@ public class SegmentRecoveryIntegrityTest {
                 }
                 throw new AssertionError("a surviving leftover must refuse the slot");
             } catch (MmapSegmentException expected) {
-                TestUtils.assertContains(expected.getMessage(), "could not remove");
+                TestUtils.assertContains(expected.getMessage(), "could not remove drained SF leftover");
             }
             Assert.assertTrue("the refused leftover must stay on disk",
                     Files.exists(leftoverPath));
