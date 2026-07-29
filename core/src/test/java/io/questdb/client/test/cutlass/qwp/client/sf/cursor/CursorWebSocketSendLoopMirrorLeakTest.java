@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -413,14 +414,15 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
 
     /**
      * Reads the u64 generation {@code populateThreeFrameSlot}'s fresh-slot path
-     * stamped into {@code sf-initial.sfa} (offset 24 -- see MmapSegment's header
-     * layout).
+     * stamped into {@code sf-initial.sfa} (the last 8 bytes of the header -- see
+     * MmapSegment's header layout).
      */
     private static long readSegmentGeneration(Path slot) throws IOException {
         byte[] bytes = Files.readAllBytes(slot.resolve("sf-initial.sfa"));
+        int offset = MmapSegment.HEADER_SIZE - 8;
         long v = 0;
         for (int i = 0; i < 8; i++) {
-            v |= (long) (bytes[24 + i] & 0xFFL) << (8 * i);
+            v |= (long) (bytes[offset + i] & 0xFFL) << (8 * i);
         }
         return v;
     }

@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
@@ -842,15 +843,16 @@ public class CursorWebSocketSendLoopOrphanTailTest {
 
     /**
      * Reads the u64 generation {@code newEngine()}'s fresh-slot path stamped into
-     * {@code sf-initial.sfa} (offset 24 -- see MmapSegment's header layout). A test
-     * that populates {@code .symbol-dict} out-of-band via {@code openClean} between
-     * an engine's close and its recovery must stamp the SAME generation the
-     * surviving segment carries, or the second engine's recovery would (correctly)
-     * discard the dictionary as belonging to a different lineage.
+     * {@code sf-initial.sfa} (the last 8 bytes of the header -- see MmapSegment's
+     * header layout). A test that populates {@code .symbol-dict} out-of-band via
+     * {@code openClean} between an engine's close and its recovery must stamp the
+     * SAME generation the surviving segment carries, or the second engine's
+     * recovery would (correctly) discard the dictionary as belonging to a
+     * different lineage.
      */
     private long readSegmentGeneration() throws java.io.IOException {
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(tmpDir + "/sf-initial.sfa", "r")) {
-            raf.seek(24);
+            raf.seek(MmapSegment.HEADER_SIZE - 8);
             byte[] buf = new byte[8];
             raf.readFully(buf);
             long v = 0;

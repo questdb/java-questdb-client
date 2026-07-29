@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.ObjList;
@@ -1579,17 +1580,18 @@ public class DeltaDictRecoveryTest {
 
     /**
      * Reads the u64 generation this slot's producer lineage stamped into its
-     * initial segment (offset 24 -- see MmapSegment's header layout). A test that
-     * rewrites {@code .symbol-dict} out-of-band (simulating a host-crash tear) must
-     * stamp it with the SAME generation the surviving segments carry: openClean()
-     * takes whatever value it is given, and a mismatch would make a later recovery
-     * (correctly) discard the rewritten dictionary as belonging to a different
-     * lineage instead of trusting the intact prefix these tests set up.
+     * initial segment (the last 8 bytes of the header -- see MmapSegment's header
+     * layout). A test that rewrites {@code .symbol-dict} out-of-band (simulating a
+     * host-crash tear) must stamp it with the SAME generation the surviving
+     * segments carry: openClean() takes whatever value it is given, and a mismatch
+     * would make a later recovery (correctly) discard the rewritten dictionary as
+     * belonging to a different lineage instead of trusting the intact prefix these
+     * tests set up.
      */
     private static long readSegmentGeneration(java.nio.file.Path slotDir) throws IOException {
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(
                 slotDir.resolve("sf-initial.sfa").toFile(), "r")) {
-            raf.seek(24);
+            raf.seek(MmapSegment.HEADER_SIZE - 8);
             byte[] buf = new byte[8];
             raf.readFully(buf);
             return ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).getLong();

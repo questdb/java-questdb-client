@@ -442,51 +442,63 @@ public final class SegmentManager implements QuietCloseable {
                 String path = null;
                 boolean installed = false;
                 try {
-                    // baseSeq is provisional — SegmentRing.appendOrFsn calls
-                    // rebaseSeq() at rotation time to pin the real value. We
-                    // pass the manager's best guess (nextSeqHint at this
-                    // instant), which is fine since it's overwritten anyway.
-                    if (memoryMode) {
-                        spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
-                    } else {
-                        path = nextSparePath(e.dir);
-                        // Native path bytes (NUL-terminated) live in pathScratch
-                        // from the call above. Hand them straight to MmapSegment.create
-                        // via its long-ptr overload, bypassing the byte[] + native
-                        // malloc that the String overload would incur on every
-                        // rotation.
-                        //
-                        // The spare's generation must match every other segment in this
-                        // lineage, so read it off the CURRENT active rather than deriving a
-                        // new one: the active already carries whatever the fresh-slot path
-                        // (or, for a recovered ring, SegmentRing.openExisting's agreement
-                        // check) established for this slot.
-                        spare = MmapSegment.create(FilesFacade.INSTANCE,
-                                pathScratch.ptr(), path,
-                                e.ring.nextSeqHint(), segmentSizeBytes,
-                                e.ring.getActive().generation());
-                    }
-                    Runnable installHook = beforeInstallSyncHook;
-                    if (installHook != null) {
-                        installHook.run();
-                    }
-                    // Install + commit atomically under the manager lock.
-                    // If `e.ring` was deregistered between the snapshot
-                    // above and now, abandoning the spare here is the only
-                    // way to keep totalBytes consistent: deregister already
-                    // subtracted ring.totalSegmentBytes() (without the
-                    // spare, since it wasn't installed yet) so a commit at
-                    // this point would inflate totalBytes by one segment
-                    // with no future subtractor. By holding `lock` across
-                    // installHotSpare AND the += commit AND the registration
-                    // check, deregister is forced to either
-                    // observe the spare in the ring (and subtract it) or
-                    // run before installation (so no install happens).
-                    synchronized (lock) {
-                        if (e.registered) {
-                            e.ring.installHotSpare(spare);
-                            totalBytes += segmentSizeBytes;
-                            installed = true;
+                    // The ring's active segment carries the generation every spare in
+                    // this lineage must match (see below). It can be null if the ring
+                    // closed between this tick's ring snapshot and now -- close() nulls
+                    // it under the ring's own monitor (SegmentRing.close()) with no
+                    // coordination with the manager thread. A closed ring rejects
+                    // installHotSpare regardless, so there is nothing to provision this
+                    // tick; skip cleanly rather than dereference null and fall into the
+                    // catch below as a misleading "will retry" warning for a ring that
+                    // will never accept a spare again.
+                    MmapSegment active = e.ring.getActive();
+                    if (active != null) {
+                        // baseSeq is provisional — SegmentRing.appendOrFsn calls
+                        // rebaseSeq() at rotation time to pin the real value. We
+                        // pass the manager's best guess (nextSeqHint at this
+                        // instant), which is fine since it's overwritten anyway.
+                        if (memoryMode) {
+                            spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
+                        } else {
+                            path = nextSparePath(e.dir);
+                            // Native path bytes (NUL-terminated) live in pathScratch
+                            // from the call above. Hand them straight to MmapSegment.create
+                            // via its long-ptr overload, bypassing the byte[] + native
+                            // malloc that the String overload would incur on every
+                            // rotation.
+                            //
+                            // The spare's generation must match every other segment in this
+                            // lineage, so read it off the CURRENT active rather than deriving a
+                            // new one: the active already carries whatever the fresh-slot path
+                            // (or, for a recovered ring, SegmentRing.openExisting's agreement
+                            // check) established for this slot.
+                            spare = MmapSegment.create(FilesFacade.INSTANCE,
+                                    pathScratch.ptr(), path,
+                                    e.ring.nextSeqHint(), segmentSizeBytes,
+                                    active.generation());
+                        }
+                        Runnable installHook = beforeInstallSyncHook;
+                        if (installHook != null) {
+                            installHook.run();
+                        }
+                        // Install + commit atomically under the manager lock.
+                        // If `e.ring` was deregistered between the snapshot
+                        // above and now, abandoning the spare here is the only
+                        // way to keep totalBytes consistent: deregister already
+                        // subtracted ring.totalSegmentBytes() (without the
+                        // spare, since it wasn't installed yet) so a commit at
+                        // this point would inflate totalBytes by one segment
+                        // with no future subtractor. By holding `lock` across
+                        // installHotSpare AND the += commit AND the registration
+                        // check, deregister is forced to either
+                        // observe the spare in the ring (and subtract it) or
+                        // run before installation (so no install happens).
+                        synchronized (lock) {
+                            if (e.registered) {
+                                e.ring.installHotSpare(spare);
+                                totalBytes += segmentSizeBytes;
+                                installed = true;
+                            }
                         }
                     }
                 } catch (Throwable t) {

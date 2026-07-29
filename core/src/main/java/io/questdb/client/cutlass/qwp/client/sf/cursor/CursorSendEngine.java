@@ -864,6 +864,16 @@ public final class CursorSendEngine implements QuietCloseable {
         }
     }
 
+    /**
+     * The producer lineage this slot belongs to -- see the field's own javadoc.
+     * Test-only: production never needs to read this back out, since
+     * {@code SegmentManager} reads it off the ring's active segment instead.
+     */
+    @TestOnly
+    public long generation() {
+        return generation;
+    }
+
     @TestOnly
     public int recoveryFoldCount() {
         return recoveryFoldCount;
