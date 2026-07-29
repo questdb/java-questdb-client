@@ -366,8 +366,8 @@ public class QwpTableBuffer implements QuietCloseable {
     /**
      * Sets the create-only designated timestamp column name hint for this
      * table. The value is sticky across rows and buffer resets. It may be
-     * re-declared while the buffer holds no rows; changing it while rows are
-     * buffered throws.
+     * set or re-declared only while the buffer holds no rows; any set while
+     * rows are buffered throws.
      *
      * @param columnName non-empty name of at most 127 UTF-8 bytes
      */
@@ -383,6 +383,12 @@ public class QwpTableBuffer implements QuietCloseable {
             );
         }
         if (designatedTimestampName == null) {
+            if (rowCount != 0) {
+                throw new LineSenderException(
+                        "cannot set designated timestamp name for table '" + tableName
+                                + "' after rows are buffered [new=" + columnName + ']'
+                );
+            }
             designatedTimestampName = Chars.toString(columnName);
         } else if (!Chars.equals(designatedTimestampName, columnName)) {
             if (rowCount != 0) {

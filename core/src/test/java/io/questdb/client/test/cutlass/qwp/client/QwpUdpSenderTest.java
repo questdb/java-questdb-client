@@ -1730,6 +1730,33 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testTableOptionsDesignatedTimestampRejectedAfterRowsBuffered() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            int maxDatagramSize = 1024;
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t");
+                sender.longColumn("x", 1).atNow();
+
+                // a late hint would grow the committed datagram past the cap
+                // with no re-check on the flush path, so it must be rejected
+                assertThrowsContains(
+                        "after rows are buffered",
+                        () -> sender.tableOptions().designatedTimestamp("event_ts")
+                );
+
+                sender.flush();
+                Assert.assertEquals(1, nf.packets.size());
+                Assert.assertEquals(0, (byte) (nf.packets.get(0)[HEADER_OFFSET_FLAGS] & FLAG_TABLE_OPTIONS));
+                assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+
+                // rowCount == 0 after the flush: the hint is accepted again
+                sender.tableOptions().designatedTimestamp("event_ts");
+            }
+        });
+    }
+
+    @Test
     public void testTableOptionsOnlyRowIsDiscarded() throws Exception {
         assertMemoryLeak(() -> {
             CapturingNetworkFacade nf = new CapturingNetworkFacade();

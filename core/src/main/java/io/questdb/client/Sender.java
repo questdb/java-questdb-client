@@ -870,9 +870,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * silently ignore it and create the conventional {@code timestamp}
          * column instead.
          * <p>
-         * The hint is sticky per table. It may be re-declared with a different
-         * name while the table has no buffered rows; changing it while rows
-         * are buffered throws.
+         * The hint is sticky per table. It may be set or re-declared only
+         * while the table has no buffered rows; setting it while rows are
+         * buffered throws.
          *
          * @param columnName non-empty column name of at most 127 UTF-8 bytes
          * @return this instance for method chaining

@@ -1372,6 +1372,27 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testDesignatedTimestampNameFirstSetAfterRowsBufferedThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("x", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+                try {
+                    table.setDesignatedTimestampName("event_time");
+                    fail("expected rejection of first set after rows are buffered");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("after rows are buffered"));
+                }
+                assertNull(table.getDesignatedTimestampName());
+
+                table.reset();
+                table.setDesignatedTimestampName("event_time");
+                assertEquals("event_time", table.getDesignatedTimestampName());
+            }
+        });
+    }
+
+    @Test
     public void testDesignatedTimestampNameIsStickyAndConsistent() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
