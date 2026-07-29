@@ -934,6 +934,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
+        private static final String TLS_ROOTS_INSECURE_CONFIG_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
         // close() drain timeout. Default applied at build() time. 0 or -1
         // means "fast close" (skip the drain entirely); any positive value
         // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
@@ -1415,7 +1416,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 ClientTlsConfiguration tlsConfig = null;
                 if (tlsEnabled) {
-                    assert (trustStorePath == null) == (trustStorePassword == null); //either both null or both non-null
+                    assert trustStorePassword == null || trustStorePath != null;
                     tlsConfig = new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode == TlsValidationMode.DEFAULT ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE);
                 }
                 return AbstractLineHttpSender.createLineSender(hosts, ports, httpPath, httpClientConfiguration, tlsConfig, actualAutoFlushRows, httpToken,
@@ -1437,7 +1438,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 ClientTlsConfiguration wsTlsConfig = null;
                 if (tlsEnabled) {
-                    assert (trustStorePath == null) == (trustStorePassword == null);
+                    assert trustStorePassword == null || trustStorePath != null;
                     wsTlsConfig = new ClientTlsConfiguration(
                             trustStorePath,
                             trustStorePassword,
@@ -3573,12 +3574,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (hosts.size() == 0) {
                 throw new LineSenderException("addr is missing");
             }
-            if (trustStorePath != null) {
-                if (trustStorePassword == null) {
-                    throw new LineSenderException("tls_roots was configured, but tls_roots_password is missing");
-                }
-            } else if (trustStorePassword != null) {
+            if (trustStorePath == null && trustStorePassword != null) {
                 throw new LineSenderException("tls_roots_password was configured, but tls_roots is missing");
+            }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
             }
             if (protocol == PROTOCOL_HTTP || protocol == PROTOCOL_WEBSOCKET) {
                 if (user != null) {
@@ -3836,8 +3836,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
                 throw new IllegalArgumentException("tls_verify/tls_roots/tls_roots_password require the wss:: schema");
             }
-            if ((tlsRoots == null) != (tlsRootsPassword == null)) {
-                throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
+            if (tlsRoots == null && tlsRootsPassword != null) {
+                throw new IllegalArgumentException("tls_roots_password requires tls_roots");
+            }
+            if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+                throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
             }
         }
 
@@ -3974,6 +3977,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (!tlsEnabled && tlsValidationMode != TlsValidationMode.DEFAULT) {
                 throw new LineSenderException("TLS validation disabled, but TLS was not enabled");
+            }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException("custom trust store cannot be combined with disabled TLS validation");
             }
             if (keyId != null && bufferCapacity < MIN_BUFFER_SIZE) {
                 throw new LineSenderException("Requested buffer too small ")
@@ -4133,17 +4139,42 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         public class AdvancedTlsSettings {
             /**
-             * Configure a custom truststore. This is only needed when using {@link #enableTls()} when your default
-             * truststore does not contain certificate chain used by a server. Most users should not need it.
+             * Configure a PEM file containing one or more custom root certificates.
+             * This is only needed when using {@link #enableTls()} and the default
+             * trust store does not contain the certificate chain used by a server.
+             * Most users should not need it.
              * <br>
-             * The path can be either a path on a local filesystem. Or you can prefix it with "classpath:" to instruct
-             * the Sender to load a trust store from a classpath.
+             * The path can be on the local filesystem, or it can use the
+             * {@code classpath:} prefix.
+             *
+             * @param pemRootsPath a path to a PEM certificate file or bundle
+             * @return an instance of LineSenderBuilder for further configuration
+             */
+            public LineSenderBuilder customTrustStore(String pemRootsPath) {
+                return setCustomTrustStore(pemRootsPath, null);
+            }
+
+            /**
+             * Configure a password-protected JKS or PKCS#12 trust store. This is
+             * only needed when using {@link #enableTls()} and the default trust
+             * store does not contain the certificate chain used by a server.
+             * Most users should not need it.
+             * <br>
+             * The path can be on the local filesystem, or it can use the
+             * {@code classpath:} prefix.
              *
              * @param trustStorePath     a path to a trust store.
-             * @param trustStorePassword a password to for the truststore
+             * @param trustStorePassword the trust store password
              * @return an instance of LineSenderBuilder for further configuration
              */
             public LineSenderBuilder customTrustStore(String trustStorePath, char[] trustStorePassword) {
+                if (trustStorePassword == null) {
+                    throw new LineSenderException("trust store password cannot be null");
+                }
+                return setCustomTrustStore(trustStorePath, trustStorePassword);
+            }
+
+            private LineSenderBuilder setCustomTrustStore(String trustStorePath, char[] trustStorePassword) {
                 if (LineSenderBuilder.this.trustStorePath != null) {
                     throw new LineSenderException("custom trust store was already configured ")
                             .put("[path=").put(LineSenderBuilder.this.trustStorePath).put("]");
@@ -4151,8 +4182,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (Chars.isBlank(trustStorePath)) {
                     throw new LineSenderException("trust store path cannot be empty nor null");
                 }
-                if (trustStorePassword == null) {
-                    throw new LineSenderException("trust store password cannot be null");
+                if (tlsValidationMode == TlsValidationMode.INSECURE) {
+                    throw new LineSenderException("custom trust store cannot be configured when TLS validation is disabled");
                 }
 
                 LineSenderBuilder.this.trustStorePath = trustStorePath;
@@ -4165,12 +4196,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
              * This is suitable when testing self-signed certificate. It's inherently insecure and should
              * never be used in a production.
              * <br>
-             * If you cannot use trusted certificate then you should prefer {@link  #customTrustStore(String, char[])}
-             * over disabling validation.
+             * If you cannot use a certificate in the default trust store then
+             * you should prefer {@link #customTrustStore(String)} or
+             * {@link #customTrustStore(String, char[])} over disabling validation.
              *
              * @return an instance of LineSenderBuilder for further configuration
              */
             public LineSenderBuilder disableCertificateValidation() {
+                if (LineSenderBuilder.this.trustStorePath != null) {
+                    throw new LineSenderException("TLS validation cannot be disabled when a custom trust store is configured");
+                }
                 LineSenderBuilder.this.tlsValidationMode = TlsValidationMode.INSECURE;
                 return LineSenderBuilder.this;
             }

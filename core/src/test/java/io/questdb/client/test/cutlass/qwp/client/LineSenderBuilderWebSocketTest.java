@@ -1030,6 +1030,26 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testWssConfigString_tlsRootsPasswordWithoutRoots_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots_password=secret;",
+                "tls_roots_password requires tls_roots"
+        );
+    }
+
+    @Test
+    public void testWssConfigString_tlsRootsWithUnsafeOff_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots=/ca.pem;tls_verify=unsafe_off;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_verify=unsafe_off;tls_roots=/ca.p12;tls_roots_password=secret;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
+    }
+
+    @Test
     public void testWsConfigString_withToken() throws Exception {
         assertMemoryLeak(() -> {
             Sender.LineSenderBuilder builder = Sender.builder("ws::addr=localhost:9000;token=mytoken;");
