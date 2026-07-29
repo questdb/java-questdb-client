@@ -1374,7 +1374,7 @@ public class PersistedSymbolDictTest {
      * Lands ONE armed entry append short -- writes {@code len-1} of the {@code len}
      * requested bytes and reports {@code len-1} -- reproducing a disk-full / quota
      * short write mid-persist. Fires only on an entry append (offset past the
-     * 8-byte header), never the header write, and disarms after firing so the retry
+     * 16-byte header), never the header write, and disarms after firing so the retry
      * writes cleanly.
      */
     private static final class ShortWriteOnceFacade extends DelegatingFilesFacade {

@@ -274,8 +274,9 @@ public final class CursorSendEngine implements QuietCloseable {
             // already on disk and corrupting ACK translation, trim, and replay.
             // May throw UnreplayableSlotException when recovery had to skip an
             // unreadable segment -- the catch (Throwable) below cleans up and
-            // lets it propagate so Sender.build() can quarantine the slot
-            // instead of seeding the ack past frames that were never sent.
+            // lets it propagate so the constructor's two callers, Sender.build()
+            // and BackgroundDrainer, can quarantine the slot instead of seeding
+            // the ack past frames that were never sent.
             SegmentRing recovered = memoryMode ? null
                     : SegmentRing.openExisting(sfDir, segmentSizeBytes);
             this.wasRecoveredFromDisk = recovered != null;
@@ -501,9 +502,10 @@ public final class CursorSendEngine implements QuietCloseable {
                     // safe for THIS session: the next recovery would seed its catch-up
                     // from the stale file and replay this generation's frames on top,
                     // misattributing symbols with no detectable gap. So openClean()
-                    // refuses that case outright (throws LineSenderException) instead of
-                    // degrading to null; the catch (Throwable) below cleans up and lets
-                    // it propagate.
+                    // refuses that case outright (throws UnreplayableSlotException)
+                    // instead of degrading to null; the catch (Throwable) below cleans
+                    // up and lets it propagate so Sender.build() can quarantine this
+                    // fresh, dataless slot instead of bricking every restart.
                     persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir, generationInProgress);
                 }
                 MmapSegment initial;

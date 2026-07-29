@@ -46,6 +46,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -238,14 +239,19 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // exercised. Emitting a zero-entry catch-up frame there would burn a wire
         // sequence and, via fsnAtZero = replayStart - catchUpFrames, shift the
         // baseline so the first real frame no longer lands on replayStart.
+        //
+        // framesSent and fsnAtZero alone do NOT discriminate the sentDictCount > 0
+        // conjunct: sendDictCatchUp has no unsplit fast path, so with sentDictCount == 0
+        // its walk is a no-op and both values come out identical whether or not the
+        // guard skips the call. capReads is what does discriminate it: sendDictCatchUp's
+        // first statement reads client.getServerMaxBatchSize(), so removing the
+        // sentDictCount > 0 conjunct (this test's engine has hasReplayDictionaryDependency
+        // == true and a real client, so the other two conjuncts hold) would call
+        // sendDictCatchUp anyway and register that read even though it ships nothing.
         TestUtils.assertMemoryLeak(() -> {
-            // cap 0 ("server advertises no cap"); the value is otherwise incidental
-            // here. sendDictCatchUp has no unsplit fast path -- it walks sentDictCount
-            // entries under either cap -- so with an empty mirror (sentDictCount == 0)
-            // the loop never executes and framesSent stays 0 regardless of the guard
-            // under test. This assertion pins the empty-dictionary behaviour itself,
-            // not the sentDictCount > 0 guard.
-            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            // cap 0 ("server advertises no cap"); the value is otherwise incidental here.
+            AtomicInteger capReads = new AtomicInteger();
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0, false, capReads::incrementAndGet);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);
                 try {
@@ -255,6 +261,9 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             0, client.framesSent);
                     assertEquals("the baseline must stay at replayStart when nothing is re-registered",
                             7L, loop.fsnAtZero());
+                    assertEquals("an empty dictionary must skip sendDictCatchUp entirely -- "
+                                    + "not call it and discover there is nothing to send",
+                            0, capReads.get());
                 } finally {
                     loop.close();
                 }

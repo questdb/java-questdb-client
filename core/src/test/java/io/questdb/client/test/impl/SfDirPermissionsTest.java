@@ -80,10 +80,10 @@ public class SfDirPermissionsTest {
         // umask can only clear bits, so widening only .slot-locks leaves a second uid
         // unable to create its slot directory -- build() then fails one level before
         // the problem the mode exists to solve.
-        Assert.assertEquals(Files.DIR_MODE_DEFAULT, recordedModeFor("sf_dir=/tmp/x;"));
-        Assert.assertEquals(Files.DIR_MODE_DEFAULT, recordedLockDirModeFor("sf_dir=/tmp/x;"));
-        Assert.assertEquals(Files.DIR_MODE_SHARED, recordedModeFor("sf_dir=/tmp/y;sf_dir_shared=on;"));
-        Assert.assertEquals(Files.DIR_MODE_SHARED, recordedLockDirModeFor("sf_dir=/tmp/y;sf_dir_shared=on;"));
+        Assert.assertEquals(Files.DIR_MODE_DEFAULT, recordedModeFor(false));
+        Assert.assertEquals(Files.DIR_MODE_DEFAULT, recordedLockDirModeFor(false));
+        Assert.assertEquals(Files.DIR_MODE_SHARED, recordedModeFor(true));
+        Assert.assertEquals(Files.DIR_MODE_SHARED, recordedLockDirModeFor(true));
     }
 
     /**
@@ -147,15 +147,38 @@ public class SfDirPermissionsTest {
     }
 
     /**
-     * The mode {@code Sender.build()} resolves for {@code sf_dir} itself
-     * ({@code sfDirShared ? DIR_MODE_SHARED : DIR_MODE_DEFAULT}), read back via
-     * the same connect-string-snapshot facade {@code WsSenderConfigHonoredTest}
-     * uses to prove a key reaches the builder.
+     * Builds a real {@code Sender} against a real local {@link TestWebSocketServer}
+     * with {@code sf_dir_shared} set per {@code shared}, and returns the mode
+     * {@code Sender.build()} actually passed to {@code mkdir} for {@code sf_dir}
+     * itself -- observed through {@link Sender.LineSenderBuilder#setSfDirFilesFacadeForTest},
+     * the seam added for exactly this purpose: {@code Files.mkdir} is a static,
+     * non-facade binding, so without it a test asserting the
+     * {@code sf_dir_shared -> dirMode} resolution has no way to watch the real call
+     * and can only re-implement the ternary it means to guard -- which proves
+     * nothing about {@code Sender.build()} itself (the bug this test now catches:
+     * reverting {@code Sender.java}'s {@code dirMode} ternary to an unconditional
+     * mode must turn this red).
      */
-    private static int recordedModeFor(String kv) {
-        Map<String, Object> snapshot = Sender.builder("ws::addr=h:9000;" + kv).wsConfigSnapshotForTest();
-        boolean shared = Boolean.TRUE.equals(snapshot.get("sf_dir_shared"));
-        return shared ? Files.DIR_MODE_SHARED : Files.DIR_MODE_DEFAULT;
+    private int recordedModeFor(boolean shared) throws Exception {
+        String sfDir = temp.newFolder("sf-mode-" + System.nanoTime()).getAbsolutePath() + "/sf";
+        RecordingMkdirFacade ff = new RecordingMkdirFacade();
+        int[] recordedMode = new int[]{-1};
+        TestUtils.assertMemoryLeak(() -> {
+            Sender.LineSenderBuilder.setSfDirFilesFacadeForTest(ff);
+            try (TestWebSocketServer server = new TestWebSocketServer(new NoOpServerHandler())) {
+                server.start();
+                Assert.assertTrue("test WS server never started", server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";"
+                        + (shared ? "sf_dir_shared=on;" : "");
+                try (Sender sender = Sender.builder(cfg).build()) {
+                    // No rows written -- Files.mkdir(sf_dir) already ran before connect().
+                }
+            } finally {
+                Sender.LineSenderBuilder.setSfDirFilesFacadeForTest(null);
+            }
+            recordedMode[0] = ff.modeFor(sfDir);
+        });
+        return recordedMode[0];
     }
 
     private static Set<PosixFilePermission> statPerms(String path) throws Exception {
@@ -200,15 +223,16 @@ public class SfDirPermissionsTest {
     }
 
     /**
-     * Feeds {@link #recordedModeFor(String)}'s resolved mode into
+     * Feeds the mode {@code sf_dir_shared} resolves to into
      * {@link SlotLock#acquireLogical(io.questdb.client.std.FilesFacade, String, int)}
      * and records the mode it actually passes to {@code mkdir} for the
      * {@code .slot-locks} parent -- proving the SAME resolved value that governs
-     * {@code sf_dir} is what reaches the lock directory too, not an
+     * {@code sf_dir} (see {@link #recordedModeFor(boolean)}, which observes that
+     * side independently) is what reaches the lock directory too, not an
      * independently-hardcoded one (the exact way the fixed regression happened).
      */
-    private int recordedLockDirModeFor(String kv) throws Exception {
-        int mode = recordedModeFor(kv);
+    private int recordedLockDirModeFor(boolean shared) throws Exception {
+        int mode = shared ? Files.DIR_MODE_SHARED : Files.DIR_MODE_DEFAULT;
         String parent = temp.newFolder("lock-check-" + System.nanoTime()).getAbsolutePath();
         String slot = parent + "/slot";
         String lockDir = parent + "/.slot-locks";

@@ -1028,6 +1028,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // the bytes stay put for a human to inspect and resend.
         private static final String QUARANTINE_SLOT_SUFFIX =
                 OrphanScanner.QUARANTINE_SLOT_INFIX;
+        // Swappable ONLY so a test can observe the mode build() actually passes to
+        // mkdir for sf_dir itself -- Files.mkdir is a static, non-facade binding, so
+        // without this seam a test asserting the sf_dir_shared -> dirMode resolution
+        // has no way to watch the real call and can only re-implement the ternary
+        // below, which proves nothing about this code.
+        @TestOnly
+        private static volatile FilesFacade sfDirFilesFacade = FilesFacade.INSTANCE;
         private final ObjList<String> hosts = new ObjList<>();
         private final IntList ports = new IntList();
         private long authTimeoutMillis = QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS;
@@ -1563,7 +1570,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 } else {
                     dirMode = sfDirShared ? Files.DIR_MODE_SHARED : Files.DIR_MODE_DEFAULT;
                     if (!Files.exists(sfDir)) {
-                        int rc = Files.mkdir(sfDir, dirMode);
+                        int rc = sfDirFilesFacade.mkdir(sfDir, dirMode);
                         // mkdir is non-zero on failure, but "already exists"
                         // is one such failure. Multiple SF senders sharing one
                         // sf_dir can be built concurrently (the pool calls
@@ -3208,6 +3215,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         @TestOnly
         public static void setQuarantineFilesFacadeForTest(FilesFacade ff) {
             quarantineFilesFacade = ff == null ? FilesFacade.INSTANCE : ff;
+        }
+
+        @TestOnly
+        public static void setSfDirFilesFacadeForTest(FilesFacade ff) {
+            sfDirFilesFacade = ff == null ? FilesFacade.INSTANCE : ff;
         }
 
         private static int resolveIPv4(String host) {

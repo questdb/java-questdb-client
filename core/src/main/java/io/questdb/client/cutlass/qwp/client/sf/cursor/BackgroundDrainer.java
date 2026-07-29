@@ -589,6 +589,24 @@ public final class BackgroundDrainer implements Runnable {
                     return;
                 }
                 throw t;
+            } catch (UnreplayableSlotException t) {
+                // The constructor assigns this.slotLock (CursorSendEngine's own
+                // .lock, taken under SlotLock.acquire) before the try that opens
+                // the ring, so this throw proves the ring was opened under that
+                // lock -- adoption happened, even though the local `engine`
+                // reference here is still null. Quarantine explicitly instead of
+                // falling into the generic catch below, whose null-engine gate
+                // exists for a DIFFERENT case (a pre-adoption failure) and would
+                // otherwise leave the slot uncleared: the next scan would see
+                // only the surviving segments, recompute skippedSegmentCount as
+                // 0 (the unreadable one is already renamed .corrupt), and report
+                // SUCCESS over the frames that were never actually drained.
+                String msg = t.getMessage();
+                LOG.error("drainer slot {} is unreplayable, quarantining: {}", slotPath, msg);
+                lastErrorMessage = msg;
+                OrphanScanner.markFailed(slotPath, "unreplayable: " + msg);
+                outcome = DrainOutcome.FAILED;
+                return;
             }
             if (logicalSlotLock != null) {
                 logicalSlotLock.close();
@@ -720,8 +738,13 @@ public final class BackgroundDrainer implements Runnable {
             lastErrorMessage = msg;
             // Quarantine ONLY a slot this drainer actually adopted. engine is
             // assigned after CursorSendEngine has taken the slot's own .lock, so
-            // a null engine here means the failure happened before adoption --
-            // while merely probing a slot another live process still owns.
+            // a null engine here generally means the failure happened before
+            // adoption -- while merely probing a slot another live process
+            // still owns. UnreplayableSlotException does NOT fit that pattern:
+            // CursorSendEngine assigns its slotLock field before the try that
+            // opens the ring, so that throw proves adoption happened even
+            // though engine is still null here -- which is why it has its own
+            // catch above instead of falling through to this one.
             //
             // The failures that reach this point pre-adoption are LOCAL and
             // usually transient: acquireLogical rethrows anything that is not

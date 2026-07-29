@@ -220,7 +220,9 @@ public class DeltaDictRecoveryTest {
         // whole segment once they were acked (modelled by deleting sf-initial.sfa, which is
         // exactly what SegmentManager does). The dictionary is torn away too, so nothing
         // anywhere still holds those ids, and the surviving frames' deltas start above them.
-        // Replaying would null-pad the hole and silently misattribute symbol values.
+        // Replaying would hit the server's DELTA_DICT_GAP rejection -- QwpMessageCursor
+        // refuses a delta whose start runs past the dictionary's coverage rather than
+        // null-padding the hole.
         //
         // So the slot is unreplayable -- and it is SET ASIDE, not allowed to brick the sender.
         // Failing here is what bricked it: senderId is stable and a not-fully-drained slot is
@@ -717,8 +719,9 @@ public class DeltaDictRecoveryTest {
 
             // Phase 2: recover against a fresh server that reconstructs its per-
             // connection dictionary from the wire exactly as the real one does --
-            // null-padding any gap, so a gap surfaces as a null rather than passing
-            // silently.
+            // REJECTING any gap (QwpWireTestUtils.accumulateDeltaDictionary's default
+            // allowGap=false), so a gap surfaces as a DictionaryGapException / NACK
+            // rather than passing silently.
             DictReconstructingHandler handler = new DictReconstructingHandler();
             try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
                 int port = good.getPort();

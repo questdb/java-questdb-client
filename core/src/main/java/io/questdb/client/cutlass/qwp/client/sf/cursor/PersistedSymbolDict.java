@@ -24,7 +24,6 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.std.Crc32c;
@@ -365,7 +364,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * run full-dict from id 0 while the survivor -- describing a prior
      * generation's id space -- stays on disk, and the next recovery would trust
      * it and misattribute symbols with no detectable gap. So that case throws
-     * {@link LineSenderException} instead of degrading -- see {@link #openFresh}.
+     * {@link UnreplayableSlotException} instead of degrading -- see {@link #openFresh}.
      *
      * @param generation the producer lineage this freshly-started slot belongs to --
      *                   the same value the caller stamps into its fresh initial
@@ -996,7 +995,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                      The next recovery cannot tell the two apart: ids overlap,
      *                      the CRC is valid, and the catch-up would register the
      *                      wrong strings under ids this generation's rows reference.
-     *                      So this case throws {@link LineSenderException} rather
+     *                      So this case throws {@link UnreplayableSlotException} rather
      *                      than degrading to null. {@code false} for the recovery
      *                      path ({@link #open}), which only ever reaches this method
      *                      when the file is absent or a headerless stub -- nothing
@@ -1019,7 +1018,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 // cannot distinguish the two: the ids overlap, the CRC is valid, and the
                 // catch-up registers the wrong strings under ids this generation's rows
                 // reference. Refuse the slot; the bytes stay on disk for an operator.
-                throw new LineSenderException("symbol dict ").put(filePath)
+                // Typed as UnreplayableSlotException (rather than a plain
+                // LineSenderException) so Sender.build()'s constructor-time catch
+                // quarantines this fresh, dataless slot instead of bricking every
+                // restart under a stable senderId.
+                throw new UnreplayableSlotException("symbol dict ").put(filePath)
                         .put(" already exists and cannot be truncated (rc=").put(fd)
                         .put("); refusing to start on a slot whose dictionary describes a")
                         .put(" different id space -- move or remove it by hand");

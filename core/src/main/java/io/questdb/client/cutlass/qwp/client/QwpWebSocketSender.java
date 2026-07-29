@@ -1905,6 +1905,17 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Whether this sender is still in delta-encoded mode. Flips to {@code false}
+     * permanently once {@link #disableDeltaDict} fires (a persisted-dictionary
+     * write failure, including a recognised mmap access fault) -- every later
+     * flush then ships full self-sufficient frames instead.
+     */
+    @TestOnly
+    public boolean isDeltaDictEnabledForTest() {
+        return deltaDictEnabled;
+    }
+
+    /**
      * Total binary frames whose ACKs have been received and applied.
      */
     public long getTotalAcks() {
