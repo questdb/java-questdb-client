@@ -43,13 +43,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BooleanSupplier;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
+import java.util.function.LongSupplier;
 
 public class QuestDBImplCloseLifecycleTest {
 
+    private static final long QUERY_CREATION_WAIT_STATE_OFFSET =
+            Unsafe.getFieldOffset(QueryClientPool.class, "creationWaitState");
     private static final String QUERY_CFG = "ws::addr=127.0.0.1:9000;";
+    private static final long SENDER_CREATION_WAIT_STATE_OFFSET =
+            Unsafe.getFieldOffset(SenderPool.class, "creationWaitState");
     private static final String SENDER_CFG = "http::addr=127.0.0.1:1;protocol_version=2;auto_flush=off;";
 
     @Test(timeout = 30_000)
@@ -186,18 +191,14 @@ public class QuestDBImplCloseLifecycleTest {
                 inCreation.countDown();
                 awaitOrFail(releaseCreation, "test never released query creation");
             };
-            // A 1s creation-wait budget, not 100ms: the interrupt storm below must land at least
-            // twice inside this window for the deadline-restart property to be exercised at all,
-            // and a freshly started, yielding interrupter thread is not guaranteed two scheduler
-            // quanta within 100ms on a saturated CI agent (observed on hosted 3-core mac agents,
-            // where the post-join count assert failed with the product deadline honored exactly).
+            // A 1s creation-wait budget, not 100ms, leaves enough room to
+            // establish the handshaked interrupt loop before asserting the
+            // original absolute deadline.
             QuestDBImpl db = newQuestDB(
                     SENDER_CFG, 0, 0, 1000, slotIndex -> fakeSender(null, null, null), connectHook);
             QueryClientPool pool = db.getQueryPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
-            AtomicBoolean keepInterrupting = new AtomicBoolean(true);
-            AtomicInteger interruptCount = new AtomicInteger();
             Thread borrower = new Thread(() -> {
                 try {
                     db.borrowQuery();
@@ -209,13 +210,6 @@ public class QuestDBImplCloseLifecycleTest {
                 db.close();
                 closeReturnedInterrupted.set(Thread.currentThread().isInterrupted());
             }, "interrupted-query-closer");
-            Thread interrupter = new Thread(() -> {
-                while (keepInterrupting.get()) {
-                    interruptCount.incrementAndGet();
-                    closer.interrupt();
-                    Thread.yield();
-                }
-            }, "query-close-interrupter");
             long nativeBaseline = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
             try {
                 borrower.start();
@@ -226,14 +220,17 @@ public class QuestDBImplCloseLifecycleTest {
                 closer.start();
                 awaitCreationWaiter(pool,
                         "facade close did not wait while query construction was internally owned");
-                interrupter.start();
-                awaitRepeatedInterrupts(interruptCount, pool::hasCreationWaiterForTesting,
-                        "query close left its creation wait before the interrupt storm landed twice");
+                long handledInterrupts = interruptUntilCreationWaitEnds(
+                        closer,
+                        () -> getCreationWaitState(pool),
+                        "query creation wait did not honor its absolute deadline");
                 closer.join(TimeUnit.SECONDS.toMillis(5));
                 Assert.assertFalse(
                         "repeated interrupts restarted the query creation-wait deadline",
                         closer.isAlive());
-                Assert.assertTrue("test did not repeatedly interrupt query close", interruptCount.get() > 1);
+                Assert.assertTrue(
+                        "query close did not handle both interrupts",
+                        handledInterrupts > 1);
                 Assert.assertTrue("facade close must restore query closer interruption",
                         closeReturnedInterrupted.get());
                 Assert.assertEquals(
@@ -252,9 +249,7 @@ public class QuestDBImplCloseLifecycleTest {
                         borrowOutcome.get() instanceof QueryException
                                 && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
             } finally {
-                keepInterrupting.set(false);
                 releaseCreation.countDown();
-                interrupter.join(TimeUnit.SECONDS.toMillis(10));
                 db.close();
                 borrower.join(TimeUnit.SECONDS.toMillis(10));
                 closer.join(TimeUnit.SECONDS.toMillis(10));
@@ -275,15 +270,13 @@ public class QuestDBImplCloseLifecycleTest {
             };
             String senderConfig = "ws::addr=localhost:1;sf_dir="
                     + System.getProperty("java.io.tmpdir") + "/qdb-interrupted-pool-" + System.nanoTime() + ";";
-            // 1s creation-wait budget for the same reason as the query-interrupt test above: the
-            // interrupt storm must land at least twice inside the window even on a saturated agent.
+            // Use the same 1s budget and handshaked interrupt loop as the query
+            // lifecycle test above.
             QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 1000, senderFactory, client -> {
             });
             SenderPool pool = db.getSenderPoolForTesting();
             AtomicReference<Throwable> borrowOutcome = new AtomicReference<>();
             AtomicBoolean closeReturnedInterrupted = new AtomicBoolean();
-            AtomicBoolean keepInterrupting = new AtomicBoolean(true);
-            AtomicInteger interruptCount = new AtomicInteger();
             Thread borrower = new Thread(() -> {
                 try {
                     db.borrowSender();
@@ -295,13 +288,6 @@ public class QuestDBImplCloseLifecycleTest {
                 db.close();
                 closeReturnedInterrupted.set(Thread.currentThread().isInterrupted());
             }, "interrupted-sender-closer");
-            Thread interrupter = new Thread(() -> {
-                while (keepInterrupting.get()) {
-                    interruptCount.incrementAndGet();
-                    closer.interrupt();
-                    Thread.yield();
-                }
-            }, "sender-close-interrupter");
             try {
                 borrower.start();
                 Assert.assertTrue("sender borrow never reached construction",
@@ -313,14 +299,17 @@ public class QuestDBImplCloseLifecycleTest {
                 closer.start();
                 awaitCreationWaiter(pool,
                         "facade close did not wait while sender construction was internally owned");
-                interrupter.start();
-                awaitRepeatedInterrupts(interruptCount, pool::hasCreationWaiterForTesting,
-                        "sender close left its creation wait before the interrupt storm landed twice");
+                long handledInterrupts = interruptUntilCreationWaitEnds(
+                        closer,
+                        () -> getCreationWaitState(pool),
+                        "sender creation wait did not honor its absolute deadline");
                 closer.join(TimeUnit.SECONDS.toMillis(5));
                 Assert.assertFalse(
                         "repeated interrupts restarted the sender creation-wait deadline",
                         closer.isAlive());
-                Assert.assertTrue("test did not repeatedly interrupt sender close", interruptCount.get() > 1);
+                Assert.assertTrue(
+                        "sender close did not handle both interrupts",
+                        handledInterrupts > 1);
                 Assert.assertTrue("facade close must restore sender closer interruption",
                         closeReturnedInterrupted.get());
                 Assert.assertEquals(
@@ -341,9 +330,7 @@ public class QuestDBImplCloseLifecycleTest {
                         borrowOutcome.get() instanceof LineSenderException
                                 && String.valueOf(borrowOutcome.get().getMessage()).contains("closed"));
             } finally {
-                keepInterrupting.set(false);
                 releaseCreation.countDown();
-                interrupter.join(TimeUnit.SECONDS.toMillis(10));
                 db.close();
                 borrower.join(TimeUnit.SECONDS.toMillis(10));
                 closer.join(TimeUnit.SECONDS.toMillis(10));
@@ -529,32 +516,69 @@ public class QuestDBImplCloseLifecycleTest {
         Assert.fail(message);
     }
 
+    private static long getCreationWaitState(QueryClientPool pool) {
+        return Unsafe.getUnsafe().getLongVolatile(pool, QUERY_CREATION_WAIT_STATE_OFFSET);
+    }
+
+    private static long getCreationWaitState(SenderPool pool) {
+        return Unsafe.getUnsafe().getLongVolatile(pool, SENDER_CREATION_WAIT_STATE_OFFSET);
+    }
+
     /**
-     * Holds the test until the interrupt storm has landed at least twice while the facade close is
-     * still inside its bounded creation wait. The deadline-restart property is only exercised by
-     * interrupts that arrive during that wait, and the scheduler owes the interrupter thread
-     * nothing: with a post-join count assert alone, the run races the close budget against thread
-     * scheduling and can fail with the product invariant intact. Failing here instead separates
-     * "interrupter starved before the budget expired" from a genuine deadline bug.
+     * Delivers one interrupt at a time, waiting until the creation-wait loop
+     * handles each one before delivering the next. This prevents interrupt
+     * coalescing while keeping pressure on the wait until its original absolute
+     * deadline expires. The state snapshot encodes active in the sign bit and
+     * the handled-interrupt count in the remaining bits.
      */
-    private static void awaitRepeatedInterrupts(
-            AtomicInteger interruptCount,
-            BooleanSupplier closerStillWaiting,
+    private static long interruptUntilCreationWaitEnds(
+            Thread closer,
+            LongSupplier creationWaitState,
             String message
     ) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
-            // Count first: two interrupts observed while polling means the storm landed no matter
-            // how quickly the wait ends afterwards, so a budget expiry seen next is not a failure.
-            if (interruptCount.get() > 1) {
-                return;
+            long state = creationWaitState.getAsLong();
+            long handledInterrupts = state & Long.MAX_VALUE;
+            if (state >= 0) {
+                Assert.assertTrue(
+                        message + "; wait ended after handling only " + handledInterrupts + " interrupt(s)",
+                        handledInterrupts > 1);
+                return handledInterrupts;
             }
-            if (!closerStillWaiting.getAsBoolean()) {
-                Assert.fail(message + "; interrupts landed: " + interruptCount.get());
+
+            closer.interrupt();
+            long countBeforeInterrupt = handledInterrupts;
+            while (System.nanoTime() < deadline) {
+                state = creationWaitState.getAsLong();
+                handledInterrupts = state & Long.MAX_VALUE;
+                if (state >= 0) {
+                    Assert.assertTrue(
+                            message + "; wait ended after handling only " + handledInterrupts + " interrupt(s)",
+                            handledInterrupts > 1);
+                    return handledInterrupts;
+                }
+                if (handledInterrupts > countBeforeInterrupt) {
+                    // Keep enough interrupt pressure to expose a restarted
+                    // deadline without monopolising a CI worker core.
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+                    break;
+                }
+                Thread.yield();
             }
-            Thread.yield();
         }
-        Assert.fail(message + "; interrupts landed: " + interruptCount.get());
+
+        long state = creationWaitState.getAsLong();
+        long handledInterrupts = state & Long.MAX_VALUE;
+        if (state >= 0) {
+            Assert.assertTrue(
+                    message + "; wait ended after handling only " + handledInterrupts + " interrupt(s)",
+                    handledInterrupts > 1);
+            return handledInterrupts;
+        }
+        Assert.fail(message + "; creation wait still active after handling "
+                + handledInterrupts + " interrupt(s)");
+        return 0;
     }
 
     private static void awaitOrFail(CountDownLatch latch, String message) {

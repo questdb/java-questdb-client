@@ -238,6 +238,12 @@ public final class SenderPool implements AutoCloseable {
     // (cancelling recovery) WITHOUT making a later close() short-circuit the
     // teardown. Guarded by lock.
     private boolean closeStarted;
+    // Atomic test witness for the bounded creation-wait loop. The sign bit
+    // means active; the remaining bits count handled InterruptedExceptions.
+    // Condition.hasWaiters() cannot serve this purpose because an interrupt
+    // transiently transfers the closer out of the condition queue. Volatile
+    // lets white-box tests observe active/count as one coherent snapshot.
+    private volatile long creationWaitState;
     private int inFlightCreations;
     // Lease teardowns currently running on borrower threads (retireLease's
     // delegate-close section, outside the lock). close() counts these as
@@ -1339,11 +1345,16 @@ public final class SenderPool implements AutoCloseable {
         return startupRecoveryThread;
     }
 
+    /**
+     * Returns whether {@link #close()} is inside its bounded wait for
+     * in-flight creations. This remains true while an interrupt transfers the
+     * closer out of the condition queue and it re-enters with the same deadline.
+     */
     @TestOnly
     public boolean hasCreationWaiterForTesting() {
         lock.lock();
         try {
-            return lock.hasWaiters(creationFinished);
+            return creationWaitState < 0;
         } finally {
             lock.unlock();
         }
@@ -1483,13 +1494,21 @@ public final class SenderPool implements AutoCloseable {
             final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
-            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
-                try {
-                    creationFinished.awaitNanos(creationRemainingNanos);
-                } catch (InterruptedException e) {
-                    creationWaitInterrupted = true;
+            creationWaitState = inFlightCreations > 0 && creationRemainingNanos > 0
+                    ? Long.MIN_VALUE
+                    : 0;
+            try {
+                while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    try {
+                        creationFinished.awaitNanos(creationRemainingNanos);
+                    } catch (InterruptedException e) {
+                        creationWaitInterrupted = true;
+                        creationWaitState++;
+                    }
+                    creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
                 }
-                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            } finally {
+                creationWaitState &= Long.MAX_VALUE;
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
