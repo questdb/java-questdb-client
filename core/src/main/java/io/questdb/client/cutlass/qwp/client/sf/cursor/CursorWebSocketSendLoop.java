@@ -131,7 +131,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * briefly down), so a strike count alone can false-positive a transient into
      * a producer-fatal terminal. Requiring the suspect to survive this window
      * gives a brief outage time to clear (an OK at/beyond the suspect resets the
-     * detector) before escalation. {@code 0} = legacy immediate escalation at the
+     * detector) before escalation. {@code 0} = immediate escalation at the
      * strike threshold. Configurable per sender via the
      * {@code poison_min_escalation_window_millis} connect-string key or
      * {@code LineSenderBuilder.poisonMinEscalationWindowMillis(long)}.
@@ -513,7 +513,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final int maxHeadFrameRejections;
     // Minimum wall-clock dwell (nanos) a suspect frame must stay poisoned before
     // escalation, even after the strike threshold is hit (connect-string key
-    // poison_min_escalation_window_millis). 0 = legacy immediate escalation.
+    // poison_min_escalation_window_millis). 0 = immediate.
     private final long poisonMinEscalationWindowNanos;
     private volatile boolean running;
     // sendOffset: byte offset inside sendingSegment of the first not-yet-sent
@@ -651,12 +651,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * the same head-of-line frame, with no ack progress in between, before the
      * loop escalates to a typed terminal. Must be {@code >= 1}. Then the minimum
      * wall-clock dwell (millis) the suspect must stay poisoned before escalation
-     * ({@code poison_min_escalation_window_millis}; {@code >= 0}, where 0 = legacy
+     * ({@code poison_min_escalation_window_millis}; {@code >= 0}, where 0 =
      * immediate escalation at the threshold).
      * <p>
-     * The final argument is the analogous dwell for the symbol-dict catch-up cap gap.
-     * It is retained here for source and binary compatibility but is consulted only when
-     * the policy-aware overload selects
+     * The final argument is the analogous dwell for the symbol-dict catch-up cap gap; it
+     * is consulted only when the policy-aware overload selects
      * {@link CatchUpCapGapPolicy#TERMINAL_AFTER_SETTLE_BUDGET}.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
@@ -1947,7 +1946,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // middlebox, or a fast NACK loop), so the count alone would false-
         // positive a brief outage into a producer-fatal terminal. Any OK at/
         // beyond the suspect during the window resets the detector (see the
-        // STATUS_OK handler). Window 0 = legacy immediate escalation.
+        // STATUS_OK handler). Window 0 = immediate escalation.
         return (now - poisonFirstStrikeNanos) >= poisonMinEscalationWindowNanos;
     }
 
@@ -3210,14 +3209,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             return false; // payload not fully published yet
         }
         long frameAddr = base + sendOffset + MmapSegment.FRAME_HEADER_SIZE;
-        // Torn-dictionary guard. sentDictCount is this loop's model of how many ids
-        // the CURRENT server has been told about: seeded from the persisted
-        // dictionary, re-registered by the catch-up, and extended by
-        // accumulateSentDict as each frame goes out. A frame whose delta starts ABOVE
-        // that coverage references ids the server was never given; replaying it would
-        // make the server null-pad the hole (QwpMessageCursor grows the dict with
-        // nulls to deltaStart+deltaCount) and land rows with SILENTLY NULL symbols.
-        // Fail terminally instead; the unreplayable data must be resent.
+        // Torn-dictionary guard. sentDictCount is this loop's model of how many ids the
+        // CURRENT server has been told about. A frame whose delta starts ABOVE that
+        // coverage references ids the server was never given, and the server now rejects
+        // such a frame with STATUS_DICTIONARY_GAP rather than null-padding the hole. That
+        // rejection is retriable -- a wire recycle re-registers from id 0 -- but this
+        // frame cannot become sendable without one, and against a server old enough to
+        // null-pad it would land rows with silently NULL symbols. Fail terminally here,
+        // where the unreplayable range is still attributable.
         //
         // The guard, the mirror and the catch-up are ONE mechanism and are all
         // ungated (see the constructor). A frame at deltaStart == sentDictCount is

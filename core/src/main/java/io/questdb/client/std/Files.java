@@ -86,10 +86,12 @@ public final class Files {
      * (umask 002) gets the 0775 a second uid needs to create its own entries here.
      * <p>
      * <b>The sticky bit is best-effort, NOT a guarantee this client relies on.</b> On
-     * Linux {@code mkdir(2)} sets the new directory to {@code (mode & ~umask & 0777)} -- the
-     * {@code & 0777} strips {@code S_ISVTX}, so the bit is silently dropped on the primary
-     * deployment platform (POSIX leaves sticky-on-mkdir unspecified; some platforms honor
-     * it, Linux does not). It is therefore wrong to depend on restricted-deletion semantics
+     * Linux {@code mkdir(2)} applies {@code mode & ~umask} to the permission bits only --
+     * the {@code & 0777} in that shorthand covers rwx, not the special bits -- and
+     * {@code S_ISVTX} is honoured regardless of umask, so the sticky bit DOES survive to
+     * the new directory on the primary deployment platform. POSIX itself leaves
+     * sticky-on-mkdir unspecified, so this client still does not depend on it holding
+     * on every platform it runs on. It is therefore wrong to depend on restricted-deletion semantics
      * for correctness. Mutual exclusion of the slot lock does NOT rest on it: the safety
      * comes from never unlinking a lock file this process does not hold
      * ({@code SlotLock.removeOrphanLogical} acquires the lock before removing it), which
@@ -108,10 +110,13 @@ public final class Files {
      * directory itself stays {@link #DIR_MODE_DEFAULT}.
      * <p>
      * NOTE: {@link #mkdir} passes this straight to POSIX {@code mkdir}, so the effective
-     * mode is {@code mode & ~umask & 0777}. Under umask 000 -- a systemd unit with no
-     * {@code UMask=}, many container entrypoints -- this yields 0777, and Linux strips
-     * {@code S_ISVTX}, so there is no restricted deletion either. It is therefore opt-in
-     * via the {@code sf_dir_shared} connect-string key; the default is
+     * permission bits are {@code mode & ~umask & 0777}; unlike those bits, Linux honours
+     * {@code S_ISVTX} regardless of umask. Under umask 000 -- a systemd unit with no
+     * {@code UMask=}, many container entrypoints -- the permission bits still come out
+     * 0777 (world-writable), even though the sticky bit survives and keeps deletion
+     * restricted to each entry's own owner. World-writable directory contents are
+     * exposure enough on their own, so this mode stays opt-in via the
+     * {@code sf_dir_shared} connect-string key; the default is
      * {@link #DIR_MODE_DEFAULT}.
      */
     public static final int DIR_MODE_SHARED = 1023;

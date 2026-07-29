@@ -93,11 +93,16 @@ public class SfDirPermissionsTest {
      * ACTUAL on-disk POSIX permissions {@code Files.mkdir} left behind -- not a
      * recorded {@code int}. This exercises the real call sequence in
      * {@code Sender.build()} ({@code Files.mkdir(sfDir, dirMode)} then
-     * {@code SlotLock.acquireLogical(slotPath, dirMode)}), so it catches a
-     * regression the component-level test above cannot: one that reorders
-     * {@code dirMode}'s resolution relative to the {@code mkdir} call, or
-     * reintroduces "restrict {@code sf_dir} but not {@code .slot-locks}" in a
-     * way that only manifests once {@code build()} actually runs.
+     * {@code SlotLock.acquireLogical(slotPath, dirMode)}) and checks the result on a
+     * real filesystem, which the component-level test above does not. It does NOT add
+     * bit-for-bit regression coverage beyond that test: under the common umask 022,
+     * {@code mkdir(2)} applies {@code mode & ~umask}, so {@code DIR_MODE_SHARED}
+     * (01777) and {@code DIR_MODE_DEFAULT} (0755) collapse to the identical 0755, and
+     * {@code PosixFilePermission} has no bit for {@code S_ISVTX} on any platform -- so
+     * this test cannot observe the one bit that distinguishes the two modes under that
+     * umask. The exact-mode regression guard remains
+     * {@link #testSfDirAndLockDirAreGatedTogether}; what this test adds is proof the
+     * real call sequence runs and a check against the real filesystem.
      * <p>
      * The "{@code sf_dir_shared=on} is observably wider" assertion is gated on
      * the ambient umask: {@code mkdir(2)} applies {@code mode & ~umask & 0777},

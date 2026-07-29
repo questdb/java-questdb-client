@@ -419,18 +419,14 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (persistedDictInProgress != null
                         && recoveredMaxSymbolId >= persistedDictInProgress.size()
                         && recoveredMaxSymbolDeltaStart == 0L) {
-                    // Only a NON-EMPTY discarded dictionary can desynchronise the fold.
-                    // The first fold was keyed to this very size, so when it is 0 the
-                    // re-fold below recomputes the identical baseline-0 result -- and
-                    // that is the OVERWHELMINGLY common case, not the rare one the
-                    // comment used to describe: every frame the shipped client ever
-                    // wrote passes confirmedMaxId = -1, hence deltaStart == 0, hence
-                    // maxDeltaStart == 0; and such a slot has no .symbol-dict, so
-                    // recovery creates a fresh EMPTY one. All three conditions therefore
-                    // hold on the FIRST restart after upgrading, for every non-empty
-                    // slot, and the re-fold was a second O(payload bytes) walk -- with a
+                    // Only a NON-EMPTY discarded dictionary can desynchronise the fold. The
+                    // first fold was keyed to this very size, so when it is 0 the re-fold
+                    // below recomputes the identical baseline-0 result -- a no-op. The guard
+                    // exists for the case below where discardedSize is genuinely > 0: the
+                    // re-fold there is a second O(payload bytes) walk -- with a
                     // byte-at-a-time varint decode over full-dict frames, which carry the
-                    // whole dictionary -- for no result change at all.
+                    // whole dictionary -- so it is worth paying only when the mismatch it
+                    // resolves is real.
                     int discardedSize = persistedDictInProgress.size();
                     persistedDictInProgress.close();
                     persistedDictInProgress = null;
@@ -1036,7 +1032,8 @@ public final class CursorSendEngine implements QuietCloseable {
      * re-registers its dictionary from id 0 as it replays, so seeding the mirror -- and
      * shipping a catch-up frame off it -- would be pure redundancy. Above zero, at least one
      * frame's delta starts above ids it does not itself carry, so the mirror must hold those
-     * ids before the replay begins or the server null-pads the hole.
+     * ids before the replay begins, or the server rejects the frame with
+     * STATUS_DICTIONARY_GAP.
      */
     public long recoveredMaxSymbolDeltaStart() {
         return recoveredMaxSymbolDeltaStart;

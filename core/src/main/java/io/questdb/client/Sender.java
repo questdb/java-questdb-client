@@ -2604,7 +2604,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * alone can turn a transient outage into a producer-fatal terminal.
          * This window guarantees a brief outage a chance to clear (an OK
          * at/beyond the suspect resets the detector) first. {@code 0} disables
-         * the dwell (legacy immediate escalation at the strike threshold).
+         * the dwell (immediate escalation at the strike threshold).
          * Default {@code 5_000} (5 s). WebSocket only.
          */
         public LineSenderBuilder poisonMinEscalationWindowMillis(long millis) {

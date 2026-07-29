@@ -227,8 +227,8 @@ public class SegmentManagerTest {
             //
             // The append below is incidental to the contract under test; it
             // does NOT cross the SegmentRing high-water mark for this 4-frame
-            // segment (HEADER_SIZE 24 + FRAME_HEADER_SIZE 8 + 16 = 48 vs
-            // signalAtBytes = (120 >> 2) * 3 = 90), so no producer-side wakeup
+            // segment (HEADER_SIZE 32 + FRAME_HEADER_SIZE 8 + 16 = 56 vs
+            // signalAtBytes = (128 >> 2) * 3 = 96), so no producer-side wakeup
             // fires. The rotation/high-water wakeup paths are covered by
             // testRotationWakeupTriggersImmediateSparePrep, and the
             // deterministic register-after-park case is covered by

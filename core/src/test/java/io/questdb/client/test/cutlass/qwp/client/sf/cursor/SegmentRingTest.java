@@ -182,8 +182,8 @@ public class SegmentRingTest {
         // a dead path.
         TestUtils.assertMemoryLeak(() -> {
             // 4 100-byte frames per segment. signalAtBytes is 75% of segSize,
-            // and HEADER (24) + 3 frames (3*108 = 324) lands publishedOffset
-            // at 348, just past the 342-byte threshold.
+            // and HEADER (32) + 3 frames (3*108 = 324) lands publishedOffset
+            // at 356, just past the 348-byte threshold.
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 100);
             long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
@@ -402,7 +402,8 @@ public class SegmentRingTest {
                     throw new AssertionError(
                             "expected recovery to refuse rather than silently drop the stray file");
                 } catch (UnreplayableSlotException expected) {
-                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 1 unreadable segment(s)"));
                 }
                 assertFalse("the unreadable stray file must be renamed aside", Files.exists(strayPath));
                 assertTrue("the renamed file must survive for a postmortem",
@@ -451,7 +452,8 @@ public class SegmentRingTest {
                     throw new AssertionError(
                             "expected recovery to refuse rather than silently drop the oldest segment");
                 } catch (UnreplayableSlotException expected) {
-                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 1 unreadable segment(s)"));
                 }
                 assertFalse("the unreadable oldest segment must be renamed aside",
                         Files.exists(oldestPath));
@@ -495,7 +497,8 @@ public class SegmentRingTest {
                             "expected recovery to refuse rather than let a later recovery reuse the "
                                     + "skipped segment's FSN range");
                 } catch (UnreplayableSlotException expected) {
-                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 1 unreadable segment(s)"));
                 }
                 assertFalse("the unreadable newest segment must be renamed aside",
                         Files.exists(newestPath));
@@ -546,7 +549,8 @@ public class SegmentRingTest {
                     throw new AssertionError("expected recovery to refuse rather than throw the "
                             + "untyped FSN-gap exception the interior skip opens");
                 } catch (UnreplayableSlotException expected) {
-                    assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("skipped 1 unreadable segment(s)"));
                 }
                 assertFalse("the unreadable interior segment must be renamed aside",
                         Files.exists(interiorPath));

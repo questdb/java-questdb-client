@@ -223,9 +223,13 @@ public class MmapSegmentRecoveryFaultTest {
      * length-injecting facade, so the scan's read of the beyond-EOF page faults
      * on ext4/xfs too. The fix must <em>recognize</em> that fault and keep
      * recovery safe -- never a JVM abort, never a raw {@code InternalError}
-     * escaping into {@code SegmentRing}'s recovery loop. Revert the
-     * {@code scanFrames}/{@code openExisting} mmap-fault guard (or fold the CRC
-     * back through native {@code Crc32c}) and this errors or aborts the fork.
+     * escaping into {@code SegmentRing}'s recovery loop.
+     * <p>
+     * NOTE: on a JDK without precise unsafe-access fault delivery (8, 11, 17) this test
+     * does NOT pin SegmentRing's arm -- assertLateFaultTolerable degrades to "the process
+     * survived and the message mentions an unsafe memory access operation", which any raw
+     * escaping fault satisfies. Reverting the guard leaves this test green. Do not read
+     * JDK-8 CI green here as regression protection for the skip path.
      * <p>
      * Two handled outcomes are accepted, because which one occurs depends on
      * whether the recovery methods are JIT-compiled at fault time:
@@ -347,9 +351,13 @@ public class MmapSegmentRecoveryFaultTest {
      * drives {@link SegmentRing#openExisting} rather than
      * {@code MmapSegment.openExisting}: pre-21 HotSpot may deliver the
      * unsafe-access fault in the caller's frame, so only the per-file arm in
-     * {@code SegmentRing} can convert it on the shipping JDK 8 target. Revert
-     * that arm (or the header-block conversion) and a raw {@code InternalError}
-     * escapes here instead of the typed refusal.
+     * {@code SegmentRing} can convert it on the shipping JDK 8 target.
+     * <p>
+     * NOTE: on a JDK without precise unsafe-access fault delivery (8, 11, 17) this test
+     * does NOT pin SegmentRing's arm -- assertLateFaultTolerable degrades to "the process
+     * survived and the message mentions an unsafe memory access operation", which any raw
+     * escaping fault satisfies. Reverting the guard leaves this test green. Do not read
+     * JDK-8 CI green here as regression protection for the skip path.
      */
     @Test
     public void testHeaderFaultOnMapPastEofIsSkippableAnyFilesystem() throws Exception {
@@ -461,6 +469,13 @@ public class MmapSegmentRecoveryFaultTest {
      * recycled descriptor -- a double release. The catch must clear the
      * holder as its first statement so a caller's holder-based cleanup can
      * never see the same segment twice.
+     * <p>
+     * This only exercises the PRE-assignment throw: the garbage header below fails
+     * the bad-magic check before {@code inFlight[0] = segment} ever runs, so
+     * {@code inFlight[0]} is null going in and stays null regardless of whether the
+     * catch clears it. It does not exercise the post-assignment deferred-fault window
+     * (a fault after construction, inside the try, with the holder already populated) --
+     * reverting the catch's holder-clearing statement leaves this test green.
      */
     @Test
     public void testFailedOpenDoesNotLeaveASegmentInTheHolder() throws Exception {

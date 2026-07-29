@@ -321,7 +321,7 @@ public class CursorWebSocketSendLoopOrphanTailTest {
         // sitting in a SEALED segment, reachable only through the sealed walk.
         TestUtils.assertMemoryLeak(() -> {
             // Small segments so the tail really does roll one. Each frame is
-            // FRAME_HEADER_SIZE + (QWP HEADER_SIZE + 2) = 22 bytes, against 256 - 24
+            // FRAME_HEADER_SIZE + (QWP HEADER_SIZE + 2) = 22 bytes, against 256 - 32 = 224
             // usable, so a segment holds ~10.
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 256)) {
                 // Committed delta frames registering ids 0,1,2 -- the highest COMMITTED

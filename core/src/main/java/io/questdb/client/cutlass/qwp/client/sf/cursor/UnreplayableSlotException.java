@@ -30,7 +30,8 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * A recovered store-and-forward slot whose symbol dictionary cannot be rebuilt at all --
  * neither from the persisted side-file's intact prefix nor from the surviving frames' own
  * delta sections. Its frames reference ids that nothing still holds, so replaying them
- * would null-pad the gap on the server and silently misattribute symbol values.
+ * would make the server reject the frame with STATUS_DICTIONARY_GAP -- the ids cannot be
+ * reconstructed, so the frame cannot be replayed at all.
  * <p>
  * This is the ONE verdict {@code seedGlobalDictionaryFromPersisted} reaches after it has
  * tried every source of truth it has, so it is the only signal that may quarantine a slot.

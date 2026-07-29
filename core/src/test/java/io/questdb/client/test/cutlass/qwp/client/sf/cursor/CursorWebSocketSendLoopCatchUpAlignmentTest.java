@@ -239,12 +239,12 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         // sequence and, via fsnAtZero = replayStart - catchUpFrames, shift the
         // baseline so the first real frame no longer lands on replayStart.
         TestUtils.assertMemoryLeak(() -> {
-            // cap 0 ("server advertises no cap") on purpose. Under a positive cap
-            // sendDictCatchUp would walk zero entries and return 0 frames anyway,
-            // so both assertions below would hold even with the sentDictCount > 0
-            // conjunct deleted -- the test would pin nothing. Cap 0 takes the
-            // fast path that sends one whole-dictionary frame unconditionally, so
-            // only the guard keeps the frame count at zero.
+            // cap 0 ("server advertises no cap"); the value is otherwise incidental
+            // here. sendDictCatchUp has no unsplit fast path -- it walks sentDictCount
+            // entries under either cap -- so with an empty mirror (sentDictCount == 0)
+            // the loop never executes and framesSent stays 0 regardless of the guard
+            // under test. This assertion pins the empty-dictionary behaviour itself,
+            // not the sentDictCount > 0 guard.
             CatchUpCapturingClient client = new CatchUpCapturingClient(0);
             try (CursorSendEngine engine = newEngine()) {
                 CursorWebSocketSendLoop loop = newLoop(engine, client);

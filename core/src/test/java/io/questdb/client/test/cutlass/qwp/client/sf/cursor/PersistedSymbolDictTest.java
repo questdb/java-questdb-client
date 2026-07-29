@@ -602,7 +602,7 @@ public class PersistedSymbolDictTest {
             file[1] = 'Y';
             file[2] = 'D';
             file[3] = '1';
-            file[4] = 1;
+            file[4] = 1; // VERSION
             file[8] = (byte) GEN; // generation (GEN fits one byte; bytes 9-15 stay zero)
             System.arraycopy(body, 0, file, HEADER_SIZE, body.length);
             int crcAt = HEADER_SIZE + body.length;
