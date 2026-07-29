@@ -120,7 +120,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * Initial connection failures are not retained as terminal sender state; a later
  * operation may try to connect again.
  */
-public class QwpWebSocketSender implements Sender {
+public class QwpWebSocketSender implements Sender, QwpTableBuffer.Owner {
 
     public static final long DEFAULT_AUTH_TIMEOUT_MS = 15_000L;
     // Soft per-batch byte budget. Trips a flush when raw column-buffer bytes
@@ -1011,10 +1011,7 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public void cancelRow() {
         checkNotClosed();
-        if (currentTableBuffer != null) {
-            currentTableBuffer.cancelCurrentRow();
-            currentTableBuffer.rollbackUncommittedColumns();
-        }
+        rollbackRow();
     }
 
     /**
@@ -1812,6 +1809,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Row counterpart of {@link #getPendingBytes()}: committed-but-unflushed
+     * rows across all tables, as tracked for the auto-flush row threshold.
+     */
+    @TestOnly
+    public int getPendingRowCount() {
+        return pendingRowCount;
+    }
+
+    /**
      * Server-advertised cap on the per-batch raw byte size. Zero before the
      * first connect; updated by every successful reconnect via
      * {@link #applyServerBatchSizeLimit(int)}.
@@ -1824,10 +1830,18 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public QwpTableBuffer getTableBuffer(String tableName) {
         QwpTableBuffer buffer = tableBuffers.get(tableName);
+        if (buffer == currentTableBuffer && buffer != null) {
+            // Keep the timestamp caches and byte snapshot intact: re-snapping
+            // mid-row would fold in-progress bytes into the snapshot and break
+            // sendRow()'s delta accounting.
+            return buffer;
+        }
         if (buffer == null) {
             buffer = new QwpTableBuffer(tableName, this);
             tableBuffers.put(tableName, buffer);
         }
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
         currentTableBuffer = buffer;
         currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
         currentTableName = tableName;
@@ -2233,6 +2247,33 @@ public class QwpWebSocketSender implements Sender {
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
+    }
+
+    /**
+     * {@link QwpTableBuffer.Owner} callback: the buffer is about to close all
+     * of its column buffers, so drop any cached column references and remove
+     * exactly the buffer's accounted share from the pending totals. That
+     * share is its committed bytes (the snapshot for the current table, which
+     * excludes any in-progress row; raw storage otherwise) minus its baseline
+     * bytes, which pendingBytes never included. Runs before the buffer wipes
+     * itself, so all three values still reflect the pre-clear state.
+     */
+    @Override
+    public void onTableBufferClear(QwpTableBuffer buffer) {
+        long committedBytes;
+        if (buffer == currentTableBuffer) {
+            cachedTimestampColumn = null;
+            cachedTimestampNanosColumn = null;
+            committedBytes = currentTableBufferSnapshotBytes;
+            currentTableBufferSnapshotBytes = 0;
+        } else {
+            committedBytes = buffer.getBufferedBytes();
+        }
+        pendingBytes -= committedBytes - buffer.getBaselineBytes();
+        pendingRowCount -= buffer.getRowCount();
+        if (pendingRowCount == 0) {
+            firstPendingRowTimeNanos = 0;
+        }
     }
 
     /**
@@ -3823,7 +3864,11 @@ public class QwpWebSocketSender implements Sender {
         }
         currentBatchMaxSymbolId = -1;
         pendingBytes = 0;
-        currentTableBufferSnapshotBytes = 0;
+        // Anchor at the post-reset storage (baseline seed bytes of var-width
+        // columns), matching the empty-flush path above, so per-row deltas
+        // accumulated from here always equal committedBytes - baselineBytes.
+        currentTableBufferSnapshotBytes = currentTableBuffer == null
+                ? 0 : currentTableBuffer.getBufferedBytes();
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
     }
@@ -3860,6 +3905,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void rollbackRow() {
+        // rollbackUncommittedColumns() may close a newly created designated
+        // timestamp column, so cached references must not survive rollback.
+        cachedTimestampColumn = null;
+        cachedTimestampNanosColumn = null;
         if (currentTableBuffer != null) {
             currentTableBuffer.cancelCurrentRow();
             currentTableBuffer.rollbackUncommittedColumns();
