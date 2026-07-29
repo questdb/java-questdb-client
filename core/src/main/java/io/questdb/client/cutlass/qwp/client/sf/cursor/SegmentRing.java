@@ -509,9 +509,25 @@ public final class SegmentRing implements QuietCloseable {
                             long torn = segment.tornTailBytes();
                             segment.close();
                             if (torn > 0) {
+                                // Preserve-by-rename: the bytes stay on disk under
+                                // .corrupt, so a surviving quarantine failure leaves a
+                                // file the NEXT recovery re-examines by the same rules
+                                // -- it can never be mistaken for this generation's.
                                 quarantineFile(filesFacade, path);
                             } else if (!filesFacade.remove(path)) {
-                                LOG.warn("could not remove drained SF leftover {}", path);
+                                // Returning EMPTY here makes the caller start fresh at
+                                // baseSeq 0 in a directory that still holds a prior
+                                // generation's file. Their FSN ranges then overlap while
+                                // their symbol ids describe different strings, and no
+                                // downstream guard can see it: contiguity and the
+                                // manifest boundaries both reason about FSNs, and both
+                                // generations number theirs from the same origin. Refuse
+                                // the slot so the state stays representable-by-refusal
+                                // rather than silently mixed.
+                                throw new SfRecoveryException("could not remove drained SF leftover "
+                                        + path + "; refusing to start fresh in a slot that still"
+                                        + " holds a prior generation's segment -- move or remove"
+                                        + " it by hand");
                             }
                         }
                         all.clear();
