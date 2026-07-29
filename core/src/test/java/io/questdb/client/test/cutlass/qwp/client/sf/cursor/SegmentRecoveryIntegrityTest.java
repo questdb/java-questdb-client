@@ -30,7 +30,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfManifest;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -984,7 +983,7 @@ public class SegmentRecoveryIntegrityTest {
                     ring.close();
                 }
                 throw new AssertionError("a surviving leftover must refuse the slot");
-            } catch (SfRecoveryException expected) {
+            } catch (MmapSegmentException expected) {
                 TestUtils.assertContains(expected.getMessage(), "could not remove");
             }
             Assert.assertTrue("the refused leftover must stay on disk",

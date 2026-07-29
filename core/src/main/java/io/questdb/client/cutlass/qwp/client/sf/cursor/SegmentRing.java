@@ -509,10 +509,12 @@ public final class SegmentRing implements QuietCloseable {
                             long torn = segment.tornTailBytes();
                             segment.close();
                             if (torn > 0) {
-                                // Preserve-by-rename: the bytes stay on disk under
-                                // .corrupt, so a surviving quarantine failure leaves a
-                                // file the NEXT recovery re-examines by the same rules
-                                // -- it can never be mistaken for this generation's.
+                                // Preserve, not destroy: on success the bytes move to
+                                // .corrupt; if even the rename fails, they stay under
+                                // their original name instead. Either way the file
+                                // survives for the NEXT recovery to re-examine by the
+                                // same rules -- it can never be mistaken for this
+                                // generation's.
                                 quarantineFile(filesFacade, path);
                             } else if (!filesFacade.remove(path)) {
                                 // Returning EMPTY here makes the caller start fresh at
@@ -524,10 +526,15 @@ public final class SegmentRing implements QuietCloseable {
                                 // generations number theirs from the same origin. Refuse
                                 // the slot so the state stays representable-by-refusal
                                 // rather than silently mixed.
-                                throw new SfRecoveryException("could not remove drained SF leftover "
+                                //
+                                // Operational, not terminal: an unlink can fail for a
+                                // transient reason (a share lock, an antivirus or backup
+                                // handle), exactly as the manifest unlink below can. The
+                                // plain type aborts startup for a retry instead of
+                                // quarantining a slot whose bytes may be perfectly intact.
+                                throw new MmapSegmentException("could not remove drained SF leftover "
                                         + path + "; refusing to start fresh in a slot that still"
-                                        + " holds a prior generation's segment -- move or remove"
-                                        + " it by hand");
+                                        + " holds a prior generation's segment");
                             }
                         }
                         all.clear();
