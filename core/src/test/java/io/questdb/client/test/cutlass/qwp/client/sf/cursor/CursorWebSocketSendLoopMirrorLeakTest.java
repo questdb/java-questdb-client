@@ -364,7 +364,7 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
             Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
                     + ";sf_dir=" + sfDir
-                    + ";sf_max_bytes=4096"
+                    + ";sf_max_segment_bytes=4096"
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg)) {
                 for (int i = 0; i < ROWS; i++) {

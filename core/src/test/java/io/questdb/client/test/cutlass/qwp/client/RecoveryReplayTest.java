@@ -86,7 +86,7 @@ public class RecoveryReplayTest {
             String pad = repeat("x", 64);
             String cfg1 = "ws::addr=localhost:" + port1
                     + ";sf_dir=" + sfDir
-                    + ";sf_max_bytes=4096"
+                    + ";sf_max_segment_bytes=4096"
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg1)) {
                 for (int i = 0; i < 50; i++) {

@@ -77,11 +77,17 @@ public class SegmentRingRecoveryUnlinkTest {
     }
 
     @Test
-    public void testRecoveryUnlinksEmptyOrphanSegments() throws Exception {
+    public void testRecoveryReusesSoleEmptyOrphanAsInitialActive() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Simulate a crashed prior session that left an unrotated hot spare
             // (valid SF01 header, frameCount=0). MmapSegment.create stamps the
             // header but writes no frames.
+            //
+            // Contract (manifest-era): a clean empty leftover is REUSED as the
+            // fresh ring's initial active instead of being unlinked and
+            // re-created. The anti-leak guarantee this test was written for
+            // still holds -- crash cycles converge to exactly one segment
+            // file, they don't accumulate.
             String orphanPath = tmpDir + "/sf-orphan.sfa";
             MmapSegment empty = MmapSegment.create(orphanPath, 0L, SEGMENT_SIZE, GEN);
             empty.close();
@@ -90,12 +96,17 @@ public class SegmentRingRecoveryUnlinkTest {
 
             SegmentRing recovered = SegmentRing.openExisting(tmpDir, SEGMENT_SIZE);
 
-            Assert.assertNull(
-                    "recovery returned a ring even though the only segment was empty",
+            Assert.assertNotNull(
+                    "recovery must reuse the clean empty leftover as the initial active",
                     recovered);
-            Assert.assertFalse(
-                    "recovery left the empty orphan .sfa on disk — disk leak grows "
-                            + "with every crash cycle",
+            try {
+                Assert.assertEquals("reused ring must be empty", -1, recovered.publishedFsn());
+                Assert.assertEquals(0, recovered.getActive().baseSeq());
+                Assert.assertEquals(orphanPath, recovered.getActive().path());
+            } finally {
+                recovered.close();
+            }
+            Assert.assertTrue("the reused segment file must still exist",
                     Files.exists(orphanPath));
         });
     }

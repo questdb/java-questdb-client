@@ -115,9 +115,13 @@ public class SegmentSkipQuarantineTest {
                             + "drainer never re-adopts it (OrphanScanner also excludes it by the "
                             + "\"unreplayable-\" infix, independent of this sentinel)",
                     java.nio.file.Files.exists(quarantined.resolve(".failed")));
-            Assert.assertTrue("the originally-corrupted segment must still carry its own .corrupt "
-                            + "rename inside the quarantined copy -- both C5 mechanisms fired",
-                    java.nio.file.Files.exists(quarantined.resolve("sf-initial.sfa.corrupt")));
+            // Recovery failed CLOSED, so it never reached its deferred quarantine step:
+            // the corrupt segment keeps its original name and every byte stays put.
+            // Preserve-by-rename happens at the SLOT level here (the whole directory
+            // moved aside), which is what keeps the data available for a manual resend.
+            Assert.assertTrue("the corrupted segment's bytes must survive inside the "
+                            + "quarantined copy, untouched by the failed recovery",
+                    java.nio.file.Files.exists(quarantined.resolve("sf-initial.sfa")));
 
             // The critical regression check: the live slot is a GENUINELY FRESH directory, not
             // the tainted one left in place with the corrupt file merely invisible to a
@@ -181,15 +185,12 @@ public class SegmentSkipQuarantineTest {
             }
             // The tainted slot's bytes must survive on disk for a manual resend -- the guard
             // fails loudly rather than dropping data, exactly like the connect()-time case.
-            // Unlike the dictionary-refusal case (nothing renamed, so a plain .sfa count is
-            // enough), the per-file skip arm ALREADY renamed the corrupted segment to
-            // .corrupt as part of THIS SAME failed attempt -- before quarantineTornSlot ever
-            // ran out of candidate names -- so its frame data survives under that name, not
-            // as a .sfa file.
+            // Recovery fails closed BEFORE its deferred quarantine step, so the corrupted
+            // segment is still at its original name: a failed recovery never mutates the
+            // slot it could not prove safe.
             Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(liveSlot));
-            Assert.assertTrue("the corrupted segment's frame data must be preserved under its "
-                            + "renamed name",
-                    java.nio.file.Files.exists(liveSlot.resolve("sf-initial.sfa.corrupt")));
+            Assert.assertTrue("the corrupted segment's frame data must be preserved",
+                    java.nio.file.Files.exists(liveSlot.resolve("sf-initial.sfa")));
         });
     }
 
@@ -206,7 +207,7 @@ public class SegmentSkipQuarantineTest {
             String pad = io.questdb.client.test.tools.TestUtils.repeat("x", 64);
             String cfg = "ws::addr=localhost:" + port
                     + ";sf_dir=" + sfDir
-                    + ";sf_max_bytes=4096"
+                    + ";sf_max_segment_bytes=4096"
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg)) {
                 for (int i = 0; i < 20; i++) {

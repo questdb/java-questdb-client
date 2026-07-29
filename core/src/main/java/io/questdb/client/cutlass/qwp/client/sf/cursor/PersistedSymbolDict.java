@@ -59,14 +59,14 @@ import org.slf4j.LoggerFactory;
  *   offset 0: u32 magic = 'SYD1'
  *   offset 4: u8  version = 1
  *   offset 5: 3 bytes reserved (zero)
- *   offset 8: u64 generation
+ *   offset 8: u64 lineageId
  *   offset 16: chunks, each
  *             [entryCount: varint][entryBytes: varint][entries][crc32c: u32]
  *             where entries = [len: varint][utf8] repeated entryCount times,
  *             occupying exactly entryBytes bytes, and the CRC-32C covers the
  *             two header varints AND the entry region.
  * </pre>
- * <b>{@code generation}</b> ties this dictionary to the producer lineage that
+ * <b>{@code lineageId}</b> ties this dictionary to the producer lineage that
  * wrote it -- the same value {@link MmapSegment} stamps into every segment of
  * that lineage. The only check a recovered dictionary previously got was a
  * size heuristic: nothing compared its persisted strings against the strings
@@ -253,13 +253,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * <p>
      * Returns {@code null} on any I/O or parse failure -- including an existing file
      * that cannot be read, carries an unknown version or a generation that disagrees
-     * with {@code expectedGeneration}, or fails its checksums. The caller then falls
+     * with {@code expectedLineageId}, or fails its checksums. The caller then falls
      * back to full-dictionary (self-sufficient) frames for this slot, so a broken
      * side-file degrades gracefully rather than aborting the sender. Crucially, a
      * {@code null} return NEVER destroys the file: see the class-level "Never
      * recreate over an existing file" note.
      *
-     * @param expectedGeneration the producer lineage the caller expects this dictionary
+     * @param expectedLineageId the producer lineage the caller expects this dictionary
      *                           to belong to -- the same value {@link MmapSegment} carries
      *                           in the segments this slot recovered. A recovered dictionary
      *                           whose stamped generation disagrees is a survivor from a
@@ -268,8 +268,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                           discarded (degrading to full self-sufficient frames) rather
      *                           than trusted on a size heuristic alone.
      */
-    public static PersistedSymbolDict open(String slotDir, long expectedGeneration) {
-        return open(FilesFacade.INSTANCE, slotDir, expectedGeneration);
+    public static PersistedSymbolDict open(String slotDir, long expectedLineageId) {
+        return open(FilesFacade.INSTANCE, slotDir, expectedLineageId);
     }
 
     /**
@@ -277,7 +277,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * {@link FilesFacade#INSTANCE}; tests inject a fault facade to drive recovery
      * I/O failures (e.g. a truncate that cannot drop a torn tail).
      */
-    public static PersistedSymbolDict open(FilesFacade ff, String slotDir, long expectedGeneration) {
+    public static PersistedSymbolDict open(FilesFacade ff, String slotDir, long expectedLineageId) {
         String filePath = slotDir + "/" + FILE_NAME;
         boolean exists = ff.exists(filePath);
         long existing = exists ? ff.length(filePath) : -1L;
@@ -325,7 +325,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // sender that cannot be constructed at all.
             PersistedSymbolDict[] inFlight = new PersistedSymbolDict[1];
             try {
-                return openExisting(ff, filePath, existing, expectedGeneration, inFlight);
+                return openExisting(ff, filePath, existing, expectedLineageId, inFlight);
             } catch (Throwable t) {
                 if (inFlight[0] != null) {
                     inFlight[0].close();
@@ -341,7 +341,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // an absent/stub file has no id space to preserve, so a create failure
         // still just degrades to null (full self-sufficient frames), same as
         // every other recovery I/O failure above.
-        return openFresh(ff, filePath, false, expectedGeneration);
+        return openFresh(ff, filePath, false, expectedLineageId);
     }
 
     /**
@@ -366,20 +366,20 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * it and misattribute symbols with no detectable gap. So that case throws
      * {@link UnreplayableSlotException} instead of degrading -- see {@link #openFresh}.
      *
-     * @param generation the producer lineage this freshly-started slot belongs to --
+     * @param lineageId the producer lineage this freshly-started slot belongs to --
      *                   the same value the caller stamps into its fresh initial
      *                   {@link MmapSegment}, so the dictionary and the frames that
      *                   will reference its ids agree from the outset.
      */
-    public static PersistedSymbolDict openClean(String slotDir, long generation) {
-        return openClean(FilesFacade.INSTANCE, slotDir, generation);
+    public static PersistedSymbolDict openClean(String slotDir, long lineageId) {
+        return openClean(FilesFacade.INSTANCE, slotDir, lineageId);
     }
 
     /**
      * Facade-aware variant of {@link #openClean(String, long)}.
      */
-    public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir, long generation) {
-        return openFresh(ff, slotDir + "/" + FILE_NAME, true, generation);
+    public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir, long lineageId) {
+        return openFresh(ff, slotDir + "/" + FILE_NAME, true, lineageId);
     }
 
     /**
@@ -763,7 +763,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                 built instance (fd plus loaded-entry buffer) reachable by someone.
      */
     private static PersistedSymbolDict openExisting(FilesFacade ff, String filePath, long fileLen,
-                                                     long expectedGeneration, PersistedSymbolDict[] inFlight) {
+                                                     long expectedLineageId, PersistedSymbolDict[] inFlight) {
         int fd = ff.openRW(filePath);
         if (fd < 0) {
             LOG.warn("symbol dict {} could not be opened (rc={}); "
@@ -806,11 +806,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // self-sufficient frames) is always safe, so that is the disposition for every
             // ambiguity here -- return null directly rather than throw, since this is an
             // ordinary refusal, not an I/O or parse failure.
-            long fileGeneration = Unsafe.getUnsafe().getLong(inputAddr + 8);
-            if (fileGeneration != expectedGeneration) {
-                LOG.warn("symbol dict {} belongs to generation {} but this slot is {}; "
+            long fileLineageId = Unsafe.getUnsafe().getLong(inputAddr + 8);
+            if (fileLineageId != expectedLineageId) {
+                LOG.warn("symbol dict {} belongs to lineage {} but this slot is {}; "
                                 + "discarding it and falling back to full-dictionary frames",
-                        filePath, fileGeneration, expectedGeneration);
+                        filePath, fileLineageId, expectedLineageId);
                 if (mappedInput) {
                     ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
                 } else {
@@ -1002,13 +1002,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
      *                      load-bearing to lose -- so a create failure there still
      *                      just degrades to null like every other recovery I/O
      *                      failure.
-     * @param generation the producer lineage to stamp into the freshly-created header --
+     * @param lineageId the producer lineage to stamp into the freshly-created header --
      *                    the caller's expected/derived generation in both the
      *                    {@code mustTruncate} and non-{@code mustTruncate} cases, so a
      *                    dictionary created here always already agrees with its caller.
      */
     private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath, boolean mustTruncate,
-                                                 long generation) {
+                                                 long lineageId) {
         int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
             if (mustTruncate && ff.exists(filePath)) {
@@ -1038,7 +1038,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             Unsafe.getUnsafe().putByte(hdr + 5, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 6, (byte) 0);
             Unsafe.getUnsafe().putByte(hdr + 7, (byte) 0);
-            Unsafe.getUnsafe().putLong(hdr + 8, generation);
+            Unsafe.getUnsafe().putLong(hdr + 8, lineageId);
             long written = ff.write(fd, hdr, HEADER_SIZE, 0);
             if (written != HEADER_SIZE) {
                 int fdToClose = fd;

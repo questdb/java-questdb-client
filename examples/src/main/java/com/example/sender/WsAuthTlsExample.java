@@ -15,8 +15,9 @@ import io.questdb.client.Sender;
  *       (Enterprise). Mutually exclusive with {@code username}/{@code password}.</li>
  *   <li>{@code username=...;password=...} -- HTTP basic auth; both halves
  *       required together.</li>
- *   <li>{@code tls_roots=...;tls_roots_password=...} -- a custom truststore
- *       (e.g. a JKS) when the server cert isn't in the default trust store.</li>
+ *   <li>{@code tls_roots=...} -- a PEM certificate or bundle when the server
+ *       cert isn't in the default trust store. Add {@code tls_roots_password}
+ *       when the file is a JKS or PKCS#12 trust store instead.</li>
  * </ul>
  * The {@code wss} schema turns on TLS. Contrast with the ILP TLS examples
  * ({@link AuthTlsExample}, {@link HttpsAuthExample}), which secure a dedicated
@@ -26,13 +27,12 @@ import io.questdb.client.Sender;
 public class WsAuthTlsExample {
 
     public static void main(String[] args) {
-        // Replace the address, token, and truststore path with your own. For
+        // Replace the address, token, and PEM roots path with your own. For
         // HTTP basic auth swap token= for username=...;password=...
         try (QuestDB db = QuestDB.connect(
                 "wss::addr=db.example.com:9000;"
                         + "token=YOUR_BEARER_TOKEN;"
-                        + "tls_roots=/path/to/truststore.jks;"
-                        + "tls_roots_password=changeit;")) {
+                        + "tls_roots=/path/to/ca.pem;")) {
 
             try (Sender sender = db.borrowSender()) {
                 sender.table("trades")
@@ -49,5 +49,8 @@ public class WsAuthTlsExample {
         // production -- it defeats TLS entirely:
         //
         //   QuestDB.connect("wss::addr=localhost:9000;tls_verify=unsafe_off;token=...;")
+        //
+        // Existing JKS and PKCS#12 trust stores remain supported by pairing
+        // tls_roots=/path/to/truststore.jks with tls_roots_password=changeit.
     }
 }

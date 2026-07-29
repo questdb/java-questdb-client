@@ -311,7 +311,7 @@ public class SelfSufficientFramesTest {
      * <p>
      * The failure is injected at the RING, not the cap: both frames pass the pre-flight
      * (each is under the advertised cap) but "big"'s frame does not fit a fresh
-     * sf_max_bytes segment, so it fails in sealAndSwapBuffer AFTER "a" was published.
+     * sf_max_segment_bytes segment, so it fails in sealAndSwapBuffer AFTER "a" was published.
      */
     @Test(timeout = 60_000L)
     public void testMidSplitPublishFailureLeavesTheDictionaryIdempotent() throws Exception {
@@ -327,7 +327,7 @@ public class SelfSufficientFramesTest {
                 String pad = new String(new char[100]).replace('\0', 'x');
                 String cfg = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
-                        + ";sf_max_bytes=1024"
+                        + ";sf_max_segment_bytes=1024"
                         + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
                         + ";close_flush_timeout_millis=0;";
                 Sender sender = Sender.fromConfig(cfg);
@@ -366,7 +366,7 @@ public class SelfSufficientFramesTest {
                 } finally {
                     try {
                         // close() re-flushes the retained batch, which is permanently
-                        // unflushable at this sf_max_bytes -- not what we assert.
+                        // unflushable at this sf_max_segment_bytes -- not what we assert.
                         sender.close();
                     } catch (LineSenderException ignored) {
                     }
@@ -471,7 +471,7 @@ public class SelfSufficientFramesTest {
         //
         // Setup: the server cap (150) splits the two-table batch, and each split frame
         // still FITS that cap, so the split pre-flight passes and the publish is actually
-        // attempted. sf_max_bytes=64 then makes every frame larger than the segment, so
+        // attempted. sf_max_segment_bytes=64 then makes every frame larger than the segment, so
         // appendBlocking fails with PAYLOAD_TOO_LARGE -- deterministically, no
         // backpressure timing needed.
         Path sfDir = temporaryFolder.newFolder("qwp-sf-split-persist-fail").toPath();
@@ -484,7 +484,7 @@ public class SelfSufficientFramesTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 String config = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
-                        + ";sf_max_bytes=64;";
+                        + ";sf_max_segment_bytes=64;";
                 String pad = TestUtils.repeat("x", 60);
                 Sender sender = Sender.fromConfig(config);
                 try {

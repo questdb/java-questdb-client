@@ -149,7 +149,7 @@ public class ObjList<T> implements Mutable, Sinkable, ReadOnlyObjList<T> {
             System.arraycopy(buffer, to + 1, buffer, from, move);
         }
         pos = Math.max(0, pos - (to - from + 1));
-        Arrays.fill(buffer, pos, buffer.length - 1, null);
+        Arrays.fill(buffer, pos, buffer.length, null);
     }
 
     public void remove(int index) {

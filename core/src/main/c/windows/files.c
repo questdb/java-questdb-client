@@ -77,11 +77,16 @@ static jint open_file(const char *utf8Path,
     }
     HANDLE h = CreateFileW(wide, desiredAccess, shareMode, NULL,
                            creationDisposition, flagsAndAttributes, NULL);
-    free(wide);
     if (h == INVALID_HANDLE_VALUE) {
+        // Save the CreateFileW failure code BEFORE free(): the thread's
+        // last-error value may be overwritten by any subsequent API/CRT call
+        // (HeapFree can SetLastError), and callers such as fsyncDir0 rely on
+        // the saved value being the CreateFileW error.
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     return HANDLE_TO_FD(h);
 }
 
@@ -100,6 +105,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRW0
                      GENERIC_READ | GENERIC_WRITE,
                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                      OPEN_ALWAYS,
+                     FILE_ATTRIBUTE_NORMAL);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_openRWExclusive0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    return open_file((const char *) (uintptr_t) lpszName,
+                     GENERIC_READ | GENERIC_WRITE,
+                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                     CREATE_NEW,
                      FILE_ATTRIBUTE_NORMAL);
 }
 
@@ -215,6 +229,52 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsync
     return 0;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_fsyncDir0
+        (JNIEnv *e, jclass cl, jlong lpszName) {
+    jint fd = open_file((const char *) (uintptr_t) lpszName,
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS);
+    if (fd < 0) {
+        // A directory can be crash-consistent yet not openable for write:
+        // some ACL/filesystem configurations refuse a GENERIC_WRITE open of a
+        // directory handle with ERROR_ACCESS_DENIED. Directory-entry durability
+        // on NTFS is provided by metadata journaling ($LogFile), so degrade to
+        // best-effort success here rather than hard-failing the SF durability
+        // path. Consult the error open_file() saved at the CreateFileW failure
+        // point rather than the live GetLastError(): the intervening free()
+        // and return path inside open_file() are not guaranteed to preserve
+        // the thread's last-error value. A genuine failure such as a missing
+        // directory (ERROR_PATH_NOT_FOUND) still propagates as fatal.
+        if (GetSavedLastError() == ERROR_ACCESS_DENIED) {
+            return 0;
+        }
+        return -1;
+    }
+    if (!FlushFileBuffers(FD_TO_HANDLE(fd))) {
+        DWORD err = GetLastError();
+        CloseHandle(FD_TO_HANDLE(fd));
+        // FlushFileBuffers is documented for file/volume handles; NTFS refuses
+        // it on a directory handle (typically ERROR_ACCESS_DENIED, and
+        // ERROR_INVALID_FUNCTION on filesystems that do not implement it).
+        // create/rename/unlink of directory entries are made crash consistent
+        // by NTFS metadata journaling, so treat those "not supported"
+        // signatures as best-effort success. This mirrors libgit2/PostgreSQL/
+        // SQLite, which do not rely on directory fsync on Windows, and keeps
+        // the SF manifest-create, slot-lock, and trim/unlink barriers from
+        // hard-failing. Any other error is a real I/O failure and stays fatal.
+        if (err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION) {
+            return 0;
+        }
+        SetLastError(err);
+        SaveLastError();
+        return -1;
+    }
+    CloseHandle(FD_TO_HANDLE(fd));
+    return 0;
+}
+
 JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_truncate
         (JNIEnv *e, jclass cl, jint fd, jlong size) {
     FILE_END_OF_FILE_INFO eof;
@@ -300,18 +360,24 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_length0
                            OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL,
                            NULL);
-    free(wide);
     if (h == INVALID_HANDLE_VALUE) {
+        /* Save the CreateFileW failure code BEFORE free(): any subsequent
+         * API/CRT call (HeapFree can SetLastError) may overwrite the
+         * thread's last-error value -- same pattern as open_file(). */
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     LARGE_INTEGER sz;
     BOOL ok = GetFileSizeEx(h, &sz);
-    CloseHandle(h);
     if (!ok) {
+        /* Save before CloseHandle() can clobber the last-error value. */
         SaveLastError();
+        CloseHandle(h);
         return -1;
     }
+    CloseHandle(h);
     return (jlong) sz.QuadPart;
 }
 
@@ -331,6 +397,20 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_lock
     return 0;
 }
 
+JNIEXPORT jint JNICALL Java_io_questdb_client_cutlass_qwp_client_sf_cursor_SlotLock_release0
+        (JNIEnv *e, jclass cl, jint fd) {
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof(ov));
+    if (!UnlockFileEx(FD_TO_HANDLE(fd), 0, MAXDWORD, MAXDWORD, &ov)) {
+        SaveLastError();
+        return -1;
+    }
+    /* Unlock success confirms that the slot is reusable. Match POSIX by
+     * closing once without making handle cleanup part of that signal. */
+    (void) CloseHandle(FD_TO_HANDLE(fd));
+    return 0;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
         (JNIEnv *e, jclass cl, jlong lpszPath, jint mode) {
     (void) mode;
@@ -340,11 +420,13 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mkdir0
         return -1;
     }
     BOOL ok = CreateDirectoryW(wide, NULL);
-    free(wide);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         return -1;
     }
+    free(wide);
     return 0;
 }
 
@@ -373,11 +455,13 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_client_std_Files_remove0
     } else {
         ok = DeleteFileW(wide);
     }
-    free(wide);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         return JNI_FALSE;
     }
+    free(wide);
     return JNI_TRUE;
 }
 
@@ -395,12 +479,15 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_rename0
         return -1;
     }
     BOOL ok = MoveFileExW(oldW, newW, MOVEFILE_REPLACE_EXISTING);
-    free(oldW);
-    free(newW);
     if (!ok) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(oldW);
+        free(newW);
         return -1;
     }
+    free(oldW);
+    free(newW);
     return 0;
 }
 
@@ -438,11 +525,13 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findFirst0
     pattern[pathLen] = '\0';
 
     wchar_t *wide = utf8_to_wide(pattern);
-    free(pattern);
     if (!wide) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(pattern);
         return 0;
     }
+    free(pattern);
 
     qdb_find_t *find = (qdb_find_t *) malloc(sizeof(qdb_find_t));
     if (!find) {
@@ -450,12 +539,14 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Files_findFirst0
         return 0;
     }
     find->handle = FindFirstFileW(wide, &find->data);
-    free(wide);
     if (find->handle == INVALID_HANDLE_VALUE) {
+        /* Save before free() can clobber the last-error value. */
         SaveLastError();
+        free(wide);
         free(find);
         return 0;
     }
+    free(wide);
     find->hasEntry = 1;
     win_findname_to_utf8(find);
     return (jlong) (uintptr_t) find;
@@ -614,4 +705,17 @@ JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_msync
      * separately via Files.fsync. */
     (void) async;
     return 0;
+}
+
+/* Best-effort page pin. VirtualLock is quota-bound to the process working-set
+ * minimum; callers treat any refusal as a soft downgrade, so no
+ * SaveLastError() -- the refusal is not surfaced as an error. */
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_mlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return VirtualLock((LPVOID) (uintptr_t) addr, (SIZE_T) len) ? 0 : -1;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_client_std_Files_munlock0
+        (JNIEnv *e, jclass cl, jlong addr, jlong len) {
+    return VirtualUnlock((LPVOID) (uintptr_t) addr, (SIZE_T) len) ? 0 : -1;
 }

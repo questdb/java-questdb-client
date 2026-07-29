@@ -133,6 +133,11 @@ public class NetworkFacadeImpl implements NetworkFacade {
     }
 
     @Override
+    public int shutdown(int fd) {
+        return Net.shutdown(fd);
+    }
+
+    @Override
     public long sockaddr(int address, int port) {
         return Net.sockaddr(address, port);
     }

@@ -85,6 +85,10 @@ public interface FilesFacade {
 
     int fsync(int fd);
 
+    default int fsyncDir(String dir) {
+        return Files.fsyncDir(dir);
+    }
+
     /**
      * Whether callers should use this facade's mmap path. The production facade
      * returns {@code true}; wrapping fault facades retain positioned I/O unless
@@ -95,21 +99,18 @@ public interface FilesFacade {
         return this == INSTANCE;
     }
 
+    /**
+     * Returns the current byte length of the file referenced by open descriptor
+     * {@code fd}, or a negative value when the descriptor cannot be statted.
+     */
     long length(int fd);
 
     /**
-     * Stat length of the file at {@code path}, in bytes. Default delegates to
-     * {@link Files#length(String)}.
-     *
-     * <p>Test injection point: {@code MmapSegment.openExisting} maps the file to
-     * this length and scans straight out of the mapping, so a wrapping facade
-     * that returns a value <em>larger</em> than the real file makes the mapping
-     * extend past end-of-file. A read of a page beyond real EOF raises SIGBUS on
-     * <em>every</em> filesystem (which HotSpot translates to a catchable
-     * {@code InternalError} at an {@code Unsafe} intrinsic site) — the same fault
-     * a genuinely unbacked/sparse page raises on ZFS, but reproduced
-     * deterministically on ext4/xfs too. That is what lets recovery's mmap-fault
-     * guard be regression-tested on any CI runner rather than only on ZFS.
+     * Stat length of the file at {@code path}, in bytes.
+     * {@link DefaultFilesFacade} delegates to {@link Files#length(String)}.
+     * Code that already owns an open descriptor should prefer
+     * {@link #length(int)} so path replacement cannot make the stat refer to a
+     * different file.
      */
     long length(String path);
 
@@ -118,11 +119,33 @@ public interface FilesFacade {
     int mkdir(String path, int mode);
 
     /**
+     * Best-effort page pin over {@code [addr, addr+len)} of an mmap'd region.
+     * Returns 0 when the range is locked, non-zero when the platform refuses
+     * (RLIMIT_MEMLOCK, missing privilege, or a native library without the
+     * symbol). Callers must treat refusal as a soft downgrade, never an error.
+     */
+    default int mlock(long addr, long len) {
+        return Files.mlock(addr, len);
+    }
+
+    /**
      * Maps a file region. Kept on the facade so mmap failures can be injected
      * without relying on platform-specific filesystem behavior.
      */
     default long mmap(int fd, long len, long offset, int flags, int memoryTag) {
         return Files.mmap(fd, len, offset, flags, memoryTag);
+    }
+
+    default int msync(long addr, long len, boolean async) {
+        return Files.msync(addr, len, async);
+    }
+
+    /**
+     * Releases a pin taken by {@link #mlock(long, long)}. Best-effort;
+     * refusals are ignorable ({@code munmap} implicitly unlocks).
+     */
+    default int munlock(long addr, long len) {
+        return Files.munlock(addr, len);
     }
 
     /** Releases a region returned by {@link #mmap(int, long, long, int, int)}. */
@@ -145,12 +168,27 @@ public interface FilesFacade {
     /** Variant of {@link #openRW(String)} taking a pre-encoded native UTF-8 path pointer. */
     int openRW(long pathPtr);
 
+    default int openRWExclusive(String path) {
+        return Files.openRWExclusive(path);
+    }
+
+    default int openRWExclusive(long pathPtr) {
+        return Files.openRWExclusive(pathPtr);
+    }
+
     /**
      * Variant of {@code length(String)} taking a pre-encoded native UTF-8 path
      * pointer; same allocation-elision rationale as {@link #openRW(long)}.
      */
     long length(long pathPtr);
 
+    /**
+     * Reads up to {@code len} bytes from the absolute file {@code offset} into
+     * native memory at {@code addr}, without changing the descriptor position.
+     * A positive result may be shorter than requested and callers that require
+     * the whole range must retry. For a non-zero request, {@code 0} means EOF
+     * or no progress and a negative result indicates an operating-system error.
+     */
     long read(int fd, long addr, long len, long offset);
 
     boolean remove(String path);

@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
@@ -82,8 +83,8 @@ public class PrReviewRedTests {
     /**
      * Finding C1 / C10 — first-frame CRC corruption silently deletes the segment.
      * <p>
-     * If frame[0] of a recovered .sfa fails CRC validation, scanFrames returns
-     * lastGood=HEADER_SIZE, countFrames returns 0, and SegmentRing.openExisting
+     * If frame[0] of a recovered .sfa fails CRC validation, the recovery scan
+     * returns lastGood=HEADER_SIZE and frameCount=0, and SegmentRing.openExisting
      * unlinks the file as an "empty hot-spare leftover" — destroying every frame
      * that physically followed the corrupt header. The torn-tail WARN inside
      * MmapSegment.openExisting is dropped on the floor.
@@ -138,17 +139,10 @@ public class PrReviewRedTests {
             Assert.assertTrue("setup: file should still exist after CRC clobber",
                     Files.exists(segPath));
 
-            // Run recovery. Since this is the ONLY segment in the slot, and it
-            // cannot contribute any frames, recovery must refuse rather than
-            // silently proceed as though the directory held nothing at all.
-            try {
-                Misc.free(SegmentRing.openExisting(tmpDir, 64 * 1024));
-                Assert.fail("FINDING C1 (C5-strengthened): expected recovery to refuse "
-                        + "rather than silently treat the unreadable segment as an empty slot");
-            } catch (UnreplayableSlotException expected) {
-                Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("skipped"));
-            }
+            // Run recovery. The segment contributes zero frames, so there is no
+            // chain to build and the slot reports empty -- but the bytes must
+            // survive, under .corrupt, rather than being unlinked.
+            Misc.free(SegmentRing.openExisting(tmpDir, 64 * 1024));
             // The original C1 spec, unchanged: a segment with non-zero contents past
             // the header (tornTailBytes > 0) must be preserved at its original path
             // OR quarantined to <path>.corrupt so a postmortem can recover the

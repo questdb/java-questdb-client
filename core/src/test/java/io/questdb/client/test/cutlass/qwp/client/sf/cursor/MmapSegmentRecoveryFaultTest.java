@@ -25,15 +25,12 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Misc;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -41,67 +38,19 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * Regression guard for the recovery-time SIGBUS hazard in {@link MmapSegment}.
- * <p>
- * On recovery, {@link MmapSegment#openExisting} maps a persisted {@code .sfa}
- * to its stat length and scans frames straight out of the mapping. When a prior
- * session left a sparse segment tail -- a truncate-based pre-allocation that
- * never materialized the tail blocks, as happens on ZFS -- a read of an
- * unbacked page raises the JVM's recoverable
- * {@code InternalError("...unsafe memory access operation...")} (a translated
- * SIGBUS). Recovery must treat that page as the boundary of recoverable data,
- * keep every frame below it, and hand back a usable segment -- not let the
- * error abort recovery of the whole slot (the reported ZFS-CI flake).
- * <p>
- * These tests drive the <b>production entry point</b> ({@code openExisting}),
- * not the private scan methods via reflection. That matters for two reasons:
- * <ul>
- *   <li>It exercises the real recovery path end to end.</li>
- *   <li>On pre-21 JDKs the mmap-fault {@code InternalError} is delivered
- *       imprecisely ("a fault occurred in <i>a recent</i> unsafe memory access
- *       operation in compiled Java code") and escapes a <i>reflective</i>
- *       {@code Method.invoke} frame instead of being caught inside the scan --
- *       so a reflection-based test spuriously fails on the shipping JDK 8/11/17
- *       even though the direct-call production path catches it fine.</li>
- * </ul>
- * The fault-delivery mechanism the fix rests on was verified directly on the
- * shipping/CI Java floor -- JDK 8 (Temurin 1.8.0_492) -- not merely inferred
- * from the adjacent pre-21 LTS releases: the whole class passes there in both
- * interpreter ({@code -Xint}) and JIT modes, HotSpot emits the exact pre-21
- * message above, and a <i>direct</i> {@code try/catch} catches the fault in
- * interpreter, C1, and C2 modes. {@code isMmapAccessFault}'s shared
- * {@code "unsafe memory access operation"} fragment matches that message while
- * the JDK 21+-only needle it replaced does not -- the guard is live on JDK 8.
- * The unbacked tail is produced portably by truncating the file down (dropping
- * the tail blocks) and back up to the mapping size (leaving a sparse hole). A
- * hole-faulting filesystem (ZFS) then faults on the read exactly as in
- * production -- the case the fix must survive rather than fold the CRC through
- * the native, JNI-side {@code Crc32c} where a SIGBUS is uncatchable and aborts
- * the JVM. A hole-zero-filling filesystem (ext4) instead reads the hole back as
- * zeroes, which fails the frame CRC; either way recovery must stop at the same
- * boundary and recover the same frames.
- * <p>
- * <b>Fail-on-revert on any filesystem.</b> The sparse-hole tests above only
- * fault on ZFS: on ext4/xfs the within-EOF hole zero-fills, so the scan stops
- * via the CRC-mismatch / bad-magic branch and they stay green even with the
- * mmap-fault guard reverted -- no regression protection on the ext4/xfs CI
- * runners. The two {@code MapPastEof} tests below close that gap portably.
- * They truncate the file <em>down</em> (freeing the tail blocks) and hand
- * {@code openExisting} a {@link FilesFacade} that reports the original, larger
- * length, so the mapping extends past real end-of-file. A read of a page beyond
- * real EOF raises SIGBUS on <em>every</em> filesystem -- the same catchable
- * {@code InternalError} an unbacked ZFS page raises -- so they exercise the
- * real fault path (and fail on revert) on ext4/xfs too, not only on ZFS.
+ * Regression guards for recovery through positioned file reads. Recovery must
+ * consume every byte it validates before mmap creation so sparse or unbacked
+ * pages never raise SIGBUS during validation. Sparse holes are ordinary zero-filled
+ * reads; negative reads, premature EOF, and file-size changes are operational
+ * errors that fail recovery closed without returning a live mapping or mutating
+ * the segment.
  */
 public class MmapSegmentRecoveryFaultTest {
 
-    private static final long GEN = 1L;
     private static final long SEGMENT_BYTES = 1L << 20;
 
     private String tmpDir;
@@ -133,8 +82,8 @@ public class MmapSegmentRecoveryFaultTest {
 
             long boundary = writeSegment(path, 7L, new int[]{payloadLen});
             assertEquals("frame must fill exactly one page", page, boundary);
-            // Drop the tail blocks, then re-extend logically so [page, SEGMENT_BYTES)
-            // is an unbacked hole under the recovery mapping.
+            // Drop the tail blocks, then re-extend logically so
+            // [page, SEGMENT_BYTES) is an unbacked hole in the persisted file.
             punchSparseTail(path, page);
 
             try (MmapSegment seg = MmapSegment.openExisting(path)) {
@@ -146,15 +95,9 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * The harder case: a frame whose 8-byte header sits on a backed page but
-     * whose payload reaches into the unbacked hole (a torn write leaves a real
-     * positive {@code payloadLen} with the payload spanning the boundary). The
-     * CRC fold therefore reads across the backed-to-unbacked edge. Recovery
-     * must reject that frame and keep the one below it -- and, crucially, must
-     * do so via {@code Unsafe} reads: the native, JNI-side {@code Crc32c} over
-     * an unbacked page raises a SIGBUS that HotSpot cannot translate, aborting
-     * the whole JVM (verified: an {@code hs_err} in
-     * {@code Java_io_questdb_client_std_Crc32c_update}).
+     * The harder sparse case: a frame header is backed but its payload reaches
+     * into a hole. Positioned reads return zeroes for the hole, so CRC
+     * validation rejects that frame without dereferencing the mapping.
      */
     @Test
     public void testRecoverySurvivesPayloadReachingUnbackedPage() throws Exception {
@@ -167,10 +110,16 @@ public class MmapSegmentRecoveryFaultTest {
             // the backed->unbacked edge.
             final long frame2Offset = boundary - 16;
             final int payloadLen2 = (int) page;
-            final int payloadLen1 = (int) (frame2Offset - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
+            final int payloadLen1 = (int) (
+                    frame2Offset - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE
+            );
 
             long used = writeSegment(path, 11L, new int[]{payloadLen1, payloadLen2});
-            assertEquals("frame 2's header must end 8 bytes below the page boundary", boundary - 8, frame2Offset + MmapSegment.FRAME_HEADER_SIZE);
+            assertEquals(
+                    "frame 2's header must end 8 bytes below the page boundary",
+                    boundary - 8,
+                    frame2Offset + MmapSegment.FRAME_HEADER_SIZE
+            );
             assertTrue("frame 2 payload must reach past the boundary", used > boundary);
             punchSparseTail(path, boundary);
 
@@ -186,18 +135,8 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * M1 regression: the header block (magic/version/baseSeq) is read before
-     * {@code scanFrames}, so an unbacked page 0 faults ahead of the guarded
-     * scan. {@link MmapSegment#openExisting} must surface that as a
-     * {@link MmapSegmentException} -- the per-file signal {@code SegmentRing}
-     * catches to skip just this {@code .sfa} -- and never let the raw
-     * {@code InternalError} escape and abort recovery of every sibling segment.
-     * <p>
-     * Portable across filesystems: on a hole-faulting FS (ZFS) the fault is
-     * converted to a {@code MmapSegmentException} in {@code openExisting}'s
-     * catch; on a hole-zero-filling FS (ext4) page 0 reads back as zeroes, so
-     * the magic check fails and throws {@code MmapSegmentException} directly.
-     * Either way the file is skippable, not fatal.
+     * A sparse page zero header is positively identified as corrupt from the
+     * bytes returned by positioned read and is therefore skippable per-file.
      */
     @Test
     public void testUnbackedHeaderPageIsSkippableNotFatal() throws Exception {
@@ -208,352 +147,173 @@ public class MmapSegmentRecoveryFaultTest {
             punchSparseTail(path, 0L);
             try {
                 MmapSegment.openExisting(path).close();
-                fail("expected MmapSegmentException for an unbacked header page");
-            } catch (MmapSegmentException expected) {
-                // ok -- SegmentRing's per-file catch skips just this file
-                // instead of aborting recovery of the whole slot.
+                fail("expected corruption for a sparse zero header");
+            } catch (MmapSegmentCorruptionException expected) {
+                // ok -- SegmentRing's narrow corruption catch skips just this
+                // file instead of aborting recovery of the whole slot.
+            } catch (MmapSegmentException unexpected) {
+                fail("expected quarantinable corruption subtype, got " + unexpected);
             }
         });
     }
 
-    /**
-     * Portable fail-on-revert guard for the recovery mmap-fault handling on the
-     * scan path. Unlike {@link #testRecoveryKeepsFramesBeforeUnbackedTail}
-     * (which only faults on ZFS), this maps the file past real EOF via the
-     * length-injecting facade, so the scan's read of the beyond-EOF page faults
-     * on ext4/xfs too. The fix must <em>recognize</em> that fault and keep
-     * recovery safe -- never a JVM abort, never a raw {@code InternalError}
-     * escaping into {@code SegmentRing}'s recovery loop.
-     * <p>
-     * NOTE: on a JDK without precise unsafe-access fault delivery (8, 11, 17) this test
-     * does NOT pin SegmentRing's arm -- assertLateFaultTolerable degrades to "the process
-     * survived and the message mentions an unsafe memory access operation", which any raw
-     * escaping fault satisfies. Reverting the guard leaves this test green. Do not read
-     * JDK-8 CI green here as regression protection for the skip path.
-     * <p>
-     * Two handled outcomes are accepted, because which one occurs depends on
-     * whether the recovery methods are JIT-compiled at fault time:
-     * <ul>
-     *   <li><b>Interpreter / C1:</b> {@code scanFrames}'s own
-     *       {@code catch (InternalError)} fires, so the frame below the tear is
-     *       recovered and a usable segment is returned -- no skip, recovery
-     *       succeeds normally.</li>
-     *   <li><b>C2:</b> once {@code scanFrames} is inlined into
-     *       {@code openExisting}, HotSpot delivers the async unsafe-access
-     *       {@code InternalError} to {@code openExisting}'s outer
-     *       {@code catch (Throwable)} instead of the inlined inner one, which
-     *       converts the file to a skippable {@link MmapSegmentException}.
-     *       {@code SegmentRing} still catches it at the per-file boundary, but a
-     *       skip now refuses the WHOLE slot ({@link UnreplayableSlotException})
-     *       rather than quietly returning a ring built from the healthy
-     *       sibling alone -- the faulting file's frame range cannot be shown
-     *       already-acked.</li>
-     * </ul>
-     * (The C2 delivery imprecision is a property of HotSpot's async
-     * unsafe-access fault handling, not of this seam; the seam only makes it
-     * reproducible off ZFS.)
-     * <p>
-     * The assertion therefore runs through {@link SegmentRing#openExisting},
-     * NOT {@code MmapSegment.openExisting} directly. Before JDK 21 HotSpot
-     * delivers the unsafe-access fault asynchronously -- at the next return or
-     * safepoint check rather than at the faulting read -- so it can surface in
-     * {@code MmapSegment.openExisting}'s CALLER, past every handler that class
-     * installs. Asserting on the direct call therefore asserted something the
-     * JVM does not guarantee on the shipping JDK 8 target: it passed on 21+ and
-     * on whichever pre-21 tier happened to deliver precisely, and errored with a
-     * raw {@code InternalError} otherwise. {@code SegmentRing}'s per-file arm is
-     * the boundary that can hold the guarantee, because it is the frame the late
-     * delivery lands in -- and it is also the only boundary the invariant is
-     * about: skip one {@code .sfa}, never abort the slot.
-     */
     @Test
-    public void testScanFaultOnMapPastEofIsHandledAnyFilesystem() throws Exception {
-        try {
-            scanFaultOnMapPastEofBody();
-        } catch (InternalError lateFault) {
-            assertLateFaultTolerable(lateFault);
-        }
+    public void testLargeFrameRecoveryCrossesReadBuffer() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-large-frame.sfa";
+            // Put frame 2's length field across the first 64 KiB boundary,
+            // then make its payload span several recovery-buffer refills.
+            final int firstPayloadLen = 64 * 1024
+                    - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE - 5;
+            final int largePayloadLen = 3 * 64 * 1024 + 17;
+            assertEquals(64 * 1024 - 5,
+                    MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + firstPayloadLen);
+            long expectedEnd = writeSegment(path, 13L, new int[]{firstPayloadLen, largePayloadLen, 31});
+            try (MmapSegment seg = MmapSegment.openExisting(path)) {
+                assertEquals(3L, seg.frameCount());
+                assertEquals(expectedEnd, seg.publishedOffset());
+                assertEquals(0L, seg.tornTailBytes());
+            }
+        });
     }
 
-    private void scanFaultOnMapPastEofBody() throws Exception {
+    @Test
+    public void testReadErrorFailsClosedBeforeMmap() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            final String path = tmpDir + "/seg-mappasteof-scan.sfa";
-            final long page = Files.PAGE_SIZE;
-            // One frame that ends exactly on the first page boundary.
-            final int payloadLen = (int) (page - MmapSegment.HEADER_SIZE - MmapSegment.FRAME_HEADER_SIZE);
-            long boundary = writeSegment(path, 5L, new int[]{payloadLen});
-            assertEquals("frame must fill exactly one page", page, boundary);
-            // Free every block past the first page: the file is now exactly one
-            // (fully backed) page, with nothing beyond it on disk.
-            truncateTo(path, page);
-            // Report twice the real length so openExisting maps a second,
-            // beyond-EOF page; the scan faults reading it on any filesystem.
-            // A healthy sibling, contiguous below the faulting segment (baseSeq
-            // 0..4, faulting one at 5), so recovery has something to refuse
-            // OTHER than an empty directory in the late-delivery branch below.
-            String siblingPath = tmpDir + "/seg-sibling.sfa";
-            writeSegment(siblingPath, 0L, new int[]{8, 8, 8, 8, 8});
-
-            FilesFacade ff = new MapPastEofFacade(path, 2 * page);
-            // Must not throw an untyped/raw error on any JDK or JIT tier -- only
-            // ever a recovered ring (precise delivery) or the typed refusal
-            // (late-but-handled delivery). Revert the fault handling and a raw
-            // InternalError propagates out of here instead.
-            SegmentRing ring = null;
+            final String path = tmpDir + "/seg-read-error.sfa";
+            writeSegment(path, 17L, new int[]{256});
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.failReadWithError = true;
+            ff.stopReadsAt = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
             try {
-                ring = SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES);
-            } catch (UnreplayableSlotException refused) {
-                // Late delivery: SegmentRing caught the fault (directly, or via
-                // MmapSegment.openExisting's own conversion) at the per-file
-                // boundary and skipped the faulting file -- which now refuses
-                // the WHOLE slot rather than quietly recovering the sibling
-                // alone, since the faulting file's frame range cannot be shown
-                // already-acked. The sibling's data is not lost: it stays on
-                // disk, unrenamed, and the faulting file is quarantined to
-                // .corrupt for a postmortem.
-                assertTrue(refused.getMessage(), refused.getMessage().contains("skipped"));
-                assertFalse("the unreadable segment must be renamed aside", Files.exists(path));
-                assertTrue("the renamed file must survive for a postmortem",
-                        Files.exists(path + ".corrupt"));
-                assertTrue("the healthy sibling must be untouched", Files.exists(siblingPath));
-                return;
+                MmapSegment.openExisting(ff, path).close();
+                fail("expected positioned-read failure");
+            } catch (MmapSegmentException expected) {
+                assertFalse("operational read errors must not be quarantinable corruption",
+                        expected instanceof MmapSegmentCorruptionException);
+                assertTrue(expected.getMessage(), expected.getMessage().contains("could not read"));
             }
+            assertEquals("mapping must not start after a failed scan", 0, ff.mmapCalls);
+            assertEquals("open descriptor must be closed", 1, ff.closeCalls);
+            assertTrue("read failure must not mutate the segment", Files.exists(path));
+        });
+    }
+
+    @Test
+    public void testReadErrorAfterDetectedTornBytesStillFailsClosed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-torn-then-read-error.sfa";
+            long lastGood = writeSegment(path, 18L, new int[]{256});
+
+            // Make the failed-frame header non-zero in the first recovery
+            // buffer. Recovery must still read the rest of the suffix so an
+            // operational error in a later buffer cannot hide behind the
+            // already-established torn-tail signal.
+            int fd = Files.openRW(path);
+            assertTrue("openRW failed", fd >= 0);
+            long marker = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
             try {
-                // Interpreter / C1, or precise delivery on 21+: scanFrames' own
-                // catch fired and the frame below the tear survived -- no skip
-                // occurred at all, so recovery succeeds normally.
-                assertNotNull("precise delivery must still recover a usable ring", ring);
-                assertEquals("the frame below the beyond-EOF page must be recovered",
-                        5L, ring.getActive().baseSeq());
-                assertEquals(1L, ring.getActive().frameCount());
-                assertEquals("scan must stop at the beyond-EOF boundary",
-                        page, ring.getActive().publishedOffset());
+                Unsafe.getUnsafe().putByte(marker, (byte) 1);
+                assertEquals(1L, Files.write(fd, marker, 1L, lastGood));
             } finally {
-                if (ring != null) {
-                    ring.close();
-                }
+                Unsafe.free(marker, 1, MemoryTag.NATIVE_DEFAULT);
+                Files.close(fd);
             }
-        });
-    }
 
-    /**
-     * Portable fail-on-revert guard for the header-block fault path, asserted at
-     * the boundary that owns the guarantee. The faulting file is truncated to
-     * empty while the facade reports a full page, so its very first header read
-     * (magic) lands on a beyond-EOF page and faults on any filesystem; a healthy
-     * sibling sits beside it in the same directory. Recovery must skip the
-     * faulting {@code .sfa}, quarantine it to {@code .corrupt}, and refuse the
-     * whole slot ({@link UnreplayableSlotException}) rather than quietly
-     * returning a ring built from the sibling alone -- never let the fault
-     * abort the slot with an untyped error, and never abort the JVM.
-     * <p>
-     * As with {@link #testScanFaultOnMapPastEofIsHandledAnyFilesystem}, this
-     * drives {@link SegmentRing#openExisting} rather than
-     * {@code MmapSegment.openExisting}: pre-21 HotSpot may deliver the
-     * unsafe-access fault in the caller's frame, so only the per-file arm in
-     * {@code SegmentRing} can convert it on the shipping JDK 8 target.
-     * <p>
-     * NOTE: on a JDK without precise unsafe-access fault delivery (8, 11, 17) this test
-     * does NOT pin SegmentRing's arm -- assertLateFaultTolerable degrades to "the process
-     * survived and the message mentions an unsafe memory access operation", which any raw
-     * escaping fault satisfies. Reverting the guard leaves this test green. Do not read
-     * JDK-8 CI green here as regression protection for the skip path.
-     */
-    @Test
-    public void testHeaderFaultOnMapPastEofIsSkippableAnyFilesystem() throws Exception {
-        try {
-            headerFaultOnMapPastEofBody();
-        } catch (InternalError lateFault) {
-            assertLateFaultTolerable(lateFault);
-        }
-    }
-
-    private void headerFaultOnMapPastEofBody() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            final String faulting = tmpDir + "/seg-mappasteof-header.sfa";
-            final String healthy = tmpDir + "/seg-mappasteof-sibling.sfa";
-            final long page = Files.PAGE_SIZE;
-            writeSegment(faulting, 9L, new int[]{64});
-            // Free every block: the file is now empty, so even page 0 (the
-            // header) is beyond EOF under the reported one-page mapping.
-            truncateTo(faulting, 0L);
-            // The sibling is untouched and must survive the neighbour's fault.
-            writeSegment(healthy, 0L, new int[]{64, 64});
-            FilesFacade ff = new MapPastEofFacade(faulting, page);
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.failReadWithError = true;
+            ff.stopReadsAt = 64L * 1024L;
             try {
-                Misc.free(SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
-                fail("expected recovery to refuse rather than silently drop the "
-                        + "faulting segment's range");
-            } catch (UnreplayableSlotException expected) {
-                assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
-            }
-            assertFalse("the unreadable segment must be renamed aside", Files.exists(faulting));
-            assertTrue("the renamed file must survive for a postmortem",
-                    Files.exists(faulting + ".corrupt"));
-            assertTrue("the healthy sibling must be untouched", Files.exists(healthy));
-        });
-    }
-
-    /**
-     * Deterministic cover for {@code SegmentRing}'s per-file mmap-fault arm, on
-     * every JDK. The JIT-dependent tests above cannot pin it: on 21+ the fault is
-     * delivered precisely and {@code MmapSegment}'s own handlers absorb it before
-     * {@code SegmentRing} ever sees one, and on pre-21 the delivery frame is
-     * unbounded. So this injects the fault directly at the boundary instead --
-     * the facade throws the recognized {@code InternalError} out of
-     * {@code ff.length(path)}, which {@code MmapSegment.openExisting} evaluates
-     * BEFORE entering its own try block, exactly reproducing the pre-21 case
-     * where the error reaches {@code SegmentRing} unconverted.
-     * <p>
-     * Recovery must skip that one {@code .sfa} -- rename it to {@code .corrupt}
-     * and refuse the whole slot with {@link UnreplayableSlotException} rather
-     * than quietly returning a ring built from the sibling alone, since the
-     * faulting file's frame range cannot be shown already-acked. Drop the
-     * {@code isMmapAccessFault} arm and the error reaches the outer catch,
-     * which closes every recovered segment and rethrows an untyped exception
-     * instead -- {@code build()} would then fail the slot forever rather than
-     * quarantine it.
-     */
-    @Test
-    public void testSegmentRingRefusesSlotOnUnconvertedMmapFault() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            final String faulting = tmpDir + "/seg-lateflt-faulting.sfa";
-            final String healthy = tmpDir + "/seg-lateflt-sibling.sfa";
-            writeSegment(faulting, 9L, new int[]{64});
-            writeSegment(healthy, 0L, new int[]{64, 64});
-            FilesFacade ff = new ThrowingLengthFacade(faulting, new InternalError(
-                    "a fault occurred in a recent unsafe memory access operation in compiled Java code"));
-            try {
-                Misc.free(SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
-                fail("expected recovery to refuse rather than silently drop the "
-                        + "faulting segment's range");
-            } catch (UnreplayableSlotException expected) {
-                assertTrue(expected.getMessage(), expected.getMessage().contains("skipped"));
-            }
-            assertFalse("the unreadable segment must be renamed aside", Files.exists(faulting));
-            assertTrue("the renamed file must survive for a postmortem",
-                    Files.exists(faulting + ".corrupt"));
-            assertTrue("the healthy sibling must be untouched", Files.exists(healthy));
-        });
-    }
-
-    /**
-     * The companion negative: the per-file arm widened to {@code catch (Throwable)}
-     * to reach late-delivered mmap faults, so it must still let everything else
-     * through. An {@code InternalError} that is NOT the recognized mmap access
-     * fault is a genuine VM error and has to propagate -- swallowing it would turn
-     * the arm into a blanket "skip on anything" and hide real failures behind a
-     * silently short recovery.
-     */
-    @Test
-    public void testSegmentRingPropagatesUnrecognizedInternalError() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            final String faulting = tmpDir + "/seg-otherr-faulting.sfa";
-            writeSegment(faulting, 0L, new int[]{64});
-            InternalError unrelated = new InternalError("some unrelated VM failure");
-            FilesFacade ff = new ThrowingLengthFacade(faulting, unrelated);
-            try {
-                Misc.free(SegmentRing.openExisting(ff, tmpDir, SEGMENT_BYTES));
-                fail("an unrecognized InternalError must not be treated as a per-file skip");
-            } catch (InternalError expected) {
-                assertEquals(unrelated.getMessage(), expected.getMessage());
-            }
-        });
-    }
-
-    /**
-     * C11 regression guard: {@code openExisting}'s catch releases the mapping
-     * and fd itself and rethrows. Leaving the holder populated would hand the
-     * caller a segment whose resources are already gone, so the caller's
-     * close() would unmap a range the allocator may have reused and close a
-     * recycled descriptor -- a double release. The catch must clear the
-     * holder as its first statement so a caller's holder-based cleanup can
-     * never see the same segment twice.
-     * <p>
-     * This only exercises the PRE-assignment throw: the garbage header below fails
-     * the bad-magic check before {@code inFlight[0] = segment} ever runs, so
-     * {@code inFlight[0]} is null going in and stays null regardless of whether the
-     * catch clears it. It does not exercise the post-assignment deferred-fault window
-     * (a fault after construction, inside the try, with the holder already populated) --
-     * reverting the catch's holder-clearing statement leaves this test green.
-     */
-    @Test
-    public void testFailedOpenDoesNotLeaveASegmentInTheHolder() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            String path = tmpDir + "/bad-header.sfa";
-            writeGarbageHeader(path);
-            MmapSegment[] inFlight = new MmapSegment[1];
-            try {
-                MmapSegment.openExisting(FilesFacade.INSTANCE, path, inFlight);
-                fail("expected the bad header to be rejected");
+                MmapSegment.openExisting(ff, path).close();
+                fail("expected later positioned-read failure");
             } catch (MmapSegmentException expected) {
-                assertNull("a failed open must not leave a segment in the holder", inFlight[0]);
+                assertFalse(expected instanceof MmapSegmentCorruptionException);
+                assertTrue(expected.getMessage(), expected.getMessage().contains("could not read"));
             }
+            assertTrue("fault must occur after recovery consumed the first buffer", ff.readCalls > 1);
+            assertEquals("mapping must not start after any suffix read fails", 0, ff.mmapCalls);
+            assertEquals("open descriptor must be closed", 1, ff.closeCalls);
+            assertTrue("read failure must not mutate the segment", Files.exists(path));
         });
     }
 
-    /**
-     * True when the running JVM delivers an unsafe-access fault at the faulting
-     * instruction, so a handler around the read is guaranteed to see it.
-     * JDK-8283699 made delivery precise in 21; before that HotSpot records the
-     * fault and raises the {@code InternalError} at the next return or safepoint
-     * check, which can be an arbitrary caller frame.
-     */
-    private static boolean hasPreciseUnsafeAccessFaults() {
-        String spec = System.getProperty("java.specification.version", "1.8");
-        try {
-            return (spec.startsWith("1.")
-                    ? Integer.parseInt(spec.substring(2))
-                    : Integer.parseInt(spec)) >= 21;
-        } catch (NumberFormatException e) {
-            return false;
-        }
-    }
-
-    /**
-     * Absorbs the one outcome no handler in the recovery path can intercept on a
-     * pre-21 JVM: an asynchronously delivered unsafe-access {@code InternalError}
-     * that surfaces in a caller frame. Observed landing two frames above
-     * {@link SegmentRing#openExisting} once the suite has warmed the JIT, so
-     * neither {@code MmapSegment}'s own handlers nor {@code SegmentRing}'s
-     * per-file arm can convert it there.
-     * <p>
-     * This is deliberately NOT a blanket tolerance. On 21+ delivery is precise,
-     * so a leaked {@code InternalError} means a genuine handling gap and is
-     * rethrown -- that is where the strong fail-on-revert guarantee lives. On
-     * pre-21 the assertion degrades to what the JVM still makes checkable: the
-     * process survived, and the escaping error is the RECOGNIZED mmap access
-     * fault rather than an arbitrary VM error.
-     */
-    private static void assertLateFaultTolerable(InternalError e) {
-        if (hasPreciseUnsafeAccessFaults()) {
-            throw e;
-        }
-        String msg = e.getMessage();
-        assertTrue("a late-delivered fault must still be the recognized mmap access fault: " + msg,
-                msg != null && msg.contains("unsafe memory access operation"));
-    }
-
-    /**
-     * Writes 64 bytes of {@code 0xFF} to a fresh file at {@code path} -- long
-     * enough to pass the file-length-vs-{@code HEADER_SIZE} check but wrong from
-     * the first 4 bytes onward, so {@code openExisting}'s magic check rejects it
-     * before ever touching frame data.
-     */
-    private static void writeGarbageHeader(String path) {
-        final int len = 64;
-        int fd = Files.openCleanRW(path);
-        assertTrue("openCleanRW failed", fd >= 0);
-        long buf = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
-        try {
-            for (int i = 0; i < len; i++) {
-                Unsafe.getUnsafe().putByte(buf + i, (byte) 0xFF);
+    @Test
+    public void testShortReadFailsClosedBeforeMmap() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-short-read.sfa";
+            writeSegment(path, 19L, new int[]{256});
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.stopReadsAt = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 32L;
+            try {
+                MmapSegment.openExisting(ff, path).close();
+                fail("expected premature EOF failure");
+            } catch (MmapSegmentException expected) {
+                assertFalse("premature EOF must remain an operational failure",
+                        expected instanceof MmapSegmentCorruptionException);
+                assertTrue(expected.getMessage(), expected.getMessage().contains("short read"));
             }
-            assertEquals((long) len, Files.write(fd, buf, len, 0));
-        } finally {
-            Unsafe.free(buf, len, MemoryTag.NATIVE_DEFAULT);
-            Files.close(fd);
-        }
+            assertEquals("mapping must not start after a failed scan", 0, ff.mmapCalls);
+            assertEquals("open descriptor must be closed", 1, ff.closeCalls);
+            assertTrue("short read must not mutate the segment", Files.exists(path));
+        });
+    }
+
+    @Test
+    public void testShortReadsAreRetried() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-partial-reads.sfa";
+            long expectedEnd = writeSegment(path, 23L, new int[]{31, 127, 4097});
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.maxReadSize = 1024;
+            try (MmapSegment seg = MmapSegment.openExisting(ff, path)) {
+                assertEquals(3L, seg.frameCount());
+                assertEquals(expectedEnd, seg.publishedOffset());
+            }
+            assertTrue("recovery must loop over partial positioned reads", ff.readCalls > 1);
+            assertEquals(1, ff.mmapCalls);
+            assertEquals(1, ff.closeCalls);
+        });
+    }
+
+    @Test
+    public void testSizeChangeFailsClosedBeforeMmap() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-size-change.sfa";
+            writeSegment(path, 29L, new int[]{64});
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.changeLengthAfterScan = true;
+            try {
+                MmapSegment.openExisting(ff, path).close();
+                fail("expected unstable-size failure");
+            } catch (MmapSegmentException expected) {
+                assertFalse(expected instanceof MmapSegmentCorruptionException);
+                assertTrue(expected.getMessage(), expected.getMessage().contains("size changed"));
+            }
+            assertEquals("mapping must not start for an unstable file", 0, ff.mmapCalls);
+            assertEquals("open descriptor must be closed", 1, ff.closeCalls);
+            assertTrue("size-race detection must not mutate the segment", Files.exists(path));
+        });
+    }
+
+    @Test
+    public void testSizeChangeWhileMappingFailsClosedAndUnmaps() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String path = tmpDir + "/seg-size-change-while-mapping.sfa";
+            writeSegment(path, 31L, new int[]{64});
+            RecoveryReadFacade ff = new RecoveryReadFacade();
+            ff.changeLengthOnMmap = true;
+            try {
+                MmapSegment.openExisting(ff, path).close();
+                fail("expected size change during mmap to fail recovery");
+            } catch (MmapSegmentException expected) {
+                assertFalse(expected instanceof MmapSegmentCorruptionException);
+                assertTrue(expected.getMessage(), expected.getMessage().contains("size changed while mapping"));
+            }
+            assertEquals("scan should map only after validation", 1, ff.mmapCalls);
+            assertEquals("rejected mapping must be released", 1, ff.munmapCalls);
+            assertEquals("open descriptor must be closed", 1, ff.closeCalls);
+            assertTrue("injected size observation must not mutate the segment", Files.exists(path));
+        });
     }
 
     /**
@@ -569,10 +329,8 @@ public class MmapSegmentRecoveryFaultTest {
         }
         long buf = Unsafe.malloc(maxLen, MemoryTag.NATIVE_DEFAULT);
         try {
-            for (int i = 0; i < maxLen; i++) {
-                Unsafe.getUnsafe().putByte(buf + i, (byte) (i | 1)); // all non-zero
-            }
-            try (MmapSegment seg = MmapSegment.create(path, baseSeq, SEGMENT_BYTES, GEN)) {
+            Unsafe.getUnsafe().setMemory(buf, maxLen, (byte) 1);
+            try (MmapSegment seg = MmapSegment.create(path, baseSeq, SEGMENT_BYTES)) {
                 for (int len : payloadLens) {
                     assertTrue("append must fit", seg.tryAppend(buf, len) >= 0);
                 }
@@ -587,8 +345,8 @@ public class MmapSegmentRecoveryFaultTest {
      * Turns {@code [keepBytes, SEGMENT_BYTES)} of the file into an unbacked
      * sparse hole: truncate down to {@code keepBytes} (frees the tail blocks),
      * then back up to {@code SEGMENT_BYTES} (re-extends the logical size without
-     * allocating blocks). Recovery maps the full stat length, so the hole is
-     * inside the mapping -- reads of it fault on ZFS and zero-fill on ext4.
+     * allocating blocks). Positioned recovery reads observe the hole as zeroes
+     * without dereferencing it through mmap.
      */
     private static void punchSparseTail(String path, long keepBytes) {
         int fd = Files.openRW(path);
@@ -602,62 +360,20 @@ public class MmapSegmentRecoveryFaultTest {
     }
 
     /**
-     * Shrinks the file to {@code keepBytes}, freeing every block past it, and
-     * leaves it there (no re-extend). Combined with a facade that reports a
-     * larger length, the freed region becomes a beyond-EOF part of the mapping
-     * that faults on read on any filesystem.
+     * Positioned-read fault seam. Calls not involved in recovery scanning
+     * delegate to the production {@link FilesFacade#INSTANCE}.
      */
-    private static void truncateTo(String path, long keepBytes) {
-        int fd = Files.openRW(path);
-        assertTrue("openRW failed", fd >= 0);
-        try {
-            assertTrue("truncate failed", Files.truncate(fd, keepBytes));
-        } finally {
-            Files.close(fd);
-        }
-    }
-
-    /**
-     * Throws a caller-supplied {@link Error} from {@code length(String)} for one
-     * target path, delegating everything else. {@code length} is the first thing
-     * {@code MmapSegment.openExisting} calls and it sits OUTSIDE that method's
-     * try block, so the error reaches {@code SegmentRing}'s per-file arm
-     * unconverted -- which is what a pre-21 late-delivered unsafe-access fault
-     * looks like from there.
-     */
-    private static final class ThrowingLengthFacade extends DelegatingFilesFacade {
-        private final Error toThrow;
-        private final String targetPath;
-
-        ThrowingLengthFacade(String targetPath, Error toThrow) {
-            this.targetPath = targetPath;
-            this.toThrow = toThrow;
-        }
-
-        @Override
-        public long length(String path) {
-            if (targetPath.equals(path)) {
-                throw toThrow;
-            }
-            return super.length(path);
-        }
-    }
-
-    /**
-     * A {@link FilesFacade} that reports an inflated stat length for one target
-     * path so {@code openExisting} maps that file past end-of-file (see
-     * {@link FilesFacade#length(String)}); every other call, including
-     * {@code length} for any other path, delegates to the production
-     * {@link FilesFacade#INSTANCE}.
-     */
-    private static final class MapPastEofFacade implements FilesFacade {
-        private final long reportedLength;
-        private final String targetPath;
-
-        MapPastEofFacade(String targetPath, long reportedLength) {
-            this.targetPath = targetPath;
-            this.reportedLength = reportedLength;
-        }
+    private static final class RecoveryReadFacade implements FilesFacade {
+        private boolean changeLengthAfterScan;
+        private boolean changeLengthOnMmap;
+        private int closeCalls;
+        private boolean failReadWithError;
+        private int lengthCalls;
+        private int maxReadSize = Integer.MAX_VALUE;
+        private int mmapCalls;
+        private int munmapCalls;
+        private int readCalls;
+        private long stopReadsAt = Long.MAX_VALUE;
 
         @Override
         public boolean allocate(int fd, long size) {
@@ -671,6 +387,7 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public int close(int fd) {
+            closeCalls++;
             return INSTANCE.close(fd);
         }
 
@@ -716,7 +433,13 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long length(int fd) {
-            return INSTANCE.length(fd);
+            long length = INSTANCE.length(fd);
+            lengthCalls++;
+            if ((changeLengthAfterScan && lengthCalls > 1)
+                    || (changeLengthOnMmap && mmapCalls > 0)) {
+                return length - 1L;
+            }
+            return length;
         }
 
         @Override
@@ -726,7 +449,7 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long length(String path) {
-            return targetPath.equals(path) ? reportedLength : INSTANCE.length(path);
+            return INSTANCE.length(path);
         }
 
         @Override
@@ -737,6 +460,18 @@ public class MmapSegmentRecoveryFaultTest {
         @Override
         public int mkdir(String path, int mode) {
             return INSTANCE.mkdir(path, mode);
+        }
+
+        @Override
+        public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+            mmapCalls++;
+            return INSTANCE.mmap(fd, len, offset, flags, memoryTag);
+        }
+
+        @Override
+        public void munmap(long address, long len, int memoryTag) {
+            munmapCalls++;
+            INSTANCE.munmap(address, len, memoryTag);
         }
 
         @Override
@@ -761,7 +496,15 @@ public class MmapSegmentRecoveryFaultTest {
 
         @Override
         public long read(int fd, long addr, long len, long offset) {
-            return INSTANCE.read(fd, addr, len, offset);
+            readCalls++;
+            if (offset >= stopReadsAt) {
+                return failReadWithError ? -1L : 0L;
+            }
+            long delegatedLen = Math.min(len, (long) maxReadSize);
+            if (delegatedLen > stopReadsAt - offset) {
+                delegatedLen = stopReadsAt - offset;
+            }
+            return INSTANCE.read(fd, addr, delegatedLen, offset);
         }
 
         @Override

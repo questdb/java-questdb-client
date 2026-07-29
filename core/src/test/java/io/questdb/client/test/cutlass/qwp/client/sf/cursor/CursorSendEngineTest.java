@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
@@ -252,6 +253,55 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testCheckDurabilitySurfacesLatchedFailureToSenderEntryPoints() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // QwpWebSocketSender.flushAndGetSequence()/awaitAckedFsn() call
+            // engine.checkDurability() as their FIRST durability act, so this
+            // delegation seam is what stands between a latched periodic
+            // data-barrier failure and a producer that keeps publishing into
+            // an unsyncable slot. It had zero test references before this
+            // pin. Contract: quiet when clean, throws the LATCHED instance
+            // (not a copy) on every call until the manager's healed pass
+            // clears it -- callers poll it, so it must be repeatable, not
+            // one-shot.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                engine.checkDurability(); // clean: must not throw
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                for (int i = 0; i < 2; i++) {
+                    try {
+                        engine.checkDurability();
+                        fail("latched durability failure must surface on call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        assertTrue("the latched instance itself must surface",
+                                expected == failure);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAppendChecksLatchedDurabilityFailureBeforePublishing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                try {
+                    engine.appendBlocking(buf, 16);
+                    fail("expected latched durability failure");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected == failure);
+                }
+                assertEquals(-1L, engine.publishedFsn());
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testAppendBlockingNeverFailsUnderManagerSupply() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
@@ -289,8 +339,8 @@ public class CursorSendEngineTest {
                 MmapSegment spare = engine.activeSegment();
                 assertNotSame("a rotation must have installed a new active segment", initial, spare);
                 try (MmapSegment reopened = MmapSegment.openExisting(spare.path())) {
-                    assertEquals("the rotation spare's on-disk generation must match the engine's",
-                            engine.generation(), reopened.generation());
+                    assertEquals("the rotation spare's on-disk lineage id must match the engine's",
+                            engine.lineageId(), reopened.lineageId());
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
@@ -370,6 +420,25 @@ public class CursorSendEngineTest {
             CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096);
             engine.close();
             engine.close();
+        });
+    }
+
+    @Test
+    public void testCallbackCreationFailurePrecedesOwnedManagerResources() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine.setBeforeDeferredCloseCreationHook(() -> {
+                throw new OutOfMemoryError("simulated bound callback allocation failure");
+            });
+            try {
+                try {
+                    new CursorSendEngine(tmpDir, 4096);
+                    fail("expected callback allocation failure");
+                } catch (OutOfMemoryError expected) {
+                    assertEquals("simulated bound callback allocation failure", expected.getMessage());
+                }
+            } finally {
+                CursorSendEngine.setBeforeDeferredCloseCreationHook(null);
+            }
         });
     }
 
@@ -576,6 +645,53 @@ public class CursorSendEngineTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicRotationWaitsForDurablePredecessor() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE
+                    + 2L * (MmapSegment.FRAME_HEADER_SIZE + 64L);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            CursorSendEngine engine = new CursorSendEngine(
+                    tmpDir, segmentSize, segmentSize * 4L,
+                    TimeUnit.SECONDS.toNanos(5), TimeUnit.HOURS.toNanos(1));
+            try {
+                assertEquals(0L, engine.appendBlocking(buf, 64));
+                assertEquals(1L, engine.appendBlocking(buf, 64));
+                // The third append needs rotation. Its predecessor is dirty and
+                // the periodic deadline is an hour away, so only the explicit
+                // rotation request can make progress.
+                assertEquals(2L, engine.appendBlocking(buf, 64));
+                ObjList<MmapSegment> sealed = engine.getRingForTesting().getSealedSegments();
+                assertEquals(1, sealed.size());
+                assertTrue(sealed.getQuick(0).isPublishedDurable());
+                MmapSegment active = engine.getRingForTesting().getActive();
+                assertFalse(active.isPublishedDurable());
+                engine.close();
+                assertTrue("close must sync the unacknowledged active", active.isPublishedDurable());
+            } finally {
+                engine.close();
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicValidationPrecedesOwnedManagerAllocation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try {
+                new CursorSendEngine(
+                        null,
+                        4096L,
+                        8192L,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        1L);
+                fail("expected periodic memory-mode validation failure");
+            } catch (IllegalArgumentException expected) {
+                assertTrue(expected.getMessage().contains("requires disk store-and-forward mode"));
             }
         });
     }
@@ -811,11 +927,12 @@ public class CursorSendEngineTest {
             String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
         Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
                 String.class, long.class, SegmentManager.class, boolean.class, long.class,
-                FilesFacade.class);
+                long.class, long.class, FilesFacade.class);
         ctor.setAccessible(true);
         try {
             ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, FilesFacade.INSTANCE);
+                    SegmentManager.UNLIMITED_TOTAL_BYTES,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, 0L, FilesFacade.INSTANCE);
             fail("expected constructor failure");
             return null;
         } catch (InvocationTargetException e) {

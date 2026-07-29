@@ -115,6 +115,14 @@ public class QuestDBBuilderTest {
     }
 
     @Test
+    public void testTlsRootsWithUnsafeOffRejectedAtBuildWithMinZero() {
+        assertBuildRejected(
+                "wss::addr=127.0.0.1:1;tls_roots=/ca.pem;tls_verify=unsafe_off;sender_pool_min=0;query_pool_min=0;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
+    }
+
+    @Test
     public void testMalformedPoolValueRejectedAtBuild() {
         // A non-numeric pool value is rejected at build()'s pool-key resolution,
         // even with min=0. sender_pool_max is read through ConfigView.getInt,

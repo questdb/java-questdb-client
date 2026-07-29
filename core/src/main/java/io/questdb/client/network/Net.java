@@ -151,6 +151,8 @@ public final class Net {
 
     public static native int setTcpNoDelay(int fd, boolean noDelay);
 
+    public static native int shutdown(int fd);
+
     public static long sockaddr(int ipv4address, int port) {
         SOCK_ADDR_COUNTER.incrementAndGet();
         return sockaddr0(ipv4address, port);

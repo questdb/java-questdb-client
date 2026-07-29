@@ -286,10 +286,30 @@ public class SenderPoolCloseLifecycleTest {
                 Assert.assertTrue("borrower never reached the factory",
                         inCreate.await(10, TimeUnit.SECONDS));
 
-                // Close the pool while the creation is in flight: nothing is
-                // outstanding (the new slot never entered `all`), so this
-                // returns promptly with `closed` raised.
-                pool.close();
+                // Raise the same early shutdown signal used by QuestDBImpl so
+                // the creation deterministically takes the teardown branch.
+                pool.markClosingForTesting();
+
+                // close() now owns the in-flight creation reservation until
+                // its closed-mid-creation teardown completes, so run it on a
+                // separate thread while the creation remains parked.
+                Thread poolCloser = new Thread(pool::close, "pool-closer");
+                poolCloser.start();
+
+                // Make poolCloser the primary closer DETERMINISTICALLY before
+                // anything else moves: wait until it has claimed closeStarted
+                // and parked in the bounded in-flight-creation wait (which
+                // releases the lock). Without this the lock-probe close()
+                // below can win the closeStarted race, become the primary
+                // closer itself and legitimately block in that same 5s wait
+                // (the parked teardown holds inFlightCreations at 1) -- a
+                // false "lock held" failure under slow thread scheduling.
+                long closerParkedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!pool.hasCreationWaiterForTesting()) {
+                    Assert.assertTrue("pool-closer never parked in the in-flight-creation wait",
+                            System.nanoTime() < closerParkedDeadline);
+                    Thread.sleep(1);
+                }
 
                 // Let the creation finish: the borrower re-locks, observes the
                 // closed pool and starts the delegate teardown, which parks.
@@ -313,6 +333,8 @@ public class SenderPoolCloseLifecycleTest {
                         lockFree);
 
                 borrower.join(TimeUnit.SECONDS.toMillis(10));
+                poolCloser.join(TimeUnit.SECONDS.toMillis(10));
+                Assert.assertFalse("pool close did not finish", poolCloser.isAlive());
                 Assert.assertFalse("borrower did not finish", borrower.isAlive());
                 Assert.assertTrue(
                         "borrow() must surface the closed pool, got: " + borrowOutcome.get(),

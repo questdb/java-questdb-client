@@ -48,6 +48,11 @@ final class SenderSlot {
     private final Sender delegate;
     private final SenderPool pool;
     private final int slotIndex;
+    // Index in SenderPool.retiredSlots, or -1 while this slot is not retired.
+    // Guarded by the pool lock. The pool maintains this index across swap
+    // removals so the delegate's release callback can recover this exact slot
+    // without scanning every other retired slot.
+    private int retiredIndex = -1;
     // Monotonic lease id. Mutated only under the SenderPool lock (bumped in
     // borrow() when the slot is handed out and in giveBack()/discardBroken()
     // when it is returned). A PooledSender wrapper captures it live for its
@@ -110,6 +115,14 @@ final class SenderSlot {
 
     SenderPool pool() {
         return pool;
+    }
+
+    int retiredIndex() {
+        return retiredIndex;
+    }
+
+    void retiredIndex(int retiredIndex) {
+        this.retiredIndex = retiredIndex;
     }
 
     int slotIndex() {

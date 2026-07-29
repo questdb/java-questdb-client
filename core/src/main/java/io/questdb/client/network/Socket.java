@@ -38,6 +38,17 @@ public interface Socket extends QuietCloseable {
     int WRITE_FLAG = 1;
 
     /**
+     * Closes only the network traffic path so a concurrent blocking send or
+     * receive returns. Implementations must retain any I/O buffers until the
+     * owning worker has stopped and {@link #close()} performs full cleanup.
+     * The compatibility default fails without touching implementation-owned
+     * resources; custom sockets must override this method to opt in.
+     */
+    default void closeTraffic() {
+        throw new UnsupportedOperationException("traffic shutdown is not supported by this socket");
+    }
+
+    /**
      * @return file descriptor associated with the socket.
      */
     int getFd();

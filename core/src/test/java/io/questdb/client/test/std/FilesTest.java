@@ -74,6 +74,16 @@ public class FilesTest {
     }
 
     @Test
+    public void testFsyncParentDir() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String child = tmpDir + "/child";
+            assertEquals(0, Files.mkdir(child, Files.DIR_MODE_DEFAULT));
+            assertEquals(0, Files.fsyncParentDir(child));
+            assertTrue(Files.remove(child));
+        });
+    }
+
+    @Test
     public void testWriteReadRoundtrip() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/test.bin";

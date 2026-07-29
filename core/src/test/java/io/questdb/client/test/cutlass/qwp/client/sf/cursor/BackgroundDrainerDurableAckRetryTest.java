@@ -511,8 +511,8 @@ public class BackgroundDrainerDurableAckRetryTest {
             // .lock forever with no .failed sentinel and only a throttled WARN as
             // a trace. A JVM/programming failure is not a transport outage:
             // retrying cannot clear it, so it must escape the loop on the FIRST
-            // sweep. run()'s outer catch then quarantines the slot (markFailed +
-            // FAILED) and its finally releases the lock -- quarantine-and-exit.
+            // sweep. run() records FAILED without quarantining recoverable data,
+            // releases the lock in finally, and propagates the Error.
             CountingListener listener = new CountingListener();
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(
                     () -> new LinkageError("simulated JVM failure"));
