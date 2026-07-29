@@ -96,11 +96,13 @@ public class SfDirPermissionsTest {
      * {@code SlotLock.acquireLogical(slotPath, dirMode)}) and checks the result on a
      * real filesystem, which the component-level test above does not. It does NOT add
      * bit-for-bit regression coverage beyond that test: under the common umask 022,
-     * {@code mkdir(2)} applies {@code mode & ~umask}, so {@code DIR_MODE_SHARED}
-     * (01777) and {@code DIR_MODE_DEFAULT} (0755) collapse to the identical 0755, and
-     * {@code PosixFilePermission} has no bit for {@code S_ISVTX} on any platform -- so
-     * this test cannot observe the one bit that distinguishes the two modes under that
-     * umask. The exact-mode regression guard remains
+     * {@code mkdir(2)}'s {@code mode & ~umask} only touches the permission bits, so
+     * {@code DIR_MODE_SHARED} (01777) and {@code DIR_MODE_DEFAULT} (0755) come out
+     * with identical 0755 permission bits -- the sticky bit itself does NOT collapse
+     * (Linux honours it regardless of umask; see {@link io.questdb.client.std.Files#DIR_MODE_SHARED}),
+     * but {@code PosixFilePermission} has no bit for {@code S_ISVTX} on any platform,
+     * so this test cannot observe the one bit that actually still differs between the
+     * two modes. The exact-mode regression guard remains
      * {@link #testSfDirAndLockDirAreGatedTogether}; what this test adds is proof the
      * real call sequence runs and a check against the real filesystem.
      * <p>
