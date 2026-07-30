@@ -506,10 +506,19 @@ public final class SegmentRing implements QuietCloseable {
                             if (torn > 0) {
                                 // Preserve, not destroy: on success the bytes move to
                                 // .corrupt; if even the rename fails, they stay under
-                                // their original name instead. Either way the file
-                                // survives for the NEXT recovery to re-examine by the
-                                // same rules -- it can never be mistaken for this
-                                // generation's.
+                                // their original name instead (quarantineFile only
+                                // logs a warning on a failed rename, so a torn,
+                                // data-bearing leftover really can remain a plain
+                                // .sfa file here). Either way the file survives for
+                                // the NEXT recovery to re-examine -- and it is THAT
+                                // recovery's FSN boundary checks, not the name, that
+                                // keep it from being mistaken for this generation's:
+                                // a base above activeBase throws ("segment exists
+                                // beyond committed SF active boundary"), a base
+                                // colliding with the new chain fails
+                                // validateContiguous's expected-next-base check, and
+                                // a base wholly below headBase is excluded from the
+                                // chain and quarantined again as a non-retained extra.
                                 quarantineFile(filesFacade, path);
                             } else if (!filesFacade.remove(path)) {
                                 // Returning EMPTY here makes the caller start fresh at

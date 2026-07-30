@@ -184,8 +184,8 @@ public class SegmentRingTest {
         // a dead path.
         TestUtils.assertMemoryLeak(() -> {
             // 4 100-byte frames per segment. signalAtBytes is 75% of segSize,
-            // and HEADER (32) + 3 frames (3*108 = 324) lands publishedOffset
-            // at 356, just past the 348-byte threshold.
+            // and HEADER (24) + 3 frames (3*108 = 324) lands publishedOffset
+            // at 348, just past the 342-byte threshold.
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 100);
             long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
