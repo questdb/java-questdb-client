@@ -152,11 +152,6 @@ public final class SegmentRing implements QuietCloseable {
     private long nextSeq;
     private boolean periodicSyncEnabled;
     private volatile long publishedFsn;
-    // The lineage id every recovered segment agreed on -- see recover()'s
-    // chain check. MISSING_LINEAGE_ID for a ring built via the plain
-    // constructor (a fresh start with no recovered segments to agree on
-    // anything); read-only after construction for a recovered ring.
-    private long recoveredLineageId = MmapSegment.MISSING_LINEAGE_ID;
     private volatile boolean syncRequested;
     // Plain (producer-thread-only) flag; set to true the first time we ask
     // the manager for a spare for the current active segment, cleared on
@@ -599,27 +594,6 @@ public final class SegmentRing implements QuietCloseable {
                 }
             }
 
-            // Segments from two producer generations can come to share one slot
-            // directory -- a crash between generations, an orphan adoption racing
-            // a fresh start, an operator merging leftovers -- and their FSN ranges
-            // can still line up perfectly, so neither validateContiguous nor a
-            // manifest boundary can see it: both reason about FSNs, and both
-            // lineages number theirs from the same origin. The lineage id every
-            // segment carries makes it a direct comparison. Checked over the
-            // admitted chain, after boundaries have selected it, so a stale
-            // below-head file from a prior lineage (which recovery already
-            // discards) cannot refuse an otherwise healthy slot.
-            long chainLineageId = chain.get(0).lineageId();
-            for (int i = 1, n = chain.size(); i < n; i++) {
-                long segmentLineageId = chain.get(i).lineageId();
-                if (segmentLineageId != chainLineageId) {
-                    throw new UnreplayableSlotException(
-                            "segments in " + sfDir + " disagree on lineage id (" + chainLineageId
-                                    + " vs " + segmentLineageId + "); two producer lineages appear"
-                                    + " to share this slot -- the affected data must be resent");
-                }
-            }
-
             // Build membership and clean validated extras while every mmap and
             // the manifest still have one local owner. In particular, an OOM
             // while allocating the identity map falls through to the outer
@@ -679,7 +653,6 @@ public final class SegmentRing implements QuietCloseable {
                 chain.get(i - 1).linkSuccessor(chain.get(i));
             }
             SegmentRing ring = new SegmentRing(active, maxBytesPerSegment, manifest);
-            ring.recoveredLineageId = chainLineageId;
             for (int i = 0, n = chain.size() - 1; i < n; i++) {
                 ring.sealedSegments.add(chain.get(i));
             }
@@ -1494,21 +1467,6 @@ public final class SegmentRing implements QuietCloseable {
      */
     public long publishedFsn() {
         return publishedFsn;
-    }
-
-    /**
-     * The lineage id every segment {@link #recover} admitted into the chain
-     * agreed on, or {@link MmapSegment#MISSING_LINEAGE_ID} for a ring built
-     * fresh via {@link #SegmentRing(MmapSegment, long)} (nothing was recovered
-     * to agree on anything). {@code CursorSendEngine} passes this to
-     * {@link PersistedSymbolDict#open(FilesFacade, String)} so a recovered
-     * dictionary is trusted only if it belongs to the same producer lineage as
-     * the frames that reference its ids -- an identity no manifest boundary,
-     * CRC or gap check can establish, because two lineages can share one slot
-     * with perfectly contiguous FSNs.
-     */
-    public long recoveredLineageId() {
-        return recoveredLineageId;
     }
 
     /**

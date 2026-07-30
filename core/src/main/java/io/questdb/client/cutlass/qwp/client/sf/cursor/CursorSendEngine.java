@@ -414,15 +414,14 @@ public final class CursorSendEngine implements QuietCloseable {
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
             // already on disk and corrupting ACK translation, trim, and replay.
-            // May throw UnreplayableSlotException (the recovered chain disagrees on
-            // its lineage id) or SfRecoveryException / MmapSegmentCorruptionException
-            // (the durable chain is proven corrupt or incomplete) -- the
-            // catch (Throwable) below cleans up and lets them propagate so the
-            // constructor's two callers, Sender.build() and BackgroundDrainer, can
-            // quarantine the slot instead of seeding the ack past frames that were
-            // never sent. A plain MmapSegmentException is operational: it aborts
-            // startup without quarantining, so a transient EMFILE/ENOMEM can never
-            // silently drop durable frames.
+            // May throw UnreplayableSlotException or SfRecoveryException /
+            // MmapSegmentCorruptionException (the durable chain is proven corrupt
+            // or incomplete) -- the catch (Throwable) below cleans up and lets
+            // them propagate so the constructor's two callers, Sender.build() and
+            // BackgroundDrainer, can quarantine the slot instead of seeding the
+            // ack past frames that were never sent. A plain MmapSegmentException
+            // is operational: it aborts startup without quarantining, so a
+            // transient EMFILE/ENOMEM can never silently drop durable frames.
             SegmentRing.Recovery recovery = memoryMode ? null
                     : SegmentRing.recover(filesFacade, sfDir, segmentSizeBytes);
             SegmentRing recovered = recovery == null ? null : recovery.ring();
@@ -484,16 +483,11 @@ public final class CursorSendEngine implements QuietCloseable {
                     throw new SfOperationalException(
                             "could not open required ack watermark for SF slot " + sfDir);
                 }
-                // Every segment SegmentRing.recover admitted into the chain agreed
-                // on this lineage id (it refuses the slot otherwise -- see the chain
-                // check there), so it is the producer lineage this recovery belongs to.
-                lineageIdInProgress = recovered.recoveredLineageId();
                 // Load the persisted symbol dictionary so delta-encoded frames
                 // in this recovered slot can be re-registered on the fresh
-                // server before replay. Null on open failure, OR when a
-                // survivor's stamped lineage id disagrees with the one above
-                // (a prior lineage's dictionary sharing this slot) -> delta
-                // disabled.
+                // server before replay. Returns null on any I/O or parse
+                // failure, in which case the sender degrades to full
+                // self-sufficient frames for this session.
                 persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();

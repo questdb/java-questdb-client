@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfSanitizedResidueException;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Misc;
@@ -1055,40 +1054,6 @@ public class SegmentRingTest {
                         Files.exists(oldestPath));
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    /**
-     * Segments disagreeing with each other means two producer lineages wrote into one
-     * slot directory. A slot-level sidecar cannot see this at all: the generation
-     * living in the segment header makes it a direct comparison. Each segment carries
-     * one frame -- an empty segment (frameCount == 0) is instead treated as a
-     * hot-spare leftover and unlinked before the generation check ever runs -- and
-     * their FSN ranges are contiguous (0, then 1), so the gap check alone could not
-     * have caught this either.
-     */
-    @Test
-    public void testRecoveryRefusesSegmentsFromTwoLineages() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
-            try {
-                try (MmapSegment a = MmapSegment.create(tmpDir + "/sf-0.sfa", 0L, 4096L, 100L)) {
-                    assertNotNull(a);
-                    a.tryAppend(buf, 8);
-                }
-                try (MmapSegment b = MmapSegment.create(tmpDir + "/sf-1.sfa", 1L, 4096L, 200L)) {
-                    assertNotNull(b);
-                    b.tryAppend(buf, 8);
-                }
-            } finally {
-                Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
-            }
-            try {
-                Misc.free(SegmentRing.openExisting(tmpDir, 4096L));
-                throw new AssertionError("segments from two lineages must not be replayed");
-            } catch (UnreplayableSlotException expected) {
-                TestUtils.assertContains(expected.getMessage(), "lineage id");
             }
         });
     }
