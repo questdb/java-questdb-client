@@ -192,15 +192,38 @@ public abstract class AbstractLineHttpSender implements Sender {
 
         this.isTls = tlsConfig != null;
 
-        if (client != null) {
-            this.client = client;
-        } else {
-            this.client = isTls ?
-                    HttpClientFactory.newTlsInstance(clientConfiguration, tlsConfig)
-                    : HttpClientFactory.newPlainTextInstance(clientConfiguration);
+        // The sender owns the client from the assignment on, whether the caller handed it in or
+        // this constructor built it - close() frees it either way. newRequest() writes the request
+        // preamble into the client's request buffer and throws when the path, the User-Agent
+        // header or an auth header does not fit, so a throw past the assignment would strand a
+        // socket and two native buffers that no caller ever receives a reference to.
+        // createLineSender() cannot clean that up on our behalf: it builds the sender in a return
+        // expression, past every catch it has.
+        try {
+            if (client != null) {
+                this.client = client;
+            } else {
+                this.client = isTls ?
+                        HttpClientFactory.newTlsInstance(clientConfiguration, tlsConfig)
+                        : HttpClientFactory.newPlainTextInstance(clientConfiguration);
+            }
+            this.questDBVersion = new BuildInformationHolder().getSwVersion();
+            this.request = newRequest();
+        } catch (Throwable th) {
+            if (this.client != null) {
+                // Attach a close failure to the primary one rather than let it replace it: a TLS
+                // socket can throw from close(), and the caller has to see why construction failed.
+                try {
+                    this.client.close();
+                } catch (Throwable closeFailure) {
+                    if (closeFailure != th) {
+                        th.addSuppressed(closeFailure);
+                    }
+                }
+                this.client = null;
+            }
+            throw th;
         }
-        this.questDBVersion = new BuildInformationHolder().getSwVersion();
-        this.request = newRequest();
         this.maxNameLength = maxNameLength;
         this.rnd = rnd;
     }
