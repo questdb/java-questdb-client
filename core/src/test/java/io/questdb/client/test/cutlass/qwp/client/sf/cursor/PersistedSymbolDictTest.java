@@ -1150,6 +1150,66 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testExactHeaderSizeFileIsCompleteWhileOneByteShorterIsARecreatedStub() throws Exception {
+        // HEADER_SIZE shrank from 16 to 8 when the lineage stamp was removed (see
+        // PersistedSymbolDict's class javadoc): a length that used to fall inside the
+        // sub-header-stub range [0, 16) -- and so got silently recreated by the
+        // truncating openFresh() -- can now be a COMPLETE, zero-chunk dictionary that
+        // open() must load as-is instead of discarding. This pins the new boundary
+        // from both sides: exactly HEADER_SIZE bytes is a complete empty dict and
+        // must NOT be recreated; HEADER_SIZE - 1 bytes is still the crash-left stub
+        // it always was and must still be recreated.
+        assertMemoryLeak(() -> {
+            // Side 1: exactly HEADER_SIZE bytes -- magic, version, three reserved
+            // zero bytes, no chunks -- is complete and must load, not recreate.
+            Path completeDir = newFolder("qwp-symdict-exact-header");
+            Path completeFile = completeDir.resolve(".symbol-dict");
+            byte[] complete = new byte[HEADER_SIZE];
+            complete[0] = 'S';
+            complete[1] = 'Y';
+            complete[2] = 'D';
+            complete[3] = '1';
+            complete[4] = 1; // VERSION
+            Files.write(completeFile, complete);
+
+            try (PersistedSymbolDict d = PersistedSymbolDict.open(completeDir.toString())) {
+                Assert.assertNotNull("an exactly-HEADER_SIZE file must load, not be refused", d);
+                Assert.assertEquals("a zero-chunk file must recover empty", 0, d.size());
+                Assert.assertEquals("open() must NOT rewrite an already-complete header",
+                        (long) HEADER_SIZE, Files.size(completeFile));
+
+                // Prove the returned instance is genuinely usable, not just non-null.
+                d.appendSymbol("a");
+            }
+            try (PersistedSymbolDict reopened = PersistedSymbolDict.open(completeDir.toString())) {
+                Assert.assertEquals("the append made after loading the boundary file must survive reopen",
+                        1, reopened.size());
+                Assert.assertEquals("a", reopened.readLoadedSymbols().getQuick(0));
+            }
+
+            // Side 2: one byte short of HEADER_SIZE is still the crash-left
+            // sub-header stub it always was, and open() must still recreate it with
+            // a full header rather than try to load it.
+            Path stubDir = newFolder("qwp-symdict-sub-header-stub");
+            Path stubFile = stubDir.resolve(".symbol-dict");
+            byte[] stub = new byte[HEADER_SIZE - 1];
+            stub[0] = 'S';
+            stub[1] = 'Y';
+            stub[2] = 'D';
+            stub[3] = '1';
+            stub[4] = 1; // VERSION
+            Files.write(stubFile, stub);
+
+            try (PersistedSymbolDict d = PersistedSymbolDict.open(stubDir.toString())) {
+                Assert.assertNotNull("a sub-header stub must still be recreated, not refused", d);
+                Assert.assertEquals("a recreated dict must start empty", 0, d.size());
+                Assert.assertEquals("openFresh must have written a full header over the stub",
+                        (long) HEADER_SIZE, Files.size(stubFile));
+            }
+        });
+    }
+
+    @Test
     public void testTruncateFailureDegradesWithoutDestroyingTheFile() throws Exception {
         // A host crash can leave a torn/stale tail past the last complete chunk.
         // open() drops it with a truncate; if that truncate FAILS (a read-only
