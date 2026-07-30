@@ -1158,7 +1158,12 @@ public class PersistedSymbolDictTest {
         // open() must load as-is instead of discarding. This pins the new boundary
         // from both sides: exactly HEADER_SIZE bytes is a complete empty dict and
         // must NOT be recreated; HEADER_SIZE - 1 bytes is still the crash-left stub
-        // it always was and must still be recreated.
+        // it always was and must still be recreated. A file-size assertion alone
+        // cannot tell "loaded" from "recreated" here, since openFresh writes the
+        // very same magic/version/reserved bytes the fixture hand-writes --
+        // usedMappedRecoveryInput() is what actually distinguishes the two paths,
+        // being true only through openExisting's mmap recovery and always false
+        // from openFresh.
         assertMemoryLeak(() -> {
             // Side 1: exactly HEADER_SIZE bytes -- magic, version, three reserved
             // zero bytes, no chunks -- is complete and must load, not recreate.
@@ -1174,6 +1179,8 @@ public class PersistedSymbolDictTest {
 
             try (PersistedSymbolDict d = PersistedSymbolDict.open(completeDir.toString())) {
                 Assert.assertNotNull("an exactly-HEADER_SIZE file must load, not be refused", d);
+                Assert.assertTrue("must recover through openExisting's mmap path, not a silent recreate",
+                        d.usedMappedRecoveryInput());
                 Assert.assertEquals("a zero-chunk file must recover empty", 0, d.size());
                 Assert.assertEquals("open() must NOT rewrite an already-complete header",
                         (long) HEADER_SIZE, Files.size(completeFile));
@@ -1202,6 +1209,8 @@ public class PersistedSymbolDictTest {
 
             try (PersistedSymbolDict d = PersistedSymbolDict.open(stubDir.toString())) {
                 Assert.assertNotNull("a sub-header stub must still be recreated, not refused", d);
+                Assert.assertFalse("a sub-header stub must be recreated by openFresh, not loaded",
+                        d.usedMappedRecoveryInput());
                 Assert.assertEquals("a recreated dict must start empty", 0, d.size());
                 Assert.assertEquals("openFresh must have written a full header over the stub",
                         (long) HEADER_SIZE, Files.size(stubFile));
