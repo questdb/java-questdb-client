@@ -48,7 +48,6 @@ import static org.junit.Assert.assertTrue;
 
 public class SegmentManagerTest {
 
-    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -143,7 +142,7 @@ public class SegmentManagerTest {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, 200_000L /* 0.2ms */)) {
                 mgr.start();
@@ -161,7 +160,7 @@ public class SegmentManagerTest {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
@@ -199,7 +198,7 @@ public class SegmentManagerTest {
             long segSize = MmapSegment.HEADER_SIZE
                     + 2 * (MmapSegment.FRAME_HEADER_SIZE + 32);
             String seg0Path = tmpDir + "/0000000000000000.sfa";
-            MmapSegment seg0 = MmapSegment.create(seg0Path, 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(seg0Path, 0, segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try (AckWatermark watermark = AckWatermark.open(tmpDir);
                  SegmentRing ring = new SegmentRing(seg0, segSize);
@@ -235,7 +234,7 @@ public class SegmentManagerTest {
             // the cap (counted at register-time), so this leaves headroom for
             // exactly 2 manager-provisioned spares before backpressure kicks in.
             long cap = 3 * segSize;
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try (AckWatermark watermark = AckWatermark.open(tmpDir);
                  SegmentRing ring = new SegmentRing(seg0, segSize);
@@ -304,7 +303,7 @@ public class SegmentManagerTest {
             long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
@@ -341,7 +340,7 @@ public class SegmentManagerTest {
             long pollNanos = 5_000_000_000L; // 5 seconds
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
                 mgr.start();
@@ -369,7 +368,7 @@ public class SegmentManagerTest {
             long pollNanos = 5_000_000_000L;
             long segSize = MmapSegment.HEADER_SIZE
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
-            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try (SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, pollNanos)) {
@@ -421,9 +420,9 @@ public class SegmentManagerTest {
             String dirB = tmpDir + "/B"; Files.mkdir(dirB, Files.DIR_MODE_DEFAULT);
             String dirC = tmpDir + "/C"; Files.mkdir(dirC, Files.DIR_MODE_DEFAULT);
             try (
-                    SegmentRing ringA = new SegmentRing(MmapSegment.create(dirA + "/0000000000000000.sfa", 0, segSize, GEN), segSize);
-                    SegmentRing ringB = new SegmentRing(MmapSegment.create(dirB + "/0000000000000000.sfa", 0, segSize, GEN), segSize);
-                    SegmentRing ringC = new SegmentRing(MmapSegment.create(dirC + "/0000000000000000.sfa", 0, segSize, GEN), segSize);
+                    SegmentRing ringA = new SegmentRing(MmapSegment.create(dirA + "/0000000000000000.sfa", 0, segSize), segSize);
+                    SegmentRing ringB = new SegmentRing(MmapSegment.create(dirB + "/0000000000000000.sfa", 0, segSize), segSize);
+                    SegmentRing ringC = new SegmentRing(MmapSegment.create(dirC + "/0000000000000000.sfa", 0, segSize), segSize);
                     SegmentManager mgr = new SegmentManager(segSize, 200_000L)
             ) {
                 mgr.start();

@@ -64,7 +64,6 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class SegmentManagerCloseRaceTest {
 
-    private static final long GEN = 1L;
     private static final int ITERATIONS = 200;
     private static final long SEGMENT_SIZE = 64 * 1024;
     private String tmpDir;
@@ -98,7 +97,7 @@ public class SegmentManagerCloseRaceTest {
                     String slot = tmpDir + "/slot-" + i;
                     Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
                     MmapSegment initial = MmapSegment.create(
-                            slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE, GEN);
+                            slot + "/sf-initial.sfa", 0L, SEGMENT_SIZE);
                     rings[i] = new SegmentRing(initial, SEGMENT_SIZE);
                     manager.register(rings[i], slot);
                     // Immediately deregister + close. The manager may be mid-
@@ -137,7 +136,7 @@ public class SegmentManagerCloseRaceTest {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             String slot = tmpDir + "/timeout-slot";
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize, GEN);
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
             SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
             CountDownLatch workerBlocked = new CountDownLatch(1);
@@ -590,7 +589,7 @@ public class SegmentManagerCloseRaceTest {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 32);
             String slot = tmpDir + "/interrupt-slot";
             Assert.assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
-            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize, GEN);
+            MmapSegment initial = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(initial, segSize);
             SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60));
             CountDownLatch workerBlocked = new CountDownLatch(1);

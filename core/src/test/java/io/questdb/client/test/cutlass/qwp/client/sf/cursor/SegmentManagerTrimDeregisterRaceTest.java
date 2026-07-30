@@ -66,7 +66,6 @@ import static org.junit.Assert.assertTrue;
  */
 public class SegmentManagerTrimDeregisterRaceTest {
 
-    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -100,7 +99,7 @@ public class SegmentManagerTrimDeregisterRaceTest {
                 String dir = tmpDir + "/single-ring";
                 assertEquals(0, Files.mkdir(dir, Files.DIR_MODE_DEFAULT));
                 String activePath = dir + "/sf-initial.sfa";
-                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(activePath, 0L, segSize);
                 SegmentRing ring = new SegmentRing(seg0, segSize);
 
                 long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);

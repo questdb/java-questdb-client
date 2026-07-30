@@ -44,7 +44,6 @@ import java.nio.file.Paths;
  */
 public class SegmentRingRecoveryUnlinkTest {
 
-    private static final long GEN = 1L;
     private static final long SEGMENT_SIZE = 64 * 1024;
     private String tmpDir;
 
@@ -89,7 +88,7 @@ public class SegmentRingRecoveryUnlinkTest {
             // still holds -- crash cycles converge to exactly one segment
             // file, they don't accumulate.
             String orphanPath = tmpDir + "/sf-orphan.sfa";
-            MmapSegment empty = MmapSegment.create(orphanPath, 0L, SEGMENT_SIZE, GEN);
+            MmapSegment empty = MmapSegment.create(orphanPath, 0L, SEGMENT_SIZE);
             empty.close();
             Assert.assertTrue("setup: orphan .sfa should exist on disk",
                     Files.exists(orphanPath));
@@ -118,7 +117,7 @@ public class SegmentRingRecoveryUnlinkTest {
             // Recovery should keep the valid one (return a ring) and unlink the
             // empty one (no longer on disk).
             String validPath = tmpDir + "/sf-valid.sfa";
-            MmapSegment valid = MmapSegment.create(validPath, 0L, SEGMENT_SIZE, GEN);
+            MmapSegment valid = MmapSegment.create(validPath, 0L, SEGMENT_SIZE);
             // Append one frame so frameCount = 1 → kept on recovery.
             long buf = io.questdb.client.std.Unsafe.malloc(32,
                     io.questdb.client.std.MemoryTag.NATIVE_DEFAULT);
@@ -134,7 +133,7 @@ public class SegmentRingRecoveryUnlinkTest {
             valid.close();
 
             String orphanPath = tmpDir + "/sf-empty-orphan.sfa";
-            MmapSegment empty = MmapSegment.create(orphanPath, 1L, SEGMENT_SIZE, GEN);
+            MmapSegment empty = MmapSegment.create(orphanPath, 1L, SEGMENT_SIZE);
             empty.close();
 
             Assert.assertTrue("setup: valid .sfa should exist", Files.exists(validPath));

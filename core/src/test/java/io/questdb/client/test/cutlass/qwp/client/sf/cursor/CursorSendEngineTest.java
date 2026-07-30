@@ -55,7 +55,6 @@ import java.util.concurrent.locks.LockSupport;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -289,35 +288,6 @@ public class CursorSendEngineTest {
                 }
                 assertEquals(199, engine.publishedFsn());
                 assertNotNull("active segment is always non-null", engine.activeSegment());
-            } finally {
-                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
-            }
-        });
-    }
-
-    /**
-     * SegmentManager.serviceRing derives a rotation spare's generation from the
-     * ring's current active segment rather than threading it through register(); this
-     * pins that propagation all the way to the bytes a spare writes to disk, not just
-     * the in-memory field the same create() call also sets.
-     */
-    @Test
-    public void testRotationSpareCarriesTheEnginesGenerationOnDisk() throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            // Exactly 2 frames of 64 bytes fit per segment; the 3rd append rotates.
-            long segSize = MmapSegment.HEADER_SIZE + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize)) {
-                MmapSegment initial = engine.activeSegment();
-                for (int i = 0; i < 20 && engine.activeSegment() == initial; i++) {
-                    engine.appendBlocking(buf, 64);
-                }
-                MmapSegment spare = engine.activeSegment();
-                assertNotSame("a rotation must have installed a new active segment", initial, spare);
-                try (MmapSegment reopened = MmapSegment.openExisting(spare.path())) {
-                    assertEquals("the rotation spare's on-disk lineage id must match the engine's",
-                            engine.lineageId(), reopened.lineageId());
-                }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
             }

@@ -60,7 +60,6 @@ import static org.junit.Assert.assertTrue;
 public class BackgroundDrainerUnreplayableSlotQuarantineTest {
 
     private static final int FRAME_PAYLOAD_BYTES = 16;
-    private static final long GENERATION = 1L;
 
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
@@ -146,7 +145,7 @@ public class BackgroundDrainerUnreplayableSlotQuarantineTest {
     private static void writeSegment(String path, long baseSeq, long segSizeBytes, int frameCount) {
         long buf = Unsafe.malloc(FRAME_PAYLOAD_BYTES, MemoryTag.NATIVE_DEFAULT);
         try {
-            MmapSegment seg = MmapSegment.create(path, baseSeq, segSizeBytes, GENERATION);
+            MmapSegment seg = MmapSegment.create(path, baseSeq, segSizeBytes);
             try {
                 for (int i = 0; i < frameCount; i++) {
                     seg.tryAppend(buf, FRAME_PAYLOAD_BYTES);

@@ -909,15 +909,12 @@ public final class SegmentManager implements QuietCloseable {
                 String path = null;
                 boolean installed = false;
                 try {
-                    // The ring's active segment carries the lineage id every spare in
-                    // this lineage must match (see below). It can be null if the ring
-                    // closed between this tick's ring snapshot and now -- close() nulls
-                    // it under the ring's own monitor (SegmentRing.close()) with no
+                    // Null if the ring closed between this tick's snapshot and now:
+                    // close() nulls it under the ring's own monitor with no
                     // coordination with the manager thread. A closed ring rejects
-                    // installHotSpare regardless, so there is nothing to provision this
-                    // tick; skip cleanly rather than dereference null and fall into the
-                    // catch below as a misleading "will retry" warning for a ring that
-                    // will never accept a spare again.
+                    // installHotSpare regardless, so there is nothing to provision
+                    // this tick; skip cleanly rather than provision a spare that will
+                    // be abandoned.
                     MmapSegment active = e.ring.getActive();
                     if (active != null) {
                         // baseSeq is provisional -- SegmentRing.appendOrFsn calls
@@ -933,16 +930,9 @@ public final class SegmentManager implements QuietCloseable {
                             // via its long-ptr overload, bypassing the byte[] + native
                             // malloc that the String overload would incur on every
                             // rotation.
-                            //
-                            // The spare's lineage id must match every other segment in this
-                            // lineage, so read it off the CURRENT active rather than deriving
-                            // a new one: the active already carries whatever the fresh-slot
-                            // path (or, for a recovered ring, SegmentRing.recover's chain
-                            // agreement check) established for this slot.
                             spare = MmapSegment.create(filesFacade,
                                     pathScratch.ptr(), path,
-                                    e.ring.nextSeqHint(), segmentSizeBytes,
-                                    active.lineageId(), true);
+                                    e.ring.nextSeqHint(), segmentSizeBytes, true);
                         }
                         Runnable installHook = beforeInstallSyncHook;
                         if (installHook != null) {

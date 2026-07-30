@@ -61,7 +61,6 @@ import static org.junit.Assert.assertTrue;
  */
 public class SegmentManagerWatermarkDeregisterRaceTest {
 
-    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -85,7 +84,7 @@ public class SegmentManagerWatermarkDeregisterRaceTest {
             String slot = tmpDir + "/single-ring";
             assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
 
-            MmapSegment seg0 = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize, GEN);
+            MmapSegment seg0 = MmapSegment.create(slot + "/sf-initial.sfa", 0L, segSize);
             SegmentRing ring = new SegmentRing(seg0, segSize);
             AckWatermark watermark = AckWatermark.open(slot);
             assertNotNull(watermark);

@@ -54,10 +54,6 @@ import static org.junit.Assert.assertTrue;
 
 public class SegmentRingTest {
 
-    // Arbitrary non-zero producer generation shared by every test in this file that
-    // does not itself exercise the generation-agreement check (that one --
-    // testRecoveryRefusesSegmentsFromTwoGenerations -- uses its own literals).
-    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -93,7 +89,7 @@ public class SegmentRingTest {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg = MmapSegment.create(tmpDir + "/0.sfa", 0, 64 * 1024, GEN);
+                MmapSegment seg = MmapSegment.create(tmpDir + "/0.sfa", 0, 64 * 1024);
                 try (SegmentRing ring = new SegmentRing(seg, 64 * 1024)) {
                     assertEquals(0, ring.nextSeqHint());
                     assertEquals(-1, ring.publishedFsn());
@@ -119,7 +115,7 @@ public class SegmentRingTest {
                     + 2 * (MmapSegment.FRAME_HEADER_SIZE + 100);
             long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg0.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg0.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     fillPattern(buf, 100, 0);
                     assertEquals(0, ring.appendOrFsn(buf, 100));
@@ -131,7 +127,7 @@ public class SegmentRingTest {
 
                     // Manager installs a fresh spare with the right baseSeq.
                     MmapSegment spare = MmapSegment.create(tmpDir + "/seg1.sfa",
-                            ring.nextSeqHint(), segSize, GEN);
+                            ring.nextSeqHint(), segSize);
                     ring.installHotSpare(spare);
 
                     // Now the same append succeeds, and FSN keeps incrementing across
@@ -160,12 +156,12 @@ public class SegmentRingTest {
                     + (MmapSegment.FRAME_HEADER_SIZE + 64);
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     fillPattern(buf, 64, 0);
                     assertEquals(0, ring.appendOrFsn(buf, 64));    // active full
                     // Manager guessed baseSeq=999 long before the active filled.
-                    MmapSegment lateSpare = MmapSegment.create(tmpDir + "/lateseg.sfa", 999, segSize, GEN);
+                    MmapSegment lateSpare = MmapSegment.create(tmpDir + "/lateseg.sfa", 999, segSize);
                     ring.installHotSpare(lateSpare);
                     // Rotation must rebase the spare to baseSeq=1 (the actual nextSeq).
                     assertEquals(1, ring.appendOrFsn(buf, 64));
@@ -194,7 +190,7 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 100);
             long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/wseg0.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     int[] wakeups = {0};
                     ring.setManagerWakeup(() -> wakeups[0]++);
@@ -219,7 +215,7 @@ public class SegmentRingTest {
                     // Install spare, then retry. The retry triggers rotation,
                     // which fires the wakeup unconditionally.
                     ring.installHotSpare(MmapSegment.create(
-                            tmpDir + "/wseg1.sfa", ring.nextSeqHint(), segSize, GEN));
+                            tmpDir + "/wseg1.sfa", ring.nextSeqHint(), segSize));
                     assertEquals(4, ring.appendOrFsn(buf, 100));
                     assertEquals("rotation fires wakeup", 2, wakeups[0]);
 
@@ -305,16 +301,16 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/t0.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/t0.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     fillPattern(buf, 16, 0);
                     // Fill seg0 (FSN 0..3).
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
                     // Spare for seg1 (FSN 4..7).
-                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t1.sfa", 4, segSize, GEN));
+                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t1.sfa", 4, segSize));
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
                     // Spare for seg2 (FSN 8..11).
-                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t2.sfa", 8, segSize, GEN));
+                    ring.installHotSpare(MmapSegment.create(tmpDir + "/t2.sfa", 8, segSize));
                     for (int i = 0; i < 4; i++) ring.appendOrFsn(buf, 16);
 
                     // No acks yet — nothing to trim.
@@ -365,15 +361,15 @@ public class SegmentRingTest {
             try {
                 // Write three segments with FSN ranges 0..3, 4..7, 8..9 (last
                 // partially full so the recovered ring has appendable room).
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/r0.sfa", 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/r0.sfa", 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
-                MmapSegment s1 = MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/r1.sfa", 4, segSize);
                 for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
                 s1.close();
 
-                MmapSegment s2 = MmapSegment.create(tmpDir + "/r2.sfa", 8, segSize, GEN);
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/r2.sfa", 8, segSize);
                 s2.tryAppend(buf, 16);
                 s2.tryAppend(buf, 16);
                 s2.close();
@@ -731,13 +727,13 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/g0.sfa", 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/g0.sfa", 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
                 // Gap: should be baseSeq=4 next, but we use 100 — simulating
                 // a segment file that was deleted out from under us.
-                MmapSegment s2 = MmapSegment.create(tmpDir + "/g2.sfa", 100, segSize, GEN);
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/g2.sfa", 100, segSize);
                 s2.tryAppend(buf, 16);
                 s2.close();
 
@@ -774,7 +770,7 @@ public class SegmentRingTest {
             try {
                 // One good segment.
                 String goodPath = tmpDir + "/good.sfa";
-                MmapSegment s0 = MmapSegment.create(goodPath, 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(goodPath, 0, segSize);
                 s0.tryAppend(buf, 16);
                 s0.close();
                 // One stray .sfa with no proper header.
@@ -826,15 +822,15 @@ public class SegmentRingTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 String oldestPath = tmpDir + "/skip-oldest-0.sfa";
-                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
-                MmapSegment s1 = MmapSegment.create(tmpDir + "/skip-oldest-1.sfa", 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/skip-oldest-1.sfa", 4, segSize);
                 for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
                 s1.close();
 
-                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-oldest-2.sfa", 8, segSize, GEN);
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-oldest-2.sfa", 8, segSize);
                 s2.tryAppend(buf, 16);
                 s2.close();
 
@@ -874,12 +870,12 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-newest-0.sfa", 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-newest-0.sfa", 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
                 String newestPath = tmpDir + "/skip-newest-1.sfa";
-                MmapSegment s1 = MmapSegment.create(newestPath, 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(newestPath, 4, segSize);
                 s1.tryAppend(buf, 16);
                 s1.close();
 
@@ -922,16 +918,16 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-interior-0.sfa", 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-interior-0.sfa", 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
                 String interiorPath = tmpDir + "/skip-interior-1.sfa";
-                MmapSegment s1 = MmapSegment.create(interiorPath, 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(interiorPath, 4, segSize);
                 for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
                 s1.close();
 
-                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-interior-2.sfa", 8, segSize, GEN);
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-interior-2.sfa", 8, segSize);
                 s2.tryAppend(buf, 16);
                 s2.close();
 
@@ -976,12 +972,12 @@ public class SegmentRingTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 String path0 = tmpDir + "/skip-all-0.sfa";
-                MmapSegment s0 = MmapSegment.create(path0, 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(path0, 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
                 String path1 = tmpDir + "/skip-all-1.sfa";
-                MmapSegment s1 = MmapSegment.create(path1, 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(path1, 4, segSize);
                 s1.tryAppend(buf, 16);
                 s1.close();
 
@@ -1031,11 +1027,11 @@ public class SegmentRingTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 String oldestPath = tmpDir + "/torn-oldest-0.sfa";
-                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize, GEN);
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
                 for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
                 s0.close();
 
-                MmapSegment s1 = MmapSegment.create(tmpDir + "/torn-oldest-1.sfa", 4, segSize, GEN);
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/torn-oldest-1.sfa", 4, segSize);
                 s1.tryAppend(buf, 16);
                 s1.close();
 
@@ -1070,7 +1066,7 @@ public class SegmentRingTest {
             // would test the clamp instead of the regression rule.
             long buf = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg = MmapSegment.create(tmpDir + "/m.sfa", 0, 8192, GEN);
+                MmapSegment seg = MmapSegment.create(tmpDir + "/m.sfa", 0, 8192);
                 try (SegmentRing ring = new SegmentRing(seg, 8192)) {
                     // Publish 201 frames so FSNs 0..200 exist on the ring.
                     for (int i = 0; i <= 200; i++) {
@@ -1110,7 +1106,7 @@ public class SegmentRingTest {
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg-0000.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/seg-0000.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     fillPattern(buf, 16, 0);
                     // (sealedCount + 1) iterations puts exactly sealedCount segments
@@ -1123,7 +1119,7 @@ public class SegmentRingTest {
                         // Active is now full; install a spare so the next append rotates.
                         MmapSegment spare = MmapSegment.create(
                                 tmpDir + "/seg-" + String.format("%04d", i + 1) + ".sfa",
-                                ring.nextSeqHint(), segSize, GEN);
+                                ring.nextSeqHint(), segSize);
                         ring.installHotSpare(spare);
                     }
                     // After the loop we have `sealedCount` sealed segments and one
@@ -1182,14 +1178,14 @@ public class SegmentRingTest {
             long segSize = MmapSegment.HEADER_SIZE + (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                MmapSegment seg0 = MmapSegment.create(tmpDir + "/t-0.sfa", 0, segSize, GEN);
+                MmapSegment seg0 = MmapSegment.create(tmpDir + "/t-0.sfa", 0, segSize);
                 try (SegmentRing ring = new SegmentRing(seg0, segSize)) {
                     fillPattern(buf, 16, 0);
                     // Build sealed: [seg0, seg1, seg2, seg3]; active = seg4.
                     for (int i = 0; i < 4; i++) {
                         ring.appendOrFsn(buf, 16);
                         ring.installHotSpare(MmapSegment.create(
-                                tmpDir + "/t-" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize, GEN));
+                                tmpDir + "/t-" + (i + 1) + ".sfa", ring.nextSeqHint(), segSize));
                     }
                     MmapSegment seg0Snapshot = ring.firstSealed();
                     assertNotNull(seg0Snapshot);
@@ -1308,7 +1304,7 @@ public class SegmentRingTest {
                     String name = String.format("sf-%05d.sfa", i);
                     long segSize = MmapSegment.HEADER_SIZE
                             + MmapSegment.FRAME_HEADER_SIZE + 16;
-                    try (MmapSegment seg = MmapSegment.create(tmpDir + "/" + name, i, segSize, GEN)) {
+                    try (MmapSegment seg = MmapSegment.create(tmpDir + "/" + name, i, segSize)) {
                         assertTrue("setup append " + i, seg.tryAppend(buf, 16) >= 0);
                     }
                 }
@@ -1498,7 +1494,7 @@ public class SegmentRingTest {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
-            MmapSegment seg = MmapSegment.create(tmpDir + "/seg.sfa", 0, segSize, GEN);
+            MmapSegment seg = MmapSegment.create(tmpDir + "/seg.sfa", 0, segSize);
             try (SegmentRing ring = new SegmentRing(seg, segSize)) {
                 assertEquals(segSize, ring.maxBytesPerSegment());
             }
@@ -1517,7 +1513,7 @@ public class SegmentRingTest {
                     + 4 * (MmapSegment.FRAME_HEADER_SIZE + 32);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
             try {
-                try (MmapSegment seg = MmapSegment.create(tmpDir + "/sf-00000.sfa", 0, segSize, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(tmpDir + "/sf-00000.sfa", 0, segSize)) {
                     fillPattern(buf, 32, 0);
                     assertTrue(seg.tryAppend(buf, 32) >= 0);
                 }

@@ -965,7 +965,7 @@ public class SegmentRecoveryIntegrityTest {
     public void testDrainWindowFailsClosedWhenLeftoverCannotBeRemoved() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String leftoverPath = tmpDir + "/sf-000000000000000a.sfa";
-            MmapSegment leftover = MmapSegment.create(leftoverPath, 0L, SEGMENT_SIZE, 1L);
+            MmapSegment leftover = MmapSegment.create(leftoverPath, 0L, SEGMENT_SIZE);
             leftover.close();
             // Collapsed boundaries above the leftover's base: the drain declared
             // everything acked, and no file sits at the committed active base.

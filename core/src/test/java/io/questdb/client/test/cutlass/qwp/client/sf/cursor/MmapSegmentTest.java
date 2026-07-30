@@ -46,10 +46,6 @@ import static org.junit.Assert.fail;
 
 public class MmapSegmentTest {
 
-    // Arbitrary non-zero producer generation shared by every test in this file that
-    // does not itself exercise the generation field (testSegmentCarriesItsGeneration
-    // AcrossReopen below is the one that does, and uses its own literal).
-    private static final long GEN = 1L;
     private String tmpDir;
 
     @Before
@@ -125,7 +121,7 @@ public class MmapSegmentTest {
                     + MmapSegment.FRAME_HEADER_SIZE + 50;
             long buf = Unsafe.malloc(50, MemoryTag.NATIVE_DEFAULT);
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 0L, size, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, size)) {
                     // Initial: room for two 50-byte payloads (each with an 8-byte envelope).
                     long firstCap = seg.capacityRemaining();
                     assertTrue(firstCap >= 50);
@@ -169,7 +165,7 @@ public class MmapSegmentTest {
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try {
                 // Append 100 distinct payloads of 32 bytes each.
-                try (MmapSegment seg = MmapSegment.create(path, 42L, 64 * 1024, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 42L, 64 * 1024)) {
                     assertEquals(42L, seg.baseSeq());
                     assertEquals(MmapSegment.HEADER_SIZE, seg.publishedOffset());
                     for (int i = 0; i < 100; i++) {
@@ -197,18 +193,30 @@ public class MmapSegmentTest {
         });
     }
 
+    /**
+     * Pins the documented 24-byte header. The layout is shared with the Java
+     * reference client's main line and with the Rust client, so a field added
+     * here is a cross-implementation format break, not a local detail.
+     */
     @Test
-    public void testSegmentCarriesItsLineageIdAcrossReopen() throws Exception {
-        // The lineage id must travel with the frames that reference the ids -- that is
-        // the whole reason it lives in the segment header rather than in the manifest.
+    public void testHeaderShapeMatchesTheDocumentedLayout() throws Exception {
+        assertEquals(24, MmapSegment.HEADER_SIZE);
+        assertEquals(1, MmapSegment.VERSION);
         TestUtils.assertMemoryLeak(() -> {
-            String path = tmpDir + "/seg-lineage.sfa";
-            try (MmapSegment seg = MmapSegment.create(path, 0L, 4096L, 4242L)) {
-                assertEquals(4242L, seg.lineageId());
+            String path = tmpDir + "/seg-header.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096L)) {
+                assertEquals(7L, seg.baseSeq());
             }
-            try (MmapSegment reopened = MmapSegment.openExisting(path)) {
-                assertEquals(4242L, reopened.lineageId());
-            }
+            byte[] bytes = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
+            java.nio.ByteBuffer header = java.nio.ByteBuffer
+                    .wrap(bytes, 0, MmapSegment.HEADER_SIZE)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            assertEquals(MmapSegment.FILE_MAGIC, header.getInt(0));
+            assertEquals(MmapSegment.VERSION, header.get(4));
+            assertEquals("flags", 0, header.get(5));
+            assertEquals("reserved", 0, header.getShort(6));
+            assertEquals(7L, header.getLong(8));
+            assertTrue("createdMicros must be stamped", header.getLong(16) > 0L);
         });
     }
 
@@ -218,7 +226,7 @@ public class MmapSegmentTest {
         // format change can be refused rather than misread. Task 14 relies on it.
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-bad-version.sfa";
-            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096, GEN)) {
+            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096)) {
                 assertEquals(7L, seg.baseSeq());
             }
             try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
@@ -243,7 +251,7 @@ public class MmapSegmentTest {
             FaultyFilesFacade ff = new FaultyFilesFacade();
             ff.failOnAllocate = true;
             try {
-                MmapSegment.create(ff, path, 0L, sizeBytes, GEN).close();
+                MmapSegment.create(ff, path, 0L, sizeBytes).close();
                 fail("expected MmapSegmentException from failed pre-allocation");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(),
@@ -267,7 +275,7 @@ public class MmapSegmentTest {
             FaultyFilesFacade ff = new FaultyFilesFacade();
             ff.failOnOpenRWExclusive = true;
             try {
-                MmapSegment.create(ff, path, 0L, sizeBytes, GEN).close();
+                MmapSegment.create(ff, path, 0L, sizeBytes).close();
                 fail("expected MmapSegmentException from openRWExclusive returning -1");
             } catch (MmapSegmentException expected) {
                 assertTrue(expected.getMessage(),
@@ -298,7 +306,7 @@ public class MmapSegmentTest {
             int attempts = 50;
             for (int i = 0; i < attempts; i++) {
                 try {
-                    MmapSegment.create(ff, tmpDir + "/seg-" + i + ".sfa", 0L, sizeBytes, GEN).close();
+                    MmapSegment.create(ff, tmpDir + "/seg-" + i + ".sfa", 0L, sizeBytes).close();
                     fail("expected MmapSegmentException on iteration " + i);
                 } catch (MmapSegmentException ignored) {
                     // expected
@@ -351,7 +359,7 @@ public class MmapSegmentTest {
             try {
                 // Write three legitimate frames so there's something the
                 // recovery path could lose.
-                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
                     for (int i = 0; i < 3; i++) {
                         fillPattern(buf, 32, i);
                         seg.tryAppend(buf, 32);
@@ -457,7 +465,7 @@ public class MmapSegmentTest {
                     + MmapSegment.FRAME_HEADER_SIZE + 100;
             long buf = Unsafe.malloc(100, MemoryTag.NATIVE_DEFAULT);
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 0L, sizeBytes, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, sizeBytes)) {
                     fillPattern(buf, 100, 0);
                     long ok = seg.tryAppend(buf, 100);
                     assertEquals("first append should fit at offset HEADER_SIZE",
@@ -513,7 +521,7 @@ public class MmapSegmentTest {
             String path = tmpDir + "/seg-clean-tail.sfa";
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
                     for (int i = 0; i < 3; i++) {
                         fillPattern(buf, 16, i);
                         seg.tryAppend(buf, 16);
@@ -537,7 +545,7 @@ public class MmapSegmentTest {
             // file has just the header and an all-zero body. Recovery must not
             // emit a torn-tail signal here either.
             String path = tmpDir + "/seg-fresh.sfa";
-            try (MmapSegment seg = MmapSegment.create(path, 42L, 4096, GEN)) {
+            try (MmapSegment seg = MmapSegment.create(path, 42L, 4096)) {
                 seg.msync();
             }
             try (MmapSegment seg = MmapSegment.openExisting(path)) {
@@ -867,7 +875,7 @@ public class MmapSegmentTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             long lastGood;
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 0L, 4096)) {
                     for (int i = 0; i < 3; i++) {
                         fillPattern(buf, 16, i);
                         seg.tryAppend(buf, 16);
@@ -902,7 +910,7 @@ public class MmapSegmentTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             long expectedEnd;
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 9L, 4096, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 9L, 4096)) {
                     fillPattern(buf, 16, 1);
                     seg.tryAppend(buf, 16);
                     expectedEnd = seg.publishedOffset();
@@ -938,7 +946,7 @@ public class MmapSegmentTest {
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             long expectedEnd;
             try {
-                try (MmapSegment seg = MmapSegment.create(path, 7L, 64 * 1024, GEN)) {
+                try (MmapSegment seg = MmapSegment.create(path, 7L, 64 * 1024)) {
                     for (int i = 0; i < 5; i++) {
                         fillPattern(buf, 16, i);
                         seg.tryAppend(buf, 16);

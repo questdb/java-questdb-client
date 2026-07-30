@@ -29,7 +29,6 @@ import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.ObjList;
-import io.questdb.client.std.Os;
 import io.questdb.client.std.QuietCloseable;
 import org.jetbrains.annotations.TestOnly;
 
@@ -101,14 +100,6 @@ public final class CursorSendEngine implements QuietCloseable {
     // breaking the segment chain underneath it.
     private final FilesFacade dictFf;
     private final FilesFacade filesFacade;
-    // The producer lineage this slot belongs to: derived fresh (see the constructor's
-    // fresh-start branch) or read from the recovered chain's agreed lineage id
-    // (SegmentRing.recoveredLineageId()). Held for the slot's lifetime -- every
-    // segment SegmentManager rotates in for this ring carries the same value (read
-    // off the current active at rotation time), and it is what seeds/validates the
-    // persisted symbol dictionary via PersistedSymbolDict.openClean/open.
-    // MmapSegment.MISSING_LINEAGE_ID in memory mode, where neither concept applies.
-    private final long lineageId;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
     // case close() also stops the manager. When the manager is shared across
@@ -408,7 +399,6 @@ public final class CursorSendEngine implements QuietCloseable {
         AckWatermark watermarkInProgress = null;
         PersistedSymbolDict persistedDictInProgress = null;
         RecoveredFrameAnalysis recoveredFrameAnalysisInProgress = null;
-        long lineageIdInProgress = MmapSegment.MISSING_LINEAGE_ID;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
@@ -623,18 +613,6 @@ public final class CursorSendEngine implements QuietCloseable {
                         throw new SfOperationalException(
                                 "could not open required ack watermark for SF slot " + sfDir);
                     }
-                    // Stamp a fresh lineage id for this slot. Every segment this
-                    // slot ever writes -- the initial segment below, and every rotation
-                    // spare SegmentManager creates afterwards -- carries this same value,
-                    // and the dictionary below is stamped with it too, so a later
-                    // recovery can tell a dictionary or segment belonging to a stale,
-                    // prior generation sharing this directory from one belonging to this
-                    // session. 0 (MISSING_LINEAGE_ID) is reserved, hence the retry loop;
-                    // the mix (not a raw timestamp) spreads the low bits a producer-count
-                    // comparison would otherwise leave clustered.
-                    do {
-                        lineageIdInProgress = Os.currentTimeMicros() * 0x9E3779B97F4A7C15L;
-                    } while (lineageIdInProgress == MmapSegment.MISSING_LINEAGE_ID);
                     // A fresh slot MUST start with an EMPTY symbol dictionary.
                     // Unlike the ack watermark above -- a discardable optimization a
                     // max() clamp protects -- the dictionary is load-bearing: a
@@ -672,8 +650,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     // whose recovery hard-fails with "segment requires
                     // missing manifest" even though nothing was lost.
                     initialPath = sfDir + "/sf-initial.sfa";
-                    initial = MmapSegment.create(filesFacade, initialPath, 0L, segmentSizeBytes,
-                            lineageIdInProgress);
+                    initial = MmapSegment.create(filesFacade, initialPath, 0L, segmentSizeBytes);
                 }
                 try {
                     if (!memoryMode) {
@@ -721,13 +698,12 @@ public final class CursorSendEngine implements QuietCloseable {
                 manager.start();
             }
             manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos);
-            // All construction succeeded -- commit the ring, watermark,
-            // symbol-dictionary and lineage-id references.
+            // All construction succeeded -- commit the ring, watermark, and
+            // symbol-dictionary references.
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
             this.persistedSymbolDict = persistedDictInProgress;
             this.recoveredFrameAnalysis = recoveredFrameAnalysisInProgress;
-            this.lineageId = lineageIdInProgress;
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
@@ -1586,16 +1562,6 @@ public final class CursorSendEngine implements QuietCloseable {
         if (len > 0) {
             io.questdb.client.std.Unsafe.getUnsafe().copyMemory(analysis.rawAddr(), target, len);
         }
-    }
-
-    /**
-     * The producer lineage this slot belongs to -- see the field's own javadoc.
-     * Test-only: production never needs to read this back out, since
-     * {@code SegmentManager} reads it off the ring's active segment instead.
-     */
-    @TestOnly
-    public long lineageId() {
-        return lineageId;
     }
 
     @TestOnly
