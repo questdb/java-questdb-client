@@ -97,6 +97,10 @@ public final class QueryClientPool implements AutoCloseable {
     // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
     // once at build time on a different thread than the borrowers that read it.
     private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
+    // Threads currently inside close()'s bounded creation-wait loop. Exists so
+    // hasCreationWaiterForTesting() can report that region as a stable state
+    // rather than probing the condition queue; see that method. Guarded by lock.
+    private int closeCreationWaiters;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -339,13 +343,18 @@ public final class QueryClientPool implements AutoCloseable {
             final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
-            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
-                try {
-                    creationFinished.awaitNanos(creationRemainingNanos);
-                } catch (InterruptedException e) {
-                    creationWaitInterrupted = true;
+            closeCreationWaiters++;
+            try {
+                while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    try {
+                        creationFinished.awaitNanos(creationRemainingNanos);
+                    } catch (InterruptedException e) {
+                        creationWaitInterrupted = true;
+                    }
+                    creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
                 }
-                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            } finally {
+                closeCreationWaiters--;
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
@@ -528,11 +537,17 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
+    // True while a close() is inside its bounded creation wait. Deliberately not
+    // lock.hasWaiters(creationFinished): an interrupt moves the waiter out of the
+    // condition queue and into the lock's sync queue to reacquire before await
+    // rethrows, so under an interrupt storm hasWaiters() reads false for a
+    // measurable fraction of the wait even though close() never left it. Tests
+    // that assert on the wait region need a state that does not flicker.
     @TestOnly
     public boolean hasCreationWaiterForTesting() {
         lock.lock();
         try {
-            return lock.hasWaiters(creationFinished);
+            return closeCreationWaiters > 0;
         } finally {
             lock.unlock();
         }
