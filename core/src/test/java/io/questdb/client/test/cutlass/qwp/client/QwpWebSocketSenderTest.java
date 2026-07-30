@@ -257,12 +257,19 @@ public class QwpWebSocketSenderTest {
                 sender.setConnectedForTest(true);
                 QwpTableBuffer buffer = sender.getTableBuffer("t");
 
-                sender.table("t").longColumn("a", 1); // row left unfinished
+                sender.table("t")
+                        .stringColumn("s", "committed")
+                        .at(1, ChronoUnit.MICROS);
+                sender.table("t").stringColumn("s", "unfinished");
                 buffer.clear();
 
+                Assert.assertEquals(0, buffer.getRowCount());
+                Assert.assertEquals(0, sender.getPendingRowCount());
+                Assert.assertEquals(0, sender.getPendingBytes());
+
                 sender.table("t")
-                        .longColumn("a", 2)
-                        .at(1, ChronoUnit.MICROS);
+                        .stringColumn("s", "after")
+                        .at(2, ChronoUnit.MICROS);
 
                 Assert.assertEquals(1, buffer.getRowCount());
                 Assert.assertEquals(1, sender.getPendingRowCount());
@@ -305,6 +312,52 @@ public class QwpWebSocketSenderTest {
                 Assert.assertEquals(1, t1.getRowCount());
                 Assert.assertEquals(2, sender.getPendingRowCount());
                 Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+            }
+        });
+    }
+
+    @Test
+    public void testFlushReanchorsPendingBytesAtVarWidthBaseline() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(
+                    new TestWebSocketServer.WebSocketServerHandler() {
+                    })) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                CursorSendEngine engine = new CursorSendEngine(null, 4L * 1024 * 1024);
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost",
+                        server.getPort(),
+                        null,
+                        Integer.MAX_VALUE,
+                        0,
+                        0L,
+                        null,
+                        false,
+                        engine,
+                        0L)) {
+                    sender.table("t")
+                            .stringColumn("s", "before")
+                            .at(1, ChronoUnit.MICROS);
+                    sender.flush();
+
+                    QwpTableBuffer buffer = sender.getTableBuffer("t");
+                    long baselineBytes = buffer.getBaselineBytes();
+                    Assert.assertTrue(
+                            "flush must retain var-width seed storage",
+                            baselineBytes > 0);
+                    Assert.assertEquals(baselineBytes, sender.totalBufferedBytes());
+                    Assert.assertEquals(0, sender.getPendingBytes());
+
+                    sender.table("t")
+                            .stringColumn("s", "after")
+                            .at(2, ChronoUnit.MICROS);
+
+                    Assert.assertEquals(
+                            sender.totalBufferedBytes() - baselineBytes,
+                            sender.getPendingBytes());
+                }
             }
         });
     }
