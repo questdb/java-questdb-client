@@ -494,7 +494,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // survivor's stamped lineage id disagrees with the one above
                 // (a prior lineage's dictionary sharing this slot) -> delta
                 // disabled.
-                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir, lineageIdInProgress);
+                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
                 // Reject watermarks past publishedFsn: a correctly
@@ -662,7 +662,7 @@ public final class CursorSendEngine implements QuietCloseable {
                     // instead of degrading to null; the catch (Throwable) below cleans
                     // up and lets it propagate so Sender.build() can quarantine this
                     // fresh, dataless slot instead of bricking every restart.
-                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir, lineageIdInProgress);
+                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;

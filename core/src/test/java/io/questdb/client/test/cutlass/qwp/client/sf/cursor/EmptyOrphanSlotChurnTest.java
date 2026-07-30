@@ -59,11 +59,6 @@ import static org.junit.Assert.assertNotNull;
  */
 public class EmptyOrphanSlotChurnTest {
 
-    // Arbitrary non-zero generation: no segments exist yet at either call site below
-    // (a fresh CursorSendEngine start truncates the dictionary unconditionally,
-    // regardless of the stamped generation, and close() removes it again since the
-    // slot is fully drained), so no other generation needs to agree with this one.
-    private static final long GEN = 1L;
     private String sfDir;
 
     @Before
@@ -104,7 +99,7 @@ public class EmptyOrphanSlotChurnTest {
         // dictionary the send loop replays and misattribute symbols on reconnect.
         TestUtils.assertMemoryLeak(() -> {
             // Pre-seed a stale dictionary in the slot, with no segments behind it.
-            PersistedSymbolDict stale = PersistedSymbolDict.open(sfDir, GEN);
+            PersistedSymbolDict stale = PersistedSymbolDict.open(sfDir);
             assertNotNull(stale);
             try {
                 stale.appendSymbol("staleX");
@@ -126,7 +121,7 @@ public class EmptyOrphanSlotChurnTest {
             }
 
             // The survivor's bytes are physically gone, not just hidden.
-            PersistedSymbolDict reopened = PersistedSymbolDict.open(sfDir, GEN);
+            PersistedSymbolDict reopened = PersistedSymbolDict.open(sfDir);
             assertNotNull(reopened);
             try {
                 assertEquals(0, reopened.size());

@@ -30,7 +30,6 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.ObjList;
@@ -1119,7 +1118,7 @@ public class DeltaDictRecoveryTest {
             // The persisted dictionary must hold the superset: sym-0..sym-4 (5 ids),
             // one more than the four recorded frames reference, with no duplicate.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
-            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString(), readSegmentGeneration(slot));
+            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString());
             Assert.assertNotNull(pd);
             try {
                 Assert.assertEquals("failed publish must leave the dict a superset (sym-0..sym-4)",
@@ -1189,7 +1188,7 @@ public class DeltaDictRecoveryTest {
             // The persisted dictionary holds TWO entries (both encode to '?').
             int persistedSize;
             java.nio.file.Path slot = Paths.get(sfDir, "default");
-            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString(), readSegmentGeneration(slot));
+            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString());
             Assert.assertNotNull(pd);
             try {
                 persistedSize = pd.size();
@@ -1267,12 +1266,10 @@ public class DeltaDictRecoveryTest {
             // Simulate the host-crash tear: rewrite the dictionary to drop its highest
             // entry (c@2), keeping a@0,b@1 -- while the frame that introduced c@2 stays on
             // disk. openClean truncates; the two appends leave exactly the two-entry
-            // dictionary a torn tail would recover to. Stamped with the surviving
-            // segment's own generation so the resumed sender's recovery below still
-            // trusts this rewritten dictionary as belonging to the same lineage.
+            // dictionary a torn tail would recover to.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             String slotDir = slot.toString();
-            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir, readSegmentGeneration(slot))) {
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
                 Assert.assertNotNull(torn);
                 torn.appendSymbol("a");
                 torn.appendSymbol("b");
@@ -1350,12 +1347,10 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Total tear: the dictionary recovers EMPTY but still opens. Stamped with
-            // the surviving segment's own generation -- see the sibling
-            // testTornDictSubsetRebuildsFromSurvivingFrames for why.
+            // Total tear: the dictionary recovers EMPTY but still opens.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             String slotDir = slot.toString();
-            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir, readSegmentGeneration(slot))) {
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
                 Assert.assertNotNull(torn);
                 Assert.assertEquals(0, torn.size());
             }
@@ -1470,10 +1465,8 @@ public class DeltaDictRecoveryTest {
             // the case that bricked build().
             final int survivingEntries = 3;
             Assert.assertTrue(survivingEntries < DISTINCT_SYMBOLS);
-            // Stamped with the surviving segments' own generation -- see
-            // testTornDictSubsetRebuildsFromSurvivingFrames for why.
             try (PersistedSymbolDict survivor =
-                         PersistedSymbolDict.openClean(slot.toString(), readSegmentGeneration(slot))) {
+                         PersistedSymbolDict.openClean(slot.toString())) {
                 Assert.assertNotNull("the survivor dictionary must open", survivor);
                 for (int i = 0; i < survivingEntries; i++) {
                     survivor.appendSymbol("sym-" + i);
@@ -1613,26 +1606,6 @@ public class DeltaDictRecoveryTest {
         bb.putInt(0);          // reserved
         bb.putLong(fsn);
         java.nio.file.Files.write(path, buf);
-    }
-
-    /**
-     * Reads the u64 generation this slot's producer lineage stamped into its
-     * initial segment (the last 8 bytes of the header -- see MmapSegment's header
-     * layout). A test that rewrites {@code .symbol-dict} out-of-band (simulating a
-     * host-crash tear) must stamp it with the SAME generation the surviving
-     * segments carry: openClean() takes whatever value it is given, and a mismatch
-     * would make a later recovery (correctly) discard the rewritten dictionary as
-     * belonging to a different lineage instead of trusting the intact prefix these
-     * tests set up.
-     */
-    private static long readSegmentGeneration(java.nio.file.Path slotDir) throws IOException {
-        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(
-                slotDir.resolve("sf-initial.sfa").toFile(), "r")) {
-            raf.seek(MmapSegment.HEADER_SIZE - 8);
-            byte[] buf = new byte[8];
-            raf.readFully(buf);
-            return ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).getLong();
-        }
     }
 
     /**
@@ -1862,13 +1835,9 @@ public class DeltaDictRecoveryTest {
             }
 
             // Host-crash tear: drop c@2 from the side-file, keep the frame that defines it.
-            // Stamped with the surviving segment's own generation so Phase 2's recovery
-            // below still trusts this rewritten dictionary as belonging to the same
-            // lineage.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             String slotDir = slot.toString();
-            long slotGeneration = readSegmentGeneration(slot);
-            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir, slotGeneration)) {
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
                 Assert.assertNotNull(torn);
                 torn.appendSymbol("a");
                 torn.appendSymbol("b");
@@ -1887,7 +1856,7 @@ public class DeltaDictRecoveryTest {
             }
 
             // The write-ahead invariant must hold again on disk, with no new traffic.
-            try (PersistedSymbolDict healed = PersistedSymbolDict.open(slotDir, slotGeneration)) {
+            try (PersistedSymbolDict healed = PersistedSymbolDict.open(slotDir)) {
                 Assert.assertNotNull("the healed dictionary must still be readable", healed);
                 ObjList<String> symbols = healed.readLoadedSymbols();
                 Assert.assertEquals("recovery must re-persist the frame-rebuilt suffix "

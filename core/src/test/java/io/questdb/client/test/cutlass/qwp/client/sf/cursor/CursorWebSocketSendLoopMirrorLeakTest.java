@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -401,30 +400,12 @@ public class CursorWebSocketSendLoopMirrorLeakTest {
     }
 
     private static void replacePersistedDictionaryWithTwoSymbolPrefix(Path slot) throws IOException {
-        // Stamped with the surviving segment's own generation so the recovery
-        // exercised right after this call still trusts this rewritten dictionary as
-        // belonging to the same lineage -- see readSegmentGeneration.
-        try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString(), readSegmentGeneration(slot))) {
+        try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slot.toString())) {
             Assert.assertNotNull(torn);
             torn.appendSymbol("a");
             torn.appendSymbol("b");
             Assert.assertEquals(2, torn.size());
         }
-    }
-
-    /**
-     * Reads the u64 generation {@code populateThreeFrameSlot}'s fresh-slot path
-     * stamped into {@code sf-initial.sfa} (the last 8 bytes of the header -- see
-     * MmapSegment's header layout).
-     */
-    private static long readSegmentGeneration(Path slot) throws IOException {
-        byte[] bytes = Files.readAllBytes(slot.resolve("sf-initial.sfa"));
-        int offset = MmapSegment.HEADER_SIZE - 8;
-        long v = 0;
-        for (int i = 0; i < 8; i++) {
-            v |= (long) (bytes[offset + i] & 0xFFL) << (8 * i);
-        }
-        return v;
     }
 
     private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {

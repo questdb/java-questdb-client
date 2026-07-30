@@ -1501,7 +1501,7 @@ public final class SegmentRing implements QuietCloseable {
      * agreed on, or {@link MmapSegment#MISSING_LINEAGE_ID} for a ring built
      * fresh via {@link #SegmentRing(MmapSegment, long)} (nothing was recovered
      * to agree on anything). {@code CursorSendEngine} passes this to
-     * {@link PersistedSymbolDict#open(FilesFacade, String, long)} so a recovered
+     * {@link PersistedSymbolDict#open(FilesFacade, String)} so a recovered
      * dictionary is trusted only if it belongs to the same producer lineage as
      * the frames that reference its ids -- an identity no manifest boundary,
      * CRC or gap check can establish, because two lineages can share one slot

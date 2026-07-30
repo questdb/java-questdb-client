@@ -102,9 +102,7 @@ public class CursorSendEngineTest {
             }
             // Two persisted entries, below the three the frames define, so
             // recoveredMaxSymbolId (2) >= size (2) and the discard fires with size > 0.
-            // Stamped with the surviving segment's own generation so the reopen below
-            // still trusts this rewritten dictionary as belonging to the same lineage.
-            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir, readSegmentGeneration(tmpDir))) {
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
                 assertNotNull(pd);
                 pd.appendSymbol("a");
                 pd.appendSymbol("b");
@@ -114,28 +112,6 @@ public class CursorSendEngineTest {
                         2, reopened.recoveryFoldCount());
             }
         });
-    }
-
-    /**
-     * Reads the u64 generation a fresh {@code CursorSendEngine} stamped into
-     * {@code sf-initial.sfa} (the last 8 bytes of the header -- see MmapSegment's
-     * header layout). A test that rewrites {@code .symbol-dict} out-of-band via
-     * {@code openClean} between an engine's close and its reopen must stamp the
-     * SAME generation the surviving segment carries, or the reopened engine's
-     * recovery would (correctly) discard the dictionary as belonging to a
-     * different lineage.
-     */
-    private static long readSegmentGeneration(String slotDir) throws java.io.IOException {
-        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(slotDir + "/sf-initial.sfa", "r")) {
-            raf.seek(MmapSegment.HEADER_SIZE - 8);
-            byte[] buf = new byte[8];
-            raf.readFully(buf);
-            long v = 0;
-            for (int i = 0; i < 8; i++) {
-                v |= (long) (buf[i] & 0xFFL) << (8 * i);
-            }
-            return v;
-        }
     }
 
     /** A self-sufficient frame: deltaStart 0, one 1-byte symbol per char. */
