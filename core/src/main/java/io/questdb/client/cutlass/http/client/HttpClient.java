@@ -83,16 +83,47 @@ public abstract class HttpClient implements QuietCloseable {
 
     public HttpClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         this.nf = configuration.getNetworkFacade();
-        this.socket = socketFactory.newInstance(nf, LOG);
-        this.defaultTimeout = configuration.getTimeout();
-        this.connectTimeout = configuration.getConnectTimeout();
-        this.bufferSize = configuration.getInitialRequestBufferSize();
-        this.maxBufferSize = configuration.getMaximumRequestBufferSize();
-        this.responseParserBufSize = configuration.getResponseBufferSize();
-        this.fixBrokenConnection = configuration.fixBrokenConnection();
-        this.bufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseHeaders = new ResponseHeaders(responseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        // Locals mirror the resources the constructor takes. A throw past the first of them - the
+        // ResponseHeaders parser allocates natively, and so do both mallocs - leaves a half-built
+        // client that no caller can reach, so close() will never run and the catch has to free
+        // what was taken. The catch cannot read a blank final the failing statement never
+        // assigned, hence the locals. Sizes are read up front for the same reason.
+        final int requestBufSize = configuration.getInitialRequestBufferSize();
+        final int responseBufSize = configuration.getResponseBufferSize();
+        Socket socket = null;
+        long requestBuf = 0;
+        long responseBuf = 0;
+        try {
+            this.socket = socket = socketFactory.newInstance(nf, LOG);
+            this.defaultTimeout = configuration.getTimeout();
+            this.connectTimeout = configuration.getConnectTimeout();
+            this.bufferSize = requestBufSize;
+            this.maxBufferSize = configuration.getMaximumRequestBufferSize();
+            this.responseParserBufSize = responseBufSize;
+            this.fixBrokenConnection = configuration.fixBrokenConnection();
+            this.bufLo = requestBuf = Unsafe.malloc(requestBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseParserBufLo = responseBuf = Unsafe.malloc(responseBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseHeaders = new ResponseHeaders(responseBuf, responseBufSize, defaultTimeout, 4096, csPool);
+        } catch (Throwable th) {
+            if (responseBuf != 0) {
+                this.responseParserBufLo = Unsafe.free(responseBuf, responseBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (requestBuf != 0) {
+                this.bufLo = Unsafe.free(requestBuf, requestBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (socket != null) {
+                // Attach a close failure to the primary one rather than let it replace it: a TLS
+                // socket can throw from close(), and the caller has to see why construction failed.
+                try {
+                    socket.close();
+                } catch (Throwable closeFailure) {
+                    if (closeFailure != th) {
+                        th.addSuppressed(closeFailure);
+                    }
+                }
+            }
+            throw th;
+        }
     }
 
     @Override
@@ -853,9 +884,28 @@ public abstract class HttpClient implements QuietCloseable {
 
         public ResponseHeaders(long respParserBufLo, int respParserBufSize, int defaultTimeout, int headerBufSize, ObjectPool<DirectUtf8String> pool) {
             super(headerBufSize, pool);
-            this.defaultTimeout = defaultTimeout;
-            this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
-            this.chunkedResponse = new ChunkedResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+            try {
+                this.defaultTimeout = defaultTimeout;
+                this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+                this.chunkedResponse = new ChunkedResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+            } catch (Throwable th) {
+                // super() has already taken the parser's native header buffer and sink. The outer
+                // HttpClient never receives this object when a statement here throws, so its own
+                // catch cannot reach the parser and nothing would ever free it. Java does not run a
+                // superclass close() when a subclass constructor fails.
+                //
+                // The two response objects allocate nothing native, so only a Java-heap
+                // OutOfMemoryError reaches this catch, and there is no seam that can inject one
+                // without adding test-only production surface. That leaves the block untested by
+                // design; it is the same shape as the platform subclasses, which
+                // HttpClientConstructorTest does cover.
+                //
+                // super.close() rather than close(): close() is overridden to keep parser memory
+                // alive for the client to release later, and it would also tear down the outer
+                // client's live socket.
+                super.close();
+                throw th;
+            }
         }
 
         public void await() {

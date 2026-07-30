@@ -351,6 +351,83 @@ public class QuestDBImplCloseLifecycleTest {
         });
     }
 
+    /**
+     * Pins the contract {@link #awaitRepeatedInterrupts} depends on: while a close sits in its
+     * bounded creation wait, {@code hasCreationWaiterForTesting()} must stay true through an
+     * interrupt storm. Implementing it as {@code lock.hasWaiters(creationFinished)} does not:
+     * an interrupt moves the waiter off the condition queue and onto the lock's sync queue to
+     * reacquire before await rethrows, so the probe reads false for a few percent of the samples
+     * while the product is still honouring the very deadline the storm is meant to attack. That
+     * flicker fails the interrupt tests above on slower agents (seen on windows-msvc-2022-x64),
+     * blaming the product for a defect in the observation.
+     */
+    @Test(timeout = 30_000)
+    public void creationWaitStateDoesNotFlickerUnderInterruptStorm() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CountDownLatch inCreation = new CountDownLatch(1);
+            CountDownLatch releaseCreation = new CountDownLatch(1);
+            AtomicInteger teardownCount = new AtomicInteger();
+            IntFunction<Sender> senderFactory = slotIndex -> {
+                inCreation.countDown();
+                awaitOrFail(releaseCreation, "test never released sender creation");
+                return fakeSender(teardownCount, null, null);
+            };
+            String senderConfig = "ws::addr=localhost:1;sf_dir="
+                    + System.getProperty("java.io.tmpdir") + "/qdb-stable-wait-pool-" + System.nanoTime() + ";";
+            // The creation-wait budget is the full MAX_CLOSE_CREATION_WAIT_MILLIS cap so the poll
+            // window below cannot race a legitimate expiry even on a saturated agent: any false
+            // reading inside it is the flicker, not the deadline.
+            QuestDBImpl db = newQuestDB(senderConfig, 0, 0, 5000, senderFactory, client -> {
+            });
+            SenderPool pool = db.getSenderPoolForTesting();
+            AtomicBoolean keepInterrupting = new AtomicBoolean(true);
+            AtomicInteger interruptCount = new AtomicInteger();
+            Thread borrower = new Thread(() -> {
+                try {
+                    db.borrowSender();
+                } catch (Throwable ignored) {
+                }
+            }, "stable-wait-sender-borrower");
+            Thread closer = new Thread(db::close, "stable-wait-sender-closer");
+            Thread interrupter = new Thread(() -> {
+                while (keepInterrupting.get()) {
+                    interruptCount.incrementAndGet();
+                    closer.interrupt();
+                    Thread.yield();
+                }
+            }, "stable-wait-close-interrupter");
+            try {
+                borrower.start();
+                Assert.assertTrue("sender borrow never reached construction",
+                        inCreation.await(10, TimeUnit.SECONDS));
+
+                closer.start();
+                awaitCreationWaiter(pool,
+                        "facade close did not wait while sender construction was internally owned");
+                interrupter.start();
+                long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+                int polls = 0;
+                while (System.nanoTime() < until) {
+                    if (!pool.hasCreationWaiterForTesting()) {
+                        Assert.fail("creation-wait state flickered under the interrupt storm after "
+                                + polls + " polls; interrupts landed: " + interruptCount.get());
+                    }
+                    polls++;
+                    Thread.yield();
+                }
+                Assert.assertTrue("interrupt storm never landed", interruptCount.get() > 1);
+                Assert.assertTrue("close must still be inside its creation wait", closer.isAlive());
+            } finally {
+                keepInterrupting.set(false);
+                releaseCreation.countDown();
+                interrupter.join(TimeUnit.SECONDS.toMillis(10));
+                db.close();
+                borrower.join(TimeUnit.SECONDS.toMillis(10));
+                closer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        });
+    }
+
     @Test(timeout = 30_000)
     public void facadeCloseWaitsForQueryCreationAndTeardown() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -536,6 +613,11 @@ public class QuestDBImplCloseLifecycleTest {
      * nothing: with a post-join count assert alone, the run races the close budget against thread
      * scheduling and can fail with the product invariant intact. Failing here instead separates
      * "interrupter starved before the budget expired" from a genuine deadline bug.
+     * <p>
+     * {@code closerStillWaiting} must report the wait region as a stable state, not probe the
+     * condition queue: every interrupt moves the closer out of that queue to reacquire the lock,
+     * so a queue probe reads "not waiting" for a few percent of the poll samples with the product
+     * invariant intact. Both pools' {@code hasCreationWaiterForTesting()} count the region instead.
      */
     private static void awaitRepeatedInterrupts(
             AtomicInteger interruptCount,
@@ -550,7 +632,13 @@ public class QuestDBImplCloseLifecycleTest {
                 return;
             }
             if (!closerStillWaiting.getAsBoolean()) {
-                Assert.fail(message + "; interrupts landed: " + interruptCount.get());
+                // The count above was sampled before the predicate, so the second interrupt may
+                // have landed in between; re-read before failing rather than on a stale sample.
+                int landed = interruptCount.get();
+                if (landed > 1) {
+                    return;
+                }
+                Assert.fail(message + "; interrupts landed: " + landed);
             }
             Thread.yield();
         }
