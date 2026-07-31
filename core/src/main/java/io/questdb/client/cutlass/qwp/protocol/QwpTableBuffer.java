@@ -266,20 +266,25 @@ public class QwpTableBuffer implements QuietCloseable {
      * <p>
      * This should be called after all column values for the current row have been set.
      */
-    public void nextRow() {
+    public long nextRow() {
         // Reset sequential access cursor for the next row
         columnAccessCursor = 0;
         inProgressColumnCount = 0;
-        // Ensure all columns have the same row count
+        // Ensure all columns have the same row count; sum the buffered bytes in
+        // the same pass so the caller does not need a second O(columns) walk to
+        // account the row (sendRow used to call getBufferedBytes() again here).
+        long bytes = 0;
         for (int i = 0, n = columns.size(); i < n; i++) {
             ColumnBuffer col = fastColumns[i];
             // If column wasn't set for this row, add a null
             while (col.size < rowCount + 1) {
                 col.addNull();
             }
+            bytes += col.getBufferedBytes();
         }
         rowCount++;
         committedColumnCount = columns.size();
+        return bytes;
     }
 
     /**

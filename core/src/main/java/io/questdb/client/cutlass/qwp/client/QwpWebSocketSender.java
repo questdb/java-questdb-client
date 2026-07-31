@@ -4573,7 +4573,7 @@ public class QwpWebSocketSender implements Sender {
             }
         }
 
-        currentTableBuffer.nextRow();
+        long bufferedNow = currentTableBuffer.nextRow();
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();
@@ -4581,12 +4581,11 @@ public class QwpWebSocketSender implements Sender {
         pendingRowCount++;
 
         // Advance pendingBytes by the bytes the just-committed row added to
-        // the current table, then re-snap. Column setters and nextRow()
-        // only ever touch currentTableBuffer between consistency points, so
-        // the per-row work stays O(numColumns of the current table) -- no
+        // the current table. nextRow() accumulated the total during its
+        // null-padding walk, so there is no second O(columns) walk needed here.
+        // The per-row work stays O(numColumns of the current table) -- no
         // map walk, no scaling with the number of tables this sender has
         // seen across its lifetime.
-        long bufferedNow = currentTableBuffer.getBufferedBytes();
         pendingBytes += bufferedNow - currentTableBufferSnapshotBytes;
         currentTableBufferSnapshotBytes = bufferedNow;
 
