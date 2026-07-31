@@ -198,6 +198,18 @@ public class SegmentSkipQuarantineTest {
      * Writes a real slot via a silent (never-acking) server so multiple segments survive on
      * disk unacked, then corrupts the oldest one's magic bytes. Returns the live slot path.
      * sf-initial.sfa (baseSeq 0) is guaranteed to be the oldest since nothing ever acked it.
+     * <p>
+     * {@code sf_max_segment_bytes} is set well below the 20 rows' total encoded size (each
+     * row seals to a ~108-byte frame, so 20 rows never fill the default 4096-byte segment) so
+     * the append path itself performs a genuine rotation -- {@code SegmentRing.appendOrFsn}
+     * only rotates when {@code tryAppend} reports the active segment full. Without this, the
+     * setup's old {@code > 1} segment-file precondition could be satisfied by nothing more than
+     * the empty hot spare {@code SegmentManager} provisions asynchronously the moment the ring
+     * registers ({@code SegmentRing.needsHotSpare} is simply {@code hotSpare == null}, independent
+     * of bytes written) -- a background-thread race against this method's {@code Sender} closing,
+     * observed to fail consistently on Windows CI and to coin-flip on the JDK 8 Linux leg. Forcing
+     * a genuine rotation makes the precondition -- and the corruption scenario it sets up, a skip
+     * among data-bearing survivors -- true by construction rather than by timing.
      */
     private java.nio.file.Path writeMultiSegmentSlotWithCorruptedOldest() throws Exception {
         try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
@@ -207,7 +219,7 @@ public class SegmentSkipQuarantineTest {
             String pad = io.questdb.client.test.tools.TestUtils.repeat("x", 64);
             String cfg = "ws::addr=localhost:" + port
                     + ";sf_dir=" + sfDir
-                    + ";sf_max_segment_bytes=4096"
+                    + ";sf_max_segment_bytes=512"
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg)) {
                 for (int i = 0; i < 20; i++) {
@@ -221,9 +233,14 @@ public class SegmentSkipQuarantineTest {
         java.nio.file.Path oldest = liveSlot.resolve("sf-initial.sfa");
         Assert.assertTrue("setup: sf-initial.sfa must survive -- nothing acked it",
                 java.nio.file.Files.exists(oldest));
+        java.util.List<String> segmentFiles = listSegmentFileNames(liveSlot.toString());
         Assert.assertTrue("setup: the slot must hold more than one segment so the corruption "
                         + "below is a skip among survivors, not the only file present",
-                countSegmentFiles(liveSlot.toString()) > 1);
+                segmentFiles.size() > 1);
+        Assert.assertTrue("setup: at least one segment besides sf-initial.sfa must carry real "
+                        + "frames -- an empty hot spare alone does not construct the intended "
+                        + "\"skip among data-bearing survivors\" scenario",
+                survivorCarriesFrames(liveSlot.toString(), segmentFiles));
         corruptMagic(oldest.toString());
         return liveSlot;
     }
@@ -248,24 +265,24 @@ public class SegmentSkipQuarantineTest {
         }
     }
 
-    private static int countSegmentFiles(String dir) {
-        if (!Files.exists(dir)) return 0;
+    private static java.util.List<String> listSegmentFileNames(String dir) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        if (!Files.exists(dir)) return names;
         long find = Files.findFirst(dir);
-        if (find <= 0) return 0;
-        int n = 0;
+        if (find <= 0) return names;
         try {
             int rc = 1;
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
                 if (name != null && name.endsWith(".sfa")) {
-                    n++;
+                    names.add(name);
                 }
                 rc = Files.findNext(find);
             }
         } finally {
             Files.findClose(find);
         }
-        return n;
+        return names;
     }
 
     private static void rmDirRec(String dir) {
@@ -287,6 +304,22 @@ public class SegmentSkipQuarantineTest {
             }
         }
         Files.remove(dir);
+    }
+
+    /**
+     * True if any segment other than {@code sf-initial.sfa} holds at least one real frame.
+     * Distinguishes a genuine rotation survivor from the asynchronously provisioned, always-empty
+     * hot spare that the segment manager may or may not have installed by the time the producer
+     * closes -- the setup precondition must not depend on winning that race.
+     */
+    private static boolean survivorCarriesFrames(String dir, java.util.List<String> segmentFileNames) {
+        for (String name : segmentFileNames) {
+            if ("sf-initial.sfa".equals(name)) continue;
+            try (MmapSegment seg = MmapSegment.openExisting(dir + "/" + name)) {
+                if (seg.frameCount() > 0) return true;
+            }
+        }
+        return false;
     }
 
     /** Records that at least one binary frame arrived; never acks. */
