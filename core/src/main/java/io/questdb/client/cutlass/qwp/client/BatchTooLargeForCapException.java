@@ -32,6 +32,9 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * against a larger-cap node, so {@code close()} has to recognise it and discard the batch
  * rather than abandon every row an earlier flush already published. Matching on the
  * message text would be the alternative, and would silently swallow unrelated failures.
+ * {@link io.questdb.client.Sender#reset()} discards the retained batch and leaves the
+ * sender usable -- the non-destructive recovery when producing smaller batches is not
+ * an option.
  */
 public class BatchTooLargeForCapException extends LineSenderException {
 

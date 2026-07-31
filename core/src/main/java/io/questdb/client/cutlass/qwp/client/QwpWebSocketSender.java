@@ -4014,7 +4014,9 @@ public class QwpWebSocketSender implements Sender {
                         .put(", serverMaxBatchSize=").put(cap).put(']')
                         .put("; the batch is retained for retry and every flush() will "
                                 + "reject it again until a larger-cap node is reached -- "
-                                + "close the sender to discard it, or produce smaller batches");
+                                + "call reset() to discard the retained batch and keep this "
+                                + "sender, close the sender to discard everything, or produce "
+                                + "smaller batches");
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.
