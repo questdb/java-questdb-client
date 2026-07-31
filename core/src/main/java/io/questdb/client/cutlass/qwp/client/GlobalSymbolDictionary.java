@@ -24,6 +24,8 @@
 
 package io.questdb.client.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.CharSequenceIntHashMap;
 import io.questdb.client.std.ObjList;
 
@@ -67,6 +69,10 @@ public class GlobalSymbolDictionary {
      * unconditionally keeps {@link #size()} equal to that count. The reverse lookup
      * keeps the highest id for a colliding string, which is harmless: both ids
      * encode to the same bytes, so resolving either is equivalent.
+     * <p>
+     * Deliberately NOT capped at {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}:
+     * recovery replays entries {@link #getOrAddSymbol} already admitted under the
+     * cap, so an over-cap replay is unreachable from data this client wrote.
      *
      * @param symbol the recovered symbol string (must not be null)
      * @return the id assigned (the previous {@link #size()})
@@ -124,6 +130,7 @@ public class GlobalSymbolDictionary {
      * @param symbol the symbol string (must not be null)
      * @return the global ID for this symbol (>= 0)
      * @throws IllegalArgumentException if symbol is null
+     * @throws LineSenderException if the symbol is new and the dictionary already holds {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE} entries
      */
     public int getOrAddSymbol(CharSequence symbol) {
         if (symbol == null) {
@@ -133,6 +140,22 @@ public class GlobalSymbolDictionary {
         int existingId = symbolToId.get(symbol);
         if (existingId != CharSequenceIntHashMap.NO_ENTRY_VALUE) {
             return existingId;
+        }
+
+        // The server rejects any delta or catch-up whose deltaStartId + deltaCount
+        // exceeds the protocol cap, and that rejection is terminal for the sender --
+        // in store-and-forward mode it would strand an already-buffered backlog with
+        // no drainer able to deliver it. Refusing the symbol HERE, before the row is
+        // buffered, keeps everything buffered deliverable: the check is > on the
+        // server, so a dictionary of exactly the cap still catches up cleanly.
+        if (idToSymbol.size() >= QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE) {
+            throw new LineSenderException(
+                    "global symbol dictionary is full: the QWP protocol caps a sender's distinct symbol values at "
+                            + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE
+                            + ". Rows using already-registered symbol values continue to work. To start a fresh "
+                            + "dictionary, close this sender and build a new one (with store-and-forward the "
+                            + "buffered backlog drains first). For unbounded-cardinality data use varchar "
+                            + "columns instead of symbol");
         }
 
         // Assign new ID — toString() only for new symbols that must be stored
