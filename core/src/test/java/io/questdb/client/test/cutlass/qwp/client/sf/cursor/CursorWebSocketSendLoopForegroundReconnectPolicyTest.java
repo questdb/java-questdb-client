@@ -24,12 +24,14 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -71,6 +73,53 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         assertAsyncInitialForegroundSurfacesTerminal(true,
                 () -> new QwpDurableAckMismatchException("localhost", 1, "primary"),
                 "durable-ack-mismatch");
+    }
+
+    @Test
+    public void testFirstConnectCatchUpFailureKeepsStartupTerminalArmed() throws Exception {
+        // swapClient must not latch hasEverConnected before the dictionary
+        // catch-up succeeds. An ASYNC first connect that completes the upgrade
+        // and then dies inside the catch-up has never fully established a
+        // connection, so a subsequent bad-credential rejection is still a
+        // STARTUP failure and must latch the terminal -- not retry silently
+        // while the sender buffers into store-and-forward forever.
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(
+                    sfDir.newFolder().getAbsolutePath(), SEGMENT_SIZE_BYTES)) {
+                CatchUpThenAuthFactory factory = new CatchUpThenAuthFactory();
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        null,
+                        engine,
+                        0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        factory,
+                        1L,
+                        4L,
+                        false,
+                        0L,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        0L,
+                        0L,
+                        CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                try {
+                    seedMirror(loop, "sym0"); // non-empty mirror => swapClient runs the catch-up
+                    appendFrame(engine, (byte) 1);
+                    loop.start();
+
+                    await(() -> loop.getTerminalError() != null,
+                            "an endpoint-policy failure after a failed first catch-up must latch the startup terminal");
+                    Assert.assertTrue("the terminal must name the endpoint-policy failure, got: "
+                                    + loop.getTerminalError().getMessage(),
+                            loop.getTerminalError().getMessage().contains("ws-upgrade-failed"));
+                    Assert.assertFalse("a connection whose catch-up failed was never fully established",
+                            loop.hasEverConnected());
+                    Assert.assertEquals("the auth rejection must latch on first sight",
+                            2, factory.attempts());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
     }
 
     @Test
@@ -258,6 +307,21 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
         }
     }
 
+    private static void seedMirror(CursorWebSocketSendLoop loop, String symbol) {
+        // Mirror entry layout: [len varint][utf8]. One symbol under 128 bytes
+        // keeps the varint single-byte. The loop takes ownership of the buffer
+        // and frees it with the mirror on close (the same contract
+        // CursorWebSocketSendLoopCatchUpAlignmentTest.seedMirror relies on).
+        byte[] bytes = symbol.getBytes(StandardCharsets.UTF_8);
+        int total = 1 + bytes.length;
+        long addr = Unsafe.malloc(total, MemoryTag.NATIVE_DEFAULT);
+        Unsafe.getUnsafe().putByte(addr, (byte) bytes.length);
+        for (int i = 0; i < bytes.length; i++) {
+            Unsafe.getUnsafe().putByte(addr + 1 + i, bytes[i]);
+        }
+        loop.seedSentDictMirrorForTest(addr, total, 1);
+    }
+
     @FunctionalInterface
     private interface Condition {
         boolean isTrue() throws Exception;
@@ -385,6 +449,59 @@ public class CursorWebSocketSendLoopForegroundReconnectPolicyTest {
             bb.put(name);
             bb.putLong(wireSeq);
             return bb.array();
+        }
+    }
+
+    private static final class CatchUpThenAuthFactory implements CursorWebSocketSendLoop.ReconnectFactory {
+        private final AtomicInteger attempts = new AtomicInteger();
+
+        int attempts() {
+            return attempts.get();
+        }
+
+        @Override
+        public WebSocketClient reconnect() throws Exception {
+            if (attempts.incrementAndGet() == 1) {
+                // The upgrade "succeeds" (the loop receives a live client), then
+                // every send fails: swapClient's dictionary catch-up dies
+                // mid-flight on the first connection.
+                return new FailingSendClient();
+            }
+            throw new QwpAuthFailedException(401, "localhost", 1);
+        }
+    }
+
+    private static final class FailingSendClient extends WebSocketClient {
+        private FailingSendClient() {
+            super(DefaultHttpClientConfiguration.INSTANCE, PlainSocketFactory.INSTANCE);
+        }
+
+        @Override
+        public int getServerMaxBatchSize() {
+            return 0; // no advertised cap: the catch-up ships one unchunked frame
+        }
+
+        @Override
+        public int getServerQwpVersion() {
+            return 1;
+        }
+
+        @Override
+        public void sendBinary(long dataPtr, int length) {
+            throw new RuntimeException("transient wire failure during catch-up");
+        }
+
+        @Override
+        public void sendBinary(long firstPtr, int firstLength, long secondPtr, int secondLength) {
+            throw new RuntimeException("transient wire failure during catch-up");
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
         }
     }
 }

@@ -2537,13 +2537,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private void swapClient(WebSocketClient newClient) {
         WebSocketClient old = this.client;
         this.client = newClient;
-        // Sticky: once the wire is up, we've reached the server at least once
-        // for this sender's lifetime. Exposed to the owning sender for
-        // connection-state observability, and it ends initialization: from here
-        // on endpointPolicyFailureIsTerminal() stops latching endpoint-policy
-        // failures on a foreground sender and rides them out instead, because
-        // store-and-forward now owns the buffered data (Invariant B).
-        this.hasEverConnected = true;
         this.lastReconnectError = null;
         if (old != null) {
             try {
@@ -2574,6 +2567,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         clearDurableAckTracking();
         setWireBaselineWithCatchUp(replayStart);
         positionCursorAt(replayStart);
+        // Sticky: once the wire is up, we've reached the server at least once
+        // for this sender's lifetime. Exposed to the owning sender for
+        // connection-state observability, and it ends initialization: from here
+        // on endpointPolicyFailureIsTerminal() stops latching endpoint-policy
+        // failures on a foreground sender and rides them out instead, because
+        // store-and-forward now owns the buffered data (Invariant B).
+        // Deliberately LAST: a first connection that completes the upgrade but
+        // dies inside the dictionary catch-up above was never fully
+        // established, so the sender stays INITIALIZING and a subsequent
+        // endpoint-policy rejection still latches the startup terminal.
+        this.hasEverConnected = true;
     }
 
     /**
