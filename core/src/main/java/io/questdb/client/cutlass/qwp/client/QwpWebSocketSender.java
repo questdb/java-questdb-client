@@ -1899,6 +1899,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Live view of the producer's global symbol dictionary, so tests can drive
+     * the dictionary to the protocol cap without pushing a million rows through
+     * the row API. Producer-thread only, like every dictionary access.
+     */
+    @TestOnly
+    public GlobalSymbolDictionary getGlobalSymbolDictionaryForTest() {
+        return globalSymbolDictionary;
+    }
+
+    /**
      * Snapshot of the producer's symbol prefix whose persisted-dictionary chunks
      * have committed. The persisted size advances only after the chunk CRC and
      * payload have been written, so this observes the write-ahead boundary without
