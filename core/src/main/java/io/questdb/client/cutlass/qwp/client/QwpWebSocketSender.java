@@ -2577,9 +2577,6 @@ public class QwpWebSocketSender implements Sender {
      * gets its own drainer thread, capped at {@code maxBackgroundDrainers}
      * concurrent. Drainers run until the slot is fully drained or a
      * terminal error occurs (then they drop a {@code .failed} sentinel).
-     * {@code dirMode} is the owner sender's resolved {@code sf_dir_shared}
-     * mode, forwarded so a drainer's {@code .slot-locks} creation matches the
-     * mode the foreground sender created {@code sf_dir} with.
      * <p>
      * Should be called once, immediately after {@code connect()} returns.
      * Subsequent calls add more drainers to the same pool.
@@ -2588,15 +2585,13 @@ public class QwpWebSocketSender implements Sender {
             io.questdb.client.std.ObjList<String> orphanSlotPaths,
             int maxBackgroundDrainers,
             long segmentSizeBytes,
-            long sfMaxTotalBytes,
-            int dirMode
+            long sfMaxTotalBytes
     ) {
         startOrphanDrainers(
                 orphanSlotPaths,
                 maxBackgroundDrainers,
                 segmentSizeBytes,
                 sfMaxTotalBytes,
-                dirMode,
                 0L);
     }
 
@@ -2609,7 +2604,6 @@ public class QwpWebSocketSender implements Sender {
             int maxBackgroundDrainers,
             long segmentSizeBytes,
             long sfMaxTotalBytes,
-            int dirMode,
             long syncIntervalNanos
     ) {
         if (orphanSlotPaths == null || orphanSlotPaths.size() == 0
@@ -2657,8 +2651,7 @@ public class QwpWebSocketSender implements Sender {
                             durableAckKeepaliveIntervalMillis,
                             maxFrameRejections,
                             poisonMinEscalationWindowMillis,
-                            catchUpCapGapMinEscalationWindowMillis,
-                            dirMode);
+                            catchUpCapGapMinEscalationWindowMillis);
             ref[0] = drainer;
             drainerPool.submit(drainer);
         }

@@ -76,51 +76,6 @@ public final class Files {
      * others may traverse and read but not modify. 0755 octal
      */
     public static final int DIR_MODE_DEFAULT = 493;
-    /**
-     * Creation mode for a directory that processes running as DIFFERENT users must all
-     * create entries in: the store-and-forward root and its logical slot-lock directory.
-     * <b>01777 octal -- 0777 plus the sticky bit.</b>
-     * <p>
-     * The rwx widening is the load-bearing part and it works: the deployment's umask
-     * decides the sharing policy, so the usual 022 yields 0755 (identical to
-     * {@link #DIR_MODE_DEFAULT}, the common case unchanged) while a shared-group deployment
-     * (umask 002) gets the 0775 a second uid needs to create its own entries here.
-     * <p>
-     * <b>The sticky bit is best-effort, NOT a guarantee this client relies on.</b> On
-     * Linux {@code mkdir(2)} applies {@code mode & ~umask} to the permission bits only --
-     * the {@code & 0777} in that shorthand covers rwx, not the special bits -- and
-     * {@code S_ISVTX} is honoured regardless of umask, so the sticky bit DOES survive to
-     * the new directory on the primary deployment platform. POSIX itself leaves
-     * sticky-on-mkdir unspecified, so this client still does not depend on it holding
-     * on every platform it runs on. It is therefore wrong to depend on restricted-deletion semantics
-     * for correctness. Mutual exclusion of the slot lock does NOT rest on it: the safety
-     * comes from never unlinking a lock file this process does not hold
-     * ({@code SlotLock.removeOrphanLogical} acquires the lock before removing it), which
-     * holds regardless of directory permissions. Defending a multi-tenant host against a
-     * hostile local uid unlinking another process's lock would need the sticky bit applied
-     * by an explicit {@code chmod} after {@code mkdir} (and on an already-existing directory
-     * on upgrade, since {@code mkdir} does not touch it) -- there is no {@code chmod} binding
-     * in this class today, so that protection is not provided and must not be assumed.
-     * <p>
-     * This must be applied to EVERY directory on the path a foreign uid has to create in.
-     * Applying it only to {@code .slot-locks} -- while {@code sf_dir} itself stays 0755 --
-     * is a half-measure: umask can only clear bits, so under umask 002 the lock directory
-     * becomes group-writable while sf_dir does not, and the second uid still cannot create
-     * its slot directory. build() then fails one level before the problem this mode
-     * exists to solve. Do NOT use it for a directory only its creator writes to; the slot
-     * directory itself stays {@link #DIR_MODE_DEFAULT}.
-     * <p>
-     * NOTE: {@link #mkdir} passes this straight to POSIX {@code mkdir}, so the effective
-     * permission bits are {@code mode & ~umask & 0777}; unlike those bits, Linux honours
-     * {@code S_ISVTX} regardless of umask. Under umask 000 -- a systemd unit with no
-     * {@code UMask=}, many container entrypoints -- the permission bits still come out
-     * 0777 (world-writable), even though the sticky bit survives and keeps deletion
-     * restricted to each entry's own owner. World-writable directory contents are
-     * exposure enough on their own, so this mode stays opt-in via the
-     * {@code sf_dir_shared} connect-string key; the default is
-     * {@link #DIR_MODE_DEFAULT}.
-     */
-    public static final int DIR_MODE_SHARED = 1023;
 
     /** {@code dirent.d_type} sentinel: type unknown (filesystem doesn't fill it). */
     public static final int DT_UNKNOWN = 0;
