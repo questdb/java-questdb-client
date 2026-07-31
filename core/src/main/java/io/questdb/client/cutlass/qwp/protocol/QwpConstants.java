@@ -81,24 +81,24 @@ public final class QwpConstants {
      */
     public static final int MAX_COLUMN_NAME_LENGTH = 127;
     /**
-     * Maximum table name length in bytes. Mirrors the server's same-named
-     * constant; used by the decoder to reject malformed wire bytes.
-     */
-    public static final int MAX_TABLE_NAME_LENGTH = 127;
-    /**
      * Maximum number of distinct symbol values a sender's global symbol dictionary
      * may hold. Mirrors the server-side {@code QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE}
      * (questdb OSS): the ingress decoder rejects any delta or catch-up frame whose
      * {@code deltaStartId + deltaCount} exceeds this limit, and classifies the
      * rejection as a parse error, which the sender treats as terminal. The producer
-     * therefore enforces the cap at registration time ({@code GlobalSymbolDictionary
-     * #getOrAddSymbol}), before the row is buffered, so everything already buffered
-     * always references ids the server will accept.
+     * therefore enforces the cap at registration time ({@code GlobalSymbolDictionary#getOrAddSymbol}),
+     * before the row is buffered, so everything already buffered always references
+     * ids the server will accept.
      * <p>
      * NOT the result-direction cap: {@code QwpResultBatchDecoder.MAX_CONN_DICT_SIZE}
      * (8,388,608) governs server-to-client result batches and is unrelated.
      */
     public static final int MAX_SYMBOL_DICTIONARY_SIZE = 1_000_000;
+    /**
+     * Maximum table name length in bytes. Mirrors the server's same-named
+     * constant; used by the decoder to reject malformed wire bytes.
+     */
+    public static final int MAX_TABLE_NAME_LENGTH = 127;
     /**
      * Status byte on a {@code QUERY_ERROR} frame: the query was cancelled,
      * either by a client {@code CANCEL} frame or by explicit server-side
