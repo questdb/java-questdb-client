@@ -192,8 +192,8 @@ public final class SlotLock implements QuietCloseable {
         // nothing about the LOGICAL lock, which Sender.build() holds across its whole
         // construct -> connect -> quarantine transition, in a frame ABOVE this one: an
         // ordinary failed connect closes the engine from inside that scope, reaches here,
-        // and used to unlink the very file build() was holding. Acquiring first turns
-        // that into a no-op instead of silent double-ownership.
+        // and used to unlink the very file build() was holding. Acquiring first narrows
+        // that to a single-syscall window instead of silent double-ownership.
         SlotLock guard;
         try {
             guard = acquireAt(ff, slotDir, paths[1], paths[2]);
@@ -204,8 +204,11 @@ public final class SlotLock implements QuietCloseable {
             return;
         }
         try {
-            ff.remove(paths[1]);
+            // Sidecar first: once paths[1] (.lock) is unlinked, a racing acquirer can
+            // create a fresh lock inode and write its own .lock.pid inside our window;
+            // removing the pid file first means no successor's sidecar can be hit.
             ff.remove(paths[2]);
+            ff.remove(paths[1]);
         } finally {
             guard.close();
         }

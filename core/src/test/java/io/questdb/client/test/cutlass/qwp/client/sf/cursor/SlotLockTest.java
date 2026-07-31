@@ -355,6 +355,29 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testRemoveOrphanLogicalUnlinksPidSidecarBeforeLockFile() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/unlink-order";
+            // Create the lock pair, then release so removal is uncontended.
+            SlotLock.acquireLogical(slot).close();
+            java.util.List<String> removed = new java.util.ArrayList<>();
+            DelegatingFilesFacade recording = new DelegatingFilesFacade() {
+                @Override
+                public boolean remove(String path) {
+                    removed.add(path);
+                    return super.remove(path);
+                }
+            };
+            SlotLock.removeOrphanLogical(recording, slot);
+            assertEquals("both lock files must be removed", 2, removed.size());
+            assertTrue("pid sidecar must be unlinked first, got: " + removed,
+                    removed.get(0).endsWith(".lock.pid"));
+            assertTrue("lock file must be unlinked second, got: " + removed,
+                    removed.get(1).endsWith(".lock"));
+        });
+    }
+
+    @Test
     public void testPersistentFailedCloseDoesNotBlockDifferentSlot() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String failedSlot = parentDir + "/persistent-failed-close";
