@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.std.Files;
@@ -39,6 +40,7 @@ import org.junit.Test;
 import java.nio.file.Paths;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -191,6 +193,83 @@ public class SegmentSkipQuarantineTest {
             Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(liveSlot));
             Assert.assertTrue("the corrupted segment's frame data must be preserved",
                     java.nio.file.Files.exists(liveSlot.resolve("sf-initial.sfa")));
+        });
+    }
+
+    /**
+     * A build()-time quarantine abandons buffered rows, and the synchronous {@link SenderError}
+     * dispatch (fired from inside {@code build()} itself -- see {@code Sender.java} around the
+     * quarantine block) is the only programmatic channel telling the application that data
+     * needs resending: the client ships {@code slf4j-api} with no binding, so {@code LOG.error}
+     * alone can vanish into a NOP logger. Pins that a capturing handler actually receives the
+     * error, and that it carries the expected category, policy, and a message naming the
+     * quarantined location.
+     */
+    @Test(timeout = 30_000L)
+    public void testQuarantineDispatchesSenderErrorToHandler() throws Exception {
+        assertMemoryLeak(() -> {
+            writeMultiSegmentSlotWithCorruptedOldest();
+            AtomicReference<SenderError> received = new AtomicReference<>();
+            try (TestWebSocketServer good = new TestWebSocketServer(new MarkerHandler(new AtomicBoolean()))) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender s2 = Sender.builder("ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;")
+                        .errorHandler(e -> received.compareAndSet(null, e))
+                        .build()) {
+                    // build() itself quarantined the torn slot; no rows are needed --
+                    // the dispatch is synchronous inside build().
+                }
+            }
+            SenderError err = received.get();
+            Assert.assertNotNull("a build()-time quarantine abandons buffered rows; the error "
+                    + "handler is the ONLY programmatic channel telling the app to resend "
+                    + "(slf4j ships unbound, so LOG.error alone can be a NOP)", err);
+            Assert.assertEquals(SenderError.Category.PROTOCOL_VIOLATION, err.getCategory());
+            Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+            Assert.assertTrue("the error must name where the data went [msg=" + err.getServerMessage() + ']',
+                    err.getServerMessage() != null
+                            && err.getServerMessage().contains("set aside at")
+                            && err.getServerMessage().contains("unreplayable-"));
+        });
+    }
+
+    /**
+     * A handler that throws must stay contained: a build()-time quarantine is a bounded,
+     * already-handled outage, and a misbehaving handler must not turn it back into a failed
+     * {@code build()} or stop the producer from coming up on the fresh slot. Pins both halves --
+     * the throw is swallowed AND the quarantine itself still completes -- over the same fixture
+     * as {@link #testQuarantineDispatchesSenderErrorToHandler()}.
+     */
+    @Test(timeout = 30_000L)
+    public void testThrowingErrorHandlerDoesNotFailBuild() throws Exception {
+        assertMemoryLeak(() -> {
+            writeMultiSegmentSlotWithCorruptedOldest();
+            AtomicBoolean sawBinary = new AtomicBoolean();
+            try (TestWebSocketServer good = new TestWebSocketServer(new MarkerHandler(sawBinary))) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender s2 = Sender.builder("ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;")
+                        .errorHandler(e -> {
+                            throw new RuntimeException("handler failure must stay contained");
+                        })
+                        .build()) {
+                    // A throwing handler must not turn the contained outage back into a
+                    // failed build: the sender must come up on the fresh slot and work.
+                    s2.table("foo").stringColumn("p", "after-throwing-handler").longColumn("v", 1).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && !sawBinary.get()) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertTrue("the producer must keep producing", sawBinary.get());
+            }
+            Assert.assertTrue("the quarantine itself must still have completed",
+                    java.nio.file.Files.isDirectory(Paths.get(sfDir, "default.unreplayable-0")));
         });
     }
 
