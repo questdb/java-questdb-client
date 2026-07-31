@@ -3187,7 +3187,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // came from the constructor itself: no engine was ever built, so there is nothing to
             // close.
             if (torn != null) {
-                torn.close(false);
+                try {
+                    torn.close(false);
+                } catch (Throwable ignored) {
+                    // Best-effort, like build()'s other rollback closes. A failed close
+                    // here (fsync of a not-fully-drained slot, a torn dictionary fd)
+                    // must not abort the quarantine: skipping the rename and markFailed
+                    // below would restore the permanent build() brick this method
+                    // exists to remove, and replace the recovery verdict in `cause`
+                    // with a secondary close failure.
+                }
             }
             Runnable hook = quarantineAfterCloseHook;
             if (hook != null) {

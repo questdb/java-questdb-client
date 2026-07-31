@@ -107,22 +107,27 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private void decodeSymbols(GlobalSymbolDictionary target) {
         long p = rawAddr;
         long limit = rawAddr + committedRawLen;
+        // UnreplayableSlotException, not IllegalStateException: Sender.build() routes
+        // exactly the typed recovery exceptions to slot quarantine. An untyped throw
+        // from here escapes build() and re-fails identically on every restart -- the
+        // permanent brick quarantine exists to remove. The :238 arm is data-reachable
+        // (the suffix cap bounds the recovered dictionary's byte size).
         for (int i = 0; i < committedRawCount; i++) {
             long encoded = readVarint(p, limit);
             if (encoded < 0L) {
-                throw new IllegalStateException("malformed cached symbol dictionary suffix");
+                throw new UnreplayableSlotException("malformed cached symbol dictionary suffix");
             }
             int varintLen = (int) (encoded & 7L);
             long symbolLen = encoded >>> 3;
             p += varintLen;
             if (symbolLen > limit - p) {
-                throw new IllegalStateException("truncated cached symbol dictionary suffix");
+                throw new UnreplayableSlotException("truncated cached symbol dictionary suffix");
             }
             target.addRecoveredSymbol(Utf8s.stringFromUtf8Bytes(p, p + symbolLen));
             p += symbolLen;
         }
         if (p != limit) {
-            throw new IllegalStateException("overfilled cached symbol dictionary suffix");
+            throw new UnreplayableSlotException("overfilled cached symbol dictionary suffix");
         }
     }
 
@@ -235,7 +240,7 @@ final class RecoveredFrameAnalysis implements QuietCloseable {
     private void appendRaw(long addr, int len, int count) {
         long required = (long) runningRawLen + len;
         if (required > MAX_RAW_BYTES) {
-            throw new IllegalStateException("recovered symbol dictionary suffix exceeds maximum size "
+            throw new UnreplayableSlotException("recovered symbol dictionary suffix exceeds maximum size "
                     + "[required=" + required + ", max=" + MAX_RAW_BYTES + ']');
         }
         if (required > rawCapacity) {
