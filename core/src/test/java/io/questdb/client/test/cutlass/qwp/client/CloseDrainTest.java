@@ -321,6 +321,7 @@ public class CloseDrainTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port
+                    + ";initial_connect_retry=sync"
                     + ";reconnect_initial_backoff_millis=20"
                     + ";reconnect_max_backoff_millis=100"
                     + ";close_flush_timeout_millis=" + timeoutMs + ";";

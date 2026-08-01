@@ -76,8 +76,8 @@ public class DeltaDictRecoveryTest {
     // writeAndTearUnreplayableSlot arithmetic: 12 one-symbol frames, FSNs 0..11,
     // acks held at 10 so frame 11 stays unacked and keeps the slot alive across
     // close(). recoveredCommitBoundaryFsn is therefore 11; stamping the watermark
-    // at 11 afterwards produces the fully-acked recovery, leaving it produces the
-    // unacked (quarantine) recovery.
+    // at 11 afterwards produces the fully-acked recovery, leaving it unstamped produces
+    // the unacked (quarantine) recovery.
     private static final int ACK_THROUGH = 10;
     private static final int FRAMES = 12;
 
@@ -224,8 +224,8 @@ public class DeltaDictRecoveryTest {
         // rebuilds from the frames that are still on disk.
         //
         // Here the frames that REGISTERED the early ids are gone for good: trim unlinked their
-        // whole segment once they were acked (modelled by deleting sf-initial.sfa, which is
-        // exactly what SegmentManager does). The dictionary is torn away too, so nothing
+        // whole segment once they were acked (the live SegmentManager performs the trim, unlinking
+        // sf-initial.sfa once its frames are acked). The dictionary is torn away too, so nothing
         // anywhere still holds those ids, and the surviving frames' deltas start above them.
         // Replaying would hit the server's DELTA_DICT_GAP rejection -- QwpMessageCursor
         // refuses a delta whose start runs past the dictionary's coverage rather than
