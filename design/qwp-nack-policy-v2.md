@@ -99,8 +99,13 @@ diagnostics only.
 
 The server already handles it at the right layer (Invariant B work): the
 read-only gate and the commit-path authorization refusal both set
-`roleChangeClosePending` and close with a reconnect-eligible `NORMAL_CLOSURE`
-instead of NACKing `SECURITY_ERROR` (`QwpIngressProcessorState`). The client
+`roleChangeClosePending` and close with a reconnect-eligible
+`NORMAL_CLOSURE` instead of NACKing `SECURITY_ERROR`
+(`QwpIngressProcessorState`). A private-use code would let the server tell
+the client's verbatim CLOSE echo apart from a voluntary client CLOSE that
+crossed it on the wire, but deployed fleets classify anything outside
+`NORMAL_CLOSURE`/`GOING_AWAY` as a poison strike, so that needs a
+negotiated capability first. The client
 reconnects, hits the 421 role reject on the now-replica, and retries from SF
 until a primary is reachable. Consequently:
 

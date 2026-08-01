@@ -222,6 +222,11 @@ public final class SenderPool implements AutoCloseable {
     // production; regression tests release a retired slot here to prove that
     // the terminal pass re-probes returned capacity before throwing.
     private volatile Runnable borrowWaitExpiredHook;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     // Slots removed from `all` whose delegate is still releasing its flock.
     // They keep reserving capacity (and their slotInUse mark) until the
     // flock drops, so the cap check and the slot allocator stay consistent
@@ -1410,6 +1415,11 @@ public final class SenderPool implements AutoCloseable {
         this.borrowWaitExpiredHook = hook;
     }
 
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
+    }
+
     /**
      * Raises the shutdown signal early -- without tearing down live delegates --
      * so an in-flight startup-recovery step stops promptly between slots. Direct
@@ -1484,12 +1494,20 @@ public final class SenderPool implements AutoCloseable {
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
             while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
                 try {
                     creationFinished.awaitNanos(creationRemainingNanos);
                 } catch (InterruptedException e) {
                     creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
                 }
                 creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
