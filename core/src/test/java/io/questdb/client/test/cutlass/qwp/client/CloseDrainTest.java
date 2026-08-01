@@ -291,8 +291,13 @@ public class CloseDrainTest {
                     sender.close();
                     Assert.fail("close() should have thrown a drain-timeout error");
                 } catch (LineSenderException e) {
-                    Assert.assertTrue("expected drain-timeout message, got: " + e.getMessage(),
-                            e.getMessage().contains("drain timed out"));
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected drain-timeout message, got: " + msg,
+                            msg.contains("drain timed out"));
+                    Assert.assertFalse("no outage may be named when the wire never dropped, got: " + msg,
+                            msg.contains("the wire is not draining:"));
+                    Assert.assertTrue("expected the generic guidance tail, got: " + msg,
+                            msg.contains("data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"));
                 }
                 elapsedMs = (System.nanoTime() - t0) / 1_000_000;
             }
@@ -301,6 +306,60 @@ public class CloseDrainTest {
                     elapsedMs >= timeoutMs);
             Assert.assertTrue("close() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
                     elapsedMs < timeoutMs * 4);
+        }
+    }
+
+    @Test
+    public void testCloseDrainTimeoutNamesTheReconnectOutage() throws Exception {
+        // The drain-timeout message exists to name the outage the I/O thread is
+        // riding out: a revoked token must read as an auth failure, not as a
+        // timeout-tuning problem. The server accepts the first connection, drops
+        // it on the first frame without acking, and 401s every reconnect.
+        long timeoutMs = 1500;
+        try (TestWebSocketServer server = new TestWebSocketServer(new ReceiveThenDropHandler())) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + port
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=100"
+                    + ";close_flush_timeout_millis=" + timeoutMs + ";";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            boolean closeAttempted = false;
+            try {
+                // The sender is already connected; from here every NEW handshake
+                // is rejected with 401.
+                server.setRejectWithStatus(401, "Unauthorized");
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                // The handler drops the connection on that frame. Wait until the
+                // reconnect loop has been through at least one full failed attempt
+                // so lastReconnectError holds the 401 before close() gives up.
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (sender.getTotalReconnectAttempts() < 2
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(20);
+                }
+                Assert.assertTrue("the reconnect loop must have retried against the 401",
+                        sender.getTotalReconnectAttempts() >= 2);
+                try {
+                    closeAttempted = true;
+                    sender.close();
+                    Assert.fail("close() should have thrown a drain-timeout error");
+                } catch (LineSenderException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue("expected drain-timeout prefix, got: " + msg,
+                            msg.contains("drain timed out"));
+                    Assert.assertTrue("expected the outage to be named, got: " + msg,
+                            msg.contains("the wire is not draining:"));
+                    Assert.assertTrue("expected the 401 to be named, got: " + msg,
+                            msg.contains("WebSocket upgrade rejected with HTTP 401"));
+                }
+            } finally {
+                if (!closeAttempted) {
+                    sender.close();
+                }
+            }
         }
     }
 
@@ -652,6 +711,23 @@ public class CloseDrainTest {
                 }
             }
             // frames past the first are deferred: withhold their acks
+        }
+    }
+
+    /**
+     * Receives the first frame, closes the connection without acking it, and
+     * ignores everything after -- the drop forces the sender into its reconnect
+     * loop with data still undrained.
+     */
+    private static class ReceiveThenDropHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private boolean dropped;
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (!dropped) {
+                dropped = true;
+                client.close();
+            }
         }
     }
 
