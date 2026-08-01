@@ -55,6 +55,13 @@ public class PersistedSymbolDictTest {
     // On-disk geometry, mirrored from PersistedSymbolDict so the layout-derived
     // corruption tests below read as arithmetic rather than magic numbers.
     private static final int CRC_SIZE = 4;
+    // Injected errno codes for the stat-classification seam
+    // (FilesFacade.errno() -> Files.isNotFoundError). 2 is ENOENT on POSIX and
+    // ERROR_FILE_NOT_FOUND on Windows -- a proven not-found on both; 5 is EIO
+    // on POSIX and ERROR_ACCESS_DENIED on Windows -- "not a not-found" on
+    // both, so each constant classifies identically on every platform.
+    private static final int FAKE_EIO = 5;
+    private static final int FAKE_ENOENT = 2;
     private static final int HEADER_SIZE = 8;
 
     @Rule
@@ -920,6 +927,57 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testOpenCleanRefusesWhenTheSurvivorProbeCannotDetermineExistence() throws Exception {
+        // openFresh's refuse-vs-degrade decision used to ride on an errno-blind
+        // ff.exists(): access(2) has no error channel, so a transient stat
+        // error there read as "absent" and the session proceeded full-dict from
+        // id 0 NEXT TO a populated prior-generation side-file -- the
+        // misattribution shape openFresh's own javadoc forbids. When the create
+        // fails AND the probe cannot PROVE the path absent (any errno but a
+        // not-found), the slot must be refused, never degraded to null.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-clean-ambiguous-probe");
+            try (PersistedSymbolDict first = PersistedSymbolDict.openClean(dir.toString())) {
+                first.appendSymbol("survivor");
+            }
+            Path f = dir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(f);
+            DelegatingFilesFacade ambiguous = new DelegatingFilesFacade() {
+                @Override
+                public int errno() {
+                    return FAKE_EIO;
+                }
+
+                @Override
+                public boolean exists(String path) {
+                    // The lie under test: an errno-blind existence check reads
+                    // a stat error as "absent". Trusting it must redden this
+                    // test.
+                    return false;
+                }
+
+                @Override
+                public long length(String path) {
+                    return -1L;
+                }
+
+                @Override
+                public int openCleanRW(String path) {
+                    return -1;
+                }
+            };
+            try {
+                PersistedSymbolDict.openClean(ambiguous, dir.toString());
+                Assert.fail("an undeterminable survivor state must refuse the slot, never degrade to null");
+            } catch (UnreplayableSlotException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be truncated"));
+            }
+            Assert.assertArrayEquals("refusing is not deleting: the survivor stays for an operator",
+                    before, Files.readAllBytes(f));
+        });
+    }
+
+    @Test
     public void testOpenFailuresDoNotCreateOrDestroyDictionaryFiles() throws Exception {
         assertMemoryLeak(() -> {
             Path freshDir = newFolder("qwp-symdict-fresh-open-failure");
@@ -1179,6 +1237,90 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testStatErrorNeverReadsAsAbsentEvenWhenTheExistenceCheckSaysSo() throws Exception {
+        // Errno-blind existence checks (access(2) / a boolean PathFileExists)
+        // have no error channel: a transient stat error and a genuinely absent
+        // file both read as "absent" through them, and open() used to route on
+        // exactly such a check -- silently taking the null-degrade for a file
+        // that was merely unreachable this instant. The disposition must come
+        // from the stat's errno alone: only a proven not-found takes the null
+        // arm, every other stat failure throws -- even while an errno-blind
+        // exists() is claiming the file is not there.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-stat-error-lying-exists");
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
+                d.appendSymbol("one");
+            }
+            Path f = dir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(f);
+
+            DelegatingFilesFacade ambiguousStat = new DelegatingFilesFacade() {
+                @Override
+                public int errno() {
+                    return FAKE_EIO;
+                }
+
+                @Override
+                public boolean exists(String path) {
+                    // The lie under test: routing on this must redden the test.
+                    return false;
+                }
+
+                @Override
+                public long length(String path) {
+                    return -1L;
+                }
+            };
+            try {
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(ambiguousStat, dir.toString());
+                if (reopened != null) {
+                    reopened.close();
+                }
+                Assert.fail("a non-not-found stat error must throw, never read as an absent file");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("length could not be read"));
+            }
+            Assert.assertArrayEquals("the failed stat must not touch the file",
+                    before, Files.readAllBytes(f));
+        });
+    }
+
+    @Test
+    public void testStatNotFoundErrnoTakesTheAbsentArm() throws Exception {
+        // The flip side of the stat-error disposition: a stat failure whose
+        // errno PROVES not-found (ENOENT / ERROR_FILE_NOT_FOUND) is the absent
+        // file it claims to be. Dict-less slot recovery is a routine path, so
+        // it must keep degrading to null (full-dict frames) on every platform,
+        // and must not fabricate a side-file on the way out.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-enoent");
+            final int[] openCleanCalls = {0};
+            DelegatingFilesFacade notFound = new DelegatingFilesFacade() {
+                @Override
+                public int errno() {
+                    return FAKE_ENOENT;
+                }
+
+                @Override
+                public long length(String path) {
+                    return -1L;
+                }
+
+                @Override
+                public int openCleanRW(String path) {
+                    openCleanCalls[0]++;
+                    return super.openCleanRW(path);
+                }
+            };
+            Assert.assertNull("a proven not-found must take the dictionary-less null arm",
+                    PersistedSymbolDict.open(notFound, dir.toString()));
+            Assert.assertEquals("the recovery path must never attempt to create a side-file",
+                    0, openCleanCalls[0]);
+            Assert.assertFalse(Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
+        });
+    }
+
+    @Test
     public void testExactHeaderSizeFileIsCompleteWhileOneByteShorterIsLeftAsAStub() throws Exception {
         // HEADER_SIZE shrank from 16 to 8 when the lineage stamp was removed (see
         // PersistedSymbolDict's class javadoc): a length that used to fall inside the
@@ -1401,7 +1543,7 @@ public class PersistedSymbolDictTest {
     /**
      * Fails every {@link #truncate(int, long)} -- reproducing a host where the
      * torn/stale-tail truncate cannot succeed (read-only remount, Windows share
-     * lock) so {@code open()}'s fail-clean recreate path runs.
+     * lock) so {@code open()}'s retriable fail-loud path runs.
      */
     private static final class FailingTruncateFacade extends DelegatingFilesFacade {
         @Override
@@ -1461,10 +1603,18 @@ public class PersistedSymbolDictTest {
     /**
      * Reports a length of -1 -- the stat-error sentinel -- for the dictionary file,
      * reproducing a transient stat failure (an EIO on a flaky disk) where the file is
-     * present but its size cannot be read. open() must treat this as "present but
-     * unreadable" and degrade to null, NOT route it to the truncating fresh-open path.
+     * present but its size cannot be read. open() must throw the retriable
+     * SfOperationalException, leaving every byte on disk. The paired errno()
+     * override is what classifies the fault: a facade faking length() &lt; 0
+     * without pinning an errno would leave the not-found classification to
+     * whatever the last REAL syscall set.
      */
     private static final class StatFailsLengthFacade extends DelegatingFilesFacade {
+        @Override
+        public int errno() {
+            return FAKE_EIO;
+        }
+
         @Override
         public long length(String path) {
             return -1L;

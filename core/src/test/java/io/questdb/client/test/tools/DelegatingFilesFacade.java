@@ -54,6 +54,11 @@ public class DelegatingFilesFacade implements FilesFacade {
     }
 
     @Override
+    public int errno() {
+        return INSTANCE.errno();
+    }
+
+    @Override
     public boolean exists(String path) {
         return INSTANCE.exists(path);
     }

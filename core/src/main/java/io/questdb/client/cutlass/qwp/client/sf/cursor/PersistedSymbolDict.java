@@ -254,14 +254,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * recreate, or destroy on the recovery path" note. Three-way disposition:
      * <ul>
      *   <li>Returns {@code null} ONLY when the content is provably absent or
-     *       corrupt -- the file does not exist, is a sub-header stub, carries a
-     *       bad magic/version, or is too large to reopen. The caller falls back
-     *       to full-dictionary (self-sufficient) frames for this slot, and the
-     *       disposition is sticky: nothing is created or destroyed, so a later
-     *       recovery reaches the same verdict.</li>
+     *       corrupt -- the stat proves the file does not exist (a not-found
+     *       errno, see {@link Files#isNotFoundError(int)}), or the file is a
+     *       sub-header stub, carries a bad magic/version, or is too large to
+     *       reopen. The caller falls back to full-dictionary (self-sufficient)
+     *       frames for this slot, and the disposition is sticky: nothing is
+     *       created or destroyed, so a later recovery reaches the same
+     *       verdict.</li>
      *   <li>Throws {@link SfOperationalException} for any TRANSIENT I/O failure
-     *       against a file that does or might exist -- a stat error, a failed
-     *       open, a failed mmap/read, a failed torn-tail truncate, or a
+     *       against a file that does or might exist -- a stat failure other
+     *       than a proven not-found, a failed open, a failed mmap/read, a
+     *       failed torn-tail truncate, or a
      *       late-delivered mmap fault. Every byte is left on disk for a retry
      *       once the transient clears; {@code Sender.build()} aborts construction
      *       without quarantining and {@code BackgroundDrainer} leaves the slot for
@@ -282,24 +285,32 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        boolean exists = ff.exists(filePath);
-        long existing = exists ? ff.length(filePath) : -1L;
-        if (exists && existing < 0) {
-            // The file is present but its length could not be stat'd (a transient
-            // EIO on a flaky disk). Fail LOUDLY and retriably. Degrading here --
-            // running this session on full-dict frames next to a stale populated
-            // side-file -- is the entry point of the cross-generation
-            // misattribution chain: a later recovery would trust the survivor
-            // against frames it never described. A genuine sub-header stub
-            // reports a length in [0, HEADER_SIZE); only a stat error reports
-            // < 0, so the two are distinguishable. The file is left intact;
-            // Sender.build() aborts without quarantining and BackgroundDrainer
-            // leaves the slot for a later scan, so a retry once the transient
-            // clears recovers the slot in full.
-            throw new SfOperationalException("symbol dict " + filePath
-                    + " exists but its length could not be read; file left intact for a retry");
-        }
-        if (existing >= HEADER_SIZE) {
+        long existing = ff.length(filePath);
+        if (existing < 0) {
+            // The stat failed. Only a proven not-found errno may take the
+            // absent arm below -- mirroring the Rust client's open_recovered,
+            // which maps ErrorKind::NotFound to "absent" and errors on every
+            // other stat failure. Any other errno (a transient EIO on a flaky
+            // disk, a permission fault) leaves existence UNKNOWN, and treating
+            // unknown as absent would silently degrade this session to
+            // full-dict frames next to a possibly populated side-file -- the
+            // entry point of the cross-generation misattribution chain: a
+            // later recovery would trust the survivor against frames it never
+            // described. (An errno-blind ff.exists() -- access(2) / a boolean
+            // PathFileExists -- used to route here and had exactly that hole:
+            // every stat error read as "absent".) Fail LOUDLY and retriably
+            // instead: the file, if any, is left intact; Sender.build() aborts
+            // without quarantining and BackgroundDrainer leaves the slot for a
+            // later scan, so a retry once the transient clears recovers the
+            // slot in full.
+            int errno = ff.errno();
+            if (!Files.isNotFoundError(errno)) {
+                throw new SfOperationalException("symbol dict " + filePath
+                        + " length could not be read (errno=" + errno
+                        + "); file left intact for a retry");
+            }
+            // Proven absent: fall through to the absent arm below.
+        } else if (existing >= HEADER_SIZE) {
             // Chunk lengths and the retained contiguous entry region are int-sized,
             // so a dictionary at or past Integer.MAX_VALUE cannot be represented
             // safely even though production recovery maps rather than reads it.
@@ -805,7 +816,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 } else {
                     Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
                 }
-                ff.close(fd);
+                // Zero after release and relinquish the fd before closing it
+                // (the success path and openFresh use the same discipline): if
+                // close -- or anything after it -- threw through the ff seam,
+                // the catch below would otherwise release both a second time.
+                inputAddr = 0L;
+                int fdToClose = fd;
+                fd = -1;
+                ff.close(fdToClose);
                 LOG.warn("symbol dict {} has bad magic or unknown version; falling back to "
                         + "full-dictionary frames (file left intact)", filePath);
                 return null;
@@ -855,19 +873,28 @@ public final class PersistedSymbolDict implements QuietCloseable {
             inFlight[0] = dict;
             return dict;
         } catch (Throwable t) {
-            if (inputAddr != 0L) {
-                if (mappedInput) {
-                    ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
-                } else {
-                    Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
+            // Cleanup runs in exactly ONE frame. Once inFlight[0] is set, the
+            // dict owns entriesAddr (as loadedEntriesAddr) and fd, inputAddr is
+            // already released and zeroed, and open()'s holder catch closes the
+            // dict -- yet a late async unsafe-access fault CAN still land in
+            // THIS frame, on the return poll after the publish. Releasing the
+            // locals here as well and then rethrowing would have the holder
+            // free the same buffer and close the same fd a second time.
+            if (inFlight[0] == null) {
+                if (inputAddr != 0L) {
+                    if (mappedInput) {
+                        ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
+                    } else {
+                        Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
+                    }
                 }
-            }
-            if (entriesAddr != 0L) {
-                // capacity, not entriesLen: the shrink may not have happened yet.
-                Unsafe.free(entriesAddr, entriesCapacity, MemoryTag.NATIVE_DEFAULT);
-            }
-            if (fd >= 0) {
-                ff.close(fd);
+                if (entriesAddr != 0L) {
+                    // capacity, not entriesLen: the shrink may not have happened yet.
+                    Unsafe.free(entriesAddr, entriesCapacity, MemoryTag.NATIVE_DEFAULT);
+                }
+                if (fd >= 0) {
+                    ff.close(fd);
+                }
             }
             if (t instanceof SfOperationalException) {
                 throw (SfOperationalException) t;
@@ -998,20 +1025,31 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath) {
         int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
-            if (ff.exists(filePath)) {
+            // Route the refuse-vs-degrade decision on what a stat PROVES, not
+            // on an errno-blind ff.exists() (access(2) / a boolean
+            // PathFileExists collapses every stat error to "absent"): only a
+            // not-found errno proves there is nothing here to protect. A file
+            // that exists -- or whose state cannot be determined -- takes the
+            // refuse arm, never the null-degrade.
+            long len = ff.length(filePath);
+            if (len >= 0 || !Files.isNotFoundError(ff.errno())) {
                 // A fresh slot MUST start with an empty dictionary. Proceeding without one
                 // leaves the previous generation's entries on disk while this session
                 // writes rows against a fresh id space from 0, and the next recovery
                 // cannot distinguish the two: the ids overlap, the CRC is valid, and the
                 // catch-up registers the wrong strings under ids this generation's rows
                 // reference. Refuse the slot; the bytes stay on disk for an operator.
-                // Typed as UnreplayableSlotException (rather than a plain
-                // LineSenderException) so Sender.build()'s constructor-time catch
-                // quarantines this fresh, dataless slot instead of bricking every
-                // restart under a stable senderId.
+                // Same verdict when the probe itself failed with anything but a
+                // not-found: a survivor MAY be there, and degrading next to it
+                // would hand the next recovery a side-file this session's rows
+                // never described. Typed as UnreplayableSlotException (rather
+                // than a plain LineSenderException) so Sender.build()'s
+                // constructor-time catch quarantines this fresh, dataless slot
+                // instead of bricking every restart under a stable senderId.
                 throw new UnreplayableSlotException("symbol dict ").put(filePath)
-                        .put(" already exists and cannot be truncated (rc=").put(fd)
-                        .put("); refusing to start on a slot whose dictionary describes a")
+                        .put(" already exists (or its state cannot be determined) and cannot be")
+                        .put(" truncated (rc=").put(fd)
+                        .put("); refusing to start on a slot whose dictionary may describe a")
                         .put(" different id space -- move or remove it by hand");
             }
             LOG.warn("symbol dict {} could not be created (rc={}); proceeding without it", filePath, fd);

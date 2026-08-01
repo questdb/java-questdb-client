@@ -180,13 +180,13 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testUnopenableDictRebuildsFromFramesFromIdZero() throws Exception {
+    public void testAbsentDictRebuildsFromFramesFromIdZero() throws Exception {
         // Same rebuild, but the persisted dictionary is ABSENT rather than torn. The
         // producer's seed used to be gated on the dictionary having opened, which made the
-        // whole rebuild dead code for exactly this case. (This used to plant a same-name
-        // DIRECTORY to model an unopenable dictionary; open() no longer degrades on that --
-        // it throws SfOperationalException -- so a plain delete is the fixture that still
-        // reaches the null-degrade this test exercises.)
+        // whole rebuild dead code for exactly this case. (An earlier revision planted a
+        // same-name DIRECTORY to model an unopenable dictionary; open() no longer degrades
+        // on that -- it throws SfOperationalException -- so a plain delete is the fixture
+        // that still reaches the null-degrade this test exercises.)
         assertMemoryLeak(() -> {
             recordSixDeltaFrames();
             java.nio.file.Path slot = Paths.get(sfDir, "default");
@@ -198,7 +198,7 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testUnopenableDictRebuildsFromFramesAcrossTheAckWatermark() throws Exception {
+    public void testAbsentDictRebuildsFromFramesAcrossTheAckWatermark() throws Exception {
         // The hardest of the three: the dictionary is ABSENT (see the sibling test above for
         // why a directory-plant no longer reaches this path) AND the replay set starts at
         // deltaStart=3, so ids 0..2 exist nowhere except the acked frames on disk.
@@ -598,9 +598,9 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
-    public void testUnopenableDictSeedsTheProducerAboveTheRecoveredIds() throws Exception {
+    public void testAbsentDictSeedsTheProducerAboveTheRecoveredIds() throws Exception {
         // The producer must resume ABOVE the ids the recovered frames already define, even when
-        // the dictionary is absent (see testUnopenableDictRebuildsFromFramesFromIdZero for why a
+        // the dictionary is absent (see testAbsentDictRebuildsFromFramesFromIdZero for why a
         // directory-plant no longer models this -- open() now throws instead of degrading).
         //
         // seedGlobalDictionaryFromPersisted used to be gated on deltaDictEnabled, which is false
@@ -1988,8 +1988,17 @@ public class DeltaDictRecoveryTest {
 
             // Session B: recovery hits a transient stat fault on the side-file.
             // Construction must fail with SfOperationalException -- not degrade,
-            // not quarantine.
+            // not quarantine. The errno override pins the fault's
+            // classification: 5 is EIO on POSIX and ERROR_ACCESS_DENIED on
+            // Windows, "not a not-found" on both, so the faked length() < 0
+            // deterministically takes the transient arm instead of whatever the
+            // last real syscall left in errno.
             DelegatingFilesFacade statFault = new DelegatingFilesFacade() {
+                @Override
+                public int errno() {
+                    return 5;
+                }
+
                 @Override
                 public long length(String path) {
                     if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {

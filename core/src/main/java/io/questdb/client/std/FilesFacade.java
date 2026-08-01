@@ -65,6 +65,21 @@ public interface FilesFacade {
 
     int close(int fd);
 
+    /**
+     * The error code of this thread's most recent failed filesystem call:
+     * {@code errno} on POSIX, the saved {@code GetLastError()} value on
+     * Windows (see {@link Os#errno()}). Meaningful only when read immediately
+     * after a facade call reported failure. Lives on the facade so a
+     * fault-injecting test can pin a deterministic code next to an injected
+     * failure -- a facade that fakes {@code length(path) < 0} must also fake
+     * the errno that classifies it (e.g. via
+     * {@link Files#isNotFoundError(int)}), or the classification would read
+     * whatever the last REAL syscall left behind.
+     */
+    default int errno() {
+        return Os.errno();
+    }
+
     boolean exists(String path);
 
     void findClose(long findPtr);

@@ -1629,7 +1629,10 @@ public final class CursorSendEngine implements QuietCloseable {
 
     /**
      * The engine's persisted symbol dictionary, or {@code null} in memory mode
-     * (and in disk mode if it failed to open). The producer appends new symbols
+     * (and in disk mode when recovery proved the side-file absent or corrupt,
+     * or a fresh slot could not create one -- a TRANSIENT open failure never
+     * lands here: it throws {@link SfOperationalException} out of the
+     * constructor, so no engine exists). The producer appends new symbols
      * to it; recovery / orphan-drain read its loaded entries to seed catch-up.
      */
     public PersistedSymbolDict getPersistedSymbolDict() {
