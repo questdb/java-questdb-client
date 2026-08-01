@@ -940,7 +940,8 @@ public final class SegmentManager implements QuietCloseable {
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     LOG.warn("SF {}: cannot provision spare in {} "
                                     + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
-                                    + "Producer is backpressured until ACK-driven trim frees space.",
+                                    + "Producer is backpressured until ACK-driven trim frees segment "
+                                    + "space; side-file bytes are not reclaimed by trim.",
                             memoryMode ? "memory cap reached" : "disk-full",
                             memoryMode ? "<memory>" : e.dir, observedTotal, observedSideFileBytes,
                             maxTotalBytes, segmentSizeBytes);
