@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -44,8 +45,6 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -74,6 +73,13 @@ public class DeltaDictRecoveryTest {
 
     private static final int DISTINCT_SYMBOLS = 8;
     private static final int ROWS = 40;
+    // writeAndTearUnreplayableSlot arithmetic: 12 one-symbol frames, FSNs 0..11,
+    // acks held at 10 so frame 11 stays unacked and keeps the slot alive across
+    // close(). recoveredCommitBoundaryFsn is therefore 11; stamping the watermark
+    // at 11 afterwards produces the fully-acked recovery, leaving it produces the
+    // unacked (quarantine) recovery.
+    private static final int ACK_THROUGH = 10;
+    private static final int FRAMES = 12;
 
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
@@ -353,23 +359,6 @@ public class DeltaDictRecoveryTest {
         });
     }
 
-    /**
-     * DISABLED by the upstream merge -- the premise, not the assertion, is what
-     * broke. See {@link #writeAndTearUnreplayableSlot()}: its raw delete of
-     * {@code sf-initial.sfa} no longer models an ack-driven trim now that a real
-     * trim durably advances the {@code SfManifest} head before unlinking. What
-     * recovery sees instead is a committed head boundary whose file is gone, and
-     * it fails closed on that BEFORE consulting the ack watermark this test
-     * writes -- so the slot is set aside and the "resumes in place" assertion
-     * cannot hold.
-     * <p>
-     * Whether a slot whose watermark proves every frame acked should still fail
-     * closed on a missing head is an upstream design question (the manifest is
-     * the durable boundary record; the watermark is best-effort), not something
-     * this test can settle. Re-enable once the fixture can trim the head the way
-     * the manager does.
-     */
-    @org.junit.Ignore("fixture no longer models an ack-driven trim; see javadoc")
     @Test
     public void testFullyAckedTornSlotResumesInPlaceWithoutQuarantine() throws Exception {
         // M1 regression -- the ACKED counterpart to
@@ -407,6 +396,17 @@ public class DeltaDictRecoveryTest {
                 // build() must succeed WITHOUT setting the slot aside, and the producer
                 // must keep working on the SAME slot.
                 try (Sender s2 = Sender.fromConfig(cfg)) {
+                    // Pin the branch, not just the outcome: the fixture must land exactly
+                    // on the acked-gap boundary (QwpWebSocketSender's ackedFsn >=
+                    // commitBoundaryFsn test at its == edge). Without this, the test could
+                    // pass because no gap was detected at all.
+                    CursorSendEngine recovered =
+                            ((QwpWebSocketSender) s2).getCursorEngineForTesting();
+                    Assert.assertTrue("the fixture must leave surviving frames whose deltas "
+                                    + "start above the torn dictionary",
+                            recovered.recoveredMaxSymbolDeltaStart() > 0);
+                    Assert.assertEquals("the fixture must land exactly on the acked-gap boundary",
+                            recovered.recoveredCommitBoundaryFsn(), recovered.ackedFsn());
                     s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
                     s2.flush();
                     long deadline = System.currentTimeMillis() + 10_000;
@@ -518,9 +518,9 @@ public class DeltaDictRecoveryTest {
                         Sender.fromConfig(cfg).close();
                         Assert.fail("build() must throw when the unreplayable slot rename fails");
                     } catch (LineSenderException expected) {
-                        // The cause text tracks whichever recovery verdict fires first
-                        // (see writeAndTearUnreplayableSlot's note); what this test pins
-                        // is the OPERATOR-FACING tail: a failed set-aside must say the
+                        // writeAndTearUnreplayableSlot now deterministically produces the
+                        // dictionary-gap verdict (UnreplayableSlotException); what this test
+                        // pins is the OPERATOR-FACING tail: a failed set-aside must say the
                         // slot cannot be started until it is moved by hand, and must name
                         // the rename it attempted.
                         Assert.assertTrue(expected.getMessage(),
@@ -548,53 +548,103 @@ public class DeltaDictRecoveryTest {
         });
     }
 
-    // Writes 12 delta frames (each introducing a new symbol) into the default slot
-    // across several small segments, then makes the slot GENUINELY unreplayable: trims
-    // the segment holding the earliest ids (munmap + unlink, exactly what SegmentManager
-    // does once they are acked) and tears the .symbol-dict down to its header, so the
-    // surviving frames' deltas start above ids nothing on disk still holds. Recovering
-    // such a slot throws UnreplayableSlotException.
-    /**
-     * NOTE (upstream merge): this fixture no longer reaches the dictionary-gap
-     * verdict it was written for. Deleting {@code sf-initial.sfa} modelled an
-     * ack-driven trim when a trim was just an unlink; since {@code SfManifest}
-     * landed, a real trim durably advances {@code headBase} BEFORE unlinking
-     * (SegmentRing.advanceManifestHeadPast), so a raw delete now presents as a
-     * head segment that vanished outside the protocol and
-     * {@code SegmentRing.recover} fails closed on the boundary check first --
-     * before {@code seedGlobalDictionaryFromPersisted} ever runs.
-     * <p>
-     * The tests below therefore still assert the right OUTCOME (the slot is set
-     * aside, its bytes preserved, the producer keeps working) but they now reach
-     * it through the chain-boundary check rather than the dictionary-gap check.
-     * Restoring the original coverage needs a fixture that trims the head the way
-     * the manager does -- advancing the manifest head durably -- which needs a
-     * test seam that does not exist yet.
-     */
+    // Leaves the default slot in the genuine post-trim torn state, reached the way
+    // production reaches it: a real sender, a real acked prefix (frames 0..ACK_THROUGH),
+    // and the SegmentManager's own trim, which durably advances the manifest headBase
+    // before unlinking -- the step a raw delete used to fake. The unacked tail
+    // (frames above ACK_THROUGH) keeps the slot alive across close(). The dictionary
+    // is then torn down to its 8-byte header (structurally valid, zero entries), so
+    // the surviving frames' deltas start above ids nothing on disk still holds and
+    // recovery reaches the dictionary-gap verdict in seedGlobalDictionaryFromPersisted:
+    // ackedFsn < recoveredCommitBoundaryFsn throws UnreplayableSlotException; a
+    // watermark hand-stamped at the commit boundary (writeAckWatermark) resumes in place.
     private void writeAndTearUnreplayableSlot() throws Exception {
-        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-            int port = silent.getPort();
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
-            // Small segments so the frames roll into several files and the earliest ones
-            // can be trimmed away independently.
+        java.nio.file.Path slot = Paths.get(sfDir, "default");
+        try (TestWebSocketServer server = new TestWebSocketServer(new PrefixAckHandler(ACK_THROUGH))) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // Small segments so the frames roll into several files and the acked
+            // prefix's segments can be trimmed away independently.
             String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
                     + ";sf_max_segment_bytes=256;close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg)) {
-                for (int i = 0; i < 12; i++) {
+                for (int i = 0; i < FRAMES; i++) {
                     s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                     s1.flush();
                 }
+                Assert.assertTrue("the acked prefix must be acknowledged",
+                        s1.awaitAckedFsn(ACK_THROUGH, 10_000));
+                // The manager's worker (1 ms poll) unlinks the head segment only AFTER
+                // advanceManifestHeadPast committed the new headBase, so waiting on the
+                // file's disappearance is waiting on a manifest-correct trim.
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (java.nio.file.Files.exists(slot.resolve("sf-initial.sfa"))
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertFalse("the manager must have trimmed the acked head segment",
+                        java.nio.file.Files.exists(slot.resolve("sf-initial.sfa")));
             }
         }
-        java.nio.file.Path slot = Paths.get(sfDir, "default");
-        Assert.assertTrue("the frames must have rolled into more than one segment",
-                countSegmentFiles(slot) > 1);
-        // TRIM the segment that holds the earliest frames.
-        java.nio.file.Files.delete(slot.resolve("sf-initial.sfa"));
-        // ...and tear the dictionary away as well, so nothing holds those ids at all.
+        // The unacked tail kept the slot from being cleaned up on close().
+        Assert.assertTrue("surviving frames must remain on disk", countSegmentFiles(slot) >= 1);
+        // Tear the dictionary to its header: zero entries, still structurally valid.
         java.nio.file.Path dict = slot.resolve(".symbol-dict");
         java.nio.file.Files.write(dict, Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8));
+    }
+
+    /**
+     * A committed head segment that vanishes OUTSIDE the trim protocol (no manifest
+     * advance) is proven corruption: recovery fails closed on the manifest boundary
+     * inside the engine constructor -- before any dictionary verdict runs -- and
+     * build() sets the slot aside through the constructor arm. The torn-dict
+     * fixtures used to reach this check by accident; this test keeps it covered
+     * deliberately.
+     */
+    @Test
+    public void testHeadSegmentMissingOutsideTrimProtocolIsSetAside() throws Exception {
+        assertMemoryLeak(() -> {
+            // No acks: nothing trims, every segment file stays put.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=256;close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < FRAMES; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            Assert.assertTrue("the frames must have rolled into more than one segment",
+                    countSegmentFiles(slot) > 1);
+            // Raw unlink: the manifest still names this segment as the committed head.
+            java.nio.file.Files.delete(slot.resolve("sf-initial.sfa"));
+
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // build() must set the corrupt slot aside and start on a fresh one.
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "fresh").longColumn("v", 1).atNow();
+                    s2.flush();
+                }
+            }
+            java.nio.file.Path aside = Paths.get(sfDir, "default.unreplayable-0");
+            Assert.assertTrue("the corrupt slot must be set aside",
+                    java.nio.file.Files.isDirectory(aside));
+            String reason = new String(
+                    java.nio.file.Files.readAllBytes(aside.resolve(".failed")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            Assert.assertTrue("the .failed sentinel must carry the chain-boundary verdict, got: " + reason,
+                    reason.contains("missing expected SF head segment"));
+        });
     }
 
     @Test
@@ -1606,12 +1656,21 @@ public class DeltaDictRecoveryTest {
     }
 
     private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {
-        byte[] buf = new byte[16];
-        ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
-        bb.putInt(0x31574B41); // 'AKW1'
-        bb.putInt(0);          // reserved
-        bb.putLong(fsn);
-        java.nio.file.Files.write(path, buf);
+        // Go through the production AckWatermark API rather than hand-rolling the
+        // on-disk layout: AckWatermark.open() resets any file that is not its
+        // current 8192-byte, CRC/generation-protected size (see its "wrong-sized
+        // files ... are reset" contract), so a hand-rolled stub the wrong size
+        // is silently discarded on the very next open -- read() then returns
+        // INVALID and recovery falls back to the segment-derived seed instead of
+        // this watermark.
+        AckWatermark watermark = AckWatermark.open(path.getParent().toString());
+        Assert.assertNotNull("ack watermark must open for the test fixture", watermark);
+        try {
+            watermark.write(fsn);
+            watermark.sync();
+        } finally {
+            watermark.close();
+        }
     }
 
     /**
@@ -1735,6 +1794,32 @@ public class DeltaDictRecoveryTest {
         }
     }
 
+    // ACKs wire sequences [0 .. ackThroughSeq] and then goes silent. The acked
+    // prefix lets the live SegmentManager trim its sealed head segments -- durably
+    // advancing the manifest headBase before unlinking, exactly like production --
+    // while the unacked tail keeps the slot alive across close().
+    private static final class PrefixAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final long ackThroughSeq;
+        private long nextSeq;
+
+        PrefixAckHandler(long ackThroughSeq) {
+            this.ackThroughSeq = ackThroughSeq;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq = nextSeq++;
+            if (seq > ackThroughSeq) {
+                return; // silent from here: the tail stays unacked on disk
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     /**
      * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
      * leaving a file behind at its path -- the fault shape a transient failure
@@ -1794,6 +1879,15 @@ public class DeltaDictRecoveryTest {
                 hasSegmentFile(aside));
         Assert.assertTrue("the set-aside slot must carry the .failed sentinel",
                 java.nio.file.Files.exists(aside.resolve(".failed")));
+        try {
+            String reason = new String(
+                    java.nio.file.Files.readAllBytes(aside.resolve(".failed")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            Assert.assertTrue("the set-aside must carry the dictionary-gap verdict, got: " + reason,
+                    reason.contains("symbol dictionary is incomplete"));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
         Assert.assertTrue("the sender must continue on a live slot",
                 java.nio.file.Files.isDirectory(Paths.get(sfDir, "default")));
     }
