@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -63,6 +64,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  */
 public class CursorWebSocketSendLoopTornDictGuardTest {
 
+    private static final int ACK_THROUGH = 10;
+    private static final int FRAMES = 12;
+
     private String sfDir;
 
     @Before
@@ -79,21 +83,6 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
         TestUtils.removeTmpDirRec(sfDir);
     }
 
-    /**
-     * DISABLED by the upstream merge, for the same reason as
-     * {@code DeltaDictRecoveryTest.testFullyAckedTornSlotResumesInPlaceWithoutQuarantine}:
-     * {@link #writeAndTearGappedSlot()} deletes {@code sf-initial.sfa} to model an
-     * ack-driven trim, but since {@code SfManifest} landed a real trim durably
-     * advances {@code headBase} before unlinking. Recovery now fails closed on the
-     * missing head boundary inside {@code new CursorSendEngine(...)}, so the send
-     * loop -- and therefore the torn-dict guard this test exists to pin -- is never
-     * reached. The guard itself is unchanged by this merge.
-     * <p>
-     * Re-enable once the fixture can trim the head the way the manager does
-     * (acknowledge, let the manager's trim pass advance the manifest, then tear
-     * the dictionary).
-     */
-    @org.junit.Ignore("fixture no longer models an ack-driven trim; see javadoc")
     @Test
     public void testGuardFiresOnGenuineGapAndShipsNoFrame() throws Exception {
         assertMemoryLeak(() -> {
@@ -101,6 +90,9 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
 
             CountingClient client = new CountingClient();
             try (CursorSendEngine engine = new CursorSendEngine(sfDir + "/default", 16_384)) {
+                Assert.assertTrue("the fixture must leave recovered frames whose deltas start "
+                                + "above the torn dictionary -- otherwise the guard has nothing to refuse",
+                        engine.recoveredMaxSymbolDeltaStart() > 0);
                 // The persisted dict was torn away and the registering frames trimmed, so
                 // the mirror cannot be seeded from either source: sentDictCount stays 0
                 // while the first surviving frame's delta starts above it.
@@ -157,28 +149,36 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
     }
 
     // Writes 12 delta frames (each a new symbol) into the default slot across several
-    // small segments, then makes the slot carry a GENUINE gap: trims the segment
-    // holding the earliest ids (munmap + unlink, as SegmentManager does once they are
-    // acked) and tears the .symbol-dict down to its header. The surviving frames' deltas
-    // then start above ids nothing on disk still holds, so the mirror cannot be rebuilt.
+    // small segments, ACKs frames 0..ACK_THROUGH so the live SegmentManager performs a
+    // real, manifest-correct trim of the acked head segments, then tears the
+    // .symbol-dict down to its header. The surviving frames' deltas start above ids
+    // nothing on disk still holds, so the recovered mirror cannot be rebuilt and the
+    // pre-send guard must refuse the first frame.
     private void writeAndTearGappedSlot() throws Exception {
-        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
-            int port = silent.getPort();
-            silent.start();
-            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+        Path slot = Paths.get(sfDir, "default");
+        try (TestWebSocketServer server = new TestWebSocketServer(new PrefixAckHandler(ACK_THROUGH))) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
                     + ";sf_max_segment_bytes=256;close_flush_timeout_millis=0;";
             try (Sender s = Sender.fromConfig(cfg)) {
-                for (int i = 0; i < 12; i++) {
+                for (int i = 0; i < FRAMES; i++) {
                     s.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
                     s.flush();
                 }
+                Assert.assertTrue("the acked prefix must be acknowledged",
+                        s.awaitAckedFsn(ACK_THROUGH, 10_000));
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (Files.exists(slot.resolve("sf-initial.sfa"))
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertFalse("the manager must have trimmed the acked head segment",
+                        Files.exists(slot.resolve("sf-initial.sfa")));
             }
         }
-        Path slot = Paths.get(sfDir, "default");
-        Assert.assertTrue("the frames must have rolled into more than one segment",
-                countSegmentFiles(slot) > 1);
-        Files.delete(slot.resolve("sf-initial.sfa"));
+        Assert.assertTrue("surviving frames must remain on disk", countSegmentFiles(slot) >= 1);
         Path dict = slot.resolve(".symbol-dict");
         Files.write(dict, Arrays.copyOf(Files.readAllBytes(dict), 8));
     }
@@ -216,10 +216,25 @@ public class CursorWebSocketSendLoopTornDictGuardTest {
         }
     }
 
-    private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+    private static final class PrefixAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final long ackThroughSeq;
+        private long nextSeq;
+
+        PrefixAckHandler(long ackThroughSeq) {
+            this.ackThroughSeq = ackThroughSeq;
+        }
+
         @Override
-        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-            // never acks -- the sender leaves everything unacked in the slot
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq = nextSeq++;
+            if (seq > ackThroughSeq) {
+                return; // silent from here: the tail stays unacked on disk
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
         }
     }
 }
