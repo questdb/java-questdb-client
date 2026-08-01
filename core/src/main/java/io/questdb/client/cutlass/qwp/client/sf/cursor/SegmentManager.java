@@ -600,6 +600,18 @@ public final class SegmentManager implements QuietCloseable {
      * A positive interval requires disk-backed store-and-forward mode.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos) {
+        register(ring, dir, watermark, syncIntervalNanos, null);
+    }
+
+    /**
+     * Same as {@link #register(SegmentRing, String, AckWatermark, long)} but
+     * also wires a live gauge of the slot's {@code .symbol-dict} side-file
+     * bytes. The manager reads the gauge at every provisioning cap check so
+     * the dictionary counts against {@code sf_max_total_bytes} alongside the
+     * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
+     * mode, degraded full-dict sessions).
+     */
+    public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {
             throw new IllegalArgumentException("syncIntervalNanos must not be negative");
         }
@@ -619,7 +631,7 @@ public final class SegmentManager implements QuietCloseable {
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
-        RingEntry e = new RingEntry(ring, dir, watermark, syncIntervalNanos, ticks.getAsLong());
+        RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
@@ -653,6 +665,31 @@ public final class SegmentManager implements QuietCloseable {
     public SegmentRing getInServiceRingForTesting() {
         RingEntry entry = inService;
         return entry == null ? null : entry.ring;
+    }
+
+    // Callers must hold `lock` (the rings list is mutated under it). The
+    // side-file bytes are read live from each slot's gauge instead of being
+    // folded into the incremental totalBytes counter: the dictionary grows
+    // out-of-band on producer threads, so an incremental mirror would
+    // drift, while a live read cannot. Each gauge takes its dictionary's
+    // own monitor -- a leaf lock (no dict method reaches back into the
+    // manager), so lock -> dict monitor is the only nesting order.
+    private long sideFileBytesLocked() {
+        long total = 0L;
+        for (int i = 0, n = rings.size(); i < n; i++) {
+            LongSupplier gauge = rings.get(i).sideFileBytes;
+            if (gauge != null) {
+                total += gauge.getAsLong();
+            }
+        }
+        return total;
+    }
+
+    @TestOnly
+    public long getCapAccountedBytesForTesting() {
+        synchronized (lock) {
+            return totalBytes + sideFileBytesLocked();
+        }
     }
 
     @TestOnly
@@ -887,21 +924,26 @@ public final class SegmentManager implements QuietCloseable {
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
         if (e.ring.needsHotSpare()) {
-            // Snapshot totalBytes under lock — register/deregister can mutate
-            // it from caller threads. Heavy provisioning I/O happens outside
-            // the lock; the post-install commit re-acquires it.
+            // Snapshot totalBytes under lock -- register/deregister can mutate
+            // it from caller threads -- and add the live side-file bytes of
+            // every registered slot, so .symbol-dict growth counts against the
+            // cap. Heavy provisioning I/O happens outside the lock; the
+            // post-install commit re-acquires it.
             long observedTotal;
+            long observedSideFileBytes;
             synchronized (lock) {
-                observedTotal = totalBytes;
+                observedSideFileBytes = sideFileBytesLocked();
+                observedTotal = totalBytes + observedSideFileBytes;
             }
             if (observedTotal + segmentSizeBytes > maxTotalBytes) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     LOG.warn("SF {}: cannot provision spare in {} "
-                                    + "(totalBytes={}, cap={}, segmentSize={}). "
+                                    + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
                                     + "Producer is backpressured until ACK-driven trim frees space.",
                             memoryMode ? "memory cap reached" : "disk-full",
-                            memoryMode ? "<memory>" : e.dir, observedTotal, maxTotalBytes, segmentSizeBytes);
+                            memoryMode ? "<memory>" : e.dir, observedTotal, observedSideFileBytes,
+                            maxTotalBytes, segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
             } else {
@@ -1337,6 +1379,11 @@ public final class SegmentManager implements QuietCloseable {
     private static final class RingEntry {
         final String dir;
         final SegmentRing ring;
+        // Live gauge of the slot's .symbol-dict side-file bytes, or null when
+        // the slot has no dictionary (memory mode, degraded full-dict
+        // sessions). Read at the provisioning cap check only -- never folded
+        // into totalBytes, which stays a segments-only counter.
+        final LongSupplier sideFileBytes;
         final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
         // mode and for callers that didn't supply one. Manager-thread
@@ -1374,12 +1421,14 @@ public final class SegmentManager implements QuietCloseable {
                 SegmentRing ring,
                 String dir,
                 AckWatermark watermark,
+                LongSupplier sideFileBytes,
                 long syncIntervalNanos,
                 long now
         ) {
             this.ring = ring;
             this.dir = dir;
             this.watermark = watermark;
+            this.sideFileBytes = sideFileBytes;
             this.syncIntervalNanos = syncIntervalNanos;
             // Run the first periodic pass immediately. This establishes a
             // durable baseline for segments recovered from MEMORY mode.
