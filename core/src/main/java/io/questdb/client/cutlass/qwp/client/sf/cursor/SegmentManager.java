@@ -610,6 +610,11 @@ public final class SegmentManager implements QuietCloseable {
      * the dictionary counts against {@code sf_max_total_bytes} alongside the
      * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
      * mode, degraded full-dict sessions).
+     * <p>
+     * The gauge is invoked with the manager's internal lock held, so it must
+     * be wait-free and must not throw: a throwing gauge terminates the
+     * manager worker for every registered ring, and a blocking gauge stalls
+     * register/deregister for all slots.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {

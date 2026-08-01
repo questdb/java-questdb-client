@@ -37,6 +37,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Regression for P-C8: the {@code sf_max_total_bytes} cap check compared
@@ -113,7 +114,14 @@ public class SegmentManagerSideFileCapTest {
             try (SegmentManager ignored = manager) {
                 manager.start();
                 manager.register(ring, slotDir, null, 0L, null);
-                Thread.sleep(100);
+                // Poll instead of a fixed sleep: this is a must-provision assertion, and
+                // a flat 100ms sleep flakes on a loaded CI box where the worker's 1ms tick
+                // gets delayed past the sleep window. Bound the poll with a deadline so a
+                // genuine regression still fails instead of hanging.
+                long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (countSfaFiles(slotDir) != 3 && System.nanoTime() < deadlineNanos) {
+                    Thread.sleep(5);
+                }
             }
 
             Assert.assertEquals("without the gauge the manager must fill the cap exactly",

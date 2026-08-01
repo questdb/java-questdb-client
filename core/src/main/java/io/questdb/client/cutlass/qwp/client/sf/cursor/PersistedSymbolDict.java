@@ -210,7 +210,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
     private long appendMapCapacity;
     private long appendMapOffset;
     private int appendMapGrowthCount;
-    private long appendOffset;
+    // Single writer under this object's monitor (every append/close method is
+    // synchronized); volatile so the manager's cap-check gauge (appendedBytes())
+    // reads it wait-free -- and 64-bit-atomically -- without taking the monitor
+    // a producer may hold across append I/O.
+    private volatile long appendOffset;
     private long appendWriteCount;
     private boolean closed;
     // In-memory copy of the WIRE entry region [len][utf8]... -- chunk headers and
@@ -658,8 +662,12 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * truncates away. {@code SegmentManager} reads this through the gauge
      * wired at engine registration so the dictionary counts against the
      * {@code sf_max_total_bytes} cap alongside the {@code .sfa} segments.
+     * <p>
+     * The read is wait-free -- a volatile read of the offset the last
+     * committed chunk advanced -- so the {@code SegmentManager} worker never
+     * blocks on this dictionary's monitor while holding its own lock.
      */
-    public synchronized long appendedBytes() {
+    public long appendedBytes() {
         return appendOffset;
     }
 
