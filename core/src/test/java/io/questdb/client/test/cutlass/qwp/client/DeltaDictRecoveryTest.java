@@ -180,16 +180,17 @@ public class DeltaDictRecoveryTest {
 
     @Test
     public void testUnopenableDictRebuildsFromFramesFromIdZero() throws Exception {
-        // Same rebuild, but the dictionary cannot be OPENED at all (fd exhaustion, a
-        // read-only remount, ENOSPC -- modelled by planting a directory in its place). The
+        // Same rebuild, but the persisted dictionary is ABSENT rather than torn. The
         // producer's seed used to be gated on the dictionary having opened, which made the
-        // whole rebuild dead code for exactly this case.
+        // whole rebuild dead code for exactly this case. (This used to plant a same-name
+        // DIRECTORY to model an unopenable dictionary; open() no longer degrades on that --
+        // it throws SfOperationalException -- so a plain delete is the fixture that still
+        // reaches the null-degrade this test exercises.)
         assertMemoryLeak(() -> {
             recordSixDeltaFrames();
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
             java.nio.file.Files.delete(dict);
-            java.nio.file.Files.createDirectory(dict);
             writeAckWatermark(slot.resolve(".ack-watermark"), 0);
             assertSlotRecoversWithCompleteDictionary();
         });
@@ -197,14 +198,14 @@ public class DeltaDictRecoveryTest {
 
     @Test
     public void testUnopenableDictRebuildsFromFramesAcrossTheAckWatermark() throws Exception {
-        // The hardest of the three: the dictionary is unopenable AND the replay set starts at
+        // The hardest of the three: the dictionary is ABSENT (see the sibling test above for
+        // why a directory-plant no longer reaches this path) AND the replay set starts at
         // deltaStart=3, so ids 0..2 exist nowhere except the acked frames on disk.
         assertMemoryLeak(() -> {
             recordSixDeltaFrames();
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
             java.nio.file.Files.delete(dict);
-            java.nio.file.Files.createDirectory(dict);
             writeAckWatermark(slot.resolve(".ack-watermark"), 2);
             assertSlotRecoversWithCompleteDictionary();
         });
@@ -598,7 +599,8 @@ public class DeltaDictRecoveryTest {
     @Test
     public void testUnopenableDictSeedsTheProducerAboveTheRecoveredIds() throws Exception {
         // The producer must resume ABOVE the ids the recovered frames already define, even when
-        // the dictionary could not be opened.
+        // the dictionary is absent (see testUnopenableDictRebuildsFromFramesFromIdZero for why a
+        // directory-plant no longer models this -- open() now throws instead of degrading).
         //
         // seedGlobalDictionaryFromPersisted used to be gated on deltaDictEnabled, which is false
         // exactly here -- so the producer restarted its id space at 0, on top of ids the
@@ -614,7 +616,6 @@ public class DeltaDictRecoveryTest {
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
             java.nio.file.Files.delete(dict);
-            java.nio.file.Files.createDirectory(dict);
             writeAckWatermark(slot.resolve(".ack-watermark"), 2);
 
             DictReconstructingHandler handler = new DictReconstructingHandler();
@@ -741,14 +742,17 @@ public class DeltaDictRecoveryTest {
                 }
             }
 
-            // Make the persisted dictionary UNOPENABLE: a directory of the same name
-            // defeats both openRW and openCleanRW, so PersistedSymbolDict.open()
-            // returns null. Deliberately do NOT stamp the ack watermark -- replay must
-            // start at frame 0, which is what makes the sequence self-sufficient.
+            // Make the persisted dictionary ABSENT. The recovery entry point never
+            // fabricates a side-file, so deleting it alone produces the
+            // no-dictionary recovery under test. (This used to plant a same-name
+            // DIRECTORY to defeat open()'s recreate-on-absent; that fixture would
+            // now read as an unopenable-but-present file -- a transient -- and
+            // throw SfOperationalException instead of exercising this path.)
+            // Deliberately do NOT stamp the ack watermark -- replay must start at
+            // frame 0, which is what makes the sequence self-sufficient.
             java.nio.file.Path slot = Paths.get(sfDir, "default");
             java.nio.file.Path dict = slot.resolve(".symbol-dict");
             java.nio.file.Files.delete(dict);
-            java.nio.file.Files.createDirectory(dict);
 
             // Phase 2: recover against a fresh server that reconstructs its per-
             // connection dictionary from the wire exactly as the real one does --
@@ -1560,9 +1564,8 @@ public class DeltaDictRecoveryTest {
                         java.nio.file.Files.exists(dict));
             }
 
-            // Recovery opens a FRESH EMPTY .symbol-dict where the (never-created)
-            // side-file belongs -- exactly the state a full-dict-fallback slot
-            // recovers into (frames on disk, no dictionary behind them).
+            // Recovery finds no side-file and fabricates none: the slot recovers
+            // dictionary-less, in full-dict mode, straight from its frames.
 
             // Phase 2: recover. build() must SUCCEED (not throw the torn-dict guard),
             // and the self-sufficient frames replay against a fresh server gap-free.
@@ -1596,6 +1599,8 @@ public class DeltaDictRecoveryTest {
                     Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
                 }
             }
+            Assert.assertFalse("recovery must not fabricate a side-file for a full-dict slot",
+                    java.nio.file.Files.exists(dict));
         });
     }
 

@@ -475,9 +475,16 @@ public final class CursorSendEngine implements QuietCloseable {
                 }
                 // Load the persisted symbol dictionary so delta-encoded frames
                 // in this recovered slot can be re-registered on the fresh
-                // server before replay. Returns null on any I/O or parse
-                // failure, in which case the sender degrades to full
-                // self-sufficient frames for this session.
+                // server before replay. Returns null only when the dictionary
+                // is provably absent or corrupt -- the sender then degrades to
+                // full self-sufficient frames for this session, a disposition
+                // that is sticky across restarts. A TRANSIENT I/O failure
+                // instead throws SfOperationalException out of this
+                // constructor: Sender.build() aborts without quarantining and
+                // BackgroundDrainer leaves the slot for a later scan, so an
+                // intact backlog is never set aside and a degraded session can
+                // never write frames next to a stale side-file that a later
+                // recovery would trust.
                 persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
@@ -581,12 +588,15 @@ public final class CursorSendEngine implements QuietCloseable {
                     // mismatch entirely instead of trading a permanent brick for a needless
                     // quarantine plus a "resend the affected data" the operator does not owe.
                     //
-                    // Reachable on one transient plus one crash: a session whose
-                    // .symbol-dict fails to open (EIO, fd exhaustion, a Windows share
-                    // lock) falls back to full-dict frames and, per the never-recreate
-                    // contract, leaves the previous session's populated side-file intact;
-                    // if that session then crashes, this recovery opens a dictionary with
-                    // size > 0 next to self-sufficient frames that out-reach it.
+                    // Reachable when self-sufficient frames sit next to a POPULATED
+                    // side-file. open() no longer degrades on a transient (it throws
+                    // SfOperationalException), so the organic route is a host-crash
+                    // tear that shortened the dictionary's CRC-valid prefix below the
+                    // ids the surviving full-dict frames reference; an operator
+                    // restoring a side-file by hand lands here too. Either way the
+                    // frames carry their whole dictionary inline, so discarding the
+                    // survivor and re-folding at baseline 0 recovers the slot exactly
+                    // as written.
                     //
                     // Re-folding rather than keeping the dictionary preserves the discard's
                     // whole point -- the slot recovers in full-dict mode, exactly as it was

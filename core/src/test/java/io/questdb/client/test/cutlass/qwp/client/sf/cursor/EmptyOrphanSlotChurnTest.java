@@ -120,14 +120,15 @@ public class EmptyOrphanSlotChurnTest {
                         0, pd.size());
             }
 
-            // The survivor's bytes are physically gone, not just hidden.
-            PersistedSymbolDict reopened = PersistedSymbolDict.open(sfDir);
-            assertNotNull(reopened);
-            try {
-                assertEquals(0, reopened.size());
-            } finally {
-                reopened.close();
-            }
+            // The survivor's bytes are physically gone, not just hidden: this fresh-start
+            // engine never publishes a frame, so its close() is the fully-drained path,
+            // which unlinks the freshly-truncated dictionary alongside the ring and
+            // watermark (see CursorSendEngine's finishClose: "the dictionary has no
+            // frames behind it"). open() now honestly reports that as ABSENT (null)
+            // rather than fabricating a replacement file to reopen, so the strongest
+            // proof left that the stale bytes are gone is the file's own absence.
+            assertFalse("fully-drained close must remove the discarded dictionary",
+                    java.nio.file.Files.exists(Paths.get(sfDir, ".symbol-dict")));
         });
     }
 
