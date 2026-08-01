@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
@@ -1948,6 +1949,133 @@ public class DeltaDictRecoveryTest {
         });
     }
 
+    @Test
+    public void testTransientDictFaultOnRecoveredSlotFailsLoudAndRetryRecoversInFull() throws Exception {
+        // The cross-generation misattribution chain (sessions A -> B -> C) needed
+        // session B to hit a transient opening the side-file, silently degrade to
+        // full-dict, and write frames next to A's stale populated dictionary --
+        // which session C then trusted, resolving A's ids to B's strings with no
+        // detectable gap. Recovery now follows the Rust client's disposition:
+        // the transient fails session B's construction LOUDLY with the retriable
+        // SfOperationalException (the type Sender.build() refuses to quarantine
+        // on), the slot's bytes stay byte-identical, and once the transient
+        // clears the SAME slot recovers in full -- delta mode on, every id
+        // resolving to the string session A registered.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Session A: a real delta-mode sender persists DISTINCT_SYMBOLS
+            // symbols and their unacked delta frames, then dies (close-fast
+            // against a server that never acks).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            Assert.assertTrue("session A must leave a populated side-file",
+                    java.nio.file.Files.exists(dict));
+            byte[] dictBefore = java.nio.file.Files.readAllBytes(dict);
+            List<String> slotBefore = sortedFileNames(slot);
+
+            // Session B: recovery hits a transient stat fault on the side-file.
+            // Construction must fail with SfOperationalException -- not degrade,
+            // not quarantine.
+            DelegatingFilesFacade statFault = new DelegatingFilesFacade() {
+                @Override
+                public long length(String path) {
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        return -1L;
+                    }
+                    return super.length(path);
+                }
+            };
+            try {
+                CursorSendEngine leaked = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, statFault);
+                leaked.close(false);
+                Assert.fail("a transient dict fault on a recovered slot must fail engine construction");
+            } catch (SfOperationalException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains(PersistedSymbolDict.FILE_NAME));
+            }
+
+            // The slot is untouched: byte-identical dictionary, session A's
+            // segment data survives, no new file is fabricated, and nothing is
+            // quarantined anywhere under the SF root. This is NOT a raw
+            // before/after file-list equality: recovery legitimately unlinks a
+            // leftover, never-rotated-in EMPTY hot-spare on the way in
+            // (SegmentRing.recover cleans it up before the dictionary is even
+            // opened, regardless of how that check resolves -- the same note
+            // documented on testQuarantineRenameFailurePreservesOriginalSlot),
+            // so the after-set may be a SUBSET of the before-set but must never
+            // be a superset.
+            Assert.assertArrayEquals("the transient must not alter the side-file",
+                    dictBefore, java.nio.file.Files.readAllBytes(dict));
+            List<String> slotAfter = sortedFileNames(slot);
+            Assert.assertTrue("the transient must not fabricate a new slot file [before=" + slotBefore
+                            + ", after=" + slotAfter + ']',
+                    slotBefore.containsAll(slotAfter));
+            Assert.assertTrue("session A's segment data must survive the failed attempt",
+                    hasSegmentFile(slot));
+            for (String name : sortedFileNames(Paths.get(sfDir))) {
+                Assert.assertFalse("a transient must never quarantine: " + name,
+                        name.contains("unreplayable") || name.endsWith(".failed"));
+            }
+
+            // Session B', engine level: the transient cleared -- the SAME slot
+            // recovers with delta mode on and every persisted entry loaded.
+            CursorSendEngine recovered = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    io.questdb.client.std.FilesFacade.INSTANCE);
+            try {
+                Assert.assertTrue("delta mode must survive the failed attempt",
+                        recovered.isDeltaDictEnabled());
+                Assert.assertEquals("every persisted symbol must reload",
+                        DISTINCT_SYMBOLS, recovered.getPersistedSymbolDict().size());
+            } finally {
+                recovered.close(false);
+            }
+
+            // Session B', wire level: a real build() replays the backlog and the
+            // server-side dictionary reconstructs every id -> string mapping
+            // exactly as session A registered it -- the misattribution the old
+            // degrade made possible cannot occur.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size",
+                        DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+        });
+    }
+
     private static boolean hasSegmentFile(java.nio.file.Path dir) {
         java.io.File[] files = dir.toFile().listFiles();
         if (files != null) {
@@ -1959,6 +2087,14 @@ public class DeltaDictRecoveryTest {
             }
         }
         return false;
+    }
+
+    private static List<String> sortedFileNames(java.nio.file.Path dir) throws IOException {
+        try (java.util.stream.Stream<java.nio.file.Path> entries = java.nio.file.Files.list(dir)) {
+            return entries.map(p -> p.getFileName().toString())
+                    .sorted()
+                    .collect(java.util.stream.Collectors.toList());
+        }
     }
 
 
