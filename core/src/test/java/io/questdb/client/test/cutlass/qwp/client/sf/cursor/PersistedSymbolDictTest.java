@@ -159,6 +159,31 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
+    public void testAppendedBytesTracksDurableFileBytes() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-appended-bytes");
+            long afterAppends;
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
+                Assert.assertNotNull(d);
+                Assert.assertEquals("a fresh dictionary holds exactly the file header",
+                        HEADER_SIZE, d.appendedBytes());
+                d.appendSymbol("AAPL");
+                d.appendSymbol("GOOG");
+                afterAppends = d.appendedBytes();
+                Assert.assertTrue("committed appends must grow the accounted bytes",
+                        afterAppends > HEADER_SIZE);
+            }
+            // close() truncates the preallocated append-window tail back to the
+            // durable offset, so a recovery reopen must account the same bytes.
+            try (PersistedSymbolDict reopened = PersistedSymbolDict.open(dir.toString())) {
+                Assert.assertNotNull(reopened);
+                Assert.assertEquals("recovery must account the same durable bytes",
+                        afterAppends, reopened.appendedBytes());
+            }
+        });
+    }
+
+    @Test
     public void testAppendRawEntriesMatchesAppendSymbols() throws Exception {
         // M1: the producer persists the frame's already-encoded delta bytes via
         // appendRawEntries instead of re-encoding the symbols. Those bytes are the

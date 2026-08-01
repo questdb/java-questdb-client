@@ -652,6 +652,18 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
+     * Durable bytes the side-file currently holds: the header plus every
+     * committed chunk -- the append offset the next chunk starts at.
+     * Excludes the preallocated append-window tail, which {@code close()}
+     * truncates away. {@code SegmentManager} reads this through the gauge
+     * wired at engine registration so the dictionary counts against the
+     * {@code sf_max_total_bytes} cap alongside the {@code .sfa} segments.
+     */
+    public synchronized long appendedBytes() {
+        return appendOffset;
+    }
+
+    /**
      * Base address of the loaded entry region -- the concatenated
      * {@code [len][utf8]} bytes of every recovered symbol in id order, exactly as a
      * delta section carries them (chunk headers and CRCs stripped). Zero when
