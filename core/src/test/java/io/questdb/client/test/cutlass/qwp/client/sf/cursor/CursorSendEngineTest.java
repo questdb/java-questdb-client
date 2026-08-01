@@ -302,9 +302,11 @@ public class CursorSendEngineTest {
             // cap = 3*segSize and segSize fitting 2 frames, the producer can land
             // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
             // needs a spare3 that the cap forbids → backpressure → deadline.
+            // The cap also includes the dictionary side-file bytes (8), so we add
+            // that to ensure the same number of segments fit.
             long segSize = MmapSegment.HEADER_SIZE
                     + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long cap = 3 * segSize;
+            long cap = 3 * segSize + 8;
             long shortDeadlineNanos = 200_000_000L; // 200 ms
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {
@@ -859,6 +861,33 @@ public class CursorSendEngineTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testRegistrationWiresDictSideFileBytesIntoCapAccounting() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096, manager)) {
+                    PersistedSymbolDict dict = engine.getPersistedSymbolDict();
+                    assertNotNull("disk-mode engine must own a symbol dictionary", dict);
+                    // A fresh dictionary already holds its file header, so the
+                    // wiring is observable before any append.
+                    assertEquals("cap accounting must include the dictionary side-file bytes",
+                            manager.getTotalBytesForTesting() + dict.appendedBytes(),
+                            manager.getCapAccountedBytesForTesting());
+                    dict.appendSymbol("AAPL");
+                    assertEquals("side-file growth must be visible to the cap accounting live",
+                            manager.getTotalBytesForTesting() + dict.appendedBytes(),
+                            manager.getCapAccountedBytesForTesting());
+                }
+                assertEquals("deregistration must drop the slot's side-file gauge",
+                        manager.getTotalBytesForTesting(),
+                        manager.getCapAccountedBytesForTesting());
+            } finally {
+                manager.close();
             }
         });
     }

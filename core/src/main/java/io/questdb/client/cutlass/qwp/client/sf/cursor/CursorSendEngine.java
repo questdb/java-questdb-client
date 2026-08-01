@@ -707,7 +707,11 @@ public final class CursorSendEngine implements QuietCloseable {
             if (ownsManager) {
                 manager.start();
             }
-            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos);
+            // The gauge outlives close() safely: appendedBytes() only reads a
+            // long under the dictionary's monitor, never touching the fd, so a
+            // manager tick racing engine shutdown observes the final offset.
+            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
+                    persistedDictInProgress == null ? null : persistedDictInProgress::appendedBytes);
             // All construction succeeded -- commit the ring, watermark, and
             // symbol-dictionary references.
             this.ring = ringInProgress;
