@@ -99,7 +99,7 @@ public class EmptyOrphanSlotChurnTest {
         // dictionary the send loop replays and misattribute symbols on reconnect.
         TestUtils.assertMemoryLeak(() -> {
             // Pre-seed a stale dictionary in the slot, with no segments behind it.
-            PersistedSymbolDict stale = PersistedSymbolDict.open(sfDir);
+            PersistedSymbolDict stale = PersistedSymbolDict.openClean(sfDir);
             assertNotNull(stale);
             try {
                 stale.appendSymbol("staleX");

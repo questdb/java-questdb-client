@@ -111,7 +111,7 @@ public class PersistedSymbolDictTest {
     public void testAppendPersistsAcrossReopen() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(d);
                 Assert.assertEquals(0, d.size());
                 d.appendSymbol("AAPL");
@@ -167,14 +167,14 @@ public class PersistedSymbolDictTest {
             dict.getOrAddSymbol("");     // id 1 -- empty entry mid-range
             dict.getOrAddSymbol("MSFT"); // id 2
 
-            try (PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString())) {
+            try (PersistedSymbolDict encoded = PersistedSymbolDict.openClean(src.toString())) {
                 encoded.appendSymbols(dict, 0, 2);
             }
 
             // Reopen to obtain the on-disk entry region [len][utf8]... verbatim,
             // then replay it byte-for-byte into a fresh dict via appendRawEntries.
             try (PersistedSymbolDict reopened = PersistedSymbolDict.open(src.toString());
-                 PersistedSymbolDict raw = PersistedSymbolDict.open(dst.toString())) {
+                 PersistedSymbolDict raw = PersistedSymbolDict.openClean(dst.toString())) {
                 raw.appendRawEntries(reopened.loadedEntriesAddr(),
                         reopened.loadedEntriesLen(), reopened.size());
                 Assert.assertEquals(3, raw.size());
@@ -210,7 +210,7 @@ public class PersistedSymbolDictTest {
             dict.getOrAddSymbol("AAPL"); // id 0
             dict.getOrAddSymbol("MSFT"); // id 1
             dict.getOrAddSymbol("GOOG"); // id 2
-            try (PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString())) {
+            try (PersistedSymbolDict encoded = PersistedSymbolDict.openClean(src.toString())) {
                 encoded.appendSymbols(dict, 0, 2);
             }
 
@@ -218,7 +218,7 @@ public class PersistedSymbolDictTest {
             // with a count of 1: validateRawEntries stops one entry in with
             // src < srcLimit and throws "under-filled", before any bytes are written.
             try (PersistedSymbolDict reopened = PersistedSymbolDict.open(src.toString());
-                 PersistedSymbolDict raw = PersistedSymbolDict.open(dst.toString())) {
+                 PersistedSymbolDict raw = PersistedSymbolDict.openClean(dst.toString())) {
                 try {
                     raw.appendRawEntries(reopened.loadedEntriesAddr(), reopened.loadedEntriesLen(), 1);
                     Assert.fail("an inconsistent (len,count) triple must be rejected");
@@ -249,7 +249,7 @@ public class PersistedSymbolDictTest {
             dict.getOrAddSymbol("MSFT"); // id 1
 
             // Encode the range once to obtain its on-disk [len][utf8]... bytes.
-            try (PersistedSymbolDict encoded = PersistedSymbolDict.open(src.toString())) {
+            try (PersistedSymbolDict encoded = PersistedSymbolDict.openClean(src.toString())) {
                 encoded.appendSymbols(dict, 0, 1);
             }
 
@@ -259,7 +259,7 @@ public class PersistedSymbolDictTest {
                 int count = source.size();
 
                 ShortWriteOnceFacade ff = new ShortWriteOnceFacade();
-                try (PersistedSymbolDict d = PersistedSymbolDict.open(ff, dst.toString())) {
+                try (PersistedSymbolDict d = PersistedSymbolDict.openClean(ff, dst.toString())) {
                     Assert.assertNotNull(d);
                     ff.armed = true; // the next entry append lands short
                     try {
@@ -304,7 +304,7 @@ public class PersistedSymbolDictTest {
             dict.getOrAddSymbol("MSFT"); // id 2
             dict.getOrAddSymbol("TSLA"); // id 3
 
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbols(dict, 0, 3); // one write for all four ids
                 Assert.assertEquals(4, d.size());
                 d.appendSymbols(dict, 4, 3); // empty range (to < from) is a no-op
@@ -349,7 +349,7 @@ public class PersistedSymbolDictTest {
             dict.getOrAddSymbol("GOOG"); // id 1
 
             ShortWriteOnceFacade ff = new ShortWriteOnceFacade();
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(ff, dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(ff, dir.toString())) {
                 Assert.assertNotNull(d);
                 ff.armed = true; // the next entry append lands short
                 try {
@@ -402,7 +402,7 @@ public class PersistedSymbolDictTest {
                 dict.getOrAddSymbol(String.valueOf((char) ('a' + i)));
             }
             Assert.assertEquals(n, dict.size());
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(d);
                 d.appendSymbols(dict, 0, n - 1);
                 Assert.assertEquals(n, d.size());
@@ -432,7 +432,7 @@ public class PersistedSymbolDictTest {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
             Path file = dir.resolve(PersistedSymbolDict.FILE_NAME);
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(d);
                 for (int i = 0; i < 10_000; i++) {
                     d.appendSymbol("sym-" + i);
@@ -473,7 +473,7 @@ public class PersistedSymbolDictTest {
             Assert.assertEquals(n, dict.size());
 
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(d);
                 // Multi-symbol batches so the appendSymbols encode loop is exercised,
                 // not just the single-symbol path.
@@ -660,7 +660,7 @@ public class PersistedSymbolDictTest {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
             Path f = dir.resolve(".symbol-dict");
-            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict seed = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(seed);
                 seed.appendSymbol("a");
             }
@@ -684,7 +684,7 @@ public class PersistedSymbolDictTest {
         // non-zero.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("AAPL");
             }
 
@@ -703,7 +703,7 @@ public class PersistedSymbolDictTest {
     public void testEmptySymbolRoundTrips() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("");
                 d.appendSymbol("nonempty");
             }
@@ -753,7 +753,7 @@ public class PersistedSymbolDictTest {
             assertMultiByte(twoByte);
             assertMultiByte(threeByte);
             assertMultiByte(fourByte);
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol(twoByte);
                 d.appendSymbol(threeByte);
                 d.appendSymbol(fourByte);
@@ -782,7 +782,7 @@ public class PersistedSymbolDictTest {
         // forces a resend of the rest).
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("s0");
                 d.appendSymbol("s1");
                 d.appendSymbol("s2");
@@ -832,7 +832,7 @@ public class PersistedSymbolDictTest {
             Path dir = newFolder("qwp-symdict");
             // Just over the old 1 << 20 (1 MB) ceiling.
             String big = TestUtils.repeat("x", (1 << 20) + 17);
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("before");
                 d.appendSymbol(big);
                 d.appendSymbol("after");
@@ -861,7 +861,7 @@ public class PersistedSymbolDictTest {
         // mapping and misattributes symbols on the next reconnect.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict-clean");
-            try (PersistedSymbolDict stale = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict stale = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(stale);
                 stale.appendSymbol("staleX");
                 stale.appendSymbol("staleY");
@@ -929,7 +929,7 @@ public class PersistedSymbolDictTest {
             Assert.assertFalse(Files.exists(freshDir.resolve(PersistedSymbolDict.FILE_NAME)));
 
             Path existingDir = newFolder("qwp-symdict-existing-open-failure");
-            try (PersistedSymbolDict seed = PersistedSymbolDict.open(existingDir.toString())) {
+            try (PersistedSymbolDict seed = PersistedSymbolDict.openClean(existingDir.toString())) {
                 Assert.assertNotNull(seed);
                 seed.appendSymbol("AAPL");
             }
@@ -964,7 +964,7 @@ public class PersistedSymbolDictTest {
     public void testRecoveryMmapFailureClosesDescriptorAndPreservesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict-recovery-mmap-failure");
-            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict seed = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(seed);
                 seed.appendSymbol("AAPL");
             }
@@ -984,7 +984,7 @@ public class PersistedSymbolDictTest {
     public void testRemoveOrphanDeletesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("A");
             }
             Path f = dir.resolve(".symbol-dict");
@@ -1010,7 +1010,7 @@ public class PersistedSymbolDictTest {
     public void testShortRecoveryReadClosesDescriptorAndPreservesFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict-short-read");
-            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict seed = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(seed);
                 seed.appendSymbol("AAPL");
             }
@@ -1043,7 +1043,7 @@ public class PersistedSymbolDictTest {
         // before openRW; without it, openExisting opens the file and parses garbage.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict seed = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict seed = PersistedSymbolDict.openClean(dir.toString())) {
                 Assert.assertNotNull(seed);
                 for (int i = 0; i < 40; i++) {
                     seed.appendSymbol("sym" + i);
@@ -1068,7 +1068,7 @@ public class PersistedSymbolDictTest {
             Path dir = newFolder("qwp-symdict");
             // Write two complete entries, then a torn trailing record: a
             // length prefix of 5 followed by only 2 bytes (crash mid-append).
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("one");
                 d.appendSymbol("two");
             }
@@ -1115,7 +1115,7 @@ public class PersistedSymbolDictTest {
         // for a later attempt, once the transient clears.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("one");
                 d.appendSymbol("two");
             }
@@ -1234,7 +1234,7 @@ public class PersistedSymbolDictTest {
         // the bytes for the next attempt, once the mount is writable again.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(dir.toString())) {
+            try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
                 d.appendSymbol("one");
                 d.appendSymbol("two");
             }
