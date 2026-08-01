@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Crc32c;
@@ -936,7 +937,12 @@ public class PersistedSymbolDictTest {
             Path file = existingDir.resolve(PersistedSymbolDict.FILE_NAME);
             byte[] before = Files.readAllBytes(file);
             IoFailureFacade existingFf = new IoFailureFacade(IoFailure.OPEN_EXISTING);
-            Assert.assertNull(PersistedSymbolDict.open(existingFf, existingDir.toString()));
+            try {
+                PersistedSymbolDict.open(existingFf, existingDir.toString());
+                Assert.fail("an openRW failure against an existing dictionary must throw SfOperationalException");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not be opened"));
+            }
             Assert.assertEquals(1, existingFf.openRwAttempts);
             existingFf.assertAllOpenedDescriptorsClosed();
             Assert.assertArrayEquals("failed recovery open must preserve the load-bearing file",
@@ -946,17 +952,26 @@ public class PersistedSymbolDictTest {
 
     @Test
     public void testOpenToleratesAnAbsentDictionary() throws Exception {
-        // The recovery entry point must keep its existing tolerance: with no file there
-        // is nothing stale to inherit, so degrading to full-dict frames is safe.
+        // The recovery entry point tolerates an absent side-file -- there is
+        // nothing stale to inherit, so degrading to full-dict frames is safe --
+        // and it must NOT fabricate one: a fresh empty dictionary planted next
+        // to recovered segments would manufacture disagreeing state where the
+        // absent-file disposition is naturally sticky across restarts.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict-empty-slot");
-            DelegatingFilesFacade ff = new DelegatingFilesFacade() {
+            final int[] openCleanCalls = {0};
+            DelegatingFilesFacade counting = new DelegatingFilesFacade() {
                 @Override
                 public int openCleanRW(String path) {
-                    return -1;
+                    openCleanCalls[0]++;
+                    return super.openCleanRW(path);
                 }
             };
-            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
+            Assert.assertNull(PersistedSymbolDict.open(counting, dir.toString()));
+            Assert.assertEquals("the recovery path must never attempt to create a side-file",
+                    0, openCleanCalls[0]);
+            Assert.assertFalse("no side-file may appear on the recovery path",
+                    Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
         });
     }
 
@@ -972,7 +987,12 @@ public class PersistedSymbolDictTest {
             byte[] before = Files.readAllBytes(file);
 
             IoFailureFacade ff = new IoFailureFacade(IoFailure.MMAP);
-            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
+            try {
+                PersistedSymbolDict.open(ff, dir.toString());
+                Assert.fail("a recovery mmap failure must throw SfOperationalException");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not mmap"));
+            }
             ff.assertAllOpenedDescriptorsClosed();
             Assert.assertEquals(1, ff.mmapCalls);
             Assert.assertArrayEquals("failed recovery mmap must preserve the load-bearing file",
@@ -1018,7 +1038,12 @@ public class PersistedSymbolDictTest {
             byte[] before = Files.readAllBytes(file);
 
             IoFailureFacade ff = new IoFailureFacade(IoFailure.READ);
-            Assert.assertNull(PersistedSymbolDict.open(ff, dir.toString()));
+            try {
+                PersistedSymbolDict.open(ff, dir.toString());
+                Assert.fail("a short recovery read must throw SfOperationalException");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("short read"));
+            }
             ff.assertAllOpenedDescriptorsClosed();
             Assert.assertArrayEquals("short recovery read must preserve the load-bearing file",
                     before, Files.readAllBytes(file));
@@ -1103,16 +1128,17 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testTransientLengthFaultDegradesWithoutDestroyingTheFile() throws Exception {
+    public void testTransientLengthFaultFailsLoudWithoutDestroyingTheFile() throws Exception {
         // open() routes on ff.length(): a value < HEADER_SIZE falls through to the
-        // truncating openFresh(). A genuine sub-header stub reports a length in
+        // absent-or-stub null path. A genuine sub-header stub reports a length in
         // [0, HEADER_SIZE), but a TRANSIENT stat failure (an EIO on a flaky disk)
         // reports the -1 error sentinel for a fully populated file -- and routing that
-        // to openFresh would O_TRUNC the only copy of load-bearing state, the exact
-        // destruction the "Never recreate over an existing file" contract forbids. A
-        // negative length is distinguishable from a stub, so open() must degrade to
-        // null (fall back to full self-sufficient frames) and leave every byte on disk
-        // for a later attempt, once the transient clears.
+        // through the null path would silently degrade next to load-bearing state
+        // that never gets destroyed, but also never gets a loud signal to retry --
+        // the exact silent-degrade the "Never create, recreate, or destroy on the
+        // recovery path" contract forbids. A negative length is distinguishable from
+        // a stub, so open() must throw the retriable SfOperationalException and leave
+        // every byte on disk for a later attempt, once the transient clears.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
             try (PersistedSymbolDict d = PersistedSymbolDict.openClean(dir.toString())) {
@@ -1125,16 +1151,19 @@ public class PersistedSymbolDictTest {
             Assert.assertTrue("a populated dict must exceed the header", before.length > HEADER_SIZE);
 
             // Reopen through a facade whose length() reports the -1 stat-error
-            // sentinel for the (present) file -- the branch under test.
-            PersistedSymbolDict reopened = PersistedSymbolDict.open(new StatFailsLengthFacade(), dir.toString());
-            if (reopened != null) {
-                // Pre-fix: open() fell through to openFresh() and handed back a fresh
-                // empty dict over the now-truncated file. Close its fd so only the
-                // assertion below reports the failure, not a leaked descriptor.
-                reopened.close();
+            // sentinel for the (present) file -- the branch under test. A transient
+            // must FAIL LOUDLY and retriably: silently degrading to full-dict frames
+            // next to a stale populated side-file is the entry point of the
+            // cross-generation misattribution chain.
+            try {
+                PersistedSymbolDict reopened = PersistedSymbolDict.open(new StatFailsLengthFacade(), dir.toString());
+                if (reopened != null) {
+                    reopened.close();
+                }
+                Assert.fail("a transient length-stat fault must throw SfOperationalException");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("length could not be read"));
             }
-            Assert.assertNull("a populated dict whose length cannot be stat'd must degrade to null, not truncate",
-                    reopened);
             Assert.assertArrayEquals("a transient length-stat fault must NOT destroy the dictionary",
                     before, Files.readAllBytes(f));
 
@@ -1150,20 +1179,20 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testExactHeaderSizeFileIsCompleteWhileOneByteShorterIsARecreatedStub() throws Exception {
+    public void testExactHeaderSizeFileIsCompleteWhileOneByteShorterIsLeftAsAStub() throws Exception {
         // HEADER_SIZE shrank from 16 to 8 when the lineage stamp was removed (see
         // PersistedSymbolDict's class javadoc): a length that used to fall inside the
-        // sub-header-stub range [0, 16) -- and so got silently recreated by the
-        // truncating openFresh() -- can now be a COMPLETE, zero-chunk dictionary that
-        // open() must load as-is instead of discarding. This pins the new boundary
-        // from both sides: exactly HEADER_SIZE bytes is a complete empty dict and
-        // must NOT be recreated; HEADER_SIZE - 1 bytes is still the crash-left stub
-        // it always was and must still be recreated. A file-size assertion alone
-        // cannot tell "loaded" from "recreated" here, since openFresh writes the
-        // very same magic/version/reserved bytes the fixture hand-writes --
-        // usedMappedRecoveryInput() is what actually distinguishes the two paths,
-        // being true only through openExisting's mmap recovery and always false
-        // from openFresh.
+        // sub-header-stub range [0, 16) -- and so used to get silently recreated by
+        // the truncating openFresh() -- can now be a COMPLETE, zero-chunk dictionary
+        // that open() must load as-is instead of discarding. This pins the new
+        // boundary from both sides: exactly HEADER_SIZE bytes is a complete empty
+        // dict and must load; HEADER_SIZE - 1 bytes is still the crash-left stub it
+        // always was, and the recovery path now leaves it exactly as found instead of
+        // recreating it -- there is no valid dictionary in a sub-header stub, so
+        // open() reports null and the disposition is sticky across restarts (the
+        // caller runs full-dict frames every time). usedMappedRecoveryInput() proves
+        // side 1 truly loaded through openExisting's mmap recovery rather than
+        // matching by coincidence on the header bytes openFresh would also write.
         assertMemoryLeak(() -> {
             // Side 1: exactly HEADER_SIZE bytes -- magic, version, three reserved
             // zero bytes, no chunks -- is complete and must load, not recreate.
@@ -1195,8 +1224,10 @@ public class PersistedSymbolDictTest {
             }
 
             // Side 2: one byte short of HEADER_SIZE is still the crash-left
-            // sub-header stub it always was, and open() must still recreate it with
-            // a full header rather than try to load it.
+            // sub-header stub it always was; the recovery path no longer recreates
+            // it -- there is no valid dictionary here, so open() reports null and
+            // leaves the stub exactly as found (the caller runs full-dict frames,
+            // and the disposition repeats identically on every later recovery).
             Path stubDir = newFolder("qwp-symdict-sub-header-stub");
             Path stubFile = stubDir.resolve(".symbol-dict");
             byte[] stub = new byte[HEADER_SIZE - 1];
@@ -1207,30 +1238,26 @@ public class PersistedSymbolDictTest {
             stub[4] = 1; // VERSION
             Files.write(stubFile, stub);
 
-            try (PersistedSymbolDict d = PersistedSymbolDict.open(stubDir.toString())) {
-                Assert.assertNotNull("a sub-header stub must still be recreated, not refused", d);
-                Assert.assertFalse("a sub-header stub must be recreated by openFresh, not loaded",
-                        d.usedMappedRecoveryInput());
-                Assert.assertEquals("a recreated dict must start empty", 0, d.size());
-                Assert.assertEquals("openFresh must have written a full header over the stub",
-                        (long) HEADER_SIZE, Files.size(stubFile));
-            }
+            Assert.assertNull("a sub-header stub holds no valid dictionary and must not be recreated",
+                    PersistedSymbolDict.open(stubDir.toString()));
+            Assert.assertArrayEquals("the stub must be left exactly as found",
+                    stub, Files.readAllBytes(stubFile));
         });
     }
 
     @Test
-    public void testTruncateFailureDegradesWithoutDestroyingTheFile() throws Exception {
+    public void testTruncateFailureFailsLoudWithoutDestroyingTheFile() throws Exception {
         // A host crash can leave a torn/stale tail past the last complete chunk.
         // open() drops it with a truncate; if that truncate FAILS (a read-only
         // remount, a Windows share lock), the file still exposes the stale bytes,
         // whose self-consistent chunk CRC a later shifted parse could accept as a real
-        // symbol. So a failed truncate must make the file UNTRUSTED -- open() degrades
-        // to null (the sender falls back to full self-sufficient frames) rather than
-        // returning a dict laid over stale bytes.
+        // symbol. So a failed truncate must make the file UNTRUSTED -- open() throws
+        // the retriable SfOperationalException rather than returning a dict laid over
+        // stale bytes.
         //
         // It must NOT recreate the file, which is what it used to do: a read-only
         // remount is transient, and destroying the [one, two] prefix on the way past it
-        // makes every surviving delta frame permanently unreplayable. Degrading leaves
+        // makes every surviving delta frame permanently unreplayable. Throwing leaves
         // the bytes for the next attempt, once the mount is writable again.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict");
@@ -1249,8 +1276,12 @@ public class PersistedSymbolDictTest {
             byte[] before = Files.readAllBytes(f);
 
             // Reopen through a facade whose truncate() fails.
-            Assert.assertNull("a dict whose torn tail cannot be trimmed must degrade to null",
-                    PersistedSymbolDict.open(new FailingTruncateFacade(), dir.toString()));
+            try {
+                PersistedSymbolDict.open(new FailingTruncateFacade(), dir.toString());
+                Assert.fail("a dict whose torn tail cannot be trimmed must throw SfOperationalException");
+            } catch (SfOperationalException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("torn/stale symbol dictionary tail"));
+            }
             Assert.assertArrayEquals("a failed truncate must NOT destroy the dictionary",
                     before, Files.readAllBytes(f));
 

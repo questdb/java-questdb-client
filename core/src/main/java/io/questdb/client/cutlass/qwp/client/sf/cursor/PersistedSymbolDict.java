@@ -52,7 +52,7 @@ import org.slf4j.LoggerFactory;
  * {@code max()} clamp -- this file is <b>load-bearing</b>: a surviving frame
  * that references an id missing from it is unrecoverable. It is therefore held
  * to a stronger durability contract, and {@link #open} never destroys it (see
- * "Never recreate over an existing file" below).
+ * "Never create, recreate, or destroy on the recovery path" below).
  * <p>
  * <b>Layout</b> (little-endian):
  * <pre>
@@ -118,15 +118,25 @@ import org.slf4j.LoggerFactory;
  * A torn trailing chunk from a crash mid-append is self-healing: {@link #open}
  * stops parsing at the first incomplete chunk and the next append overwrites it.
  * <p>
- * <b>Never recreate over an existing file.</b> {@link #open} -- the RECOVERY
- * entry point -- returns {@code null} when an existing file cannot be read or
- * parsed, and NEVER falls back to recreating it empty. Recreating would mean
- * {@code O_TRUNC} over the only copy of load-bearing state, so a single transient
- * read error (an EIO on a flaky disk, a short read) would permanently destroy the
- * dictionary the surviving delta frames reference -- turning a recoverable outage
- * into unrecoverable data. A {@code null} instead degrades the sender to full
- * self-sufficient frames and leaves every byte on disk, so a later attempt, once
- * the transient clears, can still recover the slot in full. Only
+ * <b>Never create, recreate, or destroy on the recovery path.</b> {@link #open}
+ * -- the RECOVERY entry point -- returns {@code null} ONLY when the content is
+ * provably absent or corrupt (no file, a sub-header stub, a bad magic/version, a
+ * too-large file), never fabricating a fresh side-file over an absent one and
+ * never recreating over an existing one. That degrades the sender to full
+ * self-sufficient frames, and the disposition is sticky across restarts: nothing
+ * was created or destroyed, so a later recovery reaches the same verdict. Any
+ * TRANSIENT I/O failure against a file that does or might exist -- a stat error,
+ * a failed open, a failed mmap/read, a failed torn-tail truncate, a late-delivered
+ * mmap fault -- instead THROWS the retriable {@link SfOperationalException}: a
+ * single transient (an EIO on a flaky disk, a short read) must not be treated the
+ * same as proven corruption, because {@code O_TRUNC}-ing or otherwise discarding
+ * the only copy of load-bearing state on a fault that clears on retry would turn
+ * a recoverable outage into unrecoverable data. Construction aborts loudly on
+ * that exception; {@code Sender.build()} and {@code BackgroundDrainer} both treat
+ * it as abort-without-quarantine rather than a terminal verdict, so a later
+ * attempt, once the transient clears, still recovers the slot in full -- the
+ * promise this class always documented, now actually implemented. This mirrors
+ * the Rust client's {@code open_recovered} disposition matrix. Only
  * {@link #openClean} -- the FRESH-slot path, where discarding is the whole point
  * -- truncates.
  * <p>
@@ -239,16 +249,27 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Opens the dictionary file in {@code slotDir} for RECOVERY, creating it only
-     * when it does not already exist. An existing file is parsed and its complete,
-     * CRC-valid chunks are loaded into memory (see {@link #loadedEntriesAddr()}).
-     * <p>
-     * Returns {@code null} on any I/O or parse failure -- including an existing file
-     * that cannot be read, carries an unknown version, or fails its checksums. The
-     * caller then falls back to full-dictionary (self-sufficient) frames for this
-     * slot, so a broken side-file degrades gracefully rather than aborting the
-     * sender. Crucially, a {@code null} return NEVER destroys the file: see the
-     * class-level "Never recreate over an existing file" note.
+     * Opens the dictionary file in {@code slotDir} for RECOVERY. Never creates,
+     * recreates, or destroys the file -- see the class-level "Never create,
+     * recreate, or destroy on the recovery path" note. Three-way disposition:
+     * <ul>
+     *   <li>Returns {@code null} ONLY when the content is provably absent or
+     *       corrupt -- the file does not exist, is a sub-header stub, carries a
+     *       bad magic/version, or is too large to reopen. The caller falls back
+     *       to full-dictionary (self-sufficient) frames for this slot, and the
+     *       disposition is sticky: nothing is created or destroyed, so a later
+     *       recovery reaches the same verdict.</li>
+     *   <li>Throws {@link SfOperationalException} for any TRANSIENT I/O failure
+     *       against a file that does or might exist -- a stat error, a failed
+     *       open, a failed mmap/read, a failed torn-tail truncate, or a
+     *       late-delivered mmap fault. Every byte is left on disk for a retry
+     *       once the transient clears; {@code Sender.build()} aborts construction
+     *       without quarantining and {@code BackgroundDrainer} leaves the slot for
+     *       a later scan.</li>
+     *   <li>Otherwise returns a {@link PersistedSymbolDict} with the existing
+     *       file's complete, CRC-valid chunks loaded into memory (see
+     *       {@link #loadedEntriesAddr()}).</li>
+     * </ul>
      */
     public static PersistedSymbolDict open(String slotDir) {
         return open(FilesFacade.INSTANCE, slotDir);
@@ -264,33 +285,32 @@ public final class PersistedSymbolDict implements QuietCloseable {
         boolean exists = ff.exists(filePath);
         long existing = exists ? ff.length(filePath) : -1L;
         if (exists && existing < 0) {
-            // The file is present but its length could not be stat'd (a transient EIO
-            // on a flaky disk). Do NOT fall through to openFresh below, which O_TRUNCs:
-            // truncating the only copy of load-bearing state on a TRANSIENT fault is the
-            // exact destruction the class-level "Never recreate over an existing file"
-            // note forbids -- and unlike the openExisting read path, this routing check
-            // otherwise has no guard. A genuine sub-header stub reports a length in
-            // [0, HEADER_SIZE); only a stat error reports < 0, so the two are
-            // distinguishable. Degrade to full self-sufficient frames and leave every
-            // byte on disk for a later attempt, once the transient clears.
-            LOG.warn("symbol dict {} exists but its length could not be read; "
-                    + "falling back to full-dictionary frames (file left intact)", filePath);
-            return null;
+            // The file is present but its length could not be stat'd (a transient
+            // EIO on a flaky disk). Fail LOUDLY and retriably. Degrading here --
+            // running this session on full-dict frames next to a stale populated
+            // side-file -- is the entry point of the cross-generation
+            // misattribution chain: a later recovery would trust the survivor
+            // against frames it never described. A genuine sub-header stub
+            // reports a length in [0, HEADER_SIZE); only a stat error reports
+            // < 0, so the two are distinguishable. The file is left intact;
+            // Sender.build() aborts without quarantining and BackgroundDrainer
+            // leaves the slot for a later scan, so a retry once the transient
+            // clears recovers the slot in full.
+            throw new SfOperationalException("symbol dict " + filePath
+                    + " exists but its length could not be read; file left intact for a retry");
         }
         if (existing >= HEADER_SIZE) {
             // Chunk lengths and the retained contiguous entry region are int-sized,
             // so a dictionary at or past Integer.MAX_VALUE cannot be represented
             // safely even though production recovery maps rather than reads it.
+            // A permanent property of the file, not a transient: degrade to
+            // full-dictionary frames. The disposition is sticky -- full-dict mode
+            // never appends the file -- so every later recovery decides the same.
             if (existing >= Integer.MAX_VALUE) {
                 LOG.warn("symbol dict {} too large ({} bytes) to reopen; "
                         + "falling back to full-dictionary frames (file left intact)", filePath, existing);
                 return null;
             }
-            // NEVER recreate over an existing file on the recovery path: openFresh
-            // truncates, and these bytes are the only copy of state the surviving
-            // delta frames reference. A null degrades this slot to full
-            // self-sufficient frames and preserves the file for a later attempt.
-            //
             // The holder catches what openExisting's own catch structurally cannot.
             // Recovery reads the file through a mapping (Unsafe loads in
             // scanAndCopyRecoveredChunks), and pre-JDK-21 HotSpot delivers an
@@ -312,18 +332,24 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 if (inFlight[0] != null) {
                     inFlight[0].close();
                 }
-                LOG.warn("symbol dict {} recovery faulted late; falling back to "
-                        + "full-dictionary frames (file left intact)", filePath, t);
-                return null;
+                if (t instanceof SfOperationalException) {
+                    throw (SfOperationalException) t;
+                }
+                // A late-delivered mmap access fault is an I/O failure in
+                // disguise: the file is intact, so it is retriable like every
+                // other transient above.
+                throw new SfOperationalException("symbol dict " + filePath
+                        + " recovery faulted late; file left intact for a retry", t);
             }
         }
-        // Absent, or a sub-header stub left by a crash inside openFresh: no
-        // load-bearing content to lose, so create it. mustTruncate=false: this
-        // is the RECOVERY entry point, and there is nothing here to protect --
-        // an absent/stub file has no id space to preserve, so a create failure
-        // still just degrades to null (full self-sufficient frames), same as
-        // every other recovery I/O failure above.
-        return openFresh(ff, filePath, false);
+        // Absent, or a sub-header stub left by a crash inside openFresh: there is
+        // no valid dictionary here, and the RECOVERY path never fabricates one.
+        // A fresh empty side-file planted next to recovered segments would
+        // manufacture disagreeing state; leaving the slot dictionary-less is
+        // naturally sticky instead (full-dict mode never creates or appends the
+        // file), so every later recovery makes the same call. The caller runs
+        // this session on full self-sufficient frames.
+        return null;
     }
 
     /**
@@ -356,7 +382,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * Facade-aware variant of {@link #openClean(String)}.
      */
     public static PersistedSymbolDict openClean(FilesFacade ff, String slotDir) {
-        return openFresh(ff, slotDir + "/" + FILE_NAME, true);
+        return openFresh(ff, slotDir + "/" + FILE_NAME);
     }
 
     /**
@@ -743,9 +769,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
                                                      PersistedSymbolDict[] inFlight) {
         int fd = ff.openRW(filePath);
         if (fd < 0) {
-            LOG.warn("symbol dict {} could not be opened (rc={}); "
-                    + "falling back to full-dictionary frames (file left intact)", filePath, fd);
-            return null;
+            throw new SfOperationalException("symbol dict " + filePath
+                    + " could not be opened for recovery (rc=" + fd + "); file left intact for a retry");
         }
         int len = (int) fileLen; // open() bounds fileLen to [HEADER_SIZE, Integer.MAX_VALUE)
         boolean mappedInput = ff.isMmapAllowed();
@@ -758,7 +783,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 inputAddr = ff.mmap(fd, fileLen, 0L, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
                 if (inputAddr == Files.FAILED_MMAP_ADDRESS) {
                     inputAddr = 0L;
-                    throw new IllegalStateException("could not mmap symbol dictionary for recovery");
+                    throw new SfOperationalException("could not mmap symbol dictionary for recovery: " + filePath);
                 }
             } else {
                 // Fault-injection facades retain the positioned-read path so tests
@@ -766,13 +791,24 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 inputAddr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
                 long read = ff.read(fd, inputAddr, len, 0);
                 if (read != len) {
-                    throw new IllegalStateException("short read while recovering symbol dictionary "
-                            + "[expected=" + len + ", actual=" + read + ']');
+                    throw new SfOperationalException("short read while recovering symbol dictionary " + filePath
+                            + " [expected=" + len + ", actual=" + read + ']');
                 }
             }
             if (Unsafe.getUnsafe().getInt(inputAddr) != FILE_MAGIC
                     || Unsafe.getUnsafe().getByte(inputAddr + 4) != VERSION) {
-                throw new IllegalStateException("bad magic or unknown symbol dictionary version");
+                // Proven local corruption, not a transient: degrade to full-dictionary
+                // frames exactly as before, leaving the bytes for forensics. Sticky --
+                // the magic never heals -- so every later recovery decides the same.
+                if (mappedInput) {
+                    ff.munmap(inputAddr, fileLen, MemoryTag.MMAP_DEFAULT);
+                } else {
+                    Unsafe.free(inputAddr, len, MemoryTag.NATIVE_DEFAULT);
+                }
+                ff.close(fd);
+                LOG.warn("symbol dict {} has bad magic or unknown version; falling back to "
+                        + "full-dictionary frames (file left intact)", filePath);
+                return null;
             }
             // ONE pass: validate each chunk's CRC and, once proven good, copy its
             // entries straight out. The entry region is by construction a subset of
@@ -804,11 +840,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // leave residue past its own end. The truncate result IS checked: a file
             // we cannot trim could still expose stale post-end bytes whose
             // (self-consistent) chunk CRC the parse would accept at a shifted
-            // position, so a failed truncate makes the file untrusted -- return null
-            // (the sender falls back to full self-sufficient frames) and, per the
-            // never-destroy contract, leave every byte on disk.
+            // position, so a failed truncate makes the file untrusted. The failed
+            // trim surfaces as a retriable SfOperationalException rather than a
+            // silent null: the retry re-parses and trims once the filesystem is
+            // writable again, exactly as the truncate test's third phase proves.
             if (scan.validLen < len && !ff.truncate(fd, scan.validLen)) {
-                throw new IllegalStateException("could not drop torn/stale symbol dictionary tail");
+                throw new SfOperationalException("could not drop torn/stale symbol dictionary tail: "
+                        + filePath + "; file left intact for a retry");
             }
             PersistedSymbolDict dict = new PersistedSymbolDict(
                     ff, filePath, fd, scan.validLen, scan.count, entriesAddr, entriesLen, mappedInput);
@@ -831,12 +869,11 @@ public final class PersistedSymbolDict implements QuietCloseable {
             if (fd >= 0) {
                 ff.close(fd);
             }
-            // Pass the throwable as a trailing argument with no matching placeholder so
-            // slf4j prints the stack trace: this WARN is the only forensic record of why
-            // a load-bearing dictionary was abandoned.
-            LOG.warn("symbol dict {} recovery failed; falling back to full-dictionary frames "
-                    + "(file left intact)", filePath, t);
-            return null;
+            if (t instanceof SfOperationalException) {
+                throw (SfOperationalException) t;
+            }
+            throw new SfOperationalException("symbol dict " + filePath
+                    + " recovery failed; file left intact for a retry", t);
         }
     }
 
@@ -942,26 +979,26 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * @param mustTruncate {@code true} for the fresh-slot path ({@link #openClean}),
-     *                      where an existing file MUST be cleared -- a survivor that
-     *                      cannot be truncated describes a prior generation's id
-     *                      space, and proceeding anyway would leave it on disk while
-     *                      this session writes rows against a fresh id space from 0.
-     *                      The next recovery cannot tell the two apart: ids overlap,
-     *                      the CRC is valid, and the catch-up would register the
-     *                      wrong strings under ids this generation's rows reference.
-     *                      So this case throws {@link UnreplayableSlotException} rather
-     *                      than degrading to null. {@code false} for the recovery
-     *                      path ({@link #open}), which only ever reaches this method
-     *                      when the file is absent or a headerless stub -- nothing
-     *                      load-bearing to lose -- so a create failure there still
-     *                      just degrades to null like every other recovery I/O
-     *                      failure.
+     * Opens {@code filePath} as a FRESH, EMPTY dictionary file, discarding any
+     * surviving content. Serves only the fresh-slot path ({@link #openClean}) --
+     * after the disposition split in {@link #open}, the recovery path never
+     * reaches this method, since it never creates or truncates.
+     * <p>
+     * An existing file MUST be cleared here: a survivor that cannot be truncated
+     * describes a prior generation's id space, and proceeding anyway would leave
+     * it on disk while this session writes rows against a fresh id space from 0.
+     * The next recovery cannot tell the two apart -- ids overlap, the CRC is
+     * valid, and the catch-up would register the wrong strings under ids this
+     * generation's rows reference -- so that case throws
+     * {@link UnreplayableSlotException} rather than degrading to {@code null}.
+     * When no file exists at all, there is nothing to protect, so a create
+     * failure just degrades to {@code null} and the caller proceeds without a
+     * dictionary.
      */
-    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath, boolean mustTruncate) {
+    private static PersistedSymbolDict openFresh(FilesFacade ff, String filePath) {
         int fd = ff.openCleanRW(filePath);
         if (fd < 0) {
-            if (mustTruncate && ff.exists(filePath)) {
+            if (ff.exists(filePath)) {
                 // A fresh slot MUST start with an empty dictionary. Proceeding without one
                 // leaves the previous generation's entries on disk while this session
                 // writes rows against a fresh id space from 0, and the next recovery
