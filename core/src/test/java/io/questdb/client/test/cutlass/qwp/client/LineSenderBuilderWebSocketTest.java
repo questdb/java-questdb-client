@@ -38,7 +38,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 /**
  * Tests for WebSocket transport support in the Sender.builder() API.
  * These tests verify the builder configuration and validation,
- * not actual WebSocket connectivity (which requires a running server).
+ * not actual WebSocket connectivity (that requires a running server).
  */
 public class LineSenderBuilderWebSocketTest extends AbstractTest {
 
@@ -635,6 +635,39 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testStoreAndForwardMaxSegmentBytes() {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET);
+
+        Assert.assertSame(builder, builder.storeAndForwardMaxSegmentBytes(64 * 1024L));
+        Assert.assertEquals(
+                64 * 1024L,
+                ((Number) builder.wsConfigSnapshotForTest().get("sf_max_segment_bytes")).longValue()
+        );
+    }
+
+    @Test
+    public void testStoreAndForwardMaxSegmentBytesRejectsNonPositiveValues() {
+        long[] rejected = {0L, -1L};
+        for (long value : rejected) {
+            assertThrows("sf_max_segment_bytes must be positive: " + value,
+                    () -> Sender.builder(Sender.Transport.WEBSOCKET).storeAndForwardMaxSegmentBytes(value));
+        }
+    }
+
+    @Test
+    public void testStoreAndForwardMaxSegmentBytesRejectedForNonWebSocketTransports() {
+        Sender.Transport[] rejected = {
+                Sender.Transport.HTTP,
+                Sender.Transport.TCP,
+                Sender.Transport.UDP
+        };
+        for (Sender.Transport transport : rejected) {
+            assertThrows("store_and_forward is only supported for WebSocket transport",
+                    () -> Sender.builder(transport).storeAndForwardMaxSegmentBytes(64 * 1024L));
+        }
+    }
+
+    @Test
     public void testSyncModeAutoFlushDefaults() throws Exception {
         // Regression test: connect() must not hardcode autoFlush to 0.
         assertMemoryLeak(() -> {
@@ -807,6 +840,15 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // QwpQueryClient (egress).
         assertBadConfig("ws::addr=localhost:9000;path=/read/v1;",
                 "unknown configuration key: path");
+    }
+
+    @Test
+    public void testWsConfigString_withSfMaxBytes_fails() {
+        // sf_max_bytes is the spelling this key carries in the 1.2.1-1.3.5 jars.
+        // sf_max_segment_bytes replaces it with no alias, so the old spelling
+        // rejects as an unknown key rather than silently configuring nothing.
+        assertBadConfig("ws::addr=localhost:9000;sf_max_bytes=4096;",
+                "unknown configuration key: sf_max_bytes");
     }
 
     @Test
@@ -985,6 +1027,26 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // plain ws string validateWsConfig rejects them.
         assertBadConfig("ws::addr=localhost:9000;tls_verify=on;", "require the wss:: schema");
         assertBadConfig("ws::addr=localhost:9000;tls_roots=/ca.p12;", "require the wss:: schema");
+    }
+
+    @Test
+    public void testWssConfigString_tlsRootsPasswordWithoutRoots_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots_password=secret;",
+                "tls_roots_password requires tls_roots"
+        );
+    }
+
+    @Test
+    public void testWssConfigString_tlsRootsWithUnsafeOff_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots=/ca.pem;tls_verify=unsafe_off;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_verify=unsafe_off;tls_roots=/ca.p12;tls_roots_password=secret;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
     }
 
     @Test

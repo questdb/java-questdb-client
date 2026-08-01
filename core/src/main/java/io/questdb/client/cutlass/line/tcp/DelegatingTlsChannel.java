@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.line.tcp;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineChannel;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.network.TlsTrustStore;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Misc;
 import io.questdb.client.std.Unsafe;
@@ -34,39 +35,16 @@ import io.questdb.client.std.Vect;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.TrustManagerFactory;
-import javax.net.ssl.X509TrustManager;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
-import java.security.KeyStore;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 
 public final class DelegatingTlsChannel implements LineChannel {
     private static final long ADDRESS_FIELD_OFFSET;
     private static final int AFTER_HANDSHAKE = 1;
-    private static final TrustManager[] BLIND_TRUST_MANAGERS = new TrustManager[]{new X509TrustManager() {
-        public void checkClientTrusted(X509Certificate[] certs, String t) {
-        }
-
-        public void checkServerTrusted(X509Certificate[] certs, String t) {
-        }
-
-        public X509Certificate[] getAcceptedIssuers() {
-            return null;
-        }
-    }};
-
     private static final long CAPACITY_FIELD_OFFSET;
     private static final int CLOSED = 3;
     private static final int CLOSING = 2;
@@ -202,44 +180,14 @@ public final class DelegatingTlsChannel implements LineChannel {
     }
 
     private static SSLEngine createSslEngine(String trustStorePath, char[] trustStorePassword, Sender.TlsValidationMode validationMode, String peerHost) {
-        assert trustStorePath == null || validationMode == Sender.TlsValidationMode.DEFAULT;
         try {
-            SSLContext sslContext;
-            if (trustStorePath != null) {
-                sslContext = SSLContext.getInstance("TLS");
-                TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-                KeyStore jks = KeyStore.getInstance("JKS");
-                try (InputStream trustStoreStream = openTruststoreStream(trustStorePath)) {
-                    jks.load(trustStoreStream, trustStorePassword);
-                }
-                tmf.init(jks);
-                TrustManager[] trustManagers = tmf.getTrustManagers();
-                sslContext.init(null, trustManagers, new SecureRandom());
-            } else if (validationMode == Sender.TlsValidationMode.INSECURE) {
-                sslContext = SSLContext.getInstance("TLS");
-                sslContext.init(null, BLIND_TRUST_MANAGERS, new SecureRandom());
-            } else {
-                sslContext = SSLContext.getDefault();
-            }
-
-            // SSLEngine needs to know hostname during TLS handshake to validate a server certificate was issued
-            // for the server we are connecting to. For details see the comment below.
-            // Hostname validation does not use port at all hence we can get away with a dummy value -1
-            SSLEngine sslEngine = sslContext.createSSLEngine(peerHost, -1);
-            if (validationMode != Sender.TlsValidationMode.INSECURE) {
-                SSLParameters sslParameters = sslEngine.getSSLParameters();
-                // The https validation algorithm? That looks confusing! After all we are not using any
-                // https here at so what does it mean?
-                // It's actually simple: It just instructs the SSLEngine to perform the same hostname validation
-                // as it does during HTTPS connections. SSLEngine does not do hostname validation by default. Without
-                // this option SSLEngine would happily accept any certificate as long as it's signed by a trusted CA.
-                // This option will make sure certificates are accepted only if they were issued for the
-                // server we are connecting to.
-                sslParameters.setEndpointIdentificationAlgorithm("https");
-                sslEngine.setSSLParameters(sslParameters);
-            }
-            sslEngine.setUseClientMode(true);
-            return sslEngine;
+            return TlsTrustStore.createSslEngine(
+                    trustStorePath,
+                    trustStorePassword,
+                    validationMode == Sender.TlsValidationMode.INSECURE,
+                    peerHost,
+                    DelegatingTlsChannel.class
+            );
         } catch (Throwable t) {
             if (t instanceof LineSenderException) {
                 throw (LineSenderException) t;
@@ -254,20 +202,6 @@ public final class DelegatingTlsChannel implements LineChannel {
         long newAddress = Unsafe.realloc(oldAddress, oldCapacity, newCapacity, MemoryTag.NATIVE_TLS_RSS);
         resetBufferToPointer(buffer, newAddress, newCapacity);
         return newAddress;
-    }
-
-    private static InputStream openTruststoreStream(String trustStorePath) throws FileNotFoundException {
-        InputStream trustStoreStream;
-        if (trustStorePath.startsWith("classpath:")) {
-            String adjustedPath = trustStorePath.substring("classpath:".length());
-            trustStoreStream = DelegatingTlsChannel.class.getResourceAsStream(adjustedPath);
-            if (trustStoreStream == null) {
-                throw new LineSenderException("configured trust store is unavailable ")
-                        .put("[path=").put(trustStorePath).put("]");
-            }
-            return trustStoreStream;
-        }
-        return new FileInputStream(trustStorePath);
     }
 
     private static void resetBufferToPointer(ByteBuffer buffer, long ptr, int len) {

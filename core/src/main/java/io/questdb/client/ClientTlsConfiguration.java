@@ -33,6 +33,9 @@ public class ClientTlsConfiguration {
     private final String trustStorePath;
 
     public ClientTlsConfiguration(String trustStorePath, char[] trustStorePassword, int tlsValidationMode) {
+        if (trustStorePath != null && tlsValidationMode == TLS_VALIDATION_MODE_NONE) {
+            throw new IllegalArgumentException("custom trust store cannot be combined with disabled TLS validation");
+        }
         this.trustStorePath = trustStorePath;
         this.trustStorePassword = trustStorePassword;
         this.tlsValidationMode = tlsValidationMode;

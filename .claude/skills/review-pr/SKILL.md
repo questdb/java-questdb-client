@@ -244,7 +244,15 @@ For each finding in the draft report:
 9. **For cross-context findings (Agent 9)**: re-read the callsite in full, including its callers up two levels, and confirm the broken behavior is reachable from production code paths. Cross-context findings are high-value but also the easiest to overstate — verify carefully.
 10. **For test-efficacy findings (Agents 11, 13)**: re-read the cited assertion in full context and confirm it truly cannot fail — a "vacuous assertion" claim is a false positive if production code actually recomputes the asserted value. For "would pass without the fix" claims, trace what the assertion observes against the reverted production hunk before reporting.
 11. **For test-code-quality findings (Agent 12)**: confirm a flagged reflective access really has a non-reflective alternative (some QuestDB internals genuinely require reflection in tests) before reporting it. Confirm a "reinvented helper" finding by actually locating the helper with Grep and checking its signature fits the test's need.
-12. **Classify each finding** as:
+12. **For "swallowed exception → silent wrong results / leak / corrupt state" claims**: a `catch` block is defensive coding, not evidence that anything throws. Before reporting, name **all three** of:
+    (a) the **concrete exception type** and the **exact statement** that raises it — quote the throwing line, don't infer it from the presence of a `try`;
+    (b) proof that this type is actually **caught by the specific catch clause cited** — `catch (SqlException | CairoException)` does NOT catch `OutOfMemoryError`, `IllegalArgumentException`, `NullPointerException`, or any other unlisted `Error`/`RuntimeException`. An `Error` that escapes the catch means the operation **fails loudly**, which inverts the finding;
+    (c) that the throwing statement is reachable with the arguments the callsite actually passes (constants, pre-reserved capacity, and guarded early returns frequently make it unreachable).
+    If any of (a)-(c) cannot be established, the finding is **not** a silent-wrong-results bug. It may still be reportable as a **latent invariant violation / hardening** item — file it that way under Moderate, state explicitly that no user-visible impact exists today, and say what future change would make it live.
+    Also check for the **non-throwing** sibling: a `void` method that silently drops or frees its argument on an early return (`if (x) { free(arg); return; }`) breaks the same invariant with no exception at all, is usually far more reachable than the throw, and is not fixed by reordering statements around the call. Report that path instead of, or in addition to, the throw.
+13. **Verify the conjunction, not just the links.** A multi-step finding ("A publishes early → B can throw → C swallows → D reads stale → wrong result") is only as true as its weakest step, but per-line verification (item 1) confirms each step **in isolation** and will happily mark all of them CONFIRMED. Before filing any finding whose argument is a chain of three or more propositions, identify the single **load-bearing step** — the one that, if false, collapses the whole thing (usually "this can actually happen", not "this line says what the reporter says it says") — and verify **that** step first and hardest. Record it in the finding as "load-bearing step: <X>, verified by <evidence>". A finding whose every link is individually true can still be a false positive.
+14. **Verify the proposed fix compiles and closes the window.** Re-read the fix against the surrounding code before including it: check that every variable it references is still in scope and non-`null` at the point it runs (statements like `a = b = c = null;` and ownership transfers routinely invalidate "just move this call later" advice), that it does not introduce a double-free or leak in the `finally`, and that it closes **every** path identified in item 12 — not just the one the reporter noticed. A fix that doesn't compile or that leaves the real path open discredits an otherwise valid finding.
+15. **Classify each finding** as:
     - **CONFIRMED in-diff** — the bug is real and inside the diff
     - **CONFIRMED at out-of-diff callsite** — the bug is in an unchanged file because the changed symbol is used there in a way that's now broken (cite the file and the contract from 2.5c that was violated)
     - **FALSE POSITIVE** — the code is actually correct (explain why)
@@ -456,7 +464,9 @@ source in CI, so a binary in the diff is never acceptable.** Each must include:
 - Suggested fix
 
 ### Moderate
-Issues worth addressing but not blocking.
+Issues worth addressing but not blocking. This is also where **latent invariant violations whose trigger has been shown unreachable** belong (Step 3b.12): the code is fragile and worth fixing, but no input reaches the broken state today. Each such finding must name the specific guard, catch clause, or early return that makes it unreachable, state that there is no user-visible impact today, and say what future change would make it live.
+
+A defect only qualifies as Critical if its trigger is **reachable**. "Rare but reachable" is Critical; "shown not to exist on any code path" is not a confirmed bug at all and belongs here instead — with the reachability analysis attached.
 
 ### Minor
 Style nits and suggestions.

@@ -61,7 +61,7 @@ public class WsSenderConfigHonoredTest {
         assertHonored("request_durable_ack=on", "request_durable_ack", true);
         assertHonored("sender_id=probe-1", "sender_id", "probe-1");
         assertHonored("sf_dir=/var/probe", "sf_dir", "/var/probe");
-        assertHonored("sf_max_bytes=4096", "sf_max_bytes", 4096L);
+        assertHonored("sf_max_segment_bytes=4096", "sf_max_segment_bytes", 4096L);
         assertHonored("sf_max_total_bytes=8192", "sf_max_total_bytes", 8192L);
         assertHonored("sf_durability=periodic", "sf_durability", "PERIODIC");
         assertHonored("sf_append_deadline_millis=1500", "sf_append_deadline_millis", 1500L);
@@ -91,8 +91,12 @@ public class WsSenderConfigHonoredTest {
         Assert.assertEquals("pw", aliasCreds.get("password"));
         markHonored("username", "password");
 
-        // tls keys require wss; tls_roots must be paired with its password.
+        // TLS keys require wss. A passwordless roots path is PEM; supplying a
+        // password retains the JKS/PKCS12 trust-store path.
         assertHonoredWss("tls_verify=unsafe_off", "tls_verify", "INSECURE");
+        Map<String, Object> pem = snapshot("wss::addr=h:9000;tls_roots=/ca.pem;");
+        Assert.assertEquals("/ca.pem", pem.get("tls_roots"));
+        Assert.assertNull(pem.get("tls_roots_password"));
         Map<String, Object> tls = snapshot("wss::addr=h:9000;tls_roots=/ca.p12;tls_roots_password=pw;");
         Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
         Assert.assertEquals("pw", tls.get("tls_roots_password"));

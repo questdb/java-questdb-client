@@ -80,10 +80,13 @@ public class QwpQueryClientConfigHonoredTest {
             markHonored("username", "password", "token");
 
             // COMMON TLS keys applied by egress (require the wss schema). tls_verify
-            // drives the validation mode; tls_roots/tls_roots_password set the trust
-            // store. All three read back from the snapshot.
+            // drives the validation mode. A passwordless roots path is PEM;
+            // supplying a password retains the JKS/PKCS12 trust-store path.
             Assert.assertEquals(ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE,
                     snapshot("wss::addr=h:9000;tls_verify=unsafe_off;").get("tls_verify"));
+            Map<String, Object> pem = snapshot("wss::addr=h:9000;tls_roots=/ca.pem;");
+            Assert.assertEquals("/ca.pem", pem.get("tls_roots"));
+            Assert.assertNull(pem.get("tls_roots_password"));
             Map<String, Object> tls = snapshot("wss::addr=h:9000;tls_roots=/ca.p12;tls_roots_password=pw;");
             Assert.assertEquals("/ca.p12", tls.get("tls_roots"));
             Assert.assertEquals("pw", tls.get("tls_roots_password"));

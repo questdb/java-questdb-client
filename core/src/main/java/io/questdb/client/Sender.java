@@ -934,6 +934,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      */
     final class LineSenderBuilder {
         private static final int AUTO_FLUSH_DISABLED = 0;
+        private static final String TLS_ROOTS_INSECURE_CONFIG_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
         // close() drain timeout. Default applied at build() time. 0 or -1
         // means "fast close" (skip the drain entirely); any positive value
         // bounds the wait for ackedFsn to catch up to publishedFsn. Uses
@@ -1128,7 +1129,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Durability contract for SF append/flush. FLUSH and APPEND remain
         // deferred follow-ups; PERIODIC uses the segment manager.
         private SfDurability sfDurability = SfDurability.MEMORY;
-        private long sfMaxBytes = PARAMETER_NOT_SET_EXPLICITLY;
+        private long sfMaxSegmentBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfMaxTotalBytes = PARAMETER_NOT_SET_EXPLICITLY;
         private long sfSyncIntervalMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private boolean shouldDestroyPrivKey;
@@ -1415,7 +1416,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 ClientTlsConfiguration tlsConfig = null;
                 if (tlsEnabled) {
-                    assert (trustStorePath == null) == (trustStorePassword == null); //either both null or both non-null
+                    assert trustStorePassword == null || trustStorePath != null;
                     tlsConfig = new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode == TlsValidationMode.DEFAULT ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE);
                 }
                 return AbstractLineHttpSender.createLineSender(hosts, ports, httpPath, httpClientConfiguration, tlsConfig, actualAutoFlushRows, httpToken,
@@ -1437,7 +1438,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
                 ClientTlsConfiguration wsTlsConfig = null;
                 if (tlsEnabled) {
-                    assert (trustStorePath == null) == (trustStorePassword == null);
+                    assert trustStorePassword == null || trustStorePath != null;
                     wsTlsConfig = new ClientTlsConfiguration(
                             trustStorePath,
                             trustStorePassword,
@@ -1452,9 +1453,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // (same lock-free architecture, no disk involvement).
                 // Durability-combination validation lives in validateParameters
                 // so build() and no-connect validation apply the same rules.
-                long actualSfMaxBytes = sfMaxBytes == PARAMETER_NOT_SET_EXPLICITLY
+                long actualSfMaxSegmentBytes = sfMaxSegmentBytes == PARAMETER_NOT_SET_EXPLICITLY
                         ? DEFAULT_SEGMENT_BYTES
-                        : sfMaxBytes;
+                        : sfMaxSegmentBytes;
                 // Default cap depends on backing: RAM (memory mode) is tight
                 // by default; disk (SF mode) is cheap so the default is
                 // generous enough that normal traffic never hits it.
@@ -1462,7 +1463,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_MAX_BYTES_MEMORY
                         : DEFAULT_MAX_BYTES_SF;
                 long actualSfMaxTotalBytes = sfMaxTotalBytes == PARAMETER_NOT_SET_EXPLICITLY
-                        ? Math.max(defaultMaxTotal, actualSfMaxBytes * 2)
+                        ? Math.max(defaultMaxTotal, actualSfMaxSegmentBytes * 2)
                         : sfMaxTotalBytes;
                 long actualCloseFlushTimeoutMillis = closeFlushTimeoutMillis == CLOSE_FLUSH_TIMEOUT_NOT_SET
                         ? DEFAULT_CLOSE_FLUSH_TIMEOUT_MILLIS
@@ -1556,7 +1557,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_SF_SYNC_INTERVAL_MILLIS : sfSyncIntervalMillis) * 1_000_000L
                         : 0L;
                 CursorSendEngine cursorEngine = new CursorSendEngine(
-                        slotPath, actualSfMaxBytes,
+                        slotPath, actualSfMaxSegmentBytes,
                         actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
                         actualSfSyncIntervalNanos);
                 int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
@@ -1638,7 +1639,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                             connected.startOrphanDrainers(
                                     orphans,
                                     maxBackgroundDrainers,
-                                    actualSfMaxBytes,
+                                    actualSfMaxSegmentBytes,
                                     actualSfMaxTotalBytes,
                                     actualSfSyncIntervalNanos);
                         }
@@ -2770,19 +2771,21 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Maximum bytes per segment file before rotation. Defaults to
-         * {@code DEFAULT_SEGMENT_BYTES}
-         * (4 MiB). Smaller segments mean faster trim of acked data; larger
-         * segments mean fewer rotations.
+         * Maximum bytes per segment file before rotation, the builder form of
+         * the {@code sf_max_segment_bytes} connect-string key. Smaller segments
+         * mean faster trim of acked data; larger segments mean fewer rotations.
+         * Default: {@code 4 MiB}. WebSocket transport only.
+         *
+         * @param maxSegmentBytes per-segment cap in bytes; must be positive
          */
-        public LineSenderBuilder storeAndForwardMaxBytes(long maxBytes) {
+        public LineSenderBuilder storeAndForwardMaxSegmentBytes(long maxSegmentBytes) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("store_and_forward is only supported for WebSocket transport");
             }
-            if (maxBytes <= 0) {
-                throw new LineSenderException("sf_max_bytes must be positive: ").put(maxBytes);
+            if (maxSegmentBytes <= 0) {
+                throw new LineSenderException("sf_max_segment_bytes must be positive: ").put(maxSegmentBytes);
             }
-            this.sfMaxBytes = maxBytes;
+            this.sfMaxSegmentBytes = maxSegmentBytes;
             return this;
         }
 
@@ -3387,12 +3390,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "sender_id");
                     senderId(sink.toString());
-                } else if (Chars.equals("sf_max_bytes", sink)) {
+                } else if (Chars.equals("sf_max_segment_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
-                        throw new LineSenderException("sf_max_bytes is only supported for WebSocket transport");
+                        throw new LineSenderException("sf_max_segment_bytes is only supported for WebSocket transport");
                     }
-                    pos = getValue(configurationString, pos, sink, "sf_max_bytes");
-                    storeAndForwardMaxBytes(parseSizeValue(sink, "sf_max_bytes"));
+                    pos = getValue(configurationString, pos, sink, "sf_max_segment_bytes");
+                    storeAndForwardMaxSegmentBytes(parseSizeValue(sink, "sf_max_segment_bytes"));
                 } else if (Chars.equals("sf_max_total_bytes", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("sf_max_total_bytes is only supported for WebSocket transport");
@@ -3571,12 +3574,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (hosts.size() == 0) {
                 throw new LineSenderException("addr is missing");
             }
-            if (trustStorePath != null) {
-                if (trustStorePassword == null) {
-                    throw new LineSenderException("tls_roots was configured, but tls_roots_password is missing");
-                }
-            } else if (trustStorePassword != null) {
+            if (trustStorePath == null && trustStorePassword != null) {
                 throw new LineSenderException("tls_roots_password was configured, but tls_roots is missing");
+            }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
             }
             if (protocol == PROTOCOL_HTTP || protocol == PROTOCOL_WEBSOCKET) {
                 if (user != null) {
@@ -3730,8 +3732,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
-                if (view.has("sf_max_bytes")) {
-                    storeAndForwardMaxBytes(wsSize(view, v, "sf_max_bytes"));
+                if (view.has("sf_max_segment_bytes")) {
+                    storeAndForwardMaxSegmentBytes(wsSize(view, v, "sf_max_segment_bytes"));
                 }
                 if (view.has("sf_max_total_bytes")) {
                     storeAndForwardMaxTotalBytes(wsSize(view, v, "sf_max_total_bytes"));
@@ -3834,8 +3836,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (!tls && (tlsVerify != null || tlsRoots != null || tlsRootsPassword != null)) {
                 throw new IllegalArgumentException("tls_verify/tls_roots/tls_roots_password require the wss:: schema");
             }
-            if ((tlsRoots == null) != (tlsRootsPassword == null)) {
-                throw new IllegalArgumentException("tls_roots and tls_roots_password must be provided together");
+            if (tlsRoots == null && tlsRootsPassword != null) {
+                throw new IllegalArgumentException("tls_roots_password requires tls_roots");
+            }
+            if (tlsRoots != null && "unsafe_off".equals(tlsVerify)) {
+                throw new IllegalArgumentException(TLS_ROOTS_INSECURE_CONFIG_ERROR);
             }
         }
 
@@ -3892,7 +3897,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("request_durable_ack", requestDurableAck);
             m.put("sender_id", senderId);
             m.put("sf_dir", sfDir);
-            m.put("sf_max_bytes", sfMaxBytes);
+            m.put("sf_max_segment_bytes", sfMaxSegmentBytes);
             m.put("sf_max_total_bytes", sfMaxTotalBytes);
             m.put("sf_durability", sfDurability == null ? null : sfDurability.name());
             m.put("sf_append_deadline_millis", sfAppendDeadlineMillis);
@@ -3972,6 +3977,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (!tlsEnabled && tlsValidationMode != TlsValidationMode.DEFAULT) {
                 throw new LineSenderException("TLS validation disabled, but TLS was not enabled");
+            }
+            if (trustStorePath != null && tlsValidationMode == TlsValidationMode.INSECURE) {
+                throw new LineSenderException("custom trust store cannot be combined with disabled TLS validation");
             }
             if (keyId != null && bufferCapacity < MIN_BUFFER_SIZE) {
                 throw new LineSenderException("Requested buffer too small ")
@@ -4131,17 +4139,42 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         public class AdvancedTlsSettings {
             /**
-             * Configure a custom truststore. This is only needed when using {@link #enableTls()} when your default
-             * truststore does not contain certificate chain used by a server. Most users should not need it.
+             * Configure a PEM file containing one or more custom root certificates.
+             * This is only needed when using {@link #enableTls()} and the default
+             * trust store does not contain the certificate chain used by a server.
+             * Most users should not need it.
              * <br>
-             * The path can be either a path on a local filesystem. Or you can prefix it with "classpath:" to instruct
-             * the Sender to load a trust store from a classpath.
+             * The path can be on the local filesystem, or it can use the
+             * {@code classpath:} prefix.
+             *
+             * @param pemRootsPath a path to a PEM certificate file or bundle
+             * @return an instance of LineSenderBuilder for further configuration
+             */
+            public LineSenderBuilder customTrustStore(String pemRootsPath) {
+                return setCustomTrustStore(pemRootsPath, null);
+            }
+
+            /**
+             * Configure a password-protected JKS or PKCS#12 trust store. This is
+             * only needed when using {@link #enableTls()} and the default trust
+             * store does not contain the certificate chain used by a server.
+             * Most users should not need it.
+             * <br>
+             * The path can be on the local filesystem, or it can use the
+             * {@code classpath:} prefix.
              *
              * @param trustStorePath     a path to a trust store.
-             * @param trustStorePassword a password to for the truststore
+             * @param trustStorePassword the trust store password
              * @return an instance of LineSenderBuilder for further configuration
              */
             public LineSenderBuilder customTrustStore(String trustStorePath, char[] trustStorePassword) {
+                if (trustStorePassword == null) {
+                    throw new LineSenderException("trust store password cannot be null");
+                }
+                return setCustomTrustStore(trustStorePath, trustStorePassword);
+            }
+
+            private LineSenderBuilder setCustomTrustStore(String trustStorePath, char[] trustStorePassword) {
                 if (LineSenderBuilder.this.trustStorePath != null) {
                     throw new LineSenderException("custom trust store was already configured ")
                             .put("[path=").put(LineSenderBuilder.this.trustStorePath).put("]");
@@ -4149,8 +4182,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (Chars.isBlank(trustStorePath)) {
                     throw new LineSenderException("trust store path cannot be empty nor null");
                 }
-                if (trustStorePassword == null) {
-                    throw new LineSenderException("trust store password cannot be null");
+                if (tlsValidationMode == TlsValidationMode.INSECURE) {
+                    throw new LineSenderException("custom trust store cannot be configured when TLS validation is disabled");
                 }
 
                 LineSenderBuilder.this.trustStorePath = trustStorePath;
@@ -4163,12 +4196,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
              * This is suitable when testing self-signed certificate. It's inherently insecure and should
              * never be used in a production.
              * <br>
-             * If you cannot use trusted certificate then you should prefer {@link  #customTrustStore(String, char[])}
-             * over disabling validation.
+             * If you cannot use a certificate in the default trust store then
+             * you should prefer {@link #customTrustStore(String)} or
+             * {@link #customTrustStore(String, char[])} over disabling validation.
              *
              * @return an instance of LineSenderBuilder for further configuration
              */
             public LineSenderBuilder disableCertificateValidation() {
+                if (LineSenderBuilder.this.trustStorePath != null) {
+                    throw new LineSenderException("TLS validation cannot be disabled when a custom trust store is configured");
+                }
                 LineSenderBuilder.this.tlsValidationMode = TlsValidationMode.INSECURE;
                 return LineSenderBuilder.this;
             }
