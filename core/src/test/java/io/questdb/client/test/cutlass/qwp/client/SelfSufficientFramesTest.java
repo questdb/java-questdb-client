@@ -754,6 +754,79 @@ public class SelfSufficientFramesTest {
         });
     }
 
+    @Test
+    public void testCloseStillDrainsWhenTheRetainedBatchIsOverCap() throws Exception {
+        // close() step 1 flushes; an over-cap batch throws there. Letting that throw
+        // escape skips sendCommitMessage, sealAndSwapBuffer AND drainOnClose --
+        // abandoning every row an earlier successful flush already published. close()
+        // therefore discards the retained batch, remembers the error, and runs the rest.
+        //
+        // The observable is drainOnClose: with a server that never acks and a short
+        // close budget, reaching step 3 produces a drain timeout. Remove the
+        // catch(BatchTooLargeForCapException) and no drain timeout appears anywhere,
+        // because close() never gets there. Every other close() assertion in the suite
+        // survives that mutation -- the sites all catch the parent LineSenderException,
+        // so caught-inside and escaping are indistinguishable to them.
+        assertMemoryLeak(() -> {
+            NeverAckingHandler handler = new NeverAckingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(200);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String pad = new String(new char[40]).replace('\0', 'x');
+                boolean threw = false;
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000"
+                        + ";close_flush_timeout_millis=250;")) {
+                    // A batch that fits: published and sent, but never acked.
+                    sender.table("small").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 5_000);
+
+                    // A batch no split can shrink: retained, and close() must discard it.
+                    for (int i = 0; i < 12; i++) {
+                        sender.table("big").stringColumn("p", pad).longColumn("v", (long) i).atNow();
+                    }
+                } catch (LineSenderException e) {
+                    threw = true;
+                    String all = collectMessages(e);
+                    Assert.assertTrue("close() must reach drainOnClose after discarding the "
+                            + "over-cap batch, but saw: " + all, all.contains("drain timed out"));
+                }
+                Assert.assertTrue("close() must surface the retained over-cap batch", threw);
+            }
+        });
+    }
+
+    // Flattens a throwable's message with its cause and suppressed chain, so an
+    // assertion does not depend on which of close()'s several errors ends up outermost.
+    private static String collectMessages(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        for (Throwable cur = t; cur != null; cur = cur.getCause()) {
+            sb.append(cur.getMessage()).append(' ');
+            for (Throwable sup : cur.getSuppressed()) {
+                sb.append(collectMessages(sup)).append(' ');
+            }
+            if (cur.getCause() == cur) {
+                break;
+            }
+        }
+        return sb.toString();
+    }
+
+    // Captures frames but never acks, so close()'s bounded drain always times out.
+    private static class NeverAckingHandler implements TestWebSocketServer.WebSocketServerHandler {
+        final java.util.List<byte[]> batches =
+                new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            batches.add(data.clone());
+        }
+    }
+
     private static int readVarint(byte[] buf, int offset) {
         return QwpWireTestUtils.readVarint(buf, new int[]{offset});
     }

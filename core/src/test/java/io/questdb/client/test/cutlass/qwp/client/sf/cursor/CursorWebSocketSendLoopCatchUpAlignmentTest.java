@@ -1294,6 +1294,137 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                 0L, 0L);
     }
 
+    @Test
+    public void testHostileNegativeAckSequenceCannotTrimUnsentFrames() throws Exception {
+        // fsnAtZero is NEGATIVE whenever a reconnect's dictionary catch-up spans more
+        // frames than the replay start -- a shape this feature introduced. Add a corrupt
+        // or hostile negative wire sequence and the OK path's "fsnAtZero + capped" wraps
+        // POSITIVE, so acknowledge() would trim every published frame the server never
+        // received. The lower clamp is the only thing between that and silent data loss,
+        // and reverting it left the whole suite green.
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 4);
+                long ackedBefore = engine.ackedFsn();
+                long published = engine.publishedFsn();
+                assertTrue("precondition: frames are published but unacked", published > ackedBefore);
+
+                CursorWebSocketSendLoop loop = newForegroundLoop(engine, client);
+                try {
+                    // The exact shape the catch-up produces: a negative baseline, with
+                    // one wire sequence already consumed so highestSent == 0.
+                    loop.setFsnAtZeroForTest(-5L);
+                    loop.setNextWireSeqForTest(1L);
+                    // Long.MIN_VALUE is what makes the unclamped sum wrap positive:
+                    // -5 + Long.MIN_VALUE == Long.MAX_VALUE - 4.
+                    deliverOk(loop, Long.MIN_VALUE);
+
+                    assertEquals("a negative wire sequence must not advance the ack watermark",
+                            ackedBefore, engine.ackedFsn());
+                    assertTrue("no published frame may be acked by a hostile sequence",
+                            engine.ackedFsn() < published);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testConnectLoopEntryKeepsTheCapGapEpisodeForACapGapCause() throws Exception {
+        // connectLoop's ENTRY guard decides whether a RE-ENTRY keeps the orphan
+        // drainer's cap-gap settle budget. Accrual inside a single connectLoop
+        // invocation is guarded separately, so making this line unconditional leaves
+        // the rest of the suite green.
+        assertConnectLoopEntry(true);
+    }
+
+    @Test
+    public void testConnectLoopEntryRestartsTheCapGapEpisodeForAnUnrelatedCause() throws Exception {
+        // The other direction: a transport outage says nothing about whether the
+        // cluster's batch cap stayed incompatible while nobody answered, so its
+        // downtime must not count toward the orphan dwell. Deleting the line leaves
+        // the rest of the suite green.
+        assertConnectLoopEntry(false);
+    }
+
+    /**
+     * Accrues one orphan cap-gap strike, then re-enters {@code connectLoop} with either
+     * the cap gap itself or an unrelated transport failure, and asserts the episode is
+     * respectively preserved or restarted.
+     * <p>
+     * The observation is taken inside the reconnect factory: that is the first point
+     * after the entry guard runs, and before the loop body's own reset (which fires for
+     * every non-cap-gap outcome and would otherwise mask the difference).
+     */
+    private void assertConnectLoopEntry(boolean reenterWithCapGap) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorWebSocketSendLoop[] loopRef = new CursorWebSocketSendLoop[1];
+            int[] observedAttempts = {-1};
+            long[] observedAnchor = {Long.MIN_VALUE};
+            try (CursorSendEngine engine = newEngine()) {
+                appendFrames(engine, 1);
+                CursorWebSocketSendLoop loop = new CursorWebSocketSendLoop(
+                        // A 160-byte cap against a 200-byte mirror entry: the catch-up
+                        // cannot re-register it, which is a genuine cap gap.
+                        new CatchUpCapturingClient(160), engine, 0L,
+                        CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
+                        () -> {
+                            // First point after the entry guard; the no-cap client lets
+                            // the ensuing catch-up succeed so the loop exits promptly.
+                            observedAttempts[0] = loopRef[0].catchUpCapGapAttempts();
+                            observedAnchor[0] = loopRef[0].catchUpCapGapFirstNanos();
+                            return new CatchUpCapturingClient(0);
+                        },
+                        100L, 5_000L, false,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        0L, 0L,
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                loopRef[0] = loop;
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    Throwable capGap = null;
+                    try {
+                        invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                        fail("an entry larger than the cap must raise a cap gap");
+                    } catch (RuntimeException e) {
+                        // CatchUpSendException is private to the loop, so raising a real
+                        // one is the only way a test can obtain a cap-gap throwable.
+                        assertEquals("CatchUpSendException", e.getClass().getSimpleName());
+                        capGap = e;
+                    }
+                    int accrued = loop.catchUpCapGapAttempts();
+                    long anchor = loop.catchUpCapGapFirstNanos();
+                    assertTrue("precondition: the cap gap must have accrued a strike", accrued > 0);
+
+                    loop.setRunningForTest(true);
+                    loop.connectLoopForTest(
+                            reenterWithCapGap ? capGap : new LineSenderException("transport outage"),
+                            "reconnect", 0L);
+
+                    assertTrue("precondition: the reconnect factory must have been consulted",
+                            observedAttempts[0] >= 0);
+                    if (reenterWithCapGap) {
+                        assertEquals("a cap-gap re-entry must not restart the strike count",
+                                accrued, observedAttempts[0]);
+                        assertEquals("a cap-gap re-entry must keep the dwell anchor",
+                                anchor, observedAnchor[0]);
+                    } else {
+                        assertEquals("an unrelated cause must restart the strike count",
+                                0, observedAttempts[0]);
+                        assertEquals("an unrelated cause must clear the dwell anchor",
+                                -1L, observedAnchor[0]);
+                    }
+                } finally {
+                    loop.setRunningForTest(false);
+                    loop.close();
+                }
+            }
+        });
+    }
+
     private CursorSendEngine newEngine() {
         return new CursorSendEngine(tmpDir, 16_384);
     }
