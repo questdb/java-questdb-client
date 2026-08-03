@@ -4731,30 +4731,21 @@ public class QwpWebSocketSender implements Sender {
     private void sendRow() {
         ensureConnected();
 
-        // Hard guard: if THIS row's bytes already exceed the server's wire
-        // cap, the flush would produce an oversize WS frame the server
-        // closes with ws-close[1009]. Check the per-row delta before
-        // nextRow() commits the row, so the at()/atNow() error path can
-        // roll back via rollbackRow() and prior committed rows in the
-        // batch stay intact. (The check ignores the null-padding bytes
-        // nextRow() will add; that's bounded by numColumns * elemSize and
-        // far below any realistic cap.)
+        // Hard guard: a single row whose bytes exceed the server's wire cap
+        // would flush as an oversize WS frame the server closes with
+        // ws-close[1009]. nextRow() measures the row -- padding included,
+        // since padding goes to the wire too -- inside its existing walk and
+        // throws BEFORE committing, so the at()/atNow() error path can roll
+        // back via rollbackRow() and prior committed rows in the batch stay
+        // intact.
         // Snapshot the volatile cap ONCE, as flushPendingRows does. The I/O thread
         // lowers serverMaxBatchSize -- or clears it to 0 on a failover to a node that
         // advertises no cap -- mid-stream via applyServerBatchSizeLimit. Re-reading the
         // field across the guard and the throw could observe it drop to 0 between reads
         // and reject the row against a "cap" of 0, which actually means "no cap".
         int cap = serverMaxBatchSize;
-        if (cap > 0) {
-            long rowBytes = currentTableBuffer.getBufferedBytes() - currentTableBufferSnapshotBytes;
-            if (rowBytes > cap) {
-                throw new LineSenderException("row too large for server batch cap")
-                        .put(" [rowBytes=").put(rowBytes)
-                        .put(", serverMaxBatchSize=").put(cap).put(']');
-            }
-        }
-
-        long bufferedNow = currentTableBuffer.nextRow();
+        long bufferedNow = currentTableBuffer.nextRow(
+                currentTableBufferSnapshotBytes, cap > 0 ? cap : Long.MAX_VALUE);
 
         if (pendingRowCount == 0) {
             firstPendingRowTimeNanos = System.nanoTime();

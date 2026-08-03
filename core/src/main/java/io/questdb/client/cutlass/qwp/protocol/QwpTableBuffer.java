@@ -267,9 +267,25 @@ public class QwpTableBuffer implements QuietCloseable {
      * This should be called after all column values for the current row have been set.
      */
     public long nextRow() {
-        // Reset sequential access cursor for the next row
-        columnAccessCursor = 0;
-        inProgressColumnCount = 0;
+        return nextRow(0, Long.MAX_VALUE);
+    }
+
+    /**
+     * Advances to the next row, enforcing a per-row byte budget.
+     * <p>
+     * Pads unset columns with nulls and sums the buffered bytes in the same
+     * pass, then commits the row only if the row's bytes -- the new total
+     * minus {@code snapshotBytes}, padding included -- fit {@code maxRowBytes}.
+     * On an oversize row it throws BEFORE the commit motion, so
+     * {@link #cancelCurrentRow()} undoes the row's value writes and the
+     * padding nulls alike; previously committed rows are untouched.
+     *
+     * @param snapshotBytes the total returned by the previous commit; the
+     *                      baseline the row's own bytes are measured against
+     * @param maxRowBytes   the budget; pass {@link Long#MAX_VALUE} for none
+     * @return the new total buffered bytes across all columns
+     */
+    public long nextRow(long snapshotBytes, long maxRowBytes) {
         // Ensure all columns have the same row count; sum the buffered bytes in
         // the same pass so the caller does not need a second O(columns) walk to
         // account the row (sendRow used to call getBufferedBytes() again here).
@@ -282,6 +298,15 @@ public class QwpTableBuffer implements QuietCloseable {
             }
             bytes += col.getBufferedBytes();
         }
+        long rowBytes = bytes - snapshotBytes;
+        if (rowBytes > maxRowBytes) {
+            throw new LineSenderException("row too large for server batch cap")
+                    .put(" [rowBytes=").put(rowBytes)
+                    .put(", serverMaxBatchSize=").put(maxRowBytes).put(']');
+        }
+        // Reset sequential access cursor for the next row
+        columnAccessCursor = 0;
+        inProgressColumnCount = 0;
         rowCount++;
         committedColumnCount = columns.size();
         return bytes;

@@ -1241,6 +1241,87 @@ public class QwpTableBufferTest {
     }
 
     @Test
+    public void testNextRowBudgetBoundaryIsExactIncludingPadding() throws Exception {
+        // Self-calibrating boundary test: row 2 measures the true cost of a
+        // one-column row (value bytes plus whatever the padding walk appends for
+        // the unset column), then row 3 -- the identical shape -- must be
+        // rejected by a budget one byte below that cost and accepted at exactly
+        // that cost. This pins the budget to the same walk that pads the row.
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer setCol = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true);
+                QwpTableBuffer.ColumnBuffer paddedCol = table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true);
+                // Seed both columns so later rows create no new columns.
+                setCol.addLong(1);
+                paddedCol.addString("seed");
+                table.nextRow();
+
+                long snapshot1 = table.getBufferedBytes();
+                setCol.addLong(2); // only one column set; nextRow pads the other
+                long committed = table.nextRow();
+                long paddedRowCost = committed - snapshot1;
+                assertTrue("a LONG value alone is 8 bytes", paddedRowCost >= Long.BYTES);
+
+                long snapshot2 = table.getBufferedBytes();
+                setCol.addLong(3);
+                try {
+                    table.nextRow(snapshot2, paddedRowCost - 1);
+                    fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    assertTrue("got: " + e.getMessage(),
+                            e.getMessage().contains("row too large for server batch cap"));
+                }
+                table.cancelCurrentRow();
+
+                // The identical row with the exact cost as its budget commits.
+                setCol.addLong(3);
+                table.nextRow(snapshot2, paddedRowCost);
+                assertEquals(3, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testNextRowRejectsRowOverByteBudgetBeforeCommit() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                QwpTableBuffer.ColumnBuffer strCol = table.getOrCreateColumn("s", QwpConstants.TYPE_VARCHAR, true);
+                QwpTableBuffer.ColumnBuffer longCol = table.getOrCreateColumn("a", QwpConstants.TYPE_LONG, true);
+                strCol.addString("small");
+                longCol.addLong(1);
+                table.nextRow();
+                long snapshot = table.getBufferedBytes();
+                assertEquals(1, table.getRowCount());
+
+                StringBuilder big = new StringBuilder();
+                for (int i = 0; i < 256; i++) {
+                    big.append('x');
+                }
+                strCol.addString(big.toString());
+                longCol.addLong(2);
+                try {
+                    table.nextRow(snapshot, 64);
+                    fail("Expected LineSenderException");
+                } catch (LineSenderException e) {
+                    assertTrue("got: " + e.getMessage(),
+                            e.getMessage().contains("row too large for server batch cap"));
+                }
+                // The row must NOT have committed, and the sender's at() error path
+                // (cancelCurrentRow) must restore the exact pre-row byte state.
+                assertEquals(1, table.getRowCount());
+                table.cancelCurrentRow();
+                assertEquals(snapshot, table.getBufferedBytes());
+
+                // The buffer stays usable: the next in-budget row commits.
+                strCol.addString("ok");
+                longCol.addLong(3);
+                table.nextRow(snapshot, Long.MAX_VALUE);
+                assertEquals(2, table.getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testNextRowWithPreparedMissingColumnsPadsListedColumns() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpTableBuffer table = new QwpTableBuffer("test")) {
