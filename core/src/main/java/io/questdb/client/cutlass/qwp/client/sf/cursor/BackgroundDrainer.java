@@ -24,6 +24,8 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.SenderError;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
@@ -119,6 +121,13 @@ public final class BackgroundDrainer implements Runnable {
      * reference an already-closed engine once the drain ends.
      */
     private volatile CursorSendEngine engineForTesting;
+    // Sink for SenderError.dataLoss reports fired when this drainer
+    // permanently abandons a slot behind a .failed sentinel. Volatile for the
+    // same reason as `listener`: applied by the pool at submit time, read on
+    // the drainer thread. Null means the abandonment is announced only via
+    // LOG -- a NOP for apps without an slf4j binding -- which is exactly the
+    // silence this sink exists to break.
+    private volatile SenderErrorHandler errorSink;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -335,7 +344,9 @@ public final class BackgroundDrainer implements Runnable {
                 String msg = e.getMessage();
                 LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
                 lastErrorMessage = msg;
-                OrphanScanner.markFailed(slotPath, "auth/upgrade: " + msg);
+                String reason = "auth/upgrade: " + msg;
+                OrphanScanner.markFailed(slotPath, reason);
+                dispatchDataLoss(reason);
                 outcome = DrainOutcome.FAILED;
                 return null;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
@@ -402,9 +413,10 @@ public final class BackgroundDrainer implements Runnable {
                         }
                     }
                     lastErrorMessage = e.getMessage();
-                    OrphanScanner.markFailed(slotPath,
-                            "durable-ack persistently unavailable after "
-                                    + capabilityGapAttempts + " attempts: " + e.getMessage());
+                    String reason = "durable-ack persistently unavailable after "
+                            + capabilityGapAttempts + " attempts: " + e.getMessage();
+                    OrphanScanner.markFailed(slotPath, reason);
+                    dispatchDataLoss(reason);
                     outcome = DrainOutcome.FAILED;
                     return null;
                 }
@@ -585,6 +597,27 @@ public final class BackgroundDrainer implements Runnable {
         return stopRequested;
     }
 
+    // Every markFailed site pairs with one of these: the .failed sentinel is
+    // permanent (nothing in production clears it), so each one is a
+    // permanent-abandonment verdict on the slot's unacked data. A throwing
+    // sink must not disturb the drainer's own teardown arc.
+    private void dispatchDataLoss(String reason) {
+        if (slotPath == null) {
+            // Only the @TestOnly zero-segment drainer carries a null slot path; a
+            // DATA_LOSS without a quarantined path would violate the factory's contract.
+            return;
+        }
+        SenderErrorHandler sink = errorSink;
+        if (sink != null) {
+            try {
+                sink.onError(SenderError.dataLoss(reason, slotPath));
+            } catch (Throwable t) {
+                LOG.warn("drainer error sink threw while reporting abandoned slot {}: {}",
+                        slotPath, String.valueOf(t));
+            }
+        }
+    }
+
     @Override
     public void run() {
         runnerThread = Thread.currentThread();
@@ -682,7 +715,9 @@ public final class BackgroundDrainer implements Runnable {
                 String msg = t.getMessage();
                 LOG.error("drainer slot {} is unreplayable, quarantining: {}", slotPath, msg);
                 lastErrorMessage = msg;
-                OrphanScanner.markFailed(slotPath, "unreplayable: " + msg);
+                String reason = "unreplayable: " + msg;
+                OrphanScanner.markFailed(slotPath, reason);
+                dispatchDataLoss(reason);
                 outcome = DrainOutcome.FAILED;
                 return;
             } catch (Exception t) {
@@ -824,7 +859,9 @@ public final class BackgroundDrainer implements Runnable {
                         String msg = t.getMessage();
                         LOG.error("drainer wire error for slot {}: {}", slotPath, msg);
                         lastErrorMessage = msg;
-                        OrphanScanner.markFailed(slotPath, "wire: " + msg);
+                        String reason = "wire: " + msg;
+                        OrphanScanner.markFailed(slotPath, reason);
+                        dispatchDataLoss(reason);
                         outcome = DrainOutcome.FAILED;
                         return;
                     }
@@ -876,11 +913,13 @@ public final class BackgroundDrainer implements Runnable {
             // treats .failed as disqualifying and nothing ever removes it, so a
             // sentinel on a transient failure would strand a healthy slot's
             // unacked data once its real owner died.
+            String reason = "setup: " + msg;
             try {
-                OrphanScanner.markFailed(slotPath, "setup: " + msg);
+                OrphanScanner.markFailed(slotPath, reason);
             } catch (Throwable ignored) {
                 // best-effort
             }
+            dispatchDataLoss(reason);
             outcome = DrainOutcome.FAILED;
         } finally {
             boolean ioThreadStopped = true;
@@ -937,6 +976,14 @@ public final class BackgroundDrainer implements Runnable {
             // the pool's executor may have scheduled onto this same thread.
             runnerThread = null;
         }
+    }
+
+    public SenderErrorHandler getErrorSink() {
+        return errorSink;
+    }
+
+    public void setErrorSink(SenderErrorHandler errorSink) {
+        this.errorSink = errorSink;
     }
 
     /**

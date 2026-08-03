@@ -28,6 +28,7 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -40,7 +41,7 @@ public class SenderErrorTest {
         // Pin the public enum values — adding/removing requires a deliberate spec change
         // (and an update to wire-classification mapping in the I/O loop).
         SenderError.Category[] cats = SenderError.Category.values();
-        Assert.assertEquals(9, cats.length);
+        Assert.assertEquals(10, cats.length);
         Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, SenderError.Category.valueOf("SCHEMA_MISMATCH"));
         Assert.assertEquals(SenderError.Category.PARSE_ERROR, SenderError.Category.valueOf("PARSE_ERROR"));
         Assert.assertEquals(SenderError.Category.INTERNAL_ERROR, SenderError.Category.valueOf("INTERNAL_ERROR"));
@@ -49,16 +50,18 @@ public class SenderErrorTest {
         Assert.assertEquals(SenderError.Category.NOT_WRITABLE, SenderError.Category.valueOf("NOT_WRITABLE"));
         Assert.assertEquals(SenderError.Category.DICTIONARY_GAP, SenderError.Category.valueOf("DICTIONARY_GAP"));
         Assert.assertEquals(SenderError.Category.PROTOCOL_VIOLATION, SenderError.Category.valueOf("PROTOCOL_VIOLATION"));
+        Assert.assertEquals(SenderError.Category.DATA_LOSS, SenderError.Category.valueOf("DATA_LOSS"));
         Assert.assertEquals(SenderError.Category.UNKNOWN, SenderError.Category.valueOf("UNKNOWN"));
     }
 
     @Test
     public void testAllPoliciesEnumerable() {
         SenderError.Policy[] policies = SenderError.Policy.values();
-        Assert.assertEquals(3, policies.length);
+        Assert.assertEquals(4, policies.length);
         Assert.assertEquals(SenderError.Policy.RETRIABLE, SenderError.Policy.valueOf("RETRIABLE"));
         Assert.assertEquals(SenderError.Policy.RETRIABLE_OTHER, SenderError.Policy.valueOf("RETRIABLE_OTHER"));
         Assert.assertEquals(SenderError.Policy.TERMINAL, SenderError.Policy.valueOf("TERMINAL"));
+        Assert.assertEquals(SenderError.Policy.ABANDONED, SenderError.Policy.valueOf("ABANDONED"));
     }
 
     @Test
@@ -234,5 +237,43 @@ public class SenderErrorTest {
                 0L
         );
         Assert.assertTrue(e.toString().contains("table=(multi)"));
+    }
+
+    @Test
+    public void testDataLossFactoryBindsCategoryAndPolicy() {
+        SenderError e = SenderError.dataLoss(
+                "symbol dictionary is incomplete [slot set aside at /tmp/s.unreplayable-0]",
+                "/tmp/s.unreplayable-0");
+        Assert.assertEquals(SenderError.Category.DATA_LOSS, e.getCategory());
+        Assert.assertEquals(SenderError.Policy.ABANDONED, e.getAppliedPolicy());
+        Assert.assertEquals(SenderError.NO_STATUS_BYTE, e.getServerStatusByte());
+        Assert.assertEquals(SenderError.NO_MESSAGE_SEQUENCE, e.getMessageSequence());
+        Assert.assertEquals(SenderError.NO_MESSAGE_SEQUENCE, e.getFromFsn());
+        Assert.assertEquals(SenderError.NO_MESSAGE_SEQUENCE, e.getToFsn());
+        Assert.assertNull(e.getTableName());
+        Assert.assertEquals("/tmp/s.unreplayable-0", e.getQuarantinedPath());
+        Assert.assertEquals(
+                "symbol dictionary is incomplete [slot set aside at /tmp/s.unreplayable-0]",
+                e.getServerMessage());
+        Assert.assertNotEquals(0L, e.getDetectedAtNanos());
+    }
+
+    @Test
+    public void testQuarantinedPathNullForServerErrors() {
+        // The public constructor never sets a quarantined path: only the
+        // dataLoss factory can, which is what keeps the field an honest
+        // "where are my abandoned bytes" answer rather than a free-text slot.
+        SenderError e = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                SenderError.Policy.TERMINAL, 0x03, "boom", 1L, 2L, 3L, "t", 4L);
+        Assert.assertNull(e.getQuarantinedPath());
+    }
+
+    @Test
+    public void testDataLossPolicyResolvesToAbandoned() {
+        // DATA_LOSS never arrives from the wire (classify() cannot produce
+        // it), but the resolver must still map it explicitly so a refactor
+        // of the switch cannot silently re-adopt it into the TERMINAL arm.
+        Assert.assertEquals(SenderError.Policy.ABANDONED,
+                CursorWebSocketSendLoop.defaultPolicyFor(SenderError.Category.DATA_LOSS));
     }
 }

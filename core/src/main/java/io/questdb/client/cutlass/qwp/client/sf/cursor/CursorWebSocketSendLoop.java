@@ -1104,6 +1104,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Policy.RETRIABLE;
             case NOT_WRITABLE:    // read-only replica / demoting primary: rotate endpoints
                 return SenderError.Policy.RETRIABLE_OTHER;
+            case DATA_LOSS:
+                // Client-originated; classify() never produces it (no wire byte
+                // maps to it). Explicit so the default arm's TERMINAL cannot
+                // silently re-adopt the category.
+                return SenderError.Policy.ABANDONED;
             case SCHEMA_MISMATCH: // deterministic: same bytes, same mismatch
             case PARSE_ERROR:     // deterministic: malformed bytes never parse
             case SECURITY_ERROR:  // ACL denial on a writable node (read-only refusals arrive as role-change closes)
@@ -3675,8 +3680,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long highestSent = nextWireSeq - 1;
                 if (highestSent < 0) return; // ACK before any send — ignore
                 long capped = Math.max(0L, Math.min(wireSeq, highestSent));
-                if (capped < wireSeq) {
-                    LOG.warn("server ACK wire seq {} exceeds highest sent {}, clamping",
+                if (capped != wireSeq) {
+                    LOG.warn("server ACK wire seq {} outside sent range [0, {}], clamping",
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
@@ -3883,8 +3888,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return;
             }
             long cappedSeq = Math.max(0L, Math.min(wireSeq, highestSent));
-            if (cappedSeq < wireSeq) {
-                LOG.warn("server NACK wire seq {} exceeds highest sent {}, clamping",
+            if (cappedSeq != wireSeq) {
+                LOG.warn("server NACK wire seq {} outside sent range [0, {}], clamping",
                         wireSeq, highestSent);
             }
             long fsn = fsnAtZero + cappedSeq;

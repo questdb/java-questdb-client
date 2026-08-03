@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.network.PlainSocketFactory;
@@ -248,6 +249,8 @@ public class BackgroundDrainerDurableAckRetryTest {
                     () -> new WebSocketUpgradeException(500, null, "server error during upgrade"));
             BackgroundDrainer drainer = newDrainer(factory);
             drainer.setListener(listener);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
             WebSocketClient out = drainer.connectWithDurableAckRetry();
             assertNull(out);
             assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
@@ -259,6 +262,15 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertTrue(Files.exists(sentinel));
             // The factory must have been invoked exactly once — no retry on a terminal.
             assertEquals(1, factory.attempts());
+            // The error sink must learn about the abandonment too, tagged with
+            // the same "auth/upgrade: " reason prefix the sentinel carries.
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            SenderError err = captured.get(0);
+            assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            assertEquals(slotPath, err.getQuarantinedPath());
+            assertTrue("reason must carry the site prefix [msg=" + err.getServerMessage() + ']',
+                    err.getServerMessage() != null && err.getServerMessage().startsWith("auth/upgrade: "));
         });
     }
 

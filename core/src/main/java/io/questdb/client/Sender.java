@@ -3238,18 +3238,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // into a failed build, so swallow anything it raises.
             if (errorHandler != null) {
                 try {
-                    errorHandler.onError(new SenderError(
-                            SenderError.Category.PROTOCOL_VIOLATION,
-                            SenderError.Policy.TERMINAL,
-                            SenderError.NO_STATUS_BYTE,
+                    errorHandler.onError(SenderError.dataLoss(
                             detail + " [slot set aside at " + quarantinePath
                                     + "; sender continues on a fresh slot at " + slotPath + ']',
-                            SenderError.NO_MESSAGE_SEQUENCE,
-                            SenderError.NO_MESSAGE_SEQUENCE,
-                            SenderError.NO_MESSAGE_SEQUENCE,
-                            null,
-                            System.nanoTime()
-                    ));
+                            quarantinePath));
                 } catch (Throwable handlerFailure) {
                     LOG.error("sender error handler threw while reporting a quarantined slot: {}",
                             String.valueOf(handlerFailure));

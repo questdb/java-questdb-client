@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
@@ -259,6 +260,38 @@ public class DeltaDictRecoveryTest {
                 Assert.assertEquals("the producer must keep producing on its fresh slot",
                         Arrays.asList("after-recovery"), handler.dictSnapshot());
             }
+        });
+    }
+
+    @Test(timeout = 30_000L)
+    public void testConnectPathQuarantineReportsDataLoss() throws Exception {
+        // Classification pin for the SECOND quarantine arm -- the connect-path
+        // dictionary seed (build() -> connect -> seedGlobalDictionaryFromPersisted).
+        // The constructor arm is pinned in SegmentSkipQuarantineTest; without this
+        // test a future divergence between the two arms' dispatches goes unnoticed.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            AtomicReference<SenderError> received = new AtomicReference<>();
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender s2 = Sender.builder("ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";")
+                        .errorHandler(e -> received.compareAndSet(null, e))
+                        .build()) {
+                    // build() quarantined the torn slot on the connect path and came
+                    // up on a fresh one; the dispatch is synchronous inside build().
+                }
+                assertUnreplayableSlotSetAside();
+            }
+            SenderError err = received.get();
+            Assert.assertNotNull("connect-path quarantine must reach the handler", err);
+            Assert.assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            Assert.assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            Assert.assertNotNull(err.getQuarantinedPath());
+            Assert.assertTrue("path must name the set-aside dir [path=" + err.getQuarantinedPath() + ']',
+                    err.getQuarantinedPath().contains("unreplayable-"));
         });
     }
 

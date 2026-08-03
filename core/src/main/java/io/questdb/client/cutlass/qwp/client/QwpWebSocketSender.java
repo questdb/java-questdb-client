@@ -286,7 +286,7 @@ public class QwpWebSocketSender implements Sender {
     // while the producer thread reads it from sendRow without
     // holding the sender monitor.
     private volatile int effectiveAutoFlushBytes;
-    private SenderErrorDispatcher errorDispatcher;
+    private volatile SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
     // this before connect() runs.
@@ -2626,6 +2626,18 @@ public class QwpWebSocketSender implements Sender {
             // Install the user listener as the pool's submit-time default so
             // the drainers submitted below observe it from their first event.
             drainerPool.setListener(this.drainerListener);
+            // Route drainer data-loss reports through the sender's own error
+            // dispatcher: async, bounded, and contained exactly like every
+            // other SenderError. The dispatcher field is read lazily because
+            // it is created on connect, which can complete after this pool is
+            // built; a null dispatcher (never connected) leaves the site's own
+            // LOG line as the only announcement, same as before this sink.
+            drainerPool.setErrorSink(err -> {
+                SenderErrorDispatcher d = errorDispatcher;
+                if (d != null) {
+                    d.offer(err);
+                }
+            });
         }
         for (int i = 0, n = orphanSlotPaths.size(); i < n; i++) {
             String slot = orphanSlotPaths.get(i);

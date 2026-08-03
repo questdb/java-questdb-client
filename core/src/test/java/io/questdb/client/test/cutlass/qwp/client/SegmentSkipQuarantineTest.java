@@ -226,12 +226,17 @@ public class SegmentSkipQuarantineTest {
             Assert.assertNotNull("a build()-time quarantine abandons buffered rows; the error "
                     + "handler is the ONLY programmatic channel telling the app to resend "
                     + "(slf4j ships unbound, so LOG.error alone can be a NOP)", err);
-            Assert.assertEquals(SenderError.Category.PROTOCOL_VIOLATION, err.getCategory());
-            Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
-            Assert.assertTrue("the error must name where the data went [msg=" + err.getServerMessage() + ']',
+            Assert.assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            Assert.assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            Assert.assertNotNull("getQuarantinedPath() is the programmatic answer to "
+                    + "\"where are my bytes\"; message parsing must not be required", err.getQuarantinedPath());
+            Assert.assertTrue("quarantined path must name the set-aside dir [path="
+                            + err.getQuarantinedPath() + ']',
+                    err.getQuarantinedPath().contains("unreplayable-"));
+            Assert.assertTrue("the message must still name where the data went [msg="
+                            + err.getServerMessage() + ']',
                     err.getServerMessage() != null
-                            && err.getServerMessage().contains("set aside at")
-                            && err.getServerMessage().contains("unreplayable-"));
+                            && err.getServerMessage().contains("set aside at"));
         });
     }
 
