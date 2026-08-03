@@ -345,6 +345,7 @@ public final class BackgroundDrainer implements Runnable {
                 LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
                 lastErrorMessage = msg;
                 OrphanScanner.markFailed(slotPath, "auth/upgrade: " + msg);
+                dispatchDataLoss("auth/upgrade: " + msg);
                 outcome = DrainOutcome.FAILED;
                 return null;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
@@ -414,6 +415,8 @@ public final class BackgroundDrainer implements Runnable {
                     OrphanScanner.markFailed(slotPath,
                             "durable-ack persistently unavailable after "
                                     + capabilityGapAttempts + " attempts: " + e.getMessage());
+                    dispatchDataLoss("durable-ack persistently unavailable after "
+                            + capabilityGapAttempts + " attempts: " + e.getMessage());
                     outcome = DrainOutcome.FAILED;
                     return null;
                 }
@@ -851,6 +854,7 @@ public final class BackgroundDrainer implements Runnable {
                         LOG.error("drainer wire error for slot {}: {}", slotPath, msg);
                         lastErrorMessage = msg;
                         OrphanScanner.markFailed(slotPath, "wire: " + msg);
+                        dispatchDataLoss("wire: " + msg);
                         outcome = DrainOutcome.FAILED;
                         return;
                     }
