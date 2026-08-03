@@ -31,8 +31,10 @@ import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.PlainSocketFactory;
+import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
@@ -264,6 +266,58 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                     assertEquals("an empty dictionary must skip sendDictCatchUp entirely -- "
                                     + "not call it and discover there is nothing to send",
                             0, capReads.get());
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDegradedDeltaPrefixSlotWithLostDictStillEmitsReconnectCatchUp() throws Exception {
+        // Isolates the second disjunct of hasReplayDictionaryDependency
+        // (CursorWebSocketSendLoop constructor): isDeltaDictEnabled() ||
+        // recoveredMaxSymbolDeltaStart() > 0. It is load-bearing only when the first
+        // disjunct is false. A sender that degraded to full-dict (disableDeltaDict) and
+        // whose .symbol-dict then did not survive -- a host-crash tear on top of the
+        // degrade -- reports isDeltaDictEnabled() == false, yet its recovered ring still
+        // carries a DELTA PREFIX (deltaStart > 0) and the full-dict suffix it shipped after
+        // degrading. The loop rebuilds the mirror from the frames' own deltas (they carry
+        // their symbols inline) and MUST still re-register the whole dictionary with a
+        // catch-up: dropping the recoveredMaxSymbolDeltaStart > 0 disjunct makes
+        // hasReplayDictionaryDependency false, skips the catch-up, and replays the
+        // deltaStart > 0 prefix against a server that never registered ids 0..n -- a gap.
+        // Not covered elsewhere: CursorWebSocketSendLoopTornDictGuardTest exercises the
+        // GAPPED torn slot (frames out-reach what any frame defines -> refuse, no catch-up),
+        // and the seedMirror catch-up tests inject the mirror instead of recovering a slot.
+        TestUtils.assertMemoryLeak(() -> {
+            // Delta prefix (deltaStart 0, 1) then the full-dict suffix the degraded producer
+            // ships (deltaStart 0, whole dict).
+            try (CursorSendEngine writer = newEngine()) {
+                appendDeltaDictFrame(writer, 0, 'a');
+                appendDeltaDictFrame(writer, 1, 'b');
+                appendDeltaDictFrame(writer, 0, 'a', 'b', 'c');
+            }
+            // Tear the dictionary away, so recovery finds none: PersistedSymbolDict.open()
+            // returns null for an absent file and the recovery path never fabricates one,
+            // leaving isDeltaDictEnabled() false while the delta prefix keeps maxDeltaStart > 0.
+            Files.remove(tmpDir + "/" + PersistedSymbolDict.FILE_NAME);
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0); // no cap => one frame
+            try (CursorSendEngine engine = newEngine()) { // re-open recovers the slot
+                assertFalse("a torn/absent side-file leaves the delta dict disabled",
+                        engine.isDeltaDictEnabled());
+                assertTrue("the delta prefix survives the fold, so maxDeltaStart > 0",
+                        engine.recoveredMaxSymbolDeltaStart() > 0L);
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                    assertTrue("a degraded delta-prefix slot must STILL emit a reconnect catch-up "
+                                    + "via the recoveredMaxSymbolDeltaStart > 0 disjunct, even with "
+                                    + "the delta dict disabled", client.framesSent >= 1);
+                    // The catch-up re-registers the whole rebuilt dictionary [a, b, c] -- the
+                    // ids the delta prefix and full-dict suffix reference -- so the replayed
+                    // deltaStart=0 suffix redefines ids the server already holds.
+                    assertCatchUpReassembles(client, "a", "b", "c");
                 } finally {
                     loop.close();
                 }
@@ -947,6 +1001,37 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
             }
         } finally {
             Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    /**
+     * Appends a delta-symbol-dictionary frame starting at {@code deltaStart}, one 1-byte
+     * symbol per char. deltaStart and deltaCount are small enough to be single-byte
+     * varints. deltaStart 0 is the self-sufficient full-dict frame a degraded producer
+     * ships; deltaStart > 0 is a delta frame that depends on the ids below it.
+     */
+    private static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
+        int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) deltaStart);         // deltaStart
+            Unsafe.getUnsafe().putByte(p + 1, (byte) symbols.length); // deltaCount
+            long q = p + 2;
+            for (char c : symbols) {
+                Unsafe.getUnsafe().putByte(q, (byte) 1);
+                Unsafe.getUnsafe().putByte(q + 1, (byte) c);
+                q += 2;
+            }
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
         }
     }
 

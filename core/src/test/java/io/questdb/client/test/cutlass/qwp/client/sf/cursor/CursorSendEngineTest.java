@@ -113,6 +113,35 @@ public class CursorSendEngineTest {
         });
     }
 
+    /**
+     * A delta-symbol-dictionary frame starting at {@code deltaStart}, one 1-byte symbol
+     * per char. deltaStart and deltaCount are small enough to be single-byte varints.
+     */
+    private static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
+        int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) deltaStart);         // deltaStart
+            Unsafe.getUnsafe().putByte(p + 1, (byte) symbols.length); // deltaCount
+            long q = p + 2;
+            for (char c : symbols) {
+                Unsafe.getUnsafe().putByte(q, (byte) 1);
+                Unsafe.getUnsafe().putByte(q + 1, (byte) c);
+                q += 2;
+            }
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     /** A self-sufficient frame: deltaStart 0, one 1-byte symbol per char. */
     private static void appendFullDictFrame(CursorSendEngine engine, char... symbols) {
         int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
@@ -139,6 +168,63 @@ public class CursorSendEngineTest {
         }
     }
 
+
+    /**
+     * The must-NOT-fire twin of {@link #testPopulatedDictionaryDiscardStillReFolds}.
+     * <p>
+     * A sender that ran in delta mode and then hit a disk-full / mmap fault on its
+     * write-ahead dictionary persist calls disableDeltaDict: it keeps the delta frames it
+     * already published and appends self-sufficient full-dict frames for the rest of its
+     * life. The recovered slot therefore carries a DELTA PREFIX (deltaStart 0, 1) followed
+     * by a FULL-DICT SUFFIX (deltaStart 0), so maxDeltaStart() stays > 0 even though the
+     * last frame re-registers from id 0. The discard guard's third conjunct
+     * (recoveredMaxSymbolDeltaStart == 0) is thus false and it must NOT discard the
+     * side-file -- the delta-prefix frames are not self-sufficient and still need it.
+     * Discarding here would re-fold at baseline 0 and drop a still-delta slot into
+     * full-dict mode.
+     * <p>
+     * {@code CursorWebSocketSendLoopOrphanTailTest#testTornDeltaSlotKeepsItsDictionaryInstead-
+     * OfBeingDiscarded} already guards the deltaStart conjunct with an all-delta torn slot
+     * (deltaStart 2, 3). This adds the mid-life shape's distinguishing tail: a full-dict
+     * SUFFIX at deltaStart 0 above a lower delta prefix, so maxDeltaStart (1) exceeds the
+     * LAST frame's deltaStart (0) -- a mutant reading the last frame's deltaStart instead of
+     * the running max would slip through the all-delta fixture but is caught here. It also
+     * pins recoveryFoldCount() == 1, i.e. that the whole discard/re-fold block is skipped.
+     */
+    @Test(timeout = 20_000L)
+    public void testMidLifeDegradedSlotKeepsItsDictionaryOnRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Delta prefix (two frames, one new id each -> maxDeltaStart 1) then the
+            // full-dict suffix the degraded producer emits (deltaStart 0, whole dict).
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendDeltaDictFrame(engine, 0, 'a');
+                appendDeltaDictFrame(engine, 1, 'b');
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            // The side-file the delta prefix persisted before the fault holds ids 0 and 1
+            // (a, b); id 2 (c) is the write that faulted, so it never persisted. This is
+            // the same recoveredMaxSymbolId (2) >= size (2) geometry as the discard test,
+            // but the delta prefix keeps maxDeltaStart > 0.
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("the delta prefix must survive the fold, keeping maxDeltaStart > 0",
+                        reopened.recoveredMaxSymbolDeltaStart() > 0L);
+                assertTrue("the full-dict suffix references id 2, above the side-file's size",
+                        reopened.recoveredMaxSymbolId() >= 2L);
+                assertTrue("the discard guard must NOT fire: the side-file is load-bearing for "
+                                + "the delta prefix, so it is kept and delta mode preserved",
+                        reopened.isDeltaDictEnabled());
+                assertNotNull("the persisted dictionary must be kept, not discarded",
+                        reopened.getPersistedSymbolDict());
+                assertEquals("a kept dictionary needs no re-fold -- the discard block was skipped",
+                        1, reopened.recoveryFoldCount());
+            }
+        });
+    }
 
     /**
      * A recovery-seed baseline mismatch must be quarantinable, not a permanent brick.
