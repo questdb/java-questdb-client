@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
@@ -35,6 +37,8 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
@@ -180,6 +184,57 @@ public class EngineCloseSlotLockReleaseTest {
             engine.close();
 
             assertFalse("a fully-drained close with no logical-lock holder must reclaim it",
+                    Files.exists(logicalLockPath));
+        });
+    }
+
+    /**
+     * The sender wiring one frame above {@link #testCloseDoesNotUnlinkALogicalLockItsCallerHolds}
+     * and {@link #testFullyDrainedCloseStillReclaimsAnUnheldLogicalLock}: those pin
+     * {@code CursorSendEngine.close(boolean)} directly, but nothing exercised the path that SETS
+     * the flag -- {@code QwpWebSocketSender.connect()}'s rollback flipping
+     * {@code reclaimLogicalSlotLockOnClose} to false and threading it into
+     * {@code engine.close(...)}. That field has 4 production references and, before this, 0 test
+     * references.
+     * <p>
+     * When a fresh slot's FIRST connect fails (the ordinary "server isn't up yet" startup), the
+     * slot is fully drained, so the DEFAULT close reclaims (unlinks) the logical lock
+     * {@code Sender.build()} still holds one frame up -- freeing the pathname while the flock is
+     * held, so the next {@code acquireLogical} mints a second inode. The rollback must instead
+     * thread {@code close(false)}. Here the lock is materialised UN-held (so the reclaim is not
+     * additionally blocked by the acquire-before-unlink guard), which isolates the flag: correct
+     * code skips the reclaim and the file survives; flipping the rollback back to the default
+     * reclaim removes it and turns this red.
+     */
+    @Test(timeout = 10_000L)
+    public void testConnectRollbackDoesNotReclaimTheLogicalLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot2";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot2.lock";
+
+            // Materialise the logical lock file (release the flock, leave the file), as
+            // Sender.build() would have around the failing connect.
+            SlotLock.acquireLogical(slotDir).close();
+            assertTrue(Files.exists(logicalLockPath));
+
+            // A free-but-closed loopback port refuses the connect deterministically.
+            int refusedPort;
+            try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                refusedPort = s.getLocalPort();
+            }
+
+            // A fresh slot: publishedFsn() < 0, so the rollback close takes the fully-drained arm.
+            CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+            try {
+                QwpWebSocketSender.connect("localhost", refusedPort, null, 0, 0, 0L, null, false, engine);
+                fail("connect to a refused port must fail and roll back");
+            } catch (LineSenderException expected) {
+                // the connect()-rollback path ran and closed the engine
+            }
+
+            assertTrue("the connect() rollback must thread close(false) so the logical lock its "
+                            + "caller (Sender.build) still holds is left intact, not reclaimed",
                     Files.exists(logicalLockPath));
         });
     }

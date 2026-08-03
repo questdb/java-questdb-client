@@ -686,6 +686,45 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testDefaultCapGapEscalationWindowKeepsStrikesAloneRetriable() throws Exception {
+        // testCatchUpCapGapStrikesAloneDoNotLatchWithinTheEscalationWindow pins the count+dwell
+        // AND, but with an INJECTED one-hour dwell -- so it stays green even if the DEFAULT dwell
+        // every orphan drainer inherits (BackgroundDrainer forwards
+        // DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS) were set to 0. A zero default
+        // makes escalation count-only, quarantining a drainable orphan slot on the very routine
+        // rolling restart the dwell exists to ride out. Construct the loop with the DEFAULT dwell
+        // (as the drainer does), drive well past the strike budget in far under the window, and
+        // assert the loop stays retriable: setting the constant to 0 reddens this.
+        TestUtils.assertMemoryLeak(() -> {
+            int maxAttempts = CursorWebSocketSendLoop.maxCatchUpCapGapAttempts();
+            CatchUpCapturingClient client = new CatchUpCapturingClient(160);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client,
+                        CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS);
+                try {
+                    seedMirror(loop, TestUtils.repeat("x", 200));
+                    for (int i = 1; i <= maxAttempts + 4; i++) {
+                        try {
+                            invokeSetWireBaselineWithCatchUp(loop, engine.ackedFsn() + 1L);
+                            fail("cap gap must raise a retriable CatchUpSendException (attempt " + i + ')');
+                        } catch (RuntimeException e) {
+                            assertEquals("CatchUpSendException", e.getClass().getSimpleName());
+                        }
+                        // Under a non-zero default the episode is far too young to escalate, so
+                        // the producer-facing latch must stay clear on every attempt -- including
+                        // those past the strike budget. A zero default latches here instead.
+                        loop.checkError();
+                    }
+                    assertTrue("the strikes must exceed the budget, so only the dwell keeps it retriable",
+                            loop.catchUpCapGapAttempts() > maxAttempts);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCatchUpCapGapDwellConversionSaturatesInsteadOfOverflowing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long maxExactMillis = Long.MAX_VALUE / 1_000_000L;
