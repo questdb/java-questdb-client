@@ -3890,9 +3890,24 @@ public class QwpWebSocketSender implements Sender {
         // frame carries only ids above sentMaxSymbolId; a reconnect re-registers
         // the dictionary via an I/O-thread catch-up frame before replay, so the
         // producer's monotonic baseline stays valid across the wire boundary.
+        // Snapshot the volatile cap ONCE for this whole flush. The I/O thread lowers
+        // serverMaxBatchSize on a mid-stream failover to a smaller-cap node
+        // (applyServerBatchSizeLimit); if the dictionary pre-registration, the split
+        // pre-flight and the publish loop re-read the field independently, a failover
+        // between them would size frames against different caps -- breaking the
+        // all-or-nothing guarantee. They all use this snapshot; the next flush picks
+        // up the new cap.
+        int cap = serverMaxBatchSize;
+        // A full-dictionary frame carries the whole dictionary from id 0, so once
+        // that section alone fills the cap no frame of any size fits and the sender
+        // can never flush again. Register the dictionary up front instead, as
+        // DEFERRED dictionary-only frames each chunked under the cap, and let the
+        // data frames below encode against the resulting baseline (an empty delta).
+        // No-op unless the section genuinely does not leave room for a body.
+        int deltaBaseline = preRegisterDictionaryChunks(cap, currentBatchMaxSymbolId);
         encoder.setDeferCommit(deferCommit);
         encoder.beginMessage(tableCount, globalSymbolDictionary,
-                symbolDeltaBaseline(), currentBatchMaxSymbolId);
+                deltaBaseline, currentBatchMaxSymbolId);
         // Record each table's encoded body size (position delta across addTable).
         // When the batch needs splitting, these lengths delimit immutable body
         // slices in the combined encoder buffer for direct frame assembly. The
@@ -3916,18 +3931,10 @@ public class QwpWebSocketSender implements Sender {
         int messageSize = encoder.finishMessage();
         QwpBufferWriter buffer = encoder.getBuffer();
 
-        // Snapshot the volatile cap ONCE for this whole flush. The I/O thread lowers
-        // serverMaxBatchSize on a mid-stream failover to a smaller-cap node
-        // (applyServerBatchSizeLimit); if the split pre-flight and the publish loop
-        // re-read the field independently, a failover between them would size frames
-        // against two different caps -- breaking the all-or-nothing guarantee and
-        // firing the publish-loop assert on a legitimate race. Both use this snapshot;
-        // the next flush picks up the new cap.
-        int cap = serverMaxBatchSize;
         if (cap > 0 && messageSize > cap) {
             // Keep the completed combined frame staged in the encoder while the
             // split path copies its delta entries and table-body slices.
-            flushPendingRowsSplit(deferCommit, combinedBodyStart, cap);
+            flushPendingRowsSplit(deferCommit, combinedBodyStart, cap, deltaBaseline);
             return;
         }
 
@@ -3982,7 +3989,8 @@ public class QwpWebSocketSender implements Sender {
     private void flushPendingRowsSplit(
             boolean deferCommit,
             int combinedBodyStart,
-            int cap
+            int cap,
+            int deltaBaseline
     ) {
         if (LOG.isDebugEnabled()) {
             LOG.debug("Splitting flush across multiple messages [serverMaxBatchSize={}, defer={}]", cap, deferCommit);
@@ -4004,7 +4012,7 @@ public class QwpWebSocketSender implements Sender {
         // (advanceSentMaxSymbolId), so each size equals the frame the staged-slice
         // assembler will build; this pass mutates no delta/persist state.
         int nonEmptyCount = flushTableBuffers.size();
-        int simBaseline = symbolDeltaBaseline();
+        int simBaseline = deltaBaseline;
         for (int i = 0; i < nonEmptyCount; i++) {
             CharSequence tableName = flushTableNames.getQuick(i);
             int messageSize = encoder.getSplitMessageSize(
@@ -4020,9 +4028,16 @@ public class QwpWebSocketSender implements Sender {
                 // never fit, so say that here rather than let a caller read the repeat
                 // rejections as a transient and keep appending to a batch that only
                 // grows.
+                // preRegisterDictionaryChunks has already moved an over-cap dictionary
+                // into its own frames, so anything still oversized here is the table
+                // body -- which reset() and smaller batches genuinely do fix. Report
+                // the dictionary's contribution anyway so the split is visible.
+                int frameOverhead = encoder.getSplitMessageSize(
+                        0, simBaseline, currentBatchMaxSymbolId);
                 throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
+                        .put(", dictionaryFrameBytes=").put(frameOverhead)
                         .put(", serverMaxBatchSize=").put(cap).put(']')
                         .put("; the batch is retained for retry and every flush() will "
                                 + "reject it again until a larger-cap node is reached -- "
@@ -4038,6 +4053,12 @@ public class QwpWebSocketSender implements Sender {
         }
 
         int tableBodyOffset = combinedBodyStart;
+        // Mirrors simBaseline above and advanceSentMaxSymbolId below, so the frame
+        // this loop assembles is byte-identical to the one the pre-flight sized.
+        // Re-reading symbolDeltaBaseline() here instead would ignore the dictionary
+        // pre-registration, which advances the baseline without touching
+        // sentMaxSymbolId (full-dict mode never advances it).
+        int frameBaseline = deltaBaseline;
         for (int i = 0; i < nonEmptyCount; i++) {
             CharSequence tableName = flushTableNames.getQuick(i);
 
@@ -4060,7 +4081,7 @@ public class QwpWebSocketSender implements Sender {
                     tableBodyOffset,
                     tableBodyLength,
                     deferThis,
-                    symbolDeltaBaseline(),
+                    frameBaseline,
                     currentBatchMaxSymbolId
             );
             tableBodyOffset += tableBodyLength;
@@ -4081,6 +4102,9 @@ public class QwpWebSocketSender implements Sender {
             // Frame queued: advance so the next split frame's delta starts above
             // the ids this one just registered.
             advanceSentMaxSymbolId();
+            if (deltaDictEnabled && currentBatchMaxSymbolId > frameBaseline) {
+                frameBaseline = currentBatchMaxSymbolId;
+            }
         }
 
         encoder.setDeferCommit(false);
@@ -4220,6 +4244,19 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Healing here, eagerly and in full, restores the invariant before the window opens.
      */
+    /**
+     * On-wire byte cost of one symbol-dictionary entry, exactly as
+     * {@code NativeBufferWriter.putString} writes it: {@code [varint utf8Len][utf8]}.
+     * Both of that method's branches (the ASCII fast path, which reserves
+     * {@code varintSize(charLen) == varintSize(utf8Len)}, and the two-pass fallback)
+     * produce this size, so the chunker below sizes frames against the same
+     * arithmetic the encoder will use rather than an independent estimate.
+     */
+    private int dictionaryEntryWireBytes(int id) {
+        int utf8Len = NativeBufferWriter.utf8Length(globalSymbolDictionary.getSymbol(id));
+        return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
+    }
+
     private void healPersistedDictionary(PersistedSymbolDict pd) {
         if (pd == null || !deltaDictEnabled) {
             return;
@@ -4337,6 +4374,134 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException("failed to persist symbol dictionary before publish; "
                     + "this sender has switched to full self-sufficient frames -- retry the flush", t);
         }
+    }
+
+    /**
+     * Registers {@code (symbolDeltaBaseline() .. batchMaxId]} as one or more DEFERRED,
+     * dictionary-only frames when the batch's dictionary section would not leave room
+     * for a table body under {@code cap}, and returns the delta baseline the batch's
+     * data frames must then encode against.
+     * <p>
+     * <b>Why this exists.</b> A full-dictionary frame carries the whole dictionary from
+     * id 0, so its fixed overhead grows with lifetime symbol cardinality. Once that
+     * overhead alone reaches the server's batch cap, EVERY frame is oversized however
+     * the batch is split, {@code flushPendingRowsSplit}'s pre-flight rejects it, and the
+     * sender can never flush again -- {@code reset()} discards rows, not the dictionary,
+     * so the next batch fails identically. Chunking the dictionary into its own frames
+     * removes the wall: each chunk carries a contiguous id range sized under the cap,
+     * exactly as {@code CursorWebSocketSendLoop.sendDictCatchUp} chunks the reconnect
+     * catch-up, and the data frames that follow carry an empty delta.
+     * <p>
+     * <b>Why it is safe to make the data frames non-self-sufficient.</b> Full-dict mode
+     * exists so a recovered or orphan-drained slot never replays a frame whose symbol
+     * ids nothing registered. The chunks preserve that, one level up: they are emitted
+     * with {@code FLAG_DEFER_COMMIT}, and the server refuses to advance its cumulative
+     * ack watermark over uncommitted deferred rows (it marks them and, as a last
+     * resort, clamps the watermark and logs {@code critical}). A deferred group is
+     * therefore atomic with respect to the client's trim watermark: the chunks cannot
+     * be trimmed away ahead of the data frames that depend on them, so the GROUP is
+     * self-sufficient even though its individual frames are not. Recovery replays it
+     * whole, in order, and {@code RecoveredFrameAnalysis} folds the chunks' deltas
+     * before it reaches the data frames.
+     * <p>
+     * The baseline is deliberately NOT persisted into {@code sentMaxSymbolId}: full-dict
+     * mode carries no cross-batch dictionary state, so every batch re-registers. That
+     * keeps the bandwidth cost full-dict mode already accepts, and keeps each batch
+     * independently replayable.
+     * <p>
+     * All-or-nothing: every entry is validated against the cap BEFORE any chunk is
+     * published, so a symbol too large to ship at all throws with nothing on the ring.
+     *
+     * @return {@code batchMaxId} when chunks were published (the data frames then carry
+     * an empty delta), otherwise {@link #symbolDeltaBaseline()} unchanged
+     */
+    private int preRegisterDictionaryChunks(int cap, int batchMaxId) {
+        int baseline = symbolDeltaBaseline();
+        // FULL-DICT MODE ONLY. In delta mode the section covers just this batch's new
+        // symbols -- bounded by what the batch references, and already handled by the
+        // split -- and, decisively, publishing here would break the write-ahead
+        // invariant: these frames go on the ring BEFORE
+        // persistNewSymbolsBeforePublish() runs, so a crash between them would leave
+        // frames referencing ids the .symbol-dict cannot describe, and recovery would
+        // quarantine the slot. Full-dict mode has no side-file and no write-ahead, so
+        // it carries no such ordering constraint.
+        if (deltaDictEnabled || cap <= 0 || batchMaxId <= baseline) {
+            return baseline;
+        }
+        int from = baseline + 1;
+        // One pass to size the section AND prove every entry is shippable, so the
+        // publish pass below cannot fail partway and strand deferred chunks.
+        long sectionBytes = 0;
+        for (int id = from; id <= batchMaxId; id++) {
+            int entryBytes = dictionaryEntryWireBytes(id);
+            long soloFrameBytes = (long) QwpConstants.HEADER_SIZE
+                    + NativeBufferWriter.varintSize(id)
+                    + NativeBufferWriter.varintSize(1)
+                    + entryBytes;
+            if (soloFrameBytes > cap) {
+                throw new BatchTooLargeForCapException("a single symbol value is too large for the server batch cap")
+                        .put(" [symbolId=").put(id)
+                        .put(", frameBytes=").put(soloFrameBytes)
+                        .put(", serverMaxBatchSize=").put(cap).put(']')
+                        .put("; a symbol value cannot be split across frames -- shorten it, "
+                                + "raise the server's maximum batch size, or use a varchar "
+                                + "column instead of symbol for this data");
+            }
+            sectionBytes += entryBytes;
+        }
+        long inlineFrameBytes = (long) QwpConstants.HEADER_SIZE
+                + NativeBufferWriter.varintSize(from)
+                + NativeBufferWriter.varintSize(batchMaxId - from + 1)
+                + sectionBytes;
+        if (inlineFrameBytes < cap) {
+            // The dictionary still leaves room for a body, so keep the frames
+            // self-sufficient and let the ordinary path encode them inline.
+            return baseline;
+        }
+        int chunkStart = from;
+        long chunkBytes = 0;
+        for (int id = from; id <= batchMaxId; id++) {
+            int entryBytes = dictionaryEntryWireBytes(id);
+            // Size the frame this entry WOULD produce, with the count varint the
+            // grown chunk actually needs -- a reserve-based estimate can be one byte
+            // short exactly when the count crosses a varint boundary.
+            long withEntry = (long) QwpConstants.HEADER_SIZE
+                    + NativeBufferWriter.varintSize(chunkStart)
+                    + NativeBufferWriter.varintSize(id - chunkStart + 1)
+                    + chunkBytes + entryBytes;
+            if (id > chunkStart && withEntry > cap) {
+                publishDictionaryChunk(chunkStart, id - 1);
+                chunkStart = id;
+                chunkBytes = 0;
+            }
+            chunkBytes += entryBytes;
+        }
+        publishDictionaryChunk(chunkStart, batchMaxId);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Pre-registered symbol dictionary in chunks [from={}, to={}, cap={}]",
+                    from, batchMaxId, cap);
+        }
+        return batchMaxId;
+    }
+
+    /**
+     * Publishes one deferred, table-less frame registering symbol ids
+     * {@code [startId, endId]}. Mirrors {@link #sendCommitMessage()}'s publish
+     * sequence; the caller restores the encoder's defer flag before encoding the
+     * batch's data frames.
+     */
+    private void publishDictionaryChunk(int startId, int endId) {
+        encoder.setDeferCommit(true);
+        // confirmedMaxId = startId - 1 makes beginMessage emit deltaStart = startId,
+        // deltaCount = endId - startId + 1.
+        encoder.beginMessage(0, globalSymbolDictionary, startId - 1, endId);
+        int messageSize = encoder.finishMessage();
+        QwpBufferWriter buffer = encoder.getBuffer();
+        ensureActiveBufferReady();
+        activeBuffer.ensureCapacity(messageSize);
+        activeBuffer.write(buffer.getBufferPtr(), messageSize);
+        activeBuffer.incrementRowCount();
+        sealAndSwapBuffer();
     }
 
     private void resetSymbolDictStateForNewConnection() {
