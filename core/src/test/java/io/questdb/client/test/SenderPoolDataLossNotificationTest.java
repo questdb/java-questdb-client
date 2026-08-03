@@ -112,29 +112,50 @@ public class SenderPoolDataLossNotificationTest {
 
     @Test(timeout = 60_000L)
     public void testRecoveryDelegateEnvironmentNoiseStaysSuppressed() throws Exception {
-        // The other half of the contract: a recovery delegate retrying against
-        // an environmental 401 wall (~1 attempt/second, classified TERMINAL
-        // because the delegate has never connected) must NOT reach the
-        // handler. Those events carry NO_STATUS_BYTE, which is what the
-        // provenance filter keys on.
+        // The other half of the contract. A recovery delegate's build() forces
+        // initial_connect_mode=OFF, so a connect failure on the very FIRST
+        // attempt throws straight out of build() -- no live sender, no
+        // errorDispatcher, nothing to filter (recorded via a mutation check:
+        // see task-3-report.md). The suppressible case is the one AFTER a
+        // successful connect: CursorWebSocketSendLoop seeds its own
+        // hasEverConnected=true from the live client handed to it (OFF/SYNC),
+        // so a later dropped connection whose reconnect hits an environmental
+        // 401 wall is classified RETRIABLE, not the "never connected" TERMINAL
+        // case (endpointPolicyFailureIsTerminal() short-circuits false) --
+        // Invariant B keeps the store-and-forward loop retrying indefinitely
+        // instead of giving up, and reports each retry via
+        // dispatchRetriedEndpointPolicyFailure. This is the exact mechanism
+        // CursorWebSocketSendLoopForegroundReconnectPolicyTest.assertForegroundRecovers
+        // pins one layer down (a scripted auth failure after a live client is
+        // handed to the loop yields a dispatched Policy.RETRIABLE SenderError).
+        // Those events carry NO_STATUS_BYTE, which is what the provenance
+        // filter keys on, and must NOT reach the handler.
         TestUtils.assertMemoryLeak(() -> {
             seedHealthyStrandedSlot("pool-0");
             List<SenderError> received = Collections.synchronizedList(new ArrayList<SenderError>());
-            try (TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler())) {
-                server.setRejectWithStatus(401, "Unauthorized");
+            ConnectOnceThenWallHandler handler = new ConnectOnceThenWallHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                handler.setServer(server);
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 try (QuestDB ignored = QuestDB.builder()
                         .fromConfig(poolConfig(server.getPort()))
                         .errorHandler(received::add)
                         .build()) {
-                    // Spans at least one full recovery attempt against the 401
-                    // wall (recovery retries roughly once a second).
-                    Thread.sleep(3_000);
+                    // Positive signal that the delegate actually reached the
+                    // suppressible-event scenario: it connected once (latching
+                    // hasEverConnected), got dropped, and the wall is now up
+                    // for every reconnect. Without this, a slow/failed connect
+                    // would make the silence assertion vacuous.
+                    Assert.assertTrue("setup: the delegate must connect once before the wall goes up",
+                            handler.awaitWallActivated(10, TimeUnit.SECONDS));
+                    // Several reconnect attempts at the configured 25ms/200ms
+                    // backoff fit comfortably in this window.
+                    Thread.sleep(2_000);
                 }
             }
-            Assert.assertTrue("errorHandler must stay silent through an environmental 401 wall; got "
-                    + received, received.isEmpty());
+            Assert.assertTrue("errorHandler must stay silent once a connect-once delegate "
+                    + "hits a post-connect 401 wall; got " + received, received.isEmpty());
         });
     }
 
@@ -327,6 +348,49 @@ public class SenderPoolDataLossNotificationTest {
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    // Acks the first replayed frame (so the recovery delegate's single
+    // OFF-mode connect attempt succeeds and CursorWebSocketSendLoop's own
+    // hasEverConnected latches true), then drops that connection and flips a
+    // permanent 401 wall, so every reconnect attempt from here on is
+    // classified RETRIABLE rather than the "never connected" TERMINAL case.
+    // setServer() is a two-step init: the handler must exist before
+    // TestWebSocketServer's constructor accepts it, so the server reference
+    // is wired in right after construction.
+    private static final class ConnectOnceThenWallHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch wallActivated = new CountDownLatch(1);
+        private long nextSeq;
+        private volatile TestWebSocketServer server;
+        private boolean droppedFirstConnection;
+
+        boolean awaitWallActivated(long timeout, TimeUnit unit) throws InterruptedException {
+            return wallActivated.await(timeout, unit);
+        }
+
+        void setServer(TestWebSocketServer server) {
+            this.server = server;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (droppedFirstConnection) {
+                // A frame that raced the deliberate close below (a single TCP
+                // read can batch several replayed frames into one
+                // handleRead() pass, invoking this method more than once
+                // before the socket teardown is visible) -- benign.
+                return;
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq++));
+            } catch (IOException ignored) {
+                // The close() below may itself race the ack write.
+            }
+            droppedFirstConnection = true;
+            server.setRejectWithStatus(401, "Unauthorized");
+            client.close();
+            wallActivated.countDown();
         }
     }
 
