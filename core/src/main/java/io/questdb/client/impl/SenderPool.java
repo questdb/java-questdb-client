@@ -26,11 +26,13 @@ package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionListener;
+import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
@@ -152,6 +154,13 @@ public final class SenderPool implements AutoCloseable {
     private final BackgroundDrainerListener drainerListener;
     private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
+    // Delivery channel for recovery-delegate errors that pass the
+    // isRecoveryEventUserRelevant filter. Pool-owned so a slow user handler
+    // can never stall the recovery driver / housekeeper thread or overrun
+    // its stop budget; the dispatcher thread starts lazily on first offer,
+    // so pools that never hit a recovery event pay zero thread cost. Null
+    // when the user registered no errorHandler or SF is off.
+    private final SenderErrorDispatcher recoveryErrorDispatcher;
     // Test seam. Production builds delegates via defaultSender(); white-box
     // tests in io.questdb.client.test.impl reach the package-private
     // constructor by reflection to inject a factory that throws a non-
@@ -501,6 +510,10 @@ public final class SenderPool implements AutoCloseable {
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;
+        this.recoveryErrorDispatcher = (errorHandler != null && this.storeAndForward)
+                ? new SenderErrorDispatcher(errorHandler, SenderErrorDispatcher.DEFAULT_CAPACITY,
+                        "qdb-sf-pool-recovery-errors")
+                : null;
         // Pre-warm minSize connections. Pre-warm runs single-threaded in the
         // constructor, so slots 0..minSize-1 are reserved directly.
         int built = 0;
@@ -1546,6 +1559,11 @@ public final class SenderPool implements AutoCloseable {
                 // abort the loop and strand the remaining delegates unclosed.
             }
         }
+        // After delegate teardown so a quarantine fired by a late recovery
+        // step still gets its bounded (100 ms) delivery window.
+        if (recoveryErrorDispatcher != null) {
+            recoveryErrorDispatcher.close();
+        }
     }
 
     /**
@@ -1943,6 +1961,20 @@ public final class SenderPool implements AutoCloseable {
         return buildManagedSlotSender(slotIndex, true);
     }
 
+    private Sender.LineSenderBuilder applyRecoveryCallbacks(Sender.LineSenderBuilder builder) {
+        if (recoveryErrorDispatcher != null) {
+            builder.errorHandler(new SenderErrorHandler() {
+                @Override
+                public void onError(SenderError error) {
+                    if (isRecoveryEventUserRelevant(error)) {
+                        recoveryErrorDispatcher.offer(error);
+                    }
+                }
+            });
+        }
+        return builder;
+    }
+
     // Applies the user-supplied ingest callbacks to a sender builder. Null
     // callbacks are skipped so the sender keeps its loud-not-silent default.
     private Sender.LineSenderBuilder applyUserCallbacks(Sender.LineSenderBuilder builder) {
@@ -1956,6 +1988,17 @@ public final class SenderPool implements AutoCloseable {
             builder.drainerListener(drainerListener);
         }
         return builder;
+    }
+
+    // Provenance, not severity: "did a server judge these bytes, or is the
+    // client reporting they are gone?" A recovery delegate's own environment
+    // troubles -- the never-connected auth / durable-ack TERMINALs that repeat
+    // roughly once a second while a misconfiguration lasts -- all carry
+    // NO_STATUS_BYTE and stay suppressed; a plain transport failure dispatches
+    // no SenderError at all, so an unreachable server costs this path nothing.
+    private static boolean isRecoveryEventUserRelevant(SenderError e) {
+        return e.getCategory() == SenderError.Category.DATA_LOSS
+                || e.getServerStatusByte() != SenderError.NO_STATUS_BYTE;
     }
 
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
@@ -2014,9 +2057,21 @@ public final class SenderPool implements AutoCloseable {
             // returns).
             builder.drainOrphans(false);
         }
-        // Recovery delegates are internal, short-lived, OFF-mode drain senders;
-        // don't surface their connect/error events to the user's callbacks.
-        return (forRecovery ? builder : applyUserCallbacks(builder)).build();
+        // Recovery delegates drain the user's OWN data from a previous run, so
+        // the two things they can say about it -- "it was abandoned"
+        // (DATA_LOSS from a build()-time quarantine) and "the server rejected
+        // it" (a NACK carrying its wire status byte) -- must reach the user's
+        // errorHandler: this client ships slf4j-api with no binding, so
+        // LOG.error alone can announce them nowhere. What stays excluded is
+        // the delegate's own environment noise: connection events (up to one
+        // sweep per second while a slot stays stranded) and the
+        // never-connected auth / durable-ack TERMINALs, which the recovery
+        // scan already logs and dedupes per slot. See applyRecoveryCallbacks:
+        // delivery is filtered on provenance and routed through the pool's own
+        // SenderErrorDispatcher so a slow handler cannot stall the recovery
+        // driver or housekeeper thread. connectionListener and drainerListener
+        // remain unset on recovery builds.
+        return (forRecovery ? applyRecoveryCallbacks(builder) : applyUserCallbacks(builder)).build();
     }
 
     /**
