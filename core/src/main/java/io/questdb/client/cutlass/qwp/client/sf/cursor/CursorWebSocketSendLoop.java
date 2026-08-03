@@ -3680,8 +3680,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long highestSent = nextWireSeq - 1;
                 if (highestSent < 0) return; // ACK before any send — ignore
                 long capped = Math.max(0L, Math.min(wireSeq, highestSent));
-                if (capped < wireSeq) {
-                    LOG.warn("server ACK wire seq {} exceeds highest sent {}, clamping",
+                if (capped != wireSeq) {
+                    LOG.warn("server ACK wire seq {} outside sent range [0, {}], clamping",
                             wireSeq, highestSent);
                 }
                 totalAcks.incrementAndGet();
@@ -3888,8 +3888,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return;
             }
             long cappedSeq = Math.max(0L, Math.min(wireSeq, highestSent));
-            if (cappedSeq < wireSeq) {
-                LOG.warn("server NACK wire seq {} exceeds highest sent {}, clamping",
+            if (cappedSeq != wireSeq) {
+                LOG.warn("server NACK wire seq {} outside sent range [0, {}], clamping",
                         wireSeq, highestSent);
             }
             long fsn = fsnAtZero + cappedSeq;

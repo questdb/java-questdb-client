@@ -344,8 +344,9 @@ public final class BackgroundDrainer implements Runnable {
                 String msg = e.getMessage();
                 LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
                 lastErrorMessage = msg;
-                OrphanScanner.markFailed(slotPath, "auth/upgrade: " + msg);
-                dispatchDataLoss("auth/upgrade: " + msg);
+                String reason = "auth/upgrade: " + msg;
+                OrphanScanner.markFailed(slotPath, reason);
+                dispatchDataLoss(reason);
                 outcome = DrainOutcome.FAILED;
                 return null;
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
@@ -412,11 +413,10 @@ public final class BackgroundDrainer implements Runnable {
                         }
                     }
                     lastErrorMessage = e.getMessage();
-                    OrphanScanner.markFailed(slotPath,
-                            "durable-ack persistently unavailable after "
-                                    + capabilityGapAttempts + " attempts: " + e.getMessage());
-                    dispatchDataLoss("durable-ack persistently unavailable after "
-                            + capabilityGapAttempts + " attempts: " + e.getMessage());
+                    String reason = "durable-ack persistently unavailable after "
+                            + capabilityGapAttempts + " attempts: " + e.getMessage();
+                    OrphanScanner.markFailed(slotPath, reason);
+                    dispatchDataLoss(reason);
                     outcome = DrainOutcome.FAILED;
                     return null;
                 }
@@ -602,6 +602,11 @@ public final class BackgroundDrainer implements Runnable {
     // permanent-abandonment verdict on the slot's unacked data. A throwing
     // sink must not disturb the drainer's own teardown arc.
     private void dispatchDataLoss(String reason) {
+        if (slotPath == null) {
+            // Only the @TestOnly zero-segment drainer carries a null slot path; a
+            // DATA_LOSS without a quarantined path would violate the factory's contract.
+            return;
+        }
         SenderErrorHandler sink = errorSink;
         if (sink != null) {
             try {
@@ -710,8 +715,9 @@ public final class BackgroundDrainer implements Runnable {
                 String msg = t.getMessage();
                 LOG.error("drainer slot {} is unreplayable, quarantining: {}", slotPath, msg);
                 lastErrorMessage = msg;
-                OrphanScanner.markFailed(slotPath, "unreplayable: " + msg);
-                dispatchDataLoss("unreplayable: " + msg);
+                String reason = "unreplayable: " + msg;
+                OrphanScanner.markFailed(slotPath, reason);
+                dispatchDataLoss(reason);
                 outcome = DrainOutcome.FAILED;
                 return;
             } catch (Exception t) {
@@ -853,8 +859,9 @@ public final class BackgroundDrainer implements Runnable {
                         String msg = t.getMessage();
                         LOG.error("drainer wire error for slot {}: {}", slotPath, msg);
                         lastErrorMessage = msg;
-                        OrphanScanner.markFailed(slotPath, "wire: " + msg);
-                        dispatchDataLoss("wire: " + msg);
+                        String reason = "wire: " + msg;
+                        OrphanScanner.markFailed(slotPath, reason);
+                        dispatchDataLoss(reason);
                         outcome = DrainOutcome.FAILED;
                         return;
                     }
@@ -906,12 +913,13 @@ public final class BackgroundDrainer implements Runnable {
             // treats .failed as disqualifying and nothing ever removes it, so a
             // sentinel on a transient failure would strand a healthy slot's
             // unacked data once its real owner died.
+            String reason = "setup: " + msg;
             try {
-                OrphanScanner.markFailed(slotPath, "setup: " + msg);
+                OrphanScanner.markFailed(slotPath, reason);
             } catch (Throwable ignored) {
                 // best-effort
             }
-            dispatchDataLoss("setup: " + msg);
+            dispatchDataLoss(reason);
             outcome = DrainOutcome.FAILED;
         } finally {
             boolean ioThreadStopped = true;

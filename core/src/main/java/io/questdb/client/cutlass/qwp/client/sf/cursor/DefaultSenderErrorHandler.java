@@ -31,7 +31,8 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Default handler installed when the user does not call
- * {@code LineSenderBuilder.errorHandler(...)}. Logs every server rejection so
+ * {@code LineSenderBuilder.errorHandler(...)}. Logs every server rejection,
+ * plus every client-side {@link SenderError.Category#DATA_LOSS} verdict, so
  * silence is never the default — connect-string-only users still see errors
  * in their logs.
  *
@@ -47,6 +48,14 @@ public final class DefaultSenderErrorHandler implements SenderErrorHandler {
 
     @Override
     public void onError(SenderError e) {
+        if (e.getCategory() == SenderError.Category.DATA_LOSS) {
+            // No server verdict exists for this category, so the headline must not claim
+            // one; the server-shaped fields (status byte, fsn span, seq, table) are always
+            // sentinels here and would be noise.
+            LOG.error("buffered data abandoned [category={}, policy={}, quarantined={}, msg={}]",
+                    e.getCategory(), e.getAppliedPolicy(), e.getQuarantinedPath(), e.getServerMessage());
+            return;
+        }
         // Single template; SLF4J fans out the levels so the call site stays
         // identical and the message format is reviewable in one place.
         String fmt = "server rejected batch [category={}, policy={}, status=0x{}, "
