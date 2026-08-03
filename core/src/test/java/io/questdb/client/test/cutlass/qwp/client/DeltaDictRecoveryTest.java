@@ -2133,6 +2133,29 @@ public class DeltaDictRecoveryTest {
                     }
                     return super.length(path);
                 }
+                // PersistedSymbolDict stats through the pathPtr overload so it can read
+                // errno with no free() in between, so the fault has to reach that form
+                // too -- but only for the dictionary, which is what allocNativePath
+                // remembers. Faulting every pathPtr stat would break the segment paths
+                // this test also opens.
+                long dictPathPtr = -1L;
+
+                @Override
+                public long allocNativePath(String path) {
+                    long ptr = super.allocNativePath(path);
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        dictPathPtr = ptr;
+                    }
+                    return ptr;
+                }
+
+                @Override
+                public long length(long pathPtr) {
+                    if (pathPtr == dictPathPtr) {
+                        return -1L;
+                    }
+                    return super.length(pathPtr);
+                }
             };
             try {
                 CursorSendEngine leaked = new CursorSendEngine(

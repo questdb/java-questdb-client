@@ -1599,11 +1599,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 try (SlotLock logicalSlotLock = slotPath == null
                         ? null
                         : SlotLock.acquireLogical(slotPath)) {
-                    // The constructor's own recovery seed can throw UnreplayableSlotException
-                    // too (SegmentRing.openExisting refuses a slot when it had to skip an
-                    // unreadable segment -- see C5): its frame range cannot be shown
-                    // already-acked, so recovery sets the slot aside rather than risk seeding
-                    // the ack cursor past frames that were never delivered. That verdict gets
+                    // The constructor's own recovery seed can also fail terminally, and
+                    // not only as UnreplayableSlotException: when SegmentRing.openExisting
+                    // had to skip an unreadable segment it throws SfRecoveryException (it
+                    // constructs UnreplayableSlotException nowhere), and where it cannot
+                    // even prove the chain's identity -- no manifest -- it quarantines the
+                    // corrupt files and returns an EMPTY recovery rather than refusing.
+                    // Either way the frame range cannot be shown already-acked, so recovery
+                    // sets the slot aside rather than risk seeding the ack cursor past
+                    // frames that were never delivered. All three types below are load
+                    // bearing; narrowing this catch to UnreplayableSlotException would
+                    // restore the permanent build() brick for the segment-skip case. That verdict gets
                     // the exact same quarantine-and-continue treatment as the connect()-time
                     // verdict below -- constructing cursorEngine is not inside the loop below,
                     // so a throw here would otherwise escape build() entirely, uncaught.
@@ -3128,9 +3134,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Sets a slot aside that either connect() (a symbol dictionary that cannot cover its
-         * surviving frames) or the {@code CursorSendEngine} constructor itself (recovery had
-         * to skip an unreadable segment -- see C5) declared unreplayable, and returns a fresh
-         * engine on an empty slot so the producer can keep producing.
+         * surviving frames, {@code UnreplayableSlotException}) or the
+         * {@code CursorSendEngine} constructor itself (a corrupt or incomplete durable
+         * chain, {@code SfRecoveryException} / {@code MmapSegmentCorruptionException})
+         * declared terminal, and returns a fresh engine on an empty slot so the producer
+         * can keep producing.
          * <p>
          * {@code torn} is the live engine to release, or {@code null} when the verdict came
          * from the constructor and no engine was ever built -- there is nothing to
@@ -3153,13 +3161,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * So: rename the slot aside instead, and mark it {@code .failed}. The verdict is
          * authoritative -- the recovery seed already tried every source of truth (the
          * persisted prefix AND the surviving frames' own deltas, or the per-segment scan for
-         * the C5 case), and the orphan drainer's own replay guard uses that same walk, so there
+         * a skipped segment), and the orphan drainer's own replay guard uses that same walk, so there
          * is nothing a drainer could rebuild that the seed did not. {@code markFailed} (below)
          * therefore quarantines the copy for a human rather than leaving a drainer to retry an
          * unreplayable slot forever; a full-dictionary-fallback slot never reaches here, because
          * its dictionary is discarded at recovery and it never throws. The bytes are preserved
          * on disk for forensics and a manual resend, and the new name -- NOT the sender's own
-         * slot name -- keeps a restarted sender from re-adopting it (and, for the C5 case, also
+         * slot name -- keeps a restarted sender from re-adopting it (and, for the segment-skip case, also
          * keeps a later recovery from ever re-scanning the individually-renamed {@code .corrupt}
          * segment inside it). The producer, meanwhile, starts on a clean empty slot and never
          * notices.

@@ -1941,39 +1941,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
-     * Whether an endpoint-policy failure (auth, non-421 upgrade, durable-ack
-     * capability gap) latches a terminal instead of retrying under Invariant B.
-     * <p>
-     * Two callers own a terminal, for different reasons:
-     * <ul>
-     *   <li>An ORPHAN drainer: a sanctioned terminal that hands the slot back to
-     *       its quarantine owner.</li>
-     *   <li>A sender still INITIALIZING ({@code !hasEverConnected}): connectivity
-     *       problems are the caller's problem during startup and must reach it, so
-     *       an operator learns their credentials are wrong instead of watching a
-     *       silent sender buffer forever. SYNC/OFF startup reports them by throwing
-     *       from {@code build()}; ASYNC startup has no caller left to throw at, so
-     *       the latched terminal reaches the user through {@code SenderErrorHandler}
-     *       and a {@code close()} rethrow. The constructor seeds
-     *       {@code hasEverConnected = client != null}, so SYNC/OFF (which is handed a
-     *       live client) is already past initialization here and never latches.</li>
-     * </ul>
-     * Once a FOREGROUND sender has reached the server even once, initialization is
-     * over and store-and-forward owns the buffered data: every endpoint-policy
-     * failure is then a transient the drainer must ride out, never a producer-fatal
-     * terminal (Invariant B).
-     */
-    /**
      * Reports an endpoint-policy rejection a FOREGROUND sender is riding out.
      * <p>
-     * Retrying is what the store-and-forward contract demands, but until now the retry was
-     * programmatically invisible: dispatchError ran only in the terminal branches, so a
-     * revoked token produced nothing but a throttled slf4j WARN -- in a library that ships
-     * embedded in user applications, frequently with no binding configured. flush() kept
-     * returning success until SF filled, and the failure then surfaced as "cursor ring
-     * backpressured ... sf_max_total_bytes too small", pointing the operator at disk
-     * sizing. That is the same complaint this PR makes to justify keeping STARTUP
-     * terminal; post-start it was merely delayed by SF capacity, not avoided.
+     * Retrying is what the store-and-forward contract demands, but the retry must not be
+     * programmatically invisible. Without this dispatch a revoked token produces only a
+     * throttled slf4j WARN -- and this library ships embedded, frequently with no binding
+     * configured -- while flush() keeps returning success until SF fills, at which point
+     * the failure surfaces as "cursor ring backpressured ... sf_max_total_bytes too
+     * small" and points the operator at disk sizing instead of at their credentials.
      * <p>
      * RETRIABLE, not TERMINAL: the handler learns the wire is being rejected while the
      * producer stays alive and no data is at risk.
@@ -2002,6 +1977,29 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         return lastReconnectError;
     }
 
+    /**
+     * Whether an endpoint-policy failure (auth, non-421 upgrade, durable-ack
+     * capability gap) latches a terminal instead of retrying under Invariant B.
+     * <p>
+     * Two callers own a terminal, for different reasons:
+     * <ul>
+     *   <li>An ORPHAN drainer: a sanctioned terminal that hands the slot back to
+     *       its quarantine owner.</li>
+     *   <li>A sender still INITIALIZING ({@code !hasEverConnected}): connectivity
+     *       problems are the caller's problem during startup and must reach it, so
+     *       an operator learns their credentials are wrong instead of watching a
+     *       silent sender buffer forever. SYNC/OFF startup reports them by throwing
+     *       from {@code build()}; ASYNC startup has no caller left to throw at, so
+     *       the latched terminal reaches the user through {@code SenderErrorHandler}
+     *       and a {@code close()} rethrow. The constructor seeds
+     *       {@code hasEverConnected = client != null}, so SYNC/OFF (which is handed a
+     *       live client) is already past initialization here and never latches.</li>
+     * </ul>
+     * Once a FOREGROUND sender has reached the server even once, initialization is
+     * over and store-and-forward owns the buffered data: every endpoint-policy
+     * failure is then a transient the drainer must ride out, never a producer-fatal
+     * terminal (Invariant B).
+     */
     private boolean endpointPolicyFailureIsTerminal() {
         return reconnectPolicy == ReconnectPolicy.ORPHAN || !hasEverConnected;
     }

@@ -289,7 +289,8 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public static PersistedSymbolDict open(FilesFacade ff, String slotDir) {
         String filePath = slotDir + "/" + FILE_NAME;
-        long existing = ff.length(filePath);
+        int[] statErrno = {0};
+        long existing = statLength(ff, filePath, statErrno);
         if (existing < 0) {
             // The stat failed. Only a proven not-found errno may take the
             // absent arm below -- mirroring the Rust client's open_recovered,
@@ -307,7 +308,7 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // without quarantining and BackgroundDrainer leaves the slot for a
             // later scan, so a retry once the transient clears recovers the
             // slot in full.
-            int errno = ff.errno();
+            int errno = statErrno[0];
             if (!Files.isNotFoundError(errno)) {
                 throw new SfOperationalException("symbol dict " + filePath
                         + " length could not be read (errno=" + errno
@@ -932,6 +933,39 @@ public final class PersistedSymbolDict implements QuietCloseable {
      * inconsistent, exactly as the two-pass version did, so the trusted prefix is
      * unchanged.
      */
+    /**
+     * Stats {@code filePath} and, when the stat fails, captures {@code errno} with NO
+     * intervening call.
+     * <p>
+     * {@link Files#length(String)} frees its native path pointer in a {@code finally},
+     * so on POSIX a libc {@code free()} lands between the failing {@code stat} and the
+     * separate {@code Os.errno()} JNI call. POSIX does not require {@code free()} to
+     * preserve {@code errno} -- glibc only began saving and restoring it in 2.33, and
+     * this client's runtime floor is older (see {@code check-glibc-floor.sh}). A clobber
+     * would invert the disposition below: a genuinely absent file could read as a hard
+     * error and abort {@code build()}, or a real EIO could read as {@code ENOENT} and
+     * degrade this session next to a possibly-populated side-file. The pathPtr overload
+     * keeps the two calls adjacent, which is what every other errno read in this client
+     * already does -- they all follow either a socket call or the fd-based
+     * {@code length(int)} overload. Windows is unaffected either way: its {@code length0}
+     * saves the error into a TLS slot on every failing arm.
+     *
+     * @param errnoOut receives the errno when the stat failed; left untouched otherwise
+     * @return the file length, or a negative value when the stat failed
+     */
+    private static long statLength(FilesFacade ff, String filePath, int[] errnoOut) {
+        long pathPtr = ff.allocNativePath(filePath);
+        try {
+            long len = ff.length(pathPtr);
+            if (len < 0) {
+                errnoOut[0] = ff.errno();
+            }
+            return len;
+        } finally {
+            ff.freeNativePath(pathPtr);
+        }
+    }
+
     private static RecoveryScan scanAndCopyRecoveredChunks(long inputAddr, int len, long dstAddr) {
         Varint v = new Varint();
         int count = 0;
@@ -1051,8 +1085,9 @@ public final class PersistedSymbolDict implements QuietCloseable {
             // not-found errno proves there is nothing here to protect. A file
             // that exists -- or whose state cannot be determined -- takes the
             // refuse arm, never the null-degrade.
-            long len = ff.length(filePath);
-            if (len >= 0 || !Files.isNotFoundError(ff.errno())) {
+            int[] probeErrno = {0};
+            long len = statLength(ff, filePath, probeErrno);
+            if (len >= 0 || !Files.isNotFoundError(probeErrno[0])) {
                 // A fresh slot MUST start with an empty dictionary. Proceeding without one
                 // leaves the previous generation's entries on disk while this session
                 // writes rows against a fresh id space from 0, and the next recovery
@@ -1179,9 +1214,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
         // is ftruncate, so the window can cover blocks the filesystem has not committed
         // (ENOSPC, a quota, a sparse tail left by a crash) -- and touching one raises
         // SIGBUS. Inside JNI that ABORTS THE JVM with no recovery; at an Unsafe intrinsic
-        // site HotSpot converts it to a catchable InternalError. MmapSegment.scanFrames
-        // already uses updateUnsafe over the same class of mapping for exactly this
-        // reason. Costs nothing measurable and drops a JNI transition per flush.
+        // site HotSpot converts it to a catchable InternalError -- which is why
+        // MmapSegment.isMmapAccessFault stays public for exactly these two sites.
+        // MmapSegment itself no longer needs it: its recovery validates every page
+        // through positioned reads before mapping, so it checksums with the native
+        // Crc32c.update. The Java path runs at roughly two thirds the native
+        // throughput per byte -- microseconds on a chunk this size, and the price of
+        // the catchability above.
         Unsafe.getUnsafe().putInt(
                 recStart + bodyLen,
                 Crc32c.updateUnsafe(Crc32c.INIT, recStart, bodyLen));

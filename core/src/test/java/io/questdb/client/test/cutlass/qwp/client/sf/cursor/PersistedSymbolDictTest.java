@@ -985,6 +985,13 @@ public class PersistedSymbolDictTest {
                 public long length(String path) {
                     return -1L;
                 }
+                @Override
+                public long length(long pathPtr) {
+                    // Twin of the String overload: PersistedSymbolDict stats through the
+                    // pathPtr form so it can read errno with no free() in between, and the
+                    // fault must reach it whichever overload production picks.
+                    return -1L;
+                }
 
                 @Override
                 public int openCleanRW(String path) {
@@ -1295,6 +1302,13 @@ public class PersistedSymbolDictTest {
                 public long length(String path) {
                     return -1L;
                 }
+                @Override
+                public long length(long pathPtr) {
+                    // Twin of the String overload: PersistedSymbolDict stats through the
+                    // pathPtr form so it can read errno with no free() in between, and the
+                    // fault must reach it whichever overload production picks.
+                    return -1L;
+                }
             };
             try {
                 PersistedSymbolDict reopened = PersistedSymbolDict.open(ambiguousStat, dir.toString());
@@ -1328,6 +1342,13 @@ public class PersistedSymbolDictTest {
 
                 @Override
                 public long length(String path) {
+                    return -1L;
+                }
+                @Override
+                public long length(long pathPtr) {
+                    // Twin of the String overload: PersistedSymbolDict stats through the
+                    // pathPtr form so it can read errno with no free() in between, and the
+                    // fault must reach it whichever overload production picks.
                     return -1L;
                 }
 
@@ -1597,6 +1618,13 @@ public class PersistedSymbolDictTest {
         public long length(String path) {
             return (1L << 32) + 100L;
         }
+        @Override
+        public long length(long pathPtr) {
+            // Twin of the String overload: PersistedSymbolDict stats through the
+            // pathPtr form so it can read errno with no free() in between, and the
+            // fault must reach it whichever overload production picks.
+            return (1L << 32) + 100L;
+        }
 
         @Override
         public int openRW(String path) {
@@ -1642,6 +1670,13 @@ public class PersistedSymbolDictTest {
 
         @Override
         public long length(String path) {
+            return -1L;
+        }
+        @Override
+        public long length(long pathPtr) {
+            // Twin of the String overload: PersistedSymbolDict stats through the
+            // pathPtr form so it can read errno with no free() in between, and the
+            // fault must reach it whichever overload production picks.
             return -1L;
         }
     }

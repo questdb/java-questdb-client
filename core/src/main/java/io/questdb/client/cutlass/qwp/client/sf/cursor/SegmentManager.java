@@ -676,9 +676,13 @@ public final class SegmentManager implements QuietCloseable {
     // side-file bytes are read live from each slot's gauge instead of being
     // folded into the incremental totalBytes counter: the dictionary grows
     // out-of-band on producer threads, so an incremental mirror would
-    // drift, while a live read cannot. Each gauge takes its dictionary's
-    // own monitor -- a leaf lock (no dict method reaches back into the
-    // manager), so lock -> dict monitor is the only nesting order.
+    // drift, while a live read cannot. Each gauge is WAIT-FREE and takes no
+    // lock at all -- PersistedSymbolDict.appendedBytes() is a plain volatile
+    // read -- and it must stay that way. This runs with `lock` held, on the
+    // worker that drives provisioning and trim for every registered ring,
+    // while a producer can hold that dictionary's monitor across ff.allocate
+    // and mmap. A gauge that took the monitor would park the whole manager
+    // behind one producer's append I/O.
     private long sideFileBytesLocked() {
         long total = 0L;
         for (int i = 0, n = rings.size(); i < n; i++) {

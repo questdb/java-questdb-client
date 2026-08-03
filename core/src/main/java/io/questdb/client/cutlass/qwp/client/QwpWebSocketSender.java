@@ -324,8 +324,11 @@ public class QwpWebSocketSender implements Sender {
     // the very lock file build() was holding -- on POSIX that frees the pathname without
     // releasing the flock, so the next acquireLogical creates a SECOND inode and locks it.
     // build()'s own careful close(false) calls could not prevent it, because connect()
-    // closed the engine first. Reset to true once connect() hands ownership back, so a
-    // later user-initiated close() still retires the lock normally.
+    // closed the engine first. NEVER reset back to true: the only writer is connect()'s
+    // rollback, which always rethrows, so the sender carrying false is always discarded
+    // and one that reaches the user still has true and retires the lock normally on a
+    // later close(). A future path that clears this WITHOUT rethrowing must restore it,
+    // or that sender's logical lock is never reclaimed.
     private boolean reclaimLogicalSlotLockOnClose = true;
     private long pendingBytes;
     // Set true by close() once the SF slot flock has been released (the normal
@@ -3636,9 +3639,8 @@ public class QwpWebSocketSender implements Sender {
                 long acked = cursorEngine.ackedFsn();
                 // Name the outage the I/O thread is riding out, when there is one. A
                 // foreground sender now retries endpoint-policy rejections indefinitely,
-                // so a revoked token reaches the operator HERE -- and blaming timeout
-                // tuning for what is actually an auth failure is how the review found
-                // this path misdirecting.
+                // so a revoked token reaches the operator HERE, and blaming timeout
+                // tuning for what is actually an auth failure would misdirect them.
                 CursorWebSocketSendLoop loop = cursorSendLoop;
                 Throwable outage = loop == null ? null : loop.lastReconnectError();
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",

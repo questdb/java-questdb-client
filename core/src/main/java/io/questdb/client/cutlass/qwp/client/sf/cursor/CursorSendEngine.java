@@ -707,9 +707,10 @@ public final class CursorSendEngine implements QuietCloseable {
             if (ownsManager) {
                 manager.start();
             }
-            // The gauge outlives close() safely: appendedBytes() only reads a
-            // long under the dictionary's monitor, never touching the fd, so a
+            // The gauge outlives close() safely: appendedBytes() is a wait-free
+            // volatile read that takes no lock and never touches the fd, so a
             // manager tick racing engine shutdown observes the final offset.
+            // It must not become synchronized -- see sideFileBytesLocked().
             manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
                     persistedDictInProgress == null ? null : persistedDictInProgress::appendedBytes);
             // All construction succeeded -- commit the ring, watermark, and
