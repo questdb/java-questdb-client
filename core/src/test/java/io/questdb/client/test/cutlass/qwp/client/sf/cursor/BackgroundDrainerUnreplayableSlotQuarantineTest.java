@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
@@ -35,6 +36,9 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
@@ -90,6 +94,9 @@ public class BackgroundDrainerUnreplayableSlotQuarantineTest {
                     },
                     5_000L, 1L, 5L, true, 200L);
 
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer1.setErrorSink(captured::add);
+
             drainer1.run();
 
             assertEquals("a slot whose recovery had to skip an unreadable segment must FAIL",
@@ -100,6 +107,14 @@ public class BackgroundDrainerUnreplayableSlotQuarantineTest {
                     OrphanScanner.isCandidateOrphan(slotPath));
             assertEquals("quarantine must happen before any connect attempt",
                     0, connectAttempts.get());
+
+            assertEquals("one abandonment, one report: " + captured, 1, captured.size());
+            SenderError err = captured.get(0);
+            assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            assertEquals(slotPath, err.getQuarantinedPath());
+            assertTrue("reason must carry the site prefix [msg=" + err.getServerMessage() + ']',
+                    err.getServerMessage() != null && err.getServerMessage().startsWith("setup: "));
 
             // Simulate the pool's next scan cycle with a fresh drainer against the same
             // slot. Without the fix above, no sentinel was written by drainer1, so the

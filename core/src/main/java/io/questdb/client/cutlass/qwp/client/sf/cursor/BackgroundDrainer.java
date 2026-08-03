@@ -24,6 +24,8 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.SenderError;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
@@ -119,6 +121,13 @@ public final class BackgroundDrainer implements Runnable {
      * reference an already-closed engine once the drain ends.
      */
     private volatile CursorSendEngine engineForTesting;
+    // Sink for SenderError.dataLoss reports fired when this drainer
+    // permanently abandons a slot behind a .failed sentinel. Volatile for the
+    // same reason as `listener`: applied by the pool at submit time, read on
+    // the drainer thread. Null means the abandonment is announced only via
+    // LOG -- a NOP for apps without an slf4j binding -- which is exactly the
+    // silence this sink exists to break.
+    private volatile SenderErrorHandler errorSink;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -585,6 +594,22 @@ public final class BackgroundDrainer implements Runnable {
         return stopRequested;
     }
 
+    // Every markFailed site pairs with one of these: the .failed sentinel is
+    // permanent (nothing in production clears it), so each one is a
+    // permanent-abandonment verdict on the slot's unacked data. A throwing
+    // sink must not disturb the drainer's own teardown arc.
+    private void dispatchDataLoss(String reason) {
+        SenderErrorHandler sink = errorSink;
+        if (sink != null) {
+            try {
+                sink.onError(SenderError.dataLoss(reason, slotPath));
+            } catch (Throwable t) {
+                LOG.warn("drainer error sink threw while reporting abandoned slot {}: {}",
+                        slotPath, String.valueOf(t));
+            }
+        }
+    }
+
     @Override
     public void run() {
         runnerThread = Thread.currentThread();
@@ -683,6 +708,7 @@ public final class BackgroundDrainer implements Runnable {
                 LOG.error("drainer slot {} is unreplayable, quarantining: {}", slotPath, msg);
                 lastErrorMessage = msg;
                 OrphanScanner.markFailed(slotPath, "unreplayable: " + msg);
+                dispatchDataLoss("unreplayable: " + msg);
                 outcome = DrainOutcome.FAILED;
                 return;
             } catch (Exception t) {
@@ -881,6 +907,7 @@ public final class BackgroundDrainer implements Runnable {
             } catch (Throwable ignored) {
                 // best-effort
             }
+            dispatchDataLoss("setup: " + msg);
             outcome = DrainOutcome.FAILED;
         } finally {
             boolean ioThreadStopped = true;
@@ -937,6 +964,14 @@ public final class BackgroundDrainer implements Runnable {
             // the pool's executor may have scheduled onto this same thread.
             runnerThread = null;
         }
+    }
+
+    public SenderErrorHandler getErrorSink() {
+        return errorSink;
+    }
+
+    public void setErrorSink(SenderErrorHandler errorSink) {
+        this.errorSink = errorSink;
     }
 
     /**
