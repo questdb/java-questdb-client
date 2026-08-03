@@ -699,6 +699,33 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testCumulativeBufferedBytesDoNotTripPerRowCap() throws Exception {
+        // The guard budget is nextRow(currentTableBufferSnapshotBytes, cap): each
+        // row is measured against the snapshot taken at the previous commit, not
+        // against offset zero. A mutation to nextRow(0, cap) would reject every
+        // row once the table's CUMULATIVE buffered bytes crossed the cap; this
+        // pins the wiring the single-row tests cannot distinguish.
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost", 9000,
+                    /*autoFlushRows*/ Integer.MAX_VALUE,
+                    /*autoFlushBytes*/ 0,
+                    /*autoFlushIntervalNanos*/ 0L)) {
+                sender.setConnectedForTest(true);
+                sender.applyServerBatchSizeLimit(64);
+
+                // Three rows of 22-26 bytes each: every row fits the 64-byte cap,
+                // but the running total (70 after row 3) exceeds it.
+                for (int i = 0; i < 3; i++) {
+                    sender.table("t").stringColumn("s", "abcdefghijklmnopqr").atNow();
+                }
+                QwpTableBuffer buf = sender.getTableBuffer("t");
+                Assert.assertEquals(3, buf.getRowCount());
+            }
+        });
+    }
+
+    @Test
     public void testStringColumnAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();

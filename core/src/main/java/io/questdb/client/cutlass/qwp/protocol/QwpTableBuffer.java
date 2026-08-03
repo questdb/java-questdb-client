@@ -286,9 +286,6 @@ public class QwpTableBuffer implements QuietCloseable {
      * @return the new total buffered bytes across all columns
      */
     public long nextRow(long snapshotBytes, long maxRowBytes) {
-        // Reset sequential access cursor for the next row
-        columnAccessCursor = 0;
-        inProgressColumnCount = 0;
         // Ensure all columns have the same row count; sum the buffered bytes in
         // the same pass so the caller does not need a second O(columns) walk to
         // account the row (sendRow used to call getBufferedBytes() again here).
@@ -307,6 +304,9 @@ public class QwpTableBuffer implements QuietCloseable {
                     .put(" [rowBytes=").put(rowBytes)
                     .put(", serverMaxBatchSize=").put(maxRowBytes).put(']');
         }
+        // Reset sequential access cursor for the next row
+        columnAccessCursor = 0;
+        inProgressColumnCount = 0;
         rowCount++;
         committedColumnCount = columns.size();
         return bytes;
