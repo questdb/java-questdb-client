@@ -1104,6 +1104,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 return SenderError.Policy.RETRIABLE;
             case NOT_WRITABLE:    // read-only replica / demoting primary: rotate endpoints
                 return SenderError.Policy.RETRIABLE_OTHER;
+            case DATA_LOSS:
+                // Client-originated; classify() never produces it (no wire byte
+                // maps to it). Explicit so the default arm's TERMINAL cannot
+                // silently re-adopt the category.
+                return SenderError.Policy.ABANDONED;
             case SCHEMA_MISMATCH: // deterministic: same bytes, same mismatch
             case PARSE_ERROR:     // deterministic: malformed bytes never parse
             case SECURITY_ERROR:  // ACL denial on a writable node (read-only refusals arrive as role-change closes)
