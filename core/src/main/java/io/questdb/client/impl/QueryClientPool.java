@@ -97,6 +97,11 @@ public final class QueryClientPool implements AutoCloseable {
     // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
     // once at build time on a different thread than the borrowers that read it.
     private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -340,12 +345,20 @@ public final class QueryClientPool implements AutoCloseable {
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
             while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
                 try {
                     creationFinished.awaitNanos(creationRemainingNanos);
                 } catch (InterruptedException e) {
                     creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
                 }
                 creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
@@ -555,6 +568,11 @@ public final class QueryClientPool implements AutoCloseable {
     @TestOnly
     public boolean isClosedForTesting() {
         return closed;
+    }
+
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
     }
 
     private QueryWorker createUnlocked() {
