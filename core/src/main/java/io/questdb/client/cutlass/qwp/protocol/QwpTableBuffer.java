@@ -69,6 +69,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private int columnAccessCursor; // tracks expected next column index
     private boolean columnDefsCacheValid;
     private int committedColumnCount; // columns that existed at last nextRow()
+    private String designatedTimestampName;
     private ColumnBuffer[] fastColumns; // plain array for O(1) sequential access
     private int inProgressColumnCount;
     private int rowCount;
@@ -125,6 +126,7 @@ public class QwpTableBuffer implements QuietCloseable {
         }
         columns.clear();
         columnNameToIndex.clear();
+        designatedTimestampName = null;
         fastColumns = null;
         columnAccessCursor = 0;
         committedColumnCount = 0;
@@ -178,6 +180,14 @@ public class QwpTableBuffer implements QuietCloseable {
             columnDefsCacheValid = true;
         }
         return cachedColumnDefs;
+    }
+
+    /**
+     * Returns the create-only designated timestamp column name hint, or
+     * {@code null} when none was set.
+     */
+    public String getDesignatedTimestampName() {
+        return designatedTimestampName;
     }
 
     /**
@@ -351,6 +361,44 @@ public class QwpTableBuffer implements QuietCloseable {
             columns.remove(i);
         }
         rebuildColumnAccessStructures();
+    }
+
+    /**
+     * Sets the create-only designated timestamp column name hint for this
+     * table. The value is sticky across rows and buffer resets. It may be
+     * set or re-declared only while the buffer holds no rows; any set while
+     * rows are buffered throws.
+     *
+     * @param columnName non-empty name of at most 127 UTF-8 bytes
+     */
+    public void setDesignatedTimestampName(CharSequence columnName) {
+        if (columnName == null || columnName.length() == 0) {
+            throw new LineSenderException("designated timestamp name cannot be empty");
+        }
+        int utf8Length = Utf8s.utf8Bytes(columnName);
+        if (utf8Length > MAX_COLUMN_NAME_LENGTH) {
+            throw new LineSenderException(
+                    "designated timestamp name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH
+                            + ", utf8Length=" + utf8Length + ']'
+            );
+        }
+        if (designatedTimestampName == null) {
+            if (rowCount != 0) {
+                throw new LineSenderException(
+                        "cannot set designated timestamp name for table '" + tableName
+                                + "' after rows are buffered [new=" + columnName + ']'
+                );
+            }
+            designatedTimestampName = Chars.toString(columnName);
+        } else if (!Chars.equals(designatedTimestampName, columnName)) {
+            if (rowCount != 0) {
+                throw new LineSenderException(
+                        "conflicting designated timestamp names for table '" + tableName
+                                + "' [existing=" + designatedTimestampName + ", new=" + columnName + ']'
+                );
+            }
+            designatedTimestampName = Chars.toString(columnName);
+        }
     }
 
     private static void assertColumnType(CharSequence name, byte type, ColumnBuffer column) {

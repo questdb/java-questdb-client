@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
@@ -1674,6 +1675,171 @@ public class QwpUdpSenderTest {
                     decodedRow("t", "sym", "alpha", "x", 1L),
                     decodedRow("t", "sym", "beta", "x", 2L, "b", 3L)
             ), decodeRows(nf.packets));
+        });
+    }
+
+    @Test
+    public void testTableOptionsBeforeTableThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                assertThrowsContains("table()", sender::tableOptions);
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsChainingReturnsSameInstance() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                Sender.TableOptions options = sender.table("t").tableOptions();
+
+                Assert.assertSame(options, options.designatedTimestamp("ts"));
+                Assert.assertSame(options, sender.tableOptions());
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsDesignatedTimestampEmitsTrailer() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("t").tableOptions().designatedTimestamp("ts");
+                sender.longColumn("x", 42).atNow();
+                sender.flush();
+            }
+
+            Assert.assertEquals(1, nf.packets.size());
+            byte[] packet = nf.packets.get(0);
+            Assert.assertEquals(FLAG_TABLE_OPTIONS, (byte) (packet[HEADER_OFFSET_FLAGS] & FLAG_TABLE_OPTIONS));
+            Assert.assertEquals(packet.length - HEADER_SIZE, Unsafe.byteArrayGetInt(packet, 8));
+
+            byte[] expectedTrailer = {
+                    4,
+                    TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME,
+                    2, 't', 's',
+                    5, 0, 0, 0
+            };
+            int trailerOffset = packet.length - expectedTrailer.length;
+            for (int i = 0; i < expectedTrailer.length; i++) {
+                Assert.assertEquals("trailer byte " + i, expectedTrailer[i], packet[trailerOffset + i]);
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsDesignatedTimestampRejectedAfterRowsBuffered() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            int maxDatagramSize = 1024;
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t");
+                sender.longColumn("x", 1).atNow();
+
+                // a late hint would grow the committed datagram past the cap
+                // with no re-check on the flush path, so it must be rejected
+                assertThrowsContains(
+                        "after rows are buffered",
+                        () -> sender.tableOptions().designatedTimestamp("event_ts")
+                );
+
+                sender.flush();
+                Assert.assertEquals(1, nf.packets.size());
+                Assert.assertEquals(0, (byte) (nf.packets.get(0)[HEADER_OFFSET_FLAGS] & FLAG_TABLE_OPTIONS));
+                assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+
+                // rowCount == 0 after the flush: the hint is accepted again
+                sender.tableOptions().designatedTimestamp("event_ts");
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsOnlyRowIsDiscarded() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                sender.table("first").tableOptions().designatedTimestamp("ts");
+                sender.table("second");
+                sender.flush();
+                Assert.assertEquals(0, nf.sendCount);
+
+                sender.table("third").tableOptions().designatedTimestamp("event_ts");
+            }
+            Assert.assertEquals(0, nf.sendCount);
+        });
+    }
+
+    @Test
+    public void testTableOptionsRenameInvalidatesCachedDatagramEstimate() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            StringBuilder longName = new StringBuilder();
+            for (int i = 0; i < 120; i++) {
+                longName.append('t');
+            }
+            int maxDatagramSize = 1024;
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, maxDatagramSize)) {
+                sender.table("t").tableOptions().designatedTimestamp("a");
+                sender.longColumn("x", 1).atNow();
+                sender.flush();
+                Assert.assertEquals(1, nf.packets.size());
+
+                // rowCount == 0 after the flush, so re-declaring a different (much
+                // longer) name is accepted; the cached base estimate sized for "a"
+                // must not survive the rename
+                sender.table("t").tableOptions().designatedTimestamp(longName);
+                sender.longColumn("x", 2).atNow();
+                long estimate = sender.committedDatagramEstimateForTest();
+                sender.flush();
+
+                Assert.assertEquals(2, nf.packets.size());
+                int actual = nf.packets.get(1).length;
+                Assert.assertTrue(
+                        "committed estimate must cover the actual datagram [estimate=" + estimate + ", actual=" + actual + ']',
+                        estimate >= actual
+                );
+                assertPacketsWithinLimit(new RunResult(nf.packets, nf.lengths, nf.sendCount), maxDatagramSize);
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsRetainedReferenceRetargetsOnNextTableOptionsCall() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                Sender.TableOptions retained = sender.table("a").tableOptions();
+                Assert.assertSame(retained, sender.table("b").tableOptions());
+
+                // the retained reference is the re-stamped per-sender flyweight:
+                // the call lands on the currently selected table, not on "a"
+                retained.designatedTimestamp("ts");
+                Assert.assertEquals("ts", sender.currentTableBufferForTest().getDesignatedTimestampName());
+
+                sender.table("a");
+                Assert.assertNull(sender.currentTableBufferForTest().getDesignatedTimestampName());
+            }
+        });
+    }
+
+    @Test
+    public void testTableOptionsStaleReferenceRejectedUntilTableReselected() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1)) {
+                Sender.TableOptions options = sender.table("a").tableOptions();
+                options.designatedTimestamp("ts");
+
+                sender.table("b");
+                assertThrowsContains("stale", () -> options.designatedTimestamp("other_ts"));
+
+                sender.table("a");
+                Assert.assertSame(options, options.designatedTimestamp("ts"));
+                Assert.assertEquals("ts", sender.currentTableBufferForTest().getDesignatedTimestampName());
+            }
         });
     }
 

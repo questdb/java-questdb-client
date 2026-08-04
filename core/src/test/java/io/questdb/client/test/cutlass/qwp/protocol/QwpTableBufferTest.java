@@ -40,6 +40,7 @@ import org.junit.Test;
 import java.nio.charset.StandardCharsets;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import static io.questdb.client.test.tools.TestUtils.repeat;
 import static org.junit.Assert.*;
 
 public class QwpTableBufferTest {
@@ -1366,6 +1367,85 @@ public class QwpTableBufferTest {
                 assertEquals(0, Unsafe.getUnsafe().getLong(drop.getNullBitmapAddress() + Long.BYTES));
                 assertEquals(0, Unsafe.getUnsafe().getLong(drop.getNullBitmapAddress() + 2L * Long.BYTES));
                 assertEquals(0, Unsafe.getUnsafe().getInt(drop.getStringOffsetsAddress()));
+            }
+        });
+    }
+
+    @Test
+    public void testDesignatedTimestampNameFirstSetAfterRowsBufferedThrows() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.getOrCreateColumn("x", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+                try {
+                    table.setDesignatedTimestampName("event_time");
+                    fail("expected rejection of first set after rows are buffered");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("after rows are buffered"));
+                }
+                assertNull(table.getDesignatedTimestampName());
+
+                table.reset();
+                table.setDesignatedTimestampName("event_time");
+                assertEquals("event_time", table.getDesignatedTimestampName());
+            }
+        });
+    }
+
+    @Test
+    public void testDesignatedTimestampNameIsStickyAndConsistent() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                table.setDesignatedTimestampName("event_time");
+                table.setDesignatedTimestampName(new StringBuilder("event_time"));
+                table.reset();
+                assertEquals("event_time", table.getDesignatedTimestampName());
+
+                // no rows buffered: re-declaring with a different name is allowed
+                table.setDesignatedTimestampName("other_time");
+                assertEquals("other_time", table.getDesignatedTimestampName());
+
+                table.getOrCreateColumn("x", QwpConstants.TYPE_LONG, false).addLong(1);
+                table.nextRow();
+                try {
+                    table.setDesignatedTimestampName("third_time");
+                    fail("expected conflicting designated timestamp name");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("conflicting designated timestamp names"));
+                }
+                table.setDesignatedTimestampName("other_time");
+                assertEquals("other_time", table.getDesignatedTimestampName());
+
+                table.reset();
+                table.setDesignatedTimestampName("fourth_time");
+                assertEquals("fourth_time", table.getDesignatedTimestampName());
+            }
+        });
+    }
+
+    @Test
+    public void testDesignatedTimestampNameValidatesUtf8Length() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                try {
+                    table.setDesignatedTimestampName("");
+                    fail("expected empty designated timestamp name rejection");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("cannot be empty"));
+                }
+
+                String maxBytes = repeat("\u00e9", 63) + "x";
+                table.setDesignatedTimestampName(maxBytes);
+                assertEquals(maxBytes, table.getDesignatedTimestampName());
+            }
+
+            try (QwpTableBuffer table = new QwpTableBuffer("test")) {
+                try {
+                    table.setDesignatedTimestampName(repeat("\u00e9", 64));
+                    fail("expected oversized designated timestamp name rejection");
+                } catch (LineSenderException e) {
+                    assertTrue(e.getMessage().contains("utf8Length=128"));
+                }
             }
         });
     }

@@ -51,6 +51,18 @@ public final class QwpConstants {
      */
     public static final byte FLAG_GORILLA = 0x04;
     /**
+     * Flag bit: per-table options trailer enabled.
+     * <p>
+     * The client sets this flag whenever a table option is declared, without
+     * gating on the negotiated capability (UDP has no handshake, and
+     * store-and-forward frames must replay to arbitrary servers). This relies
+     * on the server-side forward-compat guarantee: pre-table-options servers
+     * validate only magic, version and payload length (unknown flag bits are
+     * ignored) and iterate exactly the header-declared table count, so trailer
+     * bytes after the last table body are never read.
+     */
+    public static final byte FLAG_TABLE_OPTIONS = 0x20;
+    /**
      * Flag bit: payload region after the prelude is zstd-compressed. Set only
      * when the handshake negotiated zstd compression. Mirror of the server-side
      * constant; see the server QwpConstants for the full description.
@@ -98,6 +110,10 @@ public final class QwpConstants {
      * the ingress {@code STATUS_*} namespace (0x00-0x09).
      */
     public static final byte STATUS_LIMIT_EXCEEDED = 0x0B;
+    /**
+     * Per-table option tag: designated timestamp column name.
+     */
+    public static final byte TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME = 0x01;
     /**
      * Column type: BINARY (length-prefixed opaque bytes).
      * Wire format: identical to VARCHAR — (N+1) x uint32 offsets + concatenated bytes.

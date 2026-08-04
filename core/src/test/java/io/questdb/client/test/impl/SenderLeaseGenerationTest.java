@@ -25,6 +25,7 @@
 package io.questdb.client.test.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.impl.PooledSender;
 import io.questdb.client.impl.SenderPool;
 import io.questdb.client.test.tools.TestUtils;
@@ -114,6 +115,43 @@ public class SenderLeaseGenerationTest {
                 pool.giveBack(leaseB);
                 Assert.assertEquals("the current borrower's close must still work",
                         1, available.size());
+            }
+        });
+    }
+
+    @Test
+    public void testStaleTableOptionsReferenceIsRejected() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Class<?> slotClass = Class.forName("io.questdb.client.impl.SenderSlot");
+            Constructor<?> slotCtor = slotClass.getDeclaredConstructor(Sender.class, SenderPool.class, int.class);
+            slotCtor.setAccessible(true);
+            Method bump = slotClass.getDeclaredMethod("bumpGeneration");
+            bump.setAccessible(true);
+            Constructor<PooledSender> leaseCtor =
+                    PooledSender.class.getDeclaredConstructor(slotClass, long.class);
+            leaseCtor.setAccessible(true);
+
+            try (QwpWebSocketSender delegate = QwpWebSocketSender.createForTesting("localhost", 9000)) {
+                Object slot = slotCtor.newInstance(delegate, null, -1);
+                bump.invoke(slot);
+                PooledSender leaseA = leaseCtor.newInstance(slot, 1L);
+
+                Sender.TableOptions options = leaseA.table("a").tableOptions();
+                Assert.assertSame(options, options.designatedTimestamp("ts"));
+                Assert.assertEquals("ts", delegate.getTableBuffer("a").getDesignatedTimestampName());
+
+                bump.invoke(slot);
+                bump.invoke(slot);
+                PooledSender leaseB = leaseCtor.newInstance(slot, 3L);
+                leaseB.table("b");
+
+                try {
+                    options.designatedTimestamp("other_ts");
+                    Assert.fail("a stale options reference must not reach the re-borrowed slot");
+                } catch (IllegalStateException expected) {
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("closed"));
+                }
+                Assert.assertNull(delegate.getTableBuffer("b").getDesignatedTimestampName());
             }
         });
     }

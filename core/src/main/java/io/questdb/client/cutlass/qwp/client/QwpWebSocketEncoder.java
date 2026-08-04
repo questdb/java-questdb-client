@@ -25,6 +25,7 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
+import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
@@ -38,12 +39,15 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
 public class QwpWebSocketEncoder implements QuietCloseable {
 
     private final QwpColumnWriter columnWriter = new QwpColumnWriter();
+    private final ObjList<QwpTableBuffer> messageTables = new ObjList<>();
     private NativeBufferWriter buffer;
     // QWP ingress always advertises Gorilla timestamp encoding. The column
     // writer still emits a per-column encoding byte and falls back to raw
     // values when delta-of-delta overflows int32.
     private byte flags = FLAG_GORILLA;
+    private byte messageHeaderFlags;
     private int payloadStart;
+    private boolean tableOptionsEnabled;
     private byte version = VERSION;
 
     public QwpWebSocketEncoder() {
@@ -56,6 +60,8 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     public void addTable(QwpTableBuffer tableBuffer) {
         columnWriter.encodeTable(tableBuffer, true, true);
+        messageTables.add(tableBuffer);
+        tableOptionsEnabled |= tableBuffer.getDesignatedTimestampName() != null;
     }
 
     public void beginMessage(
@@ -65,9 +71,12 @@ public class QwpWebSocketEncoder implements QuietCloseable {
             int batchMaxId
     ) {
         buffer.reset();
+        messageTables.clear();
+        tableOptionsEnabled = false;
         int deltaStart = confirmedMaxId + 1;
         int deltaCount = Math.max(0, batchMaxId - confirmedMaxId);
         byte headerFlags = (byte) (flags | FLAG_DELTA_SYMBOL_DICT);
+        messageHeaderFlags = headerFlags;
         byte origFlags = flags;
         flags = headerFlags;
         writeHeader(tableCount, 0);
@@ -92,13 +101,15 @@ public class QwpWebSocketEncoder implements QuietCloseable {
 
     public int encode(QwpTableBuffer tableBuffer) {
         buffer.reset();
+        messageTables.clear();
+        tableOptionsEnabled = tableBuffer.getDesignatedTimestampName() != null;
+        messageHeaderFlags = flags;
         writeHeader(1, 0);
-        int payloadStart = buffer.getPosition();
+        payloadStart = buffer.getPosition();
         columnWriter.setBuffer(buffer);
         columnWriter.encodeTable(tableBuffer, false, true);
-        int payloadLength = buffer.getPosition() - payloadStart;
-        buffer.patchInt(8, payloadLength);
-        return buffer.getPosition();
+        messageTables.add(tableBuffer);
+        return finishMessage();
     }
 
     public int encodeWithDeltaDict(
@@ -113,6 +124,14 @@ public class QwpWebSocketEncoder implements QuietCloseable {
     }
 
     public int finishMessage() {
+        if (tableOptionsEnabled) {
+            int trailerStart = buffer.getPosition();
+            for (int i = 0, n = messageTables.size(); i < n; i++) {
+                columnWriter.encodeTableOptions(messageTables.getQuick(i));
+            }
+            buffer.putInt(buffer.getPosition() - trailerStart);
+            buffer.patchByte(HEADER_OFFSET_FLAGS, (byte) (messageHeaderFlags | FLAG_TABLE_OPTIONS));
+        }
         int payloadLength = buffer.getPosition() - payloadStart;
         buffer.patchInt(8, payloadLength);
         return buffer.getPosition();

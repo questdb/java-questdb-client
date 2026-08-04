@@ -37,6 +37,8 @@ public class QwpConstantsTest {
         // Verify flag bits are at correct positions
         Assert.assertEquals(0x04, FLAG_GORILLA);
         Assert.assertEquals(0x08, FLAG_DELTA_SYMBOL_DICT);
+        Assert.assertEquals(0x20, FLAG_TABLE_OPTIONS);
+        Assert.assertEquals(0x01, TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME);
     }
 
     @Test

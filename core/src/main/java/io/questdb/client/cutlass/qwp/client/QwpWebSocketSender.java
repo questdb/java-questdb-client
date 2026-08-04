@@ -170,6 +170,7 @@ public class QwpWebSocketSender implements Sender {
     private final ReentrantLock connectWalkLock = new ReentrantLock();
     private final QwpHostHealthTracker hostTracker;
     private final CharSequenceObjHashMap<QwpTableBuffer> tableBuffers;
+    private final TableOptionsImpl tableOptions = new TableOptionsImpl();
     // null means plain text (no TLS)
     private final ClientTlsConfiguration tlsConfig;
     private MicrobatchBuffer activeBuffer;
@@ -230,6 +231,7 @@ public class QwpWebSocketSender implements Sender {
     private CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
+    private volatile boolean designatedTimestampNameSet;
     // User-supplied observer for background orphan-slot drainer events.
     // Volatile: written by setDrainerListener (any thread, before or after
     // startOrphanDrainers) and read at pool-creation time. Null -> drainers
@@ -346,6 +348,9 @@ public class QwpWebSocketSender implements Sender {
     // refresh this from the cursor I/O thread on a mid-stream reconnect while
     // sendRow reads it on the producer thread with no synchronization.
     private volatile int serverMaxBatchSize;
+    private volatile boolean serverTableOptionsCapabilityKnown;
+    private volatile boolean serverTableOptionsSupported;
+    private boolean tableOptionsWarningLogged;
 
     private QwpWebSocketSender(
             List<Endpoint> endpoints,
@@ -2576,6 +2581,13 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @Override
+    public TableOptions tableOptions() {
+        checkNotClosed();
+        checkTableSelected();
+        return tableOptions.of(currentTableBuffer);
+    }
+
+    @Override
     public QwpWebSocketSender timestampColumn(CharSequence columnName, long value, ChronoUnit unit) {
         checkNotClosed();
         checkTableSelected();
@@ -3091,6 +3103,12 @@ public class QwpWebSocketSender implements Sender {
                 }
                 hostTracker.recordSuccess(idx, !background);
                 ctx.previousIdx = idx;
+                boolean tableOptionsSupported = newClient.isServerTableOptionsSupported();
+                if (!background) {
+                    serverTableOptionsSupported = tableOptionsSupported;
+                    serverTableOptionsCapabilityKnown = true;
+                }
+                warnIfTableOptionsUnsupported(true, tableOptionsSupported);
                 if (background) {
                     // Walk bookkeeping only: recordSuccess feeds the shared health
                     // tracker and ctx.previousIdx arms this factory's own
@@ -4059,6 +4077,16 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private synchronized void warnIfTableOptionsUnsupported(boolean capabilityKnown, boolean supported) {
+        if (capabilityKnown
+                && designatedTimestampNameSet
+                && !supported
+                && !tableOptionsWarningLogged) {
+            tableOptionsWarningLogged = true;
+            LOG.warn("Server does not support QWP table options; designated timestamp name will be ignored");
+        }
+    }
+
     public static final class Endpoint {
         public final String host;
         public final int port;
@@ -4120,6 +4148,32 @@ public class QwpWebSocketSender implements Sender {
         @Override
         public WebSocketClient reconnect(CursorWebSocketSendLoop.ConnectCancellation cancellation) {
             return buildAndConnect(this, cancellation);
+        }
+    }
+
+    private final class TableOptionsImpl implements TableOptions {
+        private QwpTableBuffer tableBuffer;
+
+        @Override
+        public TableOptions designatedTimestamp(CharSequence columnName) {
+            checkNotClosed();
+            if (tableBuffer != currentTableBuffer) {
+                throw new LineSenderException(
+                        "table options reference is stale; call tableOptions() after table()"
+                );
+            }
+            tableBuffer.setDesignatedTimestampName(columnName);
+            designatedTimestampNameSet = true;
+            warnIfTableOptionsUnsupported(
+                    serverTableOptionsCapabilityKnown,
+                    serverTableOptionsSupported
+            );
+            return this;
+        }
+
+        private TableOptions of(QwpTableBuffer tableBuffer) {
+            this.tableBuffer = tableBuffer;
+            return this;
         }
     }
 }

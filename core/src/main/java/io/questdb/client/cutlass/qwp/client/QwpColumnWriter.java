@@ -289,6 +289,20 @@ class QwpColumnWriter {
         }
     }
 
+    private void writeTableOptions(QwpTableBuffer tableBuffer) {
+        String designatedTimestampName = tableBuffer.getDesignatedTimestampName();
+        if (designatedTimestampName == null) {
+            buffer.putVarint(0);
+            return;
+        }
+
+        int nameLength = NativeBufferWriter.utf8Length(designatedTimestampName);
+        int blockLength = 1 + NativeBufferWriter.varintSize(nameLength) + nameLength;
+        buffer.putVarint(blockLength);
+        buffer.putByte(TABLE_OPTION_TAG_DESIGNATED_TIMESTAMP_NAME);
+        buffer.putString(designatedTimestampName);
+    }
+
     private void writeTimestampColumn(long addr, int count, boolean useGorilla) {
         if (useGorilla && count > 2) {
             // Single pass: check feasibility and compute encoded size together
@@ -346,6 +360,21 @@ class QwpColumnWriter {
 
             encodeColumn(col, rowCount, valueCount, stringDataSize, symbolDictionarySize, useGorilla, useGlobalSymbols);
         }
+    }
+
+    int encodeTableOptions(QwpTableBuffer tableBuffer) {
+        int start = buffer.getPosition();
+        writeTableOptions(tableBuffer);
+        return buffer.getPosition() - start;
+    }
+
+    static int getSingleTableOptionsTrailerSize(CharSequence designatedTimestampName) {
+        if (designatedTimestampName == null) {
+            return 0;
+        }
+        int nameLength = NativeBufferWriter.utf8Length(designatedTimestampName);
+        int blockLength = 1 + NativeBufferWriter.varintSize(nameLength) + nameLength;
+        return NativeBufferWriter.varintSize(blockLength) + blockLength + Integer.BYTES;
     }
 
     void setBuffer(QwpBufferWriter buffer) {
