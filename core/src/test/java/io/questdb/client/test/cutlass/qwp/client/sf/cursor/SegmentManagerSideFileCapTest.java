@@ -130,6 +130,45 @@ public class SegmentManagerSideFileCapTest {
         });
     }
 
+    @Test
+    public void testLivenessFloorProvisionsDespiteSideFileBytesOverTheCap() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The dictionary is lifetime-monotonic and no trim reclaims it, so a
+            // side-file that alone eats the cap used to hold the ring at ONE
+            // segment forever: no spare, no rotation, and no ack could ever free
+            // the shortfall -- a permanent stall that survived restarts, while
+            // the disk-full warning pointed at a trim that cannot help. The cap
+            // must still guarantee each ring its minimum working set (the active
+            // segment plus one spare) and exceed itself by the dictionary's
+            // overshoot instead.
+            long cap = 3 * SEGMENT_SIZE;
+            prepopulate(slotDir, 1);
+            SegmentRing ring = SegmentRing.openExisting(slotDir, SEGMENT_SIZE);
+            Assert.assertNotNull("recovery should produce a ring", ring);
+
+            SegmentManager manager = new SegmentManager(SEGMENT_SIZE, 1_000_000L /* 1ms */, cap);
+            try (SegmentManager ignored = manager) {
+                manager.start();
+                // 10 segments' worth of dictionary against a 3-segment cap: no
+                // arithmetic makes this fit, so only the floor can provision.
+                manager.register(ring, slotDir, null, 0L, () -> 10 * SEGMENT_SIZE);
+                long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (countSfaFiles(slotDir) < 2 && System.nanoTime() < deadlineNanos) {
+                    Thread.sleep(5);
+                }
+                Assert.assertEquals("a ring below its minimum working set must be provisioned "
+                                + "even when non-reclaimable side-file bytes have eaten the cap",
+                        2, countSfaFiles(slotDir));
+                // ...and the floor is a floor, not a bypass: once the working set
+                // is whole, the cap governs again.
+                Thread.sleep(100);
+                Assert.assertEquals("the floor must not license unbounded provisioning past the cap",
+                        2, countSfaFiles(slotDir));
+            }
+            ring.close();
+        });
+    }
+
     /**
      * Pre-populates {@code dir} with {@code n} valid {@code .sfa} segment
      * files, each containing one frame so {@link SegmentRing#openExisting}

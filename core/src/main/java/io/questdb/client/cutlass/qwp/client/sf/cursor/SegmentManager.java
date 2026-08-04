@@ -69,6 +69,11 @@ public final class SegmentManager implements QuietCloseable {
             AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
     private static final int MAX_TRIMS_PER_RING_PASS = 64;
+    // The minimum working set a ring needs to keep making progress: the active
+    // segment plus one hot spare to rotate into. Below this a producer cannot
+    // advance at all, so the cap check must never hold a ring here (see
+    // livenessFloorBytes).
+    private static final int MIN_LIVE_SEGMENTS = 2;
     private static final long TRIM_RETRY_INITIAL_NANOS = 4_000_000L;
     private static final long TRIM_RETRY_MAX_NANOS = 1_024_000_000L;
     private static final int TRIM_RETRY_NONE = 0;
@@ -79,6 +84,19 @@ public final class SegmentManager implements QuietCloseable {
 
     private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
+    // Per-ring segment bytes below which the cap check never refuses to
+    // provision: MIN_LIVE_SEGMENTS * segmentSizeBytes, clamped against
+    // overflow. Segment bytes are reclaimable by ACK-driven trim, so refusing
+    // on them is productive backpressure that clears itself. Side-file bytes
+    // are NOT -- the .symbol-dict is lifetime-monotonic and nothing shrinks it
+    // -- so once they alone pushed a ring under the cap, no ack could ever
+    // free the shortfall and the producer stalled permanently, across
+    // restarts, with the disk-full warning pointing at a trim that cannot
+    // help. Guaranteeing the minimum working set turns that deadlock into
+    // ordinary backpressure: the ring cycles between one and two segments as
+    // acks arrive, ingestion continues, and the cap degrades to best-effort by
+    // exactly the dictionary's overshoot rather than stopping the pipeline.
+    private final long livenessFloorBytes;
     private final Object lock = new Object();
     private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
@@ -249,6 +267,13 @@ public final class SegmentManager implements QuietCloseable {
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
         this.maxTotalBytes = maxTotalBytes;
+        // Clamp rather than multiply blind: segmentSizeBytes is user-supplied
+        // and only bounded below, so a pathological value would wrap the
+        // product negative and make the floor test trivially false -- silently
+        // restoring the deadlock this field exists to remove.
+        this.livenessFloorBytes = segmentSizeBytes > Long.MAX_VALUE / MIN_LIVE_SEGMENTS
+                ? Long.MAX_VALUE
+                : segmentSizeBytes * MIN_LIVE_SEGMENTS;
         this.ticks = ticks;
     }
 
@@ -677,9 +702,9 @@ public final class SegmentManager implements QuietCloseable {
     // folded into the incremental totalBytes counter: the dictionary grows
     // out-of-band on producer threads, so an incremental mirror would
     // drift, while a live read cannot. Each gauge is WAIT-FREE and takes no
-    // lock at all -- PersistedSymbolDict.appendedBytes() is a plain volatile
-    // read -- and it must stay that way. This runs with `lock` held, on the
-    // worker that drives provisioning and trim for every registered ring,
+    // lock at all -- PersistedSymbolDict.occupiedDiskBytes() is a pair of
+    // volatile reads -- and it must stay that way. This runs with `lock` held,
+    // on the worker that drives provisioning and trim for every registered ring,
     // while a producer can hold that dictionary's monitor across ff.allocate
     // and mmap. A gauge that took the monitor would park the whole manager
     // behind one producer's append I/O.
@@ -944,7 +969,16 @@ public final class SegmentManager implements QuietCloseable {
                 observedSideFileBytes = sideFileBytesLocked();
                 observedTotal = totalBytes + observedSideFileBytes;
             }
-            if (observedTotal + segmentSizeBytes > maxTotalBytes) {
+            boolean withinCap = observedTotal + segmentSizeBytes <= maxTotalBytes;
+            // Liveness floor. Refusing on segment bytes is productive -- an ack
+            // trims a sealed segment and the shortfall clears. Refusing on
+            // side-file bytes is not: the dictionary never shrinks, so a ring
+            // held below its minimum working set by them would never rotate
+            // again, on this run or any later one. Provision anyway while this
+            // ring is under the floor, and account it honestly below.
+            long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
+            boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
+            if (!withinCap && !belowLivenessFloor) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     LOG.warn("SF {}: cannot provision spare in {} "
@@ -957,6 +991,26 @@ public final class SegmentManager implements QuietCloseable {
                     lastDiskFullLogNs = now;
                 }
             } else {
+                if (belowLivenessFloor) {
+                    // Exceeding a configured cap is worth saying out loud, and
+                    // saying WHY: the operator's remedy is to raise
+                    // sf_max_total_bytes or shrink the symbol dictionary, never
+                    // to wait for a trim.
+                    long now = System.nanoTime();
+                    if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
+                        LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
+                                        + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
+                                        + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
+                                        + "The symbol dictionary alone leaves no room for the "
+                                        + "active segment plus one spare, and trim cannot reclaim "
+                                        + "it; raise sf_max_total_bytes or reduce symbol "
+                                        + "cardinality.",
+                                memoryMode ? "<memory>" : e.dir, observedTotal,
+                                observedSideFileBytes, maxTotalBytes, segmentSizeBytes,
+                                ringSegmentBytes, livenessFloorBytes);
+                        lastDiskFullLogNs = now;
+                    }
+                }
                 MmapSegment spare = null;
                 String path = null;
                 boolean installed = false;

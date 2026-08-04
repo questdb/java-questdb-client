@@ -707,12 +707,17 @@ public final class CursorSendEngine implements QuietCloseable {
             if (ownsManager) {
                 manager.start();
             }
-            // The gauge outlives close() safely: appendedBytes() is a wait-free
-            // volatile read that takes no lock and never touches the fd, so a
-            // manager tick racing engine shutdown observes the final offset.
+            // occupiedDiskBytes(), not appendedBytes(): the cap is a DISK budget,
+            // and ensureAppendMap reserves real blocks past the committed offset
+            // (rounded up to APPEND_MAP_CAPACITY) for as long as the slot is
+            // live. Gauging the logical offset under-counted every live slot by
+            // up to one window.
+            // The gauge outlives close() safely: it is a pair of wait-free
+            // volatile reads that take no lock and never touch the fd, so a
+            // manager tick racing engine shutdown observes the final values.
             // It must not become synchronized -- see sideFileBytesLocked().
             manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
-                    persistedDictInProgress == null ? null : persistedDictInProgress::appendedBytes);
+                    persistedDictInProgress == null ? null : persistedDictInProgress::occupiedDiskBytes);
             // All construction succeeded -- commit the ring, watermark, and
             // symbol-dictionary references.
             this.ring = ringInProgress;

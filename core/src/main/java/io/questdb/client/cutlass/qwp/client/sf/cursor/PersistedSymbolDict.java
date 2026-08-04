@@ -226,6 +226,17 @@ public final class PersistedSymbolDict implements QuietCloseable {
     // several wire sessions. If ownership was not transferred, close() frees it.
     private long loadedEntriesAddr;
     private int loadedEntriesLen;
+    // File size the last successful ff.allocate reserved, i.e. what this
+    // side-file actually occupies on disk. ensureAppendMap rounds the append
+    // window up to APPEND_MAP_CAPACITY and allocates the whole thing, and
+    // Files.allocate reserves REAL blocks (it degrades to a sparse ftruncate
+    // only where the filesystem refuses), so the on-disk footprint runs ahead
+    // of appendOffset by up to one window for the sender's whole life -- not
+    // just after a crash. close() returns the tail. Same single-writer /
+    // volatile-reader contract as appendOffset: the manager's cap gauge reads
+    // it wait-free, without taking the monitor a producer holds across append
+    // I/O.
+    private volatile long reservedFileBytes;
     private long scratchAddr;
     private int scratchCap;
     private int size;
@@ -622,7 +633,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 // The active window reserves space past the logical end. Return that tail on
                 // orderly close; after a crash open() treats the zero-filled reserve as
                 // a torn trailing chunk and truncates it to the same appendOffset.
-                if (!ff.truncate(fd, appendOffset)) {
+                if (ff.truncate(fd, appendOffset)) {
+                    // The reserve is gone; stop reporting it. A failed truncate
+                    // deliberately leaves reservedFileBytes alone -- the blocks
+                    // are still on disk, and a gauge read racing this close
+                    // must not under-report them.
+                    reservedFileBytes = appendOffset;
+                } else {
                     LOG.warn("symbol dict {} could not trim mmap reserve to {}; recovery will "
                                     + "discard the zero-filled tail on the next open",
                             filePath, appendOffset);
@@ -659,14 +676,13 @@ public final class PersistedSymbolDict implements QuietCloseable {
     /**
      * Durable bytes the side-file currently holds: the header plus every
      * committed chunk -- the append offset the next chunk starts at.
-     * Excludes the preallocated append-window tail, which {@code close()}
-     * truncates away. {@code SegmentManager} reads this through the gauge
-     * wired at engine registration so the dictionary counts against the
-     * {@code sf_max_total_bytes} cap alongside the {@code .sfa} segments.
+     * Excludes the preallocated append-window tail, so this survives a reopen
+     * unchanged. For disk accounting use {@link #occupiedDiskBytes()} instead,
+     * which includes that tail.
      * <p>
      * The read is wait-free -- a volatile read of the offset the last
-     * committed chunk advanced -- so the {@code SegmentManager} worker never
-     * blocks on this dictionary's monitor while holding its own lock.
+     * committed chunk advanced -- so a caller never blocks on this
+     * dictionary's monitor while holding its own lock.
      */
     public long appendedBytes() {
         return appendOffset;
@@ -696,6 +712,33 @@ public final class PersistedSymbolDict implements QuietCloseable {
      */
     public int loadedEntriesLen() {
         return loadedEntriesLen;
+    }
+
+    /**
+     * Bytes this side-file occupies on disk right now: the committed prefix
+     * ({@link #appendedBytes()}) plus any append window {@code ensureAppendMap}
+     * has reserved past it. {@code SegmentManager} reads this through the gauge
+     * wired at engine registration, so the dictionary counts against
+     * {@code sf_max_total_bytes} at its real footprint rather than its logical
+     * one -- the window is rounded up to {@code APPEND_MAP_CAPACITY} and backed
+     * by real blocks, so reporting {@code appendedBytes()} under-counted a live
+     * slot by up to one window for the whole session.
+     * <p>
+     * Wait-free: two volatile reads, no monitor. Never decreases except across
+     * the truncate in {@link #close()}.
+     */
+    public long occupiedDiskBytes() {
+        // Both fields are single-writer under the monitor, but this reader
+        // takes neither, so the pair can straddle a window growth. The result
+        // is then bounded by the two instants it sampled -- never below the
+        // committed prefix, never above the file's real size -- so the cap can
+        // be off by at most one window for one tick, which is what a gauge
+        // consulted under the manager lock has to trade for staying wait-free.
+        // Max, not the reserve alone: the reserve is zero until the first
+        // append, and zero again after close()'s truncate.
+        long reserved = reservedFileBytes;
+        long committed = appendOffset;
+        return Math.max(committed, reserved);
     }
 
     /**
@@ -1268,6 +1311,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
         if (!ff.allocate(fd, newFileSize)) {
             throw new IllegalStateException("could not grow mmap append region for "
                     + FILE_NAME + " [required=" + required + ", fileSize=" + newFileSize + ']');
+        }
+        // Publish the reservation as soon as it is on disk, and before the
+        // mmap that can still fail: the blocks are committed either way, so a
+        // gauge that only counted the mapped case would under-report exactly
+        // when the filesystem is under pressure. Files.allocate never shrinks,
+        // so this only ever moves forward.
+        if (newFileSize > reservedFileBytes) {
+            reservedFileBytes = newFileSize;
         }
         if (appendMapAddr != 0L) {
             long oldAddr = appendMapAddr;

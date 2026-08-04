@@ -962,12 +962,19 @@ public class CursorSendEngineTest {
                     // A fresh dictionary already holds its file header, so the
                     // wiring is observable before any append.
                     assertEquals("cap accounting must include the dictionary side-file bytes",
-                            manager.getTotalBytesForTesting() + dict.appendedBytes(),
+                            manager.getTotalBytesForTesting() + dict.occupiedDiskBytes(),
                             manager.getCapAccountedBytesForTesting());
                     dict.appendSymbol("AAPL");
                     assertEquals("side-file growth must be visible to the cap accounting live",
-                            manager.getTotalBytesForTesting() + dict.appendedBytes(),
+                            manager.getTotalBytesForTesting() + dict.occupiedDiskBytes(),
                             manager.getCapAccountedBytesForTesting());
+                    // The gauge is the DISK footprint, not the logical offset:
+                    // the first append reserves a whole APPEND_MAP_CAPACITY
+                    // window of real blocks past the committed prefix, and the
+                    // cap must see those.
+                    assertTrue("the gauge must count the reserved append window, not just the"
+                                    + " committed prefix",
+                            dict.occupiedDiskBytes() > dict.appendedBytes());
                 }
                 assertEquals("deregistration must drop the slot's side-file gauge",
                         manager.getTotalBytesForTesting(),
