@@ -332,9 +332,8 @@ public class SegmentSkipQuarantineTest {
     /**
      * Overwrites the 4-byte {@code FILE_MAGIC} field at offset 0 so
      * {@link MmapSegment#openExisting} throws at the magic check -- the same technique
-     * {@code SegmentRingTest} and {@code PrReviewRedTests} use, landing in
-     * {@code SegmentRing}'s per-file skip arm without disturbing any other byte (real frame
-     * data included).
+     * {@code SegmentRingTest} uses, landing in {@code SegmentRing}'s per-file skip arm
+     * without disturbing any other byte (real frame data included).
      */
     private static void corruptMagic(String path) {
         int fd = Files.openRW(path);

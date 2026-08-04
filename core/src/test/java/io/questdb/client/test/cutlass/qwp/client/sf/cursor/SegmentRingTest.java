@@ -1012,9 +1012,9 @@ public class SegmentRingTest {
      * never sees a gap (it only compares files that opened successfully), so recovery
      * would otherwise seed {@code ackedFsn} past frames nothing shows were delivered --
      * the same silent loss, reached through a different branch. Corrupts frame[0]'s CRC
-     * directly (the same technique {@code PrReviewRedTests} uses for the pre-existing
-     * "must not silently unlink" guarantee), which is a genuinely different code path
-     * from {@link #corruptMagic}: a bad magic byte fails inside
+     * directly (the same technique {@link #testOpenExistingPreservesSoleSegmentWithTornFirstFrame}
+     * uses for the "must not silently unlink" guarantee), which is a genuinely different
+     * code path from {@link #corruptMagic}: a bad magic byte fails inside
      * {@code MmapSegment.openExisting} and hits the {@code catch (Throwable)} arm; a bad
      * frame[0] CRC lets {@code MmapSegment.openExisting} return normally and hits this
      * "empty leftover" branch instead.
@@ -1054,6 +1054,47 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * The single-segment variant of {@link #testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame}:
+     * here the torn segment IS the whole slot, so there is no valid sibling to recover
+     * around and no chain to refuse -- recovery reports the slot empty and returns.
+     * <p>
+     * The bytes must survive that. {@code scanFrames} bails at frame[0], so the recovery
+     * scan reports {@code frameCount() == 0} while three intact frames still sit
+     * physically behind the torn one. Treating that as an "empty hot-spare leftover" and
+     * unlinking the file destroys all of them on nothing more than a WARN -- a single bit
+     * flip (bit rot, a partial page write at crash) turning into silent data loss.
+     * Preserving the file in place, or quarantining it to {@code .corrupt}, keeps a
+     * postmortem able to recover the surviving frames.
+     */
+    @Test
+    public void testOpenExistingPreservesSoleSegmentWithTornFirstFrame() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 32, 0);
+                String segPath = tmpDir + "/sole-torn.sfa";
+                MmapSegment seg = MmapSegment.create(segPath, 0L, 64 * 1024);
+                assertTrue("setup: first append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertTrue("setup: second append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertTrue("setup: third append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertEquals("setup: three frames written", 3L, seg.frameCount());
+                seg.close();
+
+                corruptFrameZeroCrc(segPath);
+
+                Misc.free(SegmentRing.openExisting(tmpDir, 64 * 1024));
+
+                assertTrue("recovery silently unlinked a segment whose first frame failed CRC; "
+                                + "three valid frames followed it and recovery destroyed all of "
+                                + "them with only a WARN",
+                        Files.exists(segPath) || Files.exists(segPath + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testAcknowledgeIsMonotonic() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -1085,6 +1126,42 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * {@link #testAcknowledgeIsMonotonic} states the clamp in prose but never feeds
+     * {@code acknowledge} a value ABOVE {@code publishedFsn} -- every ack it makes is in
+     * range, so it pins the regression rule only. This pins the clamp itself.
+     * <p>
+     * A malformed or poisoned server NACK can carry any {@code wireSeq}, and the DROP
+     * path in {@code CursorWebSocketSendLoop.handleServerRejection} does not clamp before
+     * it reaches the engine. Should {@code ackedFsn} run past {@code publishedFsn}, the
+     * segment manager's trim pass munmaps and unlinks segments the I/O thread is still
+     * iterating, and the next {@code Unsafe.getInt} on the unmapped region SEGVs the JVM.
+     * {@code acknowledge} therefore clamps as defense-in-depth.
+     */
+    @Test
+    public void testAcknowledgeClampsAtPublishedFsn() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 32, 0);
+                MmapSegment seg = MmapSegment.create(tmpDir + "/clamp.sfa", 0L, 64 * 1024);
+                try (SegmentRing ring = new SegmentRing(seg, 64 * 1024)) {
+                    assertEquals("setup: first append yields FSN 0", 0L, ring.appendOrFsn(buf, 32));
+                    assertEquals("setup: publishedFsn matches", 0L, ring.publishedFsn());
+                    assertEquals("setup: nothing acked yet", -1L, ring.ackedFsn());
+
+                    ring.acknowledge(Long.MAX_VALUE / 2L);
+
+                    assertEquals("acknowledge must clamp a bogus seq at publishedFsn, not "
+                                    + "advance ackedFsn past what the I/O thread has sent",
+                            ring.publishedFsn(), ring.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -1533,9 +1610,12 @@ public class SegmentRingTest {
      * mismatch, leaving the frame's length field and payload -- and every later frame --
      * untouched. {@code MmapSegment.openExisting} still returns normally (the header is
      * fine), but {@code scanFrames} bails at frame[0], so {@code frameCount() == 0} and
-     * {@code tornTailBytes() > 0} -- the SAME technique {@code PrReviewRedTests} uses for
-     * the "must not silently unlink" guarantee, but landing in {@code SegmentRing}'s
-     * empty-with-torn-tail branch rather than its {@code catch (Throwable)} arm.
+     * {@code tornTailBytes() > 0} -- landing in {@code SegmentRing}'s
+     * empty-with-torn-tail branch rather than its {@code catch (Throwable)} arm. Shared by
+     * {@link #testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame} (torn oldest
+     * beside a valid sibling) and
+     * {@link #testOpenExistingPreservesSoleSegmentWithTornFirstFrame} (torn segment is the
+     * whole slot).
      */
     private static void corruptFrameZeroCrc(String path) {
         int fd = Files.openRW(path);
