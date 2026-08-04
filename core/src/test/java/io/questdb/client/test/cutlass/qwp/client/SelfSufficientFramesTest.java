@@ -639,6 +639,89 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
+    public void testFullDictFallbackGateStaysOffInDeltaMode() throws Exception {
+        // Pins the `!deltaDictEnabled` conjunct of the M1 fallback added in
+        // flushPendingRows (QwpWebSocketSender.java). The fallback's other three
+        // conjuncts -- messageSize > cap, splitFramesFit(cap, deltaBaseline) false,
+        // splitFramesFit(cap, currentBatchMaxSymbolId) true -- are ALSO satisfiable in
+        // plain delta mode, so only the explicit gate stops the fallback from firing
+        // where it must never run: publishDictionaryChunks puts dictionary-only frames
+        // on the ring BEFORE persistNewSymbolsBeforePublish's write-ahead persist runs,
+        // which is safe only in full-dict mode (no side-file, no ordering invariant to
+        // break). In delta mode it would invert the write-ahead: a crash between the
+        // dict-chunk frame and the persist would leave a frame on the ring referencing
+        // ids .symbol-dict cannot describe, quarantining the slot on recovery.
+        //
+        // Shape (memory mode, delta enabled, mirrors
+        // testSplitPreflightAdvancesBaselineSoLaterFramesArentSizedWithTheDelta): 8 new
+        // 48-char symbols (delta section 8 x 49 = 392 bytes) all registered by t1 with a
+        // tiny per-row body; t2 re-references the first symbol with a ~200-byte body. The
+        // combined frame (delta + both bodies) exceeds the 512 cap, and
+        // splitFramesFit(cap, deltaBaseline) is pessimistically false (t2's frame sized
+        // WITH the 392-byte delta overflows), which is exactly the shape that would (with
+        // the gate dropped) chunk the dictionary and then re-encode a combined frame that
+        // fits (delta collapses to empty once the baseline advances to id 7) -- publishing
+        // ONE dictionary-only frame (tableCount == 0) ahead of a single combined data
+        // frame. With the gate intact, the ordinary split runs instead: t1's frame (whole
+        // delta + tiny body) and t2's frame (empty delta + ~200-byte body) both fit 512
+        // alone, so flushPendingRowsSplit ships two DATA frames and no dictionary-only
+        // frame ever appears. The distinguishing assertion is therefore on tableCount, not
+        // just frame count: a gate-dropped fallback still produces 2 frames on this
+        // sizing, but the first one carries no table.
+        assertMemoryLeak(() -> {
+            final int cap = 512;
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                List<String> expected = new ArrayList<>();
+                String symPad = TestUtils.repeat("s", 46);
+                String rowPad = TestUtils.repeat("x", 200);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
+                    // t1 (added first -> first split frame): registers all 8 new
+                    // 48-char symbols (ids 0..7), tiny per-row body.
+                    for (int i = 0; i < 8; i++) {
+                        String sym = String.format("%02d", i) + symPad;
+                        expected.add(sym);
+                        sender.table("t1").symbol("s", sym).longColumn("v", (long) i).atNow();
+                    }
+                    // t2 (second split frame): re-references an existing symbol, no new
+                    // ids, but a ~200-byte body.
+                    sender.table("t2").symbol("s", expected.get(0))
+                            .stringColumn("p", rowPad).longColumn("v", 99L).atNow();
+                    // Must NOT throw and must NOT chunk the dictionary: the gate keeps
+                    // this batch on the ordinary (delta-carrying) split path.
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 10_000);
+                }
+
+                Assert.assertEquals("the batch must split into exactly 2 frames",
+                        2, handler.batches.size());
+                for (byte[] frame : handler.batches) {
+                    Assert.assertTrue("every frame must be a DATA frame (tableCount > 0); a "
+                                    + "tableCount == 0 frame means the dictionary was chunked "
+                                    + "in delta mode -- the fallback's delta-mode gate is off",
+                            QwpWireTestUtils.tableCount(frame) > 0);
+                }
+                byte[] f1 = handler.batches.get(0);
+                byte[] f2 = handler.batches.get(1);
+                Assert.assertEquals("first split frame deltaStart must be 0",
+                        0, readVarint(f1, DELTA_START_OFFSET));
+                Assert.assertEquals("first split frame ships all 8 new symbols",
+                        8, readVarint(f1, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("second split frame deltaStart must be 8 (baseline advanced)",
+                        8, readVarint(f2, DELTA_START_OFFSET));
+                Assert.assertEquals("second split frame carries no new symbols",
+                        0, readVarint(f2, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
+    @Test
     public void testDictionaryLargerThanTheCapShipsAsChunkedDictionaryFrames() throws Exception {
         // A full-dictionary sender carries the whole dictionary in EVERY frame, so once
         // that section alone fills the cap no frame of any size fits: the split

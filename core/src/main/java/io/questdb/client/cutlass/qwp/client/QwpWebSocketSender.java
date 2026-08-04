@@ -4531,6 +4531,7 @@ public class QwpWebSocketSender implements Sender {
      * and therefore every single entry, to fit.
      */
     private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
+        assert !deltaDictEnabled;
         int chunkStart = from;
         long chunkBytes = 0;
         for (int id = from; id <= batchMaxId; id++) {
