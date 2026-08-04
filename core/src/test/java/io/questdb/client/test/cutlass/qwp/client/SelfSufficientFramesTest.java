@@ -1112,17 +1112,24 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
-    public void testCloseCommitsDictionaryChunksStrandedByAnOversizedBody() throws Exception {
-        // preRegisterDictionaryChunks publishes its deferred, table-less chunks BEFORE the
-        // split pre-flight can reject the batch, so an oversized table body leaves them on
-        // the ring with no data frame behind them. They carry FLAG_DEFER_COMMIT, and the
-        // server withholds the ack for every deferred frame and clamps the connection's
-        // cumulative-ack watermark until the group commits -- so if close() never sends the
-        // commit, ackedFsn freezes for the connection's whole life, trim stops for EVERY
-        // frame and the ring fills. close() gates that commit on hasDeferredMessages, which
-        // only publishDictionaryChunk can set on this path: flushPendingRows throws before
-        // reaching its own assignment.
-        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-stranded-chunks").toPath();
+    public void testSectionOverCapWithAnOversizedBodyPublishesNothingOnEveryRetry() throws Exception {
+        // The section-alone-over-cap shape, which used to be pre-registered eagerly:
+        // 20 x 48-byte symbols make a ~1 KB dictionary section against a 512-byte cap,
+        // and the body is over the cap too, so the batch is genuinely unshippable.
+        //
+        // The chunker used to publish before the bodies were sized, so this shape left
+        // deferred, table-less chunks on the ring with no data frame behind them. They
+        // carry FLAG_DEFER_COMMIT and the server withholds the ack for every deferred
+        // frame until its group commits, so ackedFsn froze and trim stopped for the
+        // whole connection -- and because the throw RETAINS the batch by design and its
+        // message tells the caller to retry, EVERY retry appended another full copy of
+        // the dictionary to a ring that could no longer be trimmed. Publishing now
+        // happens only after the bodies are proven to fit, so this batch reaches the
+        // wire not at all, however many times it is retried.
+        //
+        // The retry loop is the regression guard: pre-fix batches grew by one chunk
+        // group per flush(); post-fix it stays at zero.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-section-over-cap").toPath();
         String slot = sfDir.resolve("default").toString();
         assertMemoryLeak(() -> {
             CapturingHandler handler = new CapturingHandler();
@@ -1141,48 +1148,104 @@ public class SelfSufficientFramesTest {
                 try {
                     String symPad = TestUtils.repeat("s", 46);
                     String rowPad = TestUtils.repeat("x", 60);
-                    // 20 x 48-byte symbols -> a ~1 KB full-dict section that alone exceeds
-                    // the 512-byte cap, so preRegisterDictionaryChunks chunks and publishes.
-                    // The accumulated body (~1.4 KB over 20 rows) then blows the split
-                    // pre-flight with an EMPTY delta, so the chunks are already on the ring
-                    // when the throw lands. Each row stays well under the per-row guard, so
-                    // the batch-level pre-flight is what rejects, not sendRow.
                     for (int i = 0; i < 20; i++) {
                         sender.table("big").symbol("s", String.format("%02d", i) + symPad)
                                 .stringColumn("p", rowPad).longColumn("v", (long) i).atNow();
                     }
-                    try {
-                        sender.flush();
-                        Assert.fail("a body over the cap must throw");
-                    } catch (LineSenderException e) {
-                        Assert.assertTrue(e.getMessage(),
-                                e.getMessage().contains("single table batch too large for server batch cap"));
+                    for (int attempt = 0; attempt < 3; attempt++) {
+                        try {
+                            sender.flush();
+                            Assert.fail("a body over the cap must throw");
+                        } catch (LineSenderException e) {
+                            Assert.assertTrue(e.getMessage(),
+                                    e.getMessage().contains("single table batch too large for server batch cap"));
+                        }
+                        // Measure the RING, not the wire: publishedFsn is advanced
+                        // synchronously by the publishing thread, so this cannot race
+                        // the I/O thread the way a frame count would.
+                        Assert.assertEquals("retry " + attempt + " must publish nothing: a retained "
+                                        + "batch that cannot ship must not append a dictionary copy "
+                                        + "to a ring whose ack watermark is frozen",
+                                -1L, engine.publishedFsn());
                     }
-                    waitFor(() -> !handler.batches.isEmpty(), 10_000);
-                    for (byte[] frame : handler.batches) {
-                        Assert.assertEquals("only dictionary chunks may have shipped",
-                                0, QwpWireTestUtils.tableCount(frame));
-                        Assert.assertTrue("a dictionary chunk is deferred", hasDeferCommit(frame));
-                    }
+                    // reset() discards the batch, and the sender is still usable.
+                    sender.reset();
                 } finally {
                     try {
                         sender.close();
-                    } catch (LineSenderException expected) {
-                        // close() latches and rethrows the over-cap terminal after running
-                        // its commit / seal / drain steps; the assertions below are about
-                        // what it managed to send on the way out.
+                    } catch (LineSenderException retainedBatch) {
+                        // Only reachable when an assertion above failed before
+                        // reset(): the batch is then still retained and close()
+                        // rethrows it. Swallow so the real assertion failure is
+                        // what surfaces, instead of being masked by the finally.
                     }
                 }
 
-                byte[] last = handler.batches.get(handler.batches.size() - 1);
-                Assert.assertFalse("close() must commit the deferred dictionary group: without a "
-                                + "commit frame the server never acks the chunks, the client's ack "
-                                + "watermark freezes and trim stops for the whole connection",
-                        hasDeferCommit(last));
-                Assert.assertEquals("the commit frame carries no tables",
-                        0, QwpWireTestUtils.tableCount(last));
-                Assert.assertTrue("the commit must follow at least one deferred chunk",
-                        handler.batches.size() >= 2);
+                Assert.assertEquals("nothing may reach the server at all",
+                        0, handler.batches.size());
+            }
+        });
+    }
+
+    @Test
+    public void testFullDictCommitFrameCarriesNoDictionaryAfterACancelledRow() throws Exception {
+        // sendCommitMessage bounded its delta with currentBatchMaxSymbolId in full-dict
+        // mode, on the premise -- stated in its own comment -- that "the prior flush
+        // reset it to -1". flushPendingRows returns early WITHOUT resetting it when
+        // pendingRowCount is 0, and cancelRow leaves behind the id of a symbol it
+        // registered. A commit reached through that window therefore re-shipped the
+        // ENTIRE dictionary from id 0, in the one frame no cap check and no chunker
+        // covers -- the same oversized-frame wall the chunking exists to remove.
+        // The commit carries no rows, so it must register nothing in either mode.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-commit-empty-delta").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertFalse("an unopenable .symbol-dict must select full-dict mode",
+                            ws.isDeltaDictEnabledForTest());
+
+                    // A deferred data frame leaves the group open (hasDeferredMessages).
+                    ws.setDeferCommit(true);
+                    sender.table("t").symbol("s", "AAPL").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    ws.setDeferCommit(false);
+
+                    // Register a symbol, then throw the row away: cancelRow rolls back the
+                    // row but not currentBatchMaxSymbolId, and pendingRowCount stays 0 so
+                    // the next flush's flushPendingRows returns before resetting it.
+                    sender.table("t").symbol("s", "GOOG").longColumn("v", 2L);
+                    sender.cancelRow();
+
+                    // The I/O thread ships frames asynchronously, so settle on the data
+                    // frame before counting the commit that follows it.
+                    waitFor(() -> handler.batches.size() >= 1, 10_000);
+                    int framesBefore = handler.batches.size();
+                    sender.flush(); // no rows to flush -> straight to sendCommitMessage
+                    waitFor(() -> handler.batches.size() > framesBefore, 10_000);
+                    Assert.assertEquals("the flush must emit exactly the commit frame",
+                            framesBefore + 1, handler.batches.size());
+
+                    byte[] commit = handler.batches.get(handler.batches.size() - 1);
+                    Assert.assertEquals("a commit frame carries no tables",
+                            0, QwpWireTestUtils.tableCount(commit));
+                    java.util.List<String> registered = new java.util.ArrayList<>();
+                    QwpWireTestUtils.accumulateDeltaDictionary(commit, registered);
+                    Assert.assertTrue("the commit frame must register no symbols; it re-shipped "
+                                    + registered.size() + " -- the whole dictionary from id 0",
+                            registered.isEmpty());
+                }
             }
         });
     }
