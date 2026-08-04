@@ -1106,7 +1106,22 @@ public class DeltaDictRecoveryTest {
                 Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
                 // Small segment: any frame carrying the padded row fails to publish with
                 // PAYLOAD_TOO_LARGE deterministically (no backpressure timing).
-                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;";
+                //
+                // The auto-flush knobs pin WHERE that failure surfaces. The failed flush
+                // below leaves its row buffered and does NOT restart the auto-flush clock
+                // (resetTableBuffersAfterFlush runs only after a successful publish), so
+                // the row keeps ageing against the WebSocket transport's 100 ms
+                // auto_flush_interval default. Once the first flush takes longer than that
+                // -- routine on a loaded CI host, where segment provisioning plus the
+                // backpressure spin cost ~105 ms -- the NEXT row commit auto-flushes inside
+                // atNow() and throws from there instead of from the flush() this test
+                // brackets. The batch and the branch under test are identical either way;
+                // only the throw site moves, so parking the thresholds costs no coverage.
+                // (WebSocket rejects auto_flush=off outright, hence the large finite
+                // interval.)
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=1024"
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
                 String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
                 Sender sender = Sender.fromConfig(cfg);
                 try {
