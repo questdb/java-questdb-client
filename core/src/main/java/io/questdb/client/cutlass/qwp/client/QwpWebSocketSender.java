@@ -3907,30 +3907,27 @@ public class QwpWebSocketSender implements Sender {
         // data frames below encode against the resulting baseline (an empty delta).
         // No-op unless the section genuinely does not leave room for a body.
         int deltaBaseline = preRegisterDictionaryChunks(cap, currentBatchMaxSymbolId);
-        encoder.setDeferCommit(deferCommit);
-        encoder.beginMessage(tableCount, globalSymbolDictionary,
-                deltaBaseline, currentBatchMaxSymbolId);
-        // Record each table's encoded body size (position delta across addTable).
-        // When the batch needs splitting, these lengths delimit immutable body
-        // slices in the combined encoder buffer for direct frame assembly. The
-        // capture is a couple of int ops per table on the common path.
-        splitFrameBodyBytes.clear();
-        int combinedBodyStart = encoder.getBuffer().getPosition();
-        int bodyStart = combinedBodyStart;
-        for (int i = 0; i < tableCount; i++) {
-            QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(i);
-
-            if (LOG.isDebugEnabled()) {
-                LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}]",
-                        flushTableNames.getQuick(i), tableBuffer.getRowCount(), currentBatchMaxSymbolId);
-            }
-
-            encoder.addTable(tableBuffer);
-            int bodyEnd = encoder.getBuffer().getPosition();
-            splitFrameBodyBytes.add(bodyEnd - bodyStart);
-            bodyStart = bodyEnd;
-        }
+        int combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
         int messageSize = encoder.finishMessage();
+
+        // Full-dict near-cap fallback. preRegisterDictionaryChunks declines to chunk
+        // whenever the dict-only frame fits the cap, but the section plus a table
+        // body can still push every split frame over it -- the split's pre-flight
+        // would then reject a batch that IS shippable. Chunk the dictionary now and
+        // re-encode against an empty delta. Gated on the bodies alone fitting, so a
+        // genuinely oversized table still throws with no chunk stranded on the ring.
+        // The re-encode is required, not just a baseline switch inside the split:
+        // publishing a chunk resets the encoder buffer the split's staged body
+        // slices live in (beginMessage calls buffer.reset()).
+        if (cap > 0 && messageSize > cap
+                && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
+                && !splitFramesFit(cap, deltaBaseline)
+                && splitFramesFit(cap, currentBatchMaxSymbolId)) {
+            publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            deltaBaseline = currentBatchMaxSymbolId;
+            combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
+            messageSize = encoder.finishMessage();
+        }
         QwpBufferWriter buffer = encoder.getBuffer();
 
         if (cap > 0 && messageSize > cap) {
@@ -3959,6 +3956,58 @@ public class QwpWebSocketSender implements Sender {
         }
 
         resetTableBuffersAfterFlush();
+    }
+
+    /**
+     * Encodes the staged batch as one combined frame at {@code deltaBaseline}:
+     * begins the message, appends every non-empty table, and records each table's
+     * encoded body length in {@code splitFrameBodyBytes} (when the batch needs
+     * splitting, those lengths delimit immutable body slices in the combined
+     * encoder buffer for direct frame assembly; the capture is a couple of int ops
+     * per table on the common path). The caller finishes the message; calling
+     * again re-encodes from scratch, since beginMessage resets the encoder buffer.
+     *
+     * @return the buffer position where the first table body starts
+     */
+    private int encodeCombinedFrame(int tableCount, boolean deferCommit, int deltaBaseline) {
+        encoder.setDeferCommit(deferCommit);
+        encoder.beginMessage(tableCount, globalSymbolDictionary,
+                deltaBaseline, currentBatchMaxSymbolId);
+        splitFrameBodyBytes.clear();
+        int combinedBodyStart = encoder.getBuffer().getPosition();
+        int bodyStart = combinedBodyStart;
+        for (int i = 0; i < tableCount; i++) {
+            QwpTableBuffer tableBuffer = flushTableBuffers.getQuick(i);
+
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Encoding table [name={}, rows={}, batchMaxId={}]",
+                        flushTableNames.getQuick(i), tableBuffer.getRowCount(), currentBatchMaxSymbolId);
+            }
+
+            encoder.addTable(tableBuffer);
+            int bodyEnd = encoder.getBuffer().getPosition();
+            splitFrameBodyBytes.add(bodyEnd - bodyStart);
+            bodyStart = bodyEnd;
+        }
+        return combinedBodyStart;
+    }
+
+    /**
+     * Whether every per-table split frame of the staged batch fits {@code cap}
+     * when sized at {@code baseline}. Mirrors flushPendingRowsSplit's pre-flight
+     * in full-dict mode, where the baseline never advances across frames. Only
+     * two baselines are legal: the staged message's own, and
+     * {@code currentBatchMaxSymbolId} (an empty delta, which getSplitMessageSize
+     * sizes without consulting staged state).
+     */
+    private boolean splitFramesFit(int cap, int baseline) {
+        for (int i = 0, n = splitFrameBodyBytes.size(); i < n; i++) {
+            if (encoder.getSplitMessageSize(
+                    splitFrameBodyBytes.getQuick(i), baseline, currentBatchMaxSymbolId) > cap) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -4030,10 +4079,13 @@ public class QwpWebSocketSender implements Sender {
                 // never fit, so say that here rather than let a caller read the repeat
                 // rejections as a transient and keep appending to a batch that only
                 // grows.
-                // preRegisterDictionaryChunks has already moved an over-cap dictionary
-                // into its own frames, so anything still oversized here is the table
-                // body -- which reset() and smaller batches genuinely do fix. Report
-                // the dictionary's contribution anyway so the split is visible.
+                // An over-cap dictionary has been handled upstream: preRegisterDictionaryChunks
+                // moved a section that fills the cap alone into its own frames, and
+                // flushPendingRows' fallback re-encoded against chunked registration
+                // when the inline section pushed a split frame over the cap. Anything
+                // still oversized here is the table body -- which reset() and smaller
+                // batches genuinely do fix. Report the dictionary's contribution
+                // anyway so the split is visible.
                 int frameOverhead = encoder.getSplitMessageSize(
                         0, simBaseline, currentBatchMaxSymbolId);
                 throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
@@ -4380,9 +4432,11 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Registers {@code (symbolDeltaBaseline() .. batchMaxId]} as one or more DEFERRED,
-     * dictionary-only frames when the batch's dictionary section would not leave room
-     * for a table body under {@code cap}, and returns the delta baseline the batch's
-     * data frames must then encode against.
+     * dictionary-only frames when the batch's dictionary section alone reaches
+     * {@code cap}, and returns the delta baseline the batch's data frames must then
+     * encode against. The narrower shape -- a section that fits alone but not
+     * together with a table body -- is only detectable after the bodies are
+     * encoded, and is handled by flushPendingRows' fallback re-encode.
      * <p>
      * <b>Why this exists.</b> A full-dictionary frame carries the whole dictionary from
      * id 0, so its fixed overhead grows with lifetime symbol cardinality. Once that
@@ -4456,10 +4510,28 @@ public class QwpWebSocketSender implements Sender {
                 + NativeBufferWriter.varintSize(batchMaxId - from + 1)
                 + sectionBytes;
         if (inlineFrameBytes < cap) {
-            // The dictionary still leaves room for a body, so keep the frames
-            // self-sufficient and let the ordinary path encode them inline.
+            // The dict-only frame fits, so the ordinary path can still encode the
+            // section inline. That is NOT proof a data frame fits -- the section
+            // plus a table body may exceed the cap -- but that shape is only
+            // knowable after the bodies are encoded, so flushPendingRows handles
+            // it there: it publishes the chunks via publishDictionaryChunks and
+            // re-encodes the batch against the resulting empty delta.
             return baseline;
         }
+        publishDictionaryChunks(cap, from, batchMaxId);
+        return batchMaxId;
+    }
+
+    /**
+     * Publishes symbol ids {@code [from, batchMaxId]} as deferred, dictionary-only
+     * frames, each chunked under {@code cap}. Callers must have proven every solo
+     * entry fits the cap first: {@link #preRegisterDictionaryChunks}'s sizing pass
+     * throws before reaching here, and the flushPendingRows fallback only runs
+     * after that same pass declined to chunk -- which required the WHOLE section,
+     * and therefore every single entry, to fit.
+     */
+    private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
+        assert !deltaDictEnabled;
         int chunkStart = from;
         long chunkBytes = 0;
         for (int id = from; id <= batchMaxId; id++) {
@@ -4483,7 +4555,6 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Pre-registered symbol dictionary in chunks [from={}, to={}, cap={}]",
                     from, batchMaxId, cap);
         }
-        return batchMaxId;
     }
 
     /**
