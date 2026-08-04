@@ -714,6 +714,217 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
+    public void testFullDictNearCapFallsBackToChunkedDictionary() throws Exception {
+        // M1 regression (review round 5). preRegisterDictionaryChunks declines to chunk
+        // whenever the dict-only frame fits the cap -- but that proves the dictionary
+        // fits with a ZERO-byte body. With 10 x 48-char symbols the dict-only frame is
+        // exactly 504 bytes against a 512 cap: under the cap alone, over it with any
+        // table body. Pre-fix, the split pre-flight rejected the batch as "single table
+        // batch too large" although it IS shippable (chunk the dictionary, ship the body
+        // with an empty delta), reset() could not help (the next batch re-references the
+        // same symbols), and the producer was wedged. Post-fix flushPendingRows falls
+        // back: one deferred dictionary chunk, then the data frame with an empty delta.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-nearcap").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            final int cap = 512;
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // openCleanRW fails against nothing on disk, so the slot runs full-dict.
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                List<String> expected = new ArrayList<>();
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                    // 10 x 48-char symbols: dict section 10 x 49 = 490 bytes, dict-only
+                    // frame 504 -- one row under the 512 cap.
+                    String pad = TestUtils.repeat("s", 46);
+                    for (int i = 0; i < 10; i++) {
+                        String sym = String.format("%02d", i) + pad;
+                        expected.add(sym);
+                        sender.table("t").symbol("s", sym).longColumn("v", (long) i).atNow();
+                    }
+                    // Pre-fix this threw BatchTooLargeForCapException ("single table
+                    // batch too large") on a shippable batch.
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 2, 10_000);
+                }
+
+                Assert.assertEquals("expected exactly one dictionary chunk + one data frame",
+                        2, handler.batches.size());
+                for (byte[] frame : handler.batches) {
+                    Assert.assertTrue("frame of " + frame.length + " bytes exceeds cap " + cap,
+                            frame.length <= cap);
+                }
+                byte[] chunk = handler.batches.get(0);
+                byte[] data = handler.batches.get(1);
+                Assert.assertEquals("first frame must be dictionary-only",
+                        0, QwpWireTestUtils.tableCount(chunk));
+                Assert.assertEquals("chunk deltaStart", 0, readVarint(chunk, DELTA_START_OFFSET));
+                Assert.assertEquals("chunk carries the whole dictionary",
+                        10, readVarint(chunk, DELTA_START_OFFSET + 1));
+                Assert.assertEquals("second frame must carry the table",
+                        1, QwpWireTestUtils.tableCount(data));
+                Assert.assertEquals("data frame deltaStart must sit above the chunked ids",
+                        10, readVarint(data, DELTA_START_OFFSET));
+                Assert.assertEquals("data frame must carry an empty delta",
+                        0, readVarint(data, DELTA_START_OFFSET + 1));
+
+                // The chunk must register every symbol exactly once, in id order.
+                List<String> rebuilt = new ArrayList<>();
+                for (byte[] frame : handler.batches) {
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt);
+                }
+                Assert.assertEquals(expected.size(), rebuilt.size());
+                for (int i = 0; i < expected.size(); i++) {
+                    Assert.assertEquals("symbol id " + i, expected.get(i), rebuilt.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFullDictNearCapFallbackSplitsMultiTableBatch() throws Exception {
+        // The fallback's second exit: after the dictionary is chunked, the re-encoded
+        // combined frame can still exceed the cap and must go through the ordinary
+        // split -- one empty-delta frame per table, each under the cap. Three tables
+        // with ~350-byte bodies guarantee the re-encoded combined frame (~1 KB) still
+        // splits, while every per-table empty-delta frame fits 512 comfortably.
+        // Pre-fix this threw exactly like the single-table shape: every split frame
+        // was sized WITH the 490-byte dictionary section and rejected.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-nearcap-split").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            final int cap = 512;
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                List<String> expected = new ArrayList<>();
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                    String symPad = TestUtils.repeat("s", 46);
+                    // t1 registers the 10 symbols (ids 0..9): small body, whole dict.
+                    for (int i = 0; i < 10; i++) {
+                        String sym = String.format("%02d", i) + symPad;
+                        expected.add(sym);
+                        sender.table("t1").symbol("s", sym).longColumn("v", (long) i).atNow();
+                    }
+                    // t2 and t3 re-reference existing symbols and add ~350-byte bodies.
+                    String rowPad = TestUtils.repeat("x", 50);
+                    for (int i = 0; i < 5; i++) {
+                        sender.table("t2").symbol("s", expected.get(i))
+                                .stringColumn("p", rowPad).longColumn("v", (long) i).atNow();
+                        sender.table("t3").symbol("s", expected.get(i))
+                                .stringColumn("p", rowPad).longColumn("v", (long) i).atNow();
+                    }
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 4, 10_000);
+                }
+
+                long dictOnlyFrames = 0;
+                long dataFrames = 0;
+                List<String> rebuilt = new ArrayList<>();
+                for (byte[] frame : handler.batches) {
+                    Assert.assertTrue("frame of " + frame.length + " bytes exceeds cap " + cap,
+                            frame.length <= cap);
+                    QwpWireTestUtils.accumulateDeltaDictionary(frame, rebuilt);
+                    if (QwpWireTestUtils.tableCount(frame) == 0) {
+                        dictOnlyFrames++;
+                    } else {
+                        dataFrames++;
+                        // Every data frame rides the chunked registration: empty delta.
+                        Assert.assertEquals("data frame deltaStart",
+                                10, readVarint(frame, DELTA_START_OFFSET));
+                        Assert.assertEquals("data frame must carry an empty delta",
+                                0, readVarint(frame, DELTA_START_OFFSET + 1));
+                    }
+                }
+                Assert.assertEquals("the 504-byte dictionary fits one chunk", 1, dictOnlyFrames);
+                Assert.assertEquals("the split emits one frame per table", 3, dataFrames);
+                Assert.assertEquals("every symbol registered exactly once",
+                        expected.size(), rebuilt.size());
+                for (int i = 0; i < expected.size(); i++) {
+                    Assert.assertEquals("symbol id " + i, expected.get(i), rebuilt.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFullDictNearCapOversizedBodyStrandsNoChunks() throws Exception {
+        // All-or-nothing guard on the fallback itself. Same near-cap dictionary, but the
+        // single table's body (~1 KB) exceeds the cap even with an EMPTY delta -- the
+        // batch is genuinely unshippable, so the fallback must decline BEFORE publishing
+        // any dictionary chunk. A fallback that chunked first and discovered the
+        // oversized body second would strand deferred dict-only frames on the ring; this
+        // test fails (batches > 0) under that mutation. Behaviour here is identical
+        // pre-fix and post-fix: throw, retain the batch, publish nothing.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-nearcap-bigbody").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(512);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                try (Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine)) {
+                    String symPad = TestUtils.repeat("s", 46);
+                    String rowPad = TestUtils.repeat("x", 40);
+                    // 20 rows cycling through 10 symbols: the same 504-byte dictionary
+                    // section, plus a body no split can shrink under the cap. Each row
+                    // stays well under the per-row guard.
+                    for (int i = 0; i < 20; i++) {
+                        String sym = String.format("%02d", i % 10) + symPad;
+                        sender.table("big").symbol("s", sym)
+                                .stringColumn("p", rowPad).longColumn("v", (long) i).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("a body over the cap must throw even in the fallback window");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("single table batch too large for server batch cap"));
+                    }
+                    // Retryable: the batch is retained and rejected identically again.
+                    try {
+                        sender.flush();
+                        Assert.fail("retrying the retained oversized batch must throw again");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("single table batch too large for server batch cap"));
+                    }
+                    sender.reset();
+                }
+
+                Assert.assertEquals("nothing may reach the server -- neither a data frame "
+                        + "nor a stranded dictionary chunk", 0, handler.batches.size());
+            }
+        });
+    }
+
+    @Test
     public void testSingleSymbolLargerThanTheCapThrowsWithNothingPublished() throws Exception {
         // A symbol value cannot be split across frames, so one larger than the cap is a
         // genuine terminal for this batch. It must be detected BEFORE any dictionary
