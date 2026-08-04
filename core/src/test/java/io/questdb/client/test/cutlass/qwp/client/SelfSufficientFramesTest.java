@@ -1092,8 +1092,11 @@ public class SelfSufficientFramesTest {
                     Assert.assertEquals("the rejection precedes every publish", 0, handler.batches.size());
 
                     // The contract reset() is documented to honour: discard the retained
-                    // batch and KEEP the sender usable. Symbol id 0 is already registered,
-                    // so the next frame's delta is [0, 0] -- one entry, trivially under cap.
+                    // batch and KEEP the sender usable. reset() also reclaims the 40
+                    // never-shipped ids, so this row re-registers at id 0 and the next
+                    // frame's delta is one entry, trivially under cap. (It passed before
+                    // the reclaim too, by reusing the already-registered id 0 -- see the
+                    // sibling test for the case that did not.)
                     sender.reset();
                     sender.table("t").symbol("s", "00" + symPad).longColumn("v", 0L).atNow();
                     sender.flush();
@@ -1106,6 +1109,68 @@ public class SelfSufficientFramesTest {
                         0, readVarint(frame, DELTA_START_OFFSET));
                 Assert.assertEquals("it carries only the one symbol the surviving row references, "
                                 + "not the discarded batch's 40",
+                        1, readVarint(frame, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
+    @Test
+    public void testResetReclaimsUnsentSymbolIdsSoANewSymbolCanFlush() throws Exception {
+        // The sibling above recovers because its post-reset row happens to reuse a
+        // symbol the discarded batch already registered. That is luck, not a
+        // contract: delta sections are anchored at sentMaxSymbolId+1, which only
+        // advances on a PUBLISH, so ids an abandoned batch registered sit forever
+        // between the watermark and the dictionary tip. A post-reset row carrying a
+        // NEW symbol lands above them all, and its section re-spans the whole
+        // abandoned range -- throwing identically, on every batch, forever. reset()
+        // now reclaims those never-shipped ids, so the new symbol starts at 0.
+        assertMemoryLeak(() -> {
+            final int cap = 512;
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String symPad = TestUtils.repeat("s", 46);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue("memory mode must select delta mode",
+                            ws.isDeltaDictEnabledForTest());
+
+                    for (int i = 0; i < 40; i++) {
+                        sender.table("t").symbol("s", String.format("%02d", i) + symPad)
+                                .longColumn("v", (long) i).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("a delta section over the cap must throw");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("single table batch too large for server batch cap"));
+                    }
+                    Assert.assertEquals("nothing shipped, so no id is on the wire yet",
+                            0, handler.batches.size());
+
+                    sender.reset();
+                    Assert.assertEquals("reset() must return every never-shipped id: none of the "
+                                    + "40 reached the wire or the .symbol-dict",
+                            0, ws.getGlobalSymbolDictionaryForTest().size());
+
+                    // A symbol none of the discarded rows used. Without the reclaim it
+                    // takes id 40 and drags [0..40] back into the section.
+                    sender.table("t").symbol("s", "brand-new" + symPad).longColumn("v", 99L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 10_000);
+                }
+
+                Assert.assertEquals("exactly one frame ships after reset()", 1, handler.batches.size());
+                byte[] frame = handler.batches.get(0);
+                Assert.assertEquals("the post-reset frame re-registers from id 0",
+                        0, readVarint(frame, DELTA_START_OFFSET));
+                Assert.assertEquals("it carries only the one new symbol, not the abandoned 40",
                         1, readVarint(frame, DELTA_START_OFFSET + 1));
             }
         });

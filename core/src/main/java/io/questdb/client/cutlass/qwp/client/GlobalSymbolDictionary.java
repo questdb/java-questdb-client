@@ -197,4 +197,46 @@ public class GlobalSymbolDictionary {
     public int size() {
         return idToSymbol.size();
     }
+
+    /**
+     * Drops every entry at id {@code >= newSize}, returning those ids to the
+     * unassigned space so the next {@link #getOrAddSymbol} reuses them. A no-op
+     * when {@code newSize} is at or above the current {@link #size()}.
+     * <p>
+     * <b>Reusing an id is only safe while nothing else has recorded it.</b> The
+     * persisted {@code .symbol-dict}, the on-wire delta and the send loop's
+     * catch-up mirror all key on the entry POSITION, so an id that any of them
+     * already binds to one string must never be handed to another -- that is the
+     * silent symbol misattribution the dense id space exists to prevent. The
+     * caller owns that proof; see {@code QwpWebSocketSender.reset()}, which
+     * reclaims only above both the sent watermark and the persisted size, and
+     * only in delta mode.
+     *
+     * @param newSize the number of entries to keep, from id 0
+     * @throws IllegalArgumentException if {@code newSize} is negative
+     */
+    public void truncateTo(int newSize) {
+        if (newSize < 0) {
+            throw new IllegalArgumentException("newSize cannot be negative: " + newSize);
+        }
+        int size = idToSymbol.size();
+        if (newSize >= size) {
+            return;
+        }
+        // Release the discarded strings: setPos only moves the cursor, so the
+        // backing array would otherwise keep every reclaimed entry alive.
+        for (int id = newSize; id < size; id++) {
+            idToSymbol.setQuick(id, null);
+        }
+        idToSymbol.setPos(newSize);
+        // CharSequenceIntHashMap has no remove(), so rebuild the reverse index
+        // from the survivors. O(newSize), on a path a caller only reaches when it
+        // is genuinely reclaiming ids -- the steady state never gets here. The
+        // rebuild also preserves addRecoveredSymbol's "highest id wins" rule for
+        // two source strings that decode to the same characters.
+        symbolToId.clear();
+        for (int id = 0; id < newSize; id++) {
+            symbolToId.put(idToSymbol.getQuick(id), id);
+        }
+    }
 }

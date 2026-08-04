@@ -2378,6 +2378,7 @@ public class QwpWebSocketSender implements Sender {
         // leaves behind after a successful flush, and sendCommitMessage already reads
         // it as an empty delta.
         currentBatchMaxSymbolId = -1;
+        reclaimUnsentSymbolIds();
         pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
@@ -4580,6 +4581,52 @@ public class QwpWebSocketSender implements Sender {
         // stops for every frame and the ring fills. A later successful flush reassigns
         // this from its own deferCommit, which is correct: its data frame closes the group.
         hasDeferredMessages = true;
+    }
+
+    /**
+     * Returns the ids a discarded batch registered but never shipped, so a later
+     * batch does not have to re-encode them.
+     * <p>
+     * Delta mode anchors every section at {@code sentMaxSymbolId + 1}, and that
+     * watermark only advances when a frame is published. Symbols an abandoned
+     * batch registered therefore sit permanently between the watermark and the
+     * dictionary tip: the next batch that touches ANY newer id spans them again,
+     * so the section never shrinks and the sender stays wedged on the very cap
+     * rejection {@code reset()} is documented to clear. Whether it recovers
+     * depended entirely on whether the caller's next row happened to reuse an old
+     * symbol -- which is not a contract.
+     * <p>
+     * <b>The floor is what makes reuse safe.</b> An id may be reclaimed only while
+     * nothing has bound it to a string yet:
+     * <ul>
+     *   <li>{@code id <= sentMaxSymbolId} is in a frame on the ring and in the
+     *       send loop's catch-up mirror;</li>
+     *   <li>{@code id < pd.size()} is in the {@code .symbol-dict} that recovery
+     *       replays positionally -- the write-ahead persist runs BEFORE the
+     *       publish, so a persist that succeeded under a publish that failed
+     *       leaves durable ids above the watermark.</li>
+     * </ul>
+     * Handing either to a different string is the silent misattribution the dense
+     * id space exists to prevent, so the floor is the max of the two.
+     * <p>
+     * Full-dict mode is excluded. Its sections always start at id 0, so there is
+     * no lifetime anchor to shrink and nothing to gain -- while reclaiming would
+     * let a later frame define a different string at an id a frame already on the
+     * ring defines, which is precisely the hazard above.
+     */
+    private void reclaimUnsentSymbolIds() {
+        if (!deltaDictEnabled) {
+            return;
+        }
+        int floor = sentMaxSymbolId + 1;
+        PersistedSymbolDict pd = cursorEngine == null ? null : cursorEngine.getPersistedSymbolDict();
+        if (pd != null) {
+            int durable = pd.size();
+            if (durable > floor) {
+                floor = durable;
+            }
+        }
+        globalSymbolDictionary.truncateTo(floor);
     }
 
     private void resetSymbolDictStateForNewConnection() {
