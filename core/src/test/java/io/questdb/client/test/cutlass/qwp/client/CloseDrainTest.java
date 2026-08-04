@@ -35,6 +35,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -658,11 +659,134 @@ public class CloseDrainTest {
         }
     }
 
+    /**
+     * A batch the server cap can never fit is RETAINED for retry, so on close()
+     * {@code flushPendingRows} throws {@code BatchTooLargeForCapException}. close() must
+     * discard that batch and keep going -- commit, seal and DRAIN what an earlier
+     * successful flush already published -- before rethrowTerminal surfaces the retained
+     * batch's error. Letting the throw escape instead skips all three and abandons the
+     * earlier rows.
+     * <p>
+     * The e2e sibling {@code QwpSenderOversizeRowInBatchTest} asserts a real server's row
+     * count, which pins the COMMIT half: let the exception escape and those rows never
+     * reach a transaction at all. It cannot pin the DRAIN half. Over localhost the earlier
+     * rows are normally acked before close() is even entered, so
+     * {@code drainOnClose} returns at its {@code ackedFsn >= target} early-out and removing
+     * the drain changes nothing there -- verified by mutation: skipping only
+     * {@code drainOnClose} leaves that test green.
+     * <p>
+     * Here the handler withholds every ack until the close-drain witness releases it, so
+     * the earlier row is PROVABLY unacknowledged when close() reaches the drain. The
+     * witness runs only past that early-out, so observing it fire is proof the drain had
+     * real work to do -- and releasing the acks from inside it is what lets close()
+     * finish, making the assertion impossible to satisfy without the drain.
+     */
+    @Test(timeout = 30_000L)
+    public void testCloseDrainsEarlierRowsBeforeSurfacingRetainedBatchError() throws Exception {
+        GatedAckHandler handler = new GatedAckHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler, false, "PRIMARY")) {
+            // Small enough that a handful of modest rows cannot fit, while every
+            // individual row stays far below it (so the per-row guard cannot fire).
+            server.setAdvertisedMaxBatchSize(4096);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";auto_flush_rows=10000"
+                    + ";auto_flush_bytes=off"
+                    + ";auto_flush_interval=60000"
+                    + ";close_flush_timeout_millis=10000;";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+
+            CountDownLatch drainWaiting = new CountDownLatch(1);
+            sender.setCloseDrainWaitingHook(() -> {
+                drainWaiting.countDown();
+                handler.releaseAcks();
+            });
+
+            // The earlier row: flushed successfully, then held unacked by the handler.
+            sender.table("earlier").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            // 8 x ~1 KB into ONE table: no split can fit this under the 4 KB cap, and no
+            // single row comes close to it.
+            char[] chunkChars = new char[1024];
+            Arrays.fill(chunkChars, 'x');
+            String chunk = new String(chunkChars);
+            LineSenderException flushThrown = null;
+            try {
+                for (int i = 0; i < 8; i++) {
+                    sender.table("oversize").stringColumn("payload", chunk).atNow();
+                }
+                sender.flush();
+            } catch (LineSenderException e) {
+                flushThrown = e;
+            }
+            Assert.assertNotNull("flush() must refuse a batch no split can fit under the cap",
+                    flushThrown);
+            Assert.assertTrue("expected the batch-cap rejection, got: " + flushThrown.getMessage(),
+                    flushThrown.getMessage().contains("batch too large for server batch cap"));
+
+            Assert.assertEquals("the earlier row must still be unacknowledged when close() starts,"
+                            + " or the drain has nothing to wait for and this test proves nothing",
+                    -1L, sender.getAckedFsn());
+
+            LineSenderException closeThrown = null;
+            try {
+                sender.close();
+            } catch (LineSenderException e) {
+                closeThrown = e;
+            }
+
+            Assert.assertEquals("close() must reach the bounded drain with the earlier row still"
+                            + " unacknowledged; the witness fires only past drainOnClose's"
+                            + " ackedFsn >= target early-out, so a skipped drain leaves it unfired",
+                    0L, drainWaiting.getCount());
+            Assert.assertNotNull("close() must still surface the retained batch's error after"
+                    + " committing and draining the earlier row", closeThrown);
+            Assert.assertTrue("expected the batch-cap rejection from close(), got: "
+                            + closeThrown.getMessage(),
+                    closeThrown.getMessage().contains("batch too large for server batch cap"));
+            // close() surfaced the batch-cap error rather than a "drain timed out" one, so
+            // the drain ran to completion; the handler's counter is the server-side witness
+            // that the earlier row's frame really was carried across and acked.
+            Assert.assertTrue("the drain must have carried the earlier row's frame to the server"
+                            + " and taken its ack [acksSent=" + handler.nextSeq.get() + ']',
+                    handler.nextSeq.get() >= 1L);
+        }
+    }
+
     private static String sfDirOpt() {
         String dir = Paths.get(
                 System.getProperty("java.io.tmpdir"),
                 "qdb-close-drain-" + System.nanoTime()).toString();
         return ";sf_dir=" + dir;
+    }
+
+    /**
+     * Receives frames but withholds every ack until {@link #releaseAcks()} is called, so a
+     * close-time drain provably has an unacknowledged target to wait on.
+     */
+    private static class GatedAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private final CountDownLatch released = new CountDownLatch(1);
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                if (!released.await(20, TimeUnit.SECONDS)) {
+                    throw new AssertionError("close-drain witness never released the ack gate");
+                }
+                client.sendBinary(buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        void releaseAcks() {
+            released.countDown();
+        }
     }
 
     /** Acks every binary frame after a fixed delay, so we can observe close() blocking. */
