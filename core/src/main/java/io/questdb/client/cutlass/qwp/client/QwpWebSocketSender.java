@@ -2368,6 +2368,16 @@ public class QwpWebSocketSender implements Sender {
                 buf.reset();
             }
         }
+        // Drop the batch's symbol watermark along with the rows that raised it. A
+        // later flush encodes the delta section as
+        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left behind
+        // by the discarded batch keeps re-encoding that batch's symbols: a single-row
+        // batch after reset() would still carry the whole abandoned range and hit the
+        // very cap rejection reset() is documented to clear, leaving the sender unable
+        // to flush anything at all. -1 is the same value resetTableBuffersAfterFlush
+        // leaves behind after a successful flush, and sendCommitMessage already reads
+        // it as an empty delta.
+        currentBatchMaxSymbolId = -1;
         pendingBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
@@ -4079,25 +4089,34 @@ public class QwpWebSocketSender implements Sender {
                 // never fit, so say that here rather than let a caller read the repeat
                 // rejections as a transient and keep appending to a batch that only
                 // grows.
-                // An over-cap dictionary has been handled upstream: preRegisterDictionaryChunks
-                // moved a section that fills the cap alone into its own frames, and
-                // flushPendingRows' fallback re-encoded against chunked registration
-                // when the inline section pushed a split frame over the cap. Anything
-                // still oversized here is the table body -- which reset() and smaller
-                // batches genuinely do fix. Report the dictionary's contribution
-                // anyway so the split is visible.
+                // In FULL-DICT mode an over-cap dictionary has been handled upstream:
+                // preRegisterDictionaryChunks moved a section that fills the cap alone into
+                // its own frames, and flushPendingRows' fallback re-encoded against chunked
+                // registration when the inline section pushed a split frame over the cap.
+                // In DELTA mode neither runs -- preRegisterDictionaryChunks returns early
+                // there to preserve the write-ahead persist ordering -- so the section can
+                // still be the half that does not fit, and reset() alone does not shrink it:
+                // the next batch's delta starts at the same sentMaxSymbolId+1 and spans up
+                // to whatever id it references. Pick the remedy from which half actually
+                // exceeds the cap rather than prescribing one that cannot work.
                 int frameOverhead = encoder.getSplitMessageSize(
                         0, simBaseline, currentBatchMaxSymbolId);
+                String remedy = frameOverhead > cap
+                        ? "the symbol dictionary section alone exceeds the cap, so neither reset() "
+                        + "nor smaller batches shrink it -- every later batch re-registers from the "
+                        + "same id. Close this sender and build a new one to restart the id space, "
+                        + "raise the server's maximum batch size, or use a varchar column instead of "
+                        + "symbol for this data"
+                        : "call reset() to discard the retained batch and keep this sender, close the "
+                        + "sender to discard everything, or produce smaller batches";
                 throw new BatchTooLargeForCapException("single table batch too large for server batch cap")
                         .put(" [table=").put(tableName)
                         .put(", messageSize=").put(messageSize)
                         .put(", dictionaryFrameBytes=").put(frameOverhead)
                         .put(", serverMaxBatchSize=").put(cap).put(']')
                         .put("; the batch is retained for retry and every flush() will "
-                                + "reject it again until a larger-cap node is reached -- "
-                                + "call reset() to discard the retained batch and keep this "
-                                + "sender, close the sender to discard everything, or produce "
-                                + "smaller batches");
+                                + "reject it again until a larger-cap node is reached -- ")
+                        .put(remedy);
             }
             // Mirror advanceSentMaxSymbolId: once the first frame ships the batch's
             // new ids, the remaining frames carry an empty delta above the baseline.
@@ -4575,6 +4594,16 @@ public class QwpWebSocketSender implements Sender {
         activeBuffer.write(buffer.getBufferPtr(), messageSize);
         activeBuffer.incrementRowCount();
         sealAndSwapBuffer();
+        // The chunk is on the ring carrying FLAG_DEFER_COMMIT, so the server withholds
+        // its ack and clamps the connection's cumulative-ack watermark until the group
+        // commits. Record that debt here rather than leaving it to the caller: when the
+        // batch meant to close the group throws instead -- an oversized table body
+        // reaching the split pre-flight -- flushPendingRows never reaches its own
+        // hasDeferredMessages assignment, close() skips sendCommitMessage, and the group
+        // never commits. ackedFsn then freezes for the connection's whole life, so trim
+        // stops for every frame and the ring fills. A later successful flush reassigns
+        // this from its own deferCommit, which is correct: its data frame closes the group.
+        hasDeferredMessages = true;
     }
 
     private void resetSymbolDictStateForNewConnection() {

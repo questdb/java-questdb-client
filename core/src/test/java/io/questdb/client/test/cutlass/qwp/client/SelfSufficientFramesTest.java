@@ -28,6 +28,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
@@ -1049,6 +1050,144 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
+    public void testResetClearsTheBatchSymbolWatermarkSoDeltaModeCanFlushAgain() throws Exception {
+        // Delta mode is excluded from preRegisterDictionaryChunks (the write-ahead persist
+        // ordering forbids publishing before persistNewSymbolsBeforePublish runs), so a
+        // delta section that alone exceeds the cap still reaches the split pre-flight and
+        // throws. That rejection is documented as recoverable via reset(). It only IS
+        // recoverable if reset() also drops currentBatchMaxSymbolId: the delta spans
+        // [sentMaxSymbolId+1 .. currentBatchMaxSymbolId], so a watermark left at the
+        // discarded batch's tip makes even a single-row batch re-encode the whole
+        // abandoned range and throw identically -- a permanently unflushable sender.
+        assertMemoryLeak(() -> {
+            final int cap = 512;
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(cap);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String symPad = TestUtils.repeat("s", 46);
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;")) {
+                    // 40 x 48-byte symbols: a ~1.9 KB delta section against a 512-byte cap,
+                    // with per-row bodies far under the row guard.
+                    for (int i = 0; i < 40; i++) {
+                        sender.table("t").symbol("s", String.format("%02d", i) + symPad)
+                                .longColumn("v", (long) i).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("a delta section over the cap must throw");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("single table batch too large for server batch cap"));
+                        // The dictionary, not the body, is what does not fit -- so the
+                        // message must not prescribe reset()/smaller batches as the cure.
+                        Assert.assertTrue("an over-cap dictionary section must say so, and must not "
+                                        + "prescribe a remedy that cannot shrink it [msg=" + e.getMessage() + ']',
+                                e.getMessage().contains("the symbol dictionary section alone exceeds the cap"));
+                    }
+                    Assert.assertEquals("the rejection precedes every publish", 0, handler.batches.size());
+
+                    // The contract reset() is documented to honour: discard the retained
+                    // batch and KEEP the sender usable. Symbol id 0 is already registered,
+                    // so the next frame's delta is [0, 0] -- one entry, trivially under cap.
+                    sender.reset();
+                    sender.table("t").symbol("s", "00" + symPad).longColumn("v", 0L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.batches.size() >= 1, 10_000);
+                }
+
+                Assert.assertEquals("exactly one frame ships after reset()", 1, handler.batches.size());
+                byte[] frame = handler.batches.get(0);
+                Assert.assertEquals("the post-reset frame must re-register from id 0",
+                        0, readVarint(frame, DELTA_START_OFFSET));
+                Assert.assertEquals("it carries only the one symbol the surviving row references, "
+                                + "not the discarded batch's 40",
+                        1, readVarint(frame, DELTA_START_OFFSET + 1));
+            }
+        });
+    }
+
+    @Test
+    public void testCloseCommitsDictionaryChunksStrandedByAnOversizedBody() throws Exception {
+        // preRegisterDictionaryChunks publishes its deferred, table-less chunks BEFORE the
+        // split pre-flight can reject the batch, so an oversized table body leaves them on
+        // the ring with no data frame behind them. They carry FLAG_DEFER_COMMIT, and the
+        // server withholds the ack for every deferred frame and clamps the connection's
+        // cumulative-ack watermark until the group commits -- so if close() never sends the
+        // commit, ackedFsn freezes for the connection's whole life, trim stops for EVERY
+        // frame and the ring fills. close() gates that commit on hasDeferredMessages, which
+        // only publishDictionaryChunk can set on this path: flushPendingRows throws before
+        // reaching its own assignment.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-dict-stranded-chunks").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(512);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine);
+                try {
+                    String symPad = TestUtils.repeat("s", 46);
+                    String rowPad = TestUtils.repeat("x", 60);
+                    // 20 x 48-byte symbols -> a ~1 KB full-dict section that alone exceeds
+                    // the 512-byte cap, so preRegisterDictionaryChunks chunks and publishes.
+                    // The accumulated body (~1.4 KB over 20 rows) then blows the split
+                    // pre-flight with an EMPTY delta, so the chunks are already on the ring
+                    // when the throw lands. Each row stays well under the per-row guard, so
+                    // the batch-level pre-flight is what rejects, not sendRow.
+                    for (int i = 0; i < 20; i++) {
+                        sender.table("big").symbol("s", String.format("%02d", i) + symPad)
+                                .stringColumn("p", rowPad).longColumn("v", (long) i).atNow();
+                    }
+                    try {
+                        sender.flush();
+                        Assert.fail("a body over the cap must throw");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("single table batch too large for server batch cap"));
+                    }
+                    waitFor(() -> !handler.batches.isEmpty(), 10_000);
+                    for (byte[] frame : handler.batches) {
+                        Assert.assertEquals("only dictionary chunks may have shipped",
+                                0, QwpWireTestUtils.tableCount(frame));
+                        Assert.assertTrue("a dictionary chunk is deferred", hasDeferCommit(frame));
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException expected) {
+                        // close() latches and rethrows the over-cap terminal after running
+                        // its commit / seal / drain steps; the assertions below are about
+                        // what it managed to send on the way out.
+                    }
+                }
+
+                byte[] last = handler.batches.get(handler.batches.size() - 1);
+                Assert.assertFalse("close() must commit the deferred dictionary group: without a "
+                                + "commit frame the server never acks the chunks, the client's ack "
+                                + "watermark freezes and trim stops for the whole connection",
+                        hasDeferCommit(last));
+                Assert.assertEquals("the commit frame carries no tables",
+                        0, QwpWireTestUtils.tableCount(last));
+                Assert.assertTrue("the commit must follow at least one deferred chunk",
+                        handler.batches.size() >= 2);
+            }
+        });
+    }
+
+    @Test
     public void testCloseStillDrainsWhenTheRetainedBatchIsOverCap() throws Exception {
         // close() step 1 flushes; an over-cap batch throws there. Letting that throw
         // escape skips sendCommitMessage, sealAndSwapBuffer AND drainOnClose --
@@ -1119,6 +1258,12 @@ public class SelfSufficientFramesTest {
         public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             batches.add(data.clone());
         }
+    }
+
+    /** Byte 5 of the QWP header is the flags byte; FLAG_DEFER_COMMIT is its low bit. */
+    private static boolean hasDeferCommit(byte[] frame) {
+        return frame.length >= QwpConstants.HEADER_SIZE
+                && (frame[5] & QwpConstants.FLAG_DEFER_COMMIT) != 0;
     }
 
     private static int readVarint(byte[] buf, int offset) {
