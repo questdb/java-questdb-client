@@ -116,12 +116,16 @@ public class LineHttpSenderV1 extends AbstractLineHttpSender {
 
     @Override
     public void at(long timestamp, ChronoUnit unit) {
+        // reject before the first write, not in atNow() after it: see validateRowStarted()
+        validateRowStarted();
         request.putAscii(' ').put(NanosTimestampDriver.INSTANCE.from(timestamp, unit));
         atNow();
     }
 
     @Override
     public void at(Instant timestamp) {
+        // reject before the first write, not in atNow() after it: see validateRowStarted()
+        validateRowStarted();
         request.putAscii(' ').put(NanosTimestampDriver.INSTANCE.from(timestamp));
         atNow();
     }

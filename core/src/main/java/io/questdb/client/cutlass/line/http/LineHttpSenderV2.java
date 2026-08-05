@@ -163,6 +163,8 @@ public class LineHttpSenderV2 extends AbstractLineHttpSender {
 
     @Override
     public void at(long timestamp, ChronoUnit unit) {
+        // reject before the first write, not in atNow() after it: see validateRowStarted()
+        validateRowStarted();
         request.putAscii(' ');
         putTimestamp(timestamp, unit);
         atNow();
@@ -170,6 +172,8 @@ public class LineHttpSenderV2 extends AbstractLineHttpSender {
 
     @Override
     public void at(Instant timestamp) {
+        // reject before the first write, not in atNow() after it: see validateRowStarted()
+        validateRowStarted();
         request.putAscii(' ');
         putTimestamp(timestamp);
         atNow();

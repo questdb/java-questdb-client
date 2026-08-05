@@ -33,6 +33,8 @@ import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -54,6 +56,55 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class LineHttpSenderTokenProviderTest {
+
+    @Test(timeout = 30_000)
+    public void testAtWithoutTableDoesNotCorruptTheAuthorizationHeader() throws Exception {
+        assertMemoryLeak(() -> {
+            // Regression: at() used to write the leading space and the timestamp BEFORE atNow() validated the
+            // row state. With a provider, newRequest() leaves the request at the header stage (withContent()
+            // deferred until the first row stamps the Authorization header), so those bytes landed in the HTTP
+            // HEADER block, on a line of their own. The next row's "Authorization: Bearer ..." was then appended
+            // to that line, making it an obs-fold continuation of User-Agent (RFC 7230) instead of a header of
+            // its own - so the flush went out with NO credential and the server answered 401, after which
+            // close() dropped the buffered rows. cancelRow() could not undo it: trimContentToLen only rewinds
+            // within the content section, and it early-returns while the token is pending anyway.
+            // Both at() overloads are covered, over V1 and V2 (V3 inherits V2's).
+            int[] versions = {Sender.PROTOCOL_VERSION_V1, Sender.PROTOCOL_VERSION_V2};
+            for (int i = 0; i < versions.length; i++) {
+                for (int overload = 0; overload < 2; overload++) {
+                    try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                        try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                                .address("127.0.0.1:" + server.port())
+                                .protocolVersion(versions[i])
+                                .disableAutoFlush()
+                                .httpTokenProvider(() -> "TOKEN")
+                                .build()) {
+                            try {
+                                if (overload == 0) {
+                                    sender.at(1_700_000_000_000_000_000L, ChronoUnit.NANOS);
+                                } else {
+                                    sender.at(Instant.ofEpochMilli(1_700_000_000_000L));
+                                }
+                                Assert.fail("expected at() with no table name to be rejected");
+                            } catch (LineSenderException e) {
+                                Assert.assertTrue(e.getMessage(), e.getMessage().contains("no table name was provided"));
+                            }
+                            // the documented recovery, and the sender must still be usable afterwards
+                            sender.cancelRow();
+                            sender.table("t").longColumn("v", 1L).atNow();
+                            sender.flush();
+                        }
+                        List<String> auth = server.requestAuthHeaders();
+                        Assert.assertEquals("exactly one flush must reach the server", 1, auth.size());
+                        // null here means the rejected at() spliced bytes ahead of the header, so the mock's
+                        // parser never saw a line whose field name is "Authorization"
+                        Assert.assertEquals("the token must reach the wire as its own header",
+                                "Bearer TOKEN", auth.get(0));
+                    }
+                }
+            }
+        });
+    }
 
     @Test
     public void testBuildSucceedsWhenProviderHasNotSignedInYet() throws Exception {

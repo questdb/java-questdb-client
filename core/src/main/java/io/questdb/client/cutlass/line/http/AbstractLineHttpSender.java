@@ -438,17 +438,11 @@ public abstract class AbstractLineHttpSender implements Sender {
 
     @Override
     public void atNow() {
-        switch (state) {
-            case EMPTY:
-                throw new LineSenderException("no table name was provided");
-            case TABLE_NAME_SET:
-                throw new LineSenderException("no symbols or columns were provided");
-            case ADDING_SYMBOLS:
-            case ADDING_COLUMNS:
-                request.put('\n');
-                state = RequestState.EMPTY;
-                break;
-        }
+        // validateRowStarted() rejects EMPTY and TABLE_NAME_SET, so only ADDING_SYMBOLS and ADDING_COLUMNS
+        // reach the terminator write
+        validateRowStarted();
+        request.put('\n');
+        state = RequestState.EMPTY;
         if (rowAdded()) {
             flush();
         }
@@ -950,6 +944,26 @@ public abstract class AbstractLineHttpSender implements Sender {
             throw new LineSenderException("column name contains an illegal char: '\\n', '\\r', '?', '.', ','" +
                     ", ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: ")
                     .putAsPrintable(name);
+        }
+    }
+
+    /**
+     * Rejects a row terminator that no row precedes. Subclasses MUST call this before writing the first byte
+     * of a terminator, not after: with an httpTokenProvider configured, newRequest() leaves the request at the
+     * header stage (withContent() deferred until the first row stamps the Authorization header), so a write
+     * that lands here while the state is EMPTY goes into the HTTP HEADER block, not the request body. Those
+     * bytes then start a line that folds the following "Authorization: Bearer ..." into the previous header
+     * (RFC 7230 obs-fold), and the request ships with no credential at all. cancelRow() cannot undo it either:
+     * trimContentToLen only rewinds within the content section.
+     */
+    protected void validateRowStarted() {
+        switch (state) {
+            case EMPTY:
+                throw new LineSenderException("no table name was provided");
+            case TABLE_NAME_SET:
+                throw new LineSenderException("no symbols or columns were provided");
+            default:
+                break;
         }
     }
 
