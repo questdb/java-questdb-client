@@ -470,6 +470,10 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // configured interval has elapsed since the most recent outbound event.
     // Zero until the first send; reset to zero on reconnect.
     private long lastFrameOrPingNanos;
+    // Throttles the catch-up oversize WARN. Only consulted when the server
+    // advertises NO batch cap, where the loop has no terminal to fall back on
+    // and would otherwise recycle in silence. See sendDictCatchUp.
+    private long lastUncappedOversizeWarnNanos;
     private long nextWireSeq;
     private volatile SenderProgressDispatcher progressDispatcher;
     // Frames sent during the post-reconnect catch-up window — i.e. frames
@@ -2918,6 +2922,38 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     + NativeBufferWriter.varintSize(chunkStartId + chunkSymbols)
                     + NativeBufferWriter.varintSize(1)
                     + entryBytes;
+            // No advertised cap: soloFrameLimit is MAX_SENT_DICT_BYTES (~2GB), so the
+            // cap-gap terminal below cannot fire, and packing only ever splits BETWEEN
+            // entries -- an entry wider than the receiving node's recv buffer therefore
+            // goes out whole, is closed with 1009, and the close carries no policy
+            // semantics, so failExemptPaced recycles and re-emits the byte-identical
+            // frame forever. That retry-forever is CORRECT (Invariant B: never invent a
+            // terminal for data the producer already shipped, and never surface a
+            // transport error to the caller), and tightening soloFrameLimit to the
+            // packing fallback would break it. What is missing is the diagnosis: the
+            // connect itself succeeds every cycle, so the reconnect logging never fires
+            // and the stall looks like a healthy reconnect loop until store-and-forward
+            // fills and surfaces as an unrelated out-of-space error. Name the entry.
+            //
+            // Only reachable against an endpoint that advertises no X-QWP-Max-Batch-Size
+            // AND has a smaller frame limit than an entry already in the mirror -- a
+            // pre-header server, a header-stripping proxy, or a third-party
+            // implementation; the mirror itself may have been seeded from .symbol-dict
+            // under an entirely different server generation, which is the case the
+            // homogeneous-cluster argument above does not cover.
+            if (cap <= 0 && soloFrameLen > packingLimit) {
+                long nowNanos = System.nanoTime();
+                if (lastUncappedOversizeWarnNanos == 0L
+                        || nowNanos - lastUncappedOversizeWarnNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    lastUncappedOversizeWarnNanos = nowNanos;
+                    LOG.warn("symbol dictionary entry {} needs a {}-byte catch-up frame and the server "
+                                    + "advertises no batch cap, so it cannot be split or rejected; if the "
+                                    + "connection keeps recycling with no ack progress this entry is the "
+                                    + "cause -- shorten the symbol value, raise the server's recv buffer "
+                                    + "so it advertises a cap, or use a varchar column [fallbackLimit={}]",
+                            chunkStartId + chunkSymbols, soloFrameLen, packingLimit);
+                }
+            }
             if (soloFrameLen > soloFrameLimit) {
                 // Cap gap: this entry cannot be re-registered under the fresh
                 // server's advertised cap. A HOMOGENEOUS cluster never reaches here

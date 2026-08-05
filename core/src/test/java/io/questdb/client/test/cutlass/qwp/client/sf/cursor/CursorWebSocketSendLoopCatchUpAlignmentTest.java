@@ -525,6 +525,62 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     @Test
+    public void testUncappedOversizeCatchUpEntryIsNamedInTheLog() throws Exception {
+        // With no advertised cap the loop has NO terminal to fall back on: soloFrameLimit
+        // becomes MAX_SENT_DICT_BYTES (~2GB) so the cap-gap arm cannot fire, and packing
+        // only ever splits BETWEEN entries, so an entry wider than the receiving node's
+        // recv buffer goes out whole, gets closed with 1009, and -- because close codes
+        // carry no policy semantics -- is retried byte-identically forever.
+        //
+        // That retry-forever is CORRECT and must not be tightened: inventing a terminal
+        // here would kill a producer over data it already shipped. What was missing is
+        // the DIAGNOSIS. The connect succeeds on every cycle, so the reconnect logging
+        // never fires and the stall reads as a healthy reconnect loop until
+        // store-and-forward fills and surfaces as an unrelated out-of-space error. The
+        // WARN is the only thing that names the cause, so pin it.
+        TestUtils.assertMemoryLeak(() -> {
+            // cap 0 == the server advertised no X-QWP-Max-Batch-Size header.
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            ch.qos.logback.classic.Logger loopLogger = (ch.qos.logback.classic.Logger)
+                    org.slf4j.LoggerFactory.getLogger(CursorWebSocketSendLoop.class);
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                    new ch.qos.logback.core.read.ListAppender<>();
+            appender.start();
+            ch.qos.logback.classic.Level savedLevel = loopLogger.getLevel();
+            loopLogger.setLevel(ch.qos.logback.classic.Level.ALL);
+            loopLogger.addAppender(appender);
+            try (CursorSendEngine engine = newEngine()) {
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    // One entry past UNCAPPED_CATCHUP_PACKING_LIMIT (64 KB). A single
+                    // symbol cannot be split across frames, so no chunking can save it.
+                    seedMirror(loop, TestUtils.repeat("x", 70_000));
+                    invokeSetWireBaselineWithCatchUp(loop, 0L);
+                } finally {
+                    loop.close();
+                }
+            } finally {
+                loopLogger.detachAppender(appender);
+                loopLogger.setLevel(savedLevel);
+                appender.stop();
+            }
+            boolean named = false;
+            for (ch.qos.logback.classic.spi.ILoggingEvent e : appender.list) {
+                if (e.getLevel() == ch.qos.logback.classic.Level.WARN
+                        && e.getFormattedMessage().contains("advertises no batch cap")
+                        && e.getFormattedMessage().contains("70")) {
+                    named = true;
+                    break;
+                }
+            }
+            assertTrue("an oversize catch-up entry under a cap-less server must name itself "
+                            + "in the log -- it is the only signal that failure mode produces. Saw: "
+                            + appender.list,
+                    named);
+        });
+    }
+
+    @Test
     public void testCatchUpChunkFrameSizeOverflowFailsLoud() throws Exception {
         // M3: sendDictCatchUp caps each chunk under the budget, so the single-frame
         // catch-up path cannot overflow its int frameLen at any real cardinality. The

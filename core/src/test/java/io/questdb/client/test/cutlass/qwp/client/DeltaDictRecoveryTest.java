@@ -1606,6 +1606,76 @@ public class DeltaDictRecoveryTest {
     }
 
     @Test
+    public void testDiscardedSurvivingDictionaryIsUnlinked() throws Exception {
+        // The discard must UNLINK the survivor, not merely stop using it. Closing alone
+        // left it on disk, and full-dict mode never rewrites it
+        // (persistNewSymbolsBeforePublish returns early on !deltaDictEnabled), so it was
+        // sticky: the very next recovery re-read it, and as soon as an intervening
+        // session ingested FEWER distinct symbols than it holds, the discard's
+        // recoveredMaxSymbolId >= size() guard stopped firing, delta mode came back on,
+        // and seedGlobalDictionaryFromPersisted anchored the producer on the PREVIOUS
+        // generation's strings for ids the replayed frames then redefined -- silent
+        // misattribution of every later row, with row counts intact. Nothing else
+        // catches it: the fold's `deltaEnd <= runningCoverage` fast path declares those
+        // frames already covered and never compares a string.
+        //
+        // Asserted on a DIRECTLY constructed engine, while it is still open. Going
+        // through Sender.fromConfig and reading the file after close proves nothing:
+        // close() unlinks the dictionary itself once the slot is fully drained
+        // (CursorSendEngine's fully-drained branch), so the assertion passes with the
+        // discard-time unlink removed.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Self-sufficient frames (full-dict fallback: no side-file is ever written).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                Assert.assertFalse(java.nio.file.Files.exists(dict));
+            }
+
+            // A prior generation's populated side-file, holding FEWER ids than the
+            // frames reference -- the shape that fires the discard.
+            try (PersistedSymbolDict survivor =
+                         PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                survivor.appendSymbol("stale-a");
+                survivor.appendSymbol("stale-b");
+            }
+            Assert.assertTrue(java.nio.file.Files.exists(dict));
+
+            CursorSendEngine recoveredEngine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    io.questdb.client.std.FilesFacade.INSTANCE);
+            try {
+                Assert.assertFalse("the discard must leave the slot in full-dict mode",
+                        recoveredEngine.isDeltaDictEnabled());
+                Assert.assertFalse("the discarded survivor must be unlinked at DISCARD time, or a "
+                                + "later recovery with lower symbol cardinality will seed from it",
+                        java.nio.file.Files.exists(dict));
+            } finally {
+                recoveredEngine.close(false);
+            }
+        });
+    }
+
+    @Test
     public void testFullDictFramesRecoverInFullDictModeInsteadOfBricking() throws Exception {
         // M1 regression (counterpoint to testTornDictTotalLossFailsCleanOnResume): a
         // slot written in FULL-DICT fallback -- the .symbol-dict could not open when
@@ -2246,6 +2316,110 @@ public class DeltaDictRecoveryTest {
                 for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
                     Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testTransientDictFaultRecoversInFullDictModeWhenEveryFrameIsSelfSufficient()
+            throws Exception {
+        // The counterpoint to testTransientDictFaultOnRecoveredSlotFailsLoudAndRetry-
+        // RecoversInFull. There the surviving frames were DELTA frames whose ids live
+        // only in the side-file, so an unreadable side-file genuinely blocks replay and
+        // aborting is right. Here every surviving frame is self-sufficient
+        // (maxDeltaStart == 0 -- each re-registers its whole dictionary from id 0), so
+        // the side-file is not needed to replay this slot at all.
+        //
+        // Aborting anyway was a permanent outage over a file nothing reads:
+        // SfOperationalException extends IllegalStateException, so it is NOT in
+        // Sender.build()'s quarantine catch list and escaped build() entirely. With a
+        // stable senderId and a retained slot, a NON-clearing operational error (a hard
+        // EIO on this one file, a read-only mount, an ownership change) re-threw on
+        // every restart -- the application could not construct a Sender, so it could not
+        // even BUFFER new rows. In a pool it is worse: allocateSlotIndex() hands out the
+        // LOWEST free index, so the same bad slot is re-selected and EVERY borrow()
+        // fails rather than the pool losing one slot of capacity.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Phase 1: full-dict fallback, so every frame carries its whole dictionary.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            // A prior generation's populated side-file, left where a later recovery
+            // would find it.
+            try (PersistedSymbolDict survivor =
+                         PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                survivor.appendSymbol("stale-a");
+                survivor.appendSymbol("stale-b");
+            }
+            Assert.assertTrue(java.nio.file.Files.exists(dict));
+
+            // Phase 2: the side-file cannot be read. Same stat fault the delta-frame
+            // twin uses -- errno 5 is EIO on POSIX and ERROR_ACCESS_DENIED on Windows,
+            // "not a not-found" on both, so length() < 0 deterministically takes the
+            // transient arm.
+            DelegatingFilesFacade statFault = new DelegatingFilesFacade() {
+                long dictPathPtr = -1L;
+
+                @Override
+                public long allocNativePath(String path) {
+                    long ptr = super.allocNativePath(path);
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        dictPathPtr = ptr;
+                    }
+                    return ptr;
+                }
+
+                @Override
+                public int errno() {
+                    return 5;
+                }
+
+                @Override
+                public long length(String path) {
+                    return path.endsWith(PersistedSymbolDict.FILE_NAME) ? -1L : super.length(path);
+                }
+
+                @Override
+                public long length(long pathPtr) {
+                    return pathPtr == dictPathPtr ? -1L : super.length(pathPtr);
+                }
+            };
+            CursorSendEngine recoveredEngine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, statFault);
+            try {
+                Assert.assertFalse("an unreadable dictionary must leave the slot in full-dict mode",
+                        recoveredEngine.isDeltaDictEnabled());
+                Assert.assertNull(recoveredEngine.getPersistedSymbolDict());
+                // And the unverifiable survivor is cleared, not left for the next
+                // recovery to trust -- the same reason the discard branch unlinks its
+                // own. Asserted while the engine is still OPEN: close() unlinks the
+                // dictionary itself on a fully-drained slot, which would satisfy this
+                // for the wrong reason.
+                Assert.assertFalse("an unreadable side-file must be removed once the frames are "
+                                + "proven self-sufficient, or a later recovery will seed symbols from it",
+                        java.nio.file.Files.exists(dict));
+            } finally {
+                recoveredEngine.close(false);
             }
         });
     }

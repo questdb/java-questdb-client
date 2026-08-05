@@ -478,14 +478,35 @@ public final class CursorSendEngine implements QuietCloseable {
                 // server before replay. Returns null only when the dictionary
                 // is provably absent or corrupt -- the sender then degrades to
                 // full self-sufficient frames for this session, a disposition
-                // that is sticky across restarts. A TRANSIENT I/O failure
-                // instead throws SfOperationalException out of this
-                // constructor: Sender.build() aborts without quarantining and
-                // BackgroundDrainer leaves the slot for a later scan, so an
-                // intact backlog is never set aside and a degraded session can
-                // never write frames next to a stale side-file that a later
-                // recovery would trust.
-                persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
+                // that is sticky across restarts.
+                //
+                // An I/O failure throws SfOperationalException, which is CAPTURED
+                // rather than propagated here. Whether an unreadable dictionary is
+                // fatal depends on something only the fold below can answer: if every
+                // surviving frame is self-sufficient (maxDeltaStart() == 0, i.e. each
+                // re-registers its whole dictionary from id 0) the side-file is not
+                // needed to replay this slot at all, and aborting on it would be a
+                // permanent outage over a file nothing reads. That mattered because
+                // SfOperationalException extends IllegalStateException, so it is NOT in
+                // Sender.build()'s quarantine catch list and escapes build() entirely:
+                // with a stable senderId and a retained slot, a NON-clearing operational
+                // error (a hard EIO on this one file, a read-only mount failing the tail
+                // truncate, an ownership change) re-threw on every restart. The
+                // application could then not construct a Sender at all, so it could not
+                // even BUFFER new rows -- and in a pool it is worse, because
+                // allocateSlotIndex() hands out the LOWEST free index, so the same bad
+                // slot is re-selected and every borrow() fails rather than the pool
+                // losing one slot of capacity.
+                //
+                // Deferring the verdict keeps the abort for the case that genuinely
+                // needs it (a delta frame whose ids cannot be rebuilt) and drops it for
+                // the case that does not.
+                SfOperationalException dictOpenFailure = null;
+                try {
+                    persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
+                } catch (SfOperationalException e) {
+                    dictOpenFailure = e;
+                }
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
                 // Reject watermarks past publishedFsn: a correctly
@@ -510,6 +531,47 @@ public final class CursorSendEngine implements QuietCloseable {
                 recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(
                         persistedDictInProgress == null ? 0 : persistedDictInProgress.size());
                 recoveryFoldCount++;
+                if (dictOpenFailure != null) {
+                    // The deferred verdict from the dictionary open above, now that the
+                    // fold can say whether the file was load-bearing.
+                    if (recoveredFrameAnalysisInProgress.maxDeltaStart() > 0L) {
+                        // A surviving frame's delta starts above id 0, so the ids it
+                        // references exist ONLY in the side-file this process could not
+                        // read. Replaying it would hand the server ids it was never
+                        // given. Abort -- retriably, which is why the type is unchanged:
+                        // the file is left intact, Sender.build() does not quarantine it
+                        // (SfOperationalException is deliberately outside that catch
+                        // list), and BackgroundDrainer treats it as retryable and leaves
+                        // no .failed sentinel, so a retry once the transient clears
+                        // recovers the slot in full.
+                        throw dictOpenFailure;
+                    }
+                    // Every surviving frame carries its whole dictionary inline, so the
+                    // unreadable side-file is not needed to replay this slot, and no
+                    // frame this session goes on to write will need it either
+                    // (persistedSymbolDict stays null, so isDeltaDictEnabled() is false
+                    // and the producer runs full-dict). Clear it for the same reason the
+                    // discard branch below clears its own: a session that writes
+                    // full-dict frames next to a side-file it never verified hands the
+                    // NEXT recovery a survivor describing a previous generation's id
+                    // space, which seeds the producer with the wrong strings.
+                    if (PersistedSymbolDict.removeOrphan(dictFf, sfDir)) {
+                        LOG.warn("sf slot {}: symbol dictionary unreadable ({}), but every recovered "
+                                        + "frame is self-sufficient -- removed the unusable side-file and "
+                                        + "recovering in full-dictionary mode",
+                                sfDir, dictOpenFailure.getMessage());
+                    } else {
+                        // Deliberately NOT fatal: refusing here would restore the
+                        // permanent build() outage this deferral exists to remove, over a
+                        // file nothing in this slot reads. Say plainly what is left
+                        // behind so the residue is actionable.
+                        LOG.error("sf slot {}: symbol dictionary is neither readable ({}) nor removable; "
+                                        + "recovering in full-dictionary mode, but the stale side-file "
+                                        + "SURVIVES -- remove it by hand, or a later recovery whose frames "
+                                        + "reference fewer ids than it holds will seed symbols from it",
+                                sfDir, dictOpenFailure.getMessage());
+                    }
+                }
                 // Locate the last commit-bearing frame below a potentially
                 // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
                 // closed) mid-transaction leaves deferred frames with no
@@ -574,6 +636,40 @@ public final class CursorSendEngine implements QuietCloseable {
                     int discardedSize = persistedDictInProgress.size();
                     persistedDictInProgress.close();
                     persistedDictInProgress = null;
+                    // Unlink it, do not merely stop using it. Closing alone left the
+                    // file on disk, and full-dict mode never creates or appends it
+                    // (persistNewSymbolsBeforePublish returns early on
+                    // !deltaDictEnabled), so the survivor was STICKY -- it outlived
+                    // this session unchanged and every later restart re-read it.
+                    //
+                    // That is a cross-generation trap. The discard's own guard
+                    // (recoveredMaxSymbolId >= size) is what protects a healthy slot,
+                    // and it stops firing as soon as an intervening session ingests
+                    // FEWER distinct symbols than the survivor holds. The next recovery
+                    // then keeps the stale dictionary, re-enables delta mode, and
+                    // seedGlobalDictionaryFromPersisted anchors the producer on the
+                    // PREVIOUS generation's strings for ids [0, size). Nothing detects
+                    // it: the fold's `deltaEnd <= runningCoverage` fast path declares
+                    // those frames already covered and never compares a string, so
+                    // coverage stays >= 0 and no gap is raised. On the wire the catch-up
+                    // registers the stale strings, the replayed full-dict frames then
+                    // redefine the same ids with the real ones, and every subsequent row
+                    // the producer writes against those ids lands under the wrong
+                    // symbol -- silently, with row counts intact.
+                    //
+                    // Safe to delete precisely here: this branch has already established
+                    // maxDeltaStart() == 0, so every surviving frame re-registers its
+                    // whole dictionary from id 0 and needs nothing from the file, and
+                    // this session runs full-dict so it will not write one that does.
+                    // Mirrors the AckWatermark.removeOrphan in the fresh-start branch
+                    // below, which clears its own stale artifact for the same reason.
+                    if (!PersistedSymbolDict.removeOrphan(dictFf, sfDir)) {
+                        LOG.error("sf slot {}: discarded the recovered symbol dictionary but could NOT "
+                                        + "remove the side-file; recovery continues in full-dictionary "
+                                        + "mode, but remove it by hand -- a later recovery whose frames "
+                                        + "reference fewer ids than it holds will seed symbols from it",
+                                sfDir);
+                    }
                     // Re-fold at baseline 0. The analysis above was keyed to the
                     // dictionary's size, and every consumer of it presents the baseline it
                     // derived the same way -- seedGlobalDictionaryFromPersisted computes

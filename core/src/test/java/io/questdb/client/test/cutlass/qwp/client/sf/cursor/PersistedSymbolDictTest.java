@@ -922,14 +922,23 @@ public class PersistedSymbolDictTest {
     }
 
     @Test
-    public void testOpenCleanRefusesWhenAnExistingFileCannotBeTruncated() throws Exception {
-        // openFresh returning null WITHOUT truncating leaves a previous generation's
-        // dictionary on disk while this session runs full-dict from id 0. The next
-        // recovery reads a side-file whose ids describe a different id space from the
-        // surviving frames, and no existing guard can tell: no gap, valid CRC, both
-        // bounds checks pass, and the catch-up registers the wrong strings.
+    public void testOpenCleanRemovesAnExistingFileItCannotTruncate() throws Exception {
+        // The invariant: openClean must never hand back a usable state while a
+        // previous generation's dictionary is still on disk -- this session writes
+        // rows from id 0, and the next recovery cannot tell the two id spaces apart
+        // (no gap, valid CRC, both bounds checks pass, and the catch-up registers the
+        // wrong strings). UNLINKING the survivor satisfies that just as well as
+        // truncating it, and unlink needs no descriptor, so it succeeds in exactly the
+        // fd-exhaustion transients that fail the truncate.
+        //
+        // Refusing instead was actively harmful here: openFresh runs only on the FRESH
+        // path (no recovered segments), so quarantineTornSlot renamed aside a slot
+        // holding no data at all, dropped a .failed sentinel nothing clears, and paged
+        // the caller with a DATA_LOSS "the affected data must be resent" for data that
+        // never existed -- burning one of the 64 quarantine indices each time, after
+        // which build() fails permanently.
         assertMemoryLeak(() -> {
-            Path dir = newFolder("qwp-symdict-clean-refuse");
+            Path dir = newFolder("qwp-symdict-clean-remove");
             try (PersistedSymbolDict first = PersistedSymbolDict.openClean(dir.toString())) {
                 first.appendSymbol("a");
                 first.appendSymbol("b");
@@ -940,26 +949,61 @@ public class PersistedSymbolDictTest {
                     return -1;
                 }
             };
-            try {
-                PersistedSymbolDict.openClean(ff, dir.toString());
-                Assert.fail("expected openClean to refuse rather than leave a stale dictionary");
-            } catch (LineSenderException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be truncated"));
-            }
-            // Refusing is not deleting: the bytes stay for an operator.
-            Assert.assertTrue(Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
+            Assert.assertNull("a removable survivor must degrade to null, not refuse the slot",
+                    PersistedSymbolDict.openClean(ff, dir.toString()));
+            Assert.assertFalse("the stale survivor must be gone, or the next recovery would trust it",
+                    Files.exists(dir.resolve(PersistedSymbolDict.FILE_NAME)));
         });
     }
 
     @Test
-    public void testOpenCleanRefusesWhenTheSurvivorProbeCannotDetermineExistence() throws Exception {
-        // openFresh's refuse-vs-degrade decision used to ride on an errno-blind
+    public void testOpenCleanRefusesWhenTheSurvivorCanBeNeitherTruncatedNorRemoved() throws Exception {
+        // The residual case the refusal is genuinely for. Truncation failed AND the
+        // unlink failed, so this process cannot prove the survivor is gone -- degrading
+        // would run a fresh id space next to a prior generation's dictionary. Refuse,
+        // and leave the bytes for an operator.
+        assertMemoryLeak(() -> {
+            Path dir = newFolder("qwp-symdict-clean-stuck");
+            try (PersistedSymbolDict first = PersistedSymbolDict.openClean(dir.toString())) {
+                first.appendSymbol("a");
+                first.appendSymbol("b");
+            }
+            Path f = dir.resolve(PersistedSymbolDict.FILE_NAME);
+            byte[] before = Files.readAllBytes(f);
+            DelegatingFilesFacade stuck = new DelegatingFilesFacade() {
+                @Override
+                public int openCleanRW(String path) {
+                    return -1;
+                }
+
+                @Override
+                public boolean remove(String path) {
+                    return false;
+                }
+            };
+            try {
+                PersistedSymbolDict.openClean(stuck, dir.toString());
+                Assert.fail("expected openClean to refuse rather than leave a stale dictionary");
+            } catch (LineSenderException e) {
+                Assert.assertTrue(e.getMessage(),
+                        e.getMessage().contains("cannot be truncated or removed"));
+            }
+            // Refusing is not deleting: the bytes stay for an operator.
+            Assert.assertArrayEquals("a refused slot must leave the survivor untouched",
+                    before, Files.readAllBytes(f));
+        });
+    }
+
+    @Test
+    public void testOpenCleanClearsTheSurvivorWhenItsExistenceCannotBeDetermined() throws Exception {
+        // openFresh's protect-vs-degrade decision used to ride on an errno-blind
         // ff.exists(): access(2) has no error channel, so a transient stat
         // error there read as "absent" and the session proceeded full-dict from
         // id 0 NEXT TO a populated prior-generation side-file -- the
         // misattribution shape openFresh's own javadoc forbids. When the create
         // fails AND the probe cannot PROVE the path absent (any errno but a
-        // not-found), the slot must be refused, never degraded to null.
+        // not-found), the path must be cleared before degrading -- never degraded
+        // to null alongside a survivor that may still be there.
         assertMemoryLeak(() -> {
             Path dir = newFolder("qwp-symdict-clean-ambiguous-probe");
             try (PersistedSymbolDict first = PersistedSymbolDict.openClean(dir.toString())) {
@@ -998,14 +1042,17 @@ public class PersistedSymbolDictTest {
                     return -1;
                 }
             };
-            try {
-                PersistedSymbolDict.openClean(ambiguous, dir.toString());
-                Assert.fail("an undeterminable survivor state must refuse the slot, never degrade to null");
-            } catch (UnreplayableSlotException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be truncated"));
-            }
-            Assert.assertArrayEquals("refusing is not deleting: the survivor stays for an operator",
-                    before, Files.readAllBytes(f));
+            // The blind-degrade arm returns null with the survivor STILL THERE. The
+            // protective arm clears the path first and only then degrades. Both return
+            // null, so the file -- not the return value -- is what discriminates them:
+            // asserting it is gone is what reddens this test if the errno-blind
+            // exists() is ever trusted again.
+            Assert.assertNull(PersistedSymbolDict.openClean(ambiguous, dir.toString()));
+            Assert.assertFalse("an undeterminable survivor state must clear the path before degrading, "
+                            + "never degrade next to a possibly-populated side-file",
+                    Files.exists(f));
+            Assert.assertTrue("sanity: the survivor really was populated before the call",
+                    before.length > 0);
         });
     }
 

@@ -413,21 +413,31 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Best-effort removal of a stale dictionary file. Used at fully-drained close
-     * (the slot is empty, nothing references the dictionary any more), mirroring
-     * {@link AckWatermark#removeOrphan}. The fresh-start path deliberately does NOT
-     * use this -- it opens a clean dictionary via {@link #openClean} instead, so a
-     * failed delete cannot leave a stale dictionary a new session would trust.
+     * Removal of a stale dictionary file, mirroring {@link AckWatermark#removeOrphan}.
+     * Used at fully-drained close (the slot is empty, nothing references the dictionary
+     * any more), and by recovery whenever it decides to run a slot in FULL-DICT mode
+     * next to a side-file it is not going to use -- see the callers in
+     * {@code CursorSendEngine}'s constructor. Leaving the file behind in that second
+     * case is what lets a LATER recovery, one whose frames reference fewer ids than the
+     * survivor holds, seed the producer from a previous generation's strings.
+     * <p>
+     * The fresh-start path deliberately does NOT use this -- it opens a clean dictionary
+     * via {@link #openClean} instead, so a failed delete cannot leave a stale dictionary
+     * a new session would trust.
+     *
+     * @return {@code true} when the file is gone afterwards
      */
-    public static void removeOrphan(String slotDir) {
-        removeOrphan(FilesFacade.INSTANCE, slotDir);
+    public static boolean removeOrphan(String slotDir) {
+        return removeOrphan(FilesFacade.INSTANCE, slotDir);
     }
 
     /**
      * Facade-aware variant of {@link #removeOrphan(String)}.
+     *
+     * @return {@code true} when the file is gone afterwards
      */
-    public static void removeOrphan(FilesFacade ff, String slotDir) {
-        ff.remove(slotDir + "/" + FILE_NAME);
+    public static boolean removeOrphan(FilesFacade ff, String slotDir) {
+        return ff.remove(slotDir + "/" + FILE_NAME);
     }
 
     /**
@@ -1103,6 +1113,22 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
+     * True when {@code path} names a directory. {@code findFirst} opens it as one
+     * ({@code opendir} / {@code FindFirstFileW}) and yields a positive handle;
+     * anything else -- a regular file, an absent path, an unreadable one -- comes back
+     * as {@code -1}. Used only on the fresh-slot error path, to keep the survivor
+     * unlink from rmdir'ing a directory that happens to occupy the dictionary's name.
+     */
+    private static boolean isDirectory(FilesFacade ff, String path) {
+        long findPtr = ff.findFirst(path);
+        if (findPtr > 0) {
+            ff.findClose(findPtr);
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * Opens {@code filePath} as a FRESH, EMPTY dictionary file, discarding any
      * surviving content. Serves only the fresh-slot path ({@link #openClean}) --
      * after the disposition split in {@link #open}, the recovery path never
@@ -1136,17 +1162,48 @@ public final class PersistedSymbolDict implements QuietCloseable {
                 // writes rows against a fresh id space from 0, and the next recovery
                 // cannot distinguish the two: the ids overlap, the CRC is valid, and the
                 // catch-up registers the wrong strings under ids this generation's rows
-                // reference. Refuse the slot; the bytes stay on disk for an operator.
-                // Same verdict when the probe itself failed with anything but a
-                // not-found: a survivor MAY be there, and degrading next to it
-                // would hand the next recovery a side-file this session's rows
-                // never described. Typed as UnreplayableSlotException (rather
-                // than a plain LineSenderException) so Sender.build()'s
-                // constructor-time catch quarantines this fresh, dataless slot
-                // instead of bricking every restart under a stable senderId.
+                // reference.
+                //
+                // But UNLINKING the survivor satisfies that requirement just as well as
+                // truncating it, and unlink needs no descriptor -- so try it before
+                // refusing. openCleanRW returning < 0 says only that this process could
+                // not OPEN the file; it says nothing about whether the file can be
+                // removed. An fd-exhaustion transient (EMFILE/ENFILE) under a large
+                // sender pool, or a Windows scanner holding a handle without
+                // FILE_SHARE_WRITE, fails the truncate while the unlink still succeeds.
+                // Removing is safe HERE precisely because this is the FRESH path: the
+                // slot has no recovered segments, nothing is ever seeded from this file,
+                // and the only property that matters is that no prior generation's id
+                // space survives next to the rows this session is about to write from 0.
+                //
+                // Without this, a transient quarantined a slot holding NO recoverable
+                // frames at all: quarantineTornSlot renames it aside, drops a .failed
+                // sentinel nothing ever clears, and dispatches a DATA_LOSS "the affected
+                // data must be resent" to the caller's error handler -- for data that
+                // never existed. Each recurrence also burns one of the 64 quarantine
+                // indices, after which quarantineTornSlot throws and build() fails
+                // permanently until an operator intervenes.
+                // A regular file ONLY. A directory at this path is not a stale
+                // dictionary -- it is a structural blocker (a misconfiguration, an
+                // operator artifact, possibly holding files of its own) that no retry
+                // ever clears, and FilesFacade.remove would happily rmdir it: the
+                // native is remove(3) on POSIX and an explicit RemoveDirectoryW on
+                // Windows. That case keeps the refusal it always had.
+                if (!isDirectory(ff, filePath) && ff.remove(filePath)) {
+                    LOG.warn("symbol dict {} could not be opened for truncation (rc={}); removed the "
+                            + "stale survivor instead and proceeding without a dictionary", filePath, fd);
+                    return null;
+                }
+                // Neither truncatable nor removable, or its very existence is
+                // unprovable: a survivor MAY be there, and degrading next to it would
+                // hand the next recovery a side-file this session's rows never
+                // described. Typed as UnreplayableSlotException (rather than a plain
+                // LineSenderException) so Sender.build()'s constructor-time catch
+                // quarantines this fresh, dataless slot instead of bricking every
+                // restart under a stable senderId.
                 throw new UnreplayableSlotException("symbol dict ").put(filePath)
-                        .put(" already exists (or its state cannot be determined) and cannot be")
-                        .put(" truncated (rc=").put(fd)
+                        .put(" already exists (or its state cannot be determined) and")
+                        .put(" cannot be truncated or removed (rc=").put(fd)
                         .put("); refusing to start on a slot whose dictionary may describe a")
                         .put(" different id space -- move or remove it by hand");
             }
