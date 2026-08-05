@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLockContentionException;
 import io.questdb.client.std.Files;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -108,6 +109,32 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testLogicalLockRemainsContendedAcrossSlotRenameAndRecreate() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Use the platform-native separator. In particular, this exercises
+            // acquireLogical with a backslash-only path on Windows.
+            String slot = Paths.get(parentDir, "rename").toString();
+            String moved = Paths.get(parentDir, "rename.quarantined").toString();
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+
+            try (SlotLock ignored = SlotLock.acquireLogical(slot)) {
+                assertEquals(0, Files.rename(slot, moved));
+                assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+
+                try (SlotLock unexpected = SlotLock.acquireLogical(slot)) {
+                    fail("logical slot lock must survive rename and recreate");
+                } catch (IllegalStateException expected) {
+                    assertTrue(expected.getMessage().contains("already in use"));
+                }
+            }
+
+            try (SlotLock reacquired = SlotLock.acquireLogical(slot)) {
+                assertEquals(slot, reacquired.slotDir());
+            }
+        });
+    }
+
+    @Test
     public void testReleaseConfirmsAndIsIdempotent() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/verified-release";
@@ -123,6 +150,55 @@ public class SlotLockTest {
             try (SlotLock again = SlotLock.acquire(slot)) {
                 assertEquals(slot, again.slotDir());
             }
+        });
+    }
+
+    @Test
+    public void testLogicalLockRejectsInvalidPaths() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            assertLogicalPathRejected(null, "slotDir must not be empty");
+            assertLogicalPathRejected("", "slotDir must not be empty");
+            assertLogicalPathRejected("slot",
+                    "slotDir must contain a parent and slot name: slot");
+        });
+    }
+
+    @Test
+    public void testLockDirectoryIsCreatedWithDefaultMode() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/mode-check";
+            String lockDir = parentDir + "/.slot-locks";
+            RecordingMkdirFacade ff = new RecordingMkdirFacade();
+            try (SlotLock ignored = SlotLock.acquireLogical(ff, slot)) {
+                assertEquals("the lock dir must be created with the default restrictive mode",
+                        Files.DIR_MODE_DEFAULT, ff.modeFor(lockDir));
+            }
+        });
+    }
+
+    @Test
+    public void testLogicalLockReportsLockDirectoryCreationFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/mkdir-failure";
+            // Build the lock-dir path exactly as SlotLock.acquireLogical does
+            // (parent + "/" + ".slot-locks"), NOT via Paths.get: on Windows
+            // Paths.get yields a '\' separator, so the facade's lockDir.equals(path)
+            // check never matched the production forward-slash path and the mkdir
+            // failure was never injected -- the sole cause of the Windows-only
+            // failure of this test.
+            String lockDir = parentDir + "/.slot-locks";
+            LockDirectoryFailureFacade ff = new LockDirectoryFailureFacade(lockDir);
+            try {
+                SlotLock.acquireLogical(ff, slot);
+                fail("expected logical lock directory creation failure");
+            } catch (IllegalStateException expected) {
+                assertEquals("could not create logical slot lock dir: " + lockDir + " rc=-1",
+                        expected.getMessage());
+            }
+            assertEquals("lock file must not be opened after directory creation fails",
+                    0, ff.openRwCalls);
+            assertFalse("failed mkdir must not leave the lock directory behind",
+                    Files.exists(lockDir));
         });
     }
 
@@ -171,6 +247,27 @@ public class SlotLockTest {
     }
 
     @Test
+    public void testRemoveOrphanLogicalDeletesLockAndPidFiles() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/alpha";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            // acquireLogical anchors the lock under the shared parent .slot-locks dir.
+            String lockFile = parentDir + "/.slot-locks/alpha.lock";
+            String pidFile = parentDir + "/.slot-locks/alpha.lock.pid";
+            try (SlotLock ignored = SlotLock.acquireLogical(slot)) {
+                assertTrue("logical .lock created", Files.exists(lockFile));
+                assertTrue("logical .lock.pid created", Files.exists(pidFile));
+            }
+            // close() releases the flock but deliberately keeps the file (it must
+            // outlast a slot rename); only the fully-drained retirement reclaims it.
+            assertTrue("logical .lock survives close", Files.exists(lockFile));
+            SlotLock.removeOrphanLogical(slot);
+            assertFalse("logical .lock removed on retirement", Files.exists(lockFile));
+            assertFalse("logical .lock.pid removed on retirement", Files.exists(pidFile));
+        });
+    }
+
+    @Test
     public void testFailedCloseRetainsRetryOwnerWithEquivalentPathAlias() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String slot = parentDir + "/failed-close-alias";
@@ -198,6 +295,85 @@ public class SlotLockTest {
                 releaseFailure.close();
                 lock.release();
             }
+        });
+    }
+
+    @Test
+    public void testRemoveOrphanLogicalLeavesAHeldLockFileIntact() throws Exception {
+        // removeOrphanLogical must NEVER unlink a lock file another party still holds.
+        // Sender.build() holds the logical lock across its construct -> connect ->
+        // quarantine transition, and a connect failure closes the engine from inside that
+        // scope -- reaching this cleanup while build() is still holding the lock one frame
+        // up. Unlinking it there frees the pathname without releasing the flock, so the
+        // next acquireLogical creates a SECOND inode and locks it: two owners of a lock
+        // whose only job is mutual exclusion. flock is per open-file-description, so a
+        // second open+lock contends even within one process -- which is exactly what makes
+        // the acquire-before-unlink guard observable here.
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/beta";
+            assertEquals(0, Files.mkdir(slot, Files.DIR_MODE_DEFAULT));
+            String lockFile = parentDir + "/.slot-locks/beta.lock";
+            String pidFile = parentDir + "/.slot-locks/beta.lock.pid";
+            try (SlotLock held = SlotLock.acquireLogical(slot)) {
+                assertTrue("logical .lock created", Files.exists(lockFile));
+
+                // Cleanup fires while `held` still owns the lock. It must find the lock
+                // contended and leave BOTH files on disk.
+                SlotLock.removeOrphanLogical(slot);
+                assertTrue("a held logical .lock must survive removeOrphanLogical",
+                        Files.exists(lockFile));
+                assertTrue("a held logical .lock.pid must survive removeOrphanLogical",
+                        Files.exists(pidFile));
+
+                // And the holder must still be the sole owner: a fresh acquire contends.
+                try {
+                    SlotLock.acquireLogical(slot).close();
+                    fail("a second acquireLogical must contend while the first is held");
+                } catch (IllegalStateException expected) {
+                    assertTrue(expected.getMessage(), expected.getMessage().contains("already in use"));
+                }
+            }
+            // Once released, retirement reclaims the files as before -- no leak of the
+            // dead lock+pid pair.
+            SlotLock.removeOrphanLogical(slot);
+            assertFalse("logical .lock reclaimed after release", Files.exists(lockFile));
+            assertFalse("logical .lock.pid reclaimed after release", Files.exists(pidFile));
+        });
+    }
+
+    @Test
+    public void testRemoveOrphanLogicalIsSilentNoOpWhenAbsentOrInvalid() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Never-locked slot: nothing to remove, must not throw.
+            SlotLock.removeOrphanLogical(parentDir + "/never-locked");
+            // Unlike acquireLogical (which throws on these), the retirement cleanup
+            // is best-effort and tolerates unusable input silently.
+            SlotLock.removeOrphanLogical(null);
+            SlotLock.removeOrphanLogical("");
+            SlotLock.removeOrphanLogical("slot"); // no parent component
+        });
+    }
+
+    @Test
+    public void testRemoveOrphanLogicalUnlinksPidSidecarBeforeLockFile() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slot = parentDir + "/unlink-order";
+            // Create the lock pair, then release so removal is uncontended.
+            SlotLock.acquireLogical(slot).close();
+            java.util.List<String> removed = new java.util.ArrayList<>();
+            DelegatingFilesFacade recording = new DelegatingFilesFacade() {
+                @Override
+                public boolean remove(String path) {
+                    removed.add(path);
+                    return super.remove(path);
+                }
+            };
+            SlotLock.removeOrphanLogical(recording, slot);
+            assertEquals("both lock files must be removed", 2, removed.size());
+            assertTrue("pid sidecar must be unlinked first, got: " + removed,
+                    removed.get(0).endsWith(".lock.pid"));
+            assertTrue("lock file must be unlinked second, got: " + removed,
+                    removed.get(1).endsWith(".lock"));
         });
     }
 
@@ -301,11 +477,63 @@ public class SlotLockTest {
         Files.remove(dir);
     }
 
+    private static void assertLogicalPathRejected(String slotDir, String expectedMessage) {
+        Throwable thrown = null;
+        try {
+            SlotLock.acquireLogical(slotDir);
+        } catch (Throwable t) {
+            thrown = t;
+        }
+        assertTrue("expected IllegalArgumentException", thrown instanceof IllegalArgumentException);
+        assertEquals(expectedMessage, thrown.getMessage());
+    }
+
     private static boolean isDir(String path) {
         // Cheap heuristic: directories have a readable findFirst handle.
         long find = Files.findFirst(path);
         if (find <= 0) return false;
         Files.findClose(find);
         return true;
+    }
+
+    /** Records the mode each directory was created with, then delegates. */
+    private static final class RecordingMkdirFacade extends DelegatingFilesFacade {
+        private final java.util.Map<String, Integer> modes = new java.util.HashMap<>();
+
+        int modeFor(String path) {
+            Integer mode = modes.get(path);
+            return mode == null ? -1 : mode;
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            modes.put(path, mode);
+            return super.mkdir(path, mode);
+        }
+    }
+
+    private static final class LockDirectoryFailureFacade extends DelegatingFilesFacade {
+        private final String lockDir;
+        private int openRwCalls;
+
+        private LockDirectoryFailureFacade(String lockDir) {
+            this.lockDir = lockDir;
+        }
+
+        @Override
+        public boolean exists(String path) {
+            return !lockDir.equals(path) && super.exists(path);
+        }
+
+        @Override
+        public int mkdir(String path, int mode) {
+            return lockDir.equals(path) ? -1 : super.mkdir(path, mode);
+        }
+
+        @Override
+        public int openRW(String path) {
+            openRwCalls++;
+            return super.openRW(path);
+        }
     }
 }

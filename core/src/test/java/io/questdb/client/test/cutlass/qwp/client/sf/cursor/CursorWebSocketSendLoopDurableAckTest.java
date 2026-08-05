@@ -668,7 +668,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                5_000L, 100L, 5_000L, false);
+                100L, 5_000L, false);
     }
 
     private CursorWebSocketSendLoop newDurableLoop(CursorSendEngine engine) {
@@ -677,7 +677,7 @@ public class CursorWebSocketSendLoopDurableAckTest {
                 () -> {
                     throw new UnsupportedOperationException("test loop is never started");
                 },
-                5_000L, 100L, 5_000L, true);
+                100L, 5_000L, true);
     }
 
     private static int pendingSize(CursorWebSocketSendLoop loop) throws Exception {

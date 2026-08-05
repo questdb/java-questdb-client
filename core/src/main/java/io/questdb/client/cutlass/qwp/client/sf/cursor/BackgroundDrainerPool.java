@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.QuietCloseable;
@@ -101,6 +102,7 @@ public final class BackgroundDrainerPool implements QuietCloseable {
      * drainer in the finally block of {@link #submit}.
      */
     private final AtomicLong totalSucceeded = new AtomicLong();
+    private volatile SenderErrorHandler errorSink;
     /**
      * Pool-level listener applied to drainers at submit time when the
      * drainer doesn't already carry one. Volatile so callers can install
@@ -226,6 +228,10 @@ public final class BackgroundDrainerPool implements QuietCloseable {
         return totalSucceeded.get();
     }
 
+    public void setErrorSink(SenderErrorHandler errorSink) {
+        this.errorSink = errorSink;
+    }
+
     /**
      * Plug a default {@link BackgroundDrainerListener} for drainers
      * submitted through this pool. {@code null} clears the default.
@@ -277,6 +283,10 @@ public final class BackgroundDrainerPool implements QuietCloseable {
         BackgroundDrainerListener poolListener = listener;
         if (poolListener != null && drainer.getListener() == null) {
             drainer.setListener(poolListener);
+        }
+        SenderErrorHandler poolErrorSink = errorSink;
+        if (poolErrorSink != null && drainer.getErrorSink() == null) {
+            drainer.setErrorSink(poolErrorSink);
         }
         boolean accepted = false;
         try {

@@ -47,8 +47,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>
  * On-disk layout — header and frame format:
  * <pre>
- *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags=0] [u16 reserved=0]
- *   [u64 baseSeq]       [u64 createdMicros]                       24-byte header
+ *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags]   [u16 reserved=0]
+ *   [u64 baseSeq]      [u64 createdMicros]                        24-byte header
  *   frame, frame, ...                                              each frame:
  *                                                                  [u32 crc32c]
  *                                                                  [u32 payloadLen]
@@ -182,7 +182,8 @@ public final class MmapSegment implements QuietCloseable {
         return create(ff, path, baseSeq, sizeBytes, false);
     }
 
-    static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes, boolean manifestRequired) {
+    static MmapSegment create(FilesFacade ff, String path, long baseSeq, long sizeBytes,
+                              boolean manifestRequired) {
         long pathPtr = ff.allocNativePath(path);
         try {
             return create(ff, pathPtr, path, baseSeq, sizeBytes, manifestRequired);
@@ -199,11 +200,13 @@ public final class MmapSegment implements QuietCloseable {
      * {@code DirectUtf8Sink} by the rotation hot path so it does not incur a
      * per-call {@code byte[]} + native-malloc the way the String overload does.
      */
-    public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes) {
+    public static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq,
+                                     long sizeBytes) {
         return create(ff, pathPtr, displayPath, baseSeq, sizeBytes, false);
     }
 
-    static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes, boolean manifestRequired) {
+    static MmapSegment create(FilesFacade ff, long pathPtr, String displayPath, long baseSeq, long sizeBytes,
+                              boolean manifestRequired) {
         if (sizeBytes < HEADER_SIZE + FRAME_HEADER_SIZE + 1) {
             throw new IllegalArgumentException(
                     "sizeBytes too small for header + one minimal frame: " + sizeBytes);
@@ -239,7 +242,8 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, false, 0L);
+            return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq,
+                    HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
             if (addr != Files.FAILED_MMAP_ADDRESS) {
                 ff.munmap(addr, sizeBytes, MemoryTag.MMAP_DEFAULT);
@@ -276,11 +280,57 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
             Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
-            return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq, HEADER_SIZE, 0, true, 0L);
+            return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq,
+                    HEADER_SIZE, 0, true, 0L);
         } catch (Throwable t) {
             Unsafe.free(addr, sizeBytes, MemoryTag.NATIVE_DEFAULT);
             throw t;
         }
+    }
+
+    /**
+     * True when {@code t} is the JVM's recoverable signal for a fault while
+     * accessing a memory-mapped region -- a SIGBUS/SIGSEGV that HotSpot
+     * translates into an {@code InternalError} at an {@code Unsafe} intrinsic
+     * site instead of aborting the process. It surfaces when a mapped page is
+     * not backed by real file blocks: a sparse {@code .sfa} tail on a
+     * filesystem whose pre-allocation leaves holes (e.g. ZFS, where a
+     * truncate-based {@code allocate} does not materialize blocks), or a file
+     * truncated under the mapping. Recovery treats this as an I/O boundary --
+     * the same way MappedByteBuffer readers do -- not a fatal VM error.
+     * <p>
+     * The message is matched on the fragment {@code "unsafe memory access
+     * operation"}, which is common to both HotSpot wordings and NOT
+     * version-stable as a whole: pre-21 JDKs (including the shipping/CI JDK 8)
+     * emit {@code "a fault occurred in a recent unsafe memory access operation
+     * in compiled Java code"}, while JDK 21+ shortened it to {@code "a fault
+     * occurred in an unsafe memory access operation"}. Matching the shared
+     * fragment keeps the guard effective on JDK 8/11/17 as well as 21+, while
+     * still being specific enough that a genuine VirtualMachineError (real OOM,
+     * StackOverflow) is never swallowed.
+     * <p>
+     * <b>Delivery is NOT precise before JDK 21, so callers must guard too.</b>
+     * Pre-21 HotSpot records the fault and raises the {@code InternalError} at
+     * the next return or safepoint check rather than at the faulting
+     * instruction, so it can surface in a CALLER's frame, past the handler that
+     * wraps the faulting read. JDK-8283699 made delivery precise in 21+.
+     * <p>
+     * Segment recovery no longer needs this predicate: {@link #openExisting}
+     * scans through positioned reads into a heap-free bounded buffer and only
+     * maps the file once the scan has validated it, so a sparse or unbacked
+     * page surfaces as an ordinary read failure rather than a SIGBUS. It stays
+     * public for the mappings that ARE still folded over
+     * {@code Crc32c.updateUnsafe}: {@code PersistedSymbolDict}'s append and
+     * heal paths, whose handlers in {@code QwpWebSocketSender} apply this
+     * exemption ahead of their own {@code Error} rethrow so a recognised fault
+     * degrades the sender instead of escaping as a raw {@code InternalError}.
+     */
+    public static boolean isMmapAccessFault(Throwable t) {
+        if (!(t instanceof InternalError)) {
+            return false;
+        }
+        String msg = t.getMessage();
+        return msg != null && msg.contains("unsafe memory access operation");
     }
 
     /**
@@ -679,44 +729,17 @@ public final class MmapSegment implements QuietCloseable {
     }
 
     /**
-     * Walks every published frame in this segment and returns the FSN of the
-     * LAST frame whose payload does NOT carry the given flag bit, or {@code -1}
-     * when every frame carries it (or the segment is empty).
-     * <p>
-     * A frame counts as carrying the flag ONLY when it positively parses as a
-     * message of the expected protocol: payload at least {@code minPayloadLen}
-     * bytes AND the little-endian u32 at payload offset 0 equals
-     * {@code headerMagic} AND the byte at {@code flagsOffset} has
-     * {@code flagMask} set. Anything else -- short frames, foreign payloads,
-     * magic mismatches -- counts as NOT carrying the flag. This direction is
-     * deliberate: the caller retires (trims) frames ABOVE the returned FSN,
-     * so a frame we cannot positively identify must act as a retirement
-     * barrier, never as trimmable. Misclassifying an unknown frame as
-     * deferred would silently discard data that should replay.
-     * <p>
-     * Producer-thread only, and only meaningful before new appends race the
-     * walk (recovery time). Used to locate the last commit-bearing QWP frame
-     * below a potentially orphaned FLAG_DEFER_COMMIT tail: frames above the
-     * returned FSN all carry the flag, i.e. they belong to a transaction whose
-     * commit frame was never published.
+     * Feeds every recovered frame in this segment to the engine's single-pass
+     * recovery fold. Segments are visited oldest-first by {@link SegmentRing}.
      */
-    public long findLastFrameFsnWithoutPayloadFlag(int flagsOffset, int flagMask, int headerMagic, int minPayloadLen) {
-        long best = -1L;
+    void scanRecovery(RecoveredFrameAnalysis analysis) {
         long off = HEADER_SIZE;
         long frames = frameCount;
         for (long i = 0; i < frames; i++) {
             int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + off + 4);
-            long payload = mmapAddress + off + FRAME_HEADER_SIZE;
-            boolean flagSet = payloadLen >= minPayloadLen
-                    && payloadLen > flagsOffset
-                    && Unsafe.getUnsafe().getInt(payload) == headerMagic
-                    && (Unsafe.getUnsafe().getByte(payload + flagsOffset) & flagMask) != 0;
-            if (!flagSet) {
-                best = baseSeq + i;
-            }
+            analysis.accept(baseSeq + i, mmapAddress + off + FRAME_HEADER_SIZE, payloadLen);
             off += FRAME_HEADER_SIZE + payloadLen;
         }
-        return best;
     }
 
     /**

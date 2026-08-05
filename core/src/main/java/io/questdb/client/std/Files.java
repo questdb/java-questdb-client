@@ -99,6 +99,14 @@ public final class Files {
      */
     public static final long FAILED_MMAP_ADDRESS = -1L;
 
+    // Error codes consumed by isNotFoundError(): the POSIX errno and the two
+    // Windows GetLastError() values that prove a path does not exist. ENOENT
+    // is 2 on every platform the native library ships for (Linux, macOS,
+    // FreeBSD); the Windows pair matches what Rust maps to ErrorKind::NotFound.
+    private static final int ENOENT = 2;
+    private static final int ERROR_FILE_NOT_FOUND = 2;
+    private static final int ERROR_PATH_NOT_FOUND = 3;
+
     private Files() {
     }
 
@@ -234,6 +242,24 @@ public final class Files {
      */
     public static long length(long pathPtr) {
         return length0(pathPtr);
+    }
+
+    /**
+     * Whether {@code errno} -- as reported by {@link Os#errno()} immediately
+     * after a failed path-based filesystem call such as {@link #length(String)}
+     * -- PROVES the path did not exist: {@code ENOENT} on POSIX,
+     * {@code ERROR_FILE_NOT_FOUND} / {@code ERROR_PATH_NOT_FOUND} on Windows
+     * (the same codes Rust's {@code io::ErrorKind::NotFound} maps). Any other
+     * code means the call itself failed -- an EIO on a flaky disk, a permission
+     * fault -- and the path's existence is UNKNOWN; callers deciding between an
+     * "absent" and an "error" disposition must treat it as the latter, never as
+     * absence.
+     */
+    public static boolean isNotFoundError(int errno) {
+        if (Os.type == Os.WINDOWS) {
+            return errno == ERROR_FILE_NOT_FOUND || errno == ERROR_PATH_NOT_FOUND;
+        }
+        return errno == ENOENT;
     }
 
     /**

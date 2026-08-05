@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfSanitizedResidueException;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.MemoryTag;
@@ -45,6 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -748,19 +750,32 @@ public class SegmentRingTest {
         });
     }
 
+    /**
+     * A bad-magic stray file beside a chain BASED AT ZERO is provably not that
+     * chain's missing head -- nothing can precede baseSeq 0 -- so recovery
+     * quarantines the stray to {@code .corrupt} and recovers the good segment.
+     * The bytes are preserved for a postmortem either way; what recovery must
+     * never do is treat the stray as absent and leave no evidence.
+     * <p>
+     * Contrast {@link #testOpenExistingRefusesSlotWhenOldestSegmentIsUnreadable}:
+     * there the survivors start above zero, so a corrupt file of unknown
+     * identity COULD be the head and recovery fails closed instead.
+     */
     @Test
-    public void testOpenExistingSkipsBadMagicFile() throws Exception {
+    public void testStrayBadMagicFileIsQuarantinedAndTheChainRecovers() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long segSize = MmapSegment.HEADER_SIZE
                     + (MmapSegment.FRAME_HEADER_SIZE + 16);
             long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
             try {
                 // One good segment.
-                MmapSegment s0 = MmapSegment.create(tmpDir + "/good.sfa", 0, segSize);
+                String goodPath = tmpDir + "/good.sfa";
+                MmapSegment s0 = MmapSegment.create(goodPath, 0, segSize);
                 s0.tryAppend(buf, 16);
                 s0.close();
-                // One stray .sfa with no proper header — must be ignored.
-                int fd = Files.openCleanRW(tmpDir + "/stray.sfa");
+                // One stray .sfa with no proper header.
+                String strayPath = tmpDir + "/stray.sfa";
+                int fd = Files.openCleanRW(strayPath);
                 long hdr = Unsafe.malloc(8, MemoryTag.NATIVE_DEFAULT);
                 try {
                     Unsafe.getUnsafe().putLong(hdr, 0xBADBADBADBADBADBL);
@@ -771,13 +786,311 @@ public class SegmentRingTest {
                     Unsafe.free(hdr, 8, MemoryTag.NATIVE_DEFAULT);
                 }
 
-                try (SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize)) {
-                    assertNotNull(recovered);
-                    assertEquals(0, recovered.getActive().baseSeq());
-                    assertEquals(0, recovered.getSealedSegments().size());
+                SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize);
+                assertNotNull("a chain based at 0 must recover around a stray", recovered);
+                try {
+                    assertEquals("the good segment's frame must be recovered",
+                            0L, recovered.publishedFsn());
+                } finally {
+                    recovered.close();
                 }
+                assertFalse("the unreadable stray file must be renamed aside", Files.exists(strayPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(strayPath + ".corrupt"));
+                assertTrue("the good segment must be untouched", Files.exists(goodPath));
             } finally {
                 Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Skipped OLDEST segment: {@code firstSealed()} would normally return the
+     * second-oldest survivor, and {@code CursorSendEngine} seeds
+     * {@code ackedFsn = lowestBase - 1} on the premise "anything trimmed off the
+     * ring's bottom must have been acked, because trim is ack-driven". A
+     * segment can leave the bottom because of a read fault instead of an ACK,
+     * so that premise is false -- recovery must refuse rather than hand back a
+     * ring whose sealed list quietly starts one segment higher than what
+     * really produced acked data.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenOldestSegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String oldestPath = tmpDir + "/skip-oldest-0.sfa";
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/skip-oldest-1.sfa", 4, segSize);
+                for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+                s1.close();
+
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-oldest-2.sfa", 8, segSize);
+                s2.tryAppend(buf, 16);
+                s2.close();
+
+                corruptMagic(oldestPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError(
+                            "expected recovery to refuse rather than silently drop the oldest segment");
+                } catch (SfRecoveryException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("could be its head"));
+                }
+                // Fail-closed: the chain never validated, so the deferred quarantine
+                // never ran. Every byte stays where it was, under its own name, for
+                // an operator to extract.
+                assertTrue("a failed recovery must not mutate the slot",
+                        Files.exists(oldestPath));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Corrupt NEWEST segment, chain based at zero. The corrupt file is quarantined
+     * to {@code .corrupt} -- which is what closes the FSN-reuse hazard this test
+     * was written for: once it leaves the {@code .sfa} namespace, a later recovery
+     * cannot sort it onto a baseSeq the resumed producer has since re-issued, and
+     * the manifest this recovery writes records the surviving chain's
+     * {@code activeBase} as the boundary. The survivors replay.
+     */
+    @Test
+    public void testCorruptNewestSegmentIsQuarantinedAndSurvivorsRecover() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-newest-0.sfa", 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String newestPath = tmpDir + "/skip-newest-1.sfa";
+                MmapSegment s1 = MmapSegment.create(newestPath, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptMagic(newestPath);
+
+                SegmentRing recovered = SegmentRing.openExisting(tmpDir, segSize);
+                assertNotNull("a chain based at 0 must recover without its corrupt tail", recovered);
+                try {
+                    assertEquals("every frame of the surviving chain must replay",
+                            3L, recovered.publishedFsn());
+                } finally {
+                    recovered.close();
+                }
+                assertFalse("the unreadable newest segment must be renamed aside",
+                        Files.exists(newestPath));
+                assertTrue("the renamed file must survive for a postmortem",
+                        Files.exists(newestPath + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Skipped INTERIOR segment: three segments at baseSeq 0/4/8, the MIDDLE one
+     * unreadable. Unlike the oldest/newest cases, skipping an interior segment also
+     * opens an FSN gap between its surviving neighbours (baseSeq 0 with 4 frames,
+     * then baseSeq 8 -- expected 4). If the contiguity check below ran before the
+     * skip-tally refusal, that gap would throw the untyped {@code MmapSegmentException}
+     * first, escaping BOTH {@code UnreplayableSlotException} catches in
+     * {@code Sender.build()} (the constructor-time one and the connect()-time one) and
+     * repeating identically forever: the interior file is already renamed to
+     * {@code .corrupt}, so every retry recomputes {@code skippedSegmentCount} as 0 and
+     * hits the same gap again. The skip-tally refusal must run first.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenInteriorSegmentIsUnreadable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                MmapSegment s0 = MmapSegment.create(tmpDir + "/skip-interior-0.sfa", 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String interiorPath = tmpDir + "/skip-interior-1.sfa";
+                MmapSegment s1 = MmapSegment.create(interiorPath, 4, segSize);
+                for (int i = 0; i < 4; i++) s1.tryAppend(buf, 16);
+                s1.close();
+
+                MmapSegment s2 = MmapSegment.create(tmpDir + "/skip-interior-2.sfa", 8, segSize);
+                s2.tryAppend(buf, 16);
+                s2.close();
+
+                corruptMagic(interiorPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("expected recovery to refuse rather than replay "
+                            + "survivors across the hole the interior segment left");
+                } catch (SfRecoveryException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("FSN gap in recovered segments"));
+                }
+                // Fail-closed: the chain never validated, so the deferred quarantine
+                // never ran and every byte is left exactly where it was for an
+                // operator to extract.
+                assertTrue("a failed recovery must not mutate the slot",
+                        Files.exists(interiorPath));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Every {@code .sfa} in a LEGACY (manifest-less) directory is positively
+     * corrupt, so nothing survives to anchor a chain. There is no recorded
+     * boundary to fail closed against, so recovery quarantines every file --
+     * preserving the bytes under {@code .corrupt}, out of the {@code .sfa}
+     * namespace -- and reports the slot empty so the producer can start fresh.
+     * The one thing it must never do is drop the files silently.
+     * <p>
+     * With a manifest present this same state throws instead: the manifest
+     * proves durable frames existed, and that path is covered by
+     * {@code SegmentRecoveryIntegrityTest}.
+     */
+    @Test
+    public void testEveryCorruptSegmentIsQuarantinedInALegacySlot() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String path0 = tmpDir + "/skip-all-0.sfa";
+                MmapSegment s0 = MmapSegment.create(path0, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                String path1 = tmpDir + "/skip-all-1.sfa";
+                MmapSegment s1 = MmapSegment.create(path1, 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptMagic(path0);
+                corruptMagic(path1);
+
+                assertNull("nothing survives, so the slot must report empty",
+                        SegmentRing.openExisting(tmpDir, segSize));
+                // Both files quarantined, not just the last one seen: a
+                // miscounting regression would leave one behind under its
+                // original name.
+                assertFalse(Files.exists(path0));
+                assertFalse(Files.exists(path1));
+                assertTrue("quarantine preserves the bytes as evidence",
+                        Files.exists(path0 + ".corrupt"));
+                assertTrue("quarantine preserves the bytes as evidence",
+                        Files.exists(path1 + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * The empty-with-torn-tail branch (frame[0] itself fails CRC, so
+     * {@code MmapSegment.openExisting} returns successfully but with
+     * {@code frameCount() == 0} and {@code tornTailBytes() > 0}) is a second, separate
+     * path into the same hole this task closes: it quarantines the file to
+     * {@code .corrupt} and moves on WITHOUT incrementing {@code skippedSegmentCount},
+     * because that branch predates this task and sits outside the {@code catch
+     * (Throwable)} arm entirely. If this is the OLDEST segment, the contiguity check
+     * never sees a gap (it only compares files that opened successfully), so recovery
+     * would otherwise seed {@code ackedFsn} past frames nothing shows were delivered --
+     * the same silent loss, reached through a different branch. Corrupts frame[0]'s CRC
+     * directly (the same technique {@link #testOpenExistingPreservesSoleSegmentWithTornFirstFrame}
+     * uses for the "must not silently unlink" guarantee), which is a genuinely different
+     * code path from {@link #corruptMagic}: a bad magic byte fails inside
+     * {@code MmapSegment.openExisting} and hits the {@code catch (Throwable)} arm; a bad
+     * frame[0] CRC lets {@code MmapSegment.openExisting} return normally and hits this
+     * "empty leftover" branch instead.
+     */
+    @Test
+    public void testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 4 * (MmapSegment.FRAME_HEADER_SIZE + 16);
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try {
+                String oldestPath = tmpDir + "/torn-oldest-0.sfa";
+                MmapSegment s0 = MmapSegment.create(oldestPath, 0, segSize);
+                for (int i = 0; i < 4; i++) s0.tryAppend(buf, 16);
+                s0.close();
+
+                MmapSegment s1 = MmapSegment.create(tmpDir + "/torn-oldest-1.sfa", 4, segSize);
+                s1.tryAppend(buf, 16);
+                s1.close();
+
+                corruptFrameZeroCrc(oldestPath);
+
+                try {
+                    Misc.free(SegmentRing.openExisting(tmpDir, segSize));
+                    throw new AssertionError("expected recovery to refuse rather than silently "
+                            + "seed ackedFsn past the torn oldest segment's frames");
+                } catch (SfRecoveryException expected) {
+                    assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("lost its frames to a torn write"));
+                }
+                // Fail-closed leaves the evidence in place under its own name.
+                assertTrue("a failed recovery must not mutate the slot",
+                        Files.exists(oldestPath));
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * The single-segment variant of {@link #testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame}:
+     * here the torn segment IS the whole slot, so there is no valid sibling to recover
+     * around and no chain to refuse -- recovery reports the slot empty and returns.
+     * <p>
+     * The bytes must survive that. {@code scanFrames} bails at frame[0], so the recovery
+     * scan reports {@code frameCount() == 0} while three intact frames still sit
+     * physically behind the torn one. Treating that as an "empty hot-spare leftover" and
+     * unlinking the file destroys all of them on nothing more than a WARN -- a single bit
+     * flip (bit rot, a partial page write at crash) turning into silent data loss.
+     * Preserving the file in place, or quarantining it to {@code .corrupt}, keeps a
+     * postmortem able to recover the surviving frames.
+     */
+    @Test
+    public void testOpenExistingPreservesSoleSegmentWithTornFirstFrame() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 32, 0);
+                String segPath = tmpDir + "/sole-torn.sfa";
+                MmapSegment seg = MmapSegment.create(segPath, 0L, 64 * 1024);
+                assertTrue("setup: first append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertTrue("setup: second append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertTrue("setup: third append must succeed", seg.tryAppend(buf, 32) >= 0);
+                assertEquals("setup: three frames written", 3L, seg.frameCount());
+                seg.close();
+
+                corruptFrameZeroCrc(segPath);
+
+                Misc.free(SegmentRing.openExisting(tmpDir, 64 * 1024));
+
+                assertTrue("recovery silently unlinked a segment whose first frame failed CRC; "
+                                + "three valid frames followed it and recovery destroyed all of "
+                                + "them with only a WARN",
+                        Files.exists(segPath) || Files.exists(segPath + ".corrupt"));
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -813,6 +1126,42 @@ public class SegmentRingTest {
                 }
             } finally {
                 Unsafe.free(buf, 8, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * {@link #testAcknowledgeIsMonotonic} states the clamp in prose but never feeds
+     * {@code acknowledge} a value ABOVE {@code publishedFsn} -- every ack it makes is in
+     * range, so it pins the regression rule only. This pins the clamp itself.
+     * <p>
+     * A malformed or poisoned server NACK can carry any {@code wireSeq}, and the DROP
+     * path in {@code CursorWebSocketSendLoop.handleServerRejection} does not clamp before
+     * it reaches the engine. Should {@code ackedFsn} run past {@code publishedFsn}, the
+     * segment manager's trim pass munmaps and unlinks segments the I/O thread is still
+     * iterating, and the next {@code Unsafe.getInt} on the unmapped region SEGVs the JVM.
+     * {@code acknowledge} therefore clamps as defense-in-depth.
+     */
+    @Test
+    public void testAcknowledgeClampsAtPublishedFsn() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try {
+                fillPattern(buf, 32, 0);
+                MmapSegment seg = MmapSegment.create(tmpDir + "/clamp.sfa", 0L, 64 * 1024);
+                try (SegmentRing ring = new SegmentRing(seg, 64 * 1024)) {
+                    assertEquals("setup: first append yields FSN 0", 0L, ring.appendOrFsn(buf, 32));
+                    assertEquals("setup: publishedFsn matches", 0L, ring.publishedFsn());
+                    assertEquals("setup: nothing acked yet", -1L, ring.ackedFsn());
+
+                    ring.acknowledge(Long.MAX_VALUE / 2L);
+
+                    assertEquals("acknowledge must clamp a bogus seq at publishedFsn, not "
+                                    + "advance ackedFsn past what the I/O thread has sent",
+                            ring.publishedFsn(), ring.ackedFsn());
+                }
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
     }
@@ -868,6 +1217,7 @@ public class SegmentRingTest {
                     assertEquals(0, cursor.baseSeq());
                     int visited = 1;
                     long prevBase = cursor.baseSeq();
+                    int maxSearchComparisons = 0;
                     while (true) {
                         MmapSegment next = ring.nextSealedAfter(cursor);
                         if (next == null) break;
@@ -1253,6 +1603,52 @@ public class SegmentRingTest {
                 Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
             }
         });
+    }
+
+    /**
+     * Overwrites frame[0]'s 4-byte CRC field with a value statistically guaranteed to
+     * mismatch, leaving the frame's length field and payload -- and every later frame --
+     * untouched. {@code MmapSegment.openExisting} still returns normally (the header is
+     * fine), but {@code scanFrames} bails at frame[0], so {@code frameCount() == 0} and
+     * {@code tornTailBytes() > 0} -- landing in {@code SegmentRing}'s
+     * empty-with-torn-tail branch rather than its {@code catch (Throwable)} arm. Shared by
+     * {@link #testOpenExistingRefusesSlotWhenOldestSegmentHasATornFirstFrame} (torn oldest
+     * beside a valid sibling) and
+     * {@link #testOpenExistingPreservesSoleSegmentWithTornFirstFrame} (torn segment is the
+     * whole slot).
+     */
+    private static void corruptFrameZeroCrc(String path) {
+        int fd = Files.openRW(path);
+        assertTrue("openRW failed", fd >= 0);
+        long buf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putInt(buf, 0xDEADBEEF);
+            Files.write(fd, buf, 4, MmapSegment.HEADER_SIZE);
+        } finally {
+            Unsafe.free(buf, 4, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
+    }
+
+    /**
+     * Overwrites the 4-byte {@code FILE_MAGIC} field at offset 0 with a value
+     * that cannot match {@link MmapSegment#FILE_MAGIC}, leaving every other
+     * byte -- including real frame data -- untouched. Forces
+     * {@link MmapSegment#openExisting} to throw at the magic check, landing in
+     * {@code SegmentRing}'s per-file skip arm without going anywhere near the
+     * "empty leftover" branch a torn-tail CRC failure would hit instead.
+     */
+    private static void corruptMagic(String path) {
+        int fd = Files.openRW(path);
+        assertTrue("openRW failed", fd >= 0);
+        long buf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putInt(buf, 0xBADBAD00);
+            Files.write(fd, buf, 4, 0);
+        } finally {
+            Unsafe.free(buf, 4, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
     }
 
     /**

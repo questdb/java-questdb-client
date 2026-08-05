@@ -24,12 +24,61 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
 
 public class GlobalSymbolDictionaryTest {
+
+    @Test
+    public void testAddRecoveredSymbol_appendsWithoutDeduplicating() {
+        // Recovery replays persisted entries in id order. Distinct source strings
+        // that decode to the same characters -- lone UTF-16 surrogates both
+        // UTF-8-encode to '?', so they read back as the string "?" -- must keep
+        // DISTINCT ids, so the producer id space matches the persisted entry count.
+        // getOrAddSymbol de-dups them; addRecoveredSymbol must not.
+        GlobalSymbolDictionary dedup = new GlobalSymbolDictionary();
+        dedup.getOrAddSymbol("?");
+        dedup.getOrAddSymbol("?");
+        assertEquals("getOrAddSymbol de-dups colliding strings", 1, dedup.size());
+
+        GlobalSymbolDictionary recovered = new GlobalSymbolDictionary();
+        assertEquals(0, recovered.addRecoveredSymbol("?"));
+        assertEquals(1, recovered.addRecoveredSymbol("?"));
+        assertEquals(2, recovered.addRecoveredSymbol("nvda"));
+        assertEquals("addRecoveredSymbol keeps colliding entries distinct", 3, recovered.size());
+
+        // Dense id -> symbol mapping is preserved position-for-position.
+        assertEquals("?", recovered.getSymbol(0));
+        assertEquals("?", recovered.getSymbol(1));
+        assertEquals("nvda", recovered.getSymbol(2));
+
+        // A later ingest of a colliding string reuses the highest recovered id
+        // (harmless -- both encode to identical bytes), and a genuinely new symbol
+        // continues past the recovered tip.
+        assertEquals(1, recovered.getOrAddSymbol("?"));
+        assertEquals(3, recovered.getOrAddSymbol("brand-new"));
+    }
+
+    @Test
+    public void testAddRecoveredSymbol_rejectsNullWithoutMutation() {
+        GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+        assertEquals(0, dict.addRecoveredSymbol("AAPL"));
+
+        try {
+            dict.addRecoveredSymbol(null);
+            fail("expected IllegalArgumentException");
+        } catch (IllegalArgumentException expected) {
+            assertEquals("symbol cannot be null", expected.getMessage());
+        }
+
+        assertEquals(1, dict.size());
+        assertEquals("AAPL", dict.getSymbol(0));
+        assertEquals(0, dict.getId("AAPL"));
+    }
 
     @Test
     public void testAddSymbol_assignsSequentialIds() {
@@ -245,5 +294,48 @@ public class GlobalSymbolDictionaryTest {
         assertEquals("AAPL\u0000", dict.getSymbol(3));
         assertEquals("é", dict.getSymbol(4));
         assertEquals("\uD83D\uDE00", dict.getSymbol(5));
+    }
+
+    @Test
+    public void testGetOrAddSymbol_refusesGrowthPastProtocolCap() {
+        // Pre-sized so the 1M fill does not rehash its way through the test budget.
+        GlobalSymbolDictionary dict = new GlobalSymbolDictionary(1 << 21);
+        for (int i = 0; i < QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE; i++) {
+            assertEquals(i, dict.getOrAddSymbol("f" + i));
+        }
+        // Boundary: the 1,000,000th distinct symbol (id 999_999) was ACCEPTED above --
+        // the guard must refuse growth PAST the cap, not growth TO it, because the
+        // server accepts a catch-up of exactly deltaStart + deltaCount == 1_000_000.
+        assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE, dict.size());
+
+        try {
+            dict.getOrAddSymbol("one-too-many");
+            fail("expected LineSenderException past the dictionary cap");
+        } catch (LineSenderException expected) {
+            assertTrue("message names the limit: " + expected.getMessage(),
+                    expected.getMessage().contains("1000000"));
+            assertTrue("message names the recovery: " + expected.getMessage(),
+                    expected.getMessage().contains("close this sender"));
+        }
+
+        // The refusal mutated nothing: size unchanged, the refused symbol absent,
+        // existing symbols still resolve, and a retry refuses identically.
+        assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE, dict.size());
+        assertEquals(-1, dict.getId("one-too-many"));
+        assertEquals(42, dict.getOrAddSymbol("f42"));
+        try {
+            dict.getOrAddSymbol("one-too-many");
+            fail("expected LineSenderException on retry");
+        } catch (LineSenderException expected) {
+        }
+    }
+
+    @Test
+    public void testProtocolCapConstantPinnedToServerValue() {
+        // The server-side QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE (questdb OSS) is
+        // 1_000_000 and the ingress decoder rejects any delta or catch-up whose
+        // deltaStartId + deltaCount exceeds it. If this pin fails, the server
+        // constant moved and both sides must move together.
+        assertEquals(1_000_000, QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE);
     }
 }

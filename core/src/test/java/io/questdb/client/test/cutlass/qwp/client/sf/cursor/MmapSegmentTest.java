@@ -35,6 +35,8 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.io.RandomAccessFile;
+
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -174,6 +176,8 @@ public class MmapSegmentTest {
                     long expectedEnd = MmapSegment.HEADER_SIZE
                             + 100L * (MmapSegment.FRAME_HEADER_SIZE + 32);
                     assertEquals(expectedEnd, seg.publishedOffset());
+                    assertEquals("validation scan must return the frame count",
+                            100L, seg.frameCount());
                 }
 
                 // Re-open: scan must land at exactly the same offset.
@@ -185,6 +189,55 @@ public class MmapSegmentTest {
                 }
             } finally {
                 Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    /**
+     * Pins the documented 24-byte header. The layout is shared with the Java
+     * reference client's main line and with the Rust client, so a field added
+     * here is a cross-implementation format break, not a local detail.
+     */
+    @Test
+    public void testHeaderShapeMatchesTheDocumentedLayout() throws Exception {
+        assertEquals(24, MmapSegment.HEADER_SIZE);
+        assertEquals(1, MmapSegment.VERSION);
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-header.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096L)) {
+                assertEquals(7L, seg.baseSeq());
+            }
+            byte[] bytes = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
+            java.nio.ByteBuffer header = java.nio.ByteBuffer
+                    .wrap(bytes, 0, MmapSegment.HEADER_SIZE)
+                    .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            assertEquals(MmapSegment.FILE_MAGIC, header.getInt(0));
+            assertEquals(MmapSegment.VERSION, header.get(4));
+            assertEquals("flags", 0, header.get(5));
+            assertEquals("reserved", 0, header.getShort(6));
+            assertEquals(7L, header.getLong(8));
+            assertTrue("createdMicros must be stamped", header.getLong(16) > 0L);
+        });
+    }
+
+    @Test
+    public void testSegmentWithAnUnknownVersionIsRefused() throws Exception {
+        // The version byte survives the barrier removal precisely so a real future
+        // format change can be refused rather than misread. Task 14 relies on it.
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/seg-bad-version.sfa";
+            try (MmapSegment seg = MmapSegment.create(path, 7L, 4096)) {
+                assertEquals(7L, seg.baseSeq());
+            }
+            try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
+                file.seek(4L);
+                file.writeByte(MmapSegment.VERSION + 1);
+            }
+            try {
+                MmapSegment.openExisting(path).close();
+                fail("openExisting should reject an unknown version");
+            } catch (MmapSegmentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("unsupported version"));
             }
         });
     }

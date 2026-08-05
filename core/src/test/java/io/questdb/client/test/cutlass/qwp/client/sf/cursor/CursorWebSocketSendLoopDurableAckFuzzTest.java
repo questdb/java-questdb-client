@@ -197,7 +197,7 @@ public class CursorWebSocketSendLoopDurableAckFuzzTest {
                             () -> {
                                 throw new UnsupportedOperationException();
                             },
-                            5_000L, 100L, 5_000L, true);
+                            100L, 5_000L, true);
                     Field f = CursorWebSocketSendLoop.class.getDeclaredField("nextWireSeq");
                     f.setAccessible(true);
                     f.setLong(loop, frames);

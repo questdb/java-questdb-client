@@ -152,7 +152,6 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     0L,
                     CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
-                    /* reconnectMaxDurationMillis */ 60_000L,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
                     false
@@ -271,7 +270,6 @@ public class CursorWebSocketSendLoopConnectPhaseCloseTest {
                     0L,
                     CursorWebSocketSendLoop.DEFAULT_PARK_NANOS,
                     factory,
-                    /* reconnectMaxDurationMillis */ 60_000L,
                     /* reconnectInitialBackoffMillis */ 1_000L,
                     /* reconnectMaxBackoffMillis */ 5_000L,
                     false
