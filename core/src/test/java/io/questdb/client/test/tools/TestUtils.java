@@ -37,9 +37,15 @@ import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.slf4j.Logger;
 
+import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.file.FileVisitResult;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Arrays;
 
 import static org.junit.Assert.assertNotNull;
@@ -213,6 +219,91 @@ public final class TestUtils {
             }
         }
         Files.remove(tmpDir);
+    }
+
+    /**
+     * Recursive counterpart to {@link #removeTmpDir(String)} for tests whose temp
+     * directory has subdirectories -- e.g. the store-and-forward slot layout
+     * {@code <dir>/default/...}, which the flat variant cannot clean up. A
+     * {@code null} argument is a no-op, so it is safe from {@code tearDown} before
+     * {@code setUp} ran. Uses {@code java.nio.file} (fully qualified to avoid the
+     * {@code io.questdb.client.std.Files} import clash) so subdirectories delete
+     * bottom-up.
+     */
+    public static void removeTmpDirRec(String tmpDir) {
+        if (tmpDir == null) {
+            return;
+        }
+        removeTmpDirRec(Paths.get(tmpDir), java.nio.file.Files::deleteIfExists);
+    }
+
+    /**
+     * Injectable counterpart used to verify that cleanup remains best-effort but
+     * still fails the test when any path cannot be removed.
+     */
+    static void removeTmpDirRec(Path root, PathDeleter deleter) {
+        final IOException[] firstFailure = new IOException[1];
+        try {
+            java.nio.file.Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException exc) {
+                    remember(exc);
+                    delete(dir);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(Path file, IOException exc) {
+                    remember(exc);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                private void delete(Path path) {
+                    try {
+                        deleter.delete(path);
+                    } catch (IOException e) {
+                        remember(e);
+                    }
+                }
+
+                private void remember(IOException failure) {
+                    if (failure == null || failure instanceof NoSuchFileException) {
+                        // The cleanup goal for this path is already satisfied. This
+                        // also covers a child disappearing between directory listing
+                        // and attribute lookup.
+                        return;
+                    }
+                    if (firstFailure[0] == null) {
+                        firstFailure[0] = failure;
+                    } else if (firstFailure[0] != failure) {
+                        firstFailure[0].addSuppressed(failure);
+                    }
+                }
+            });
+        } catch (NoSuchFileException ignored) {
+            // A missing root is an already-complete cleanup.
+        } catch (IOException e) {
+            if (firstFailure[0] == null) {
+                firstFailure[0] = e;
+            } else {
+                firstFailure[0].addSuppressed(e);
+            }
+        }
+        if (firstFailure[0] != null) {
+            throw new AssertionError("could not recursively remove temp directory: " + root,
+                    firstFailure[0]);
+        }
+    }
+
+    @FunctionalInterface
+    interface PathDeleter {
+        void delete(Path path) throws IOException;
     }
 
     /**

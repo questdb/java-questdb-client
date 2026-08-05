@@ -24,6 +24,8 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
@@ -35,9 +37,13 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
@@ -84,14 +90,26 @@ public class EngineCloseSlotLockReleaseTest {
     @After
     public void tearDown() {
         if (sfDir == null) return;
-        long find = Files.findFirst(sfDir);
+        rmDirRecursive(sfDir);
+    }
+
+    private static void rmDirRecursive(String dir) {
+        if (!Files.exists(dir)) return;
+        long find = Files.findFirst(dir);
         if (find > 0) {
             try {
                 int rc = 1;
                 while (rc > 0) {
                     String name = Files.utf8ToString(Files.findName(find));
                     if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(sfDir + "/" + name);
+                        String child = dir + "/" + name;
+                        long probe = Files.findFirst(child);
+                        if (probe > 0) {
+                            Files.findClose(probe);
+                            rmDirRecursive(child);
+                        } else {
+                            Files.remove(child);
+                        }
                     }
                     rc = Files.findNext(find);
                 }
@@ -99,7 +117,126 @@ public class EngineCloseSlotLockReleaseTest {
                 Files.findClose(find);
             }
         }
-        Files.remove(sfDir);
+        Files.remove(dir);
+    }
+
+    /**
+     * A close driven by a caller that HOLDS the logical slot lock must not unlink it.
+     * <p>
+     * A fresh slot is "fully drained" by definition ({@code publishedFsn() < 0}), and
+     * {@code Sender.build()} closes the engine from inside its {@code acquireLogical}
+     * scope whenever connect fails -- the ordinary "server isn't up yet" startup. An
+     * unconditional unlink there frees the pathname while build() still holds the flock,
+     * so on POSIX the next acquirer creates a SECOND inode and locks it successfully:
+     * two owners of the lock that exists solely to serialise the quarantine
+     * close-&gt;rename-&gt;recreate window.
+     * <p>
+     * Swap {@code close(false)} for {@code close()} and the second acquireLogical below
+     * succeeds instead of throwing.
+     */
+    @Test(timeout = 10_000L)
+    public void testCloseDoesNotUnlinkALogicalLockItsCallerHolds() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot0";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot0.lock";
+
+            try (SlotLock held = SlotLock.acquireLogical(slotDir)) {
+                assertTrue("scaffolding: the logical lock file must exist once acquired",
+                        Files.exists(logicalLockPath));
+
+                // A fresh slot: publishedFsn() < 0, so close() takes the fully-drained arm.
+                CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+                engine.close(false);
+
+                assertTrue("close(false) must leave the logical lock file alone -- its caller "
+                                + "still holds the flock on it",
+                        Files.exists(logicalLockPath));
+                try {
+                    SlotLock stolen = SlotLock.acquireLogical(slotDir);
+                    stolen.close();
+                    fail("the logical lock was voided while still held: a second acquireLogical "
+                            + "succeeded, so two parties now believe they own the slot");
+                } catch (IllegalStateException expected) {
+                    assertTrue("expected lock contention, got: " + expected.getMessage(),
+                            expected.getMessage().contains("already in use"));
+                }
+            }
+        });
+    }
+
+    /**
+     * The counterpart: a close by a caller that does NOT hold the logical lock still
+     * reclaims it, so {@code .slot-locks} does not accumulate a dead lock+pid pair per
+     * distinct slot name for the lifetime of {@code sf_dir}.
+     */
+    @Test(timeout = 10_000L)
+    public void testFullyDrainedCloseStillReclaimsAnUnheldLogicalLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot1";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot1.lock";
+
+            SlotLock.acquireLogical(slotDir).close(); // materialise the lock file, release it
+            assertTrue(Files.exists(logicalLockPath));
+
+            CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+            engine.close();
+
+            assertFalse("a fully-drained close with no logical-lock holder must reclaim it",
+                    Files.exists(logicalLockPath));
+        });
+    }
+
+    /**
+     * The sender wiring one frame above {@link #testCloseDoesNotUnlinkALogicalLockItsCallerHolds}
+     * and {@link #testFullyDrainedCloseStillReclaimsAnUnheldLogicalLock}: those pin
+     * {@code CursorSendEngine.close(boolean)} directly, but nothing exercised the path that SETS
+     * the flag -- {@code QwpWebSocketSender.connect()}'s rollback flipping
+     * {@code reclaimLogicalSlotLockOnClose} to false and threading it into
+     * {@code engine.close(...)}. That field has 4 production references and, before this, 0 test
+     * references.
+     * <p>
+     * When a fresh slot's FIRST connect fails (the ordinary "server isn't up yet" startup), the
+     * slot is fully drained, so the DEFAULT close reclaims (unlinks) the logical lock
+     * {@code Sender.build()} still holds one frame up -- freeing the pathname while the flock is
+     * held, so the next {@code acquireLogical} mints a second inode. The rollback must instead
+     * thread {@code close(false)}. Here the lock is materialised UN-held (so the reclaim is not
+     * additionally blocked by the acquire-before-unlink guard), which isolates the flag: correct
+     * code skips the reclaim and the file survives; flipping the rollback back to the default
+     * reclaim removes it and turns this red.
+     */
+    @Test(timeout = 10_000L)
+    public void testConnectRollbackDoesNotReclaimTheLogicalLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String slotDir = sfDir + "/slot2";
+            assertEquals(0, Files.mkdir(slotDir, Files.DIR_MODE_DEFAULT));
+            String logicalLockPath = sfDir + "/.slot-locks/slot2.lock";
+
+            // Materialise the logical lock file (release the flock, leave the file), as
+            // Sender.build() would have around the failing connect.
+            SlotLock.acquireLogical(slotDir).close();
+            assertTrue(Files.exists(logicalLockPath));
+
+            // A free-but-closed loopback port refuses the connect deterministically.
+            int refusedPort;
+            try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                refusedPort = s.getLocalPort();
+            }
+
+            // A fresh slot: publishedFsn() < 0, so the rollback close takes the fully-drained arm.
+            CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024);
+            try {
+                QwpWebSocketSender.connect("localhost", refusedPort, null, 0, 0, 0L, null, false, engine);
+                fail("connect to a refused port must fail and roll back");
+            } catch (LineSenderException expected) {
+                // the connect()-rollback path ran and closed the engine
+            }
+
+            assertTrue("the connect() rollback must thread close(false) so the logical lock its "
+                            + "caller (Sender.build) still holds is left intact, not reclaimed",
+                    Files.exists(logicalLockPath));
+        });
     }
 
     @Test(timeout = 10_000L)
@@ -174,6 +311,35 @@ public class EngineCloseSlotLockReleaseTest {
                         + "try/finally so slotLock.close() always runs. "
                         + "Underlying: " + leaked.getMessage());
             }
+        });
+    }
+
+    @Test(timeout = 10_000L)
+    public void testFullyDrainedCloseRemovesLogicalSlotLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The engine's slot lives one level under sfDir, so the parent-anchored
+            // logical lock lands at <sfDir>/.slot-locks/slot0.lock -- inside the tree
+            // tearDown cleans.
+            String slotDir = sfDir + "/slot0";
+
+            // Simulate the build's transient logical lock: acquire and release it,
+            // leaving the shared-dir lock file behind exactly as a real build does
+            // (close() releases the flock but keeps the file so it survives a rename).
+            SlotLock.acquireLogical(slotDir).close();
+            String lockFile = sfDir + "/.slot-locks/slot0.lock";
+            assertTrue("precondition: a build's logical lock leaves a file behind",
+                    Files.exists(lockFile));
+
+            // A fresh engine that never publishes is fully drained on close, so its
+            // close() runs the retirement cleanup that must reclaim the logical lock.
+            try (CursorSendEngine engine = new CursorSendEngine(slotDir, 4L * 1024 * 1024)) {
+                assertEquals(slotDir, engine.sfDir());
+            }
+
+            assertFalse("fully-drained engine close must reclaim the orphaned logical "
+                            + "slot lock; otherwise .slot-locks grows unbounded under "
+                            + "rotating senderIds",
+                    Files.exists(lockFile));
         });
     }
 }

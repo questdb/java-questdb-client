@@ -27,10 +27,16 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.ObjList;
 import io.questdb.client.std.Unsafe;
@@ -54,6 +60,209 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class CursorSendEngineTest {
+
+    /**
+     * The full-dict-fallback discard must not re-fold when the dictionary it discards was
+     * EMPTY -- which is the ordinary client-upgrade path, not a rare one.
+     * <p>
+     * Every frame the shipped client ever wrote passes confirmedMaxId = -1, so deltaStart
+     * is 0 and maxDeltaStart is 0; such a slot has no .symbol-dict, so recovery creates a
+     * fresh empty one. All three discard conditions therefore hold on the FIRST restart
+     * after upgrading, for every non-empty slot -- and the first fold was already keyed to
+     * that size-0 baseline, so the re-fold recomputed a bit-identical result over the whole
+     * backlog. Full-dict frames carry the entire dictionary, so that is a second
+     * O(payload bytes) walk with a byte-at-a-time varint decode, inside build().
+     */
+    @Test(timeout = 20_000L)
+    public void testEmptyDictionaryDiscardDoesNotReFoldTheBacklog() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("scaffolding: the discard must actually fire",
+                        reopened.recoveredMaxSymbolDeltaStart() == 0L
+                                && reopened.recoveredMaxSymbolId() >= 0L);
+                assertEquals("an empty discarded dictionary needs no second fold",
+                        1, reopened.recoveryFoldCount());
+            }
+        });
+    }
+
+    /**
+     * The counterpart: discarding a POPULATED dictionary really does desynchronise the
+     * fold from the baseline its consumers derive, so that case must still re-fold.
+     */
+    @Test(timeout = 20_000L)
+    public void testPopulatedDictionaryDiscardStillReFolds() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            // Two persisted entries, below the three the frames define, so
+            // recoveredMaxSymbolId (2) >= size (2) and the discard fires with size > 0.
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertEquals("a populated discard must re-fold at baseline 0",
+                        2, reopened.recoveryFoldCount());
+            }
+        });
+    }
+
+    /**
+     * A delta-symbol-dictionary frame starting at {@code deltaStart}, one 1-byte symbol
+     * per char. deltaStart and deltaCount are small enough to be single-byte varints.
+     */
+    private static void appendDeltaDictFrame(CursorSendEngine engine, int deltaStart, char... symbols) {
+        int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) deltaStart);         // deltaStart
+            Unsafe.getUnsafe().putByte(p + 1, (byte) symbols.length); // deltaCount
+            long q = p + 2;
+            for (char c : symbols) {
+                Unsafe.getUnsafe().putByte(q, (byte) 1);
+                Unsafe.getUnsafe().putByte(q + 1, (byte) c);
+                q += 2;
+            }
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    /** A self-sufficient frame: deltaStart 0, one 1-byte symbol per char. */
+    private static void appendFullDictFrame(CursorSendEngine engine, char... symbols) {
+        int size = QwpConstants.HEADER_SIZE + 2 + symbols.length * 2;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            for (int i = 0; i < size; i++) {
+                Unsafe.getUnsafe().putByte(buf + i, (byte) 0);
+            }
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    QwpConstants.FLAG_DELTA_SYMBOL_DICT);
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) 0);               // deltaStart
+            Unsafe.getUnsafe().putByte(p + 1, (byte) symbols.length); // deltaCount
+            long q = p + 2;
+            for (char c : symbols) {
+                Unsafe.getUnsafe().putByte(q, (byte) 1);
+                Unsafe.getUnsafe().putByte(q + 1, (byte) c);
+                q += 2;
+            }
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+
+    /**
+     * The must-NOT-fire twin of {@link #testPopulatedDictionaryDiscardStillReFolds}.
+     * <p>
+     * A sender that ran in delta mode and then hit a disk-full / mmap fault on its
+     * write-ahead dictionary persist calls disableDeltaDict: it keeps the delta frames it
+     * already published and appends self-sufficient full-dict frames for the rest of its
+     * life. The recovered slot therefore carries a DELTA PREFIX (deltaStart 0, 1) followed
+     * by a FULL-DICT SUFFIX (deltaStart 0), so maxDeltaStart() stays > 0 even though the
+     * last frame re-registers from id 0. The discard guard's third conjunct
+     * (recoveredMaxSymbolDeltaStart == 0) is thus false and it must NOT discard the
+     * side-file -- the delta-prefix frames are not self-sufficient and still need it.
+     * Discarding here would re-fold at baseline 0 and drop a still-delta slot into
+     * full-dict mode.
+     * <p>
+     * {@code CursorWebSocketSendLoopOrphanTailTest#testTornDeltaSlotKeepsItsDictionaryInstead-
+     * OfBeingDiscarded} already guards the deltaStart conjunct with an all-delta torn slot
+     * (deltaStart 2, 3). This adds the mid-life shape's distinguishing tail: a full-dict
+     * SUFFIX at deltaStart 0 above a lower delta prefix, so maxDeltaStart (1) exceeds the
+     * LAST frame's deltaStart (0) -- a mutant reading the last frame's deltaStart instead of
+     * the running max would slip through the all-delta fixture but is caught here. It also
+     * pins recoveryFoldCount() == 1, i.e. that the whole discard/re-fold block is skipped.
+     */
+    @Test(timeout = 20_000L)
+    public void testMidLifeDegradedSlotKeepsItsDictionaryOnRecovery() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Delta prefix (two frames, one new id each -> maxDeltaStart 1) then the
+            // full-dict suffix the degraded producer emits (deltaStart 0, whole dict).
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                appendDeltaDictFrame(engine, 0, 'a');
+                appendDeltaDictFrame(engine, 1, 'b');
+                appendFullDictFrame(engine, 'a', 'b', 'c');
+            }
+            // The side-file the delta prefix persisted before the fault holds ids 0 and 1
+            // (a, b); id 2 (c) is the write that faulted, so it never persisted. This is
+            // the same recoveredMaxSymbolId (2) >= size (2) geometry as the discard test,
+            // but the delta prefix keeps maxDeltaStart > 0.
+            try (PersistedSymbolDict pd = PersistedSymbolDict.openClean(tmpDir)) {
+                assertNotNull(pd);
+                pd.appendSymbol("a");
+                pd.appendSymbol("b");
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("the delta prefix must survive the fold, keeping maxDeltaStart > 0",
+                        reopened.recoveredMaxSymbolDeltaStart() > 0L);
+                assertTrue("the full-dict suffix references id 2, above the side-file's size",
+                        reopened.recoveredMaxSymbolId() >= 2L);
+                assertTrue("the discard guard must NOT fire: the side-file is load-bearing for "
+                                + "the delta prefix, so it is kept and delta mode preserved",
+                        reopened.isDeltaDictEnabled());
+                assertNotNull("the persisted dictionary must be kept, not discarded",
+                        reopened.getPersistedSymbolDict());
+                assertEquals("a kept dictionary needs no re-fold -- the discard block was skipped",
+                        1, reopened.recoveryFoldCount());
+            }
+        });
+    }
+
+    /**
+     * A recovery-seed baseline mismatch must be quarantinable, not a permanent brick.
+     * <p>
+     * checkedRecoveryAnalysis threw a raw IllegalStateException, and Sender.build() routes
+     * on the TYPE -- only UnreplayableSlotException reaches its quarantine handler. With a
+     * stable senderId and a not-fully-drained slot retained on close, every restart
+     * re-recovered the same slot and rethrew: the application could never construct a
+     * Sender, so it could not even BUFFER new rows. Revert the type and this goes red.
+     */
+    @Test(timeout = 10_000L)
+    public void testRecoveryBaselineMismatchIsQuarantinableNotAPermanentBrick() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                    engine.appendBlocking(buf, 64);
+                }
+            } finally {
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+            try (CursorSendEngine reopened = new CursorSendEngine(tmpDir, 4096)) {
+                assertTrue("scaffolding: the slot must have been recovered",
+                        reopened.wasRecoveredFromDisk());
+                try {
+                    // The fold was keyed to the persisted prefix size; ask for a baseline
+                    // that cannot match it.
+                    reopened.addRecoveredSymbolsTo(9_999, new GlobalSymbolDictionary());
+                    fail("a baseline mismatch must be reported");
+                } catch (UnreplayableSlotException expected) {
+                    assertTrue("expected the baseline-mismatch message, got: "
+                                    + expected.getMessage(),
+                            expected.getMessage().contains("recovery symbol baseline mismatch"));
+                }
+            }
+        });
+    }
+
 
     private String tmpDir;
 
@@ -105,6 +314,55 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testCheckDurabilitySurfacesLatchedFailureToSenderEntryPoints() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // QwpWebSocketSender.flushAndGetSequence()/awaitAckedFsn() call
+            // engine.checkDurability() as their FIRST durability act, so this
+            // delegation seam is what stands between a latched periodic
+            // data-barrier failure and a producer that keeps publishing into
+            // an unsyncable slot. It had zero test references before this
+            // pin. Contract: quiet when clean, throws the LATCHED instance
+            // (not a copy) on every call until the manager's healed pass
+            // clears it -- callers poll it, so it must be repeatable, not
+            // one-shot.
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                engine.checkDurability(); // clean: must not throw
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                for (int i = 0; i < 2; i++) {
+                    try {
+                        engine.checkDurability();
+                        fail("latched durability failure must surface on call #" + i);
+                    } catch (MmapSegmentException expected) {
+                        assertTrue("the latched instance itself must surface",
+                                expected == failure);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAppendChecksLatchedDurabilityFailureBeforePublishing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096)) {
+                MmapSegmentException failure = new MmapSegmentException("injected data-sync failure");
+                engine.getRingForTesting().recordDurabilityFailureForTesting(failure);
+                try {
+                    engine.appendBlocking(buf, 16);
+                    fail("expected latched durability failure");
+                } catch (MmapSegmentException expected) {
+                    assertTrue(expected == failure);
+                }
+                assertEquals(-1L, engine.publishedFsn());
+            } finally {
+                Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testAppendBlockingNeverFailsUnderManagerSupply() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
@@ -130,9 +388,11 @@ public class CursorSendEngineTest {
             // cap = 3*segSize and segSize fitting 2 frames, the producer can land
             // initial (2) + spare1 (2) + spare2 (2) = 6 frames. The 7th rotation
             // needs a spare3 that the cap forbids → backpressure → deadline.
+            // The cap also includes the dictionary side-file bytes (8), so we add
+            // that to ensure the same number of segments fit.
             long segSize = MmapSegment.HEADER_SIZE
                     + 2 * (MmapSegment.FRAME_HEADER_SIZE + 64);
-            long cap = 3 * segSize;
+            long cap = 3 * segSize + 8;
             long shortDeadlineNanos = 200_000_000L; // 200 ms
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
             try (CursorSendEngine engine = new CursorSendEngine(tmpDir, segSize, cap, shortDeadlineNanos)) {
@@ -198,6 +458,25 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testCallbackCreationFailurePrecedesOwnedManagerResources() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CursorSendEngine.setBeforeDeferredCloseCreationHook(() -> {
+                throw new OutOfMemoryError("simulated bound callback allocation failure");
+            });
+            try {
+                try {
+                    new CursorSendEngine(tmpDir, 4096);
+                    fail("expected callback allocation failure");
+                } catch (OutOfMemoryError expected) {
+                    assertEquals("simulated bound callback allocation failure", expected.getMessage());
+                }
+            } finally {
+                CursorSendEngine.setBeforeDeferredCloseCreationHook(null);
+            }
+        });
+    }
+
+    @Test
     public void testConstructorFailureAfterOwnedManagerStartCleansResources() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             SegmentManager manager = new SegmentManager(4096);
@@ -237,6 +516,29 @@ public class CursorSendEngineTest {
                 assertSlotCanBeReacquired(tmpDir);
             } finally {
                 manager.close();
+            }
+        });
+    }
+
+    @Test
+    public void testConstructorRefusesFreshSlotWhoseDictionaryPathIsARealDirectory() throws Exception {
+        // C9-A end-to-end, through a REAL EISDIR on the real FilesFacade -- not
+        // PersistedSymbolDict in isolation, and not a stubbed facade. openCleanRW
+        // is open(O_CREAT|O_TRUNC|O_RDWR, 0644), which fails with EISDIR against
+        // an existing directory, so this reproduces the real failure mode
+        // (a Windows share lock, an EIO, or anything else occupying the path that
+        // a plain open() cannot clear) and proves the refusal actually propagates
+        // out of the constructor's catch (Throwable) cleanup-and-rethrow, rather
+        // than being swallowed there.
+        TestUtils.assertMemoryLeak(() -> {
+            assertEquals(0, Files.mkdir(tmpDir + "/.symbol-dict", Files.DIR_MODE_DEFAULT));
+            try {
+                new CursorSendEngine(tmpDir, 4096);
+                fail("expected construction to refuse a fresh slot whose dictionary "
+                        + "path is blocked by an existing directory");
+            } catch (LineSenderException expected) {
+                assertTrue("expected the truncate-refusal message, got: " + expected.getMessage(),
+                        expected.getMessage().contains("cannot be truncated"));
             }
         });
     }
@@ -382,6 +684,53 @@ public class CursorSendEngineTest {
     }
 
     @Test
+    public void testPeriodicRotationWaitsForDurablePredecessor() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segmentSize = MmapSegment.HEADER_SIZE
+                    + 2L * (MmapSegment.FRAME_HEADER_SIZE + 64L);
+            long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
+            CursorSendEngine engine = new CursorSendEngine(
+                    tmpDir, segmentSize, segmentSize * 4L,
+                    TimeUnit.SECONDS.toNanos(5), TimeUnit.HOURS.toNanos(1));
+            try {
+                assertEquals(0L, engine.appendBlocking(buf, 64));
+                assertEquals(1L, engine.appendBlocking(buf, 64));
+                // The third append needs rotation. Its predecessor is dirty and
+                // the periodic deadline is an hour away, so only the explicit
+                // rotation request can make progress.
+                assertEquals(2L, engine.appendBlocking(buf, 64));
+                ObjList<MmapSegment> sealed = engine.getRingForTesting().getSealedSegments();
+                assertEquals(1, sealed.size());
+                assertTrue(sealed.getQuick(0).isPublishedDurable());
+                MmapSegment active = engine.getRingForTesting().getActive();
+                assertFalse(active.isPublishedDurable());
+                engine.close();
+                assertTrue("close must sync the unacknowledged active", active.isPublishedDurable());
+            } finally {
+                engine.close();
+                Unsafe.free(buf, 64, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicValidationPrecedesOwnedManagerAllocation() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try {
+                new CursorSendEngine(
+                        null,
+                        4096L,
+                        8192L,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        1L);
+                fail("expected periodic memory-mode validation failure");
+            } catch (IllegalArgumentException expected) {
+                assertTrue(expected.getMessage().contains("requires disk store-and-forward mode"));
+            }
+        });
+    }
+
+    @Test
     public void testRestartIntoNonEmptySfDirContinuesFsnSequence() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             // Red regression: restart against a populated SF dir must derive the
@@ -412,7 +761,10 @@ public class CursorSendEngineTest {
                     int rc = 1;
                     while (rc > 0) {
                         String name = Files.utf8ToString(Files.findName(find));
-                        if (name != null && name.endsWith(".sfa")) sfaCount++;
+                        if (name != null
+                                && name.endsWith(".sfa")) {
+                            sfaCount++;
+                        }
                         rc = Files.findNext(find);
                     }
                 } finally {
@@ -599,6 +951,40 @@ public class CursorSendEngineTest {
         });
     }
 
+    @Test
+    public void testRegistrationWiresDictSideFileBytesIntoCapAccounting() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            SegmentManager manager = new SegmentManager(4096);
+            try {
+                try (CursorSendEngine engine = new CursorSendEngine(tmpDir, 4096, manager)) {
+                    PersistedSymbolDict dict = engine.getPersistedSymbolDict();
+                    assertNotNull("disk-mode engine must own a symbol dictionary", dict);
+                    // A fresh dictionary already holds its file header, so the
+                    // wiring is observable before any append.
+                    assertEquals("cap accounting must include the dictionary side-file bytes",
+                            manager.getTotalBytesForTesting() + dict.occupiedDiskBytes(),
+                            manager.getCapAccountedBytesForTesting());
+                    dict.appendSymbol("AAPL");
+                    assertEquals("side-file growth must be visible to the cap accounting live",
+                            manager.getTotalBytesForTesting() + dict.occupiedDiskBytes(),
+                            manager.getCapAccountedBytesForTesting());
+                    // The gauge is the DISK footprint, not the logical offset:
+                    // the first append reserves a whole APPEND_MAP_CAPACITY
+                    // window of real blocks past the committed prefix, and the
+                    // cap must see those.
+                    assertTrue("the gauge must count the reserved append window, not just the"
+                                    + " committed prefix",
+                            dict.occupiedDiskBytes() > dict.appendedBytes());
+                }
+                assertEquals("deregistration must drop the slot's side-file gauge",
+                        manager.getTotalBytesForTesting(),
+                        manager.getCapAccountedBytesForTesting());
+            } finally {
+                manager.close();
+            }
+        });
+    }
+
     private static void assertSlotCanBeReacquired(String sfDir) {
         try (SlotLock ignored = SlotLock.acquire(sfDir)) {
             // good
@@ -608,11 +994,13 @@ public class CursorSendEngineTest {
     private static Throwable invokeOwnedPrivateConstructorExpectingFailure(
             String sfDir, long segmentSizeBytes, SegmentManager manager) throws Exception {
         Constructor<CursorSendEngine> ctor = CursorSendEngine.class.getDeclaredConstructor(
-                String.class, long.class, SegmentManager.class, boolean.class, long.class);
+                String.class, long.class, SegmentManager.class, boolean.class, long.class,
+                long.class, long.class, FilesFacade.class);
         ctor.setAccessible(true);
         try {
             ctor.newInstance(sfDir, segmentSizeBytes, manager, true,
-                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                    SegmentManager.UNLIMITED_TOTAL_BYTES,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, 0L, FilesFacade.INSTANCE);
             fail("expected constructor failure");
             return null;
         } catch (InvocationTargetException e) {

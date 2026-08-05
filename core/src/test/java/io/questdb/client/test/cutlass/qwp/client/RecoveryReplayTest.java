@@ -86,7 +86,7 @@ public class RecoveryReplayTest {
             String pad = repeat("x", 64);
             String cfg1 = "ws::addr=localhost:" + port1
                     + ";sf_dir=" + sfDir
-                    + ";sf_max_bytes=4096"
+                    + ";sf_max_segment_bytes=4096"
                     + ";close_flush_timeout_millis=0;";
             try (Sender s1 = Sender.fromConfig(cfg1)) {
                 for (int i = 0; i < 50; i++) {
@@ -154,7 +154,8 @@ public class RecoveryReplayTest {
             int rc = 1;
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
-                if (name != null && name.endsWith(".sfa")) {
+                if (name != null
+                        && name.endsWith(".sfa")) {
                     try {
                         try (MmapSegment seg = MmapSegment.openExisting(dir + "/" + name)) {
                             if (seg.frameCount() > 0) n++;

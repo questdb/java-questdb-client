@@ -77,6 +77,7 @@ public final class ConfigSchema {
         // (one vocabulary, side-owned application).
         str("max_frame_rejections", Side.INGRESS);
         str("poison_min_escalation_window_millis", Side.INGRESS);
+        str("catch_up_cap_gap_min_escalation_window_millis", Side.INGRESS);
         str("max_name_len", Side.INGRESS);
         str("reconnect_initial_backoff_millis", Side.INGRESS);
         str("reconnect_max_backoff_millis", Side.INGRESS);
@@ -86,8 +87,9 @@ public final class ConfigSchema {
         str("sf_append_deadline_millis", Side.INGRESS);
         str("sf_dir", Side.INGRESS);
         str("sf_durability", Side.INGRESS);
-        str("sf_max_bytes", Side.INGRESS);
+        str("sf_max_segment_bytes", Side.INGRESS);
         str("sf_max_total_bytes", Side.INGRESS);
+        str("sf_sync_interval_millis", Side.INGRESS);
         str("transaction", Side.INGRESS);
 
         // EGRESS -- the QwpQueryClient applies. Typed where there is a range or

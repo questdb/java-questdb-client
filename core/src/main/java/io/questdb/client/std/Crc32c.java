@@ -46,6 +46,7 @@ package io.questdb.client.std;
 public final class Crc32c {
     /** Seed value to start a fresh CRC-32C accumulation. */
     public static final int INIT = 0;
+    private static final int[] CRC32C_TABLE = buildCrc32cTable();
 
     private Crc32c() {
     }
@@ -64,6 +65,73 @@ public final class Crc32c {
      * subsequent chained call
      */
     public static native int update(int seed, long addr, long len);
+
+    /**
+     * Java/Unsafe slice-by-8 CRC-32C for memory that can fault while it is read,
+     * such as a recovery mmap over a sparse or concurrently truncated file.
+     * Keeping every load at an {@link Unsafe} intrinsic site lets HotSpot turn an
+     * mmap access fault into a catchable {@link InternalError}; the native
+     * {@link #update} path cannot provide that guarantee because a SIGBUS raised
+     * inside JNI aborts the JVM.
+     * <p>
+     * The hot loop consumes each 8-byte block with two {@code getInt}s rather than
+     * eight {@code getByte}s -- 9 loads per block instead of 16, for the same table
+     * work. {@code getInt} is an {@link Unsafe} intrinsic exactly as {@code getByte}
+     * is, so the fault-catchability above is unaffected. It does make the loop
+     * little-endian, which costs nothing here: the segment and dictionary formats this
+     * checksums are already little-endian throughout (their headers are read back with
+     * {@code getInt}), and the native twin this must agree with asserts the same.
+     *
+     * @param seed previous CRC value, or {@link #INIT} to start fresh
+     * @param addr off-heap address of at least {@code len} readable bytes
+     * @param len  number of bytes to consume
+     * @return the new CRC value
+     */
+    public static int updateUnsafe(int seed, long addr, long len) {
+        assert len >= 0L : "CRC length must be non-negative";
+        int crc = ~seed;
+        int[] table = CRC32C_TABLE;
+        while (len >= Long.BYTES) {
+            // Little-endian: lo holds bytes 0..3 and hi bytes 4..7, ascending from the
+            // low byte, so the per-byte table lookups below stay in wire order.
+            int lo = Unsafe.getUnsafe().getInt(addr) ^ crc;
+            int hi = Unsafe.getUnsafe().getInt(addr + Integer.BYTES);
+            crc = table[7 * 256 + (lo & 0xFF)]
+                    ^ table[6 * 256 + ((lo >>> 8) & 0xFF)]
+                    ^ table[5 * 256 + ((lo >>> 16) & 0xFF)]
+                    ^ table[4 * 256 + (lo >>> 24)]
+                    ^ table[3 * 256 + (hi & 0xFF)]
+                    ^ table[2 * 256 + ((hi >>> 8) & 0xFF)]
+                    ^ table[256 + ((hi >>> 16) & 0xFF)]
+                    ^ table[hi >>> 24];
+            addr += Long.BYTES;
+            len -= Long.BYTES;
+        }
+        while (len-- > 0L) {
+            crc = (crc >>> 8) ^ table[(crc ^ Unsafe.getUnsafe().getByte(addr++)) & 0xFF];
+        }
+        return ~crc;
+    }
+
+    private static int[] buildCrc32cTable() {
+        int[] table = new int[8 * 256];
+        for (int n = 0; n < 256; n++) {
+            int c = n;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) != 0 ? (0x82F63B78 ^ (c >>> 1)) : (c >>> 1);
+            }
+            table[n] = c;
+        }
+        for (int slice = 1; slice < 8; slice++) {
+            int previousOffset = (slice - 1) * 256;
+            int offset = slice * 256;
+            for (int n = 0; n < 256; n++) {
+                int previous = table[previousOffset + n];
+                table[offset + n] = (previous >>> 8) ^ table[previous & 0xFF];
+            }
+        }
+        return table;
+    }
 
     static {
         Os.init();

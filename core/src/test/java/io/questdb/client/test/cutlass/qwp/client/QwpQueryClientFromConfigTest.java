@@ -40,6 +40,8 @@ import org.junit.Test;
  */
 public class QwpQueryClientFromConfigTest {
 
+    private static final String TLS_ROOTS_INSECURE_ERROR = "tls_roots cannot be combined with tls_verify=unsafe_off; remove tls_verify to use custom roots, or remove tls_roots to disable certificate validation";
+
     @Test
     public void testAddrAcceptsHostWithoutPort() {
         // Host-only accepted; port defaults to the public DEFAULT_WS_PORT constant.
@@ -720,7 +722,7 @@ public class QwpQueryClientFromConfigTest {
                 "sf_append_deadline_millis=30000",
                 "sf_dir=/var/lib/qdb-sf",
                 "sf_durability=memory",
-                "sf_max_bytes=4m",
+                "sf_max_segment_bytes=4m",
                 "sf_max_total_bytes=10g",
                 "transaction=on",
         };
@@ -974,7 +976,7 @@ public class QwpQueryClientFromConfigTest {
     public void testTlsRootsPasswordWithoutPathRejected() {
         assertReject(
                 "wss::addr=db:9000;tls_roots_password=secret;",
-                "tls_roots and tls_roots_password must be provided together"
+                "tls_roots_password requires tls_roots"
         );
     }
 
@@ -984,11 +986,20 @@ public class QwpQueryClientFromConfigTest {
     }
 
     @Test
-    public void testTlsRootsWithoutPasswordRejected() {
+    public void testTlsRootsWithUnsafeOffRejected() {
         assertReject(
-                "wss::addr=db:9000;tls_roots=/etc/qdb/ca.p12;",
-                "tls_roots and tls_roots_password must be provided together"
+                "wss::addr=db:9000;tls_roots=/etc/qdb/ca.pem;tls_verify=unsafe_off;",
+                TLS_ROOTS_INSECURE_ERROR
         );
+        assertReject(
+                "wss::addr=db:9000;tls_verify=unsafe_off;tls_roots=/etc/qdb/ca.p12;tls_roots_password=secret;",
+                TLS_ROOTS_INSECURE_ERROR
+        );
+    }
+
+    @Test
+    public void testPemTlsRootsWithoutPasswordAccepted() {
+        assertParses("wss::addr=db:9000;tls_roots=/etc/qdb/ca.pem;");
     }
 
     @Test

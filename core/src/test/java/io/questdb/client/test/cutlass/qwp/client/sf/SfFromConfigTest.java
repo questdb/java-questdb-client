@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
@@ -92,7 +93,7 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesParsing() throws Exception {
+    public void testSfMaxSegmentBytesParsing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -101,7 +102,7 @@ public class SfFromConfigTest {
 
                 int port = server.getPort();
                 String config = "ws::addr=localhost:" + port
-                        + ";sf_dir=" + sfDir + ";sf_max_bytes=131072;";
+                        + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=131072;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     // Write enough data that segments rotate at ~128 KiB boundary.
                     for (int i = 0; i < 50; i++) {
@@ -139,7 +140,7 @@ public class SfFromConfigTest {
     }
 
     /**
-     * Regression test for the connect-string {@code sf_max_bytes} /
+     * Regression test for the connect-string {@code sf_max_segment_bytes} /
      * {@code sf_max_total_bytes} parser accepting values larger than
      * {@code Integer.MAX_VALUE}. The pre-cursor parser used parseInt which
      * artificially capped the SF size from the connect string at ~2 GiB.
@@ -161,6 +162,46 @@ public class SfFromConfigTest {
                     sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
                 }
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicDurabilityDefaultAndExplicitInterval() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String base = "ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfDir + ";sf_durability=periodic;";
+                try (Sender sender = Sender.fromConfig(base)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(5_000_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                }
+
+                try (Sender sender = Sender.fromConfig(base
+                        + "sender_id=explicit;sf_sync_interval_millis=123;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(123_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPeriodicDurabilityRequiresDirectory() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (Sender ignored = Sender.fromConfig(
+                    "ws::addr=localhost:1;sf_durability=periodic;")) {
+                Assert.fail("expected periodic mode without sf_dir to fail");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("requires sf_dir"));
             }
         });
     }
@@ -222,7 +263,93 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesAcceptsSizeSuffixes() throws Exception {
+    public void testSfSyncIntervalRequiresPeriodicMode() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_sync_interval_millis=5000;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected interval without periodic mode to fail");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("requires sf_durability=periodic"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalRejectsZero() throws Exception {
+        // A realistic operator typo: sf_sync_interval_millis=0. The setter
+        // rejects it at parse time (millis <= 0), before build() cross-checks
+        // periodic mode, so the out-of-range message is what surfaces.
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_durability=periodic;sf_sync_interval_millis=0;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected sf_sync_interval_millis=0 to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("sf_sync_interval_millis is out of range"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalOverflowBoundary() throws Exception {
+        // Pin the exact millis->nanos overflow guard: millis * 1_000_000 must
+        // not overflow a long. The largest accepted value is
+        // Long.MAX_VALUE / 1_000_000; one millisecond more must be rejected.
+        // Both sides are asserted so a later change to the operator (> vs >=)
+        // or the 1_000_000 divisor cannot regress silently.
+        final long maxValidMillis = Long.MAX_VALUE / 1_000_000L;
+        TestUtils.assertMemoryLeak(() -> {
+            AckHandler handler = new AckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Accept side: the boundary value is honored and converts to
+                // nanos without overflow.
+                String accepted = "ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfDir + ";sf_durability=periodic"
+                        + ";sf_sync_interval_millis=" + maxValidMillis + ";";
+                try (Sender sender = Sender.fromConfig(accepted)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals(maxValidMillis * 1_000_000L,
+                            ws.getCursorEngineForTesting().getSyncIntervalNanosForTesting());
+                }
+            }
+
+            // Reject side: one millisecond past the boundary is out of range.
+            String rejected = "ws::addr=localhost:1;sf_dir=" + sfDir
+                    + ";sf_durability=periodic;sf_sync_interval_millis="
+                    + (maxValidMillis + 1) + ";";
+            try (Sender ignored = Sender.fromConfig(rejected)) {
+                Assert.fail("expected the overflow-boundary value to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("sf_sync_interval_millis is out of range"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfSyncIntervalRejectsOnNonWebSocketTransport() throws Exception {
+        // The config-string parser rejects sf_sync_interval_millis on any
+        // non-WebSocket schema before the value is parsed.
+        TestUtils.assertMemoryLeak(() -> {
+            String config = "http::addr=localhost:1;sf_sync_interval_millis=123;";
+            try (Sender ignored = Sender.fromConfig(config)) {
+                Assert.fail("expected sf_sync_interval_millis on http to be rejected");
+            } catch (LineSenderException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains(
+                                "sf_sync_interval_millis is only supported for WebSocket transport"));
+            }
+        });
+    }
+
+    @Test
+    public void testSfMaxSegmentBytesAcceptsSizeSuffixes() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             AckHandler handler = new AckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -233,7 +360,7 @@ public class SfFromConfigTest {
                 // 64m / 4g should parse identically to their byte-count equivalents.
                 String config = "ws::addr=localhost:" + port
                         + ";sf_dir=" + sfDir
-                        + ";sf_max_bytes=64m"
+                        + ";sf_max_segment_bytes=64m"
                         + ";sf_max_total_bytes=4g;";
                 try (Sender sender = Sender.fromConfig(config)) {
                     sender.table("foo").longColumn("v", 1L).atNow();
@@ -346,14 +473,14 @@ public class SfFromConfigTest {
     }
 
     @Test
-    public void testSfMaxBytesInvalidSizeSuffixRejected() throws Exception {
+    public void testSfMaxSegmentBytesInvalidSizeSuffixRejected() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
-            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_bytes=64x;";
+            String config = "ws::addr=localhost:1;sf_dir=" + sfDir + ";sf_max_segment_bytes=64x;";
             try (Sender ignored = Sender.fromConfig(config)) {
                 Assert.fail("expected rejection of unknown unit suffix");
             } catch (LineSenderException expected) {
                 Assert.assertTrue(expected.getMessage(),
-                        expected.getMessage().contains("invalid sf_max_bytes"));
+                        expected.getMessage().contains("invalid sf_max_segment_bytes"));
             }
         });
     }

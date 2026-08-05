@@ -142,8 +142,9 @@ You can also let the client flush batches for you with the `auto_flush_rows` / `
 `ws::addr=localhost:9000;auto_flush_rows=10000;auto_flush_interval=1000;`.
 
 **Confirm a batch is durably received.** Over QWP each flush returns a frame sequence number (FSN); `awaitAckedFsn`
-blocks until the server has acknowledged it. Rows are safe in the store-and-forward log even if the ack has not landed
-yet — they replay on reconnect.
+blocks until the server has acknowledged it. With `sf_dir`, rows in the store-and-forward log replay after reconnect
+or a producer-process restart. For periodic host-power-loss checkpoints, also configure
+`sf_durability=periodic;sf_sync_interval_millis=5000;`.
 
 ```java
 try (Sender sender = db.borrowSender()) {
@@ -259,7 +260,9 @@ try (QuestDB db = QuestDB.builder()
 List every cluster node in one `addr` server list; the single string configures both the ingest and query pools across
 all of them. On the query side, `target` selects the node role to route to (`any`, `primary`, or `replica`) and
 `failover=on` enables failover across the list. The ingest side reconnects across the same node list on its own — a
-store-and-forward sender keeps buffering rows through a failover window and never drops them.
+store-and-forward sender keeps buffering rows through a failover window and replays unacknowledged data. The default
+`memory` durability mode protects process restarts, not host power loss; use periodic durability for background disk
+checkpoints.
 
 ```java
 try (QuestDB db = QuestDB.connect(
@@ -360,6 +363,19 @@ try (QuestDB db = QuestDB.connect("wss::addr=localhost:9000;username=admin;passw
     // ... use db ...
 }
 ```
+
+**Custom PEM certificate authority:**
+
+```java
+try (QuestDB db = QuestDB.connect(
+        "wss::addr=localhost:9000;tls_roots=/path/to/ca.pem;")) {
+    // ... use db ...
+}
+```
+
+`tls_roots` accepts a PEM certificate or bundle directly. For an existing JKS
+or PKCS#12 trust store, also set `tls_roots_password`; the password switches the
+file interpretation from PEM to a Java trust store.
 
 **Disable certificate validation (not for production):**
 
@@ -503,8 +519,8 @@ schema::key1=value1;key2=value2;
 | `password` / `pass`  |              | Basic-auth password                                                 |
 | `token`              |              | Bearer token (sent as an `Authorization` header on the WS upgrade)  |
 | `tls_verify`         | `on`         | TLS certificate validation (`on` or `unsafe_off`)                   |
-| `tls_roots`          |              | Path to a custom truststore                                         |
-| `tls_roots_password` |              | Truststore password                                                 |
+| `tls_roots`          |              | Path to a PEM certificate/bundle, or a JKS/PKCS#12 trust store       |
+| `tls_roots_password` |              | Optional JKS/PKCS#12 password; omit when `tls_roots` is PEM          |
 | `connect_timeout`    | _(OS)_       | TCP connect + TLS handshake timeout, in milliseconds                |
 | `auth_timeout_ms`    | `15000`      | Authentication/upgrade request timeout, in milliseconds             |
 
@@ -533,7 +549,10 @@ Applied by the query pool to select and fail over between the nodes in the `addr
 | `client_id` |         | Opaque client identifier surfaced server-side for observability                          |
 
 The ingest side also accepts store-and-forward and reconnection tuning keys (`auto_flush_*`, `initial_connect_retry`,
-`reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …). See the
+`reconnect_*`, `request_durable_ack`, `sf_*`, `max_frame_rejections`, `poison_min_escalation_window_millis`, …).
+`sf_durability=periodic` checkpoints mmap-published data in the background; `sf_sync_interval_millis` defaults to `5000`
+in that mode. The interval is a target cadence: JVM scheduling and storage-sync latency add to the actual loss window.
+Use `request_durable_ack=on` when end-to-end server durability is also required. See the
 [QuestDB documentation](https://questdb.com/docs/) for the full reference.
 
 ## Requirements

@@ -32,6 +32,7 @@ import io.questdb.client.std.Decimal256;
 import io.questdb.client.std.Decimal64;
 import io.questdb.client.std.bytes.DirectByteSlice;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -378,6 +379,21 @@ public final class PooledSender implements Sender {
 
     long generation() {
         return generation;
+    }
+
+    @TestOnly
+    public Sender getDelegateForTesting() {
+        return slot.delegate();
+    }
+
+    @TestOnly
+    public int getSlotIndexForTesting() {
+        return slot.slotIndex();
+    }
+
+    @TestOnly
+    public boolean hasSameSlotForTesting(PooledSender that) {
+        return slot == that.slot;
     }
 
     SenderSlot slot() {

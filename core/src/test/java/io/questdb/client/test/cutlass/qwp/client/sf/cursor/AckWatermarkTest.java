@@ -26,6 +26,9 @@ package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -36,6 +39,7 @@ import java.nio.file.Paths;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class AckWatermarkTest {
@@ -77,6 +81,61 @@ public class AckWatermarkTest {
     }
 
     @Test
+    public void testFacadeMmapFaultFailsOpenAndClosesFd() throws Exception {
+        // The watermark mapping must be reachable from an injected facade so
+        // tests can fault-inject mmap. On a rejected mapping, open() must
+        // fail cleanly and release the fd through the same facade.
+        TestUtils.assertMemoryLeak(() -> {
+            MappingFilesFacade ff = new MappingFilesFacade(true);
+            assertNull("open must fail when the injected facade rejects mmap",
+                    AckWatermark.open(ff, slotDir));
+            assertEquals("facade must receive the watermark mmap call", 1, ff.mmapCalls);
+            assertEquals("failed open must close the watermark fd via the facade",
+                    1, ff.watermarkFdCloseCalls);
+            assertEquals("a rejected mapping must not be munmapped", 0, ff.munmapCalls);
+        });
+    }
+
+    @Test
+    public void testFallsBackFromTornPlausibleHighValue() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                watermark.write(255L);
+                watermark.write(256L);
+                watermark.sync();
+            }
+
+            // Model a torn little-endian 255 -> 256 transition: the high byte
+            // reached storage while the low byte retained 0xff, yielding the
+            // false FSN 511. A recovered ring with publishedFsn=599 cannot
+            // reject that value using its segment ceiling.
+            long publishedFsn = 599L;
+            long corruptFsn = 511L;
+            assertTrue(corruptFsn <= publishedFsn);
+            String path = slotDir + "/" + AckWatermark.FILE_NAME;
+            int fd = Files.openRW(path);
+            assertTrue(fd >= 0);
+            long corruptByte = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().putByte(corruptByte, (byte) 0xff);
+                long fsnOffset = AckWatermark.FILE_SIZE == 16 ? 8L : 16L;
+                assertEquals(1L, Files.write(fd, corruptByte, 1, fsnOffset));
+                assertEquals(0, Files.fsync(fd));
+            } finally {
+                Files.close(fd);
+                Unsafe.free(corruptByte, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                assertEquals("torn latest record must fall back to the older watermark",
+                        255L, watermark.read());
+            }
+        });
+    }
+
+    @Test
     public void testFreshFileReadsAsInvalid() throws Exception {
         // open() creates the file zero-filled, so magic is 0 and read()
         // must report INVALID until the first write stamps the magic.
@@ -98,6 +157,53 @@ public class AckWatermarkTest {
                 assertNotNull(w);
                 w.write(-1L);
                 assertEquals(-1L, w.read());
+            }
+        });
+    }
+
+    @Test
+    public void testOpenAndCloseRouteMappingThroughFacade() throws Exception {
+        // The lifetime mapping and its release must go through the injected
+        // FilesFacade, matching MmapSegment, so test facades can observe them.
+        TestUtils.assertMemoryLeak(() -> {
+            MappingFilesFacade ff = new MappingFilesFacade(false);
+            try (AckWatermark w = AckWatermark.open(ff, slotDir)) {
+                assertNotNull(w);
+                assertEquals("open must mmap through the injected facade", 1, ff.mmapCalls);
+                w.write(7L);
+                assertEquals(7L, w.read());
+            }
+            assertEquals("close must munmap through the injected facade", 1, ff.munmapCalls);
+            assertEquals("close must release the watermark fd via the facade",
+                    1, ff.watermarkFdCloseCalls);
+        });
+    }
+
+    @Test
+    public void testPhysicalReleaseIsIdempotentAcrossTestingSeamAndClose() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            AckWatermark watermark = AckWatermark.open(slotDir);
+            assertNotNull(watermark);
+            try {
+                assertTrue("first test release must relinquish physical storage",
+                        watermark.releaseStorageButKeepWritableForTesting());
+                assertFalse("repeated test release must not touch physical storage again",
+                        watermark.releaseStorageButKeepWritableForTesting());
+                watermark.close();
+                assertFalse("close after test release must keep physical cleanup idempotent",
+                        watermark.releaseStorageButKeepWritableForTesting());
+            } finally {
+                watermark.close();
+            }
+
+            AckWatermark normallyClosed = AckWatermark.open(slotDir);
+            assertNotNull(normallyClosed);
+            try {
+                normallyClosed.close();
+                assertFalse("ordinary close must record physical relinquishment",
+                        normallyClosed.releaseStorageButKeepWritableForTesting());
+            } finally {
+                normallyClosed.close();
             }
         });
     }
@@ -129,6 +235,38 @@ public class AckWatermarkTest {
                 assertEquals(200L, w.read());
                 w.write(Long.MAX_VALUE);
                 assertEquals(Long.MAX_VALUE, w.read());
+            }
+        });
+    }
+
+    @Test
+    public void testSingleSectorTearLeavesPriorRecordRecoverable() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                watermark.write(100L);
+                watermark.write(200L);
+                watermark.sync();
+            }
+
+            String path = slotDir + "/" + AckWatermark.FILE_NAME;
+            int fd = Files.openRW(path);
+            assertTrue(fd >= 0);
+            int tornBytes = (int) Math.min(512L, Files.length(path));
+            long tornSector = Unsafe.malloc(tornBytes, MemoryTag.NATIVE_DEFAULT);
+            try {
+                Unsafe.getUnsafe().setMemory(tornSector, tornBytes, (byte) 0xA5);
+                assertEquals(tornBytes, Files.write(fd, tornSector, tornBytes, 0));
+                assertEquals(0, Files.fsync(fd));
+            } finally {
+                Files.close(fd);
+                Unsafe.free(tornSector, tornBytes, MemoryTag.NATIVE_DEFAULT);
+            }
+
+            try (AckWatermark watermark = AckWatermark.open(slotDir)) {
+                assertNotNull(watermark);
+                assertEquals("one aligned 512-byte tear must leave the prior record valid",
+                        100L, watermark.read());
             }
         });
     }
@@ -170,5 +308,69 @@ public class AckWatermarkTest {
                 assertEquals(0L, w.read());
             }
         });
+    }
+
+    /**
+     * Delegating facade that counts mmap/munmap traffic and watermark-fd
+     * closes, optionally rejecting the mapping to exercise the open()
+     * failure path.
+     */
+    private static final class MappingFilesFacade implements FilesFacade {
+        private final boolean failMmap;
+        private int mmapCalls;
+        private int munmapCalls;
+        private int watermarkFd = -1;
+        private int watermarkFdCloseCalls;
+
+        private MappingFilesFacade(boolean failMmap) {
+            this.failMmap = failMmap;
+        }
+
+        @Override public boolean allocate(int fd, long size) { return INSTANCE.allocate(fd, size); }
+        @Override public long allocNativePath(String path) { return INSTANCE.allocNativePath(path); }
+        @Override public int close(int fd) {
+            if (fd >= 0 && fd == watermarkFd) watermarkFdCloseCalls++;
+            return INSTANCE.close(fd);
+        }
+        @Override public boolean exists(String path) { return INSTANCE.exists(path); }
+        @Override public void findClose(long findPtr) { INSTANCE.findClose(findPtr); }
+        @Override public long findFirst(String dir) { return INSTANCE.findFirst(dir); }
+        @Override public long findName(long findPtr) { return INSTANCE.findName(findPtr); }
+        @Override public int findNext(long findPtr) { return INSTANCE.findNext(findPtr); }
+        @Override public int findType(long findPtr) { return INSTANCE.findType(findPtr); }
+        @Override public void freeNativePath(long pathPtr) { INSTANCE.freeNativePath(pathPtr); }
+        @Override public int fsync(int fd) { return INSTANCE.fsync(fd); }
+        @Override public long length(int fd) { return INSTANCE.length(fd); }
+        @Override public long length(String path) { return INSTANCE.length(path); }
+        @Override public long length(long pathPtr) { return INSTANCE.length(pathPtr); }
+        @Override public int lock(int fd) { return INSTANCE.lock(fd); }
+        @Override public int mkdir(String path, int mode) { return INSTANCE.mkdir(path, mode); }
+        @Override public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+            mmapCalls++;
+            if (failMmap) return Files.FAILED_MMAP_ADDRESS;
+            return INSTANCE.mmap(fd, len, offset, flags, memoryTag);
+        }
+        @Override public void munmap(long address, long len, int memoryTag) {
+            munmapCalls++;
+            INSTANCE.munmap(address, len, memoryTag);
+        }
+        @Override public int openCleanRW(String path) {
+            int fd = INSTANCE.openCleanRW(path);
+            if (path.endsWith(AckWatermark.FILE_NAME)) watermarkFd = fd;
+            return fd;
+        }
+        @Override public int openCleanRW(long pathPtr) { return INSTANCE.openCleanRW(pathPtr); }
+        @Override public int openRW(String path) {
+            int fd = INSTANCE.openRW(path);
+            if (path.endsWith(AckWatermark.FILE_NAME)) watermarkFd = fd;
+            return fd;
+        }
+        @Override public int openRW(long pathPtr) { return INSTANCE.openRW(pathPtr); }
+        @Override public long read(int fd, long addr, long len, long offset) { return INSTANCE.read(fd, addr, len, offset); }
+        @Override public boolean remove(String path) { return INSTANCE.remove(path); }
+        @Override public boolean remove(long pathPtr) { return INSTANCE.remove(pathPtr); }
+        @Override public int rename(String oldPath, String newPath) { return INSTANCE.rename(oldPath, newPath); }
+        @Override public boolean truncate(int fd, long size) { return INSTANCE.truncate(fd, size); }
+        @Override public long write(int fd, long addr, long len, long offset) { return INSTANCE.write(fd, addr, len, offset); }
     }
 }

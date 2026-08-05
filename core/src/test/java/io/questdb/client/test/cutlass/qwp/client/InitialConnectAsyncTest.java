@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.websocket.WebSocketCloseCode;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
@@ -43,65 +44,70 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Behavior of {@code initial_connect_retry=async}: the producer-thread
  * {@code Sender.fromConfig} must return immediately even when no server
- * is reachable; the I/O thread retries connect in the background. Plain
- * connect failures are retried indefinitely (Invariant B: no wall-clock
- * budget give-up); only genuine terminals (auth/upgrade reject,
- * durable-ack capability gap) are delivered through the async error
- * inbox rather than thrown at the call site.
+ * is reachable; the I/O thread retries connect in the background. Transport
+ * failures (unreachable or dropped server) are retried indefinitely
+ * (Invariant B: no wall-clock budget give-up) and never stop the producer.
+ * But the initial connect has never reached the server, so an endpoint-policy
+ * rejection there -- authentication, upgrade or durable-ack capability -- is
+ * terminal: with no caller thread left to throw at, it is delivered to the
+ * {@code SenderErrorHandler} instead of buffering forever.
  */
 public class InitialConnectAsyncTest {
 
     @Test
-    public void testAsyncAuthFailureDeliversToErrorInbox() throws Exception {
-        // Server returns HTTP 401 on every upgrade attempt. Auth failures
-        // are terminal at the I/O thread; in async mode they are
-        // delivered as a SenderError, not thrown from fromConfig.
+    public void testAsyncAuthFailureSurfacesTerminal() throws Exception {
+        // Server returns HTTP 401 on every upgrade attempt. A rejection by ENDPOINT
+        // POLICY before the sender has ever reached the server is a startup problem,
+        // not a transient, so it must reach the caller: an operator with the wrong
+        // credentials has to learn that, rather than watch a mute sender buffer into
+        // SF until it fills and misreports the cause as "out of space". SYNC/OFF
+        // startup reports it by throwing from build(); ASYNC has no caller left to
+        // throw at, so it arrives on the SenderErrorHandler instead.
+        //
+        // Contrast testAsyncNoServerRetriesForeverNoTerminal: a dead port is a
+        // TRANSPORT failure -- genuinely transient -- and retries forever even during
+        // startup. And once the wire has been up even once, initialization is over
+        // and store-and-forward owns the data, so the same 401 becomes a transient to
+        // ride out (CursorWebSocketSendLoopForegroundReconnectPolicyTest
+        // #testPostStartAuthFailureRetriesUntilCredentialsRecover).
         try (Always401Fixture fixture = new Always401Fixture()) {
             fixture.start();
             int port = fixture.getPort();
             ErrorInbox inbox = new ErrorInbox();
             String cfg = "ws::addr=localhost:" + port
                     + sfDirOpt() + ";initial_connect_retry=async"
-                    + ";reconnect_max_duration_millis=10000"
+                    + ";reconnect_max_duration_millis=200"
+                    + ";reconnect_initial_backoff_millis=10"
+                    + ";reconnect_max_backoff_millis=50"
                     + ";close_flush_timeout_millis=0;";
             Sender sender = Sender.builder(cfg)
                     .errorHandler(inbox)
                     .build();
             try {
-                // Auth-terminal must surface within hundreds of ms even
-                // though the cap is 10s.
-                long t0 = System.nanoTime();
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                awaitAtLeastOneConnectAttempt(wss);
+
                 Assert.assertTrue(
-                        "401 upgrade reject must surface a SenderError within 5s",
+                        "an async 401 must surface a terminal to the errorHandler",
                         inbox.await(5, TimeUnit.SECONDS));
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
                 SenderError err = inbox.get();
-                Assert.assertNotNull(
-                        "401 upgrade reject must surface a SenderError",
-                        err);
-                Assert.assertTrue(
-                        "auth-terminal must surface well inside the cap; took "
-                                + elapsedMs + "ms (cap was 10000ms)",
-                        elapsedMs < 5_000L);
-                Assert.assertEquals(
-                        "category must be SECURITY_ERROR for ws-upgrade-failed",
-                        SenderError.Category.SECURITY_ERROR, err.getCategory());
-                Assert.assertEquals(
-                        "auth failure is TERMINAL",
-                        SenderError.Policy.TERMINAL, err.getAppliedPolicy());
-                String msg = err.getServerMessage() == null ? "" : err.getServerMessage();
-                Assert.assertTrue(
-                        "error message must mention ws-upgrade-failed: " + msg,
-                        msg.contains("ws-upgrade-failed")
-                                || msg.contains("401"));
+                Assert.assertNotNull("a SenderError must be delivered for an async 401", err);
+                Assert.assertEquals(SenderError.Policy.TERMINAL, err.getAppliedPolicy());
+                Assert.assertEquals(SenderError.Category.SECURITY_ERROR, err.getCategory());
+                Assert.assertTrue("the terminal must name the upgrade rejection, got: "
+                                + err.getServerMessage(),
+                        err.getServerMessage().contains("ws-upgrade-failed"));
+                Assert.assertFalse("no upgrade has succeeded yet", wss.wasEverConnected());
             } finally {
-                assertCloseRethrowsTerminal(sender, "ws-upgrade-failed");
+                closeQuietly(sender);
             }
         }
     }
@@ -113,8 +119,9 @@ public class InitialConnectAsyncTest {
         // (it may appear; the data is safe in SF), so the I/O thread retries
         // forever. reconnect_max_duration_millis is IGNORED as a give-up deadline:
         // no SenderError lands, the sender stays usable, and wasEverConnected()
-        // stays false. Only a GENUINE terminal (auth/upgrade) or SF exhaustion may
-        // surface -- see testAsyncAuthFailureDeliversToErrorInbox.
+        // stays false. This is the TRANSPORT half of the startup contract; the
+        // endpoint-POLICY half, which does surface, is
+        // testAsyncAuthFailureSurfacesTerminal.
         int port = TestPorts.findUnusedPort();
         ErrorInbox inbox = new ErrorInbox();
         String cfg = "ws::addr=localhost:" + port
@@ -199,6 +206,78 @@ public class InitialConnectAsyncTest {
                 Assert.assertTrue(
                         "wasEverConnected() must flip to true after the I/O thread connects",
                         ((QwpWebSocketSender) sender).wasEverConnected());
+            } finally {
+                closeQuietly(sender);
+            }
+        }
+    }
+
+    @Test
+    public void testAsyncMetricsDistinguishInitialSendFromReconnectReplay() throws Exception {
+        ReplayMetricsHandler handler = new ReplayMetricsHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + sfDirOpt() + ";initial_connect_retry=async"
+                    + ";reconnect_initial_backoff_millis=20"
+                    + ";reconnect_max_backoff_millis=200"
+                    + ";close_flush_timeout_millis=2000;";
+            Sender sender = Sender.fromConfig(cfg);
+            try {
+                QwpWebSocketSender wss = (QwpWebSocketSender) sender;
+                handler.bind(wss, server);
+
+                // Publish before the server starts accepting. The frame has
+                // never been on any wire, so its eventual first delivery must
+                // increase sent, but not replayed.
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                awaitAtLeastOneConnectAttempt(wss);
+                Assert.assertEquals("the server must not handshake before start", 0, server.handshakeCount());
+
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the initial frame must be ACKed",
+                        handler.awaitInitialAck(5, TimeUnit.SECONDS));
+                awaitMetricAtLeast("initial ACK", wss::getTotalAcks, 1L);
+                Assert.assertEquals("exactly one frame must be sent initially",
+                        1L, wss.getTotalFramesSent());
+                long replayedAfterInitialDelivery = wss.getTotalFramesReplayed();
+
+                // The second frame reaches the established connection, but the
+                // fixture closes that connection without ACKing it. It must then
+                // arrive again on a genuinely new connection and count once as
+                // replayed.
+                sender.table("foo").longColumn("v", 2L).atNow();
+                sender.flush();
+                Assert.assertTrue("the fixture must close after the unacked frame",
+                        handler.awaitDisconnect(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the reconnect must reach the gated server",
+                        server.awaitRoleReject(5, TimeUnit.SECONDS));
+
+                // Publish another frame while reconnect is blocked at a role
+                // reject, then reopen the gate. This frame has never been sent
+                // and must not inflate the replay counter after reconnect.
+                sender.table("foo").longColumn("v", 3L).atNow();
+                sender.flush();
+                server.setRejectWithRole(null);
+
+                Assert.assertTrue("the unacked frame must be replayed",
+                        handler.awaitReplay(5, TimeUnit.SECONDS));
+                Assert.assertTrue("the outage-queued frame must be delivered",
+                        handler.awaitOutageQueuedDelivery(5, TimeUnit.SECONDS));
+                awaitMetricAtLeast("replayed frame", wss::getTotalFramesReplayed, 1L);
+                awaitMetricAtLeast("post-reconnect ACKs", wss::getTotalAcks, 3L);
+
+                Assert.assertTrue("replay must arrive on a new WebSocket connection",
+                        handler.wasReplayOnNewConnection());
+                Assert.assertTrue("the server must observe a reconnect",
+                        server.handshakeCount() >= 2);
+                Assert.assertEquals("initial delivery is not a replay",
+                        0L, replayedAfterInitialDelivery);
+                Assert.assertEquals("three first sends plus one genuine resend",
+                        4L, wss.getTotalFramesSent());
+                Assert.assertEquals("only the genuine resend is replayed",
+                        1L, wss.getTotalFramesReplayed());
             } finally {
                 closeQuietly(sender);
             }
@@ -345,6 +424,17 @@ public class InitialConnectAsyncTest {
      * before the budget expired would satisfy it even if the loop then
      * exited.
      */
+    private static void awaitMetricAtLeast(String label, LongSupplier metric, long expected) {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (metric.getAsLong() < expected) {
+            if (System.nanoTime() > deadlineNanos) {
+                throw new AssertionError(label + " did not reach " + expected
+                        + " within 5s; current=" + metric.getAsLong());
+            }
+            io.questdb.client.std.Compat.onSpinWait();
+        }
+    }
+
     private static void awaitReconnectAttemptsAdvance(QwpWebSocketSender wss) {
         long snapshot = wss.getTotalReconnectAttempts();
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -370,31 +460,6 @@ public class InitialConnectAsyncTest {
             sender.close();
         } catch (Exception ignored) {
             // close() teardown noise only
-        }
-    }
-
-    /**
-     * Closes the sender and tolerates either outcome:
-     * * close() throws -- the latched terminal must mention the expected
-     * substring (safety-net rethrow path);
-     * * close() returns cleanly -- the user installed an async error
-     * handler in this test, so the dispatcher already delivered the
-     * error to the handler (or will, on shutdown). Rethrowing on top
-     * of that would mask try-with-resources cleanup in real callers,
-     * so close() suppresses the rethrow when a custom handler is
-     * installed.
-     * Either way, the inbox observation earlier in the test pins the
-     * primary contract -- this helper just guards against close() throwing
-     * with a wrong message.
-     */
-    private static void assertCloseRethrowsTerminal(Sender sender, String expectedSubstring) {
-        try {
-            sender.close();
-        } catch (Throwable t) {
-            String msg = t.getMessage() == null ? "" : t.getMessage();
-            Assert.assertTrue(
-                    "close() rethrow must mention " + expectedSubstring + ": " + msg,
-                    msg.contains(expectedSubstring));
         }
     }
 
@@ -476,11 +541,88 @@ public class InitialConnectAsyncTest {
         }
     }
 
+    private static class ReplayMetricsHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch disconnect = new CountDownLatch(1);
+        private final CountDownLatch initialAck = new CountDownLatch(1);
+        private final CountDownLatch outageQueuedDelivery = new CountDownLatch(1);
+        private final AtomicLong received = new AtomicLong();
+        private final CountDownLatch replay = new CountDownLatch(1);
+        private final AtomicBoolean replayOnNewConnection = new AtomicBoolean();
+        private TestWebSocketServer.ClientHandler initialClient;
+        private volatile TestWebSocketServer server;
+        private volatile QwpWebSocketSender sender;
+
+        boolean awaitDisconnect(long timeout, TimeUnit unit) throws InterruptedException {
+            return disconnect.await(timeout, unit);
+        }
+
+        boolean awaitInitialAck(long timeout, TimeUnit unit) throws InterruptedException {
+            return initialAck.await(timeout, unit);
+        }
+
+        boolean awaitOutageQueuedDelivery(long timeout, TimeUnit unit) throws InterruptedException {
+            return outageQueuedDelivery.await(timeout, unit);
+        }
+
+        boolean awaitReplay(long timeout, TimeUnit unit) throws InterruptedException {
+            return replay.await(timeout, unit);
+        }
+
+        void bind(QwpWebSocketSender sender, TestWebSocketServer server) {
+            this.sender = sender;
+            this.server = server;
+        }
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long ordinal = received.incrementAndGet();
+            try {
+                if (ordinal == 1L) {
+                    initialClient = client;
+                    client.sendBinary(AckHandler.buildAck(0L));
+                    initialAck.countDown();
+                } else if (ordinal == 2L) {
+                    // Receipt alone can race the sender's post-send metric
+                    // increments. Wait until sendBinary returned before closing,
+                    // proving this frame completed a send and must be replayed.
+                    awaitSentFrames(2L);
+                    server.setRejectWithRole("REPLICA");
+                    client.sendClose(WebSocketCloseCode.GOING_AWAY, "test reconnect");
+                    disconnect.countDown();
+                } else if (ordinal == 3L) {
+                    replayOnNewConnection.set(client != initialClient);
+                    client.sendBinary(AckHandler.buildAck(0L));
+                    replay.countDown();
+                } else if (ordinal == 4L) {
+                    client.sendBinary(AckHandler.buildAck(1L));
+                    outageQueuedDelivery.countDown();
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        boolean wasReplayOnNewConnection() {
+            return replayOnNewConnection.get();
+        }
+
+        private void awaitSentFrames(long expected) {
+            long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (sender.getTotalFramesSent() < expected) {
+                if (System.nanoTime() > deadlineNanos) {
+                    throw new AssertionError("sent-frame metric did not reach " + expected
+                            + " before disconnect; current=" + sender.getTotalFramesSent());
+                }
+                io.questdb.client.std.Compat.onSpinWait();
+            }
+        }
+    }
+
     /**
      * Raw-socket fixture: every accepted connection responds with HTTP
-     * 401 Unauthorized and closes. Used to drive the async-init
-     * auth-terminal path: the I/O thread's first connect attempt classifies
-     * the response as a terminal upgrade failure.
+     * 401 Unauthorized and closes. Used to prove that the async-init I/O
+     * thread keeps retrying an endpoint-policy failure without terminalizing
+     * the producer.
      */
     private static class Always401Fixture implements AutoCloseable {
         private final java.util.List<Socket> openSockets = new java.util.concurrent.CopyOnWriteArrayList<>();

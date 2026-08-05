@@ -69,6 +69,8 @@ public class TestWebSocketServer implements Closeable {
     // client-side pool actually closed the connections it opened.
     private final AtomicInteger liveConnections = new AtomicInteger();
     private final int port;
+    private final AtomicInteger roleRejectCount = new AtomicInteger();
+    private final CountDownLatch roleRejectLatch = new CountDownLatch(1);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
@@ -113,6 +115,11 @@ public class TestWebSocketServer implements Closeable {
     // 401, 403, 404, 426, 503, etc. that the failover loop should
     // classify per failover.md §6.
     private volatile String rejectingStatusReason;
+    // When > 0, 101 upgrade responses advertise this value as the
+    // X-QWP-Max-Batch-Size header, capping the QWP message size the client
+    // builds. Lets a test force the delta-dictionary catch-up to split across
+    // several frames. Live-updatable via setAdvertisedMaxBatchSize().
+    private volatile int advertisedMaxBatchSize;
 
     public TestWebSocketServer(WebSocketServerHandler handler) throws IOException {
         this(handler, false);
@@ -168,6 +175,10 @@ public class TestWebSocketServer implements Closeable {
         serverSocket = new ServerSocket(requestedPort, 50, java.net.InetAddress.getLoopbackAddress());
         serverSocket.setSoTimeout(100);
         this.port = serverSocket.getLocalPort();
+    }
+
+    public boolean awaitRoleReject(long timeout, TimeUnit unit) throws InterruptedException {
+        return roleRejectLatch.await(timeout, unit);
     }
 
     public boolean awaitStart(long timeout, TimeUnit unit) throws InterruptedException {
@@ -232,6 +243,21 @@ public class TestWebSocketServer implements Closeable {
      */
     public String pollAuthorizationHeader(long timeout, TimeUnit unit) throws InterruptedException {
         return capturedAuthHeaders.poll(timeout, unit);
+    }
+
+    /**
+     * Number of HTTP 421 role-reject responses sent over the server's lifetime.
+     */
+    public int roleRejectCount() {
+        return roleRejectCount.get();
+    }
+
+    /**
+     * Advertises {@code X-QWP-Max-Batch-Size: <maxBatchSize>} on subsequent
+     * handshakes (live update). Pass {@code 0} to stop advertising a cap.
+     */
+    public void setAdvertisedMaxBatchSize(int maxBatchSize) {
+        this.advertisedMaxBatchSize = maxBatchSize;
     }
 
     /**
@@ -603,6 +629,8 @@ public class TestWebSocketServer implements Closeable {
                         "\r\n";
                 out.write(sb.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
+                roleRejectCount.incrementAndGet();
+                roleRejectLatch.countDown();
                 return false;
             }
 
@@ -619,6 +647,10 @@ public class TestWebSocketServer implements Closeable {
             String role = advertisedRole;
             if (role != null) {
                 sb.append("X-QuestDB-Role: ").append(role).append("\r\n");
+            }
+            int maxBatch = advertisedMaxBatchSize;
+            if (maxBatch > 0) {
+                sb.append("X-QWP-Max-Batch-Size: ").append(maxBatch).append("\r\n");
             }
             sb.append("\r\n");
             out.write(sb.toString().getBytes(StandardCharsets.US_ASCII));

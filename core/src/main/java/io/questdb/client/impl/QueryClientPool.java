@@ -27,6 +27,8 @@ package io.questdb.client.impl;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import org.jetbrains.annotations.TestOnly;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -56,10 +58,19 @@ public final class QueryClientPool implements AutoCloseable {
     // close() can never block the caller unbounded. Tunable per pool via
     // closeQueryTimeoutMillis(long).
     static final long DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS = 5_000;
+    // Hard cap on close()'s wait for a creation blocked in DNS, TCP, TLS, or
+    // WebSocket setup. A late creator retains the client and native-scratch
+    // cleanup obligation until it returns and observes the closed pool.
+    static final long MAX_CLOSE_CREATION_WAIT_MILLIS = 5_000;
+    private static final Logger LOG = LoggerFactory.getLogger(QueryClientPool.class);
     private final long acquireTimeoutMillis;
     private final ArrayList<QueryWorker> all;
     private final ArrayDeque<QueryWorker> available;
     private final String configurationString;
+    // Signals completion of internally owned creation lifecycles. Kept
+    // separate from workerReleased so an acquire waiter cannot consume the only
+    // wakeup intended for close().
+    private final Condition creationFinished;
     // Test seam. Production connects via QwpQueryClient.connect(); white-box
     // tests in io.questdb.client.test.impl reach the package-private constructor
     // by reflection to inject a hook that throws a non-RuntimeException
@@ -86,6 +97,11 @@ public final class QueryClientPool implements AutoCloseable {
     // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
     // once at build time on a different thread than the borrowers that read it.
     private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -146,6 +162,7 @@ public final class QueryClientPool implements AutoCloseable {
         this.maxLifetimeMillis = maxLifetimeMillis;
         this.all = new ArrayList<>(maxSize);
         this.available = new ArrayDeque<>(maxSize);
+        this.creationFinished = lock.newCondition();
         this.workerReleased = lock.newCondition();
         int built = 0;
         // Tracks a worker built by createUnlocked() but not yet added to `all`:
@@ -231,16 +248,11 @@ public final class QueryClientPool implements AutoCloseable {
                         // incremented, permanently shrinking pool capacity until
                         // every acquire() times out. Restoring the reservation
                         // for any throwable is safe.
-                        lock.lock();
-                        inFlightCreations--;
-                        workerReleased.signal();
-                        lock.unlock();
                         // createUnlocked() returns a fully connected client
                         // (socket + native scratch + I/O thread), so if start()
                         // threw afterwards we must close it here -- nothing else
-                        // references it. createUnlocked() already self-cleans
-                        // when connect() throws, leaving created == null, so
-                        // this only fires on the start()-throws path.
+                        // references it. Keep the creation reservation until
+                        // that cleanup finishes so close() cannot return first.
                         if (created != null) {
                             try {
                                 created.shutdown();
@@ -249,33 +261,45 @@ public final class QueryClientPool implements AutoCloseable {
                                 // original creation failure rethrown below.
                             }
                         }
+                        lock.lock();
+                        try {
+                            inFlightCreations--;
+                            creationFinished.signalAll();
+                            workerReleased.signal();
+                        } finally {
+                            lock.unlock();
+                        }
                         throw new QueryException((byte) 0,
                                 "failed to create query client: " + e.getMessage(), e);
                     }
                     lock.lock();
-                    inFlightCreations--;
                     if (closed) {
-                        // Pool was closed mid-creation -- tear the fresh worker
-                        // down rather than leaking it, but OUTSIDE the lock:
-                        // shutdown() joins the dispatch thread for up to
-                        // SHUTDOWN_JOIN_MILLIS, and close()/release()/discard()/
-                        // cancelIfCurrent() all contend on this lock (whose
-                        // contract is "held only briefly"). The accounting above
-                        // already ran under the lock, and the worker never
-                        // entered `all`, so close()'s snapshot loop cannot race
-                        // this teardown.
+                        // Keep inFlightCreations reserved while shutdown runs
+                        // outside the lock. The worker never entered `all`, so
+                        // this reservation is close()'s sole ownership record.
                         lock.unlock();
                         try {
                             created.shutdown();
                         } catch (Throwable ignored) {
                             // Best-effort: an Error from teardown must not mask
                             // the closed-pool signal.
+                        } finally {
+                            lock.lock();
+                            try {
+                                inFlightCreations--;
+                                creationFinished.signalAll();
+                                workerReleased.signalAll();
+                            } finally {
+                                lock.unlock();
+                            }
                         }
                         throw new QueryException((byte) 0, "QuestDB handle is closed");
                     }
                     all.add(created);
                     // Stamp the first lease id for this freshly built worker.
                     created.bumpGeneration();
+                    inFlightCreations--;
+                    creationFinished.signalAll();
                     return created;
                 }
                 if (remainingNanos <= 0) {
@@ -307,6 +331,43 @@ public final class QueryClientPool implements AutoCloseable {
             }
             closed = true;
             workerReleased.signalAll();
+            // A creator can block in DNS, TCP, TLS, WebSocket upgrade, or the
+            // SERVER_INFO handshake. Wait boundedly rather than turning an
+            // unset connect_timeout into an unbounded QuestDB.close(). Timing
+            // out does not abandon the client or its native scratch: the creator
+            // keeps the reservation and, once construction returns, observes
+            // closed and shuts the worker down before releasing ownership.
+            // Preserve interruption while applying the same finite budget.
+            final long creationWaitMillis = Math.max(0,
+                    Math.min(acquireTimeoutMillis, MAX_CLOSE_CREATION_WAIT_MILLIS));
+            final long creationWaitNanos = TimeUnit.MILLISECONDS.toNanos(creationWaitMillis);
+            final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
+            long creationRemainingNanos = creationWaitNanos;
+            boolean creationWaitInterrupted = false;
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
+                }
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
+            }
+            if (creationWaitInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            if (inFlightCreations > 0) {
+                LOG.warn("QueryClientPool.close(): {} query client creation(s) still in flight after {}ms; "
+                                + "each creator retains cleanup ownership until construction returns",
+                        inFlightCreations, creationWaitMillis);
+            }
             snapshot = new ArrayList<>(all);
         } finally {
             lock.unlock();
@@ -480,6 +541,16 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
+    @TestOnly
+    public boolean hasCreationWaiterForTesting() {
+        lock.lock();
+        try {
+            return lock.hasWaiters(creationFinished);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     // White-box accessor for tests: reports the current in-flight creation count
     // under the pool lock. A non-zero value after a failed acquire() means the
     // slot reservation was never released -- the capacity-shrink bug this guards
@@ -492,6 +563,16 @@ public final class QueryClientPool implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    @TestOnly
+    public boolean isClosedForTesting() {
+        return closed;
+    }
+
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
     }
 
     private QueryWorker createUnlocked() {

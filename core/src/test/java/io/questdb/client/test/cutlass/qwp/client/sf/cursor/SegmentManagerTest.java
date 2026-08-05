@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
@@ -36,6 +37,10 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
@@ -71,6 +76,65 @@ public class SegmentManagerTest {
             }
         }
         Files.remove(tmpDir);
+    }
+
+    @Test
+    public void testAckBatchDoesNotDelaySiblingSpareProvisioning() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int sealedCount = 128;
+            long segSize = MmapSegment.HEADER_SIZE + MmapSegment.FRAME_HEADER_SIZE + 1L;
+            long buf = Unsafe.malloc(1, MemoryTag.NATIVE_DEFAULT);
+            CountDownLatch busyDrained = new CountDownLatch(1);
+            CountDownLatch siblingInstall = new CountDownLatch(1);
+            AtomicInteger trimPass = new AtomicInteger();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            try (SegmentRing busyRing = new SegmentRing(MmapSegment.createInMemory(0, segSize), segSize);
+                 SegmentRing siblingRing = new SegmentRing(MmapSegment.createInMemory(0, segSize), segSize);
+                 SegmentManager manager = new SegmentManager(segSize, TimeUnit.SECONDS.toNanos(60))) {
+                for (int i = 0; i < sealedCount; i++) {
+                    assertEquals(i, busyRing.appendOrFsn(buf, 1));
+                    busyRing.installHotSpare(MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
+                }
+                assertEquals(sealedCount, busyRing.appendOrFsn(buf, 1));
+                busyRing.installHotSpare(MmapSegment.createInMemory(busyRing.nextSeqHint(), segSize));
+                busyRing.acknowledge(sealedCount - 1L);
+
+                manager.register(busyRing, null);
+                manager.register(siblingRing, null);
+                manager.setBeforeInstallSyncHook(() -> {
+                    try {
+                        assertEquals("the busy ring must stop at the 64-segment quantum before sibling service",
+                                64, busyRing.getSealedSegments().size());
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    } finally {
+                        siblingInstall.countDown();
+                    }
+                });
+                manager.setBeforeTrimSyncHook(() -> {
+                    if (trimPass.incrementAndGet() == 4) {
+                        try {
+                            assertEquals("the next fair pass must fully drain the busy ring",
+                                    0, busyRing.getSealedSegments().size());
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        } finally {
+                            busyDrained.countDown();
+                        }
+                    }
+                });
+                manager.start();
+                assertTrue("manager did not reach sibling spare provisioning",
+                        siblingInstall.await(10, TimeUnit.SECONDS));
+                assertTrue("manager parked instead of immediately rescheduling the remaining ACK batch",
+                        busyDrained.await(10, TimeUnit.SECONDS));
+                if (failure.get() != null) {
+                    throw new AssertionError("ACK batch fairness witness failed", failure.get());
+                }
+            } finally {
+                Unsafe.free(buf, 1, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
     }
 
     @Test
@@ -136,10 +200,12 @@ public class SegmentManagerTest {
             String seg0Path = tmpDir + "/0000000000000000.sfa";
             MmapSegment seg0 = MmapSegment.create(seg0Path, 0, segSize);
             long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
+            try (AckWatermark watermark = AckWatermark.open(tmpDir);
+                 SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                assertTrue("watermark must open", watermark != null);
                 mgr.start();
-                mgr.register(ring, tmpDir);
+                mgr.register(ring, tmpDir, watermark);
 
                 // Fill seg0 (2 frames) and force rotation by appending a third.
                 for (int i = 0; i < 2; i++) ring.appendOrFsn(buf, 32);
@@ -159,6 +225,49 @@ public class SegmentManagerTest {
         });
     }
 
+    /**
+     * SegmentManager creates every rotation spare with manifestRequired
+     * stamped from birth (unlike the engine's own initial segment, which is
+     * created without the flag and stamped separately only after its
+     * manifest is durable -- see CursorSendEngine's fresh-start branch). By
+     * the time a rotation can happen the manifest this slot needs already
+     * exists, so there is no crash window to protect against here; this
+     * pins the byte manager actually writes rather than just the argument it
+     * passes, the same way testHeaderShapeMatchesTheDocumentedLayout pins
+     * MmapSegment's own header bytes rather than restating a constant.
+     */
+    @Test
+    public void testRotationSpareCarriesManifestRequiredFlagOnDisk() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long segSize = MmapSegment.HEADER_SIZE
+                    + 2 * (MmapSegment.FRAME_HEADER_SIZE + 32);
+            MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
+            long buf = Unsafe.malloc(32, MemoryTag.NATIVE_DEFAULT);
+            try (SegmentRing ring = new SegmentRing(seg0, segSize);
+                 SegmentManager mgr = new SegmentManager(segSize, 200_000L)) {
+                mgr.start();
+                mgr.register(ring, tmpDir);
+
+                // Fill seg0 (2 frames) and force rotation by appending a third.
+                for (int i = 0; i < 2; i++) ring.appendOrFsn(buf, 32);
+                assertTrue("spare must land before rotation",
+                        waitFor(() -> !ring.needsHotSpare(), 2000));
+                ring.appendOrFsn(buf, 32); // FSN 2, rotates active to the spare
+
+                MmapSegment spare = ring.getActive();
+                assertNotEquals("rotation must have installed a new active segment", seg0, spare);
+                byte[] bytes = java.nio.file.Files.readAllBytes(Paths.get(spare.path()));
+                assertEquals("spare must carry the current on-disk VERSION",
+                        MmapSegment.VERSION, bytes[4]);
+                assertEquals("spare must be created with the manifestRequired flag "
+                                + "already stamped in its header",
+                        MmapSegment.MANIFEST_REQUIRED_FLAG, bytes[5]);
+            } finally {
+                Unsafe.free(buf, 32, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
     @Test
     public void testMaxTotalBytesCapBlocksProvisioningUntilTrimFrees() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
@@ -170,11 +279,13 @@ public class SegmentManagerTest {
             long cap = 3 * segSize;
             MmapSegment seg0 = MmapSegment.create(tmpDir + "/0000000000000000.sfa", 0, segSize);
             long buf = Unsafe.malloc(64, MemoryTag.NATIVE_DEFAULT);
-            try (SegmentRing ring = new SegmentRing(seg0, segSize);
+            try (AckWatermark watermark = AckWatermark.open(tmpDir);
+                 SegmentRing ring = new SegmentRing(seg0, segSize);
                  SegmentManager mgr = new SegmentManager(segSize, 200_000L, cap)) {
+                assertTrue("watermark must open", watermark != null);
                 mgr.start();
                 // register seeds totalBytes = 1*segSize (initial active).
-                mgr.register(ring, tmpDir);
+                mgr.register(ring, tmpDir, watermark);
 
                 // Manager provisions spare 1 → totalBytes = 2*segSize.
                 assertTrue(waitFor(() -> !ring.needsHotSpare(), 2000));

@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
@@ -35,6 +36,7 @@ import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 
 /**
  * Regression test for M6 — drainer adopting an empty orphan slot would
@@ -85,6 +87,49 @@ public class EmptyOrphanSlotChurnTest {
             }
         }
         Files.remove(sfDir);
+    }
+
+    @Test
+    public void testFreshStartDiscardsSurvivingStaleDictionary() throws Exception {
+        // Regression: a prior fully-drained lifecycle can leave a stale
+        // .symbol-dict behind (a best-effort delete that failed, or a crash in the
+        // close window) with NO segments. A fresh start must DISCARD it -- the
+        // dictionary is load-bearing and the fresh-start producer is not seeded
+        // from it, so trusting a survivor would diverge the producer ids from the
+        // dictionary the send loop replays and misattribute symbols on reconnect.
+        TestUtils.assertMemoryLeak(() -> {
+            // Pre-seed a stale dictionary in the slot, with no segments behind it.
+            PersistedSymbolDict stale = PersistedSymbolDict.openClean(sfDir);
+            assertNotNull(stale);
+            try {
+                stale.appendSymbol("staleX");
+                stale.appendSymbol("staleY");
+                assertEquals(2, stale.size());
+            } finally {
+                stale.close();
+            }
+
+            // A fresh start (no recovered segments) must open a CLEAN, empty
+            // dictionary -- not inherit the survivor.
+            try (CursorSendEngine engine = new CursorSendEngine(sfDir, 4L * 1024 * 1024)) {
+                assertFalse("fresh start must not report a disk recovery",
+                        engine.wasRecoveredFromDisk());
+                PersistedSymbolDict pd = engine.getPersistedSymbolDict();
+                assertNotNull(pd);
+                assertEquals("fresh start must discard the surviving stale dictionary",
+                        0, pd.size());
+            }
+
+            // The survivor's bytes are physically gone, not just hidden: this fresh-start
+            // engine never publishes a frame, so its close() is the fully-drained path,
+            // which unlinks the freshly-truncated dictionary alongside the ring and
+            // watermark (see CursorSendEngine's finishClose: "the dictionary has no
+            // frames behind it"). open() now honestly reports that as ABSENT (null)
+            // rather than fabricating a replacement file to reopen, so the strongest
+            // proof left that the stale bytes are gone is the file's own absence.
+            assertFalse("fully-drained close must remove the discarded dictionary",
+                    java.nio.file.Files.exists(Paths.get(sfDir, ".symbol-dict")));
+        });
     }
 
     @Test

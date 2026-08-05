@@ -24,6 +24,7 @@
 
 package io.questdb.client.std;
 
+import java.io.File;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
@@ -98,6 +99,14 @@ public final class Files {
      */
     public static final long FAILED_MMAP_ADDRESS = -1L;
 
+    // Error codes consumed by isNotFoundError(): the POSIX errno and the two
+    // Windows GetLastError() values that prove a path does not exist. ENOENT
+    // is 2 on every platform the native library ships for (Linux, macOS,
+    // FreeBSD); the Windows pair matches what Rust maps to ErrorKind::NotFound.
+    private static final int ENOENT = 2;
+    private static final int ERROR_FILE_NOT_FOUND = 2;
+    private static final int ERROR_PATH_NOT_FOUND = 3;
+
     private Files() {
     }
 
@@ -152,6 +161,24 @@ public final class Files {
      */
     public static int openRW(long pathPtr) {
         return openRW0(pathPtr);
+    }
+
+    /**
+     * Atomically creates {@code path} for read-write access. Fails with -1
+     * when the path already exists; existing bytes are never truncated.
+     */
+    public static int openRWExclusive(String path) {
+        long ptr = pathPtr(path);
+        try {
+            return openRWExclusive0(ptr);
+        } finally {
+            freePathPtr(ptr);
+        }
+    }
+
+    /** Native-path variant of {@link #openRWExclusive(String)}. */
+    public static int openRWExclusive(long pathPtr) {
+        return openRWExclusive0(pathPtr);
     }
 
     /**
@@ -215,6 +242,24 @@ public final class Files {
      */
     public static long length(long pathPtr) {
         return length0(pathPtr);
+    }
+
+    /**
+     * Whether {@code errno} -- as reported by {@link Os#errno()} immediately
+     * after a failed path-based filesystem call such as {@link #length(String)}
+     * -- PROVES the path did not exist: {@code ENOENT} on POSIX,
+     * {@code ERROR_FILE_NOT_FOUND} / {@code ERROR_PATH_NOT_FOUND} on Windows
+     * (the same codes Rust's {@code io::ErrorKind::NotFound} maps). Any other
+     * code means the call itself failed -- an EIO on a flaky disk, a permission
+     * fault -- and the path's existence is UNKNOWN; callers deciding between an
+     * "absent" and an "error" disposition must treat it as the latter, never as
+     * absence.
+     */
+    public static boolean isNotFoundError(int errno) {
+        if (Os.type == Os.WINDOWS) {
+            return errno == ERROR_FILE_NOT_FOUND || errno == ERROR_PATH_NOT_FOUND;
+        }
+        return errno == ENOENT;
     }
 
     /**
@@ -409,6 +454,29 @@ public final class Files {
     public static native int fsync(int fd);
 
     /**
+     * Forces directory-entry updates under {@code dir} to durable storage.
+     * Returns 0 on success and non-zero on failure. Callers use this after
+     * unlinking files whose absence must survive a host crash.
+     */
+    public static int fsyncDir(String dir) {
+        long ptr = pathPtr(dir);
+        try {
+            return fsyncDir0(ptr);
+        } finally {
+            freePathPtr(ptr);
+        }
+    }
+
+    /**
+     * Forces the directory entry naming {@code path} to durable storage by
+     * syncing its absolute parent directory.
+     */
+    public static int fsyncParentDir(String path) {
+        File parent = new File(path).getAbsoluteFile().getParentFile();
+        return parent == null ? 0 : fsyncDir(parent.getPath());
+    }
+
+    /**
      * Truncates the file to exactly {@code size} bytes via {@code ftruncate}.
      * Returns {@code true} on success. Does NOT reserve disk space — the
      * file's logical size is changed but blocks may be sparse.
@@ -531,6 +599,53 @@ public final class Files {
      */
     public static native int msync(long addr, long len, boolean async);
 
+    // Guards the optional mlock/munlock natives: a packaged native library
+    // built before these symbols existed throws UnsatisfiedLinkError on first
+    // use. Flip to unavailable and report refusal (-1) from then on, so
+    // callers degrade to their unpinned tier instead of crashing.
+    private static volatile boolean mlockLinked = true;
+
+    /**
+     * Best-effort page pin over {@code [addr, addr+len)} of an mmap'd region.
+     * Whole pages containing any part of the range are locked; {@code addr}
+     * should be page-aligned for portability. Returns 0 on success, -1 when
+     * the platform refuses (RLIMIT_MEMLOCK, missing privilege) or the loaded
+     * native library predates the symbol. Callers must treat refusal as a
+     * soft downgrade, never an error.
+     */
+    public static int mlock(long addr, long len) {
+        if (!mlockLinked) {
+            return -1;
+        }
+        try {
+            return mlock0(addr, len);
+        } catch (UnsatisfiedLinkError err) {
+            mlockLinked = false;
+            return -1;
+        }
+    }
+
+    /**
+     * Releases a pin taken by {@link #mlock(long, long)}. Best-effort: a
+     * refusal is ignorable ({@code munmap} implicitly drops any remaining
+     * locks on the range).
+     */
+    public static int munlock(long addr, long len) {
+        if (!mlockLinked) {
+            return -1;
+        }
+        try {
+            return munlock0(addr, len);
+        } catch (UnsatisfiedLinkError err) {
+            mlockLinked = false;
+            return -1;
+        }
+    }
+
+    private static native int mlock0(long addr, long len);
+
+    private static native int munlock0(long addr, long len);
+
     /**
      * Returns a native pointer to the current entry's null-terminated name
      * (UTF-8). Pointer is valid only until the next {@link #findNext(long)}
@@ -555,9 +670,13 @@ public final class Files {
 
     static native int close0(int fd);
 
+    static native int fsyncDir0(long lpszName);
+
     static native int openRO0(long lpszName);
 
     static native int openRW0(long lpszName);
+
+    static native int openRWExclusive0(long lpszName);
 
     static native int openAppend0(long lpszName);
 

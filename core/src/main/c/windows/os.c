@@ -237,3 +237,7 @@ JNIEXPORT jlong JNICALL Java_io_questdb_client_std_Os_currentTimeMicros
 void SaveLastError() {
     TlsSetValue(dwTlsIndexLastError, (LPVOID) (DWORD_PTR) GetLastError());
 };
+
+DWORD GetSavedLastError() {
+    return (DWORD) (DWORD_PTR) TlsGetValue(dwTlsIndexLastError);
+}

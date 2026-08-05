@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
+import io.questdb.client.cutlass.qwp.client.MicrobatchBuffer;
 import io.questdb.client.cutlass.qwp.client.QwpBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketEncoder;
 import io.questdb.client.cutlass.qwp.protocol.QwpTableBuffer;
@@ -1285,6 +1286,144 @@ public class QwpWebSocketEncoderTest {
     }
 
     @Test
+    public void testSplitMessageValidatesArgumentsAndSizeOverflow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 MicrobatchBuffer target = new MicrobatchBuffer(64);
+                 QwpTableBuffer table = new QwpTableBuffer("alpha")) {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                int aapl = dict.getOrAddSymbol("AAPL");
+                dict.getOrAddSymbol("GOOG");
+                table.getOrCreateColumn("sym", TYPE_SYMBOL, false)
+                        .addSymbolWithGlobalId("AAPL", aapl);
+                table.nextRow();
+
+                encoder.beginMessage(1, dict, -1, 1);
+                int tableBodyOffset = encoder.getBuffer().getPosition();
+                encoder.addTable(table);
+                int tableBodyLength = encoder.getBuffer().getPosition() - tableBodyOffset;
+                encoder.finishMessage();
+
+                target.setBufferPos(1);
+                assertFailure(IllegalStateException.class,
+                        "split message target is not empty",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength, false, -1, 1));
+                Assert.assertEquals("invalid target must not be modified", 1, target.getBufferPos());
+                target.reset();
+
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset - 1, tableBodyLength, false, -1, 1));
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, -1, false, -1, 1));
+                assertFailure(IllegalArgumentException.class,
+                        "table body slice is outside the staged message",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength + 1, false, -1, 1));
+                Assert.assertEquals("invalid slices must not write the target", 0, target.getBufferPos());
+
+                assertFailure(IllegalStateException.class,
+                        "split delta does not match the staged message"
+                                + " [stagedStart=0, stagedCount=2, splitStart=1, splitCount=1]",
+                        () -> encoder.copySplitMessage(
+                                target, tableBodyOffset, tableBodyLength, false, 0, 1));
+                Assert.assertEquals("delta mismatch must not write the target", 0, target.getBufferPos());
+
+                assertFailure(IllegalArgumentException.class,
+                        "tableBodyLength must be non-negative",
+                        () -> encoder.getSplitMessageSize(-1, -1, 1));
+                long overflowSize = (long) HEADER_SIZE
+                        + 1 // delta start 0
+                        + 1 // delta count 2
+                        + encoder.getDeltaEntriesLen()
+                        + Integer.MAX_VALUE;
+                assertFailure(OutOfMemoryError.class,
+                        "split QWP message size overflow: " + overflowSize,
+                        () -> encoder.getSplitMessageSize(Integer.MAX_VALUE, -1, 1));
+            }
+        });
+    }
+
+    @Test
+    public void testSplitMessageCopiesStagedTableBodies() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
+                 MicrobatchBuffer target = new MicrobatchBuffer(64);
+                 QwpTableBuffer t0 = new QwpTableBuffer("alpha");
+                 QwpTableBuffer t1 = new QwpTableBuffer("bravo")) {
+                GlobalSymbolDictionary dict = new GlobalSymbolDictionary();
+                int aapl = dict.getOrAddSymbol("AAPL"); // 0
+                int goog = dict.getOrAddSymbol("GOOG"); // 1
+
+                t0.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbolWithGlobalId("AAPL", aapl);
+                t0.getOrCreateColumn("v", TYPE_LONG, false).addLong(1L);
+                t0.nextRow();
+
+                t1.getOrCreateColumn("sym", TYPE_SYMBOL, false).addSymbolWithGlobalId("GOOG", goog);
+                t1.getOrCreateColumn("d", TYPE_DOUBLE, false).addDouble(2.5);
+                t1.getOrCreateColumn("s", TYPE_VARCHAR, true).addString("hello");
+                t1.nextRow();
+
+                encoder.beginMessage(2, dict, -1, 1);
+                int t0BodyOffset = encoder.getBuffer().getPosition();
+                encoder.addTable(t0);
+                int t0BodyLength = encoder.getBuffer().getPosition() - t0BodyOffset;
+                int t1BodyOffset = encoder.getBuffer().getPosition();
+                encoder.addTable(t1);
+                int t1BodyLength = encoder.getBuffer().getPosition() - t1BodyOffset;
+                encoder.finishMessage();
+                long staged = encoder.getBuffer().getBufferPtr();
+
+                // Erase the source tables after their one combined encode. Split
+                // assembly must still reproduce both bodies from staged bytes.
+                t0.clear();
+                t1.clear();
+
+                int firstSize = encoder.copySplitMessage(target, t0BodyOffset, t0BodyLength,
+                        true, -1, 1);
+                long first = target.getBufferPtr();
+                Assert.assertEquals(firstSize, target.getBufferPos());
+                Assert.assertEquals(1, Unsafe.getUnsafe().getShort(first + 6));
+                Assert.assertEquals(firstSize - HEADER_SIZE, Unsafe.getUnsafe().getInt(first + 8));
+                Assert.assertEquals(FLAG_DEFER_COMMIT,
+                        (byte) (Unsafe.getUnsafe().getByte(first + HEADER_OFFSET_FLAGS) & FLAG_DEFER_COMMIT));
+                Cursor cursor = new Cursor(first + HEADER_SIZE);
+                Assert.assertEquals(0, cursor.readVarint());
+                Assert.assertEquals(2, cursor.readVarint());
+                Assert.assertEquals("AAPL", cursor.readString());
+                Assert.assertEquals("GOOG", cursor.readString());
+                for (int i = 0; i < t0BodyLength; i++) {
+                    Assert.assertEquals("first staged table body byte " + i,
+                            Unsafe.getUnsafe().getByte(staged + t0BodyOffset + i),
+                            Unsafe.getUnsafe().getByte(cursor.address + i));
+                }
+
+                target.reset();
+                int secondSize = encoder.copySplitMessage(target, t1BodyOffset, t1BodyLength,
+                        false, 1, 1);
+                long second = target.getBufferPtr();
+                Assert.assertEquals(secondSize, target.getBufferPos());
+                Assert.assertEquals(1, Unsafe.getUnsafe().getShort(second + 6));
+                Assert.assertEquals(secondSize - HEADER_SIZE, Unsafe.getUnsafe().getInt(second + 8));
+                Assert.assertEquals(0,
+                        Unsafe.getUnsafe().getByte(second + HEADER_OFFSET_FLAGS) & FLAG_DEFER_COMMIT);
+                cursor = new Cursor(second + HEADER_SIZE);
+                Assert.assertEquals(2, cursor.readVarint());
+                Assert.assertEquals(0, cursor.readVarint());
+                for (int i = 0; i < t1BodyLength; i++) {
+                    Assert.assertEquals("second staged table body byte " + i,
+                            Unsafe.getUnsafe().getByte(staged + t1BodyOffset + i),
+                            Unsafe.getUnsafe().getByte(cursor.address + i));
+                }
+            }
+        });
+    }
+
+    @Test
     public void testVersionByteInHeader() throws Exception {
         assertMemoryLeak(() -> {
             try (QwpWebSocketEncoder encoder = new QwpWebSocketEncoder();
@@ -1310,6 +1449,22 @@ public class QwpWebSocketEncoderTest {
                 Assert.assertEquals(3, Unsafe.getUnsafe().getByte(ptr + 4));
             }
         });
+    }
+
+    private static void assertFailure(
+            Class<? extends Throwable> expectedType,
+            String expectedMessage,
+            Runnable action
+    ) {
+        Throwable thrown = null;
+        try {
+            action.run();
+        } catch (Throwable t) {
+            thrown = t;
+        }
+        Assert.assertNotNull("expected " + expectedType.getSimpleName(), thrown);
+        Assert.assertEquals(expectedType, thrown.getClass());
+        Assert.assertEquals(expectedMessage, thrown.getMessage());
     }
 
     private static final class Cursor {

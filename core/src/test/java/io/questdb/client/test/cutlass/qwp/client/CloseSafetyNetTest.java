@@ -30,6 +30,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
@@ -37,14 +38,18 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Pins both branches of {@code QwpWebSocketSender.close()}'s safety-net
- * rethrow, strictly — unlike the close assertions in
- * {@link InitialConnectAsyncTest}, which tolerate either outcome:
+ * rethrow using a deterministic server-side parse rejection:
  * <ul>
  * <li>a config-string-only caller (no custom error handler) who never calls
  * flush() MUST see the latched terminal thrown from close() — close() is the
@@ -64,34 +69,33 @@ public class CloseSafetyNetTest {
 
     @Test(timeout = 30_000)
     public void testCloseRethrowsUnsurfacedTerminalWithoutCustomHandler() throws Exception {
-        // A 401 server, no handler: the I/O thread latches a genuine auth
-        // terminal (ws-upgrade-failed / SECURITY_ERROR) that nothing has
-        // surfaced to the user. close() must throw it. (Under Invariant B a
-        // mere connection error would retry forever and never latch -- only a
-        // genuine terminal like auth does.)
-        try (TestWebSocketServer server = new TestWebSocketServer(NOOP_HANDLER)) {
-            server.setRejectWithStatus(401, "Unauthorized");
+        GatedHaltHandler handler = new GatedHaltHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             Sender sender = Sender.fromConfig(cfg(server.getPort()));
-            boolean closed = false;
+            boolean closeAttempted = false;
             try {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                handler.releaseRejection();
                 awaitLatchedTerminal((QwpWebSocketSender) sender);
                 try {
-                    closed = true;
+                    closeAttempted = true;
                     sender.close();
                     Assert.fail("close() must rethrow a terminal error that no synchronous "
                             + "caller and no custom handler has seen");
                 } catch (LineSenderException e) {
                     String msg = e.getMessage() == null ? "" : e.getMessage();
                     Assert.assertTrue("close() must rethrow the latched terminal: " + msg,
-                            msg.contains("ws-upgrade-failed") || msg.contains("401"));
+                            msg.contains("rejected") || msg.contains("parse error"));
                     Assert.assertTrue("the latched instance is the typed server exception",
                             e instanceof LineSenderServerException);
                 }
             } finally {
-                if (!closed) {
-                    sender.close();
+                handler.releaseRejection();
+                if (!closeAttempted) {
+                    closeQuietly(sender);
                 }
             }
         }
@@ -99,22 +103,31 @@ public class CloseSafetyNetTest {
 
     @Test(timeout = 30_000)
     public void testCloseStaysSilentWhenCustomHandlerAlreadyDelivered() throws Exception {
-        // Same auth terminal, but the user installed a custom error handler and
-        // the dispatcher delivered the error to it. close() must NOT
-        // double-signal.
-        try (TestWebSocketServer server = new TestWebSocketServer(NOOP_HANDLER)) {
-            server.setRejectWithStatus(401, "Unauthorized");
+        GatedHaltHandler handler = new GatedHaltHandler();
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             ErrorInbox inbox = new ErrorInbox();
             Sender sender = Sender.builder(cfg(server.getPort()))
                     .errorHandler(inbox)
                     .build();
-            Assert.assertTrue("terminal must reach the custom handler within 10s",
-                    inbox.await(10, TimeUnit.SECONDS));
-            Assert.assertNotNull(inbox.get());
-            // The handler owns the error now; a rethrow here would double-signal.
-            sender.close();
+            boolean closed = false;
+            try {
+                sender.table("foo").longColumn("v", 1L).atNow();
+                sender.flush();
+                handler.releaseRejection();
+                Assert.assertTrue("terminal must reach the custom handler within 10s",
+                        inbox.await(10, TimeUnit.SECONDS));
+                Assert.assertNotNull(inbox.get());
+                // The handler owns the error now; a rethrow here would double-signal.
+                sender.close();
+                closed = true;
+            } finally {
+                handler.releaseRejection();
+                if (!closed) {
+                    closeQuietly(sender);
+                }
+            }
         }
     }
 
@@ -136,19 +149,47 @@ public class CloseSafetyNetTest {
     private String cfg(int port) {
         return "ws::addr=localhost:" + port
                 + ";sf_dir=" + sfDir.getRoot().getAbsolutePath()
-                + ";initial_connect_retry=async"
-                + ";reconnect_max_duration_millis=400"
-                + ";reconnect_initial_backoff_millis=10"
-                + ";reconnect_max_backoff_millis=50"
                 + ";close_flush_timeout_millis=0;";
     }
 
-    private static final TestWebSocketServer.WebSocketServerHandler NOOP_HANDLER =
-            new TestWebSocketServer.WebSocketServerHandler() {
-                @Override
-                public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-                }
-            };
+    private static void closeQuietly(Sender sender) {
+        try {
+            sender.close();
+        } catch (Throwable ignored) {
+            // Cleanup after an earlier assertion; the primary failure wins.
+        }
+    }
+
+    private static final class GatedHaltHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final CountDownLatch gate = new CountDownLatch(1);
+        private final AtomicLong nextSeq = new AtomicLong();
+
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                gate.await();
+                client.sendBinary(buildErrorAck(nextSeq.getAndIncrement()));
+            } catch (IOException | InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+
+        void releaseRejection() {
+            gate.countDown();
+        }
+
+        private static byte[] buildErrorAck(long seq) {
+            byte[] message = "test: parse error".getBytes(StandardCharsets.UTF_8);
+            byte[] response = new byte[1 + 8 + 2 + message.length];
+            ByteBuffer buffer = ByteBuffer.wrap(response).order(ByteOrder.LITTLE_ENDIAN);
+            buffer.put(WebSocketResponse.STATUS_PARSE_ERROR);
+            buffer.putLong(seq);
+            buffer.putShort((short) message.length);
+            buffer.put(message);
+            return response;
+        }
+    }
 
     private static class ErrorInbox implements SenderErrorHandler {
         private final CountDownLatch latch = new CountDownLatch(1);
