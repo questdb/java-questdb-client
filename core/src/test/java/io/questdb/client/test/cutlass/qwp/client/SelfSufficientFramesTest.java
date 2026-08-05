@@ -1253,6 +1253,94 @@ public class SelfSufficientFramesTest {
     }
 
     @Test
+    public void testDictionaryChunksAreCommittedWhenTheDataFrameFailsToPublish() throws Exception {
+        // The uncovered twin of testSectionOverCapWithAnOversizedBodyPublishesNothing-
+        // OnEveryRetry. That one pins the route the pre-flight closes: a batch that can
+        // never ship publishes no chunks at all. This one pins the route it does NOT
+        // close -- splitFramesFit proves the batch is SHIPPABLE once chunked, so the
+        // chunks are published, and then the data frame fails to publish anyway.
+        //
+        // sealAndSwapBuffer throws on a buffer-recycle timeout and on appendBlocking's
+        // backpressure/PAYLOAD_TOO_LARGE paths, none of which a size check can see. The
+        // chunks are already on the ring carrying FLAG_DEFER_COMMIT with no rollback, so
+        // without the commit below the server withholds their ack and clamps the
+        // connection's cumulative watermark for its whole life: trim stops for every
+        // frame, the ring fills, and each retry appends ANOTHER full copy of the
+        // dictionary (full-dict mode re-derives deltaBaseline == -1, so chunking
+        // restarts from id 0). Ingestion in the process is dead until restart.
+        //
+        // Sizing: sf_max_segment_bytes sits between the chunk frame and the data frame,
+        // so the chunks publish and the data frame's append fails with PAYLOAD_TOO_LARGE
+        // -- deterministic, no backpressure timing.
+        Path sfDir = temporaryFolder.newFolder("qwp-sf-chunk-orphan-commit").toPath();
+        String slot = sfDir.resolve("default").toString();
+        assertMemoryLeak(() -> {
+            CapturingHandler handler = new CapturingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(150);
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                UnopenableDictFacade dictFf = new UnopenableDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 100L, 4L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, dictFf);
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 1_000_000, 0, 0L, null, false, engine);
+                try {
+                    // One 40-char symbol makes the dictionary section big enough that
+                    // section+body busts the 150-byte cap, while the body alone fits it
+                    // -- exactly the shape that fires the chunker. The chunk frame
+                    // carries only the section, so it is SMALLER than the data frame.
+                    String sym = TestUtils.repeat("s", 40);
+                    String rowPad = TestUtils.repeat("x", 96);
+                    sender.table("t").symbol("s", sym).stringColumn("p", rowPad).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("the data frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("cursor SF append failed"));
+                    }
+
+                    Assert.assertTrue("the chunker must have published at least one chunk, "
+                                    + "or this test is not on the route it claims",
+                            engine.publishedFsn() >= 0L);
+
+                    // Let the I/O thread ship what is on the ring.
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.batches.size() < 2) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertTrue("expected the chunk(s) plus a commit frame, saw "
+                            + handler.batches.size(), handler.batches.size() >= 2);
+
+                    byte[] last = handler.batches.get(handler.batches.size() - 1);
+                    Assert.assertEquals("the orphaned dictionary group must be CLOSED: the last "
+                                    + "frame has to clear FLAG_DEFER_COMMIT, or the server withholds "
+                                    + "every ack and the ring can never be trimmed again",
+                            0, last[QwpConstants.HEADER_OFFSET_FLAGS] & QwpConstants.FLAG_DEFER_COMMIT);
+                    for (int i = 0; i < handler.batches.size() - 1; i++) {
+                        Assert.assertEquals("frame " + i + " must be a deferred dictionary chunk",
+                                QwpConstants.FLAG_DEFER_COMMIT,
+                                handler.batches.get(i)[QwpConstants.HEADER_OFFSET_FLAGS]
+                                        & QwpConstants.FLAG_DEFER_COMMIT);
+                    }
+                    sender.reset();
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // The retained batch can rethrow here; the assertions above are
+                        // what this test is about.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFullDictCommitFrameCarriesNoDictionaryAfterACancelledRow() throws Exception {
         // sendCommitMessage bounded its delta with currentBatchMaxSymbolId in full-dict
         // mode, on the premise -- stated in its own comment -- that "the prior flush

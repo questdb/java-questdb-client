@@ -1205,6 +1205,19 @@ public class QwpWebSocketSender implements Sender {
                     } catch (BatchTooLargeForCapException e) {
                         resetTableBuffersAfterFlush();
                         terminalError = captureCloseError(terminalError, e);
+                    } catch (Throwable t) {
+                        // Same reasoning as the pre-flight rejection above, for the
+                        // failures a size check cannot see: sealAndSwapBuffer's
+                        // buffer-recycle timeout and appendBlocking's backpressure
+                        // deadline. Letting those escape to the outer catch skipped
+                        // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
+                        // flush that had already published deferred dictionary chunks
+                        // left their group open forever, and every row an EARLIER
+                        // successful flush published was abandoned unacked. The batch is
+                        // NOT discarded here (unlike the over-cap case, this failure is
+                        // not a verdict on the batch's contents), but the rest of close()
+                        // must still run. rethrowTerminal below surfaces it.
+                        terminalError = captureCloseError(terminalError, t);
                     }
                     if (!deferCommit && hasDeferredMessages) {
                         sendCommitMessage();
@@ -3539,6 +3552,43 @@ public class QwpWebSocketSender implements Sender {
         return flushTableBuffers.size();
     }
 
+    /**
+     * Closes the deferred group left behind by {@link #publishDictionaryChunks} when
+     * the flush that was meant to close it throws instead.
+     * <p>
+     * Every dictionary chunk carries {@code FLAG_DEFER_COMMIT}, so the server withholds
+     * its ack and CLAMPS the connection's cumulative-ack watermark until the group
+     * commits. Published frames cannot be rolled back, and the batch is deliberately
+     * retained on the failure paths that reach here -- so without this, {@code ackedFsn}
+     * freezes for the connection's whole life: trim stops for every frame, the ring
+     * fills, and each retry appends another full copy of the dictionary (full-dict mode
+     * re-derives {@code deltaBaseline == -1}, so chunking restarts from id 0). The
+     * process stops ingesting until it is restarted, even though the on-disk state
+     * self-heals -- recovery retires a deferred-only tail as an aborted transaction.
+     * <p>
+     * Committing is the same recovery {@code close()} already performs for an orphaned
+     * group, just early enough to keep the producer alive. It is safe for the chunks
+     * themselves: they carry no rows, and re-registering the same ids with the same
+     * strings is not a redefinition. When the failure came from the SPLIT path the
+     * group may also contain some of the batch's table frames, so the commit can apply
+     * a partial batch -- accepted deliberately, because the retained batch's retry
+     * re-sends every table and dedup collapses the overlap, whereas leaving the group
+     * open kills ingestion outright.
+     * <p>
+     * Best-effort: the commit publishes through the same seal path that just failed, so
+     * it can fail too. Its failure is attached to the original as a suppressed cause
+     * rather than replacing it.
+     */
+    private void commitOrphanedDictionaryChunks(Throwable primary) {
+        try {
+            sendCommitMessage();
+        } catch (Throwable t) {
+            if (t != primary) {
+                primary.addSuppressed(t);
+            }
+        }
+    }
+
     private Endpoint currentEndpoint() {
         int idx = currentEndpointIdx;
         return idx < 0 ? null : endpoints.get(idx);
@@ -3939,43 +3989,59 @@ public class QwpWebSocketSender implements Sender {
         // The re-encode is required, not just a baseline switch inside the split:
         // publishing a chunk resets the encoder buffer the split's staged body
         // slices live in (beginMessage calls buffer.reset()).
+        // splitFramesFit only proves the batch is SHIPPABLE once chunked. It says
+        // nothing about whether the frames that follow will actually publish:
+        // sealAndSwapBuffer throws on a buffer-recycle timeout and on appendBlocking's
+        // backpressure deadline (the ring at sf_max_total_bytes), and neither is
+        // reachable from a size check. Once a chunk is on the ring the flush owns a
+        // commit debt that only its own data frame closes, so track that and close it
+        // on any failure below.
+        boolean dictionaryChunksAwaitCommit = false;
         if (cap > 0 && messageSize > cap
                 && !deltaDictEnabled && currentBatchMaxSymbolId > deltaBaseline
                 && !splitFramesFit(cap, deltaBaseline)
                 && splitFramesFit(cap, currentBatchMaxSymbolId)) {
             publishDictionaryChunks(cap, deltaBaseline + 1, currentBatchMaxSymbolId);
+            dictionaryChunksAwaitCommit = true;
             deltaBaseline = currentBatchMaxSymbolId;
             combinedBodyStart = encodeCombinedFrame(tableCount, deferCommit, deltaBaseline);
             messageSize = encoder.finishMessage();
         }
-        QwpBufferWriter buffer = encoder.getBuffer();
+        try {
+            QwpBufferWriter buffer = encoder.getBuffer();
 
-        if (cap > 0 && messageSize > cap) {
-            // Keep the completed combined frame staged in the encoder while the
-            // split path copies its delta entries and table-body slices.
-            flushPendingRowsSplit(deferCommit, combinedBodyStart, cap, deltaBaseline);
-            return;
+            if (cap > 0 && messageSize > cap) {
+                // Keep the completed combined frame staged in the encoder while the
+                // split path copies its delta entries and table-body slices.
+                flushPendingRowsSplit(deferCommit, combinedBodyStart, cap, deltaBaseline);
+                return;
+            }
+
+            // Write-ahead: durably persist this frame's new symbols BEFORE it is
+            // published, so a recovered/orphan-drained slot can always rebuild the
+            // dictionary the (non-self-sufficient) delta frame references. No-op in
+            // memory mode and when the frame introduces no new symbols.
+            persistNewSymbolsBeforePublish();
+            activeBuffer.ensureCapacity(messageSize);
+            activeBuffer.write(buffer.getBufferPtr(), messageSize);
+            activeBuffer.incrementRowCount();
+            sealAndSwapBuffer();
+            // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
+            // advance the delta baseline so the next frame ships only newer ids.
+            advanceSentMaxSymbolId();
+
+            hasDeferredMessages = deferCommit;
+            if (!deferCommit) {
+                lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+            }
+
+            resetTableBuffersAfterFlush();
+        } catch (Throwable t) {
+            if (dictionaryChunksAwaitCommit) {
+                commitOrphanedDictionaryChunks(t);
+            }
+            throw t;
         }
-
-        // Write-ahead: durably persist this frame's new symbols BEFORE it is
-        // published, so a recovered/orphan-drained slot can always rebuild the
-        // dictionary the (non-self-sufficient) delta frame references. No-op in
-        // memory mode and when the frame introduces no new symbols.
-        persistNewSymbolsBeforePublish();
-        activeBuffer.ensureCapacity(messageSize);
-        activeBuffer.write(buffer.getBufferPtr(), messageSize);
-        activeBuffer.incrementRowCount();
-        sealAndSwapBuffer();
-        // The frame carrying ids up to currentBatchMaxSymbolId is now on the ring;
-        // advance the delta baseline so the next frame ships only newer ids.
-        advanceSentMaxSymbolId();
-
-        hasDeferredMessages = deferCommit;
-        if (!deferCommit) {
-            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
-        }
-
-        resetTableBuffersAfterFlush();
     }
 
     /**
@@ -4528,25 +4594,40 @@ public class QwpWebSocketSender implements Sender {
                                 + "column instead of symbol for this data");
             }
         }
+        // Pass two publishes. Every chunk is a DEFERRED frame, so from the first
+        // successful publish onward this method owns a commit debt: if a later chunk
+        // throws (sealAndSwapBuffer's buffer-recycle timeout, or appendBlocking's
+        // backpressure deadline when the ring is at sf_max_total_bytes), the chunks
+        // already on the ring have no rollback and nothing downstream will close their
+        // group. Close it here instead -- see commitOrphanedDictionaryChunks.
         int chunkStart = from;
         long chunkBytes = 0;
-        for (int id = from; id <= batchMaxId; id++) {
-            int entryBytes = dictionaryEntryWireBytes(id);
-            // Size the frame this entry WOULD produce, with the count varint the
-            // grown chunk actually needs -- a reserve-based estimate can be one byte
-            // short exactly when the count crosses a varint boundary.
-            long withEntry = (long) QwpConstants.HEADER_SIZE
-                    + NativeBufferWriter.varintSize(chunkStart)
-                    + NativeBufferWriter.varintSize(id - chunkStart + 1)
-                    + chunkBytes + entryBytes;
-            if (id > chunkStart && withEntry > cap) {
-                publishDictionaryChunk(chunkStart, id - 1);
-                chunkStart = id;
-                chunkBytes = 0;
+        boolean anyChunkPublished = false;
+        try {
+            for (int id = from; id <= batchMaxId; id++) {
+                int entryBytes = dictionaryEntryWireBytes(id);
+                // Size the frame this entry WOULD produce, with the count varint the
+                // grown chunk actually needs -- a reserve-based estimate can be one byte
+                // short exactly when the count crosses a varint boundary.
+                long withEntry = (long) QwpConstants.HEADER_SIZE
+                        + NativeBufferWriter.varintSize(chunkStart)
+                        + NativeBufferWriter.varintSize(id - chunkStart + 1)
+                        + chunkBytes + entryBytes;
+                if (id > chunkStart && withEntry > cap) {
+                    publishDictionaryChunk(chunkStart, id - 1);
+                    anyChunkPublished = true;
+                    chunkStart = id;
+                    chunkBytes = 0;
+                }
+                chunkBytes += entryBytes;
             }
-            chunkBytes += entryBytes;
+            publishDictionaryChunk(chunkStart, batchMaxId);
+        } catch (Throwable t) {
+            if (anyChunkPublished) {
+                commitOrphanedDictionaryChunks(t);
+            }
+            throw t;
         }
-        publishDictionaryChunk(chunkStart, batchMaxId);
         if (LOG.isDebugEnabled()) {
             LOG.debug("Registered symbol dictionary in chunks [from={}, to={}, cap={}]",
                     from, batchMaxId, cap);
