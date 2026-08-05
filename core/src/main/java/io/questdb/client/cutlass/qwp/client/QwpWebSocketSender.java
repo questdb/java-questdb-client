@@ -3156,6 +3156,18 @@ public class QwpWebSocketSender implements Sender {
         // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
         // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
         // Mirrors QwpQueryClient, which likewise resolves the credential once before its endpoint walk.
+        // Publish this thread as being inside the pull BEFORE making it, then re-check cancellation, exactly
+        // as the per-endpoint connect below does with the WebSocketClient. The pull is the one blocking call
+        // in the walk that cancel()'s closeTraffic() cannot reach - it runs caller-supplied HttpTokenProvider
+        // code - and it can outlast close()'s shutdown budget, so cancel() breaks it with an interrupt
+        // instead. Skipped on the foreground path, where cancellation is null and close() is not racing us.
+        if (cancellation != null) {
+            cancellation.publishCredentialPull(Thread.currentThread());
+            if (cancellation.isCancelled()) {
+                cancellation.clearCredentialPull();
+                throw new LineSenderException(ctx.abortMessage());
+            }
+        }
         final String authHeader;
         try {
             authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
@@ -3168,6 +3180,12 @@ public class QwpWebSocketSender implements Sender {
             // terminal -- so a recoverable credential outage never drops a producer store-and-forward promised
             // to keep alive.
             throw new QwpCredentialUnavailableException(e);
+        } finally {
+            // Drop the marker as soon as the pull returns, so a later cancel() cannot interrupt this thread
+            // at an arbitrary point in the walk. Mirrors ConnectCancellation.clear() for the in-flight client.
+            if (cancellation != null) {
+                cancellation.clearCredentialPull();
+            }
         }
         while (true) {
             if (ctx.isAborted()) {

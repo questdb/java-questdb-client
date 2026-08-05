@@ -3632,9 +3632,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // Latched once close() requested cancellation. Written by the owner
         // thread (cancel); read by the I/O thread's pre-connect guard.
         private volatile boolean cancelled;
+        // The I/O thread while it is inside a credential pull -- the one
+        // blocking call in the connect walk that closeTraffic() cannot reach,
+        // because it runs caller-supplied HttpTokenProvider code. Written by
+        // the I/O thread only (publishCredentialPull/clearCredentialPull);
+        // read by the owner thread (cancel). null when no pull is in flight.
+        private volatile Thread credentialPullThread;
+
+        public void clearCredentialPull() {
+            credentialPullThread = null;
+        }
 
         public boolean isCancelled() {
             return cancelled;
+        }
+
+        /**
+         * I/O-thread hook: record this thread as being about to enter a
+         * credential pull, BEFORE the blocking call. Pairs with
+         * {@link #cancel()} the same way {@link #publish(WebSocketClient)}
+         * does, except the break lever is an interrupt rather than
+         * {@code closeTraffic()} -- a token provider is caller code and owns
+         * no socket the sender can shut down.
+         */
+        public void publishCredentialPull(Thread thread) {
+            credentialPullThread = thread;
         }
 
         /**
@@ -3673,6 +3695,20 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             WebSocketClient c = inFlight;
             if (c != null) {
                 c.closeTraffic();
+            }
+            // A credential pull is caller code, so closeTraffic() cannot reach it, yet it can block far
+            // longer than close()'s shutdown budget: OidcDeviceAuth.getToken() waits up to
+            // 4 x httpTimeoutMillis (120s by default) behind a peer's silent refresh, against a 30s
+            // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS. During an IdP outage the drainer sits inside a pull for
+            // most of every retry cycle, so close() lands there routinely, not just in a narrow race. An
+            // interrupt is the only lever that reaches a Java-level wait; OidcDeviceAuth converts it into a
+            // provider failure, which the reconnect loop treats as a transient outage and then observes the
+            // abort. Fires ONLY while a pull is in flight, so a sender with no token provider is untouched.
+            // It does NOT cover a provider stalled in an OS-level TCP connect, which ignores interrupts --
+            // close() still loud-fails on its budget there, as it did before.
+            Thread t = credentialPullThread;
+            if (t != null) {
+                t.interrupt();
             }
         }
     }

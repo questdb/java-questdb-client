@@ -36,6 +36,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -268,6 +269,79 @@ public class WebSocketTokenProviderTest {
                     waitFor(() -> handler.totalBinaryReceived.get() >= 2, 10_000);
                     Assert.assertTrue("the provider must be re-queried on the reconnect retry (>=3 pulls), got " + calls.get(),
                             calls.get() >= 3);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testCloseBreaksADrainerBlockedInACredentialPull() throws Exception {
+        assertMemoryLeak(() -> {
+            // The reconnect walk publishes the WebSocketClient it is about to block on so close() can break it
+            // (ConnectCancellation), but the credential pull that now precedes the walk is caller code owning
+            // no socket, so closeTraffic() cannot reach it. A pull can outlast close()'s 30s shutdown budget -
+            // OidcDeviceAuth.getToken() waits up to 4 x httpTimeoutMillis behind a peer's silent refresh - and
+            // during an IdP outage the drainer sits inside a pull for most of every retry cycle, so close()
+            // lands there routinely. Before the fix close() burned the whole budget and then threw
+            // "cursor I/O thread did not stop", delegating teardown, on what is a clean shutdown.
+            CountDownLatch pullEntered = new CountDownLatch(1);
+            CountDownLatch neverReleased = new CountDownLatch(1);
+            AtomicBoolean blockNextPull = new AtomicBoolean(false);
+            AtomicBoolean sawInterrupt = new AtomicBoolean(false);
+            AtomicInteger calls = new AtomicInteger();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .reconnectInitialBackoffMillis(20)
+                        .reconnectMaxBackoffMillis(20)
+                        .httpTokenProvider(() -> {
+                            int n = calls.incrementAndGet();
+                            if (blockNextPull.get()) {
+                                pullEntered.countDown();
+                                try {
+                                    // only an interrupt can free this, exactly like OidcDeviceAuth's timed
+                                    // wait for its instance lock behind a peer's silent refresh
+                                    neverReleased.await(45, TimeUnit.SECONDS);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    sawInterrupt.set(true);
+                                    throw new OidcAuthException("interrupted while waiting for a token");
+                                }
+                            }
+                            return "TOKEN-" + n;
+                        })
+                        .build();
+                boolean closed = false;
+                try {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    // arm the block, then let the server's drop drive the background reconnect into the pull
+                    blockNextPull.set(true);
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("the drainer must reach the credential pull",
+                            pullEntered.await(15, TimeUnit.SECONDS));
+
+                    long startNanos = System.nanoTime();
+                    sender.close();
+                    closed = true;
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // the budget is 30s; anything near it means close() waited it out instead of breaking
+                    // the pull. A generous ceiling keeps this off the CI flake line while still failing the
+                    // pre-fix behaviour by a wide margin.
+                    Assert.assertTrue("close() must break the pull, not wait out the shutdown budget; took "
+                            + elapsedMillis + "ms", elapsedMillis < 15_000);
+                    Assert.assertTrue("close() must interrupt the thread parked in the pull", sawInterrupt.get());
+                } finally {
+                    if (!closed) {
+                        neverReleased.countDown();
+                        sender.close();
+                    }
                 }
             }
         });
