@@ -427,6 +427,40 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testFrozenSchemaEndpointsCarryAnExplicitPort() throws Exception {
+        assertMemoryLeak(() -> {
+            // The file NAME hash is pinned by testHashMatchesFrozenCrossLanguageContract; the file BODY was
+            // not. The two endpoint fields are part of the fingerprint and are compared with an exact string
+            // compare, not a URL compare, so they must carry the canonical rendering - port always explicit -
+            // that design/oidc-token-persistence.md specifies. A peer client (the Python one) that writes the
+            // default port implicitly produces a file this client silently ignores: load() returns null, the
+            // process re-prompts and re-persists in its own encoding, and the two never converge. That is
+            // invisible in every other test, because they all round-trip through this client's own writer.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            String withPort = "{\"v\":1,\"client_id\":\"questdb\","
+                    + "\"token_endpoint\":\"https://idp.example.com:443/token\","
+                    + "\"device_authorization_endpoint\":\"https://idp.example.com:443/device\","
+                    + "\"scope\":\"openid\",\"groups_in_token\":false,"
+                    + "\"access_token\":\"ACCESS-1\",\"refresh_token\":\"REFRESH-1\","
+                    + "\"expires_at_millis\":1730000000000,\"token_ttl_millis\":300000}";
+            Files.write(tokenFile(dir, key), withPort.getBytes(StandardCharsets.UTF_8));
+            Assert.assertNotNull("the documented encoding must load", store.load(key));
+
+            // the same document with the default ports omitted - the shape a naive reading of the schema
+            // example invites - must NOT load, which is exactly why the spec pins the explicit port
+            String withoutPort = withPort
+                    .replace("https://idp.example.com:443/token", "https://idp.example.com/token")
+                    .replace("https://idp.example.com:443/device", "https://idp.example.com/device");
+            Files.write(tokenFile(dir, key), withoutPort.getBytes(StandardCharsets.UTF_8));
+            Assert.assertNull("an implicit default port must not match the canonical fingerprint",
+                    store.load(key));
+        });
+    }
+
+    @Test
     public void testHashMatchesFrozenCrossLanguageContract() throws Exception {
         assertMemoryLeak(() -> {
             // the file name is a frozen cross-language contract (the Python client mirrors it byte for byte):

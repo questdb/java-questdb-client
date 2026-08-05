@@ -113,6 +113,22 @@ public interface TokenStore {
 
     /** Remove any persisted tokens for this identity. */
     void clear(TokenStoreKey key);
+
+    /** Layer 2 (optional): run action while holding the per-identity cross-process lock.
+     *  The default just runs it unlocked, so a store with no cross-process concern stays a
+     *  plain load/save/clear. An implementation that cannot acquire the lock within its
+     *  budget should run action anyway (degrade to Layer 1) rather than fail a sign-in.
+     *  NOT re-entrant: action must not call back into the owning OidcDeviceAuth. */
+    default boolean inLock(TokenStoreKey key, CriticalSection action) {
+        return action.run();
+    }
+
+    /** The critical section; its boolean result (whether a valid token resulted) is
+     *  returned by inLock unchanged. */
+    @FunctionalInterface
+    interface CriticalSection {
+        boolean run();
+    }
 }
 ```
 
@@ -127,7 +143,8 @@ public final class TokenStoreKey {
     private final String scope;
     private final String audience;                 // may be null
     private final boolean groupsInToken;
-    // getters; equals/hashCode over all fields
+    // getters only; identity is the hash() below plus the per-field fingerprint compare on
+    // load, so no equals/hashCode - the key is never used as a hash-map key
     // hash(): hex SHA-256 of a canonical join of the fields, for use as a file name
 }
 ```
@@ -179,7 +196,12 @@ Convenience: `FileTokenStore.atDefaultLocation()` and `FileTokenStore.at(Path di
   the live config** => return `null` (treat as "no cache"), never throw into the sign-in
   path. The fingerprint re-check is defence in depth against a copied/renamed/hostile file
   whose name happens to collide.
-- **clear():** `Files.deleteIfExists(target)`.
+- **clear():** `Files.deleteIfExists(target)`, run **under the same cross-process lock** as the
+  read-refresh-write, so a peer's in-flight refresh cannot resurrect the entry by renaming a fresh
+  file in just after the delete. It returns without creating the directory when nothing is
+  persisted yet. Cross-process clear stays best-effort: a peer holding a live in-memory token may
+  legitimately re-persist afterwards. It always forces a fresh sign-in for the calling process,
+  which resets its in-memory token state regardless.
 
 ## Integration into `OidcDeviceAuth`
 
@@ -318,8 +340,8 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
   {
     "v": 1,
     "client_id": "questdb",
-    "token_endpoint": "https://idp.example.com/as/token.oauth2",
-    "device_authorization_endpoint": "https://idp.example.com/as/device_authz.oauth2",
+    "token_endpoint": "https://idp.example.com:443/as/token.oauth2",
+    "device_authorization_endpoint": "https://idp.example.com:443/as/device_authz.oauth2",
     "scope": "openid",
     "audience": "api://billing",
     "groups_in_token": false,
@@ -334,6 +356,14 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
   them against the live config and ignore the file on mismatch (defence in depth against a
   hash collision or a copied/renamed file). `expires_at_millis` is absolute wall-clock, so
   it is portable across a restart and across machines that share a clock.
+
+  The two endpoint fields MUST carry the same `canon(endpoint)` rendering the file name
+  hashes — in particular **with the port always explicit**, as in the example above. The
+  re-check is a byte-exact string compare, not a URL comparison, so a writer that omits the
+  default port produces a file every other client silently ignores: `load` returns null, the
+  process re-prompts, and it re-persists in its own encoding, so the two never converge. This
+  is the one field-level normalization that is load-bearing rather than best-effort — unlike
+  the hash, where drift only costs a missed share.
 
   A field whose value is null - an absent `audience`, or a token kind the grant did not
   return (e.g. no `id_token`) - is **omitted entirely**, not written as JSON `null`. QuestDB's
@@ -379,8 +409,8 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   mandates the lock-file scheme; OS advisory locks are out.
 - **Lock file:** `<hex>.lock` beside the token file, containing a unique per-acquisition
   owner stamp — the holder's `pid@host`, a creation timestamp, and a random nonce.
-  Acquire by an exclusive-create that writes the owner stamp in the SAME atomic open (create
-  and stamp are one operation, not two — see the empty-lock note below); on contention, spin
+  Acquire by an exclusive-create (`O_CREAT|O_EXCL`) and write the owner stamp through that same
+  open handle — see the empty-lock note below for the window this leaves; on contention, spin
   with short backoff up to a small acquire budget (~3s); if it still cannot be acquired,
   **proceed without it** (degrade to Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
   is treated as abandoned and stolen, so a crashed holder cannot wedge others. The window
@@ -396,21 +426,30 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   raises the HTTP timeout must raise this window in step. A client MUST NOT advertise a tighter
   guarantee than this (an earlier draft claimed ~480s alone, omitting the connection phase).
 - **An empty/unstamped lock is reclaimable on a short grace, not the full staleness window.**
-  Acquire writes the owner stamp in the SAME atomic exclusive-create (one `O_CREAT|O_EXCL` open,
-  then the nonce), so a LIVE lock always carries a stamp and there is **no create→stamp gap** for
-  a GC/safepoint pause to straddle. An empty `<hex>.lock` can therefore arise only from a crash
-  mid-write — the exclusive create succeeded but the nonce write did not — a rare, narrow window
-  entirely inside the single write call (no bytecode boundary between two separate syscalls where
-  a pause is reported). Its mtime is fresh, which the staleness check would protect for the whole
-  window, wedging peers into lock-free refreshes; so treat a lock that carries no readable owner
-  stamp as stealable once it is older than a short grace (a few seconds) instead of the full
-  window. A cross-machine clock skew wider than the grace (the age check compares the local clock
+  The exclusive create and the stamp write are two operations on one open handle, so the file
+  **does exist empty** between them. That window is small — no I/O sits between the two — but it
+  is real, and a GC/safepoint pause or a descheduled thread CAN land in it, as can a crash
+  mid-write. Its mtime is fresh, which the staleness check would protect for the whole window,
+  wedging peers into lock-free refreshes; so treat a lock that carries no readable owner stamp
+  as stealable once it is older than a short grace — **5 seconds**, which must dominate the
+  create→stamp window on any implementation — instead of the full staleness window. **The grace,
+  not the absence of the window, is what stops a peer from stealing a lock that is mid-stamp**, so
+  a client MUST NOT shorten it on the assumption that create-with-stamp is atomic: it is not, in
+  Java (`FileChannel.open(CREATE_NEW)` then `write`) or in Python (`os.open(O_CREAT|O_EXCL)` then
+  `write`). A cross-machine clock skew wider than the grace (the age check compares the local clock
   against the file's mtime) could still pre-empt such a partial lock, but that never forges or
   tears a credential — Layer 1's atomic replacement always holds — it degrades to a concurrent
   refresh (a re-prompt on a rotating-refresh-token IdP), the same best-effort residual as running
   lock-free. The capture-then-verify steal below still aborts if the captured lock does not match
-  what was judged stale. The Python client MUST mirror this atomic create-with-stamp and the
-  empty-lock grace.
+  what was judged stale. The Python client MUST mirror the 5-second empty-lock grace.
+- **Bounded lock read.** A `<hex>.lock` larger than **4 KiB** is not read; it is treated as
+  carrying no readable stamp, i.e. as an empty lock subject to the grace above. An owner stamp is
+  tens of bytes, so a client MUST keep its stamp well under that cap or its live locks will be
+  stolen after the grace.
+- **Temp-file hygiene must not touch steal captures.** A client that sweeps its own stale
+  `<hex>*.tmp` files MUST skip any name containing `.lock.`: the capture-then-verify steal below
+  renames the lock to `<hex>.lock.<random>.tmp` while it decides, and deleting another client's
+  capture breaks its steal.
 - **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
   **only when it still carries that holder's own owner stamp**, never by bare path. Should
   a hold ever outrun the staleness window and be stolen and recreated by a peer, the
@@ -435,7 +474,7 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   deadlock.
 
 - **SPI shape:** keep `TokenStore` simple for the no-coordination case and add one
-  optional hook, e.g. `default <T> T inLock(TokenStoreKey, Supplier<T> action)` that just
+  optional hook, `default boolean inLock(TokenStoreKey, CriticalSection action)` that just
   runs `action` (no lock). `FileTokenStore` overrides it with the lock-file protocol;
   `OidcDeviceAuth` wraps its refresh step in `inLock` and does the re-read-then-decide
   (steps 2–4) as the action body. A store with no cross-process concern stays a plain
