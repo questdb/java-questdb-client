@@ -1889,6 +1889,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // cap-gap dwell (see MAX_CATCHUP_CAP_GAP_ATTEMPTS).
                 resetCatchUpCapGapEpisode();
                 lastReconnectError = e;
+                // Retrying must not be programmatically INVISIBLE, exactly as for the auth/upgrade and
+                // durable-ack policy failures above: a revoked refresh token or a permanently unreachable IdP
+                // is not self-healing, yet flush() keeps returning success while SF absorbs the rows. Without
+                // this dispatch the only signal is a throttled slf4j WARN - and this library ships embedded,
+                // frequently with no binding configured - until SF fills and the failure resurfaces as ring
+                // backpressure, pointing the operator at disk sizing instead of at their credentials. It stays
+                // RETRIABLE, not TERMINAL: the handler learns the wire is down while the producer stays alive
+                // and no data is at risk (Invariant B).
+                dispatchRetriedEndpointPolicyFailure(
+                        SenderError.Category.SECURITY_ERROR, "credential-unavailable: " + e.getMessage());
                 long now = System.nanoTime();
                 if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
                     LOG.warn("{} attempt {}: the token provider failed ({}); retrying with capped backoff -- "

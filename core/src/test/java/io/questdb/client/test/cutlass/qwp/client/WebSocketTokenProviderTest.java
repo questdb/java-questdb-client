@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -39,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -266,6 +268,77 @@ public class WebSocketTokenProviderTest {
                     waitFor(() -> handler.totalBinaryReceived.get() >= 2, 10_000);
                     Assert.assertTrue("the provider must be re-queried on the reconnect retry (>=3 pulls), got " + calls.get(),
                             calls.get() >= 3);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testPersistentCredentialOutageIsReportedToTheErrorHandler() throws Exception {
+        assertMemoryLeak(() -> {
+            // Retrying a credential outage forever (Invariant B) must not make it programmatically INVISIBLE.
+            // A revoked refresh token or a permanently dead IdP is not self-healing, yet the drainer keeps
+            // retrying and flush() keeps returning success while SF absorbs the rows; without a dispatched
+            // SenderError the only signal is a throttled slf4j WARN - and this library ships embedded, often
+            // with no binding configured - until SF fills and the failure resurfaces as ring backpressure,
+            // pointing the operator at disk sizing instead of at their credentials. The auth/upgrade and
+            // durable-ack policy failures already dispatch a RETRIABLE error for exactly this reason; the
+            // credential arm did not. RETRIABLE, not TERMINAL: the handler learns the wire is down while the
+            // producer stays alive and no data is at risk.
+            AtomicBoolean providerFailing = new AtomicBoolean(false);
+            AtomicInteger calls = new AtomicInteger();
+            AtomicReference<SenderError> credentialError = new AtomicReference<>();
+            AtomicReference<SenderError> terminalError = new AtomicReference<>();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + port)
+                        .reconnectInitialBackoffMillis(20)
+                        .reconnectMaxBackoffMillis(20)
+                        .errorHandler(e -> {
+                            if (e.getAppliedPolicy() == SenderError.Policy.TERMINAL) {
+                                terminalError.compareAndSet(null, e);
+                            } else if (e.getServerMessage() != null
+                                    && e.getServerMessage().contains("credential-unavailable")) {
+                                credentialError.compareAndSet(null, e);
+                            }
+                        })
+                        .httpTokenProvider(() -> {
+                            int n = calls.incrementAndGet();
+                            if (providerFailing.get()) {
+                                throw new OidcAuthException("persistent: not signed in");
+                            }
+                            return "TOKEN-" + n;
+                        })
+                        .build()) {
+                    Assert.assertEquals("Bearer TOKEN-1", server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                    // arm the outage before the drop, so every reconnect pull throws
+                    providerFailing.set(true);
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
+
+                    // the handler must be told, by category and by message, that the CREDENTIAL is the problem
+                    waitFor(() -> credentialError.get() != null, 15_000);
+                    SenderError err = credentialError.get();
+                    Assert.assertEquals(SenderError.Category.SECURITY_ERROR, err.getCategory());
+                    Assert.assertEquals(SenderError.Policy.RETRIABLE, err.getAppliedPolicy());
+                    Assert.assertTrue("the provider's own message must reach the handler: " + err.getServerMessage(),
+                            err.getServerMessage().contains("not signed in"));
+
+                    // and it stays RETRIABLE: no terminal, and the producer is still alive
+                    Assert.assertNull("a credential outage must never latch a terminal", terminalError.get());
+                    sender.table("foo").longColumn("v", 2L).atNow();
+
+                    // the provider recovers -> the next reconnect succeeds and the buffered rows drain
+                    providerFailing.set(false);
+                    sender.flush();
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
                 }
             }
         });
