@@ -203,6 +203,15 @@ Convenience: `FileTokenStore.atDefaultLocation()` and `FileTokenStore.at(Path di
   legitimately re-persist afterwards. It always forces a fresh sign-in for the calling process,
   which resets its in-memory token state regardless.
 
+  `clear()` MUST also delete the identity's **write temps** (`<hex>*.tmp`, excluding `.lock.`
+  captures — see *Temp-file hygiene* below), at **any age**, not just past the staleness window a
+  `save()`-time sweep uses. A crash between the temp create and the atomic rename orphans a file
+  holding the full entry — refresh token included — in plaintext, and a caller that clears and then
+  never signs in again would otherwise leave that credential on disk indefinitely, which
+  contradicts what `clear()` promises. A temp a concurrent writer is mid-rename on is a benign
+  loser: its rename fails, persistence is best-effort, and the caller is discarding the credential
+  anyway.
+
 ## Integration into `OidcDeviceAuth`
 
 All four touch points sit under the existing `ReentrantLock`, so persistence I/O is
@@ -212,11 +221,24 @@ already serialised with sign-in/refresh/clear and needs no new locking.
    guarded by a `boolean storeLoadAttempted` flag:
    ```java
    if (tokenStore != null && !storeLoadAttempted) {
-       storeLoadAttempted = true;            // set first: a bad file is not retried every call
-       PersistedToken t = tokenStore.load(storeKey);
+       // Latch only AFTER a read that COMPLETED. A missing, corrupt or foreign-identity file
+       // yields null without throwing, so that answer is definitive and is not re-read. A read
+       // that THREW is not an answer: latching there would disable persistence for the life of
+       // the instance on one transient fault, sending a headless getToken() consumer back to an
+       // interactive flow it cannot run.
+       PersistedToken t = tokenStore.load(storeKey);   // a throw here leaves the flag unset
+       storeLoadAttempted = true;
        if (t != null) {
-           // validate the SERVED token kind exactly as a wire token (reuse validateTokenChars);
-           // ignore the file on any failure rather than throw
+           // Tell an ABSENT served kind apart from a CORRUPT one; the safe answer differs.
+           //   absent (null)  -> legitimate: a grant that returned only the other kind persists
+           //                     this shape. Keep the refresh token, leave the cache empty and
+           //                     expired, and let the refresh path do the rest. Discarding it
+           //                     would re-prompt a human where one silent refresh would do.
+           //   present but unusable (blank, or a control/non-ASCII char) -> positive evidence
+           //                     something else wrote this file. Reject the WHOLE entry,
+           //                     refresh token included: adopting the refresh token of a
+           //                     tampered file would let whoever can write the store swap in
+           //                     their own and have the client silently sign in as them.
            accessToken = t.getAccessToken();
            idToken = t.getIdToken();
            refreshToken = t.getRefreshToken();
@@ -375,6 +397,14 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
   The document MUST be a single flat JSON object. A reader rejects any other shape - an array
   anywhere (for example a top-level `[ {…} ]` wrapper) or a non-object root - rather than
   extract fields from a malformed structure. The Python client MUST do the same.
+
+  The numeric fields (`v`, `expires_at_millis`, `token_ttl_millis`) are **plain JSON integers**:
+  an optional leading `-` followed by bare digits. A reader MUST NOT accept its own language's
+  numeric extensions here — QuestDB's `Numbers.parseLong` would otherwise take `1_000` and `5L`,
+  and Python's `int()` takes `1_000` and surrounding whitespace. A value only one implementation
+  can parse is a file only that implementation can read, which is exactly the divergence this
+  frozen format exists to prevent; treat anything outside the plain-integer grammar as unusable
+  and fall back as for any other bad field.
 - **Write protocol (atomicity):** write a sibling temp file created with 0600, flush, then
   **atomically rename** over the target — Java `Files.move(tmp, target, ATOMIC_MOVE,
   REPLACE_EXISTING)`, Python `os.replace(tmp, target)`. Both are `rename(2)` on POSIX
@@ -449,7 +479,19 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
 - **Temp-file hygiene must not touch steal captures.** A client that sweeps its own stale
   `<hex>*.tmp` files MUST skip any name containing `.lock.`: the capture-then-verify steal below
   renames the lock to `<hex>.lock.<random>.tmp` while it decides, and deleting another client's
-  capture breaks its steal.
+  capture breaks its steal. (The exclusion applies to `clear()`'s any-age sweep too.)
+- **Putting a captured lock back is not a rename.** When capture-then-verify decides the lock it
+  grabbed is *live* after all — a peer recreated it in the gap — the lock must be restored, and a
+  plain "rename back if the target is free" is the wrong primitive: Java `Files.move` without
+  `REPLACE_EXISTING` and Python `os.rename` both stat the target and then rename, so a third party
+  claiming the freed path between those two steps has its live lock silently destroyed by the very
+  call meant to leave it alone. Restore with a primitive that fails when the target exists and
+  cannot replace it — `link(2)` (Java `Files.createLink`, Python `os.link`) followed by unlinking
+  the capture. A filesystem without hard links may fall back to the rename, accepting that window.
+  A residual remains either way: if a third party did claim the path, the recreating peer's lock
+  file is gone while that peer still believes it holds the lock, so two holders can run for that
+  one refresh. No filesystem offers an atomic "rename only if the content is still X", so the
+  capture-verify narrows this window without closing it.
 - **Release verifies ownership.** A holder releases by re-reading the lock and deleting it
   **only when it still carries that holder's own owner stamp**, never by bare path. Should
   a hold ever outrun the staleness window and be stolen and recreated by a peer, the

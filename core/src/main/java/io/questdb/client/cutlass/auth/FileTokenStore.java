@@ -263,6 +263,15 @@ public final class FileTokenStore implements TokenStore {
             } catch (IOException e) {
                 throw new OidcAuthException(e).put("could not remove the OIDC token store file");
             }
+            // Also remove any write temp for this identity. A crash between createTempFile and the atomic
+            // rename orphans a <hash><random>.tmp holding the FULL serialized entry - access, id and refresh
+            // tokens in plaintext - and until now nothing here reclaimed it: sweepStaleTempFiles runs only
+            // from save(), so a caller that clears and never signs in again left a live refresh token on
+            // disk indefinitely, contradicting this method's contract. Sweep at ANY age, unlike save()'s
+            // staleness-bounded sweep: clear() is an explicit "forget this credential", and a temp a
+            // concurrent save is mid-rename on is a benign loser - its rename fails, persistence is
+            // best-effort, and the caller is discarding the credential anyway.
+            sweepTempFiles(key.hash(), 0L);
             return true;
         });
     }
@@ -481,6 +490,23 @@ public final class FileTokenStore implements TokenStore {
     }
 
     private static long parseLongOrZero(CharSequence value) {
+        // The frozen on-disk contract stores these as JSON numbers: an optional '-' followed by bare digits.
+        // Numbers.parseLong is more permissive than that - it accepts '_' thousands separators and an 'L'/'l'
+        // suffix - so "5L" and "1_000" would parse here and fail in every other language client reading the
+        // same file, which is exactly the kind of silent divergence a frozen cross-language format exists to
+        // prevent. Screen the value first so this client accepts only what the format actually allows; an
+        // out-of-contract value falls back to 0 like any other unusable field.
+        final int n = value.length();
+        int i = n > 0 && value.charAt(0) == '-' ? 1 : 0;
+        if (i == n) {
+            return 0; // empty, or a bare "-"
+        }
+        for (; i < n; i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') {
+                return 0;
+            }
+        }
         try {
             return Numbers.parseLong(value);
         } catch (NumericException e) {
@@ -774,14 +800,21 @@ public final class FileTokenStore implements TokenStore {
                 }
                 Os.sleep(LOCK_POLL_SLICE_MILLIS);
             } catch (IOException e) {
-                // the exclusive create may have succeeded and only the nonce write failed, leaving a partial
-                // lock; best-effort remove it (the create was exclusive, so the file is ours) so it does not
-                // wedge peers, then degrade to a lock-free refresh
-                try {
-                    Files.deleteIfExists(lock);
-                } catch (IOException ignore) {
-                    // a peer's steal moved it, or it is unreadable; the staleness/grace path settles it
-                }
+                // Do NOT delete the lock here. That used to be justified by "the exclusive create succeeded
+                // and only the nonce write failed, so the file is ours" - true for one of the failures this
+                // arm catches, but not the others. From the second loop iteration onward a PEER's live lock
+                // occupies the path, and plenty of "cannot create" failures are not
+                // FileAlreadyExistsException: fd exhaustion (EMFILE/ENFILE), EACCES, EROFS, ENOSPC and a
+                // Windows sharing violation all arrive as a plain IOException. deleteIfExists cannot tell
+                // the two cases apart, and removing a peer's live lock admits a second holder - the
+                // double-POST of one rotating refresh token this lock exists to prevent, which a
+                // reuse-detecting identity provider answers by revoking the whole token family.
+                //
+                // A lock we genuinely did leave half-created is EMPTY, and stealIfStale already reclaims an
+                // empty lock on the short EMPTY_LOCK_STEAL_GRACE_MILLIS grace, so leaving it behind costs at
+                // most that grace. Degrade to a lock-free refresh instead.
+                LOG.warn("could not acquire the OIDC token store lock; running this refresh without "
+                        + "cross-process coordination [error={}]", e.getMessage());
                 return null;
             }
         }
@@ -849,18 +882,26 @@ public final class FileTokenStore implements TokenStore {
             if (!isOlderThan(lock, lockStaleMillis)) {
                 return;
             }
-        } else if (!isOlderThan(lock, Math.min(EMPTY_LOCK_STEAL_GRACE_MILLIS, lockStaleMillis))) {
+        } else if (!isOlderThan(lock, EMPTY_LOCK_STEAL_GRACE_MILLIS)) {
             // an empty/unreadable lock is almost never a validly-held lock: acquireLock creates the lock and
             // stamps the owner nonce onto the same open channel (createLockFile via CREATE_NEW), so a live lock
             // carries its stamp within the tiny create->stamp window. An empty lock therefore means either a
             // crash mid-write (the exclusive create succeeded but the nonce write did not) or a peer momentarily
             // caught in that narrow window - a GC/safepoint pause CAN land there, which is exactly why the grace
-            // exists. Steal it on the
-            // short empty-lock grace rather than the full staleness window, so a crash orphan stops wedging peers
-            // for the whole window; the capture-verify below still confirms the lock is unchanged before
-            // completing the steal. (A cross-machine clock skew wider than the grace could still pre-empt such a
-            // partial lock, but that never forges or tears a credential - Layer-1's atomic rename holds - it
-            // degrades to at most a concurrent refresh, the best-effort residual inLock already accepts.)
+            // exists. Steal it on the short empty-lock grace rather than the full staleness window, so a crash
+            // orphan stops wedging peers for the whole window; the capture-verify below still confirms the lock
+            // is unchanged before completing the steal. (A cross-machine clock skew wider than the grace could
+            // still pre-empt such a partial lock, but that never forges or tears a credential - Layer-1's
+            // atomic rename holds - it degrades to at most a concurrent refresh, the best-effort residual
+            // inLock already accepts.)
+            //
+            // The grace is used verbatim, never clamped down to a smaller lockStaleMillis. It is the one thing
+            // standing between a peer caught mid-stamp and having its live lock stolen, so the frozen
+            // cross-language contract (design/oidc-token-persistence.md) states that a client MUST NOT shorten
+            // it - and a store built with a staleness window under 5s would otherwise do exactly that,
+            // silently. A short window is a legitimate way to say "steal an abandoned STAMPED lock quickly";
+            // it is not a statement about the create-to-stamp gap, which is the same few microseconds however
+            // the store is configured.
             return;
         }
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
@@ -872,33 +913,59 @@ public final class FileTokenStore implements TokenStore {
             return;
         }
         byte[] after = null;
+        boolean afterReadOk = false;
         try {
             after = readLockHolder(captured);
+            afterReadOk = true;
         } catch (IOException ignore) {
             // captured but cannot re-read; treated as a non-match below, so we restore rather than steal
         }
-        // confirm we captured the same stamp we judged stale (or the same unreadable/empty junk), not a live
-        // lock a peer recreated in the gap
-        final boolean confirmedStale = before == null ? after == null : Arrays.equals(before, after);
+        // Confirm we captured the same stamp we judged stale (or the same empty/oversized junk), not a live
+        // lock a peer recreated in the gap. afterReadOk is load-bearing and separate from "after == null":
+        // readLockHolder returns null for a legitimately empty or oversized lock but THROWS on an IO error,
+        // and folding those together let a failed re-read of an empty lock read as confirmedStale - so the
+        // steal completed on the strength of an IO error rather than on evidence the lock was unchanged,
+        // the exact opposite of what the catch above says it does.
+        final boolean confirmedStale = afterReadOk
+                && (before == null ? after == null : Arrays.equals(before, after));
         if (confirmedStale) {
             // genuinely the abandoned lock: drop it, so the next createLockFile can claim a fresh one
             deleteCapturedLock(captured);
             return;
         }
-        // we captured a live lock a peer recreated in the gap: put it back rather than steal it. Use a plain
-        // move (not ATOMIC_MOVE, which maps to rename(2) and would replace the target): if a third party
-        // claimed the now-free path during our capture window, FileAlreadyExistsException leaves their lock
-        // intact and we drop our captured copy rather than clobber it. That drop loses the recreating peer's
-        // lock file while it still believes it holds the lock, so for that one refresh two holders can run
-        // concurrently - the inherent residual of stealing with a lock file: a filesystem has no atomic
-        // "delete/rename only if the content is still X", so the capture-verify shrinks the window to this
-        // multi-actor race (our steal, a peer recreating, AND a third party claiming the freed path, all
-        // overlapping) but cannot close it. Best-effort by design: it degrades to one extra refresh - a
-        // re-prompt on a rotating-refresh-token IdP - never a torn or forged credential (Layer 1 still holds).
+        // We captured a live lock a peer recreated in the gap (or could not re-read what we captured): put it
+        // back rather than steal it.
+        //
+        // Restore by hard-LINKING our capture back to the lock path, not by renaming it. Files.move without
+        // REPLACE_EXISTING looks atomic but is not: it stats the target, then renames, and rename(2) silently
+        // replaces. A third party that claims the freed path between those two steps therefore had its live
+        // lock destroyed by the very call whose comment promised to leave it intact. link(2) has no such gap -
+        // it fails outright when the target exists - and it preserves the peer's exact bytes, which matters
+        // because releaseLock verifies the stamp before deleting.
+        //
+        // A residual remains and is not closeable with a lock file: if a third party did claim the path, we
+        // drop our copy, so the recreating peer's lock file is gone while that peer still believes it holds
+        // the lock, and for that one refresh two holders can run concurrently. A filesystem offers no atomic
+        // "delete or rename only if the content is still X", so the capture-verify narrows the window to this
+        // multi-actor race - our steal, a peer recreating, AND a third party claiming the freed path, all
+        // overlapping - without eliminating it. Best-effort by design: it degrades to one extra refresh, a
+        // re-prompt on a rotating-refresh-token identity provider, never a torn or forged credential
+        // (Layer 1's atomic rename still holds).
         try {
-            Files.move(captured, lock);
-        } catch (IOException e) {
+            Files.createLink(lock, captured);
             deleteCapturedLock(captured);
+        } catch (FileAlreadyExistsException e) {
+            // a third party owns the path now; leave their lock untouched and drop our copy
+            deleteCapturedLock(captured);
+        } catch (IOException | UnsupportedOperationException e) {
+            // the filesystem does not support hard links, or the link failed for another reason. Fall back to
+            // the plain move: it preserves the bytes but reopens the stat-then-rename window described above,
+            // which is still better than abandoning the peer's lock outright.
+            try {
+                Files.move(captured, lock);
+            } catch (IOException moveFailure) {
+                deleteCapturedLock(captured);
+            }
         }
     }
 
@@ -908,6 +975,13 @@ public final class FileTokenStore implements TokenStore {
         // across crashes. Best-effort sweep on save: delete only temps older than the lock-staleness window, so
         // a temp a concurrent writer is actively using (its mtime is seconds old) is never removed. A separate
         // random suffix per writer keeps concurrent saves from colliding, which is why temps are not a fixed name
+        sweepTempFiles(hashPrefix, lockStaleMillis);
+    }
+
+    private void sweepTempFiles(String hashPrefix, long minAgeMillis) {
+        // shared by save()'s staleness-bounded sweep and clear()'s unconditional one (minAgeMillis 0), which
+        // must reclaim even a freshly orphaned temp because it holds a plaintext refresh token the caller has
+        // just asked to forget
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory, hashPrefix + "*.tmp")) {
             final long now = System.currentTimeMillis();
             for (Path tmp : stream) {
@@ -922,7 +996,7 @@ public final class FileTokenStore implements TokenStore {
                     continue;
                 }
                 try {
-                    if (now - Files.getLastModifiedTime(tmp).toMillis() > lockStaleMillis) {
+                    if (now - Files.getLastModifiedTime(tmp).toMillis() >= minAgeMillis) {
                         Files.deleteIfExists(tmp);
                     }
                 } catch (IOException ignore) {

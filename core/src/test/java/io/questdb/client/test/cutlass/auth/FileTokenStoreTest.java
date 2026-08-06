@@ -314,6 +314,30 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testClearRemovesOrphanedWriteTemps() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            // A crash between createTempFile and the atomic rename orphans this: it holds the FULL
+            // serialized entry - access, id and refresh tokens in plaintext. save()'s sweep only reclaims
+            // temps past the staleness window and only ever runs from save(), so a caller that cleared and
+            // never signed in again left a live refresh token on disk indefinitely, contradicting clear()'s
+            // "removes any persisted entry for this identity".
+            Path orphan = dir.resolve(key.hash() + "9999.tmp");
+            Files.write(orphan, "{\"refresh_token\":\"REFRESH-1\"}".getBytes(StandardCharsets.UTF_8));
+
+            store.clear(key);
+
+            Assert.assertFalse("clear must remove the token file", Files.exists(tokenFile(dir, key)));
+            Assert.assertFalse("clear must also reclaim an orphaned write temp holding the refresh token",
+                    Files.exists(orphan));
+        });
+    }
+
+    @Test
     public void testCorruptFileReturnsNull() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -386,6 +410,34 @@ public class FileTokenStoreTest {
             Assert.assertTrue(result);
             Assert.assertFalse("an empty (unstamped) lock past the grace must be stolen and acquired (then released),"
                     + " not wedge the acquirer for the full staleness window", Files.exists(lock));
+        });
+    }
+
+    @Test
+    public void testEmptyLockGraceIsNotShortenedByASmallStaleWindow() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            // A staleness window far below the 5s empty-lock grace. The grace is the ONLY thing standing
+            // between a peer caught between its exclusive create and its stamp and having its live lock
+            // stolen, which is why the frozen cross-language contract says a client MUST NOT shorten it.
+            // Clamping the grace down to lockStaleMillis did exactly that, silently.
+            FileTokenStore store = new FileTokenStore(dir, 300, 100);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Files.createFile(lock); // empty: a peer momentarily between its create and its stamp
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 1_000));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            store.inLock(key, () -> {
+                ran.set(true);
+                return true;
+            });
+
+            Assert.assertTrue("inLock must still run, degrading to lock-free", ran.get());
+            Assert.assertTrue("a 1s-old empty lock is inside the 5s grace and must not be stolen",
+                    Files.exists(lock));
+            Assert.assertEquals("the peer's lock must be left exactly as it was", 0, Files.size(lock));
         });
     }
 
@@ -855,6 +907,29 @@ public class FileTokenStoreTest {
                 }
             }
             Assert.assertEquals(1, jsonCount);
+        });
+    }
+
+    @Test
+    public void testOutOfContractNumberIsRejectedNotQuietlyParsed() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Path file = tokenFile(dir, key);
+            String json = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+
+            // QuestDB's Numbers.parseLong accepts an 'L' suffix and '_' thousands separators. JSON allows
+            // neither, and neither does the frozen cross-language format - so "1L" is a schema version only
+            // THIS client can read, and accepting it would let a file diverge silently from every other
+            // language client sharing the directory. It must read as unusable instead.
+            String tampered = json.replace("\"v\":1,", "\"v\":1L,");
+            Assert.assertNotEquals("the fixture must actually have been tampered with", json, tampered);
+            Files.write(file, tampered.getBytes(StandardCharsets.UTF_8));
+
+            Assert.assertNull("a number only this client's parser accepts must not satisfy the schema gate",
+                    store.load(key));
         });
     }
 
