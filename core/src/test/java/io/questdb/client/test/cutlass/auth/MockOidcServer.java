@@ -39,6 +39,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A minimal HTTP/1.1 server for tests that impersonates an OIDC identity provider (and,
@@ -52,6 +53,10 @@ public class MockOidcServer implements Closeable {
     private final List<Socket> connSockets = Collections.synchronizedList(new ArrayList<>());
     private final List<Thread> connThreads = Collections.synchronizedList(new ArrayList<>());
     private final Handler handler;
+    // The FIRST throwable a Handler raised on a daemon connection thread (typically an assertion inside a
+    // handler). handleConnection captures it here rather than letting it die on that thread as a mere
+    // transport drop the client may swallow; close() resurfaces it on the test thread.
+    private final AtomicReference<Throwable> handlerError = new AtomicReference<>();
     private final List<String> requestAuthHeaders = Collections.synchronizedList(new ArrayList<>());
     private final ServerSocket serverSocket;
 
@@ -133,6 +138,21 @@ public class MockOidcServer implements Closeable {
             for (Thread t : connThreads) {
                 interruptAndJoin(t);
             }
+        }
+        // Resurface a failure a Handler raised on its daemon connection thread (see handleConnection): it is
+        // otherwise visible only as a transport drop the client may swallow, turning a broken assertion into a
+        // green test. Teardown ran first, so nothing leaks; rethrow after it so a test whose body otherwise
+        // passed still fails with the real cause (and one whose body already failed gets it as a suppressed
+        // exception on the primary failure).
+        Throwable handlerFailure = handlerError.get();
+        if (handlerFailure != null) {
+            if (handlerFailure instanceof Error) {
+                throw (Error) handlerFailure;
+            }
+            if (handlerFailure instanceof RuntimeException) {
+                throw (RuntimeException) handlerFailure;
+            }
+            throw new RuntimeException(handlerFailure);
         }
     }
 
@@ -351,7 +371,19 @@ public class MockOidcServer implements Closeable {
             Request request;
             while ((request = readRequest(in)) != null) {
                 requestAuthHeaders.add(request.authorization);
-                MockResponse response = handler.handle(request.method, request.path, request.body);
+                MockResponse response;
+                try {
+                    response = handler.handle(request.method, request.path, request.body);
+                } catch (Throwable t) {
+                    // The Handler runs on this daemon connection thread, where an uncaught throwable - an
+                    // assertion inside a handler, most often - is otherwise swallowed: the client sees only a
+                    // transport drop it may tolerate (a silent false pass) or retry into an opaque @Test
+                    // timeout. Capture the FIRST such failure so close() can resurface it on the test thread,
+                    // then drop the connection exactly as a return would, leaving client-visible behaviour
+                    // unchanged.
+                    handlerError.compareAndSet(null, t);
+                    return;
+                }
                 if (response.dropConnection) {
                     // returning closes the socket (try-with-resources on its streams), so the client's
                     // in-flight read fails with a transport error

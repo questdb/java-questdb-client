@@ -49,6 +49,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * Unit coverage for {@link QwpQueryClient#withBearerTokenProvider}: header
  * synthesis, re-query at each resolve (a fresh token per WebSocket upgrade),
@@ -60,6 +62,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * header and confirms a throwing provider fails the connection attempt. The
  * post-connect guard for the setter lives in
  * {@link QwpQueryClientPostConnectGuardTest}.
+ * <p>
+ * Every test runs under {@code assertMemoryLeak}: a {@link QwpQueryClient}
+ * mallocs native scratch in its constructor, so each case proves that scratch
+ * is freed on close, including on the connect/error paths.
  */
 public class QwpQueryClientTokenProviderTest {
 
@@ -78,234 +84,256 @@ public class QwpQueryClientTokenProviderTest {
     };
 
     @Test
-    public void testProviderConflictsWithBasicAuth() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerTokenProvider(() -> "tok")) {
-            try {
-                c.withBasicAuth("u", "p");
-                Assert.fail("withBasicAuth after withBearerTokenProvider must throw");
-            } catch (IllegalStateException expected) {
-                // mutually exclusive
-            }
-        }
-    }
-
-    @Test
-    public void testProviderConflictsWithBearerToken() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerTokenProvider(() -> "tok")) {
-            try {
-                c.withBearerToken("other");
-                Assert.fail("withBearerToken after withBearerTokenProvider must throw");
-            } catch (IllegalStateException expected) {
-                // mutually exclusive
-            }
-        }
-    }
-
-    @Test
-    public void testProviderNullOrBlankReturnRejected() {
-        // validateToken rejects a null, empty or blank token RETURNED by the provider before it reaches the
-        // "Bearer " header (distinct from testProviderNullRejected, which rejects a null provider at the setter)
-        String[] bad = {null, "", "   "};
-        for (String token : bad) {
-            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
-                    .withBearerTokenProvider(() -> token)) {
+    public void testProviderConflictsWithBasicAuth() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerTokenProvider(() -> "tok")) {
                 try {
-                    c.getAuthorizationHeaderForTest();
-                    Assert.fail("a null/empty/blank provider token must be rejected, was: [" + token + ']');
-                } catch (LineSenderException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("null or empty"));
+                    c.withBasicAuth("u", "p");
+                    Assert.fail("withBasicAuth after withBearerTokenProvider must throw");
+                } catch (IllegalStateException expected) {
+                    // mutually exclusive
                 }
             }
-        }
+        });
     }
 
     @Test
-    public void testProviderNullRejected() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
-            try {
-                c.withBearerTokenProvider(null);
-                Assert.fail("a null provider must be rejected");
-            } catch (IllegalArgumentException expected) {
-                // expected
+    public void testProviderConflictsWithBearerToken() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerTokenProvider(() -> "tok")) {
+                try {
+                    c.withBearerToken("other");
+                    Assert.fail("withBearerToken after withBearerTokenProvider must throw");
+                } catch (IllegalStateException expected) {
+                    // mutually exclusive
+                }
             }
-        }
+        });
     }
 
     @Test
-    public void testProviderQueriedAtEachResolve() {
-        int[] counter = {0};
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
-                .withBearerTokenProvider(() -> "tok-" + (counter[0]++))) {
-            // each resolve re-queries the provider, so a reconnect presents a fresh token
-            Assert.assertEquals("Bearer tok-0", c.getAuthorizationHeaderForTest());
-            Assert.assertEquals("Bearer tok-1", c.getAuthorizationHeaderForTest());
-        }
+    public void testProviderNullOrBlankReturnRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // validateToken rejects a null, empty or blank token RETURNED by the provider before it reaches the
+            // "Bearer " header (distinct from testProviderNullRejected, which rejects a null provider at the setter)
+            String[] bad = {null, "", "   "};
+            for (String token : bad) {
+                try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                        .withBearerTokenProvider(() -> token)) {
+                    try {
+                        c.getAuthorizationHeaderForTest();
+                        Assert.fail("a null/empty/blank provider token must be rejected, was: [" + token + ']');
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("null or empty"));
+                    }
+                }
+            }
+        });
     }
 
     @Test
-    public void testProviderSynthesizesBearerHeader() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
-                .withBearerTokenProvider(() -> "abc123")) {
-            Assert.assertEquals("Bearer abc123", c.getAuthorizationHeaderForTest());
-        }
+    public void testProviderNullRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)) {
+                try {
+                    c.withBearerTokenProvider(null);
+                    Assert.fail("a null provider must be rejected");
+                } catch (IllegalArgumentException expected) {
+                    // expected
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProviderQueriedAtEachResolve() throws Exception {
+        assertMemoryLeak(() -> {
+            int[] counter = {0};
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                    .withBearerTokenProvider(() -> "tok-" + (counter[0]++))) {
+                // each resolve re-queries the provider, so a reconnect presents a fresh token
+                Assert.assertEquals("Bearer tok-0", c.getAuthorizationHeaderForTest());
+                Assert.assertEquals("Bearer tok-1", c.getAuthorizationHeaderForTest());
+            }
+        });
+    }
+
+    @Test
+    public void testProviderSynthesizesBearerHeader() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                    .withBearerTokenProvider(() -> "abc123")) {
+                Assert.assertEquals("Bearer abc123", c.getAuthorizationHeaderForTest());
+            }
+        });
     }
 
     @Test(timeout = 20_000)
     public void testProviderTokenReResolvedOnFailoverReconnect() throws Exception {
-        // The failover reconnect path (reconnectViaTracker) resolves the Authorization header once before its
-        // endpoint walk, exactly as connect() does, so a rotating token reaches the reconnect upgrade. This
-        // pins that a regression dropping the re-resolve from the reconnect path would be caught: bind endpoint
-        // A on the initial connect (capturing tok-0), drop it, then run a query - the failover reconnect to
-        // endpoint B must upgrade with a FRESHLY resolved token, not the stale connect-time one.
-        AtomicInteger calls = new AtomicInteger();
-        TestWebSocketServer a = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-        });
-        a.setSendServerInfo(true);
-        TestWebSocketServer b = new TestWebSocketServer(new ExecDoneQueryServer());
-        b.setSendServerInfo(true);
-        try {
-            a.start();
-            b.start();
-            Assert.assertTrue(a.awaitStart(5, TimeUnit.SECONDS));
-            Assert.assertTrue(b.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // The failover reconnect path (reconnectViaTracker) resolves the Authorization header once before its
+            // endpoint walk, exactly as connect() does, so a rotating token reaches the reconnect upgrade. This
+            // pins that a regression dropping the re-resolve from the reconnect path would be caught: bind endpoint
+            // A on the initial connect (capturing tok-0), drop it, then run a query - the failover reconnect to
+            // endpoint B must upgrade with a FRESHLY resolved token, not the stale connect-time one.
+            AtomicInteger calls = new AtomicInteger();
+            TestWebSocketServer a = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            });
+            a.setSendServerInfo(true);
+            TestWebSocketServer b = new TestWebSocketServer(new ExecDoneQueryServer());
+            b.setSendServerInfo(true);
+            try {
+                a.start();
+                b.start();
+                Assert.assertTrue(a.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertTrue(b.awaitStart(5, TimeUnit.SECONDS));
 
-            try (QwpQueryClient client = QwpQueryClient.fromConfig(
-                    "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort() + ";auth_timeout_ms=2000;")
-                    .withBearerTokenProvider(() -> "tok-" + calls.getAndIncrement())) {
-                client.connect();
-                Assert.assertTrue("client must bind the first endpoint on connect", client.isConnected());
-                String aHeader = a.pollAuthorizationHeader(5, TimeUnit.SECONDS);
-                Assert.assertEquals("the initial connect upgrade must carry the first resolved token",
-                        "Bearer tok-0", aHeader);
+                try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                        "ws::addr=localhost:" + a.getPort() + ",localhost:" + b.getPort() + ";auth_timeout_ms=2000;")
+                        .withBearerTokenProvider(() -> "tok-" + calls.getAndIncrement())) {
+                    client.connect();
+                    Assert.assertTrue("client must bind the first endpoint on connect", client.isConnected());
+                    String aHeader = a.pollAuthorizationHeader(5, TimeUnit.SECONDS);
+                    Assert.assertEquals("the initial connect upgrade must carry the first resolved token",
+                            "Bearer tok-0", aHeader);
 
-                // drop endpoint A so the next execute() cannot use its connection and must fail over
+                    // drop endpoint A so the next execute() cannot use its connection and must fail over
+                    a.close();
+
+                    // the query fails on the dead A connection, drives the failover loop -> reconnectViaTracker,
+                    // which re-resolves the header and upgrades B; B answers EXEC_DONE so execute() returns
+                    client.execute("SELECT 1", NOOP_BATCH_HANDLER, false);
+
+                    String bHeader = b.pollAuthorizationHeader(5, TimeUnit.SECONDS);
+                    Assert.assertNotNull("the failover reconnect must upgrade endpoint B", bHeader);
+                    Assert.assertTrue("the reconnect upgrade must carry a Bearer token, was: " + bHeader,
+                            bHeader.startsWith("Bearer tok-"));
+                    Assert.assertNotEquals("the failover reconnect must RE-RESOLVE the provider, not reuse the "
+                            + "connect-time token", aHeader, bHeader);
+                }
+            } finally {
                 a.close();
-
-                // the query fails on the dead A connection, drives the failover loop -> reconnectViaTracker,
-                // which re-resolves the header and upgrades B; B answers EXEC_DONE so execute() returns
-                client.execute("SELECT 1", NOOP_BATCH_HANDLER, false);
-
-                String bHeader = b.pollAuthorizationHeader(5, TimeUnit.SECONDS);
-                Assert.assertNotNull("the failover reconnect must upgrade endpoint B", bHeader);
-                Assert.assertTrue("the reconnect upgrade must carry a Bearer token, was: " + bHeader,
-                        bHeader.startsWith("Bearer tok-"));
-                Assert.assertNotEquals("the failover reconnect must RE-RESOLVE the provider, not reuse the "
-                        + "connect-time token", aHeader, bHeader);
+                b.close();
             }
-        } finally {
-            a.close();
-            b.close();
-        }
+        });
     }
 
     @Test(timeout = 15_000)
     public void testProviderTokenSentOnRealUpgrade() throws Exception {
-        // drive the REAL connect path (connect() -> resolveAuthorizationHeader -> runUpgradeWithTimeout),
-        // not the test hook: the upgrade request must carry the freshly pulled "Bearer <token>". The mock
-        // answers 404 (not auth-failed, not terminal) so connect() fails fast after the header was sent.
-        List<String> authHeaders = Collections.synchronizedList(new ArrayList<>());
-        ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-        int port = listener.getLocalPort();
-        byte[] respBytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-        Thread serverThread = new Thread(() -> {
-            while (!listener.isClosed()) {
-                try {
-                    Socket s = listener.accept();
-                    Thread handler = new Thread(() -> {
-                        try (Socket sock = s) {
-                            byte[] buf = new byte[8192];
-                            int n = sock.getInputStream().read(buf);
-                            if (n < 0) {
-                                return;
-                            }
-                            String request = new String(buf, 0, n, StandardCharsets.US_ASCII);
-                            for (String line : request.split("\r\n")) {
-                                if (line.regionMatches(true, 0, "Authorization:", 0, "Authorization:".length())) {
-                                    authHeaders.add(line.substring("Authorization:".length()).trim());
+        assertMemoryLeak(() -> {
+            // drive the REAL connect path (connect() -> resolveAuthorizationHeader -> runUpgradeWithTimeout),
+            // not the test hook: the upgrade request must carry the freshly pulled "Bearer <token>". The mock
+            // answers 404 (not auth-failed, not terminal) so connect() fails fast after the header was sent.
+            List<String> authHeaders = Collections.synchronizedList(new ArrayList<>());
+            ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            int port = listener.getLocalPort();
+            byte[] respBytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+            Thread serverThread = new Thread(() -> {
+                while (!listener.isClosed()) {
+                    try {
+                        Socket s = listener.accept();
+                        Thread handler = new Thread(() -> {
+                            try (Socket sock = s) {
+                                byte[] buf = new byte[8192];
+                                int n = sock.getInputStream().read(buf);
+                                if (n < 0) {
+                                    return;
                                 }
+                                String request = new String(buf, 0, n, StandardCharsets.US_ASCII);
+                                for (String line : request.split("\r\n")) {
+                                    if (line.regionMatches(true, 0, "Authorization:", 0, "Authorization:".length())) {
+                                        authHeaders.add(line.substring("Authorization:".length()).trim());
+                                    }
+                                }
+                                OutputStream os = sock.getOutputStream();
+                                os.write(respBytes);
+                                os.flush();
+                            } catch (Exception ignored) {
                             }
-                            OutputStream os = sock.getOutputStream();
-                            os.write(respBytes);
-                            os.flush();
-                        } catch (Exception ignored) {
-                        }
-                    }, "qwp-token-upgrade-handler");
-                    handler.setDaemon(true);
-                    handler.start();
-                } catch (Exception ignored) {
-                    return;
+                        }, "qwp-token-upgrade-handler");
+                        handler.setDaemon(true);
+                        handler.start();
+                    } catch (Exception ignored) {
+                        return;
+                    }
+                }
+            }, "qwp-token-upgrade-server");
+            serverThread.setDaemon(true);
+            serverThread.start();
+
+            try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=127.0.0.1:" + port + ";failover=off;target=any;")
+                    .withBearerTokenProvider(() -> "tok-0")) {
+                try {
+                    client.connect();
+                    Assert.fail("expected connect to fail on a 404 upgrade");
+                } catch (HttpClientException expected) {
+                    // 404 is neither auth-failed nor terminal: the endpoint is exhausted and connect() fails -
+                    // but the upgrade request already carried the Bearer header captured above
+                }
+            } finally {
+                listener.close();
+                serverThread.join(500);
+            }
+            Assert.assertEquals("the provider's token must reach the real upgrade request", 1, authHeaders.size());
+            Assert.assertEquals("Bearer tok-0", authHeaders.get(0));
+        });
+    }
+
+    @Test
+    public void testProviderTokenValidated() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                    .withBearerTokenProvider(() -> "bad\ntoken")) {
+                try {
+                    c.getAuthorizationHeaderForTest();
+                    Assert.fail("a token carrying a control character must be rejected");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("control or non-ASCII"));
                 }
             }
-        }, "qwp-token-upgrade-server");
-        serverThread.setDaemon(true);
-        serverThread.start();
-
-        try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=127.0.0.1:" + port + ";failover=off;target=any;")
-                .withBearerTokenProvider(() -> "tok-0")) {
-            try {
-                client.connect();
-                Assert.fail("expected connect to fail on a 404 upgrade");
-            } catch (HttpClientException expected) {
-                // 404 is neither auth-failed nor terminal: the endpoint is exhausted and connect() fails -
-                // but the upgrade request already carried the Bearer header captured above
-            }
-        } finally {
-            listener.close();
-            serverThread.join(500);
-        }
-        Assert.assertEquals("the provider's token must reach the real upgrade request", 1, authHeaders.size());
-        Assert.assertEquals("Bearer tok-0", authHeaders.get(0));
+        });
     }
 
     @Test
-    public void testProviderTokenValidated() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
-                .withBearerTokenProvider(() -> "bad\ntoken")) {
-            try {
-                c.getAuthorizationHeaderForTest();
-                Assert.fail("a token carrying a control character must be rejected");
-            } catch (LineSenderException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("control or non-ASCII"));
+    public void testSettingBearerTokenThenProviderConflicts() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerToken("tok")) {
+                try {
+                    c.withBearerTokenProvider(() -> "other");
+                    Assert.fail("withBearerTokenProvider after withBearerToken must throw");
+                } catch (IllegalStateException expected) {
+                    // mutually exclusive
+                }
             }
-        }
-    }
-
-    @Test
-    public void testSettingBearerTokenThenProviderConflicts() {
-        try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000).withBearerToken("tok")) {
-            try {
-                c.withBearerTokenProvider(() -> "other");
-                Assert.fail("withBearerTokenProvider after withBearerToken must throw");
-            } catch (IllegalStateException expected) {
-                // mutually exclusive
-            }
-        }
+        });
     }
 
     @Test(timeout = 10_000)
     public void testThrowingProviderFailsConnect() throws Exception {
-        // a provider that throws must fail the connection attempt on the REAL connect path:
-        // resolveAuthorizationHeader runs once before the endpoint walk, so the throw propagates straight
-        // out of connect() as the provider's own error (not wrapped as "all endpoints unreachable")
-        try (
-                ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-                QwpQueryClient client = QwpQueryClient.fromConfig(
-                        "ws::addr=127.0.0.1:" + listener.getLocalPort() + ";failover=off;target=any;"
-                ).withBearerTokenProvider(() -> {
-                    throw new LineSenderException("provider down");
-                })
-        ) {
-            try {
-                client.connect();
-                Assert.fail("a throwing provider must fail the connection attempt");
-            } catch (RuntimeException expected) {
-                // the provider's own exception propagates directly (the header is resolved before the
-                // endpoint walk), not wrapped as a transport "all endpoints unreachable" error
-                Assert.assertTrue(expected.getClass().getName(), expected instanceof LineSenderException);
-                Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("provider down"));
-                Assert.assertFalse(expected.getMessage(), expected.getMessage().contains("unreachable"));
+        assertMemoryLeak(() -> {
+            // a provider that throws must fail the connection attempt on the REAL connect path:
+            // resolveAuthorizationHeader runs once before the endpoint walk, so the throw propagates straight
+            // out of connect() as the provider's own error (not wrapped as "all endpoints unreachable")
+            try (
+                    ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+                    QwpQueryClient client = QwpQueryClient.fromConfig(
+                            "ws::addr=127.0.0.1:" + listener.getLocalPort() + ";failover=off;target=any;"
+                    ).withBearerTokenProvider(() -> {
+                        throw new LineSenderException("provider down");
+                    })
+            ) {
+                try {
+                    client.connect();
+                    Assert.fail("a throwing provider must fail the connection attempt");
+                } catch (RuntimeException expected) {
+                    // the provider's own exception propagates directly (the header is resolved before the
+                    // endpoint walk), not wrapped as a transport "all endpoints unreachable" error
+                    Assert.assertTrue(expected.getClass().getName(), expected instanceof LineSenderException);
+                    Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("provider down"));
+                    Assert.assertFalse(expected.getMessage(), expected.getMessage().contains("unreachable"));
+                }
             }
-        }
+        });
     }
 
     private static byte[] buildExecDone(byte[] queryRequest) {
