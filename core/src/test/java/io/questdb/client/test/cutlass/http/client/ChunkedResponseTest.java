@@ -220,6 +220,51 @@ public class ChunkedResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testOverflowingChunkSizeIsRejectedRatherThanSpun() {
+        // A chunk-size line of 16 or more hex digits overflows Numbers.parseHexLong (val << 4, unchecked)
+        // to a NEGATIVE size, which matches neither the "size > 0" data branch nor the "size == 0"
+        // terminator - so the state machine breaks straight back to the top of the loop. The preceding
+        // chunk left receive == false with bytes still buffered, so the read gate is skipped too, and the
+        // loop spins with nothing to stop it. defaultTimeout is -1 here on purpose: no deadline can rescue
+        // this call, so the test passes only because the size itself is rejected. The server chooses that
+        // size line, and for a discovery or token response that server is untrusted.
+        final long memSize = 128;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            // one well-formed chunk (leaves receive == false), then the overflowing size line, then a
+            // trailing byte so dataLo < dataHi holds the read gate shut
+            final String wire = "1\r\nA\r\n8000000000000000\r\nX";
+            final AbstractChunkedResponse rsp = new AbstractChunkedResponse(mem, mem + memSize, -1) {
+                boolean delivered;
+
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    if (delivered) {
+                        return 0;
+                    }
+                    delivered = true;
+                    for (int i = 0; i < wire.length(); i++) {
+                        Unsafe.getUnsafe().putByte(bufLo + i, (byte) wire.charAt(i));
+                    }
+                    return wire.length();
+                }
+            };
+            rsp.begin(mem, mem);
+            Fragment first = rsp.recv();
+            Assert.assertNotNull("the first chunk must still be delivered", first);
+            Assert.assertEquals('A', (char) Unsafe.getUnsafe().getByte(first.lo()));
+            try {
+                rsp.recv();
+                Assert.fail("expected the overflowing chunk size to be rejected as malformed");
+            } catch (HttpClientException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("malformed chunk size"));
+            }
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test(timeout = 30_000)
     public void testRecvHonoursTotalTimeoutWhileChunkSizeDribbles() {
         // a server that dribbles the chunk-size line and never sends its terminating CRLF must not keep a
         // single recv() running past its timeout. recv(timeout) bounds the whole call (not each socket read),

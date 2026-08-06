@@ -99,15 +99,21 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         final boolean bounded = timeout > 0;
         final long startNanos = bounded ? System.nanoTime() : 0L;
         while (true) {
+            // Consult the deadline on EVERY pass, not only on the passes that read. A pass that neither
+            // reads nor advances the state machine re-enters the loop with receive == false and
+            // dataLo < dataHi, which skips the read gate below - so a deadline checked only inside that
+            // gate is never reached, and the loop spins without the bound this method promises. Keeping
+            // the check above the gate makes the bound hold for every pass, however the state machine got
+            // there.
+            int callTimeout = timeout;
+            if (bounded) {
+                callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                if (callTimeout <= 0) {
+                    throw new HttpClientException("timed out reading the chunked response body");
+                }
+            }
             if (receive || dataLo == dataHi) {
                 compactBuffer();
-                int callTimeout = timeout;
-                if (bounded) {
-                    callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
-                    if (callTimeout <= 0) {
-                        throw new HttpClientException("timed out reading the chunked response body");
-                    }
-                }
                 dataHi += recvOrDie(dataHi, bufHi, callTimeout);
             }
             long p; // moving data pointer for scanning buffer
@@ -142,6 +148,15 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                         chunkSize.of(dataLo, res + 1);
                         try {
                             size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
+                            if (size < 0) {
+                                // parseHexLong accumulates val << 4 with no overflow check, so a chunk-size
+                                // line of 16 or more hex digits (8000000000000000 is the smallest) wraps to a
+                                // negative value. A negative size matches neither the "size > 0" data branch
+                                // nor the "size == 0" terminator below, so the state machine would loop on it
+                                // forever - and the size line is chosen by the server, which for an OIDC
+                                // discovery or token response is untrusted. Reject it as malformed.
+                                throw new HttpClientException("malformed chunk size");
+                            }
                             consumed = 0;
                             // consume data buffer ignoring chunk size value and its furniture
                             state = STATE_CHUNK_DATA;
