@@ -283,6 +283,10 @@ public final class FileTokenStore implements TokenStore {
             // not) acquire one and are running lock-free; releaseLock deletes the lock only when it still carries
             // this nonce, so we never delete a lock a peer has since stolen
             String nonce = null;
+            // acquireLock does FileChannel I/O, so shield it from a carried interrupt flag exactly as load()
+            // does - but shield ONLY the lock bookkeeping, never action.run(). The critical section is the
+            // caller's own token refresh, and an interrupt is precisely the lever close() uses to break it.
+            boolean wasInterrupted = Thread.interrupted();
             try {
                 ensureDirectory();
                 lock = lockFile(key);
@@ -292,12 +296,28 @@ public final class FileTokenStore implements TokenStore {
                 // atomic replacement still keeps every reader consistent - only a rotating-refresh-token race
                 // across processes is left unguarded for this one refresh.
                 nonce = null;
+            } finally {
+                if (wasInterrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
             try {
                 return action.run();
             } finally {
                 if (nonce != null) {
-                    releaseLock(lock, nonce);
+                    // Release under the same shield, and re-read the flag here rather than reusing the value
+                    // above: the interrupt that matters usually arrives DURING action.run() (close() breaking
+                    // a stuck credential pull). Without this, releaseLock's channel read throws
+                    // ClosedByInterruptException, the lock file survives its whole staleness window, and every
+                    // peer degrades to an unserialized refresh meanwhile.
+                    boolean wasInterruptedInSection = Thread.interrupted();
+                    try {
+                        releaseLock(lock, nonce);
+                    } finally {
+                        if (wasInterruptedInSection) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
                 }
             }
         } finally {
@@ -307,41 +327,70 @@ public final class FileTokenStore implements TokenStore {
 
     @Override
     public PersistedToken load(TokenStoreKey key) {
-        Path file = tokenFile(key);
-        byte[] bytes;
+        // Every file operation below goes through FileChannel, an InterruptibleChannel: a thread that
+        // merely CARRIES a set interrupt flag makes the first read throw ClosedByInterruptException and
+        // closes the channel, and the flag survives. Two callers routinely arrive here with it set - an
+        // ILP producer on a pooled or managed thread, where interrupt is the standard cancellation
+        // signal, and the sender's own I/O thread, which close() interrupts to break a stuck credential
+        // pull. Neither means "abandon the token store", so clear the flag for the duration of the file
+        // I/O and restore it on the way out: the caller's cancellation signal survives intact, while the
+        // store's reads stop being collateral damage.
+        final boolean wasInterrupted = Thread.interrupted();
         try {
-            bytes = readBounded(file);
-        } catch (NoSuchFileException e) {
-            return null;
-        } catch (IOException e) {
-            throw new OidcAuthException(e).put("could not read the OIDC token store file");
+            Path file = tokenFile(key);
+            byte[] bytes;
+            try {
+                bytes = readBounded(file);
+            } catch (NoSuchFileException e) {
+                return null;
+            } catch (IOException e) {
+                throw new OidcAuthException(e).put("could not read the OIDC token store file");
+            }
+            if (bytes == null) {
+                return null;
+            }
+            return parseAndVerify(key, bytes);
+        } finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
-        if (bytes == null) {
-            return null;
-        }
-        return parseAndVerify(key, bytes);
     }
 
     @Override
     public void save(TokenStoreKey key, PersistedToken token) {
-        byte[] content = serialize(key, token);
+        // interrupt-neutral for the same reason as load(): a carried interrupt flag would otherwise abort
+        // the write or the atomic rename half-way and leave the rotated refresh token unpersisted
+        final boolean wasInterrupted = Thread.interrupted();
         try {
-            ensureDirectory();
-            sweepStaleTempFiles(key.hash());
-            Path target = tokenFile(key);
-            Path tmp = createTempFile(key.hash());
-            boolean moved = false;
+            byte[] content = serialize(key, token);
             try {
-                writeAndFlush(tmp, content);
-                replaceTarget(tmp, target);
-                moved = true;
-            } finally {
-                if (!moved) {
-                    Files.deleteIfExists(tmp);
+                ensureDirectory();
+                sweepStaleTempFiles(key.hash());
+                Path target = tokenFile(key);
+                Path tmp = createTempFile(key.hash());
+                boolean moved = false;
+                try {
+                    writeAndFlush(tmp, content);
+                    replaceTarget(tmp, target);
+                    moved = true;
+                } finally {
+                    if (!moved) {
+                        try {
+                            Files.deleteIfExists(tmp);
+                        } catch (IOException ignore) {
+                            // best-effort: never let the cleanup failure replace the write/rename failure
+                            // that is unwinding; sweepStaleTempFiles reclaims the orphan on a later save
+                        }
+                    }
                 }
+            } catch (IOException e) {
+                throw new OidcAuthException(e).put("could not persist the OIDC token to the token store");
             }
-        } catch (IOException e) {
-            throw new OidcAuthException(e).put("could not persist the OIDC token to the token store");
+        } finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -586,8 +635,14 @@ public final class FileTokenStore implements TokenStore {
             // (or the staleness steal) to reclaim
         } catch (NoSuchFileException e) {
             // already gone (stolen and not yet recreated, or removed elsewhere); nothing to release
-        } catch (IOException ignore) {
-            // best-effort release; a leftover lock goes stale and the next acquirer steals it
+        } catch (IOException e) {
+            // Best-effort release, but no longer silent. A lock we could not delete blocks every peer's
+            // coordinated refresh until it goes stale (lockStaleMillis - 10 minutes by default), and each
+            // peer degrades to an unserialized refresh meanwhile: the rotating-refresh-token race this lock
+            // exists to prevent. That is worth a line an operator can find, rather than surfacing later as
+            // unexplained repeated sign-ins.
+            LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free refresh until "
+                    + "it goes stale [error={}]", e.getMessage());
         }
     }
 

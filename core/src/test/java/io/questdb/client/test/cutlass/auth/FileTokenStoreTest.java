@@ -652,6 +652,40 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testInLockReleasesLockWhenSectionLeavesThreadInterrupted() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+
+            // The critical section is a token refresh, and close() breaks a drainer stuck in one by
+            // interrupting its thread - so inLock's release routinely runs with the flag already set.
+            // releaseLock reads the lock's owner stamp through a FileChannel, an InterruptibleChannel:
+            // with the flag set that read throws ClosedByInterruptException, which releaseLock swallows,
+            // so the lock file survives its whole staleness window (10 minutes by default) while every
+            // peer degrades to an unserialized refresh - the rotating-refresh-token race the lock exists
+            // to prevent. Release must therefore be interrupt-neutral.
+            boolean released = store.inLock(key, () -> {
+                Assert.assertTrue("the lock must be held while the action runs", Files.exists(lock));
+                Thread.currentThread().interrupt();
+                return true;
+            });
+
+            Assert.assertTrue(released);
+            try {
+                Assert.assertFalse("inLock must release the lock even when the section leaves the thread "
+                        + "interrupted", Files.exists(lock));
+                Assert.assertTrue("the caller's interrupt must be preserved, not consumed",
+                        Thread.currentThread().isInterrupted());
+            } finally {
+                // never leak the flag into the rest of the suite
+                Thread.interrupted();
+            }
+        });
+    }
+
+    @Test
     public void testInLockRunsActionAndManagesLockFile() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -711,6 +745,37 @@ public class FileTokenStoreTest {
             Assert.assertEquals("null", loaded.getAccessToken());
             Assert.assertNull("an absent id token must stay null, not become the string \"null\"", loaded.getIdToken());
             Assert.assertEquals("null", loaded.getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testLoadAndSaveSurviveACarriedInterruptFlag() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+
+            // Every file operation here goes through FileChannel, an InterruptibleChannel: a thread that
+            // merely CARRIES a set interrupt flag makes the first read or write throw
+            // ClosedByInterruptException, and the flag survives. Callers arrive that way routinely - an ILP
+            // producer on a pooled thread where interrupt is the cancellation signal, and the sender's own
+            // I/O thread, which close() interrupts to break a stuck credential pull. Neither means "abandon
+            // the token store", so the store must clear the flag around its own I/O and restore it after.
+            Thread.currentThread().interrupt();
+            try {
+                store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+                Assert.assertTrue("save must complete with the flag set", Thread.currentThread().isInterrupted());
+
+                PersistedToken loaded = store.load(key);
+                Assert.assertNotNull("load must complete with the flag set, not throw on the channel", loaded);
+                Assert.assertEquals("ACCESS-1", loaded.getAccessToken());
+                Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+                Assert.assertTrue("the caller's interrupt must be preserved, not consumed",
+                        Thread.currentThread().isInterrupted());
+            } finally {
+                // never leak the flag into the rest of the suite
+                Thread.interrupted();
+            }
         });
     }
 

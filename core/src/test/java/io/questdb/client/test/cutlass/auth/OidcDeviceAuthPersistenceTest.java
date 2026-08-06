@@ -835,6 +835,48 @@ public class OidcDeviceAuthPersistenceTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testTransientStoreLoadFailureIsRetriedNotLatched() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // The first read fails transiently - the shape a carried interrupt flag produces, since
+                // FileChannel is an InterruptibleChannel and throws ClosedByInterruptException on a thread
+                // that merely carries the flag. Latching "already attempted" on that failure disables
+                // persistence for the whole life of the instance, so a process holding a perfectly good
+                // refresh token on disk re-runs the interactive device flow instead - a hard failure for the
+                // headless getToken() consumer persistence exists for, not a degraded one. Only a read that
+                // COMPLETES (even yielding nothing) is a definitive answer worth latching.
+                fake.failLoadTimes = 1;
+                fake.loadReturns = new PersistedToken("ACCESS-PERSISTED", null, "REFRESH-1",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        auth.getToken();
+                        Assert.fail("the first call must report no usable token after the read failed");
+                    } catch (OidcAuthException expected) {
+                        // the read threw, so nothing was adopted and there is no token to serve yet
+                    }
+                    Assert.assertEquals("the failed read must not be retried within one call", 1, fake.loads.get());
+
+                    // the store recovers: the very next call must re-read it and serve the persisted token
+                    Assert.assertEquals("ACCESS-PERSISTED", auth.getToken());
+                    Assert.assertEquals("a failed read must leave the store re-readable", 2, fake.loads.get());
+                    Assert.assertEquals("a recovered store must not force the interactive device flow",
+                            0, device.get());
+                }
+            }
+        });
+    }
+
     private static OidcDeviceAuth.Builder baseBuilder(MockOidcServer server) {
         return OidcDeviceAuth.builder()
                 .clientId("questdb")
@@ -919,6 +961,10 @@ public class OidcDeviceAuthPersistenceTest {
         final AtomicInteger loads = new AtomicInteger();
         final AtomicInteger locks = new AtomicInteger();
         final AtomicInteger saves = new AtomicInteger();
+        // number of leading load() calls to fail before the first one is allowed to succeed; models a
+        // transient store fault (an interrupted channel, a momentary IO error), as opposed to a store that
+        // simply has nothing to return
+        int failLoadTimes;
         boolean failSave;
         PersistedToken loadReturns;
         PersistedToken peerInstallsOnLock;
@@ -944,6 +990,10 @@ public class OidcDeviceAuthPersistenceTest {
         @Override
         public PersistedToken load(TokenStoreKey key) {
             loads.incrementAndGet();
+            if (failLoadTimes > 0) {
+                failLoadTimes--;
+                throw new RuntimeException("token store read failed");
+            }
             return loadReturns != null ? loadReturns : stored;
         }
 

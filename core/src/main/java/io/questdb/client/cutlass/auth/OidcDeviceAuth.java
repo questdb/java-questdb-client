@@ -1216,17 +1216,21 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (tokenStore == null || storeLoadAttempted) {
             return;
         }
-        // attempt the disk read once per instance, even if it yields nothing, so a missing or bad file is
-        // not re-read on every call
-        storeLoadAttempted = true;
         PersistedToken token;
         try {
             token = tokenStore.load(storeKey);
         } catch (RuntimeException e) {
-            // best-effort: a store read failure must not break sign-in
+            // Best-effort: a store read failure must not break sign-in. Leave storeLoadAttempted UNSET so a
+            // transient failure is retried on the next call. Latching it here instead would make one failed
+            // read disable persistence for the whole life of this instance - so a process that owns a
+            // perfectly good refresh token on disk would re-run the interactive device flow, which for a
+            // headless getToken() consumer is a hard failure rather than a degraded one.
             warnPersistence("load", e);
             return;
         }
+        // the read COMPLETED, so its answer is definitive: a missing, corrupt or foreign-identity file yields
+        // null without throwing, and re-reading it on every later call would buy nothing
+        storeLoadAttempted = true;
         adopt(token);
     }
 
