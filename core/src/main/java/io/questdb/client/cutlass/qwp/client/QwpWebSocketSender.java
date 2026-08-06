@@ -887,6 +887,26 @@ public class QwpWebSocketSender implements Sender {
         );
     }
 
+    /**
+     * Wraps a CONSTANT {@code Authorization} header value as a supplier, tagged so the store-and-forward
+     * drainer can tell it apart from an {@code httpTokenProvider}-backed rotating credential. Callers that
+     * synthesize a fixed header (a static bearer token, a Basic credential) must route it through here
+     * rather than through a bare lambda, or the drainer misreads the credential as rotating.
+     * <p>
+     * The distinction is load-bearing for the orphan drainer's terminal policy. A {@code 401} against a
+     * fixed credential is a permanent misconfiguration, so quarantining the slot immediately is right. The
+     * same {@code 401} against a rotating credential can be a recoverable window - clock skew past the
+     * token's skew margin, a mid-flight revocation, an identity provider rotating its signing keys - where
+     * a later attempt carrying a freshly pulled token succeeds. See
+     * {@code BackgroundDrainer.connectWithDurableAckRetry}.
+     *
+     * @param header the constant header value, or null when no credential is configured
+     * @return a tagged supplier yielding {@code header}, or null when {@code header} is null
+     */
+    public static Supplier<String> fixedAuthHeader(String header) {
+        return header == null ? null : new FixedAuthHeader(header);
+    }
+
     @Override
     public void at(long timestamp, ChronoUnit unit) {
         checkNotClosed();
@@ -2868,10 +2888,6 @@ public class QwpWebSocketSender implements Sender {
         return terminalError;
     }
 
-    private static Supplier<String> fixedAuthHeader(String header) {
-        return header == null ? null : () -> header;
-    }
-
     private static long maskGeoHashBits(long value, int precisionBits) {
         return precisionBits >= 64 ? value : value & ((1L << precisionBits) - 1L);
     }
@@ -4484,6 +4500,16 @@ public class QwpWebSocketSender implements Sender {
         return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
     }
 
+    /**
+     * Whether the {@code Authorization} header is re-derived on every handshake from a caller-supplied
+     * token provider, rather than being a constant captured once. A rotating credential makes a
+     * {@code 401} potentially recoverable, which the orphan drainer's terminal policy depends on; see
+     * {@link #fixedAuthHeader(String)}.
+     */
+    private boolean hasDynamicCredential() {
+        return authorizationHeaderSupplier != null && !(authorizationHeaderSupplier instanceof FixedAuthHeader);
+    }
+
     private void healPersistedDictionary(PersistedSymbolDict pd) {
         if (pd == null || !deltaDictEnabled) {
             return;
@@ -5132,6 +5158,24 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * A constant {@code Authorization} header value. Its identity as a type - not the value it yields - is
+     * what {@link #hasDynamicCredential()} reads, so the drainer can apply the right terminal policy to a
+     * {@code 401}. See {@link #fixedAuthHeader(String)}.
+     */
+    private static final class FixedAuthHeader implements Supplier<String> {
+        private final String header;
+
+        private FixedAuthHeader(String header) {
+            this.header = header;
+        }
+
+        @Override
+        public String get() {
+            return header;
+        }
+    }
+
     private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {
         /**
          * Optional caller-owned liveness gate. {@code null} means this factory
@@ -5157,6 +5201,11 @@ public class QwpWebSocketSender implements Sender {
 
         String abortMessage() {
             return abortCheck != null ? abortMessage : "sender closed during connect";
+        }
+
+        @Override
+        public boolean hasDynamicCredential() {
+            return QwpWebSocketSender.this.hasDynamicCredential();
         }
 
         /**

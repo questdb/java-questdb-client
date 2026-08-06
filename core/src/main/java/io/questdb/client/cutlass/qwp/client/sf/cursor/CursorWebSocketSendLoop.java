@@ -3579,6 +3579,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         WebSocketClient reconnect() throws Exception;
 
         /**
+         * Whether this factory re-derives its {@code Authorization} header from a caller-supplied token
+         * provider on every attempt, rather than presenting a constant captured once.
+         * <p>
+         * The orphan drainer's terminal policy reads this. A {@code 401} against a CONSTANT credential is a
+         * permanent misconfiguration, so quarantining the slot on the first one is correct. Against a
+         * ROTATING credential the same {@code 401} can be a recoverable window - clock skew past the
+         * token's own skew margin, a revocation landing mid-flight, an identity provider rotating signing
+         * keys - and a later attempt carries a freshly pulled token, so quarantining immediately would
+         * abandon replayable data permanently on a fault that heals itself.
+         * <p>
+         * Default: {@code false}, the conservative answer. A factory that cannot tell (a test double, a
+         * transport with no credential at all) keeps the pre-existing fail-fast behaviour.
+         */
+        default boolean hasDynamicCredential() {
+            return false;
+        }
+
+        /**
          * Cancellable variant of {@link #reconnect()}. The loop passes a
          * per-attempt {@link ConnectCancellation} so a transport that blocks
          * inside a native connect can publish the in-flight client to the

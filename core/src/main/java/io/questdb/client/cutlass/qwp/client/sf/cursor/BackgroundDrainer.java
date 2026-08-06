@@ -92,6 +92,21 @@ public final class BackgroundDrainer implements Runnable {
      * cluster-wide misconfig hang the drainer forever.
      */
     public static final int DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS = 16;
+    /**
+     * How many consecutive {@code 401}/{@code 403} rejections an orphan drainer rides out before it
+     * quarantines the slot, when - and only when - the credential is a ROTATING one
+     * ({@link CursorWebSocketSendLoop.ReconnectFactory#hasDynamicCredential()}). Against a constant
+     * credential a rejection stays terminal on the first sweep, as it always was.
+     * <p>
+     * Small on purpose. Its job is to outlast a window that heals on its own - a revocation landing
+     * mid-flight, an identity provider rotating signing keys, a token that expires during the settle so
+     * the next pull refreshes it - not to wait out a genuinely revoked grant. A credential that stays
+     * rejected must still reach a human rather than pin the slot and a drainer-pool worker forever, so
+     * the budget is attempt-counted and deliberately short. Note it cannot repair a PERSISTENT clock
+     * skew: the provider keeps serving the same cached token, so those sweeps simply exhaust the budget
+     * and quarantine, which is the right end state for a condition that is not healing.
+     */
+    public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
     /** How often to wake and re-check ackedFsn vs target. */
     private static final long POLL_NANOS = 50_000_000L; // 50 ms
@@ -302,6 +317,11 @@ public final class BackgroundDrainer implements Runnable {
         // cluster leaves the capability-gap state, later gaps must establish a
         // fresh consecutive run before quarantine is permitted.
         int capabilityGapAttempts = 0;
+        // Consecutive 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
+        // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Never reset: unlike the capability-gap episode
+        // this budget is per-drain, not per-episode, so a credential that alternates rejected/unreachable
+        // cannot refill it indefinitely and stall the quarantine that an operator needs to see.
+        int dynamicCredentialAuthAttempts = 0;
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
         // capabilityGapBudgetNanos (or the attempt cap fires first).
@@ -338,17 +358,41 @@ public final class BackgroundDrainer implements Runnable {
             try {
                 return clientFactory.reconnect();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
-                // Genuinely non-retriable across the cluster (auth 401/403, or a
-                // non-421 upgrade reject): waiting will not fix it, so quarantine
-                // immediately under the orphan reconnect policy.
-                String msg = e.getMessage();
-                LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
-                lastErrorMessage = msg;
-                String reason = "auth/upgrade: " + msg;
-                OrphanScanner.markFailed(slotPath, reason);
-                dispatchDataLoss(reason);
-                outcome = DrainOutcome.FAILED;
-                return null;
+                // A non-421 upgrade reject, and a 401/403 against a CONSTANT credential, are genuinely
+                // non-retriable across the cluster: waiting will not fix them, so quarantine immediately
+                // under the orphan reconnect policy.
+                //
+                // A 401/403 against a ROTATING credential is a different condition. The header is
+                // re-derived from the caller's token provider on every sweep, so the rejection can be a
+                // window that heals itself, and the next sweep carries a freshly pulled token. Quarantining
+                // on the first one would permanently abandon replayable data - nothing in production clears
+                // the .failed sentinel - on a fault that repairs itself in seconds. Ride out a small bounded
+                // budget first; a credential that stays rejected still reaches a human, just later.
+                if (e instanceof QwpAuthFailedException
+                        && clientFactory.hasDynamicCredential()
+                        && ++dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS) {
+                    lastErrorMessage = e.getMessage();
+                    // An auth rejection is unrelated to any open durable-ack episode: we reached a node and
+                    // it refused the credential, which says nothing about its batch cap. Restart the episode
+                    // so a later gap gets its full settle budget, exactly as the transport arm below does.
+                    capabilityGapAttempts = 0;
+                    capabilityGapElapsedNanos = 0L;
+                    lastCapabilityGapNanos = 0L;
+                    LOG.warn("drainer slot {} attempt {}/{}: the rotating credential was rejected ({}); "
+                                    + "retrying with a freshly pulled token after backoff",
+                            slotPath, dynamicCredentialAuthAttempts,
+                            DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS, e.getMessage());
+                    // fall through to the shared capped-backoff block
+                } else {
+                    String msg = e.getMessage();
+                    LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
+                    lastErrorMessage = msg;
+                    String reason = "auth/upgrade: " + msg;
+                    OrphanScanner.markFailed(slotPath, reason);
+                    dispatchDataLoss(reason);
+                    outcome = DrainOutcome.FAILED;
+                    return null;
+                }
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
                 // INVARIANT B: every reachable endpoint is a REPLICA right now.
                 // A replica is promotable and a primary will reappear, so this is

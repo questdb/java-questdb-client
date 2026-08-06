@@ -3419,14 +3419,17 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         private Supplier<String> buildWebSocketAuthHeader() {
+            // A constant credential goes through fixedAuthHeader, not a bare lambda: the tag is what lets
+            // the store-and-forward drainer tell a permanently-wrong password from a rotating token that a
+            // fresh pull can repair, and so decide whether a 401 may quarantine an orphan slot for good.
             if (username != null && password != null) {
                 String credentials = username + ":" + password;
                 String header = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
-                return () -> header;
+                return QwpWebSocketSender.fixedAuthHeader(header);
             }
             if (httpToken != null) {
                 String header = "Bearer " + httpToken;
-                return () -> header;
+                return QwpWebSocketSender.fixedAuthHeader(header);
             }
             if (httpTokenProvider != null) {
                 // pull a fresh token at each (re)handshake so a long-lived WebSocket follows token

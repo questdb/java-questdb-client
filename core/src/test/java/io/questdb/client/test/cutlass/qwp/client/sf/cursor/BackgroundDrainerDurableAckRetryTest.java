@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -54,6 +55,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -271,6 +273,83 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertEquals(slotPath, err.getQuarantinedPath());
             assertTrue("reason must carry the site prefix [msg=" + err.getServerMessage() + ']',
                     err.getServerMessage() != null && err.getServerMessage().startsWith("auth/upgrade: "));
+        });
+    }
+
+    @Test
+    public void testFixedCredentialAuthRejectionStillQuarantinesImmediately() throws Exception {
+        assertMemoryLeak(() -> {
+            // A 401 against a CONSTANT credential is a permanent misconfiguration: re-presenting the same
+            // header cannot change the answer, so the pre-existing fail-fast quarantine must stay exactly as
+            // it was. This is the control for the rotating-credential case below - the settle budget must
+            // key off the credential's nature, not relax auth handling across the board.
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(
+                    () -> new QwpAuthFailedException(401, "127.0.0.1", 9000));
+            BackgroundDrainer drainer = newDrainer(factory);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("a constant credential must not be retried", 1, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
+    @Test
+    public void testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted() throws Exception {
+        assertMemoryLeak(() -> {
+            // The settle budget must be BOUNDED, not "retry forever". A credential that stays rejected is not
+            // healing, and pinning the slot plus a drainer-pool worker indefinitely would starve every other
+            // orphan slot while telling nobody. Once the budget is spent the drainer quarantines exactly as
+            // it always did, so an operator still gets the .failed sentinel and the DATA_LOSS report.
+            ScriptedFactory factory = ScriptedFactory
+                    .alwaysFailing(() -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
+                    .withDynamicCredential();
+            BackgroundDrainer drainer = newDrainer(factory);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("the budget must cap the retries",
+                    BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
+    @Test
+    public void testRotatingCredentialAuthRejectionRidesOutBoundedBudget() throws Exception {
+        assertMemoryLeak(() -> {
+            // With a ROTATING credential the Authorization header is re-derived from the token provider on
+            // every sweep, so a 401 can be a window that heals itself: a revocation landing mid-flight, an
+            // identity provider rotating signing keys, a token expiring during the settle so the next pull
+            // refreshes it. Quarantining on the first one permanently abandons replayable data - nothing in
+            // production clears the .failed sentinel - on a fault that repairs itself in seconds.
+            ScriptedFactory factory = ScriptedFactory
+                    .failingTimes(2, () -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
+                    .withDynamicCredential();
+            BackgroundDrainer drainer = newDrainer(factory);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertSame("the drainer must recover once the credential is accepted",
+                    factory.successSentinel(), out);
+            assertEquals(3, factory.attempts());
+            assertNotEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertFalse("a recovered credential must leave no .failed sentinel",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertTrue("no abandonment may be reported: " + captured, captured.isEmpty());
         });
     }
 
@@ -1032,6 +1111,9 @@ public class BackgroundDrainerDurableAckRetryTest {
         private final WebSocketClient successSentinel;
         private final ThrowableSupplier throwSupplier;
         private final int throwingTimes;
+        // models a sender wired to an httpTokenProvider: the Authorization header is re-derived on every
+        // attempt, so a 401 can be a window that heals rather than a permanent misconfiguration
+        private boolean dynamicCredential;
 
         ScriptedFactory(WebSocketClient successSentinel,
                         int throwingTimes,
@@ -1058,6 +1140,11 @@ public class BackgroundDrainerDurableAckRetryTest {
         }
 
         @Override
+        public boolean hasDynamicCredential() {
+            return dynamicCredential;
+        }
+
+        @Override
         public WebSocketClient reconnect() throws Exception {
             int n = calls.incrementAndGet();
             if (n <= throwingTimes) {
@@ -1072,6 +1159,11 @@ public class BackgroundDrainerDurableAckRetryTest {
 
         WebSocketClient successSentinel() {
             return successSentinel;
+        }
+
+        ScriptedFactory withDynamicCredential() {
+            this.dynamicCredential = true;
+            return this;
         }
     }
 
