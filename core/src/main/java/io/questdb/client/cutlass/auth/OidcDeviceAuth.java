@@ -556,16 +556,21 @@ public class OidcDeviceAuth implements QuietCloseable {
             maybeLoadFromStore();
             // only the kind of token signIn() actually serves counts as a cache hit; a grant that
             // returned the other kind (access token when the server wants the id token, or vice versa)
-            // leaves the served token null, so re-run the flow rather than report the unusable grant as
-            // valid and have selectToken() throw on this and every later call
+            // leaves the served token null, so fall through rather than report the unusable grant as valid
+            // and have selectToken() throw on this and every later call
             final String cachedToken = groupsInToken ? idToken : accessToken;
-            if (cachedToken != null) {
-                if (System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
-                    return cachedToken;
-                }
-                if (refreshToken != null && tryRefreshCoordinated()) {
-                    return selectToken();
-                }
+            if (cachedToken != null && System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
+                return cachedToken;
+            }
+            // Spend a silent refresh before prompting, whenever a refresh token is available - the same rule
+            // getToken() applies. That deliberately includes a null served kind: a restored entry whose grant
+            // only ever produced the OTHER kind still carries a usable refresh token, and one round-trip
+            // beats sending a human back through the device flow. Gating this on cachedToken != null, as it
+            // used to, meant such an entry always re-prompted. A refresh that does not yield the served kind
+            // returns false and falls straight through to the flow below, so this costs at most one wasted
+            // request and cannot loop.
+            if (refreshToken != null && tryRefreshCoordinated()) {
+                return selectToken();
             }
             // flag the interactive phase so a concurrent getToken() fails fast (rather than waiting behind this
             // for the whole device-code lifetime); it still waits behind the cheap cache/refresh work above
@@ -1111,15 +1116,40 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (token == null) {
             return false;
         }
-        // the file is attacker-writable, so treat the served token (the one getToken() puts verbatim into an
-        // Authorization header or a PG-wire password) as untrusted: reject a control/non-ASCII char - and the
-        // whole entry - rather than route a tampered credential onto the wire. A null, empty OR blank
-        // (whitespace-only) served token is unusable: it passes hasOnlyTokenChars vacuously (space is 0x20)
-        // but would be served as a blank "Bearer " header that only draws a 401 - and the sender's own
-        // HttpTokenProvider.validateToken (Chars.isBlank) rejects it downstream anyway - so reject it here on
-        // the same isBlank contract and fall through to a refresh or sign-in rather than wedge on it.
+        // The file is attacker-writable, so the served token - the one getToken() puts verbatim into an
+        // Authorization header or a PG-wire password - is untrusted input. Two failure shapes look similar
+        // here and must be told apart, because the safe answer to each is the opposite of the other.
         String servedToken = groupsInToken ? token.getIdToken() : token.getAccessToken();
+        String fileRefreshToken = token.getRefreshToken();
+        if (servedToken == null) {
+            // ABSENT, which is a legitimate shape rather than evidence of anything. Under
+            // groupsInToken=false a grant that returned only an id_token has storeTokens null the access
+            // token, and persistIfRotated writes the entry regardless; FileTokenStore also maps an empty
+            // on-disk value to null. Discarding such an entry throws away the refresh token, which is the
+            // one thing persistence exists to preserve, and sends a human back through the device flow
+            // where a single silent refresh would have done - a hard failure for a headless getToken()
+            // consumer. So keep the refresh token and leave the cache empty and expired, which puts
+            // getToken()/signIn() on the refresh path they already have for a null served kind. The refresh
+            // token needs no character check of its own: tryRefresh url-encodes it into the form body
+            // (appendParam -> urlEncode), unlike the served token, which reaches a header verbatim.
+            if (fileRefreshToken == null) {
+                return false; // nothing usable in this entry at all
+            }
+            accessToken = null;
+            idToken = null;
+            refreshToken = fileRefreshToken;
+            expiresAtMillis = 0;
+            tokenTtlMillis = 0;
+            lastPersistedRefreshToken = fileRefreshToken;
+            return true;
+        }
         if (Chars.isBlank(servedToken) || !hasOnlyTokenChars(servedToken)) {
+            // PRESENT but unusable: whitespace-only (which passes hasOnlyTokenChars vacuously, space being
+            // 0x20, yet would be served as a blank "Bearer " header the server only answers with 401), or
+            // carrying a control or non-ASCII character. Unlike an absent token this is positive evidence
+            // that something else wrote this file, so reject the WHOLE entry - refresh token included.
+            // Adopting the refresh token of a file we know was tampered with would let an attacker who can
+            // write the store swap in their own, and this client would silently sign in as them.
             return false;
         }
         accessToken = token.getAccessToken();
@@ -1129,7 +1159,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         // tampered file - must not null a live in-memory refresh token: doing so would make a later
         // tryRefresh() urlEncode(null) and throw an uncaught NPE (aborting the sign-in) instead of refreshing
         // with the token we still hold or degrading to an interactive sign-in.
-        String fileRefreshToken = token.getRefreshToken();
         if (fileRefreshToken != null) {
             refreshToken = fileRefreshToken;
         }

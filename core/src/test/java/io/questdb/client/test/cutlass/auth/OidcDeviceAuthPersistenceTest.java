@@ -836,6 +836,40 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testPersistedEntryWithoutServedTokenStillRefreshes() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                token.incrementAndGet();
+                return MockOidcServer.json(200, tokenJson("ACCESS-REFRESHED", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // An entry with a good refresh token but no SERVED kind is reachable: under
+                // groupsInToken=false a grant that returns only an id_token has storeTokens null the access
+                // token, and persistIfRotated writes the entry anyway - and a cross-language peer can produce
+                // the same shape. adopt() used to discard such an entry whole, throwing away the refresh
+                // token, which is the one thing persistence exists to preserve. The restart must therefore
+                // spend one silent refresh, not send a human back through the device flow.
+                fake.loadReturns = new PersistedToken(null, "ID-1", "REFRESH-1",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("ACCESS-REFRESHED", auth.signIn());
+                }
+                Assert.assertEquals("the persisted refresh token must be spent on a silent refresh",
+                        1, token.get());
+                Assert.assertEquals("a usable persisted refresh token must not force the device flow",
+                        0, device.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTransientStoreLoadFailureIsRetriedNotLatched() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
