@@ -858,17 +858,31 @@ public final class BackgroundDrainer implements Runnable {
                         if (t.getCause() instanceof Error) {
                             throw (Error) t.getCause();
                         }
-                        if (loop.capabilityGapTerminal() != null) {
-                            // Capability gap mid-drain: recycle the wire, NOT
-                            // the slot. connectWithDurableAckRetry() owns the
-                            // episode budget (16 consecutive gap sweeps /
-                            // wall clock) and drops the sentinel itself if the
-                            // gap persists. The loop's own failed sweep is not
-                            // counted toward the fresh episode -- an off-by-one
-                            // that is immaterial at budget 16.
-                            LOG.warn("drainer slot {}: durable-ack capability gap "
-                                            + "mid-drain ({}), re-entering settle budget",
-                                    slotPath, t.getMessage());
+                        if (loop.capabilityGapTerminal() != null || loop.authTerminal() != null) {
+                            // Mid-drain RECOVERABLE terminal: recycle the wire, NOT
+                            // the slot. connectWithDurableAckRetry() owns the matching
+                            // bounded budget and drops the sentinel itself if the
+                            // condition persists, so a fault that heals -- a rolling
+                            // upgrade settling, or a rotating credential's next token
+                            // being accepted -- never abandons replayable data on its
+                            // first sweep. The loop's own failed sweep is not counted
+                            // toward the fresh budget -- an off-by-one immaterial at
+                            // either budget. Two classes route here:
+                            //   - capability gap: the 16 consecutive-sweep / wall-clock
+                            //     settle budget.
+                            //   - rotating-credential 401/403 (authTerminal): the
+                            //     DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS ride-out.
+                            //     Only an ORPHAN loop with a dynamic credential sets it;
+                            //     a constant credential stays fatal and quarantines below.
+                            if (loop.authTerminal() != null) {
+                                LOG.warn("drainer slot {}: rotating credential rejected mid-drain ({}), "
+                                                + "re-entering the rotating-401 ride-out",
+                                        slotPath, t.getMessage());
+                            } else {
+                                LOG.warn("drainer slot {}: durable-ack capability gap "
+                                                + "mid-drain ({}), re-entering settle budget",
+                                        slotPath, t.getMessage());
+                            }
                             try {
                                 loop.close();
                             } catch (Throwable closeFailure) {

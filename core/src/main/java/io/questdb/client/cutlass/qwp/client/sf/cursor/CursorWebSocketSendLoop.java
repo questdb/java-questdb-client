@@ -438,6 +438,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
     private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
+    // Typed marker for a ROTATING-credential auth terminal (401/403): set (before the
+    // terminalError latch, so a checkError() caller that observes the latch is guaranteed to
+    // observe this marker too) when a mid-drain reconnect sweep on an ORPHAN drainer whose
+    // credential is dynamic (reconnectFactory.hasDynamicCredential()) threw QwpAuthFailedException.
+    // The orphan drainer consults it to route such a rejection into its bounded rotating-401
+    // ride-out (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining the slot on
+    // the first rejection: the header is re-derived from the token provider every attempt, so a 401
+    // can be a self-healing window that a freshly pulled token clears -- the same reasoning the
+    // capability-gap recycle rests on. A CONSTANT credential never sets it (it stays fatal), and
+    // foreground reconnects never set it either. Write-once alongside terminalError.
+    private volatile QwpAuthFailedException authTerminal;
     // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
     // terminalError latch, so a checkError() caller that observes the latch is
     // guaranteed to observe this marker too) when a reconnect sweep threw
@@ -1191,6 +1202,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * The typed rotating-credential auth terminal (401/403), or {@code null} if the loop's terminal
+     * (if any) is a different failure class. Non-null only after {@link #checkError()} started
+     * throwing: the marker is written before the {@code terminalError} latch, both on the I/O thread.
+     * <p>
+     * Consumer contract: the orphan drainer ({@code BackgroundDrainer}) checks this after a
+     * {@code checkError()} throw to route a mid-drain 401/403 against a ROTATING credential into its
+     * bounded rotating-401 ride-out (the header is re-derived per attempt, so the rejection can be a
+     * self-healing window a freshly pulled token clears) rather than quarantining the slot. A constant
+     * credential never sets it. Package-private on purpose -- the foreground sender must not branch
+     * on it.
+     */
+    QwpAuthFailedException authTerminal() {
+        return authTerminal;
+    }
+
+    /**
      * The typed durable-ack capability-gap terminal, or {@code null} if the
      * loop's terminal (if any) is a different failure class. Non-null only
      * after {@link #checkError()} started throwing: the marker is written
@@ -1797,11 +1824,37 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 resetCatchUpCapGapEpisode();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 if (endpointPolicyFailureIsTerminal()) {
-                    // Orphans return control to their quarantine owner.
-                    // WebSocketUpgradeException reaching here is always non-421:
-                    // role rejects are classified into the transient branch below.
-                    LOG.error("terminal upgrade error during {} -- won't retry: {}",
-                            phase, e.getMessage());
+                    // A 401/403 against a ROTATING credential on an orphan drainer is NOT uniformly
+                    // fatal: the Authorization header is re-derived from the caller's token provider on
+                    // every attempt, so the rejection can be a self-healing window (a revocation landing
+                    // mid-flight, the IdP rotating signing keys, clock skew past the token's own margin)
+                    // that a freshly pulled token clears. Hand it back as a RECOVERABLE auth-terminal --
+                    // exactly as a capability gap does -- so BackgroundDrainer recycles it through
+                    // connectWithDurableAckRetry()'s bounded rotating-401 ride-out instead of
+                    // quarantining on the first rejection and permanently abandoning replayable data.
+                    // A CONSTANT credential (or a non-421 upgrade reject) is uniformly rejected across
+                    // the cluster and stays fatal. This gates on reconnectPolicy == ORPHAN, so an
+                    // INITIALIZING foreground 401 (endpointPolicyFailureIsTerminal via !hasEverConnected)
+                    // is never masked and still reaches the caller.
+                    final boolean rotatingCredentialReject = reconnectPolicy == ReconnectPolicy.ORPHAN
+                            && e instanceof QwpAuthFailedException
+                            && reconnectFactory.hasDynamicCredential();
+                    if (rotatingCredentialReject) {
+                        if (terminalError == null) {
+                            // Publish the marker before terminalError, the volatile first-writer-wins
+                            // latch the owner observes -- same ordering as capabilityGapTerminal.
+                            authTerminal = (QwpAuthFailedException) e;
+                        }
+                        LOG.warn("rotating credential rejected during {} -- handing the slot back to the "
+                                        + "drainer to retry with a freshly pulled token: {}",
+                                phase, e.getMessage());
+                    } else {
+                        // Orphans return control to their quarantine owner.
+                        // WebSocketUpgradeException reaching here is always non-421:
+                        // role rejects are classified into the transient branch below.
+                        LOG.error("terminal upgrade error during {} -- won't retry: {}",
+                                phase, e.getMessage());
+                    }
                     long fromFsn = engine.ackedFsn() + 1L;
                     long toFsn = Math.max(fromFsn, engine.publishedFsn());
                     SenderError err = new SenderError(
