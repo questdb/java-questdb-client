@@ -24,6 +24,7 @@
 
 package io.questdb.client.test.cutlass.qwp.client;
 
+import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
@@ -82,6 +83,26 @@ public class QwpQueryClientTokenProviderTest {
         public void onError(byte status, String message) {
         }
     };
+
+    @Test
+    public void testOidcProviderFailureIsWrappedAsLineSenderException() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                    .withBearerTokenProvider(() -> {
+                        throw new OidcAuthException("the cached token could not be refreshed");
+                    })) {
+                try {
+                    c.getAuthorizationHeaderForTest();
+                    Assert.fail("an OIDC provider failure must fail token resolution");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(),
+                            e.getMessage().contains("the cached token could not be refreshed"));
+                    Assert.assertTrue("the provider failure must be retained as the cause",
+                            e.getCause() instanceof OidcAuthException);
+                }
+            }
+        });
+    }
 
     @Test
     public void testProviderConflictsWithBasicAuth() throws Exception {

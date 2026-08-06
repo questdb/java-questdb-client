@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 import io.questdb.client.cutlass.json.JsonException;
 import io.questdb.client.cutlass.json.JsonLexer;
 import io.questdb.client.cutlass.json.JsonParser;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
@@ -1882,8 +1883,10 @@ public class OidcDeviceAuthTest {
                 try {
                     sender.table("t").doubleColumn("x", 2.0).atNow();
                     Assert.fail("expected the failing provider pull to surface on the next row");
-                } catch (OidcAuthException e) {
+                } catch (LineSenderException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not be refreshed"));
+                    Assert.assertTrue("the provider failure must be retained as the cause",
+                            e.getCause() instanceof OidcAuthException);
                 }
 
                 // the provider recovers (pull #3 -> TOKEN-3); the failed pull must not have corrupted the

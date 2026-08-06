@@ -30,6 +30,7 @@ import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -1909,9 +1910,20 @@ public class QwpQueryClient implements QuietCloseable {
         // endpoint walk) so a reconnect presents a freshly refreshed token; validateToken rejects a
         // null/empty/blank return, or one carrying a control or non-ASCII character, before it reaches
         // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet)
-        // propagates out of connect()/reconnect with its own message, matching the QWP ingress sender.
+        // fails connect()/reconnect as a LineSenderException, preserving the provider failure as its cause.
         if (tokenProvider != null) {
-            CharSequence token = tokenProvider.getToken();
+            CharSequence token;
+            try {
+                token = tokenProvider.getToken();
+            } catch (LineSenderException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new LineSenderException(
+                        e.getMessage() == null
+                                ? "token provider failed to supply a credential"
+                                : e.getMessage(),
+                        e);
+            }
             HttpTokenProvider.validateToken(token);
             return "Bearer " + token;
         }

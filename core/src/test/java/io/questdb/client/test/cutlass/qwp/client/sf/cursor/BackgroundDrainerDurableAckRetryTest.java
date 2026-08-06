@@ -303,12 +303,43 @@ public class BackgroundDrainerDurableAckRetryTest {
     @Test
     public void testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted() throws Exception {
         assertMemoryLeak(() -> {
-            // The settle budget must be BOUNDED, not "retry forever". A credential that stays rejected is not
-            // healing, and pinning the slot plus a drainer-pool worker indefinitely would starve every other
-            // orphan slot while telling nobody. Once the budget is spent the drainer quarantines exactly as
-            // it always did, so an operator still gets the .failed sentinel and the DATA_LOSS report.
+            // The settle budget must be BOUNDED, not "retry forever". Quarantine is permitted only once both
+            // the attempt threshold and the wall-clock dwell floor are exhausted; this short test budget pins
+            // the terminal behavior without waiting for the production five-minute default.
             ScriptedFactory factory = ScriptedFactory
                     .alwaysFailing(() -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
+                    .withDynamicCredential();
+            long authDwellFloorMillis = 25L;
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, authDwellFloorMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            long startNanos = System.nanoTime();
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertTrue("the attempt threshold must be reached",
+                    factory.attempts() >= BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS);
+            assertTrue("quarantine must not precede the auth dwell floor [elapsedMillis="
+                            + elapsedMillis + "]",
+                    elapsedMillis >= authDwellFloorMillis);
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
+    @Test
+    public void testRotatingCredentialAuthRejectionRidesPastAttemptThresholdBeforeDwellFloor() throws Exception {
+        assertMemoryLeak(() -> {
+            // Six fast 401s must not strand the slot while the configured self-healing window is still open.
+            // The seventh attempt succeeds, proving that attempt count alone cannot quarantine replayable data.
+            ScriptedFactory factory = ScriptedFactory
+                    .failingTimes(BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS,
+                            () -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
                     .withDynamicCredential();
             BackgroundDrainer drainer = newDrainer(factory);
             List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
@@ -316,13 +347,14 @@ public class BackgroundDrainerDurableAckRetryTest {
 
             WebSocketClient out = drainer.connectWithDurableAckRetry();
 
-            assertNull(out);
-            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
-            assertEquals("the budget must cap the retries",
-                    BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS, factory.attempts());
-            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
-            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
-            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+            assertSame("the drainer must keep trying after the fast attempt threshold",
+                    factory.successSentinel(), out);
+            assertEquals(BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS + 1,
+                    factory.attempts());
+            assertNotEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertFalse("a recovered credential must leave no .failed sentinel",
+                    Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertTrue("no abandonment may be reported: " + captured, captured.isEmpty());
         });
     }
 

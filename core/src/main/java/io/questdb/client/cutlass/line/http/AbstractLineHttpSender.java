@@ -840,7 +840,18 @@ public abstract class AbstractLineHttpSender implements Sender {
             // could splice a CR/LF into the "Authorization: Bearer" header (request.authToken writes it verbatim,
             // with no CR/LF filtering). The scan is O(token length) and is dwarfed by the flush's network
             // round-trip; the WebSocket auth path validates on every pull for the same reason.
-            CharSequence token = httpTokenProvider.getToken();
+            CharSequence token;
+            try {
+                token = httpTokenProvider.getToken();
+            } catch (LineSenderException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new LineSenderException(
+                        e.getMessage() == null
+                                ? "token provider failed to supply a credential"
+                                : e.getMessage(),
+                        e);
+            }
             HttpTokenProvider.validateToken(token);
             request.authToken(token);
             request.withContent();

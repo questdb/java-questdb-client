@@ -61,10 +61,10 @@ import static org.junit.Assert.fail;
  * Mid-drain rotating-credential 401/403 coverage for {@link BackgroundDrainer}.
  * <p>
  * {@code connectWithDurableAckRetry} gives an ORPHAN drainer whose credential
- * rotates ({@code hasDynamicCredential()}) a bounded ride-out
- * ({@link BackgroundDrainer#DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS})
- * before quarantining on a 401 — the header is re-derived from the token
- * provider every attempt, so a rejection can be a self-healing window (a
+ * rotates ({@code hasDynamicCredential()}) a bounded ride-out requiring both
+ * an attempt threshold ({@link BackgroundDrainer#DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS})
+ * and a wall-clock dwell floor before quarantining on a 401 — the header is
+ * re-derived from the token provider every attempt, so a rejection can be a self-healing window (a
  * revocation landing mid-flight, the IdP rotating signing keys, clock skew) a
  * freshly pulled token clears. The same rejection hit <i>mid-drain</i> (the
  * wire drops, the loop's reconnect sweep is refused) must get the same ride-out
@@ -88,7 +88,7 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
 
     private static final long FAST_BACKOFF_MAX_MILLIS = 4L;
     private static final long FAST_BACKOFF_MILLIS = 1L;
-    private static final long RECONNECT_MAX_DURATION_MILLIS = 60_000L;
+    private static final long RECONNECT_MAX_DURATION_MILLIS = 25L;
     private static final int SEEDED_FRAMES = 5;
     private static final long SEGMENT_SIZE_BYTES = 16384L;
     private static final long SF_MAX_TOTAL_BYTES = 1L << 20;
@@ -156,10 +156,10 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
                 assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
                 assertTrue("a persistent rotating 401 must quarantine after the ride-out",
                         Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
-                // 1 healthy connect + 1 loop reconnect sweep (latches the loop's
-                // authTerminal) + the full ride-out of re-entered sweeps.
-                assertEquals(2 + BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS,
-                        factory.attempts());
+                // 1 healthy connect + 1 loop reconnect sweep (latches the loop's authTerminal) + enough
+                // re-entered sweeps to satisfy both the attempt threshold and the wall-clock dwell floor.
+                assertTrue("the drainer must reach the rotating-auth attempt threshold",
+                        factory.attempts() >= 2 + BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS);
                 assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
                 assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
             }

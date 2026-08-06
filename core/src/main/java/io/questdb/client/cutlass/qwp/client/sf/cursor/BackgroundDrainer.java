@@ -93,18 +93,19 @@ public final class BackgroundDrainer implements Runnable {
      */
     public static final int DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS = 16;
     /**
-     * How many consecutive {@code 401}/{@code 403} rejections an orphan drainer rides out before it
-     * quarantines the slot, when - and only when - the credential is a ROTATING one
+     * Attempt threshold for {@code 401}/{@code 403} rejections an orphan drainer rides out before it
+     * may quarantine the slot, when - and only when - the credential is a ROTATING one
      * ({@link CursorWebSocketSendLoop.ReconnectFactory#hasDynamicCredential()}). Against a constant
      * credential a rejection stays terminal on the first sweep, as it always was.
      * <p>
-     * Small on purpose. Its job is to outlast a window that heals on its own - a revocation landing
-     * mid-flight, an identity provider rotating signing keys, a token that expires during the settle so
-     * the next pull refreshes it - not to wait out a genuinely revoked grant. A credential that stays
-     * rejected must still reach a human rather than pin the slot and a drainer-pool worker forever, so
-     * the budget is attempt-counted and deliberately short. Note it cannot repair a PERSISTENT clock
-     * skew: the provider keeps serving the same cached token, so those sweeps simply exhaust the budget
-     * and quarantine, which is the right end state for a condition that is not healing.
+     * The attempt threshold is necessary but not sufficient: the rejection must also persist for at
+     * least {@code reconnectMaxDurationMillis}, measured from the first rejection. This wall-clock floor
+     * gives IdP signing-key and resource-server JWKS caches time to converge even when capped backoff can
+     * accumulate six attempts in only a few seconds. A credential that stays rejected still reaches a
+     * human after both thresholds are met rather than pinning the slot and a drainer-pool worker forever.
+     * Note it cannot repair a PERSISTENT clock skew: the provider keeps serving the same cached token, so
+     * those sweeps eventually exhaust both thresholds and quarantine, which is the right end state for a
+     * condition that is not healing.
      */
     public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
@@ -296,8 +297,9 @@ public final class BackgroundDrainer implements Runnable {
      * transport error -- are retried indefinitely (Invariant B) and never
      * consume the budget. Either transient restarts the attempt count and wall
      * clock so only uninterrupted capability-gap sweeps can escalate.
-     * Genuine terminals (auth failure, non-421 upgrade reject) preserve
-     * the original behavior: mark failed, exit.
+     * Genuine terminals (a constant-credential auth failure, a rotating-credential
+     * auth failure that exhausts both its attempt threshold and wall-clock floor,
+     * or a non-421 upgrade reject) mark the slot failed and exit.
      *
      * @return a fresh durable-ack-capable client, or {@code null} if
      *         {@link #outcome} has been set to FAILED or STOPPED
@@ -317,14 +319,18 @@ public final class BackgroundDrainer implements Runnable {
         // cluster leaves the capability-gap state, later gaps must establish a
         // fresh consecutive run before quarantine is permitted.
         int capabilityGapAttempts = 0;
-        // Consecutive 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
+        // 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
         // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Never reset: unlike the capability-gap episode
-        // this budget is per-drain, not per-episode, so a credential that alternates rejected/unreachable
-        // cannot refill it indefinitely and stall the quarantine that an operator needs to see.
+        // this threshold is per-drain, not per-episode, so a credential that alternates
+        // rejected/unreachable cannot refill it indefinitely and stall the quarantine that an operator
+        // needs to see.
         int dynamicCredentialAuthAttempts = 0;
+        // The rotating-auth wall-clock floor is anchored at the first 401/403 and, like the attempt
+        // threshold, never resets during this drain. A zero value means no rejection has been observed.
+        long firstDynamicCredentialAuthFailureNanos = 0L;
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
-        // capabilityGapBudgetNanos (or the attempt cap fires first).
+        // reconnectBudgetNanos (or the attempt cap fires first).
         long capabilityGapElapsedNanos = 0L;
         // Timestamp of the previous capability-gap sweep; 0 = the next gap
         // charges nothing because a fresh episode is starting.
@@ -338,7 +344,7 @@ public final class BackgroundDrainer implements Runnable {
         // more tolerance would buy exactly none. TimeUnit clamps at Long.MAX_VALUE, which
         // is the intended "effectively unbounded". CursorWebSocketSendLoop's dwell
         // conversion guards the same way for the same reason.
-        final long capabilityGapBudgetNanos =
+        final long reconnectBudgetNanos =
                 TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis);
         // Observability-only counter for the transient all-replica window;
         // never consulted for escalation (Invariant B).
@@ -366,11 +372,24 @@ public final class BackgroundDrainer implements Runnable {
                 // re-derived from the caller's token provider on every sweep, so the rejection can be a
                 // window that heals itself, and the next sweep carries a freshly pulled token. Quarantining
                 // on the first one would permanently abandon replayable data - nothing in production clears
-                // the .failed sentinel - on a fault that repairs itself in seconds. Ride out a small bounded
-                // budget first; a credential that stays rejected still reaches a human, just later.
-                if (e instanceof QwpAuthFailedException
-                        && clientFactory.hasDynamicCredential()
-                        && ++dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS) {
+                // the .failed sentinel - on a fault that repairs itself. Require BOTH enough rejection
+                // attempts and a minimum wall-clock dwell before quarantine: capped backoff can otherwise spend
+                // the attempt threshold in seconds, far sooner than IdP signing-key/JWKS caches commonly
+                // converge.
+                boolean retryDynamicCredentialAuth = false;
+                long dynamicCredentialAuthElapsedNanos = 0L;
+                if (e instanceof QwpAuthFailedException && clientFactory.hasDynamicCredential()) {
+                    dynamicCredentialAuthAttempts++;
+                    long now = System.nanoTime();
+                    if (firstDynamicCredentialAuthFailureNanos == 0L) {
+                        firstDynamicCredentialAuthFailureNanos = now;
+                    }
+                    dynamicCredentialAuthElapsedNanos = now - firstDynamicCredentialAuthFailureNanos;
+                    retryDynamicCredentialAuth =
+                            dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
+                                    || dynamicCredentialAuthElapsedNanos < reconnectBudgetNanos;
+                }
+                if (retryDynamicCredentialAuth) {
                     lastErrorMessage = e.getMessage();
                     // An auth rejection is unrelated to any open durable-ack episode: we reached a node and
                     // it refused the credential, which says nothing about its batch cap. Restart the episode
@@ -378,10 +397,13 @@ public final class BackgroundDrainer implements Runnable {
                     capabilityGapAttempts = 0;
                     capabilityGapElapsedNanos = 0L;
                     lastCapabilityGapNanos = 0L;
-                    LOG.warn("drainer slot {} attempt {}/{}: the rotating credential was rejected ({}); "
-                                    + "retrying with a freshly pulled token after backoff",
+                    LOG.warn("drainer slot {} attempt {} (threshold {}, dwell {}ms/{}ms): "
+                                    + "the rotating credential was rejected ({}); retrying with a freshly pulled "
+                                    + "token after backoff",
                             slotPath, dynamicCredentialAuthAttempts,
-                            DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS, e.getMessage());
+                            DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS,
+                            dynamicCredentialAuthElapsedNanos / 1_000_000L,
+                            reconnectMaxDurationMillis, e.getMessage());
                     // fall through to the shared capped-backoff block
                 } else {
                     String msg = e.getMessage();
@@ -443,7 +465,7 @@ public final class BackgroundDrainer implements Runnable {
                 lastCapabilityGapNanos = now;
                 long elapsedMs = capabilityGapElapsedNanos / 1_000_000L;
                 boolean exhausted = capabilityGapAttempts >= DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS
-                        || capabilityGapElapsedNanos >= capabilityGapBudgetNanos;
+                        || capabilityGapElapsedNanos >= reconnectBudgetNanos;
                 BackgroundDrainerListener l = listener;
                 if (exhausted) {
                     LOG.error("drainer giving up on slot {} after {} durable-ack-mismatch attempts ({}ms): {}",
@@ -541,7 +563,7 @@ public final class BackgroundDrainer implements Runnable {
             long sleepMillis = backoffMillis + jitter;
             if (boundedByBudget) {
                 sleepMillis = Math.min(sleepMillis,
-                        Math.max(0L, (capabilityGapBudgetNanos - capabilityGapElapsedNanos) / 1_000_000L));
+                        Math.max(0L, (reconnectBudgetNanos - capabilityGapElapsedNanos) / 1_000_000L));
             }
             if (sleepMillis > 0L && !stopRequested) {
                 long parkDeadlineNanos = System.nanoTime() + sleepMillis * 1_000_000L;
