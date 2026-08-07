@@ -217,6 +217,7 @@
                     <systemPropertyVariables>
                         <questdb.client.jar>${project.build.directory}/${project.build.finalName}.jar</questdb.client.jar>
                         <questdb.client.test.classes>${project.build.testOutputDirectory}</questdb.client.test.classes>
+                        <questdb.client.java11.src>${project.basedir}/src/main/java11</questdb.client.java11.src>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
@@ -615,22 +616,14 @@
                                             </condition>
                                         </fail>
                                         <mkdir dir="${project.build.outputDirectory}/META-INF/versions/11" />
-                                        <exec executable="${java11.home}/bin/javac" failonerror="true">
-                                            <arg value="-source" />
-                                            <arg value="11" />
-                                            <arg value="-target" />
-                                            <arg value="11" />
-                                            <arg value="-encoding" />
-                                            <arg value="UTF-8" />
-                                            <arg value="--add-exports" />
-                                            <arg value="java.base/jdk.internal.math=ALL-UNNAMED" />
-                                            <arg value="-classpath" />
-                                            <arg value="${project.build.outputDirectory}" />
-                                            <arg value="-d" />
-                                            <arg value="${project.build.outputDirectory}/META-INF/versions/11" />
-                                            <arg value="${project.basedir}/src/main/java11/io/questdb/client/std/Compat.java" />
-                                            <arg value="${project.basedir}/src/main/java11/io/questdb/client/std/FdBig.java" />
-                                        </exec>
+                                        <!-- whole source root, not an explicit file list: a file
+                                             added to src/main/java11 must ship in versions/11 or
+                                             the jar is broken on Java 9+ again (JarPackagingIT
+                                             cross-checks the packaged jar against the source root) -->
+                                        <javac srcdir="${project.basedir}/src/main/java11" destdir="${project.build.outputDirectory}/META-INF/versions/11" classpath="${project.build.outputDirectory}" source="11" target="11" encoding="UTF-8" debug="true" includeantruntime="false" fork="true" executable="${java11.home}/bin/javac" compiler="extJavac">
+                                            <compilerarg value="--add-exports" />
+                                            <compilerarg value="java.base/jdk.internal.math=ALL-UNNAMED" />
+                                        </javac>
                                     </target>
                                 </configuration>
                             </execution>

@@ -86,6 +86,15 @@ public class JarPackagingIT {
                         "META-INF/versions/11 must carry the java11 Compat shim",
                         jar.getEntry("META-INF/versions/11/io/questdb/client/std/Compat.class")
                 );
+                // every source in src/main/java11 must ship in versions/11 -- a file added
+                // to the source root but missed by the packaging step would recreate the
+                // NoClassDefFoundError class of bug on Java 9+
+                File java11SrcRoot = new File(System.getProperty("questdb.client.java11.src"));
+                Assert.assertTrue("src/main/java11 not found: " + java11SrcRoot, java11SrcRoot.isDirectory());
+                for (String relativeSource : collectJavaSources(java11SrcRoot, "")) {
+                    String entry = "META-INF/versions/11/" + relativeSource.replaceAll("\\.java$", ".class");
+                    Assert.assertNotNull("src/main/java11/" + relativeSource + " has no packaged counterpart " + entry, jar.getEntry(entry));
+                }
             } else {
                 // JDK 11+ build: dev/smoke only, never shipped. Root classes are the
                 // java11 variants and the real module descriptor is present.
@@ -96,6 +105,21 @@ public class JarPackagingIT {
                 Assert.assertNotNull("module-info.class missing", jar.getEntry("module-info.class"));
             }
         }
+    }
+
+    private static java.util.List<String> collectJavaSources(File dir, String prefix) {
+        java.util.List<String> result = new java.util.ArrayList<String>();
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    result.addAll(collectJavaSources(file, prefix + file.getName() + "/"));
+                } else if (file.getName().endsWith(".java")) {
+                    result.add(prefix + file.getName());
+                }
+            }
+        }
+        return result;
     }
 
     private static boolean classReferences(JarFile jar, String entryName, String constant) throws IOException {
