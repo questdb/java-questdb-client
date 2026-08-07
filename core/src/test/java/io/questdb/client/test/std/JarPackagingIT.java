@@ -54,14 +54,32 @@ public class JarPackagingIT {
 
     @Test
     public void testDoubleFormattingAgainstPackagedJar() throws Exception {
-        String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+        runSmokeAgainstJar(System.getProperty("java.home"));
+        if ("1.8".equals(System.getProperty("java.specification.version"))) {
+            // On a JDK 8 build the run above only exercised the root sun.misc
+            // classes. Run again on the JDK 11+ that compiled the versioned
+            // bridge, so every packaging build -- including the release verify
+            // gate -- EXECUTES the META-INF/versions/11 classes instead of only
+            // checking they exist. Required, not skipped-if-absent: packaging
+            // already failed earlier without a JDK 11 (see the antrun step).
+            String bridgeJdkHome = System.getProperty("java11.home");
+            if (bridgeJdkHome == null || bridgeJdkHome.isEmpty() || bridgeJdkHome.startsWith("${")) {
+                bridgeJdkHome = System.getenv("JAVA11_HOME");
+            }
+            Assert.assertNotNull("JAVA11_HOME (or -Djava11.home) must point at a JDK 11+", bridgeJdkHome);
+            runSmokeAgainstJar(bridgeJdkHome);
+        }
+    }
+
+    private static void runSmokeAgainstJar(String jdkHome) throws Exception {
+        String javaBin = jdkHome + File.separator + "bin" + File.separator + "java";
         String classpath = jarPath() + File.pathSeparator + System.getProperty("questdb.client.test.classes");
         Process process = new ProcessBuilder(javaBin, "-cp", classpath, DoubleFormatSmoke.class.getName())
                 .redirectErrorStream(true)
                 .start();
         String output = readFully(process.getInputStream());
         int exitCode = process.waitFor();
-        Assert.assertEquals("double formatting against the packaged jar failed:\n" + output, 0, exitCode);
+        Assert.assertEquals("double formatting against the packaged jar failed on " + javaBin + ":\n" + output, 0, exitCode);
     }
 
     @Test
