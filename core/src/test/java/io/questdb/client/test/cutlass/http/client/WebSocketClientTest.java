@@ -32,6 +32,7 @@ import io.questdb.client.cutlass.http.client.WebSocketSendBuffer;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.network.Socket;
 import io.questdb.client.network.SocketReadinessWaiter;
+import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import org.junit.Assert;
 import org.junit.Test;
@@ -313,6 +314,41 @@ public class WebSocketClientTest {
     }
 
     @Test
+    public void testSendBinaryAssemblesTwoPayloadSlicesIntoOneMaskedFrame() throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingSocket socket = new CapturingSocket();
+            long first = Unsafe.malloc(3, MemoryTag.NATIVE_DEFAULT);
+            long second = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+            try (CapturingWebSocketClient client = new CapturingWebSocketClient(socket)) {
+                setUpgradedTrue(client);
+                for (int i = 0; i < 3; i++) {
+                    Unsafe.getUnsafe().putByte(first + i, (byte) (i + 1));
+                }
+                for (int i = 0; i < 4; i++) {
+                    Unsafe.getUnsafe().putByte(second + i, (byte) (i + 4));
+                }
+
+                client.sendBinary(first, 3, second, 4);
+
+                byte[] frame = socket.sent;
+                Assert.assertNotNull(frame);
+                Assert.assertEquals((byte) 0x82, frame[0]);
+                Assert.assertEquals((byte) (0x80 | 7), frame[1]);
+                byte[] payload = new byte[7];
+                for (int i = 0; i < payload.length; i++) {
+                    payload[i] = (byte) (frame[6 + i] ^ frame[2 + (i & 3)]);
+                }
+                Assert.assertArrayEquals(
+                        new byte[]{1, 2, 3, 4, 5, 6, 7},
+                        payload);
+            } finally {
+                Unsafe.free(first, 3, MemoryTag.NATIVE_DEFAULT);
+                Unsafe.free(second, 4, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testSendCloseFrameDoesNotClobberSendBuffer() throws Exception {
         assertMemoryLeak(() -> {
             try (StubWebSocketClient client = new StubWebSocketClient()) {
@@ -460,6 +496,34 @@ public class WebSocketClientTest {
         @Override
         public boolean wantsTlsWrite() {
             return false;
+        }
+    }
+
+    private static class CapturingSocket extends FakeSocket {
+        private byte[] sent;
+
+        @Override
+        public int send(long bufferPtr, int bufferLen) {
+            sent = new byte[bufferLen];
+            for (int i = 0; i < bufferLen; i++) {
+                sent[i] = Unsafe.getUnsafe().getByte(bufferPtr + i);
+            }
+            return bufferLen;
+        }
+    }
+
+    private static class CapturingWebSocketClient extends WebSocketClient {
+
+        CapturingWebSocketClient(CapturingSocket socket) {
+            super(DefaultHttpClientConfiguration.INSTANCE, (nf, log) -> socket);
+        }
+
+        @Override
+        protected void ioWait(int timeout, int op) {
+        }
+
+        @Override
+        protected void setupIoWait() {
         }
     }
 

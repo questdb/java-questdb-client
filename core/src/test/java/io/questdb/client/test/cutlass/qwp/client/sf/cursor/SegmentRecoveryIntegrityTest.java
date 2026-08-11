@@ -29,6 +29,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentManager;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfManifest;
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -947,6 +948,46 @@ public class SegmentRecoveryIntegrityTest {
             Assert.assertEquals("surviving spare must be cleaned up", 0, countSfaFiles());
             Assert.assertFalse("collapsed manifest must be removed",
                     Files.exists(tmpDir + "/" + MANIFEST_NAME));
+        });
+    }
+
+    /**
+     * The clean-drain crash window discards leftover segment files and reports
+     * EMPTY, which makes the caller start fresh at baseSeq 0. If a leftover
+     * survives that removal, the fresh session writes its own segments into a
+     * directory that still holds a prior generation's file: two producer
+     * generations sharing one slot, with overlapping ids describing different
+     * strings. Nothing downstream can see it -- both generations number their
+     * FSNs from the same origin, so neither validateContiguous nor a manifest
+     * boundary can tell them apart. Refuse instead, leaving every byte on disk.
+     */
+    @Test
+    public void testDrainWindowFailsClosedWhenLeftoverCannotBeRemoved() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String leftoverPath = tmpDir + "/sf-000000000000000a.sfa";
+            MmapSegment leftover = MmapSegment.create(leftoverPath, 0L, SEGMENT_SIZE);
+            leftover.close();
+            // Collapsed boundaries above the leftover's base: the drain declared
+            // everything acked, and no file sits at the committed active base.
+            SfManifest.create(FilesFacade.INSTANCE, tmpDir, 5L, 5L).close();
+
+            FilesFacade facade = new DelegatingFacade() {
+                @Override
+                public boolean remove(String path) {
+                    return !leftoverPath.equals(path) && super.remove(path);
+                }
+            };
+            try {
+                SegmentRing ring = SegmentRing.openExisting(facade, tmpDir, SEGMENT_SIZE);
+                if (ring != null) {
+                    ring.close();
+                }
+                throw new AssertionError("a surviving leftover must refuse the slot");
+            } catch (MmapSegmentException expected) {
+                TestUtils.assertContains(expected.getMessage(), "could not remove drained SF leftover");
+            }
+            Assert.assertTrue("the refused leftover must stay on disk",
+                    Files.exists(leftoverPath));
         });
     }
 

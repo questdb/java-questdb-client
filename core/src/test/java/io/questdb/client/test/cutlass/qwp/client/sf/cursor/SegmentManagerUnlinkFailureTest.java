@@ -44,6 +44,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class SegmentManagerUnlinkFailureTest {
 
@@ -123,12 +124,17 @@ public class SegmentManagerUnlinkFailureTest {
                 byte[] original = java.nio.file.Files.readAllBytes(Paths.get(failedPath));
 
                 FailingFilesFacade facade = new FailingFilesFacade(failedPath, null, null);
+                AtomicLong ticks = new AtomicLong();
                 try (SegmentManager manager = new SegmentManager(
-                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade)) {
+                        segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade, ticks::get)) {
                     manager.register(ring, dir, watermark);
                     manager.start();
                     Assert.assertTrue("manager never attempted the injected unlink",
                             facade.removeAttempted.await(5, TimeUnit.SECONDS));
+                    ticks.set(TimeUnit.MINUTES.toNanos(1));
+                    manager.wakeWorker();
+                    Assert.assertTrue("manager never retried the injected unlink",
+                            facade.removeRetried.await(5, TimeUnit.SECONDS));
                     Assert.assertEquals("failed unlink must retain conservative registered bytes",
                             ring.totalSegmentBytes(), readTotalBytes(manager));
                 }
@@ -157,6 +163,7 @@ public class SegmentManagerUnlinkFailureTest {
                 Assert.assertTrue("successor write overwrote the failed-unlink segment",
                         Arrays.equals(original, java.nio.file.Files.readAllBytes(Paths.get(failedPath))));
 
+                facade.allowUnlink();
                 try (SegmentManager retryManager = new SegmentManager(
                         segmentSize, TimeUnit.SECONDS.toNanos(60), segmentSize * 8, facade)) {
                     retryManager.register(ring, dir, watermark);
@@ -243,11 +250,13 @@ public class SegmentManagerUnlinkFailureTest {
         private final String partialLowerName;
         private final String unlinkFailurePath;
         private final CountDownLatch removeAttempted = new CountDownLatch(1);
+        private final CountDownLatch removeRetried = new CountDownLatch(1);
         private int openCleanCalls;
         private boolean partialFindClosed;
         private long partialFindNamePtr;
         private boolean partialLowerObserved;
-        private int unlinkFailuresRemaining = 1;
+        private int unlinkFailureCount;
+        private volatile boolean unlinkFailureEnabled = true;
 
         private FailingFilesFacade(
                 String unlinkFailurePath,
@@ -257,6 +266,10 @@ public class SegmentManagerUnlinkFailureTest {
             this.unlinkFailurePath = unlinkFailurePath;
             this.enumerationFailureDir = enumerationFailureDir;
             this.partialLowerName = partialLowerName;
+        }
+
+        private void allowUnlink() {
+            unlinkFailureEnabled = false;
         }
 
         @Override
@@ -333,8 +346,14 @@ public class SegmentManagerUnlinkFailureTest {
         }
         @Override
         public boolean remove(String path) {
-            if (path.equals(unlinkFailurePath) && unlinkFailuresRemaining > 0) {
-                unlinkFailuresRemaining--;
+            // Keep the injected fault active until the test explicitly releases
+            // it. SegmentManager automatically retries failed trims, and its
+            // poll park may return early, so a one-shot failure can recover
+            // before the test observes the retained bookkeeping state.
+            if (unlinkFailureEnabled && path.equals(unlinkFailurePath)) {
+                if (++unlinkFailureCount > 1) {
+                    removeRetried.countDown();
+                }
                 removeAttempted.countDown();
                 return false;
             }

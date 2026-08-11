@@ -69,6 +69,11 @@ public final class SegmentManager implements QuietCloseable {
             AtomicIntegerFieldUpdater.newUpdater(RingEntry.class, "state");
     private static final Logger LOG = LoggerFactory.getLogger(SegmentManager.class);
     private static final int MAX_TRIMS_PER_RING_PASS = 64;
+    // The minimum working set a ring needs to keep making progress: the active
+    // segment plus one hot spare to rotate into. Below this a producer cannot
+    // advance at all, so the cap check must never hold a ring here (see
+    // livenessFloorBytes).
+    private static final int MIN_LIVE_SEGMENTS = 2;
     private static final long TRIM_RETRY_INITIAL_NANOS = 4_000_000L;
     private static final long TRIM_RETRY_MAX_NANOS = 1_024_000_000L;
     private static final int TRIM_RETRY_NONE = 0;
@@ -79,6 +84,19 @@ public final class SegmentManager implements QuietCloseable {
 
     private final AtomicLong fileGeneration = new AtomicLong();
     private final FilesFacade filesFacade;
+    // Per-ring segment bytes below which the cap check never refuses to
+    // provision: MIN_LIVE_SEGMENTS * segmentSizeBytes, clamped against
+    // overflow. Segment bytes are reclaimable by ACK-driven trim, so refusing
+    // on them is productive backpressure that clears itself. Side-file bytes
+    // are NOT -- the .symbol-dict is lifetime-monotonic and nothing shrinks it
+    // -- so once they alone pushed a ring under the cap, no ack could ever
+    // free the shortfall and the producer stalled permanently, across
+    // restarts, with the disk-full warning pointing at a trim that cannot
+    // help. Guaranteeing the minimum working set turns that deadlock into
+    // ordinary backpressure: the ring cycles between one and two segments as
+    // acks arrive, ingestion continues, and the cap degrades to best-effort by
+    // exactly the dictionary's overshoot rather than stopping the pipeline.
+    private final long livenessFloorBytes;
     private final Object lock = new Object();
     private final long maxTotalBytes;
     // Reused by the manager worker thread to build spare-segment paths
@@ -249,6 +267,13 @@ public final class SegmentManager implements QuietCloseable {
         this.segmentSizeBytes = segmentSizeBytes;
         this.pollNanos = pollNanos;
         this.maxTotalBytes = maxTotalBytes;
+        // Clamp rather than multiply blind: segmentSizeBytes is user-supplied
+        // and only bounded below, so a pathological value would wrap the
+        // product negative and make the floor test trivially false -- silently
+        // restoring the deadlock this field exists to remove.
+        this.livenessFloorBytes = segmentSizeBytes > Long.MAX_VALUE / MIN_LIVE_SEGMENTS
+                ? Long.MAX_VALUE
+                : segmentSizeBytes * MIN_LIVE_SEGMENTS;
         this.ticks = ticks;
     }
 
@@ -600,6 +625,23 @@ public final class SegmentManager implements QuietCloseable {
      * A positive interval requires disk-backed store-and-forward mode.
      */
     public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos) {
+        register(ring, dir, watermark, syncIntervalNanos, null);
+    }
+
+    /**
+     * Same as {@link #register(SegmentRing, String, AckWatermark, long)} but
+     * also wires a live gauge of the slot's {@code .symbol-dict} side-file
+     * bytes. The manager reads the gauge at every provisioning cap check so
+     * the dictionary counts against {@code sf_max_total_bytes} alongside the
+     * {@code .sfa} segments; a {@code null} gauge contributes zero (memory
+     * mode, degraded full-dict sessions).
+     * <p>
+     * The gauge is invoked with the manager's internal lock held, so it must
+     * be wait-free and must not throw: a throwing gauge terminates the
+     * manager worker for every registered ring, and a blocking gauge stalls
+     * register/deregister for all slots.
+     */
+    public void register(SegmentRing ring, String dir, AckWatermark watermark, long syncIntervalNanos, LongSupplier sideFileBytes) {
         if (syncIntervalNanos < 0L) {
             throw new IllegalArgumentException("syncIntervalNanos must not be negative");
         }
@@ -619,7 +661,7 @@ public final class SegmentManager implements QuietCloseable {
         // the in-flight mmap. Memory-mode rings have no dir; nothing to scan.
         long minNextGeneration = dir == null ? -1L : scanMaxGeneration(dir) + 1L;
         Runnable managerWakeup = this::wakeWorker;
-        RingEntry e = new RingEntry(ring, dir, watermark, syncIntervalNanos, ticks.getAsLong());
+        RingEntry e = new RingEntry(ring, dir, watermark, sideFileBytes, syncIntervalNanos, ticks.getAsLong());
         // ObjList.add either throws before storing e or makes the entry visible.
         // Once visible, only non-throwing state commits may remain.
         synchronized (lock) {
@@ -653,6 +695,35 @@ public final class SegmentManager implements QuietCloseable {
     public SegmentRing getInServiceRingForTesting() {
         RingEntry entry = inService;
         return entry == null ? null : entry.ring;
+    }
+
+    // Callers must hold `lock` (the rings list is mutated under it). The
+    // side-file bytes are read live from each slot's gauge instead of being
+    // folded into the incremental totalBytes counter: the dictionary grows
+    // out-of-band on producer threads, so an incremental mirror would
+    // drift, while a live read cannot. Each gauge is WAIT-FREE and takes no
+    // lock at all -- PersistedSymbolDict.occupiedDiskBytes() is a pair of
+    // volatile reads -- and it must stay that way. This runs with `lock` held,
+    // on the worker that drives provisioning and trim for every registered ring,
+    // while a producer can hold that dictionary's monitor across ff.allocate
+    // and mmap. A gauge that took the monitor would park the whole manager
+    // behind one producer's append I/O.
+    private long sideFileBytesLocked() {
+        long total = 0L;
+        for (int i = 0, n = rings.size(); i < n; i++) {
+            LongSupplier gauge = rings.get(i).sideFileBytes;
+            if (gauge != null) {
+                total += gauge.getAsLong();
+            }
+        }
+        return total;
+    }
+
+    @TestOnly
+    public long getCapAccountedBytesForTesting() {
+        synchronized (lock) {
+            return totalBytes + sideFileBytesLocked();
+        }
     }
 
     @TestOnly
@@ -887,73 +958,117 @@ public final class SegmentManager implements QuietCloseable {
         //    DISK_FULL_LOG_THROTTLE_NANOS so a sustained-disk-full state
         //    doesn't drown the log.
         if (e.ring.needsHotSpare()) {
-            // Snapshot totalBytes under lock — register/deregister can mutate
-            // it from caller threads. Heavy provisioning I/O happens outside
-            // the lock; the post-install commit re-acquires it.
+            // Snapshot totalBytes under lock -- register/deregister can mutate
+            // it from caller threads -- and add the live side-file bytes of
+            // every registered slot, so .symbol-dict growth counts against the
+            // cap. Heavy provisioning I/O happens outside the lock; the
+            // post-install commit re-acquires it.
             long observedTotal;
+            long observedSideFileBytes;
             synchronized (lock) {
-                observedTotal = totalBytes;
+                observedSideFileBytes = sideFileBytesLocked();
+                observedTotal = totalBytes + observedSideFileBytes;
             }
-            if (observedTotal + segmentSizeBytes > maxTotalBytes) {
+            boolean withinCap = observedTotal + segmentSizeBytes <= maxTotalBytes;
+            // Liveness floor. Refusing on segment bytes is productive -- an ack
+            // trims a sealed segment and the shortfall clears. Refusing on
+            // side-file bytes is not: the dictionary never shrinks, so a ring
+            // held below its minimum working set by them would never rotate
+            // again, on this run or any later one. Provision anyway while this
+            // ring is under the floor, and account it honestly below.
+            long ringSegmentBytes = withinCap ? 0L : e.ring.totalSegmentBytes();
+            boolean belowLivenessFloor = !withinCap && ringSegmentBytes < livenessFloorBytes;
+            if (!withinCap && !belowLivenessFloor) {
                 long now = System.nanoTime();
                 if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
                     LOG.warn("SF {}: cannot provision spare in {} "
-                                    + "(totalBytes={}, cap={}, segmentSize={}). "
-                                    + "Producer is backpressured until ACK-driven trim frees space.",
+                                    + "(totalBytes={}, sideFileBytes={}, cap={}, segmentSize={}). "
+                                    + "Producer is backpressured until ACK-driven trim frees segment "
+                                    + "space; side-file bytes are not reclaimed by trim.",
                             memoryMode ? "memory cap reached" : "disk-full",
-                            memoryMode ? "<memory>" : e.dir, observedTotal, maxTotalBytes, segmentSizeBytes);
+                            memoryMode ? "<memory>" : e.dir, observedTotal, observedSideFileBytes,
+                            maxTotalBytes, segmentSizeBytes);
                     lastDiskFullLogNs = now;
                 }
             } else {
+                if (belowLivenessFloor) {
+                    // Exceeding a configured cap is worth saying out loud, and
+                    // saying WHY: the operator's remedy is to raise
+                    // sf_max_total_bytes or shrink the symbol dictionary, never
+                    // to wait for a trim.
+                    long now = System.nanoTime();
+                    if (now - lastDiskFullLogNs >= DISK_FULL_LOG_THROTTLE_NANOS) {
+                        LOG.warn("SF {}: provisioning past sf_max_total_bytes to keep the slot "
+                                        + "usable (totalBytes={}, sideFileBytes={}, cap={}, "
+                                        + "segmentSize={}, ringSegmentBytes={}, minWorkingSet={}). "
+                                        + "The symbol dictionary alone leaves no room for the "
+                                        + "active segment plus one spare, and trim cannot reclaim "
+                                        + "it; raise sf_max_total_bytes or reduce symbol "
+                                        + "cardinality.",
+                                memoryMode ? "<memory>" : e.dir, observedTotal,
+                                observedSideFileBytes, maxTotalBytes, segmentSizeBytes,
+                                ringSegmentBytes, livenessFloorBytes);
+                        lastDiskFullLogNs = now;
+                    }
+                }
                 MmapSegment spare = null;
                 String path = null;
                 boolean installed = false;
                 try {
-                    // baseSeq is provisional — SegmentRing.appendOrFsn calls
-                    // rebaseSeq() at rotation time to pin the real value. We
-                    // pass the manager's best guess (nextSeqHint at this
-                    // instant), which is fine since it's overwritten anyway.
-                    if (memoryMode) {
-                        spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
-                    } else {
-                        path = nextSparePath(e.dir);
-                        // Native path bytes (NUL-terminated) live in pathScratch
-                        // from the call above. Hand them straight to MmapSegment.create
-                        // via its long-ptr overload, bypassing the byte[] + native
-                        // malloc that the String overload would incur on every
-                        // rotation.
-                        spare = MmapSegment.create(filesFacade,
-                                pathScratch.ptr(), path,
-                                e.ring.nextSeqHint(), segmentSizeBytes, true);
-                    }
-                    Runnable installHook = beforeInstallSyncHook;
-                    if (installHook != null) {
-                        installHook.run();
-                    }
-                    if (!memoryMode) {
-                        spare.syncHeader();
-                        if (filesFacade.fsyncDir(e.dir) != 0) {
-                            throw new MmapSegmentException(
-                                    "could not sync hot-spare directory " + e.dir);
+                    // Null if the ring closed between this tick's snapshot and now:
+                    // close() nulls it under the ring's own monitor with no
+                    // coordination with the manager thread. A closed ring rejects
+                    // installHotSpare regardless, so there is nothing to provision
+                    // this tick; skip cleanly rather than provision a spare that will
+                    // be abandoned.
+                    MmapSegment active = e.ring.getActive();
+                    if (active != null) {
+                        // baseSeq is provisional -- SegmentRing.appendOrFsn calls
+                        // rebaseSeq() at rotation time to pin the real value. We
+                        // pass the manager's best guess (nextSeqHint at this
+                        // instant), which is fine since it's overwritten anyway.
+                        if (memoryMode) {
+                            spare = MmapSegment.createInMemory(e.ring.nextSeqHint(), segmentSizeBytes);
+                        } else {
+                            path = nextSparePath(e.dir);
+                            // Native path bytes (NUL-terminated) live in pathScratch
+                            // from the call above. Hand them straight to MmapSegment.create
+                            // via its long-ptr overload, bypassing the byte[] + native
+                            // malloc that the String overload would incur on every
+                            // rotation.
+                            spare = MmapSegment.create(filesFacade,
+                                    pathScratch.ptr(), path,
+                                    e.ring.nextSeqHint(), segmentSizeBytes, true);
                         }
-                    }
-                    // Install + commit atomically under the manager lock.
-                    // If `e.ring` was deregistered between the snapshot
-                    // above and now, abandoning the spare here is the only
-                    // way to keep totalBytes consistent: deregister already
-                    // subtracted ring.totalSegmentBytes() (without the
-                    // spare, since it wasn't installed yet) so a commit at
-                    // this point would inflate totalBytes by one segment
-                    // with no future subtractor. By holding `lock` across
-                    // installHotSpare AND the += commit AND the registration
-                    // check, deregister is forced to either
-                    // observe the spare in the ring (and subtract it) or
-                    // run before installation (so no install happens).
-                    synchronized (lock) {
-                        if (e.isRegistered()) {
-                            e.ring.installHotSpare(spare);
-                            totalBytes += segmentSizeBytes;
-                            installed = true;
+                        Runnable installHook = beforeInstallSyncHook;
+                        if (installHook != null) {
+                            installHook.run();
+                        }
+                        if (!memoryMode) {
+                            spare.syncHeader();
+                            if (filesFacade.fsyncDir(e.dir) != 0) {
+                                throw new MmapSegmentException(
+                                        "could not sync hot-spare directory " + e.dir);
+                            }
+                        }
+                        // Install + commit atomically under the manager lock.
+                        // If `e.ring` was deregistered between the snapshot
+                        // above and now, abandoning the spare here is the only
+                        // way to keep totalBytes consistent: deregister already
+                        // subtracted ring.totalSegmentBytes() (without the
+                        // spare, since it wasn't installed yet) so a commit at
+                        // this point would inflate totalBytes by one segment
+                        // with no future subtractor. By holding `lock` across
+                        // installHotSpare AND the += commit AND the registration
+                        // check, deregister is forced to either
+                        // observe the spare in the ring (and subtract it) or
+                        // run before installation (so no install happens).
+                        synchronized (lock) {
+                            if (e.isRegistered()) {
+                                e.ring.installHotSpare(spare);
+                                totalBytes += segmentSizeBytes;
+                                installed = true;
+                            }
                         }
                     }
                 } catch (Throwable t) {
@@ -1328,6 +1443,11 @@ public final class SegmentManager implements QuietCloseable {
     private static final class RingEntry {
         final String dir;
         final SegmentRing ring;
+        // Live gauge of the slot's .symbol-dict side-file bytes, or null when
+        // the slot has no dictionary (memory mode, degraded full-dict
+        // sessions). Read at the provisioning cap check only -- never folded
+        // into totalBytes, which stays a segments-only counter.
+        final LongSupplier sideFileBytes;
         final long syncIntervalNanos;
         // Engine-owned ack watermark for this slot, or null in memory
         // mode and for callers that didn't supply one. Manager-thread
@@ -1365,12 +1485,14 @@ public final class SegmentManager implements QuietCloseable {
                 SegmentRing ring,
                 String dir,
                 AckWatermark watermark,
+                LongSupplier sideFileBytes,
                 long syncIntervalNanos,
                 long now
         ) {
             this.ring = ring;
             this.dir = dir;
             this.watermark = watermark;
+            this.sideFileBytes = sideFileBytes;
             this.syncIntervalNanos = syncIntervalNanos;
             // Run the first periodic pass immediately. This establishes a
             // durable baseline for segments recovered from MEMORY mode.

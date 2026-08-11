@@ -80,6 +80,7 @@ public class QwpQueryClientPostConnectGuardTest {
         // withTls
         assertRejects(QwpQueryClient::withTls, "withTls");
         // withTrustStore
+        assertRejects(c -> c.withTrustStore("/tmp/ca.pem"), "withTrustStore");
         assertRejects(c -> c.withTrustStore("/tmp/ts.p12", "pw".toCharArray()), "withTrustStore");
     }
 

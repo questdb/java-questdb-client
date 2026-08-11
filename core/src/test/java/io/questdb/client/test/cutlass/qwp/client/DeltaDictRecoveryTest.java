@@ -1,0 +1,2502 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client;
+
+import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
+import io.questdb.client.std.ObjList;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.DelegatingFilesFacade;
+import io.questdb.client.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+/**
+ * End-to-end recovery for the delta symbol dictionary in store-and-forward mode.
+ * <p>
+ * A file-mode sender writes delta-encoded SYMBOL frames (each frame carries only
+ * the ids it introduces) to a slot but never drains it -- simulating a crash. A
+ * fresh sender then recovers the slot and replays those non-self-sufficient
+ * frames to a brand-new server whose dictionary starts empty. Correctness hinges
+ * on the persisted {@code .symbol-dict}: the recovering sender loads it, the I/O
+ * thread re-registers the whole dictionary via a catch-up frame, and only then do
+ * the delta frames replay. This test reconstructs the server-side dictionary from
+ * the wire and asserts it comes out complete and gap-free.
+ */
+public class DeltaDictRecoveryTest {
+
+    private static final int DISTINCT_SYMBOLS = 8;
+    private static final int ROWS = 40;
+    // writeAndTearUnreplayableSlot arithmetic: 12 one-symbol frames, FSNs 0..11,
+    // acks held at 10 so frame 11 stays unacked and keeps the slot alive across
+    // close(). recoveredCommitBoundaryFsn is therefore 11; stamping the watermark
+    // at 11 afterwards produces the fully-acked recovery, leaving it unstamped produces
+    // the unacked (quarantine) recovery.
+    private static final int ACK_THROUGH = 10;
+    private static final int FRAMES = 12;
+
+    @Rule
+    public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
+
+    private String sfDir;
+
+    @Before
+    public void setUp() {
+        sfDir = temporaryFolder.getRoot().toPath().resolve("qdb-delta-recovery").toString();
+    }
+
+    @Test
+    public void testRecoveredSlotReplaysDeltaFramesAgainstFreshServer() throws Exception {
+        assertMemoryLeak(() -> {
+            // Phase 1: silent server (no acks). Sender 1 writes symbol rows and
+            // close-fast (no drain), leaving unacked delta frames + a persisted
+            // dictionary in the slot.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                String pad = TestUtils.repeat("x", 64);
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=4096"
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < ROWS; i++) {
+                        s1.table("m")
+                                .symbol("s", "sym-" + (i % DISTINCT_SYMBOLS))
+                                .stringColumn("p", pad)
+                                .longColumn("v", i)
+                                .atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Ack a prefix so recovery does NOT replay from the self-sufficient head.
+            // Rows 0..DISTINCT_SYMBOLS-1 register all the symbols, so stamping the
+            // watermark at FSN DISTINCT_SYMBOLS-1 makes recovery replay from FSN
+            // DISTINCT_SYMBOLS onward -- frames whose delta starts at
+            // DISTINCT_SYMBOLS and carries NO new symbols (rows past the first cycle
+            // reuse existing ids). The early ids those frames reference then exist
+            // ONLY in the persisted dictionary, so the reconstructed dictionary below
+            // is complete solely because the catch-up frame re-registered them. That
+            // pins the content assertions to the catch-up: without it (or with a
+            // broken one) the fresh server would null-pad ids 0..DISTINCT_SYMBOLS-1
+            // and the per-id checks would fail.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            writeAckWatermark(slot.resolve(".ack-watermark"), DISTINCT_SYMBOLS - 1);
+
+            // Phase 2: fresh server that reconstructs its per-connection dictionary
+            // from the delta sections. Sender 2 recovers the slot and replays.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+
+                // The recovering sender must have re-registered the dictionary via a
+                // catch-up (0-table) frame before replaying delta frames.
+                Assert.assertTrue("recovery sent a full-dictionary catch-up frame",
+                        handler.sawCatchUpFrame);
+                // The reconstructed dictionary must be complete and gap-free: exactly
+                // the DISTINCT_SYMBOLS symbols, no null padding left by a missing id.
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size", DISTINCT_SYMBOLS, dict.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, dict.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTornDictionaryRebuildsFromFramesAcrossTheAckWatermark() throws Exception {
+        // A host crash truncates the dictionary to nothing, and the ack watermark sits
+        // mid-stream so the replay set starts at a frame whose delta begins at id 3.
+        //
+        // The old guard called that unreplayable and told the user to resend. It is not: ids
+        // 0..2 are still sitting in the ACKED frames on disk. Trim unlinks whole SEALED
+        // segments, not individual acked frames, so those six tiny frames are all still in
+        // the one active segment. Rebuild from them and the slot drains in full.
+        assertMemoryLeak(() -> {
+            recordSixDeltaFrames();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.write(dict,
+                    Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8)); // header only
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+            assertSlotRecoversWithCompleteDictionary();
+        });
+    }
+
+    @Test
+    public void testAbsentDictRebuildsFromFramesFromIdZero() throws Exception {
+        // Same rebuild, but the persisted dictionary is ABSENT rather than torn. The
+        // producer's seed used to be gated on the dictionary having opened, which made the
+        // whole rebuild dead code for exactly this case. (An earlier revision planted a
+        // same-name DIRECTORY to model an unopenable dictionary; open() no longer degrades
+        // on that -- it throws SfOperationalException -- so a plain delete is the fixture
+        // that still reaches the null-degrade this test exercises.)
+        assertMemoryLeak(() -> {
+            recordSixDeltaFrames();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 0);
+            assertSlotRecoversWithCompleteDictionary();
+        });
+    }
+
+    @Test
+    public void testAbsentDictRebuildsFromFramesAcrossTheAckWatermark() throws Exception {
+        // The hardest of the three: the dictionary is ABSENT (see the sibling test above for
+        // why a directory-plant no longer reaches this path) AND the replay set starts at
+        // deltaStart=3, so ids 0..2 exist nowhere except the acked frames on disk.
+        assertMemoryLeak(() -> {
+            recordSixDeltaFrames();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+            assertSlotRecoversWithCompleteDictionary();
+        });
+    }
+
+    @Test
+    public void testTrimmedRegisteringFramesAreUnreplayableAndTheSlotIsSetAside() throws Exception {
+        // The genuinely unrecoverable slot -- and the only one left, now that a torn dictionary
+        // rebuilds from the frames that are still on disk.
+        //
+        // Here the frames that REGISTERED the early ids are gone for good: trim unlinked their
+        // whole segment once they were acked (the live SegmentManager performs the trim, unlinking
+        // sf-initial.sfa once its frames are acked). The dictionary is torn away too, so nothing
+        // anywhere still holds those ids, and the surviving frames' deltas start above them.
+        // Replaying would hit the server's DELTA_DICT_GAP rejection -- QwpMessageCursor
+        // refuses a delta whose start runs past the dictionary's coverage rather than
+        // null-padding the hole.
+        //
+        // So the slot is unreplayable -- and it is SET ASIDE, not allowed to brick the sender.
+        // Failing here is what bricked it: senderId is stable and a not-fully-drained slot is
+        // retained on close, so every retry re-recovered the same slot and threw again, and the
+        // application could not construct a Sender at all -- it could not even buffer new rows.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // build() must SUCCEED -- on a fresh slot -- and the producer must keep working.
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
+                        Thread.sleep(20);
+                    }
+                }
+                assertUnreplayableSlotSetAside();
+                // The producer's new data reaches the server, and not one symbol of the
+                // unreplayable slot does.
+                Assert.assertEquals("the producer must keep producing on its fresh slot",
+                        Arrays.asList("after-recovery"), handler.dictSnapshot());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000L)
+    public void testConnectPathQuarantineReportsDataLoss() throws Exception {
+        // Classification pin for the SECOND quarantine arm -- the connect-path
+        // dictionary seed (build() -> connect -> seedGlobalDictionaryFromPersisted).
+        // The constructor arm is pinned in SegmentSkipQuarantineTest; without this
+        // test a future divergence between the two arms' dispatches goes unnoticed.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            AtomicReference<SenderError> received = new AtomicReference<>();
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender s2 = Sender.builder("ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";")
+                        .errorHandler(e -> received.compareAndSet(null, e))
+                        .build()) {
+                    // build() quarantined the torn slot on the connect path and came
+                    // up on a fresh one; the dispatch is synchronous inside build().
+                }
+                assertUnreplayableSlotSetAside();
+            }
+            SenderError err = received.get();
+            Assert.assertNotNull("connect-path quarantine must reach the handler", err);
+            Assert.assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            Assert.assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            Assert.assertNotNull(err.getQuarantinedPath());
+            Assert.assertTrue("path must name the set-aside dir [path=" + err.getQuarantinedPath() + ']',
+                    err.getQuarantinedPath().contains("unreplayable-"));
+        });
+    }
+
+    @Test
+    public void testQueuedOrphanCannotAdoptSlotWhileQuarantineRecreatesItsName() throws Exception {
+        // Sender 1 leaves a genuinely unreplayable default slot. Sender 2 recovers it,
+        // closes the directory-local lock, quarantines the directory and recreates the
+        // default pathname. A scanner may already have queued that pathname before sender
+        // 2 starts; the queued drainer must not acquire the old lock inode in the close ->
+        // rename gap and later issue path-based writes/unlinks against sender 2's fresh slot.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            ObjList<String> scannerSnapshot = OrphanScanner.scan(sfDir, "other-sender");
+            Assert.assertEquals(1, scannerSnapshot.size());
+            String staleSnapshotPath = scannerSnapshot.get(0);
+
+            CountDownLatch producerInRenameGap = new CountDownLatch(1);
+            CountDownLatch allowQuarantineRename = new CountDownLatch(1);
+            AtomicReference<Sender> recoveredSender = new AtomicReference<>();
+            AtomicReference<Throwable> recoveryFailure = new AtomicReference<>();
+            Thread recoveryThread = null;
+            Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(() -> {
+                producerInRenameGap.countDown();
+                try {
+                    if (!allowQuarantineRename.await(15, TimeUnit.SECONDS)) {
+                        throw new AssertionError("timed out waiting to finish quarantine rename");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("quarantine hook interrupted", e);
+                }
+            });
+            try {
+                DictReconstructingHandler handler = new DictReconstructingHandler();
+                try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                    int port = good.getPort();
+                    good.start();
+                    Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                    String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+
+                    recoveryThread = new Thread(() -> {
+                        try {
+                            recoveredSender.set(Sender.fromConfig(cfg));
+                        } catch (Throwable t) {
+                            recoveryFailure.set(t);
+                        }
+                    }, "qwp-quarantine-recovery");
+                    recoveryThread.start();
+                    Assert.assertTrue("recovering sender did not reach the quarantine gap",
+                            producerInRenameGap.await(10, TimeUnit.SECONDS));
+
+                    BackgroundDrainer queuedDrainer = new BackgroundDrainer(
+                            staleSnapshotPath, 256, 8192, () -> null,
+                            1000, 1, 10, true, 0);
+                    Thread drainerThread = new Thread(queuedDrainer, "qwp-queued-orphan");
+                    drainerThread.start();
+                    drainerThread.join(5_000);
+                    Assert.assertFalse("queued drainer must not wait on or adopt the old inode",
+                            drainerThread.isAlive());
+                    Assert.assertEquals(BackgroundDrainer.DrainOutcome.LOCKED_BY_OTHER,
+                            queuedDrainer.outcome());
+
+                    allowQuarantineRename.countDown();
+                    recoveryThread.join(10_000);
+                    Assert.assertFalse("recovering sender did not finish", recoveryThread.isAlive());
+                    if (recoveryFailure.get() != null) {
+                        throw new AssertionError("recovering sender failed", recoveryFailure.get());
+                    }
+                    Sender sender = recoveredSender.get();
+                    Assert.assertNotNull(sender);
+                    sender.table("m").symbol("s", "after-race").longColumn("v", 99).atNow();
+                    sender.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
+                        Thread.sleep(20);
+                    }
+                    sender.close();
+                    recoveredSender.set(null);
+
+                    assertUnreplayableSlotSetAside();
+                    Assert.assertEquals("fresh producer slot must remain intact and usable",
+                            Arrays.asList("after-race"), handler.dictSnapshot());
+                }
+            } finally {
+                allowQuarantineRename.countDown();
+                if (recoveryThread != null) {
+                    recoveryThread.join(10_000);
+                    if (recoveryThread.isAlive()) {
+                        recoveryThread.interrupt();
+                    }
+                }
+                Sender sender = recoveredSender.getAndSet(null);
+                if (sender != null) {
+                    sender.close();
+                }
+                Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(null);
+            }
+        });
+    }
+
+    @Test
+    public void testFullyAckedTornSlotResumesInPlaceWithoutQuarantine() throws Exception {
+        // M1 regression -- the ACKED counterpart to
+        // testTrimmedRegisteringFramesAreUnreplayableAndTheSlotIsSetAside. The on-disk
+        // tear is IDENTICAL (earliest segment trimmed, .symbol-dict torn to its header,
+        // so the surviving frames' deltas start above ids nothing on disk still holds),
+        // but here every committed frame was already ACKED before the crash. Nothing is
+        // left to replay, so the "gap" is entirely in data the server already has.
+        //
+        // seedGlobalDictionaryFromPersisted must therefore NOT raise
+        // UnreplayableSlotException. Quarantining a fully-delivered slot would fire a
+        // false "resend required" alarm AND -- because such a slot is fully drained --
+        // let build()'s connect-path close unlink the (already-delivered) bytes the
+        // quarantine claims to preserve. The slot must resume IN PLACE.
+        //
+        // Before the fix the gap detector ignored ack state and threw, so this slot was
+        // set aside as default.unreplayable-0 with a "resend required" error for data the
+        // server had already acknowledged.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            // Mark every committed frame acked. writeAndTearUnreplayableSlot writes 12
+            // frames (FSNs 0..11), so stamping the watermark at 11 makes
+            // ackedFsn == recoveredCommitBoundaryFsn: a torn dictionary with nothing left
+            // to replay. (Not higher than 11 -- that would make the resuming producer's
+            // next frame look pre-acked.)
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            writeAckWatermark(slot.resolve(".ack-watermark"), 11);
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // build() must succeed WITHOUT setting the slot aside, and the producer
+                // must keep working on the SAME slot.
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    // Pin the branch, not just the outcome: the fixture must land exactly
+                    // on the acked-gap boundary (QwpWebSocketSender's ackedFsn >=
+                    // commitBoundaryFsn test at its == edge). Without this, the test could
+                    // pass because no gap was detected at all.
+                    CursorSendEngine recovered =
+                            ((QwpWebSocketSender) s2).getCursorEngineForTesting();
+                    Assert.assertTrue("the fixture must leave surviving frames whose deltas "
+                                    + "start above the torn dictionary",
+                            recovered.recoveredMaxSymbolDeltaStart() > 0);
+                    Assert.assertEquals("the fixture must land exactly on the acked-gap boundary",
+                            recovered.recoveredCommitBoundaryFsn(), recovered.ackedFsn());
+                    s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 1) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertEquals(
+                            "the resumed sender must deliver new data from the original slot",
+                            Arrays.asList("after-recovery"),
+                            handler.dictSnapshot());
+                }
+            }
+            // The fully-acked slot was NOT quarantined: no set-aside copy exists (the
+            // inverse of assertUnreplayableSlotSetAside), and the sender resumed on the
+            // original slot.
+            Assert.assertFalse("a fully-acked torn slot must NOT be quarantined -- its data "
+                            + "was already delivered, so there is nothing to resend",
+                    java.nio.file.Files.isDirectory(Paths.get(sfDir, "default.unreplayable-0")));
+            Assert.assertTrue("the sender must resume on the original slot",
+                    java.nio.file.Files.isDirectory(slot));
+        });
+    }
+
+    private static int countSegmentFiles(java.nio.file.Path dir) {
+        java.io.File[] files = dir.toFile().listFiles();
+        int n = 0;
+        if (files != null) {
+            for (java.io.File f : files) {
+                if (f.getName().endsWith(".sfa")) {
+                    n++;
+                }
+            }
+        }
+        return n;
+    }
+
+    @Test
+    public void testQuarantineFailsLoudlyWhenAllSlotNamesSaturated() throws Exception {
+        // M2 regression: when a recovered slot is genuinely unreplayable, build() sets
+        // it aside (quarantineTornSlot) and starts the producer on a fresh slot. But if
+        // it cannot free the slot name -- here every default.unreplayable-<i> candidate
+        // up to MAX_QUARANTINE_SLOT_ATTEMPTS (64) already exists -- it MUST fail LOUDLY:
+        // throw and leave the slot's bytes on disk for a manual resend, never silently
+        // drop data. Only the happy rename path was covered before.
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            // Saturate every quarantine candidate so quarantineTornSlot's rename loop
+            // finds no free name.
+            for (int i = 0; i < 64; i++) {
+                java.nio.file.Files.createDirectories(Paths.get(sfDir, "default.unreplayable-" + i));
+            }
+
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                Sender s = null;
+                try {
+                    s = Sender.fromConfig(cfg);
+                    Assert.fail("build() must throw when the unreplayable slot cannot be set aside");
+                } catch (LineSenderException expected) {
+                    Assert.assertTrue("unexpected message: " + expected.getMessage(),
+                            expected.getMessage().contains("too many quarantined slots already under")
+                                    && expected.getMessage().contains("moved or removed by hand"));
+                } finally {
+                    if (s != null) {
+                        s.close();
+                    }
+                }
+            }
+            // The unreplayable slot's bytes must survive on disk for a manual resend --
+            // the guard fails loudly rather than dropping data.
+            Assert.assertTrue("the slot dir must be preserved", java.nio.file.Files.exists(slot));
+            Assert.assertTrue("the slot's segment data must be preserved",
+                    countSegmentFiles(slot) >= 1);
+        });
+    }
+
+    @Test
+    public void testQuarantineRenameFailurePreservesOriginalSlot() throws Exception {
+        assertMemoryLeak(() -> {
+            writeAndTearUnreplayableSlot();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            // Snapshot when quarantine STARTS (after the engine closed, before the
+            // rename), not before build(). Recovery legitimately unlinks an empty
+            // never-rotated hot-spare on the way in (SegmentRing: frameCount()==0 and
+            // no torn tail), and whether SegmentManager provisioned one is a race --
+            // so a pre-build count measures that race, not this test's subject. What
+            // the rename failure must preserve is whatever the slot holds at the
+            // moment quarantine begins.
+            AtomicInteger atQuarantineStart = new AtomicInteger(-1);
+            Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(
+                    () -> atQuarantineStart.set(countSegmentFiles(slot)));
+            Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(new DelegatingFilesFacade() {
+                @Override
+                public int rename(String oldPath, String newPath) {
+                    return -1;
+                }
+            });
+            try {
+                try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                    int port = good.getPort();
+                    good.start();
+                    Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                    String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                    try {
+                        Sender.fromConfig(cfg).close();
+                        Assert.fail("build() must throw when the unreplayable slot rename fails");
+                    } catch (LineSenderException expected) {
+                        // writeAndTearUnreplayableSlot now deterministically produces the
+                        // dictionary-gap verdict (UnreplayableSlotException); what this test
+                        // pins is the OPERATOR-FACING tail: a failed set-aside must say the
+                        // slot cannot be started until it is moved by hand, and must name
+                        // the rename it attempted.
+                        Assert.assertTrue(expected.getMessage(),
+                                expected.getMessage().endsWith(
+                                        "The slot could not be set aside automatically (rename to "
+                                                + sfDir + "/default.unreplayable-0 failed), so this sender "
+                                                + "cannot start until " + sfDir + "/default is moved or "
+                                                + "removed by hand"));
+                    }
+                }
+            } finally {
+                Sender.LineSenderBuilder.setQuarantineFilesFacadeForTest(null);
+                Sender.LineSenderBuilder.setQuarantineAfterCloseHookForTest(null);
+            }
+            Assert.assertTrue("rename failure must preserve the original slot directory",
+                    java.nio.file.Files.isDirectory(slot));
+            // Guards the equality below against passing vacuously on an empty slot:
+            // 0 == 0 would "preserve every segment" while holding nothing.
+            Assert.assertTrue("quarantine must have started with data-bearing segments, saw: "
+                    + atQuarantineStart.get(), atQuarantineStart.get() > 0);
+            Assert.assertEquals("rename failure must preserve every segment",
+                    atQuarantineStart.get(), countSegmentFiles(slot));
+            Assert.assertFalse("failed rename must not leave a quarantine directory",
+                    java.nio.file.Files.exists(Paths.get(sfDir, "default.unreplayable-0")));
+        });
+    }
+
+    // Leaves the default slot in the genuine post-trim torn state, reached the way
+    // production reaches it: a real sender, a real acked prefix (frames 0..ACK_THROUGH),
+    // and the SegmentManager's own trim, which durably advances the manifest headBase
+    // before unlinking -- the step a raw delete used to fake. The unacked tail
+    // (frames above ACK_THROUGH) keeps the slot alive across close(). The dictionary
+    // is then torn down to its 8-byte header (structurally valid, zero entries), so
+    // the surviving frames' deltas start above ids nothing on disk still holds and
+    // recovery reaches the dictionary-gap verdict in seedGlobalDictionaryFromPersisted:
+    // ackedFsn < recoveredCommitBoundaryFsn throws UnreplayableSlotException; a
+    // watermark hand-stamped at the commit boundary (writeAckWatermark) resumes in place.
+    private void writeAndTearUnreplayableSlot() throws Exception {
+        java.nio.file.Path slot = Paths.get(sfDir, "default");
+        try (TestWebSocketServer server = new TestWebSocketServer(new PrefixAckHandler(ACK_THROUGH))) {
+            int port = server.getPort();
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // Small segments so the frames roll into several files and the acked
+            // prefix's segments can be trimmed away independently.
+            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                    + ";sf_max_segment_bytes=256;close_flush_timeout_millis=0;";
+            try (Sender s1 = Sender.fromConfig(cfg)) {
+                for (int i = 0; i < FRAMES; i++) {
+                    s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                    s1.flush();
+                }
+                Assert.assertTrue("the acked prefix must be acknowledged",
+                        s1.awaitAckedFsn(ACK_THROUGH, 10_000));
+                // The manager's worker (1 ms poll) unlinks the head segment only AFTER
+                // advanceManifestHeadPast committed the new headBase, so waiting on the
+                // file's disappearance is waiting on a manifest-correct trim.
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (java.nio.file.Files.exists(slot.resolve("sf-initial.sfa"))
+                        && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5);
+                }
+                Assert.assertFalse("the manager must have trimmed the acked head segment",
+                        java.nio.file.Files.exists(slot.resolve("sf-initial.sfa")));
+            }
+        }
+        // The unacked tail kept the slot from being cleaned up on close().
+        Assert.assertTrue("surviving frames must remain on disk", countSegmentFiles(slot) >= 1);
+        // Tear the dictionary to its header: zero entries, still structurally valid.
+        java.nio.file.Path dict = slot.resolve(".symbol-dict");
+        java.nio.file.Files.write(dict, Arrays.copyOf(java.nio.file.Files.readAllBytes(dict), 8));
+    }
+
+    /**
+     * A committed head segment that vanishes OUTSIDE the trim protocol (no manifest
+     * advance) is proven corruption: recovery fails closed on the manifest boundary
+     * inside the engine constructor -- before any dictionary verdict runs -- and
+     * build() sets the slot aside through the constructor arm. The torn-dict
+     * fixtures used to reach this check by accident; this test keeps it covered
+     * deliberately.
+     */
+    @Test
+    public void testHeadSegmentMissingOutsideTrimProtocolIsSetAside() throws Exception {
+        assertMemoryLeak(() -> {
+            // No acks: nothing trims, every segment file stays put.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=256;close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < FRAMES; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            Assert.assertTrue("the frames must have rolled into more than one segment",
+                    countSegmentFiles(slot) > 1);
+            // Raw unlink: the manifest still names this segment as the committed head.
+            java.nio.file.Files.delete(slot.resolve("sf-initial.sfa"));
+
+            try (TestWebSocketServer good = new TestWebSocketServer(new DictReconstructingHandler())) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // build() must set the corrupt slot aside and start on a fresh one.
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "fresh").longColumn("v", 1).atNow();
+                    s2.flush();
+                }
+            }
+            java.nio.file.Path aside = Paths.get(sfDir, "default.unreplayable-0");
+            Assert.assertTrue("the corrupt slot must be set aside",
+                    java.nio.file.Files.isDirectory(aside));
+            String reason = new String(
+                    java.nio.file.Files.readAllBytes(aside.resolve(".failed")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            Assert.assertTrue("the .failed sentinel must carry the chain-boundary verdict, got: " + reason,
+                    reason.contains("missing expected SF head segment"));
+        });
+    }
+
+    @Test
+    public void testAbsentDictSeedsTheProducerAboveTheRecoveredIds() throws Exception {
+        // The producer must resume ABOVE the ids the recovered frames already define, even when
+        // the dictionary is absent (see testAbsentDictRebuildsFromFramesFromIdZero for why a
+        // directory-plant no longer models this -- open() now throws instead of degrading).
+        //
+        // seedGlobalDictionaryFromPersisted used to be gated on deltaDictEnabled, which is false
+        // exactly here -- so the producer restarted its id space at 0, on top of ids the
+        // surviving frames define. The send loop's mirror (rebuilt from those frames) still read
+        // id 0 as sym-0 while the producer meant something else by it: the two disagree about
+        // what an id MEANS, which is the whole failure mode the dictionary machinery exists to
+        // prevent.
+        //
+        // Visible on the wire: the new symbol must land ABOVE the recovered ones, not on top of
+        // sym-0.
+        assertMemoryLeak(() -> {
+            recordSixDeltaFrames();
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+            writeAckWatermark(slot.resolve(".ack-watermark"), 2);
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 6) {
+                        Thread.sleep(20);
+                    }
+                    // ...and now the resumed producer introduces a symbol of its own.
+                    s2.table("m").symbol("s", "after-recovery").longColumn("v", 99).atNow();
+                    s2.flush();
+                    deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 7) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertEquals(
+                        "the resumed producer must take the NEXT id, not reuse id 0 -- reusing it "
+                                + "puts two symbols on one id and silently misattributes values",
+                        Arrays.asList("sym-0", "sym-1", "sym-2", "sym-3", "sym-4", "sym-5",
+                                "after-recovery"),
+                        handler.dictSnapshot());
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveredSenderContinuesIngestingNewSymbols() throws Exception {
+        // M2 regression: seedGlobalDictionaryFromPersisted resumes the producer's
+        // dictionary and delta baseline from the persisted .symbol-dict, so a
+        // recovered sender that continues ingesting assigns the NEXT id, not a
+        // colliding low one. Without it the new symbol reuses a recovered id and the
+        // fresh server sees a redefinition -> silent misattribution. No prior test
+        // ingests on the recovered sender. Replay is from FSN 0 (no acks), so the
+        // recovered frames legitimately overlap the seeded dictionary -- this also
+        // pins that the redefinition guard does not false-positive on normal
+        // recovery.
+        assertMemoryLeak(() -> {
+            // Phase 1: ingest DISTINCT_SYMBOLS symbols, silent server, close-fast ->
+            // unacked frames + a full persisted dictionary.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=4096;close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Phase 2: recover against a fresh server, then ingest a genuinely NEW
+            // symbol. The producer must continue at id DISTINCT_SYMBOLS.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "brand-new").longColumn("v", 99L).atNow();
+                    s2.flush();
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS + 1) {
+                        Thread.sleep(20);
+                    }
+                }
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("recovered sender must continue the dictionary, not collide: " + dict,
+                        DISTINCT_SYMBOLS + 1, dict.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("sym-" + i, dict.get(i));
+                }
+                Assert.assertEquals("brand-new", dict.get(DISTINCT_SYMBOLS));
+            }
+        });
+    }
+
+    @Test
+    public void testUnopenablePersistedDictReplaysSelfSufficientFrameSequence() throws Exception {
+        // Untrimmed counterpart of
+        // testUnopenablePersistedDictStillGuardsAgainstReplayingDeltaFrames.
+        //
+        // Same failure mode -- the persisted dictionary cannot be OPENED, so
+        // CursorSendEngine.isDeltaDictEnabled() is false -- but NOTHING was acked, so
+        // replay starts at the FIRST frame. Frames 0..5 carry deltaStart 0..5 and are
+        // COLLECTIVELY self-sufficient: replayed in order from id 0, the server
+        // accumulates the dictionary contiguously, needing no dictionary file at all.
+        //
+        // Pre-fix, accumulateSentDict was gated on deltaDictEnabled while the
+        // torn-dict guard was NOT, so sentDictCount froze at 0: frame 0 (deltaStart=0)
+        // passed the guard, but frame 1 (deltaStart=1 > 0) tripped it and latched a
+        // terminal -- and for the background drainer that means markFailed + a .failed
+        // sentinel, permanently quarantining a slot that drains perfectly. A store-
+        // and-forward contract violation: a TRANSIENT disk condition (fd exhaustion, a
+        // read-only remount, ENOSPC) stranding recoverable data.
+        //
+        // The trimmed sibling pins the other half of the contract: when replay starts
+        // ABOVE the frames that introduced the ids, the terminal is still correct.
+        assertMemoryLeak(() -> {
+            // Phase 1: each row introduces a new symbol => frame i carries deltaStart=i.
+            // The server never acks, so nothing is trimmed and replay starts at frame 0
+            // (the common orphan-drain profile: the server was down the whole time).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < 6; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+
+            // Make the persisted dictionary ABSENT. The recovery entry point never
+            // fabricates a side-file, so deleting it alone produces the
+            // no-dictionary recovery under test. (This used to plant a same-name
+            // DIRECTORY to defeat open()'s recreate-on-absent; that fixture would
+            // now read as an unopenable-but-present file -- a transient -- and
+            // throw SfOperationalException instead of exercising this path.)
+            // Deliberately do NOT stamp the ack watermark -- replay must start at
+            // frame 0, which is what makes the sequence self-sufficient.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            java.nio.file.Files.delete(dict);
+
+            // Phase 2: recover against a fresh server that reconstructs its per-
+            // connection dictionary from the wire exactly as the real one does --
+            // REJECTING any gap (QwpWireTestUtils.accumulateDeltaDictionary's default
+            // allowGap=false), so a gap surfaces as a DictionaryGapException / NACK
+            // rather than passing silently.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                LineSenderException terminal = null;
+                Sender s2 = Sender.fromConfig(cfg);
+                try {
+                    long deadline = System.currentTimeMillis() + 10_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < 6
+                            && terminal == null) {
+                        try {
+                            s2.flush();
+                            Thread.sleep(20);
+                        } catch (LineSenderException e) {
+                            terminal = e;
+                        }
+                    }
+                } finally {
+                    try {
+                        s2.close();
+                    } catch (LineSenderException e) {
+                        if (terminal == null) {
+                            terminal = e;
+                        }
+                    }
+                }
+
+                // Pre-fix: the "symbol dictionary is incomplete" terminal fires on frame 1.
+                Assert.assertNull("a self-sufficient frame sequence must replay without a terminal: "
+                                + (terminal == null ? "" : terminal.getMessage()),
+                        terminal);
+                // Pre-fix: the server dictionary stops at ["sym-0"] -- frame 1 never shipped.
+                List<String> serverDict = handler.dictSnapshot();
+                Assert.assertEquals("every delta frame must replay [dict=" + serverDict + ']',
+                        6, serverDict.size());
+                for (int i = 0; i < 6; i++) {
+                    Assert.assertEquals("id " + i + " must resolve; a null here is a server-side "
+                                    + "null-pad, i.e. a silently NULL symbol column [dict=" + serverDict + ']',
+                            "sym-" + i, serverDict.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCommitMessageDoesNotShipUnpersistedLeakedSymbol() throws Exception {
+        // C3 regression: sendCommitMessage does NOT write-ahead-persist the
+        // dictionary, so its frame must carry NO new symbol. A symbol left in the
+        // batch by a cancelled row -- cancelRow rolls back neither
+        // currentBatchMaxSymbolId nor the global-dictionary registration -- must not
+        // ride out on the commit frame: doing so puts an id on the wire that a
+        // recovered slot cannot rebuild from .symbol-dict, diverging the producer
+        // dictionary from the surviving frames and silently misattributing reused
+        // ids after a crash. The commit's delta must be bounded by sentMaxSymbolId
+        // (empty here), not currentBatchMaxSymbolId. Memory mode suffices to observe
+        // the wire behaviour; close() drains every frame to the server first.
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Transactional + autoFlushRows=1: every completed row auto-flushes
+                // as a DEFERRED batch (setting hasDeferredMessages); an explicit
+                // flush() then emits the commit message.
+                Sender sender = Sender.builder("ws::addr=localhost:" + port + ";")
+                        .transactional(true)
+                        .autoFlushRows(1)
+                        .build();
+                try {
+                    // Row 1 registers "a"@0 and auto-flushes it deferred.
+                    sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
+                    // Register "b"@1 on a row that is then cancelled: "b" stays in
+                    // the global dictionary and currentBatchMaxSymbolId advances to
+                    // 1, but nothing persists or sends it.
+                    sender.table("m").symbol("s", "b");
+                    sender.cancelRow();
+                    // Commit the deferred batch. The commit frame must carry an
+                    // EMPTY delta -- NOT "b"@1.
+                    sender.flush();
+                } finally {
+                    sender.close(); // drains every frame (incl. the commit) to the server
+                }
+
+                // The server's reconstructed dictionary must hold ONLY "a". Pre-fix
+                // the commit shipped "b"@1, so the server saw a second symbol.
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("commit frame must not ship the cancelled row's leaked symbol "
+                                + "(recovery would then diverge from the persisted dictionary): " + dict,
+                        1, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+            }
+        });
+    }
+
+    @Test
+    public void testPersistFailureSurfacesAsLineSenderException() throws Exception {
+        // A dictionary write that fails mid-flush -- a full disk, an exhausted quota --
+        // must reach the caller as a LineSenderException, like every other flush-path
+        // failure. PersistedSymbolDict throws a low-level IllegalStateException when it
+        // cannot grow its append window; persistNewSymbolsBeforePublish wraps it.
+        // Without the wrap the raw IllegalStateException sails straight past every
+        // user's `catch (LineSenderException)` around flush() and takes the application
+        // down.
+        //
+        // The fault is a REFUSED ff.allocate on the mmap append window, with the facade
+        // opting into isMmapAllowed(): that is both the real shape of ENOSPC here and
+        // the path production actually runs. A facade that inherits the default
+        // isMmapAllowed() (this == INSTANCE -> false) silently swaps the dictionary onto
+        // the positioned-write fallback, which production never executes -- so a
+        // short-write fault would prove this translation on dead code.
+        //
+        // Nothing could reach the translation at all before: PersistedSymbolDict has
+        // facade-aware overloads, but CursorSendEngine called only the
+        // FilesFacade.INSTANCE ones, so no test could inject a dictionary I/O fault
+        // through the real producer path. The engine now takes a FilesFacade for exactly
+        // this, and the sender is built on that engine directly -- the same
+        // QwpWebSocketSender.connect(..., CursorSendEngine) entry point Sender.build uses.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                String slot = Paths.get(sfDir, "default").toString();
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                FullDiskDictFacade ff = new FullDiskDictFacade();
+                // The engine owns the dictionary; the fault facade reaches only it, so the
+                // segment files still write normally and the ONLY failure is the persist.
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                try {
+                    ff.armed = true; // the next dictionary append cannot grow its window
+                    sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("a short write to the symbol dictionary must fail the flush");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue("the persist failure must be reported as a sender error, "
+                                        + "not leak a raw IllegalStateException: " + expected.getMessage(),
+                                expected.getMessage().contains("failed to persist symbol dictionary before publish"));
+                    }
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered row; the facade has disarmed, so
+                        // this normally succeeds. Either way it is not what we assert.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testReconstructingFixtureResetsAckSequencePerConnection() throws Exception {
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                for (int i = 0; i < 2; i++) {
+                    try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port + ";")) {
+                        sender.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        long fsn = sender.flushAndGetSequence();
+                        Assert.assertTrue("connection " + (i + 1) + " must receive ACK zero",
+                                sender.awaitAckedFsn(fsn, 5_000));
+                    }
+                }
+
+                Assert.assertEquals("each fresh connection must restart wire ACK sequencing",
+                        Arrays.asList(0L, 0L), handler.ackSequenceStarts());
+            }
+        });
+    }
+
+    @Test
+    public void testFailedPublishDoesNotDuplicatePersistedSymbols() throws Exception {
+        // Regression: persistNewSymbolsBeforePublish is a write-ahead -- it runs
+        // BEFORE the frame is published (sealAndSwapBuffer -> appendBlocking). If
+        // publish fails (here PAYLOAD_TOO_LARGE, a frame bigger than the SF
+        // segment; a backpressure deadline in production), the frame's symbols are
+        // already on disk but sentMaxSymbolId is NOT advanced and the rows stay
+        // buffered -- so a retry re-runs the persist. Keying the persist range off
+        // pd.size() (not sentMaxSymbolId+1) makes it idempotent. Before that fix,
+        // the retry appended the symbol a SECOND time, breaking the dense
+        // id->position invariant; on recovery every later global id shifts by one
+        // and symbol column values are silently misattributed.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Small segment; a heavily padded row's frame cannot fit, so
+                // appendBlocking throws PAYLOAD_TOO_LARGE deterministically -- no
+                // backpressure timing needed. The server never acks (SilentHandler).
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";sf_max_segment_bytes=1024;";
+                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
+                Sender sender = Sender.fromConfig(cfg);
+                try {
+                    // Buffer ONE new-symbol row, then flush it TWICE. Each flush
+                    // runs the write-ahead persist and then fails to publish; the
+                    // failed flush leaves the row buffered, so the second flush is
+                    // the retry that (pre-fix) duplicated the persisted symbol.
+                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    for (int attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            sender.flush();
+                            Assert.fail("oversized frame must fail to publish");
+                        } catch (LineSenderException expected) {
+                            // frame too large -- expected on every attempt
+                        }
+                    }
+
+                    // The persisted dictionary must hold "s0" EXACTLY ONCE.
+                    // Pre-fix, the retry duplicated it (size == 2).
+                    ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    Assert.assertNotNull(persisted);
+                    Assert.assertEquals("failed-publish retry must not duplicate the persisted symbol",
+                            1, persisted.size());
+                    Assert.assertEquals("s0", persisted.getQuick(0));
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered oversized row and
+                        // fails again (PAYLOAD_TOO_LARGE); expected here and not
+                        // what we assert. close() still runs its resource cleanup,
+                        // so no native memory leaks.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFailedPublishThenNewSymbolPersistsSuffixWithoutDuplicating() throws Exception {
+        // Regression for the re-encode (else) branch of persistNewSymbolsBeforePublish.
+        // After a failed publish leaves the durable dictionary size ahead of the wire
+        // baseline (pd.size() > sentMaxSymbolId+1), a later flush that introduces a NEW
+        // symbol cannot reuse the frame's already-encoded fast-path bytes -- it
+        // re-encodes just the [pd.size() .. currentBatchMaxSymbolId] suffix via
+        // appendSymbols. Keying that off pd.size() (not sentMaxSymbolId+1) keeps it
+        // idempotent: the already-persisted prefix is NOT re-appended.
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                // Small segment: any frame carrying the padded row fails to publish with
+                // PAYLOAD_TOO_LARGE deterministically (no backpressure timing).
+                //
+                // The auto-flush knobs pin WHERE that failure surfaces. The failed flush
+                // below leaves its row buffered and does NOT restart the auto-flush clock
+                // (resetTableBuffersAfterFlush runs only after a successful publish), so
+                // the row keeps ageing against the WebSocket transport's 100 ms
+                // auto_flush_interval default. Once the first flush takes longer than that
+                // -- routine on a loaded CI host, where segment provisioning plus the
+                // backpressure spin cost ~105 ms -- the NEXT row commit auto-flushes inside
+                // atNow() and throws from there instead of from the flush() this test
+                // brackets. The batch and the branch under test are identical either way;
+                // only the throw site moves, so parking the thresholds costs no coverage.
+                // (WebSocket rejects auto_flush=off outright, hence the large finite
+                // interval.)
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=1024"
+                        + ";auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
+                String pad = TestUtils.repeat("x", 2000); // frame >> 1024-byte segment
+                Sender sender = Sender.fromConfig(cfg);
+                try {
+                    // Flush 1: s0 is persisted (write-ahead) before the oversized frame
+                    // fails to publish. pd.size()=1, sentMaxSymbolId stays -1.
+                    sender.table("m").symbol("s", "s0").stringColumn("p", pad).longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                    }
+
+                    // Add a NEW symbol s1 (id 1). The failed s0 row is still buffered, so
+                    // the batch is {s0, s1} and the durable size (1) has run ahead of the
+                    // wire baseline (-1) -- the state that selects the appendSymbols branch.
+                    sender.table("m").symbol("s", "s1").stringColumn("p", pad).longColumn("v", 2L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                    }
+
+                    // The else branch persisted ONLY s1 (the suffix). The dictionary holds
+                    // s0, s1 exactly once each. Pre-fix (appendSymbols from
+                    // sentMaxSymbolId+1) re-appended s0, giving size 3.
+                    ObjList<String> persisted = ((QwpWebSocketSender) sender).getPersistedSymbolsForTest();
+                    Assert.assertNotNull(persisted);
+                    Assert.assertEquals("re-encode suffix must not duplicate the persisted prefix",
+                            2, persisted.size());
+                    Assert.assertEquals("s0", persisted.getQuick(0));
+                    Assert.assertEquals("s1", persisted.getQuick(1));
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // close() re-flushes the still-buffered oversized rows and fails
+                        // again (PAYLOAD_TOO_LARGE); expected, resources still released.
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRecoveryAfterFailedPublishReplaysGapFree() throws Exception {
+        // M3 end-to-end: chains a failed publish -> fresh-process recovery -> replay.
+        // A failed publish persists the frame's symbol (write-ahead) but does NOT
+        // record the frame, so the persisted dictionary becomes a strict SUPERSET of
+        // the recorded frames' references. A recovering sender must still replay
+        // gap-free: it re-registers the whole (superset) dictionary via the catch-up
+        // -- including the symbol whose frame never reached disk -- so the fresh
+        // server reconstructs a complete, gap-free dictionary. The sibling
+        // testFailedPublishDoesNotDuplicatePersistedSymbols proves the dict has no
+        // duplicate after the failed publish; this proves the resulting slot then
+        // recovers and replays end-to-end against a real server.
+        assertMemoryLeak(() -> {
+            // Phase 1: a silent server (no acks) + a small SF segment. Four small
+            // rows register sym-0..sym-3 and their frames are recorded; a fifth,
+            // oversized row registers (persists) sym-4 but its frame is too large for
+            // the segment, so appendBlocking throws and the frame is NOT recorded.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port
+                        + ";sf_dir=" + sfDir
+                        + ";sf_max_segment_bytes=4096"
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    for (int i = 0; i < 4; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                    // Oversized frame: sym-4 is persisted (write-ahead) before the
+                    // publish fails, so the dictionary runs one ahead of the frames.
+                    s1.table("m").symbol("s", "sym-4")
+                            .stringColumn("p", TestUtils.repeat("x", 8000))
+                            .longColumn("v", 4).atNow();
+                    try {
+                        s1.flush();
+                        Assert.fail("oversized frame must fail to publish");
+                    } catch (LineSenderException expected) {
+                        // PAYLOAD_TOO_LARGE -- frame not recorded, sym-4 stays persisted
+                    }
+                } finally {
+                    try {
+                        // Re-flushes the still-buffered oversized row and fails again
+                        // (expected); resources are still released, and the idempotent
+                        // write-ahead does not re-append sym-4.
+                        s1.close();
+                    } catch (LineSenderException ignored) {
+                    }
+                }
+            }
+
+            // The persisted dictionary must hold the superset: sym-0..sym-4 (5 ids),
+            // one more than the four recorded frames reference, with no duplicate.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString());
+            Assert.assertNotNull(pd);
+            try {
+                Assert.assertEquals("failed publish must leave the dict a superset (sym-0..sym-4)",
+                        5, pd.size());
+            } finally {
+                pd.close();
+            }
+
+            // Phase 2: recover against a fresh server that reconstructs its
+            // dictionary from the wire. The recovering sender must re-register all 5
+            // symbols via a catch-up (sym-4 exists ONLY in the dictionary -- no frame
+            // carries it) and replay the 4 recorded frames, leaving a complete,
+            // gap-free server dictionary.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 5) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertTrue("recovery must send a full-dictionary catch-up frame",
+                        handler.sawCatchUpFrame);
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("recovered dictionary must include the failed-publish symbol",
+                        5, dict.size());
+                for (int i = 0; i < 5; i++) {
+                    Assert.assertEquals("dictionary id " + i + " must be gap-free",
+                            "sym-" + i, dict.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRecoverySeedKeepsUtf8CollidingSymbolsInLockstep() throws Exception {
+        // M2 regression: two DISTINCT source symbols that collapse to the SAME UTF-8
+        // bytes -- lone UTF-16 surrogates, which the encoder maps to '?' -- get
+        // distinct producer ids and persist as separate entries. On recovery the
+        // producer must rebuild its id space to match the persisted entry count
+        // exactly. Pre-fix, seedGlobalDictionaryFromPersisted used getOrAddSymbol,
+        // which de-duped the two decoded "?" strings, leaving the producer
+        // dictionary (and sentMaxSymbolId) one short of pd.size() -- desyncing from
+        // the send-loop catch-up mirror (which uses pd.size()) and silently
+        // misattributing later symbols after a reconnect. addRecoveredSymbol appends
+        // without de-duping, keeping producer and mirror in lockstep.
+        assertMemoryLeak(() -> {
+            // Phase 1: ingest two lone-surrogate symbols in file mode, close-fast.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    s1.table("m").symbol("s", "\uD800").longColumn("v", 1L).atNow(); // lone surrogate -> '?'
+                    s1.flush();
+                    s1.table("m").symbol("s", "\uD801").longColumn("v", 2L).atNow(); // a DIFFERENT one -> '?'
+                    s1.flush();
+                }
+            }
+
+            // The persisted dictionary holds TWO entries (both encode to '?').
+            int persistedSize;
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            PersistedSymbolDict pd = PersistedSymbolDict.open(slot.toString());
+            Assert.assertNotNull(pd);
+            try {
+                persistedSize = pd.size();
+            } finally {
+                pd.close();
+            }
+            Assert.assertEquals("two colliding symbols must persist as two entries", 2, persistedSize);
+
+            // Phase 2: recover, then introduce a third symbol. The wire must extend
+            // the two recovered ids at id 2 rather than overwrite id 1.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender s2 = Sender.fromConfig(cfg)) {
+                    s2.table("m").symbol("s", "tail").longColumn("v", 3L).atNow();
+                    long fsn = s2.flushAndGetSequence();
+                    Assert.assertTrue("the post-recovery frame must be acknowledged",
+                            s2.awaitAckedFsn(fsn, 5_000));
+                }
+                Assert.assertEquals("the new symbol delta must continue after both recovered entries",
+                        persistedSize, handler.lastDataDeltaStart());
+                Assert.assertEquals("the reconstructed dictionary must retain both colliding entries "
+                                + "and append the new symbol at id 2",
+                        Arrays.asList("?", "?", "tail"), handler.dictSnapshot());
+            }
+        });
+    }
+
+    @Test
+    public void testTornDictSubsetRebuildsFromSurvivingFrames() throws Exception {
+        // The persisted .symbol-dict is NOT fsync'd, so a host crash can lose its
+        // highest-id tail entries while the segment frames that introduced those ids
+        // survive (out-of-order page loss). Those frames carry the torn-off symbols in
+        // their OWN delta sections -- which is exactly why the background drainer replays
+        // such a slot perfectly: accumulateSentDict rebuilds the dictionary from them.
+        //
+        // The producer must do the same. Pre-fix it seeded ONLY from the short dictionary,
+        // saw that the frames out-reached it, and threw -- permanently bricking
+        // Sender.build() for a slot the drainer drains fine. And the brick is permanent:
+        // build()'s catch releases the slot lock, but the sender that would have hosted the
+        // orphan drainer is the one that just failed, so nothing drains the slot and the
+        // retry recovers it and throws again. seedGlobalDictionaryFromPersisted now seeds
+        // from the dictionary's intact prefix AND THEN from the surviving frames' deltas,
+        // so the producer's baseline lands on exactly the coverage the send loop's mirror
+        // will reach.
+        //
+        // testTornDictionaryFailsCleanlyInsteadOfCorrupting pins the other half of the
+        // contract: when the symbol-introducing frames were acked and TRIMMED away, the ids
+        // really are unrecoverable and the resume must still fail clean.
+        assertMemoryLeak(() -> {
+            // Phase 1: three delta frames (a@0, b@1, c@2) with nothing acked, so all three
+            // survive and replay from frame 0.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Simulate the host-crash tear: rewrite the dictionary to drop its highest
+            // entry (c@2), keeping a@0,b@1 -- while the frame that introduced c@2 stays on
+            // disk. openClean truncates; the two appends leave exactly the two-entry
+            // dictionary a torn tail would recover to.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            String slotDir = slot.toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                torn.appendSymbol("a");
+                torn.appendSymbol("b");
+                Assert.assertEquals(2, torn.size());
+            }
+
+            // Phase 2: the resuming sender must REBUILD c@2 from that surviving frame,
+            // replay everything, and keep ingesting ABOVE the recovered tip.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // Pre-fix this line THREW ("subset of the surviving frames").
+                try (Sender resumed = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 3) {
+                        Thread.sleep(20);
+                    }
+                    // A NEW symbol must land ABOVE the recovered tip. Seeded short, the
+                    // producer would hand "d" an id the surviving frames already define,
+                    // silently overwriting that symbol on the server -- the corruption the
+                    // old throw existed to prevent, and which this seeding removes at the
+                    // source rather than by refusing to start.
+                    resumed.table("m").symbol("s", "d").longColumn("v", 3).atNow();
+                    resumed.flush();
+                    deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 4) {
+                        Thread.sleep(20);
+                    }
+                }
+
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("dictionary must rebuild gap-free [" + dict + ']', 4, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+                Assert.assertEquals("b", dict.get(1));
+                // Rebuilt from the surviving frame's own delta, not from the torn file.
+                Assert.assertEquals("c", dict.get(2));
+                // The new symbol, placed above the recovered tip -- no id reuse.
+                Assert.assertEquals("d", dict.get(3));
+            }
+        });
+    }
+
+    @Test
+    public void testTornDictTotalLossRebuildsFromSurvivingFrames() throws Exception {
+        // The total-loss counterpart of testTornDictSubsetRebuildsFromSurvivingFrames: the
+        // whole dictionary is gone (size 0) but the file still opens, so
+        // isDeltaDictEnabled() stays true and the engine does NOT discard it (the frames
+        // carry deltaStart 0,1,2, so maxSymbolDeltaStart != 0 and the full-dict-fallback
+        // discard correctly stays out of the way).
+        //
+        // The surviving frames start at id 0 and are collectively self-sufficient, so the
+        // producer can rebuild the ENTIRE dictionary from their deltas -- exactly as the
+        // send loop's mirror does. Pre-fix this threw and bricked build().
+        assertMemoryLeak(() -> {
+            // Phase 1: a@0, b@1, c@2; nothing acked, so all three replay from frame 0.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Total tear: the dictionary recovers EMPTY but still opens.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            String slotDir = slot.toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                Assert.assertEquals(0, torn.size());
+            }
+
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                // Pre-fix this line THREW.
+                try (Sender resumed = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 3) {
+                        Thread.sleep(20);
+                    }
+                    resumed.table("m").symbol("s", "d").longColumn("v", 3).atNow();
+                    resumed.flush();
+                    deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 4) {
+                        Thread.sleep(20);
+                    }
+                }
+
+                List<String> dict = handler.dictSnapshot();
+                Assert.assertEquals("the whole dictionary must rebuild from the frames [" + dict + ']',
+                        4, dict.size());
+                Assert.assertEquals("a", dict.get(0));
+                Assert.assertEquals("b", dict.get(1));
+                Assert.assertEquals("c", dict.get(2));
+                Assert.assertEquals("d", dict.get(3));
+            }
+            // The side-file is healed in passing -- persistNewSymbolsBeforePublish resumes
+            // from pd.size() (0 here), so the flush above re-persisted the rebuilt ids
+            // a,b,c along with d. That is not asserted on disk because it is not
+            // observable here: the slot drains fully, and a fully-drained close removes
+            // the dictionary (CursorSendEngine -> PersistedSymbolDict.removeOrphan), so
+            // re-opening it would just yield a fresh empty file. The persist-resumes-from-
+            // pd.size() behaviour is pinned by the testFailedPublish* tests.
+        });
+    }
+
+    @Test
+    public void testFullDictFramesRecoverBesideASurvivingPopulatedDictionary() throws Exception {
+        // The populated-side-file twin of testFullDictFramesRecoverInFullDictModeInsteadOf-
+        // Bricking. Self-sufficient frames can also be recovered next to a .symbol-dict
+        // that HOLDS entries, and that slot must recover exactly as the empty-side-file
+        // one does.
+        //
+        // It takes one transient plus one crash. A delta session leaves a populated
+        // .symbol-dict. The next session's open of it fails transiently (EIO, fd
+        // exhaustion, a Windows share lock), so that session runs full-dict fallback --
+        // and PersistedSymbolDict's never-recreate contract deliberately leaves the
+        // older side-file intact rather than truncating the only copy of load-bearing
+        // state. That session writes self-sufficient frames out-reaching the stale
+        // dictionary, then crashes. This recovery opens the survivor: size() > 0,
+        // maxSymbolDeltaStart == 0, recoveredMaxSymbolId >= size().
+        //
+        // CursorSendEngine discards the dictionary here (the frames carry their own, so
+        // it is not needed) -- but the recovery analysis was folded with the dictionary's
+        // size as its baseline, while seedGlobalDictionaryFromPersisted computes baseline
+        // 0 once pd is gone. checkedRecoveryAnalysis then threw "recovery symbol baseline
+        // mismatch" -- and originally as a raw IllegalStateException, which build()'s
+        // quarantine handler could not catch, so with a stable senderId every restart
+        // re-recovered the same slot and threw again: the application could never
+        // construct a Sender, and so could not even buffer new rows. That throw is now an
+        // UnreplayableSlotException, so the worst case is a quarantine rather than a
+        // permanent brick -- but a quarantine is still wrong here, because this slot is
+        // perfectly recoverable. The engine re-folds at baseline 0 when it discards, so
+        // neither outcome occurs.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            // Phase 1: force full-dict fallback via an injected FilesFacade whose
+            // openCleanRW always fails, so the frames land self-sufficient
+            // (deltaStart=0) and no side-file is ever written. NOT a planted
+            // blocker: openClean() now REFUSES a fresh slot whose existing
+            // dictionary cannot be truncated (see PersistedSymbolDictTest's
+            // truncate-refusal coverage), so leaving any artifact at the
+            // dictionary's path here would throw instead of degrading. The
+            // facade fault instead reproduces the case openClean() still
+            // tolerates -- a transient failure with nothing at the path to lose.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Constructed only after the server is up: if start()/awaitStart()
+                // ever failed, an engine built ahead of that check would leak its
+                // slot lock and native memory past this try, and assertMemoryLeak
+                // would then report that leak instead of the real failure.
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                Assert.assertFalse("full-dict fallback: no dictionary must ever be created",
+                        java.nio.file.Files.exists(dict));
+            }
+
+            // Populate the side-file a LATER delta session would have left behind.
+            // Fewer entries than the frames reference, so the discard's
+            // recoveredMaxSymbolId >= size() guard fires with size() > 0 --
+            // the case that bricked build().
+            final int survivingEntries = 3;
+            Assert.assertTrue(survivingEntries < DISTINCT_SYMBOLS);
+            try (PersistedSymbolDict survivor =
+                         PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                for (int i = 0; i < survivingEntries; i++) {
+                    survivor.appendSymbol("sym-" + i);
+                }
+                Assert.assertEquals(survivingEntries, survivor.size());
+            }
+
+            // Phase 2: recover. build() must SUCCEED, and the self-sufficient frames must
+            // replay gap-free in full-dict mode -- the stale dictionary is discarded, not
+            // trusted, so it cannot misattribute an id.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) { // must NOT throw
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertFalse("a discarded dictionary leaves full-dict mode, which is "
+                        + "catch-up-free", handler.sawCatchUpFrame);
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size",
+                        DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDiscardedSurvivingDictionaryIsUnlinked() throws Exception {
+        // The discard must UNLINK the survivor, not merely stop using it. Closing alone
+        // left it on disk, and full-dict mode never rewrites it
+        // (persistNewSymbolsBeforePublish returns early on !deltaDictEnabled), so it was
+        // sticky: the very next recovery re-read it, and as soon as an intervening
+        // session ingested FEWER distinct symbols than it holds, the discard's
+        // recoveredMaxSymbolId >= size() guard stopped firing, delta mode came back on,
+        // and seedGlobalDictionaryFromPersisted anchored the producer on the PREVIOUS
+        // generation's strings for ids the replayed frames then redefined -- silent
+        // misattribution of every later row, with row counts intact. Nothing else
+        // catches it: the fold's `deltaEnd <= runningCoverage` fast path declares those
+        // frames already covered and never compares a string.
+        //
+        // Asserted on a DIRECTLY constructed engine, while it is still open. Going
+        // through Sender.fromConfig and reading the file after close proves nothing:
+        // close() unlinks the dictionary itself once the slot is fully drained
+        // (CursorSendEngine's fully-drained branch), so the assertion passes with the
+        // discard-time unlink removed.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Self-sufficient frames (full-dict fallback: no side-file is ever written).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                Assert.assertFalse(java.nio.file.Files.exists(dict));
+            }
+
+            // A prior generation's populated side-file, holding FEWER ids than the
+            // frames reference -- the shape that fires the discard.
+            try (PersistedSymbolDict survivor =
+                         PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                survivor.appendSymbol("stale-a");
+                survivor.appendSymbol("stale-b");
+            }
+            Assert.assertTrue(java.nio.file.Files.exists(dict));
+
+            CursorSendEngine recoveredEngine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    io.questdb.client.std.FilesFacade.INSTANCE);
+            try {
+                Assert.assertFalse("the discard must leave the slot in full-dict mode",
+                        recoveredEngine.isDeltaDictEnabled());
+                Assert.assertFalse("the discarded survivor must be unlinked at DISCARD time, or a "
+                                + "later recovery with lower symbol cardinality will seed from it",
+                        java.nio.file.Files.exists(dict));
+            } finally {
+                recoveredEngine.close(false);
+            }
+        });
+    }
+
+    @Test
+    public void testFullDictFramesRecoverInFullDictModeInsteadOfBricking() throws Exception {
+        // M1 regression (counterpoint to testTornDictTotalLossFailsCleanOnResume): a
+        // slot written in FULL-DICT fallback -- the .symbol-dict could not open when
+        // writing, so isDeltaDictEnabled() was false and every frame re-ships the
+        // whole dictionary from id 0 (deltaStart=0) -- leaves SELF-SUFFICIENT frames
+        // and NO side-file. On recovery the engine opens a FRESH EMPTY .symbol-dict,
+        // so the surviving frames out-reach it (recoveredMaxSymbolId >= pd.size()==0).
+        // Those frames carry their whole dictionary inline and need no side-file, so
+        // they must RECOVER, not brick build(). CursorSendEngine detects them
+        // (maxSymbolDeltaStart == 0) and discards the empty side-file, recovering the
+        // slot in full-dict mode. Before the fix the sender's seed-time guard treated
+        // the empty dictionary as a host-crash tear and threw from Sender.build(),
+        // even though the orphan drainer drains the very same frames fine. A torn
+        // DELTA dictionary (deltaStart > 0) still fails clean -- see that other test.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+            // Force full-dict fallback in phase 1 via an injected FilesFacade whose
+            // openCleanRW always fails, so delta encoding stays disabled and the
+            // frames are written self-sufficient. NOT a planted blocker: openClean()
+            // now REFUSES a fresh slot whose existing dictionary cannot be truncated
+            // (see PersistedSymbolDictTest's truncate-refusal coverage), so leaving
+            // any artifact at the dictionary's path here would throw instead of
+            // degrading. The facade fault instead reproduces the case openClean()
+            // still tolerates -- a transient failure with nothing at the path to lose.
+            //
+            // Phase 1: silent server (no acks). Sender 1 writes new-symbol rows in
+            // full-dict mode and close-fast, leaving unacked self-sufficient frames.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+
+                // Constructed only after the server is up: if start()/awaitStart()
+                // ever failed, an engine built ahead of that check would leak its
+                // slot lock and native memory past this try, and assertMemoryLeak
+                // would then report that leak instead of the real failure.
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                UnopenableDictFacade phase1DictFf = new UnopenableDictFacade();
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, phase1DictFf);
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+                // No dictionary was ever created -- openCleanRW failed against
+                // nothing on disk, so the frames were written full-dict with no
+                // side-file.
+                Assert.assertFalse("full-dict fallback: no dictionary must ever be created",
+                        java.nio.file.Files.exists(dict));
+            }
+
+            // Recovery finds no side-file and fabricates none: the slot recovers
+            // dictionary-less, in full-dict mode, straight from its frames.
+
+            // Phase 2: recover. build() must SUCCEED (not throw the torn-dict guard),
+            // and the self-sufficient frames replay against a fresh server gap-free.
+            // Drop the first replayed data frame before ACK so a second connection
+            // must replay it and prove full-dict mode stays catch-up-free.
+            DictReconstructingHandler handler = new DictReconstructingHandler(true);
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) { // must NOT throw
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && (handler.dataFrameCount() < 2
+                            || handler.maxDictSize() < DISTINCT_SYMBOLS)) {
+                        Thread.sleep(20);
+                    }
+                }
+                Assert.assertTrue("test must force a reconnect and replay the full-dict frame",
+                        handler.dataFrameCount() >= 2);
+                // Full-dict recovery re-ships the whole dictionary inline on every
+                // frame, including after the forced reconnect, so there is NO 0-table
+                // catch-up frame (that is the delta-mode reconnect path). The
+                // reconstructed dictionary is still gap-free.
+                Assert.assertFalse("full-dict recovery must NOT send a catch-up frame",
+                        handler.sawCatchUpFrame);
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size", DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+            Assert.assertFalse("recovery must not fabricate a side-file for a full-dict slot",
+                    java.nio.file.Files.exists(dict));
+        });
+    }
+
+    private static void writeAckWatermark(java.nio.file.Path path, long fsn) throws IOException {
+        // Go through the production AckWatermark API rather than hand-rolling the
+        // on-disk layout: AckWatermark.open() resets any file that is not its
+        // current 8192-byte, CRC/generation-protected size (see its "wrong-sized
+        // files ... are reset" contract), so a hand-rolled stub the wrong size
+        // is silently discarded on the very next open -- read() then returns
+        // INVALID and recovery falls back to the segment-derived seed instead of
+        // this watermark.
+        AckWatermark watermark = AckWatermark.open(path.getParent().toString());
+        Assert.assertNotNull("ack watermark must open for the test fixture", watermark);
+        try {
+            watermark.write(fsn);
+            watermark.sync();
+        } finally {
+            watermark.close();
+        }
+    }
+
+    /**
+     * Reconstructs the per-connection symbol dictionary from delta sections,
+     * mirroring the server's {@code setQuick(deltaStart + i)} + null-padding.
+     */
+    private static class DictReconstructingHandler implements TestWebSocketServer.WebSocketServerHandler {
+        volatile boolean sawCatchUpFrame;
+        private final List<Long> ackSequenceStarts = new ArrayList<>();
+        private final List<String> dict = new ArrayList<>();
+        private final boolean dropFirstDataFrame;
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private TestWebSocketServer.ClientHandler currentClient;
+        private int dataFrameCount;
+        private TestWebSocketServer.ClientHandler droppedClient;
+        private boolean firstDataFrameDropped;
+        private boolean hasUnresolvedSequence;
+        private volatile int lastDataDeltaStart = -1;
+
+        private DictReconstructingHandler() {
+            this(false);
+        }
+
+        private DictReconstructingHandler(boolean dropFirstDataFrame) {
+            this.dropFirstDataFrame = dropFirstDataFrame;
+        }
+
+        synchronized List<Long> ackSequenceStarts() {
+            return new ArrayList<>(ackSequenceStarts);
+        }
+
+        synchronized List<String> dictSnapshot() {
+            return new ArrayList<>(dict);
+        }
+
+        synchronized int dataFrameCount() {
+            return dataFrameCount;
+        }
+
+        synchronized int maxDictSize() {
+            return dict.size();
+        }
+
+        int lastDataDeltaStart() {
+            return lastDataDeltaStart;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // Closing the socket below does not discard frames that its reader has
+            // already decoded. A faster replay loop can therefore deliver another
+            // callback for the deliberately dropped client while (or even after)
+            // the replacement connection starts. Those stale frames must not reset
+            // the fresh connection's synthetic dictionary / ACK sequence.
+            if (client == droppedClient) {
+                return;
+            }
+            boolean newConnection = currentClient != client;
+            if (newConnection) {
+                currentClient = client;
+                dict.clear(); // fresh server dictionary per connection
+                nextSeq.set(0);
+                hasUnresolvedSequence = false;
+            }
+            if (hasUnresolvedSequence) {
+                // A real server marks the connection's pipeline broken on the first
+                // rejected frame and answers every later frame with silence -- no ACK,
+                // no NACK -- until the connection resets (QwpIngressUpgradeProcessor's
+                // hasUnresolvedSequence gate). Responding here would let the client
+                // believe frames were processed that a real server dropped, and a
+                // cumulative ACK could then leapfrog the rejected sequence.
+                return;
+            }
+            try {
+                QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            } catch (QwpWireTestUtils.DictionaryGapException gap) {
+                // A real server answers a gap with STATUS_DICTIONARY_GAP and does NOT
+                // apply the frame. ACKing here is what let a client sequence a real
+                // server rejects pass green.
+                hasUnresolvedSequence = true;
+                try {
+                    long nackSequence = nextSeq.getAndIncrement();
+                    if (newConnection) {
+                        ackSequenceStarts.add(nackSequence);
+                    }
+                    client.sendBinary(QwpWireTestUtils.buildNack(nackSequence, WebSocketResponse.STATUS_DICTIONARY_GAP));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                return;
+            }
+            int tableCount = QwpWireTestUtils.tableCount(data);
+            if (tableCount == 0 && QwpWireTestUtils.hasDelta(data)) {
+                sawCatchUpFrame = true;
+            } else if (tableCount > 0 && QwpWireTestUtils.hasDelta(data)) {
+                dataFrameCount++;
+                lastDataDeltaStart = QwpWireTestUtils.readVarint(data, new int[]{12});
+                if (dropFirstDataFrame && !firstDataFrameDropped) {
+                    firstDataFrameDropped = true;
+                    droppedClient = client;
+                    client.close();
+                    return;
+                }
+            }
+            try {
+                long ackSequence = nextSeq.getAndIncrement();
+                if (newConnection) {
+                    ackSequenceStarts.add(ackSequence);
+                }
+                client.sendBinary(QwpWireTestUtils.buildAck(ackSequence));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private static class SilentHandler implements TestWebSocketServer.WebSocketServerHandler {
+        @Override
+        public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            // never acks -- sender leaves everything unacked in the slot
+        }
+    }
+
+    // ACKs wire sequences [0 .. ackThroughSeq] and then goes silent. The acked
+    // prefix lets the live SegmentManager trim its sealed head segments -- durably
+    // advancing the manifest headBase before unlinking, exactly like production --
+    // while the unacked tail keeps the slot alive across close().
+    private static final class PrefixAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final long ackThroughSeq;
+        private long nextSeq;
+
+        PrefixAckHandler(long ackThroughSeq) {
+            this.ackThroughSeq = ackThroughSeq;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long seq = nextSeq++;
+            if (seq > ackThroughSeq) {
+                return; // silent from here: the tail stays unacked on disk
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * Refuses every attempt to (re)create the symbol dictionary, WITHOUT ever
+     * leaving a file behind at its path -- the fault shape a transient failure
+     * (EIO, fd exhaustion) has on a slot with nothing there to lose. Used instead
+     * of a planted blocker to force full-dict fallback in phase 1: a blocker left
+     * on disk is exactly what openClean() now REFUSES to start on top of (see
+     * PersistedSymbolDictTest's truncate-refusal coverage), so it can no longer
+     * simulate the "nothing to lose" case this facade represents.
+     */
+    private static final class UnopenableDictFacade extends DelegatingFilesFacade {
+        @Override
+        public int openCleanRW(String path) {
+            return -1;
+        }
+    }
+
+    /**
+     * Refuses to grow the symbol dictionary's mmap append window -- the production
+     * shape of a full disk, since PersistedSymbolDict reserves that window through
+     * {@code ff.allocate} and ENOSPC surfaces there as a refusal.
+     * <p>
+     * {@code isMmapAllowed()} opts IN deliberately. The inherited default is
+     * {@code this == INSTANCE}, so any wrapping facade otherwise routes the dictionary
+     * down the positioned-write fallback that production never executes -- injecting a
+     * fault would then silently replace the code under test.
+     */
+    private static final class FullDiskDictFacade extends DelegatingFilesFacade {
+        boolean armed;
+
+        @Override
+        public boolean allocate(int fd, long size) {
+            return !armed && INSTANCE.allocate(fd, size);
+        }
+
+        @Override
+        public boolean isMmapAllowed() {
+            return true;
+        }
+    }
+
+
+    /**
+     * The unreplayable-slot contract: a recovered slot whose symbol dictionary cannot be
+     * rebuilt -- not from its own intact prefix, not from the surviving frames' delta
+     * sections -- is SET ASIDE, never silently drained and never allowed to brick the
+     * sender.
+     * <p>
+     * The bytes are kept for forensics and resend, the {@code .failed} sentinel tells the
+     * orphan drainer to treat the copy as human-in-the-loop rather than retry it forever,
+     * and the producer continues on a fresh, empty slot.
+     */
+    private void assertUnreplayableSlotSetAside() {
+        java.nio.file.Path aside = Paths.get(sfDir, "default.unreplayable-0");
+        Assert.assertTrue("the unreplayable slot must be set aside, not deleted: " + aside,
+                java.nio.file.Files.isDirectory(aside));
+        Assert.assertTrue("the set-aside slot must keep its recorded frames for resend",
+                hasSegmentFile(aside));
+        Assert.assertTrue("the set-aside slot must carry the .failed sentinel",
+                java.nio.file.Files.exists(aside.resolve(".failed")));
+        try {
+            String reason = new String(
+                    java.nio.file.Files.readAllBytes(aside.resolve(".failed")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            Assert.assertTrue("the set-aside must carry the dictionary-gap verdict, got: " + reason,
+                    reason.contains("symbol dictionary is incomplete"));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        Assert.assertTrue("the sender must continue on a live slot",
+                java.nio.file.Files.isDirectory(Paths.get(sfDir, "default")));
+    }
+
+    /**
+     * A recovery that rebuilds ids from the surviving frames must write them back to
+     * {@code .symbol-dict} IMMEDIATELY, not wait for a later batch to happen to reach
+     * that high.
+     * <p>
+     * seedGlobalDictionaryFromPersisted resumes sentMaxSymbolId at prefix + frame-suffix,
+     * so every frame published afterwards carries a deltaStart the side-file cannot
+     * describe. The steady-state write-ahead only persists
+     * {@code [pd.size() .. currentBatchMaxSymbolId]} and returns early when the batch's
+     * highest id is below pd.size() -- so it heals only if, and only as far as, later
+     * traffic references the recovered high ids. Meanwhile the frames carrying those ids
+     * are the oldest unacked and therefore the FIRST to be acked and trimmed. Once they
+     * are gone, an ordinary process crash (which store-and-forward promises to survive)
+     * leaves a slot whose frames reference ids nothing holds -> quarantine, "resend the
+     * affected data".
+     * <p>
+     * So: recover, touch nothing, and require the file to already be whole. Remove
+     * healPersistedDictionary and this drops back to the two torn entries.
+     */
+    @Test(timeout = 60_000L)
+    public void testRecoveryHealsThePersistedDictionaryBeforeAnyNewFrame() throws Exception {
+        assertMemoryLeak(() -> {
+            // Phase 1: three delta frames (a@0, b@1, c@2), nothing acked.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender s1 = Sender.fromConfig(cfg);
+                try {
+                    s1.table("m").symbol("s", "a").longColumn("v", 0).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "b").longColumn("v", 1).atNow();
+                    s1.flush();
+                    s1.table("m").symbol("s", "c").longColumn("v", 2).atNow();
+                    s1.flush();
+                } finally {
+                    s1.close();
+                }
+            }
+
+            // Host-crash tear: drop c@2 from the side-file, keep the frame that defines it.
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            String slotDir = slot.toString();
+            try (PersistedSymbolDict torn = PersistedSymbolDict.openClean(slotDir)) {
+                Assert.assertNotNull(torn);
+                torn.appendSymbol("a");
+                torn.appendSymbol("b");
+                Assert.assertEquals(2, torn.size());
+            }
+
+            // Phase 2: recover against a silent server and ingest NOTHING. Nothing is
+            // acked, so the slot is not fully drained and the side-file survives close.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                Sender.fromConfig(cfg).close();
+            }
+
+            // The write-ahead invariant must hold again on disk, with no new traffic.
+            try (PersistedSymbolDict healed = PersistedSymbolDict.open(slotDir)) {
+                Assert.assertNotNull("the healed dictionary must still be readable", healed);
+                ObjList<String> symbols = healed.readLoadedSymbols();
+                Assert.assertEquals("recovery must re-persist the frame-rebuilt suffix "
+                                + "immediately [" + symbols + ']',
+                        3, symbols.size());
+                Assert.assertEquals("a", symbols.getQuick(0));
+                Assert.assertEquals("b", symbols.getQuick(1));
+                Assert.assertEquals("c", symbols.getQuick(2));
+            }
+        });
+    }
+
+    /**
+     * A dictionary that becomes unwritable mid-run must cost bandwidth, not the sender.
+     * <p>
+     * deltaDictEnabled was written once at setCursorEngine with no runtime disable, so
+     * the first persist failure killed flush() permanently -- every later flush re-threw.
+     * A full disk reaches exactly that state and is survivable: SF's segments are
+     * pre-allocated mmap files and stay writable while the growing .symbol-dict does not,
+     * and full self-sufficient frames need no side file at all (each carries the whole
+     * dictionary from id 0, which is what recovery replays anyway).
+     * <p>
+     * So the FIRST flush must still fail -- beginMessage has already baked a delta
+     * deltaStart into the staged frame, and publishing it would put ids on the ring the
+     * side-file cannot describe -- but the SECOND must succeed, in full-dict mode. Remove
+     * the disableDeltaDict call and the second flush throws exactly like the first.
+     */
+    @Test(timeout = 60_000L)
+    public void testPersistFailureDegradesToFullDictInsteadOfKillingFlushForever() throws Exception {
+        assertMemoryLeak(() -> {
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String slot = Paths.get(sfDir, "default").toString();
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                FullDiskDictFacade ff = new FullDiskDictFacade();
+                CursorSendEngine engine = new CursorSendEngine(
+                        slot, 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
+                Sender sender = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                try {
+                    // Armed from the start, so the very first ensureAppendMap is refused --
+                    // a later append would sit inside the window already mapped and never
+                    // call allocate at all.
+                    ff.armed = true;
+                    sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("the first flush must fail: its staged frame carries a delta "
+                                + "deltaStart the side-file cannot describe");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue("expected the persist-failure message, got: "
+                                        + expected.getMessage(),
+                                expected.getMessage().contains("failed to persist symbol dictionary"));
+                    }
+
+                    // The rows are still buffered (the throw precedes every publish), so the
+                    // retry re-encodes them from id 0. Pre-fix this threw forever.
+                    sender.flush();
+
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline && handler.dataFrameCount() < 1) {
+                        Thread.sleep(20);
+                    }
+                    Assert.assertTrue("the degraded flush must actually reach the server",
+                            handler.dataFrameCount() >= 1);
+                    Assert.assertEquals("a degraded frame must be self-sufficient (deltaStart 0)",
+                            0, handler.lastDataDeltaStart());
+                    Assert.assertEquals("the full dictionary must ride along",
+                            java.util.Collections.singletonList("a"), handler.dictSnapshot());
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                        // not what we assert
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTransientDictFaultOnRecoveredSlotFailsLoudAndRetryRecoversInFull() throws Exception {
+        // The cross-generation misattribution chain (sessions A -> B -> C) needed
+        // session B to hit a transient opening the side-file, silently degrade to
+        // full-dict, and write frames next to A's stale populated dictionary --
+        // which session C then trusted, resolving A's ids to B's strings with no
+        // detectable gap. Recovery now follows the Rust client's disposition:
+        // the transient fails session B's construction LOUDLY with the retriable
+        // SfOperationalException (the type Sender.build() refuses to quarantine
+        // on), the slot's bytes stay byte-identical, and once the transient
+        // clears the SAME slot recovers in full -- delta mode on, every id
+        // resolving to the string session A registered.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Session A: a real delta-mode sender persists DISTINCT_SYMBOLS
+            // symbols and their unacked delta frames, then dies (close-fast
+            // against a server that never acks).
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender s1 = Sender.fromConfig(cfg)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            Assert.assertTrue("session A must leave a populated side-file",
+                    java.nio.file.Files.exists(dict));
+            byte[] dictBefore = java.nio.file.Files.readAllBytes(dict);
+            List<String> slotBefore = sortedFileNames(slot);
+
+            // Session B: recovery hits a transient stat fault on the side-file.
+            // Construction must fail with SfOperationalException -- not degrade,
+            // not quarantine. The errno override pins the fault's
+            // classification: 5 is EIO on POSIX and ERROR_ACCESS_DENIED on
+            // Windows, "not a not-found" on both, so the faked length() < 0
+            // deterministically takes the transient arm instead of whatever the
+            // last real syscall left in errno.
+            DelegatingFilesFacade statFault = new DelegatingFilesFacade() {
+                @Override
+                public int errno() {
+                    return 5;
+                }
+
+                @Override
+                public long length(String path) {
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        return -1L;
+                    }
+                    return super.length(path);
+                }
+                // PersistedSymbolDict stats through the pathPtr overload so it can read
+                // errno with no free() in between, so the fault has to reach that form
+                // too -- but only for the dictionary, which is what allocNativePath
+                // remembers. Faulting every pathPtr stat would break the segment paths
+                // this test also opens.
+                long dictPathPtr = -1L;
+
+                @Override
+                public long allocNativePath(String path) {
+                    long ptr = super.allocNativePath(path);
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        dictPathPtr = ptr;
+                    }
+                    return ptr;
+                }
+
+                @Override
+                public long length(long pathPtr) {
+                    if (pathPtr == dictPathPtr) {
+                        return -1L;
+                    }
+                    return super.length(pathPtr);
+                }
+            };
+            try {
+                CursorSendEngine leaked = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, statFault);
+                leaked.close(false);
+                Assert.fail("a transient dict fault on a recovered slot must fail engine construction");
+            } catch (SfOperationalException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains(PersistedSymbolDict.FILE_NAME));
+            }
+
+            // The slot is untouched: byte-identical dictionary, session A's
+            // segment data survives, no new file is fabricated, and nothing is
+            // quarantined anywhere under the SF root. This is NOT a raw
+            // before/after file-list equality: recovery legitimately unlinks a
+            // leftover, never-rotated-in EMPTY hot-spare on the way in
+            // (SegmentRing.recover cleans it up before the dictionary is even
+            // opened, regardless of how that check resolves -- the same note
+            // documented on testQuarantineRenameFailurePreservesOriginalSlot),
+            // so the after-set may be a SUBSET of the before-set but must never
+            // be a superset.
+            Assert.assertArrayEquals("the transient must not alter the side-file",
+                    dictBefore, java.nio.file.Files.readAllBytes(dict));
+            List<String> slotAfter = sortedFileNames(slot);
+            Assert.assertTrue("the transient must not fabricate a new slot file [before=" + slotBefore
+                            + ", after=" + slotAfter + ']',
+                    slotBefore.containsAll(slotAfter));
+            Assert.assertTrue("session A's segment data must survive the failed attempt",
+                    hasSegmentFile(slot));
+            for (String name : sortedFileNames(Paths.get(sfDir))) {
+                Assert.assertFalse("a transient must never quarantine: " + name,
+                        name.contains("unreplayable") || name.endsWith(".failed"));
+            }
+
+            // Session B', engine level: the transient cleared -- the SAME slot
+            // recovers with delta mode on and every persisted entry loaded.
+            CursorSendEngine recovered = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    io.questdb.client.std.FilesFacade.INSTANCE);
+            try {
+                Assert.assertTrue("delta mode must survive the failed attempt",
+                        recovered.isDeltaDictEnabled());
+                Assert.assertEquals("every persisted symbol must reload",
+                        DISTINCT_SYMBOLS, recovered.getPersistedSymbolDict().size());
+            } finally {
+                recovered.close(false);
+            }
+
+            // Session B', wire level: a real build() replays the backlog and the
+            // server-side dictionary reconstructs every id -> string mapping
+            // exactly as session A registered it -- the misattribution the old
+            // degrade made possible cannot occur.
+            DictReconstructingHandler handler = new DictReconstructingHandler();
+            try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+                int port = good.getPort();
+                good.start();
+                Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+                try (Sender ignored = Sender.fromConfig(cfg)) {
+                    long deadline = System.currentTimeMillis() + 5_000;
+                    while (System.currentTimeMillis() < deadline
+                            && handler.maxDictSize() < DISTINCT_SYMBOLS) {
+                        Thread.sleep(20);
+                    }
+                }
+                List<String> reconstructed = handler.dictSnapshot();
+                Assert.assertEquals("reconstructed dictionary size",
+                        DISTINCT_SYMBOLS, reconstructed.size());
+                for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                    Assert.assertEquals("dictionary id " + i, "sym-" + i, reconstructed.get(i));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTransientDictFaultRecoversInFullDictModeWhenEveryFrameIsSelfSufficient()
+            throws Exception {
+        // The counterpoint to testTransientDictFaultOnRecoveredSlotFailsLoudAndRetry-
+        // RecoversInFull. There the surviving frames were DELTA frames whose ids live
+        // only in the side-file, so an unreadable side-file genuinely blocks replay and
+        // aborting is right. Here every surviving frame is self-sufficient
+        // (maxDeltaStart == 0 -- each re-registers its whole dictionary from id 0), so
+        // the side-file is not needed to replay this slot at all.
+        //
+        // Aborting anyway was a permanent outage over a file nothing reads:
+        // SfOperationalException extends IllegalStateException, so it is NOT in
+        // Sender.build()'s quarantine catch list and escaped build() entirely. With a
+        // stable senderId and a retained slot, a NON-clearing operational error (a hard
+        // EIO on this one file, a read-only mount, an ownership change) re-threw on
+        // every restart -- the application could not construct a Sender, so it could not
+        // even BUFFER new rows. In a pool it is worse: allocateSlotIndex() hands out the
+        // LOWEST free index, so the same bad slot is re-selected and EVERY borrow()
+        // fails rather than the pool losing one slot of capacity.
+        assertMemoryLeak(() -> {
+            java.nio.file.Path slot = Paths.get(sfDir, "default");
+            java.nio.file.Path dict = slot.resolve(".symbol-dict");
+
+            // Phase 1: full-dict fallback, so every frame carries its whole dictionary.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                int port = silent.getPort();
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                Assert.assertEquals(0, io.questdb.client.std.Files.mkdir(sfDir,
+                        io.questdb.client.std.Files.DIR_MODE_DEFAULT));
+                CursorSendEngine phase1Engine = new CursorSendEngine(
+                        slot.toString(), 4L * 1024 * 1024, CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, new UnopenableDictFacade());
+                try (Sender s1 = QwpWebSocketSender.connect(
+                        "localhost", port, null, 0, 0, 0L, null, false, phase1Engine, 0L)) {
+                    for (int i = 0; i < DISTINCT_SYMBOLS; i++) {
+                        s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                        s1.flush();
+                    }
+                }
+            }
+            // A prior generation's populated side-file, left where a later recovery
+            // would find it.
+            try (PersistedSymbolDict survivor =
+                         PersistedSymbolDict.openClean(slot.toString())) {
+                Assert.assertNotNull("the survivor dictionary must open", survivor);
+                survivor.appendSymbol("stale-a");
+                survivor.appendSymbol("stale-b");
+            }
+            Assert.assertTrue(java.nio.file.Files.exists(dict));
+
+            // Phase 2: the side-file cannot be read. Same stat fault the delta-frame
+            // twin uses -- errno 5 is EIO on POSIX and ERROR_ACCESS_DENIED on Windows,
+            // "not a not-found" on both, so length() < 0 deterministically takes the
+            // transient arm.
+            DelegatingFilesFacade statFault = new DelegatingFilesFacade() {
+                long dictPathPtr = -1L;
+
+                @Override
+                public long allocNativePath(String path) {
+                    long ptr = super.allocNativePath(path);
+                    if (path.endsWith(PersistedSymbolDict.FILE_NAME)) {
+                        dictPathPtr = ptr;
+                    }
+                    return ptr;
+                }
+
+                @Override
+                public int errno() {
+                    return 5;
+                }
+
+                @Override
+                public long length(String path) {
+                    return path.endsWith(PersistedSymbolDict.FILE_NAME) ? -1L : super.length(path);
+                }
+
+                @Override
+                public long length(long pathPtr) {
+                    return pathPtr == dictPathPtr ? -1L : super.length(pathPtr);
+                }
+            };
+            CursorSendEngine recoveredEngine = new CursorSendEngine(
+                    slot.toString(), 4L * 1024 * 1024,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS,
+                    CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, statFault);
+            try {
+                Assert.assertFalse("an unreadable dictionary must leave the slot in full-dict mode",
+                        recoveredEngine.isDeltaDictEnabled());
+                Assert.assertNull(recoveredEngine.getPersistedSymbolDict());
+                // And the unverifiable survivor is cleared, not left for the next
+                // recovery to trust -- the same reason the discard branch unlinks its
+                // own. Asserted while the engine is still OPEN: close() unlinks the
+                // dictionary itself on a fully-drained slot, which would satisfy this
+                // for the wrong reason.
+                Assert.assertFalse("an unreadable side-file must be removed once the frames are "
+                                + "proven self-sufficient, or a later recovery will seed symbols from it",
+                        java.nio.file.Files.exists(dict));
+            } finally {
+                recoveredEngine.close(false);
+            }
+        });
+    }
+
+    private static boolean hasSegmentFile(java.nio.file.Path dir) {
+        java.io.File[] files = dir.toFile().listFiles();
+        if (files != null) {
+            for (java.io.File f : files) {
+                if (f.getName().endsWith(".sfa")
+                        && f.length() > 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static List<String> sortedFileNames(java.nio.file.Path dir) throws IOException {
+        try (java.util.stream.Stream<java.nio.file.Path> entries = java.nio.file.Files.list(dir)) {
+            return entries.map(p -> p.getFileName().toString())
+                    .sorted()
+                    .collect(java.util.stream.Collectors.toList());
+        }
+    }
+
+
+    /**
+     * Phase 1 for the recovery tests: six frames, each introducing exactly one new symbol
+     * (sym-0 .. sym-5), left unacked on disk by a silent server and a fast close.
+     */
+    private void recordSixDeltaFrames() throws Exception {
+        try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+            int port = silent.getPort();
+            silent.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                    + ";close_flush_timeout_millis=0;";
+            try (Sender s1 = Sender.fromConfig(cfg)) {
+                for (int i = 0; i < 6; i++) {
+                    s1.table("m").symbol("s", "sym-" + i).longColumn("v", i).atNow();
+                    s1.flush();
+                }
+            }
+        }
+    }
+
+    /**
+     * Recovers the slot against a fresh server and asserts the dictionary it ends up holding
+     * is COMPLETE and IN ORDER.
+     * <p>
+     * This is the strong form, and it is the point: the fresh server starts with an empty
+     * dictionary, so ids the replayed frames' deltas start ABOVE can only come from a catch-up
+     * frame -- which can only carry them if the mirror was seeded from the frames still on
+     * disk. A dictionary that came back null-padded (the server's response to an id it has
+     * never seen) or shifted by one would fail here, and that is precisely the corruption the
+     * old guard condemned these slots to avoid. It never had to.
+     */
+    private void assertSlotRecoversWithCompleteDictionary() throws Exception {
+        DictReconstructingHandler handler = new DictReconstructingHandler();
+        try (TestWebSocketServer good = new TestWebSocketServer(handler)) {
+            int port = good.getPort();
+            good.start();
+            Assert.assertTrue(good.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir + ";";
+            try (Sender s2 = Sender.fromConfig(cfg)) {
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (System.currentTimeMillis() < deadline && handler.maxDictSize() < 6) {
+                    Thread.sleep(20);
+                }
+                s2.flush();
+            }
+            Assert.assertEquals(
+                    "every id is still held by a frame on disk, so the catch-up must rebuild the "
+                            + "dictionary COMPLETE and gap-free -- not null-pad it",
+                    Arrays.asList("sym-0", "sym-1", "sym-2", "sym-3", "sym-4", "sym-5"),
+                    handler.dictSnapshot());
+        }
+    }
+
+}

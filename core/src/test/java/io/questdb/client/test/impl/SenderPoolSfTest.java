@@ -4448,7 +4448,8 @@ public class SenderPoolSfTest {
             while (rc > 0) {
                 String name = Files.utf8ToString(Files.findName(find));
                 rc = Files.findNext(find);
-                if (name != null && name.endsWith(".sfa")) {
+                if (name != null
+                        && name.endsWith(".sfa")) {
                     return true;
                 }
             }

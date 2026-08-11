@@ -28,7 +28,9 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Immutable description of a server-side rejection of an asynchronously published batch.
+ * Immutable description of a server-side rejection of an asynchronously published batch —
+ * or, for {@link Category#DATA_LOSS}, of a client-side verdict that buffered data has been
+ * permanently abandoned and must be re-ingested from its source.
  *
  * <p>Delivered to user code through two paths:
  * <ul>
@@ -60,6 +62,7 @@ public final class SenderError {
     private final long detectedAtNanos;
     private final long fromFsn;
     private final long messageSequence;
+    private final String quarantinedPath;
     private final String serverMessage;
     private final int serverStatusByte;
     private final String tableName;
@@ -75,6 +78,22 @@ public final class SenderError {
             @Nullable String tableName,
             long detectedAtNanos
     ) {
+        this(category, appliedPolicy, serverStatusByte, serverMessage, messageSequence,
+                fromFsn, toFsn, tableName, detectedAtNanos, null);
+    }
+
+    private SenderError(
+            @NotNull Category category,
+            @NotNull Policy appliedPolicy,
+            int serverStatusByte,
+            @Nullable String serverMessage,
+            long messageSequence,
+            long fromFsn,
+            long toFsn,
+            @Nullable String tableName,
+            long detectedAtNanos,
+            @Nullable String quarantinedPath
+    ) {
         this.category = category;
         this.appliedPolicy = appliedPolicy;
         this.serverStatusByte = serverStatusByte;
@@ -84,6 +103,26 @@ public final class SenderError {
         this.toFsn = toFsn;
         this.tableName = tableName;
         this.detectedAtNanos = detectedAtNanos;
+        this.quarantinedPath = quarantinedPath;
+    }
+
+    /**
+     * The only way to build a {@link Category#DATA_LOSS} report. Binds the
+     * category/policy pair the two enum constants promise each other and fills
+     * the server-shaped fields with their sentinels — there is no server
+     * verdict to report. The FSN span is {@link #NO_MESSAGE_SEQUENCE} on both
+     * bounds: the abandoned span is unknown at quarantine time (the engine is
+     * closed or was never built).
+     *
+     * @param detail          why the data is unreachable, from the recovery verdict;
+     *                        becomes {@link #getServerMessage()}
+     * @param quarantinedPath where the abandoned bytes remain on disk, for
+     *                        forensics and a manual resend
+     */
+    public static SenderError dataLoss(@NotNull String detail, @NotNull String quarantinedPath) {
+        return new SenderError(Category.DATA_LOSS, Policy.ABANDONED, NO_STATUS_BYTE, detail,
+                NO_MESSAGE_SEQUENCE, NO_MESSAGE_SEQUENCE, NO_MESSAGE_SEQUENCE, null,
+                System.nanoTime(), quarantinedPath);
     }
 
     /**
@@ -112,6 +151,7 @@ public final class SenderError {
 
     /**
      * @return inclusive lower bound of the FSN span for the rejected batch — correlation key for producer-side logs.
+     * For {@link Category#DATA_LOSS} this is {@link #NO_MESSAGE_SEQUENCE} — the abandoned span is unknown at quarantine time.
      */
     public long getFromFsn() {
         return fromFsn;
@@ -123,6 +163,16 @@ public final class SenderError {
      */
     public long getMessageSequence() {
         return messageSequence;
+    }
+
+    /**
+     * @return for {@link Category#DATA_LOSS}: the on-disk path where the abandoned
+     * bytes remain (a quarantined {@code .unreplayable-N} directory, or the slot
+     * directory itself when a drainer left it behind a {@code .failed} sentinel).
+     * Null for every other category.
+     */
+    public @Nullable String getQuarantinedPath() {
+        return quarantinedPath;
     }
 
     /**
@@ -152,6 +202,7 @@ public final class SenderError {
 
     /**
      * @return inclusive upper bound of the FSN span for the rejected batch.
+     * For {@link Category#DATA_LOSS} this is {@link #NO_MESSAGE_SEQUENCE} — the abandoned span is unknown at quarantine time.
      */
     public long getToFsn() {
         return toFsn;
@@ -166,13 +217,17 @@ public final class SenderError {
                 ", fsn=[" + fromFsn + ',' + toFsn + ']' +
                 ", table=" + (tableName == null ? "(multi)" : tableName) +
                 ", msg=" + serverMessage +
+                (quarantinedPath == null ? "" : ", quarantined=" + quarantinedPath) +
                 '}';
     }
 
     /**
-     * Server-distinguishable rejection categories. Aligned 1:1 with the stable
-     * QWP wire status bytes for ingress, plus {@link #PROTOCOL_VIOLATION} for
-     * WebSocket-level close frames and {@link #UNKNOWN} for forward compatibility.
+     * Server-distinguishable rejection categories, aligned 1:1 with the stable
+     * QWP wire status bytes for ingress, plus three client-originated ones:
+     * {@link #PROTOCOL_VIOLATION} for the poison-frame detector,
+     * {@link #DATA_LOSS} for permanently abandoned store-and-forward data (the
+     * only category with no server involvement at all), and {@link #UNKNOWN}
+     * for forward compatibility.
      */
     public enum Category {
         /**
@@ -203,12 +258,39 @@ public final class SenderError {
          */
         NOT_WRITABLE,
         /**
+         * A delta symbol dictionary began above the server's per-connection dictionary.
+         * Wire {@code 0x0D}. Unlike {@link #PARSE_ERROR} this is a function of server
+         * state, not of the frame's bytes, so the same frame succeeds after the
+         * connection's dictionary catch-up has run.
+         */
+        DICTIONARY_GAP,
+        /**
          * A frame the server (or an intermediary) deterministically rejects: the
          * poison-frame detector observed the same head-of-line frame fail
          * {@link io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop#DEFAULT_MAX_HEAD_FRAME_REJECTIONS}
          * consecutive times with no ack progress — replaying it cannot succeed.
          */
         PROTOCOL_VIOLATION,
+        /**
+         * Rows this client had durably buffered will never be sent, and no retry
+         * will change that. The only category with no server involvement: the
+         * server never saw these bytes and issued no verdict on them, so
+         * {@link #getServerStatusByte()} is always {@link #NO_STATUS_BYTE} and
+         * {@link #getServerMessage()} carries a client-side explanation. Fired
+         * when store-and-forward recovery sets an unreplayable slot aside
+         * (its symbol dictionary cannot be rebuilt from any source, or its
+         * durable chain is proven corrupt or incomplete) and when an orphan
+         * drainer abandons a slot behind a {@code .failed} sentinel that
+         * nothing clears automatically.
+         *
+         * <p>Always paired with {@link Policy#ABANDONED}; the two are never
+         * issued apart, and only {@link SenderError#dataLoss} constructs them.
+         * The bytes are preserved on disk — {@link #getQuarantinedPath()}
+         * names where — so the data can be inspected and re-ingested from its
+         * source. This is the event to page on. (The Rust client models the
+         * same verdict as {@code ErrorCode::StoreResendRequired}.)
+         */
+        DATA_LOSS,
         /**
          * Status byte the client does not recognize — forward compatibility for new server codes.
          */
@@ -221,14 +303,19 @@ public final class SenderError {
      * connect-string per-category {@code on_*_error} → connect-string global {@code on_server_error}
      * → spec defaults.
      *
-     * <p>There is no drop policy by design: the client never silently discards data. A rejected
-     * batch is either replayed ({@link #RETRIABLE} / {@link #RETRIABLE_OTHER}) or halts the
-     * sender loudly with the bytes preserved on disk ({@link #TERMINAL}).
+     * <p>There is no silent-drop policy by design: the client never discards
+     * data without telling anyone. A rejected batch is replayed
+     * ({@link #RETRIABLE} / {@link #RETRIABLE_OTHER}), halts the sender loudly
+     * with the bytes preserved on disk ({@link #TERMINAL}), or — the one case
+     * where the bytes can never be sent — is abandoned in place and announced
+     * as {@link #ABANDONED}, which is precisely what keeps the abandonment
+     * non-silent.
      *
-     * <p>{@link Category#PROTOCOL_VIOLATION} is forced {@link #TERMINAL} and
-     * {@link Category#UNKNOWN} is forced {@link #RETRIABLE} (fail open: a status byte from a
-     * newer server must degrade to retry, not to a dead sender); user overrides for those
-     * categories are ignored.
+     * <p>{@link Category#PROTOCOL_VIOLATION} is forced {@link #TERMINAL},
+     * {@link Category#UNKNOWN} is forced {@link #RETRIABLE} (fail open: a
+     * status byte from a newer server must degrade to retry, not to a dead
+     * sender), and {@link Category#DATA_LOSS} is forced {@link #ABANDONED};
+     * user overrides for these categories are ignored.
      */
     public enum Policy {
         /**
@@ -252,6 +339,21 @@ public final class SenderError {
          * caller closes and rebuilds it. The rejected bytes remain in the store-and-forward log
          * on disk — nothing is silently discarded.
          */
-        TERMINAL
+        TERMINAL,
+        /**
+         * The rows are gone. Nothing replays them, and — unlike
+         * {@link #TERMINAL} — nothing throws: no {@link LineSenderServerException}
+         * is latched, and the sender that reported this keeps running (a
+         * quarantining {@code build()} returns a working sender on a fresh,
+         * empty slot). The bytes stay on disk under the path named by
+         * {@link SenderError#getQuarantinedPath()}, for forensics and a manual
+         * resend.
+         *
+         * <p>Issued only with {@link Category#DATA_LOSS} and never resolvable
+         * from user configuration: no resolver or {@code on_*_error} key can
+         * select it or override it away. It reports a fact about bytes already
+         * abandoned, not a choice about how to react.
+         */
+        ABANDONED
     }
 }

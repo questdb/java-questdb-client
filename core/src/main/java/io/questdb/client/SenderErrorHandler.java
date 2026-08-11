@@ -32,8 +32,13 @@ import org.jetbrains.annotations.NotNull;
  * {@code LineSenderBuilder.errorHandler(SenderErrorHandler)}.
  *
  * <h2>Threading</h2>
- * Implementations are invoked on a dedicated daemon dispatcher thread, never on the I/O
- * thread or the producer thread. Slow handlers cannot stall publishing; if the bounded
+ * Handlers normally run on a dedicated daemon dispatcher thread, never on the
+ * I/O thread or the producer thread. One exception: a build()-time quarantine
+ * ({@link SenderError.Category#DATA_LOSS}) is dispatched synchronously on the
+ * thread calling {@code build()} — the async dispatcher belongs to the
+ * connected sender, which does not exist yet at build time. Handlers must not
+ * block: for the build-time case, {@code build()} is waiting.
+ * Slow handlers cannot stall publishing; if the bounded
  * inbox fills up, surplus notifications are dropped (visible via
  * {@code QwpWebSocketSender.getDroppedErrorNotifications()}).
  *

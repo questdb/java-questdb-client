@@ -25,7 +25,6 @@
 package io.questdb.client.network;
 
 import io.questdb.client.ClientTlsConfiguration;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.tcp.DelegatingTlsChannel;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.MemoryTag;
@@ -34,43 +33,21 @@ import io.questdb.client.std.Vect;
 import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 
-import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLParameters;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.TrustManagerFactory;
-import javax.net.ssl.X509TrustManager;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.security.KeyManagementException;
-import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
 import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
 
 public final class JavaTlsClientSocket implements Socket {
 
     private static final long ADDRESS_FIELD_OFFSET;
-    private static final TrustManager[] BLIND_TRUST_MANAGERS = new TrustManager[]{new X509TrustManager() {
-        public void checkClientTrusted(X509Certificate[] certs, String t) {
-        }
-
-        public void checkServerTrusted(X509Certificate[] certs, String t) {
-        }
-
-        public X509Certificate[] getAcceptedIssuers() {
-            return null;
-        }
-    }};
     private static final long CAPACITY_FIELD_OFFSET;
     private static final int INITIAL_BUFFER_CAPACITY_BYTES = 256 * 1024;
     private static final long LIMIT_FIELD_OFFSET;
@@ -395,20 +372,6 @@ public final class JavaTlsClientSocket implements Socket {
         return newAddress;
     }
 
-    private static InputStream openTrustStoreStream(String trustStorePath) throws FileNotFoundException {
-        InputStream trustStoreStream;
-        if (trustStorePath.startsWith("classpath:")) {
-            String adjustedPath = trustStorePath.substring("classpath:".length());
-            trustStoreStream = DelegatingTlsChannel.class.getResourceAsStream(adjustedPath);
-            if (trustStoreStream == null) {
-                throw new LineSenderException("configured trust store is unavailable ")
-                        .put("[path=").put(trustStorePath).put("]");
-            }
-            return trustStoreStream;
-        }
-        return new FileInputStream(trustStorePath);
-    }
-
     private static void resetBufferToPointer(ByteBuffer buffer, long ptr, int len) {
         assert buffer.isDirect();
         Unsafe.getUnsafe().putLong(buffer, ADDRESS_FIELD_OFFSET, ptr);
@@ -418,42 +381,13 @@ public final class JavaTlsClientSocket implements Socket {
     }
 
     private SSLEngine createSslEngine(CharSequence serverName) throws KeyManagementException, NoSuchAlgorithmException, KeyStoreException, IOException, CertificateException {
-        SSLContext sslContext;
-        String trustStorePath = tlsConfig.trustStorePath();
-        int tlsValidationMode = tlsConfig.tlsValidationMode();
-        if (trustStorePath != null) {
-            sslContext = SSLContext.getInstance("TLS");
-            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
-            KeyStore jks = KeyStore.getInstance("JKS");
-            try (InputStream trustStoreStream = openTrustStoreStream(trustStorePath)) {
-                jks.load(trustStoreStream, tlsConfig.trustStorePassword());
-            }
-            tmf.init(jks);
-            TrustManager[] trustManagers = tmf.getTrustManagers();
-            sslContext.init(null, trustManagers, new SecureRandom());
-        } else if (tlsValidationMode == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
-            sslContext = SSLContext.getInstance("TLS");
-            sslContext.init(null, BLIND_TRUST_MANAGERS, new SecureRandom());
-        } else {
-            sslContext = SSLContext.getDefault();
-        }
-
-        SSLEngine sslEngine = sslContext.createSSLEngine(Chars.toString(serverName), -1);
-        if (tlsValidationMode != ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE) {
-            SSLParameters sslParameters = sslEngine.getSSLParameters();
-            // The https validation algorithm? That looks confusing! After all we are not using any
-            // https here at so what does it mean?
-            // It's actually simple: It just instructs the SSLEngine to perform the same hostname validation
-            // as it does during HTTPS connections. SSLEngine does not do hostname validation by default. Without
-            // this option SSLEngine would happily accept any certificate as long as it's signed by a trusted CA.
-            // This option will make sure certificates are accepted only if they were issued for the
-            // server we are connecting to.
-            sslParameters.setEndpointIdentificationAlgorithm("https");
-            sslEngine.setSSLParameters(sslParameters);
-        }
-
-        sslEngine.setUseClientMode(true);
-        return sslEngine;
+        return TlsTrustStore.createSslEngine(
+                tlsConfig.trustStorePath(),
+                tlsConfig.trustStorePassword(),
+                tlsConfig.tlsValidationMode() == ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE,
+                Chars.toString(serverName),
+                DelegatingTlsChannel.class
+        );
     }
 
     private void freeInternalBuffers() {

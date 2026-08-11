@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.client.GlobalSymbolDictionary;
 import io.questdb.client.std.Compat;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -93,6 +94,11 @@ public final class CursorSendEngine implements QuietCloseable {
     // callback allocation failure cannot orphan manager resources. A timed-out
     // close can then hand it to either manager path without allocating.
     private final Runnable deferredClose;
+    // Facade for the persisted symbol dictionary only. Separate from
+    // filesFacade (which the manager supplies for segments, watermark and
+    // manifest) so a test can fault-inject a dictionary write without also
+    // breaking the segment chain underneath it.
+    private final FilesFacade dictFf;
     private final FilesFacade filesFacade;
     private final SegmentManager manager;
     // We own the manager iff the user constructed us with no manager — in that
@@ -109,9 +115,9 @@ public final class CursorSendEngine implements QuietCloseable {
     private final SlotLock slotLock;
     // True when the constructor recovered an existing on-disk slot rather
     // than starting fresh. Diagnostic accessor for tests and observability;
-    // cursor frames are self-sufficient (every frame carries full schema +
-    // full symbol-dict delta), so producer-side schema reset on recovery
-    // is not required.
+    // every frame carries its full inline schema, so producer-side schema reset
+    // on recovery is not required (the symbol dictionary, which delta frames do
+    // NOT carry in full, is re-registered by an I/O-thread catch-up instead).
     private final boolean wasRecoveredFromDisk;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame found in a
     // ring recovered from disk, or -1 for fresh/memory rings and recovered
@@ -121,6 +127,27 @@ public final class CursorSendEngine implements QuietCloseable {
     // covers them. Read by the sender's close-time drain to avoid waiting on
     // acks that cannot arrive.
     private long recoveredCommitBoundaryFsn = -1L;
+    // Highest symbol id any recovered delta frame references, or -1 for
+    // fresh/memory rings (and recovered rings with no symbol-bearing frame). A
+    // resuming producer seeds its dictionary baseline from the persisted
+    // .symbol-dict; if that dictionary was torn below this id by a host crash
+    // (the side-file is not fsync'd), the producer would re-use ids the surviving
+    // frames already define. seedGlobalDictionaryFromPersisted compares this
+    // against the recovered dictionary size to fail clean instead. Computed once
+    // in the constructor's recovery branch; -1 elsewhere.
+    private long recoveredMaxSymbolId = -1L;
+    // How many times the constructor folded the recovered ring. Observable because
+    // recoveryFramesVisited() cannot be: the full-dict-fallback re-fold REPLACES the
+    // analysis instance, resetting that counter, so a second fold is invisible through it.
+    private int recoveryFoldCount;
+    // Highest deltaStart across the recovered COMMITTED frames; 0 when none carries a symbol
+    // dictionary. ZERO means every surviving frame is SELF-SUFFICIENT -- it re-registers its
+    // dictionary from id 0 -- so the slot replays with no dictionary at all and the send loop
+    // needs no catch-up. ABOVE zero means at least one frame is a true delta whose ids depend
+    // on registrations it does not itself carry, so the loop must seed its mirror (and ship a
+    // catch-up) before replaying. Both the full-dict-fallback discard below and the send
+    // loop's mirror seeding key off this.
+    private long recoveredMaxSymbolDeltaStart;
     // FSN of the last frame of a recovered orphaned deferred tail, or -1 when
     // the recovered ring has no such tail. When >= 0, frames
     // [recoveredCommitBoundaryFsn + 1 .. recoveredOrphanTipFsn] all carry
@@ -136,6 +163,17 @@ public final class CursorSendEngine implements QuietCloseable {
     // constructor, closed by {@link #close()}. The segment manager writes
     // through this on every tick where ackedFsn has advanced.
     private final AckWatermark watermark;
+    // Engine-owned per-slot symbol dictionary file (disk mode only; {@code null}
+    // in memory mode and if open() failed). Enables delta-encoded SF frames:
+    // recovery / orphan-drain load it to re-register the dictionary on the fresh
+    // server before replaying non-self-sufficient frames. Opened in the
+    // constructor, closed by {@link #close()}. When null in disk mode the engine
+    // reports delta encoding as unavailable and the sender keeps full-dict frames.
+    private final PersistedSymbolDict persistedSymbolDict;
+    // Engine-owned output of the single ordered recovery walk. It is retained
+    // because both producer seeding and every recycled send loop need the same
+    // frame-rebuilt symbol suffix. Null for fresh and memory-only engines.
+    private final RecoveredFrameAnalysis recoveredFrameAnalysis;
     // close() is publicly callable from any thread (Sender.close from a user
     // thread, JVM shutdown hooks, test cleanup). volatile + synchronized
     // close() makes the check-and-set atomic and gives readers a fence.
@@ -168,6 +206,14 @@ public final class CursorSendEngine implements QuietCloseable {
     // Ensures this engine has at most one entry in the shared flock-release
     // retry driver. The error path only: ordinary closes never enqueue work.
     private final AtomicBoolean flockReleaseRetryStarted = new AtomicBoolean();
+    // False only when a caller ABOVE this engine holds the parent-anchored
+    // logical slot lock (Sender.build() across construct -> connect ->
+    // quarantine). finishClose then skips the fully-drained unlink of that
+    // lock file, which would otherwise free the pathname while the caller
+    // still holds the flock on it. Latched by close(boolean) before any
+    // cleanup runs; volatile because finishClose can run later on the manager
+    // worker's exit thread or the shared flock-release retry driver.
+    private volatile boolean reclaimLogicalSlotLock = true;
     // Published before deferredClose is registered. The manager lock provides
     // the callback handoff fence; volatile also covers a direct test/retry read.
     private volatile boolean fullyDrainedForDeferredClose;
@@ -217,6 +263,29 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * As {@link #CursorSendEngine(String, long, long, long)}, but with an explicit
+     * {@link FilesFacade} for the persisted symbol dictionary.
+     * <p>
+     * The seam exists so a test can drive a dictionary I/O fault -- a short write from
+     * a full disk or an exhausted quota -- through the REAL producer path
+     * ({@code flush()} -> the write-ahead persist), and assert it surfaces as a
+     * {@code LineSenderException} like every other flush-path failure rather than as a
+     * raw {@code IllegalStateException} that would sail past every caller's
+     * {@code catch (LineSenderException)}. Nothing else could reach that translation:
+     * {@code PersistedSymbolDict} has facade-aware overloads, but the engine used to
+     * call only the {@code FilesFacade.INSTANCE} ones, so no fault could be injected
+     * from outside. Deliberately narrower than the manager's facade: the segment
+     * chain stays on the production one, so a dictionary fault cannot be confused
+     * with a recovery failure.
+     */
+    @TestOnly
+    public CursorSendEngine(String sfDir, long segmentSizeBytes,
+                            long maxTotalBytes, long appendDeadlineNanos, FilesFacade dictFf) {
+        this(sfDir, segmentSizeBytes, null, true, maxTotalBytes,
+                appendDeadlineNanos, 0L, dictFf);
+    }
+
+    /**
      * Creates an engine with an optional periodic data-checkpoint interval.
      * A positive interval requires disk-backed store-and-forward mode.
      */
@@ -257,6 +326,14 @@ public final class CursorSendEngine implements QuietCloseable {
     private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
                              boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
                              long syncIntervalNanos) {
+        this(sfDir, segmentSizeBytes, manager, ownsManager, maxTotalBytes,
+                appendDeadlineNanos, syncIntervalNanos, FilesFacade.INSTANCE);
+    }
+
+    private CursorSendEngine(String sfDir, long segmentSizeBytes, SegmentManager manager,
+                             boolean ownsManager, long maxTotalBytes, long appendDeadlineNanos,
+                             long syncIntervalNanos, FilesFacade dictFf) {
+        this.dictFf = dictFf;
         // Allocate the bound callback before constructing an owned manager.
         // Field initializers have completed, but no engine-owned native/disk
         // resource exists yet. If callback allocation throws, construction
@@ -320,11 +397,21 @@ public final class CursorSendEngine implements QuietCloseable {
         // reference instead of orphaning the mmap'd segments + fds.
         SegmentRing ringInProgress = null;
         AckWatermark watermarkInProgress = null;
+        PersistedSymbolDict persistedDictInProgress = null;
+        RecoveredFrameAnalysis recoveredFrameAnalysisInProgress = null;
         try {
             // Disk mode: try to recover any *.sfa files left behind by a prior
             // session before deciding to start fresh. Without this the engine
             // would create a new sf-initial.sfa at baseSeq=0, overlapping FSNs
             // already on disk and corrupting ACK translation, trim, and replay.
+            // May throw UnreplayableSlotException or SfRecoveryException /
+            // MmapSegmentCorruptionException (the durable chain is proven corrupt
+            // or incomplete) -- the catch (Throwable) below cleans up and lets
+            // them propagate so the constructor's two callers, Sender.build() and
+            // BackgroundDrainer, can quarantine the slot instead of seeding the
+            // ack past frames that were never sent. A plain MmapSegmentException
+            // is operational: it aborts startup without quarantining, so a
+            // transient EMFILE/ENOMEM can never silently drop durable frames.
             SegmentRing.Recovery recovery = memoryMode ? null
                     : SegmentRing.recover(filesFacade, sfDir, segmentSizeBytes);
             SegmentRing recovered = recovery == null ? null : recovery.ring();
@@ -386,6 +473,40 @@ public final class CursorSendEngine implements QuietCloseable {
                     throw new SfOperationalException(
                             "could not open required ack watermark for SF slot " + sfDir);
                 }
+                // Load the persisted symbol dictionary so delta-encoded frames
+                // in this recovered slot can be re-registered on the fresh
+                // server before replay. Returns null only when the dictionary
+                // is provably absent or corrupt -- the sender then degrades to
+                // full self-sufficient frames for this session, a disposition
+                // that is sticky across restarts.
+                //
+                // An I/O failure throws SfOperationalException, which is CAPTURED
+                // rather than propagated here. Whether an unreadable dictionary is
+                // fatal depends on something only the fold below can answer: if every
+                // surviving frame is self-sufficient (maxDeltaStart() == 0, i.e. each
+                // re-registers its whole dictionary from id 0) the side-file is not
+                // needed to replay this slot at all, and aborting on it would be a
+                // permanent outage over a file nothing reads. That mattered because
+                // SfOperationalException extends IllegalStateException, so it is NOT in
+                // Sender.build()'s quarantine catch list and escapes build() entirely:
+                // with a stable senderId and a retained slot, a NON-clearing operational
+                // error (a hard EIO on this one file, a read-only mount failing the tail
+                // truncate, an ownership change) re-threw on every restart. The
+                // application could then not construct a Sender at all, so it could not
+                // even BUFFER new rows -- and in a pool it is worse, because
+                // allocateSlotIndex() hands out the LOWEST free index, so the same bad
+                // slot is re-selected and every borrow() fails rather than the pool
+                // losing one slot of capacity.
+                //
+                // Deferring the verdict keeps the abort for the case that genuinely
+                // needs it (a delta frame whose ids cannot be rebuilt) and drops it for
+                // the case that does not.
+                SfOperationalException dictOpenFailure = null;
+                try {
+                    persistedDictInProgress = PersistedSymbolDict.open(dictFf, sfDir);
+                } catch (SfOperationalException e) {
+                    dictOpenFailure = e;
+                }
                 long baseSeed = lowestBase - 1;
                 long watermarkFsn = watermarkInProgress.read();
                 // Reject watermarks past publishedFsn: a correctly
@@ -403,6 +524,54 @@ public final class CursorSendEngine implements QuietCloseable {
                 if (seed >= 0) {
                     recovered.acknowledge(seed);
                 }
+                // Fold the whole recovered ring once. The result checkpoints all
+                // running metadata and raw symbol bytes at each commit-bearing
+                // frame, so its final snapshot excludes an orphan deferred tail
+                // without requiring a second bounded scan.
+                recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(
+                        persistedDictInProgress == null ? 0 : persistedDictInProgress.size());
+                recoveryFoldCount++;
+                if (dictOpenFailure != null) {
+                    // The deferred verdict from the dictionary open above, now that the
+                    // fold can say whether the file was load-bearing.
+                    if (recoveredFrameAnalysisInProgress.maxDeltaStart() > 0L) {
+                        // A surviving frame's delta starts above id 0, so the ids it
+                        // references exist ONLY in the side-file this process could not
+                        // read. Replaying it would hand the server ids it was never
+                        // given. Abort -- retriably, which is why the type is unchanged:
+                        // the file is left intact, Sender.build() does not quarantine it
+                        // (SfOperationalException is deliberately outside that catch
+                        // list), and BackgroundDrainer treats it as retryable and leaves
+                        // no .failed sentinel, so a retry once the transient clears
+                        // recovers the slot in full.
+                        throw dictOpenFailure;
+                    }
+                    // Every surviving frame carries its whole dictionary inline, so the
+                    // unreadable side-file is not needed to replay this slot, and no
+                    // frame this session goes on to write will need it either
+                    // (persistedSymbolDict stays null, so isDeltaDictEnabled() is false
+                    // and the producer runs full-dict). Clear it for the same reason the
+                    // discard branch below clears its own: a session that writes
+                    // full-dict frames next to a side-file it never verified hands the
+                    // NEXT recovery a survivor describing a previous generation's id
+                    // space, which seeds the producer with the wrong strings.
+                    if (PersistedSymbolDict.removeOrphan(dictFf, sfDir)) {
+                        LOG.warn("sf slot {}: symbol dictionary unreadable ({}), but every recovered "
+                                        + "frame is self-sufficient -- removed the unusable side-file and "
+                                        + "recovering in full-dictionary mode",
+                                sfDir, dictOpenFailure.getMessage());
+                    } else {
+                        // Deliberately NOT fatal: refusing here would restore the
+                        // permanent build() outage this deferral exists to remove, over a
+                        // file nothing in this slot reads. Say plainly what is left
+                        // behind so the residue is actionable.
+                        LOG.error("sf slot {}: symbol dictionary is neither readable ({}) nor removable; "
+                                        + "recovering in full-dictionary mode, but the stale side-file "
+                                        + "SURVIVES -- remove it by hand, or a later recovery whose frames "
+                                        + "reference fewer ids than it holds will seed symbols from it",
+                                sfDir, dictOpenFailure.getMessage());
+                    }
+                }
                 // Locate the last commit-bearing frame below a potentially
                 // orphaned FLAG_DEFER_COMMIT tail. A producer that crashed (or
                 // closed) mid-transaction leaves deferred frames with no
@@ -412,12 +581,7 @@ public final class CursorSendEngine implements QuietCloseable {
                 // drainOnClose), and (b) replaying them into a NEW session's
                 // commit would resurrect half a transaction -- see the WARN
                 // below. Computed before the I/O loop or producer append.
-                this.recoveredCommitBoundaryFsn = recovered.findLastFsnWithoutPayloadFlag(
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_OFFSET_FLAGS,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.MAGIC_MESSAGE,
-                        io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE
-                );
+                this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
                 if (publishedFsn >= 0 && recoveredCommitBoundaryFsn < publishedFsn) {
                     this.recoveredOrphanTipFsn = publishedFsn;
                     LOG.warn("recovered SF log ends with {} deferred frame(s) whose transaction was never "
@@ -426,6 +590,121 @@ public final class CursorSendEngine implements QuietCloseable {
                                     + "retired (trimmed) once every frame below it is server-acked.",
                             publishedFsn - Math.max(recoveredCommitBoundaryFsn, -1L),
                             recoveredCommitBoundaryFsn, publishedFsn);
+                }
+                // Highest symbol id the surviving COMMITTED frames reference. A
+                // resuming producer compares this against its recovered dictionary
+                // size (seedGlobalDictionaryFromPersisted) to detect a host-crash
+                // tear: if a committed frame references an id the (unsynced, torn)
+                // .symbol-dict no longer holds, resuming would re-use it. The walk is
+                // bounded to recoveredCommitBoundaryFsn so the aborted orphan-deferred
+                // tail -- retired without ever being transmitted -- does not inflate
+                // this and over-reject an otherwise-recoverable slot. maxDeltaEnd()
+                // returns 0 when no such frame carries a symbol, yielding -1 here.
+                // Computed before the I/O loop or producer append; single-threaded.
+                this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
+                // Full-dict-fallback recovery. When the persisted .symbol-dict is a
+                // SUBSET of the ids the surviving frames reference
+                // (recoveredMaxSymbolId >= its size) YET every such frame is
+                // self-sufficient (maxDeltaStart() == 0 -- a full-dict frame that
+                // re-registers its dictionary from id 0), the slot was written in
+                // full-dict fallback: the dictionary never opened when writing, so no
+                // side-file exists and this recovery opened a FRESH EMPTY one. Those
+                // frames replay with no dictionary, so discard the empty side-file and
+                // recover in full-dict mode -- isDeltaDictEnabled() then reports false
+                // and the producer + send loop both run full-dict, exactly as the slot
+                // was written. Without this the sender's seed-time guard would treat the
+                // empty dictionary as a host-crash tear and brick build(), even though
+                // the orphan drainer drains the same frames fine. A genuine torn DELTA
+                // dictionary keeps a frame with deltaStart > 0 (maxDeltaStart() > 0)
+                // and is NOT discarded here: it still fails clean at seed time, since
+                // the ids its delta frames reference cannot be rebuilt without the lost
+                // dictionary. The recoveredMaxSymbolId >= size guard means this never
+                // fires for a slot whose dictionary is intact, nor for an empty slot
+                // (recoveredMaxSymbolId == -1). Single-threaded; before the I/O loop.
+                this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
+                if (persistedDictInProgress != null
+                        && recoveredMaxSymbolId >= persistedDictInProgress.size()
+                        && recoveredMaxSymbolDeltaStart == 0L) {
+                    // Only a NON-EMPTY discarded dictionary can desynchronise the fold. The
+                    // first fold was keyed to this very size, so when it is 0 the re-fold
+                    // below recomputes the identical baseline-0 result -- a no-op. The guard
+                    // exists for the case below where discardedSize is genuinely > 0: the
+                    // re-fold there is a second O(payload bytes) walk -- with a
+                    // byte-at-a-time varint decode over full-dict frames, which carry the
+                    // whole dictionary -- so it is worth paying only when the mismatch it
+                    // resolves is real.
+                    int discardedSize = persistedDictInProgress.size();
+                    persistedDictInProgress.close();
+                    persistedDictInProgress = null;
+                    // Unlink it, do not merely stop using it. Closing alone left the
+                    // file on disk, and full-dict mode never creates or appends it
+                    // (persistNewSymbolsBeforePublish returns early on
+                    // !deltaDictEnabled), so the survivor was STICKY -- it outlived
+                    // this session unchanged and every later restart re-read it.
+                    //
+                    // That is a cross-generation trap. The discard's own guard
+                    // (recoveredMaxSymbolId >= size) is what protects a healthy slot,
+                    // and it stops firing as soon as an intervening session ingests
+                    // FEWER distinct symbols than the survivor holds. The next recovery
+                    // then keeps the stale dictionary, re-enables delta mode, and
+                    // seedGlobalDictionaryFromPersisted anchors the producer on the
+                    // PREVIOUS generation's strings for ids [0, size). Nothing detects
+                    // it: the fold's `deltaEnd <= runningCoverage` fast path declares
+                    // those frames already covered and never compares a string, so
+                    // coverage stays >= 0 and no gap is raised. On the wire the catch-up
+                    // registers the stale strings, the replayed full-dict frames then
+                    // redefine the same ids with the real ones, and every subsequent row
+                    // the producer writes against those ids lands under the wrong
+                    // symbol -- silently, with row counts intact.
+                    //
+                    // Safe to delete precisely here: this branch has already established
+                    // maxDeltaStart() == 0, so every surviving frame re-registers its
+                    // whole dictionary from id 0 and needs nothing from the file, and
+                    // this session runs full-dict so it will not write one that does.
+                    // Mirrors the AckWatermark.removeOrphan in the fresh-start branch
+                    // below, which clears its own stale artifact for the same reason.
+                    if (!PersistedSymbolDict.removeOrphan(dictFf, sfDir)) {
+                        LOG.error("sf slot {}: discarded the recovered symbol dictionary but could NOT "
+                                        + "remove the side-file; recovery continues in full-dictionary "
+                                        + "mode, but remove it by hand -- a later recovery whose frames "
+                                        + "reference fewer ids than it holds will seed symbols from it",
+                                sfDir);
+                    }
+                    // Re-fold at baseline 0. The analysis above was keyed to the
+                    // dictionary's size, and every consumer of it presents the baseline it
+                    // derived the same way -- seedGlobalDictionaryFromPersisted computes
+                    // baseline 0 once pd is gone, and checkedRecoveryAnalysis rejects a
+                    // baseline that disagrees with the fold. Discarding a dictionary that
+                    // held entries (size > 0) therefore desynchronised the two and threw
+                    // "recovery symbol baseline mismatch" out of build(). checkedRecoveryAnalysis
+                    // now raises that as an UnreplayableSlotException, so build() would at least
+                    // set the slot aside rather than rethrow forever -- but quarantining is
+                    // still the wrong outcome HERE, because this slot is fully recoverable
+                    // (its frames carry their whole dictionary inline). Re-folding avoids the
+                    // mismatch entirely instead of trading a permanent brick for a needless
+                    // quarantine plus a "resend the affected data" the operator does not owe.
+                    //
+                    // Reachable when self-sufficient frames sit next to a POPULATED
+                    // side-file. open() no longer degrades on a transient (it throws
+                    // SfOperationalException), so the organic route is a host-crash
+                    // tear that shortened the dictionary's CRC-valid prefix below the
+                    // ids the surviving full-dict frames reference; an operator
+                    // restoring a side-file by hand lands here too. Either way the
+                    // frames carry their whole dictionary inline, so discarding the
+                    // survivor and re-folding at baseline 0 recovers the slot exactly
+                    // as written.
+                    //
+                    // Re-folding rather than keeping the dictionary preserves the discard's
+                    // whole point -- the slot recovers in full-dict mode, exactly as it was
+                    // written, with producer, mirror and replay guard all anchored at 0.
+                    if (discardedSize > 0) {
+                        recoveredFrameAnalysisInProgress.close();
+                        recoveredFrameAnalysisInProgress = recovered.analyzeRecovery(0);
+                        recoveryFoldCount++;
+                        this.recoveredCommitBoundaryFsn = recoveredFrameAnalysisInProgress.commitBoundaryFsn();
+                        this.recoveredMaxSymbolId = recoveredFrameAnalysisInProgress.maxDeltaEnd() - 1L;
+                        this.recoveredMaxSymbolDeltaStart = recoveredFrameAnalysisInProgress.maxDeltaStart();
+                    }
                 }
             } else {
                 // Fresh start with no recovered segments. Any stale
@@ -440,6 +719,28 @@ public final class CursorSendEngine implements QuietCloseable {
                         throw new SfOperationalException(
                                 "could not open required ack watermark for SF slot " + sfDir);
                     }
+                    // A fresh slot MUST start with an EMPTY symbol dictionary.
+                    // Unlike the ack watermark above -- a discardable optimization a
+                    // max() clamp protects -- the dictionary is load-bearing: a
+                    // delta frame referencing an id missing from it is unrecoverable,
+                    // and a STALE dictionary inherited here (the segments are gone, so
+                    // the producer is NOT seeded from it) shifts the dense id->symbol
+                    // mapping and silently misattributes symbols on the next
+                    // reconnect. openClean() truncates any survivor to empty rather
+                    // than trusting a best-effort delete that may have failed (e.g. a
+                    // Windows share lock). If the file is simply ABSENT and creating it
+                    // fails, persistedSymbolDict stays null and the sender falls back to
+                    // full self-sufficient frames -- safe for this session, since there
+                    // is no prior generation's id space to lose. But if a dictionary
+                    // DOES survive here and cannot be truncated, that fallback is only
+                    // safe for THIS session: the next recovery would seed its catch-up
+                    // from the stale file and replay this generation's frames on top,
+                    // misattributing symbols with no detectable gap. So openClean()
+                    // refuses that case outright (throws UnreplayableSlotException)
+                    // instead of degrading to null; the catch (Throwable) below cleans
+                    // up and lets it propagate so Sender.build() can quarantine this
+                    // fresh, dataless slot instead of bricking every restart.
+                    persistedDictInProgress = PersistedSymbolDict.openClean(dictFf, sfDir);
                 }
                 MmapSegment initial;
                 String initialPath = null;
@@ -502,11 +803,23 @@ public final class CursorSendEngine implements QuietCloseable {
             if (ownsManager) {
                 manager.start();
             }
-            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos);
-            // All construction succeeded — commit the ring and
-            // watermark references.
+            // occupiedDiskBytes(), not appendedBytes(): the cap is a DISK budget,
+            // and ensureAppendMap reserves real blocks past the committed offset
+            // (rounded up to APPEND_MAP_CAPACITY) for as long as the slot is
+            // live. Gauging the logical offset under-counted every live slot by
+            // up to one window.
+            // The gauge outlives close() safely: it is a pair of wait-free
+            // volatile reads that take no lock and never touch the fd, so a
+            // manager tick racing engine shutdown observes the final values.
+            // It must not become synchronized -- see sideFileBytesLocked().
+            manager.register(ringInProgress, sfDir, watermarkInProgress, syncIntervalNanos,
+                    persistedDictInProgress == null ? null : persistedDictInProgress::occupiedDiskBytes);
+            // All construction succeeded -- commit the ring, watermark, and
+            // symbol-dictionary references.
             this.ring = ringInProgress;
             this.watermark = watermarkInProgress;
+            this.persistedSymbolDict = persistedDictInProgress;
+            this.recoveredFrameAnalysis = recoveredFrameAnalysisInProgress;
         } catch (Throwable t) {
             // Stop an owned manager before freeing the ring and watermark it may
             // touch, then release the slot lock. Each cleanup is in its own
@@ -529,6 +842,18 @@ public final class CursorSendEngine implements QuietCloseable {
             if (watermarkInProgress != null) {
                 try {
                     watermarkInProgress.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (persistedDictInProgress != null) {
+                try {
+                    persistedDictInProgress.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (recoveredFrameAnalysisInProgress != null) {
+                try {
+                    recoveredFrameAnalysisInProgress.close();
                 } catch (Throwable ignored) {
                 }
             }
@@ -659,7 +984,27 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @Override
-    public synchronized void close() {
+    public void close() {
+        close(true);
+    }
+
+    /**
+     * As {@link #close()}, but {@code reclaimLogicalSlotLock == false} skips the
+     * parent-anchored logical slot-lock unlink at fully-drained retirement.
+     * <p>
+     * A caller that HOLDS that lock must pass {@code false}. {@code Sender.build()}
+     * keeps it across engine construction and connect, and closes the engine from
+     * inside that scope when connect fails -- and a fresh slot is "fully drained" by
+     * definition ({@code publishedFsn() < 0}), so the default path would unlink the
+     * lock file while build() still holds the flock on it. On POSIX that frees the
+     * pathname without releasing the lock, so the next {@code acquireLogical} creates
+     * a SECOND inode and locks it successfully: two parties owning a lock whose only
+     * job is serialising the quarantine close-&gt;rename-&gt;recreate window.
+     */
+    public synchronized void close(boolean reclaimLogicalSlotLock) {
+        // Latch before the early return: a retried close() must not widen a
+        // previous caller's narrower reclaim decision.
+        this.reclaimLogicalSlotLock &= reclaimLogicalSlotLock;
         if (closed && closeCompleted) return;
         closed = true;
         // Capture drain state BEFORE closing the ring — once the ring is
@@ -905,6 +1250,18 @@ public final class CursorSendEngine implements QuietCloseable {
                 } catch (Throwable ignored) {
                 }
             }
+            if (persistedSymbolDict != null) {
+                try {
+                    persistedSymbolDict.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (recoveredFrameAnalysis != null) {
+                try {
+                    recoveredFrameAnalysis.close();
+                } catch (Throwable ignored) {
+                }
+            }
             if (fullyDrained && watermark != null) {
                 boolean segmentsRemoved = false;
                 try {
@@ -927,6 +1284,26 @@ public final class CursorSendEngine implements QuietCloseable {
                             + "watermark so residual acknowledged segments stay covered -- the next "
                             + "engine on this slot recovers them as fully acked and retries the "
                             + "unlink on its own close", sfDir);
+                }
+                try {
+                    // Slot fully drained: the dictionary has no frames behind it.
+                    PersistedSymbolDict.removeOrphan(sfDir);
+                } catch (Throwable ignored) {
+                }
+                if (reclaimLogicalSlotLock) {
+                    try {
+                        // The logical slot lock lives OUTSIDE the slot dir (in the
+                        // shared .slot-locks dir) so it survives a slot rename; the
+                        // fully-drained retirement that removes this slot's other
+                        // side-files must remove it too, or .slot-locks accumulates a
+                        // dead lock+pid pair per distinct slot name for the lifetime of
+                        // sf_dir. Holding the directory-local lock is NOT sufficient to
+                        // make this safe -- it says nothing about the LOGICAL lock, which
+                        // a caller higher in the same stack may hold. Only a caller that
+                        // knows it does not hold it may reclaim, hence the flag.
+                        SlotLock.removeOrphanLogical(sfDir);
+                    } catch (Throwable ignored) {
+                    }
                 }
             }
             if (durabilityFailure != null) {
@@ -1266,6 +1643,79 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Decodes the cached recovery suffix directly into the producer's global
+     * dictionary. Recovery always builds the analysis with the persisted
+     * prefix size as its baseline, so no intermediate cardinality-sized list is
+     * needed on the production path.
+     */
+    public long addRecoveredSymbolsTo(int baseline, GlobalSymbolDictionary target) {
+        if (recoveredFrameAnalysis == null) {
+            return baseline;
+        }
+        RecoveredFrameAnalysis analysis = checkedRecoveryAnalysis(baseline);
+        long coverage = analysis.coverage();
+        if (coverage >= 0L) {
+            analysis.addDecodedSymbolsTo(target);
+        }
+        return coverage;
+    }
+
+    long recoveredSymbolCoverage(int baseline) {
+        return checkedRecoveryAnalysis(baseline).coverage();
+    }
+
+    int recoveredSymbolSuffixCount(int baseline) {
+        return checkedRecoveryAnalysis(baseline).rawCount();
+    }
+
+    int recoveredSymbolSuffixLen(int baseline) {
+        return checkedRecoveryAnalysis(baseline).rawLen();
+    }
+
+    void copyRecoveredSymbolSuffix(int baseline, long target) {
+        RecoveredFrameAnalysis analysis = checkedRecoveryAnalysis(baseline);
+        int len = analysis.rawLen();
+        if (len > 0) {
+            io.questdb.client.std.Unsafe.getUnsafe().copyMemory(analysis.rawAddr(), target, len);
+        }
+    }
+
+    @TestOnly
+    public int recoveryFoldCount() {
+        return recoveryFoldCount;
+    }
+
+    @TestOnly
+    public long recoveryFramesVisited() {
+        return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.framesVisited();
+    }
+
+    @TestOnly
+    public long recoverySymbolEntriesVisited() {
+        return recoveredFrameAnalysis == null ? 0L : recoveredFrameAnalysis.symbolEntriesVisited();
+    }
+
+    @TestOnly
+    public int recoverySymbolNativeCapacity() {
+        return recoveredFrameAnalysis == null ? 0 : recoveredFrameAnalysis.rawCapacity();
+    }
+
+    private RecoveredFrameAnalysis checkedRecoveryAnalysis(int baseline) {
+        if (recoveredFrameAnalysis == null || recoveredFrameAnalysis.baseline() != baseline) {
+            // UnreplayableSlotException, NOT IllegalStateException: Sender.build() routes
+            // on the type, and only this type reaches its quarantine handler. A raw
+            // IllegalStateException escapes build() instead, and because senderId is
+            // stable and a not-fully-drained slot is retained on close, every restart
+            // re-recovers the same slot and rethrows -- the application can never
+            // construct a Sender, so it cannot even BUFFER new rows.
+            throw new UnreplayableSlotException("recovery symbol baseline mismatch [expected="
+                    + (recoveredFrameAnalysis == null ? "none" : recoveredFrameAnalysis.baseline())
+                    + ", actual=" + baseline + ']');
+        }
+        return recoveredFrameAnalysis;
+    }
+
+    /**
      * Pass-through to {@link SegmentRing#findSegmentContaining(long)}.
      */
     public MmapSegment findSegmentContaining(long fsn) {
@@ -1284,6 +1734,18 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * The engine's persisted symbol dictionary, or {@code null} in memory mode
+     * (and in disk mode when recovery proved the side-file absent or corrupt,
+     * or a fresh slot could not create one -- a TRANSIENT open failure never
+     * lands here: it throws {@link SfOperationalException} out of the
+     * constructor, so no engine exists). The producer appends new symbols
+     * to it; recovery / orphan-drain read its loaded entries to seed catch-up.
+     */
+    public PersistedSymbolDict getPersistedSymbolDict() {
+        return persistedSymbolDict;
+    }
+
+    /**
      * Number of times {@link #appendBlocking} hit
      * {@link SegmentRing#BACKPRESSURE_NO_SPARE} on its first attempt and
      * had to wait for the segment manager (or for ACKs) to free space.
@@ -1291,6 +1753,18 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public long getTotalBackpressureStalls() {
         return backpressureStallCount.get();
+    }
+
+    /**
+     * Whether the sender may delta-encode symbol dictionaries on this engine.
+     * Always true in memory mode (the send loop keeps an in-process catch-up
+     * mirror). In disk mode it requires the persisted dictionary to have opened,
+     * since delta frames are not self-sufficient and recovery / orphan-drain must
+     * be able to rebuild the dictionary from disk. When false in disk mode the
+     * sender falls back to full self-sufficient frames.
+     */
+    public boolean isDeltaDictEnabled() {
+        return sfDir == null || persistedSymbolDict != null;
     }
 
     /**
@@ -1366,12 +1840,62 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     /**
+     * Highest symbol id any recovered delta frame references, or {@code -1} for
+     * fresh/memory rings (and recovered rings with no symbol-bearing frame). A
+     * resuming producer compares this against its recovered dictionary size to
+     * detect a host-crash tear of the persisted {@code .symbol-dict}.
+     */
+    public long recoveredMaxSymbolId() {
+        return recoveredMaxSymbolId;
+    }
+
+    /**
+     * Highest {@code deltaStart} across the recovered committed frames; {@code 0} when every
+     * surviving frame is self-sufficient (or none carries a dictionary at all).
+     * <p>
+     * The send loop uses this to decide whether it needs a catch-up: at zero, every frame
+     * re-registers its dictionary from id 0 as it replays, so seeding the mirror -- and
+     * shipping a catch-up frame off it -- would be pure redundancy. Above zero, at least one
+     * frame's delta starts above ids it does not itself carry, so the mirror must hold those
+     * ids before the replay begins, or the server rejects the frame with
+     * STATUS_DICTIONARY_GAP.
+     */
+    public long recoveredMaxSymbolDeltaStart() {
+        return recoveredMaxSymbolDeltaStart;
+    }
+
+    /**
      * FSN of the last frame of a recovered orphaned deferred tail, or
      * {@code -1} when none. See {@link #recoveredCommitBoundaryFsn()}: the
      * orphan range is {@code [recoveredCommitBoundaryFsn() + 1 .. this]}.
      */
     public long recoveredOrphanTipFsn() {
         return recoveredOrphanTipFsn;
+    }
+
+    /**
+     * Retires a recovered deferred tail once every frame below it is ACKed.
+     * The operation is local and idempotent: no wire sequence ever referred
+     * to these aborted-transaction frames.
+     *
+     * @return true if no orphan tail remains, false if lower frames still need
+     *         server ACKs
+     */
+    public boolean retireRecoveredOrphanTailIfReady() {
+        long orphanTip = recoveredOrphanTipFsn;
+        if (orphanTip < 0L) {
+            return true;
+        }
+        long orphanStart = recoveredCommitBoundaryFsn + 1L;
+        if (ackedFsn() < orphanStart - 1L) {
+            return false;
+        }
+        LOG.warn("retiring orphaned deferred tail: {} frame(s) [fsn {}..{}] belong to a transaction "
+                        + "whose commit was never published; aborting them (never transmitted, slots trimmed)",
+                orphanTip - orphanStart + 1L, orphanStart, orphanTip);
+        acknowledge(orphanTip);
+        recoveredOrphanTipFsn = -1L;
+        return true;
     }
 
     /**

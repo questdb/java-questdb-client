@@ -223,6 +223,53 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     @Test
+    public void testCatchUpCapGapMinEscalationWindowBuilderNegativeRejected() {
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis must be >= 0: -1",
+                () -> Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .catchUpCapGapMinEscalationWindowMillis(-1));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowBuilderNotSupportedForTcp() {
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.TCP)
+                        .address(LOCALHOST)
+                        .catchUpCapGapMinEscalationWindowMillis(300_000));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowConfigStringNegativeRejected() {
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis must be >= 0: -1",
+                () -> Sender.builder("ws::addr=localhost:9000;"
+                        + "catch_up_cap_gap_min_escalation_window_millis=-1;"));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowConfigStringNotSupportedForTcp() {
+        assertThrows("catch_up_cap_gap_min_escalation_window_millis is only supported for WebSocket transport",
+                () -> Sender.builder("tcp::addr=localhost:9009;"
+                        + "catch_up_cap_gap_min_escalation_window_millis=300000;"));
+    }
+
+    @Test
+    public void testCatchUpCapGapMinEscalationWindowUnsetInSnapshot() {
+        // wsConfigSnapshotForTest puts the raw field, not the resolved default (see
+        // WsSenderConfigHonoredTest#testSnapshotReportsTheRawUnsetSentinel), so an
+        // unset key stays -1 regardless of construction path; the resolved default
+        // (5 minutes) lives in CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS.
+        Assert.assertEquals(-1L,
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address(LOCALHOST)
+                        .wsConfigSnapshotForTest()
+                        .get("catch_up_cap_gap_min_escalation_window_millis"));
+        Assert.assertEquals(-1L,
+                Sender.builder("ws::addr=localhost:9000;")
+                        .wsConfigSnapshotForTest()
+                        .get("catch_up_cap_gap_min_escalation_window_millis"));
+    }
+
+    @Test
     public void testConnectionRefused() throws Exception {
         assertMemoryLeak(() -> {
             int port = findUnusedPort();
@@ -1027,6 +1074,26 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
         // plain ws string validateWsConfig rejects them.
         assertBadConfig("ws::addr=localhost:9000;tls_verify=on;", "require the wss:: schema");
         assertBadConfig("ws::addr=localhost:9000;tls_roots=/ca.p12;", "require the wss:: schema");
+    }
+
+    @Test
+    public void testWssConfigString_tlsRootsPasswordWithoutRoots_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots_password=secret;",
+                "tls_roots_password requires tls_roots"
+        );
+    }
+
+    @Test
+    public void testWssConfigString_tlsRootsWithUnsafeOff_fails() {
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_roots=/ca.pem;tls_verify=unsafe_off;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
+        assertBadConfig(
+                "wss::addr=localhost:9000;tls_verify=unsafe_off;tls_roots=/ca.p12;tls_roots_password=secret;",
+                "tls_roots cannot be combined with tls_verify=unsafe_off"
+        );
     }
 
     @Test

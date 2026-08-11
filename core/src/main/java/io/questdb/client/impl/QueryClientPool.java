@@ -97,12 +97,11 @@ public final class QueryClientPool implements AutoCloseable {
     // DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS. Volatile because QuestDBImpl sets it
     // once at build time on a different thread than the borrowers that read it.
     private volatile long closeQueryTimeoutMillis = DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS;
-    // Atomic test witness for the bounded creation-wait loop. The sign bit
-    // means active; the remaining bits count handled InterruptedExceptions.
-    // Condition.hasWaiters() cannot serve this purpose because an interrupt
-    // transiently transfers the closer out of the condition queue. Volatile
-    // lets white-box tests observe active/count as one coherent snapshot.
-    private volatile long creationWaitState;
+    // Test seam invoked after close() handles an interrupt and confirms the
+    // original creation-wait deadline still permits another wait. Null in
+    // production; lifecycle tests use it to acknowledge distinct retries
+    // without inspecting transient Condition queue membership.
+    private volatile Runnable creationWaitRetryHook;
     private int inFlightCreations;
 
     public QueryClientPool(
@@ -345,21 +344,21 @@ public final class QueryClientPool implements AutoCloseable {
             final long creationWaitDeadlineNanos = System.nanoTime() + creationWaitNanos;
             long creationRemainingNanos = creationWaitNanos;
             boolean creationWaitInterrupted = false;
-            creationWaitState = inFlightCreations > 0 && creationRemainingNanos > 0
-                    ? Long.MIN_VALUE
-                    : 0;
-            try {
-                while (inFlightCreations > 0 && creationRemainingNanos > 0) {
-                    try {
-                        creationFinished.awaitNanos(creationRemainingNanos);
-                    } catch (InterruptedException e) {
-                        creationWaitInterrupted = true;
-                        creationWaitState++;
-                    }
-                    creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+            while (inFlightCreations > 0 && creationRemainingNanos > 0) {
+                boolean isRetryingAfterInterrupt = false;
+                try {
+                    creationFinished.awaitNanos(creationRemainingNanos);
+                } catch (InterruptedException e) {
+                    creationWaitInterrupted = true;
+                    isRetryingAfterInterrupt = true;
                 }
-            } finally {
-                creationWaitState &= Long.MAX_VALUE;
+                creationRemainingNanos = creationWaitDeadlineNanos - System.nanoTime();
+                if (isRetryingAfterInterrupt && inFlightCreations > 0 && creationRemainingNanos > 0) {
+                    Runnable hook = creationWaitRetryHook;
+                    if (hook != null) {
+                        hook.run();
+                    }
+                }
             }
             if (creationWaitInterrupted) {
                 Thread.currentThread().interrupt();
@@ -542,16 +541,11 @@ public final class QueryClientPool implements AutoCloseable {
         }
     }
 
-    /**
-     * Returns whether {@link #close()} is inside its bounded wait for
-     * in-flight creations. This remains true while an interrupt transfers the
-     * closer out of the condition queue and it re-enters with the same deadline.
-     */
     @TestOnly
     public boolean hasCreationWaiterForTesting() {
         lock.lock();
         try {
-            return creationWaitState < 0;
+            return lock.hasWaiters(creationFinished);
         } finally {
             lock.unlock();
         }
@@ -574,6 +568,11 @@ public final class QueryClientPool implements AutoCloseable {
     @TestOnly
     public boolean isClosedForTesting() {
         return closed;
+    }
+
+    @TestOnly
+    public void setCreationWaitRetryHookForTesting(Runnable hook) {
+        this.creationWaitRetryHook = hook;
     }
 
     private QueryWorker createUnlocked() {

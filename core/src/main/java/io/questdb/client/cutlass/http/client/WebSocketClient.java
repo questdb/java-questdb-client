@@ -470,10 +470,46 @@ public abstract class WebSocketClient implements QuietCloseable {
     }
 
     /**
+     * Sends two native-memory slices as one WebSocket binary frame. The slices
+     * are copied directly into the WebSocket send buffer and masked there, so a
+     * caller assembling a small protocol prefix around a large immutable body
+     * does not need a second contiguous staging buffer.
+     *
+     * @param firstPtr     pointer to the first payload slice
+     * @param firstLength  first payload-slice length
+     * @param secondPtr    pointer to the second payload slice
+     * @param secondLength second payload-slice length
+     * @param timeout      timeout in milliseconds
+     */
+    public void sendBinary(
+            long firstPtr,
+            int firstLength,
+            long secondPtr,
+            int secondLength,
+            int timeout
+    ) {
+        checkConnected();
+        sendBuffer.reset();
+        sendBuffer.beginFrame();
+        sendBuffer.putBlockOfBytes(firstPtr, firstLength);
+        sendBuffer.putBlockOfBytes(secondPtr, secondLength);
+        WebSocketSendBuffer.FrameInfo frame = sendBuffer.endBinaryFrame();
+        doSend(sendBuffer.getBufferPtr() + frame.offset, frame.length, timeout);
+        sendBuffer.reset();
+    }
+
+    /**
      * Sends binary data with default timeout.
      */
     public void sendBinary(long dataPtr, int length) {
         sendBinary(dataPtr, length, defaultTimeout);
+    }
+
+    /**
+     * Sends two native-memory slices as one binary frame with the default timeout.
+     */
+    public void sendBinary(long firstPtr, int firstLength, long secondPtr, int secondLength) {
+        sendBinary(firstPtr, firstLength, secondPtr, secondLength, defaultTimeout);
     }
 
     /**

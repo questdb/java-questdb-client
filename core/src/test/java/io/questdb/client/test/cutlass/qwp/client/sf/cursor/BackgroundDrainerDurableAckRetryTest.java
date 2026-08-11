@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.network.PlainSocketFactory;
@@ -241,13 +242,15 @@ public class BackgroundDrainerDurableAckRetryTest {
             CountingListener listener = new CountingListener();
             // A genuinely non-retriable upgrade error (non-421 5xx upgrade reject) is
             // terminal -- waiting will not fix it -- so the drainer quarantines on the
-            // first attempt, exactly like the live sender's background loop halts on
-            // auth/upgrade. A TRANSPORT error, by contrast, is transient and is
+            // first attempt under the orphan reconnect policy. A TRANSPORT error,
+            // by contrast, is transient and is
             // retried (see testTransportErrorNeverQuarantinesInvariantB).
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(
                     () -> new WebSocketUpgradeException(500, null, "server error during upgrade"));
             BackgroundDrainer drainer = newDrainer(factory);
             drainer.setListener(listener);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
             WebSocketClient out = drainer.connectWithDurableAckRetry();
             assertNull(out);
             assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
@@ -259,6 +262,15 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertTrue(Files.exists(sentinel));
             // The factory must have been invoked exactly once — no retry on a terminal.
             assertEquals(1, factory.attempts());
+            // The error sink must learn about the abandonment too, tagged with
+            // the same "auth/upgrade: " reason prefix the sentinel carries.
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            SenderError err = captured.get(0);
+            assertEquals(SenderError.Category.DATA_LOSS, err.getCategory());
+            assertEquals(SenderError.Policy.ABANDONED, err.getAppliedPolicy());
+            assertEquals(slotPath, err.getQuarantinedPath());
+            assertTrue("reason must carry the site prefix [msg=" + err.getServerMessage() + ']',
+                    err.getServerMessage() != null && err.getServerMessage().startsWith("auth/upgrade: "));
         });
     }
 
@@ -709,13 +721,37 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test
-    public void testTransportErrorDoesNotResetCapabilityGapEpisode() throws Exception {
+    public void testSaturatingCapabilityGapBudgetDoesNotQuarantineOnTheFirstSweep() throws Exception {
         assertMemoryLeak(() -> {
-            // A transport blip between gap attempts does not prove promotion
-            // churn: it must neither consume the budget (no increment) nor
-            // restart it (no reset) -- otherwise a flaky-but-misconfigured
-            // cluster would evade the cap forever. 15 gaps, one transport error,
-            // one gap: escalates on that 16th gap attempt.
+            // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE
+            // is the natural way to ask for "never give up". A raw millis * 1_000_000L
+            // wraps that NEGATIVE, and because the escalation gate is an OR against the
+            // attempt cap, capabilityGapElapsedNanos (0 on the first sweep) already
+            // clears a negative budget -- so the slot quarantines on sweep ONE, skipping
+            // the whole 16-sweep settle budget. Asking for more tolerance bought none.
+            //
+            // The CursorWebSocketSendLoop twin of this conversion is pinned by
+            // CursorWebSocketSendLoopZeroBackoffTest; this site had no test, despite the
+            // commit that fixed it citing that one as prior art.
+            int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(
+                    () -> new QwpDurableAckMismatchException("h", 1234, "primary"));
+            BackgroundDrainer drainer = newDrainerWithBudgets(factory, Long.MAX_VALUE, 1L, 4L);
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("a saturated budget must leave the attempt cap as the only gate, "
+                            + "so the full settle budget is spent before quarantine",
+                    cap, factory.attempts());
+        });
+    }
+
+    @Test
+    public void testTransportErrorResetsCapabilityGapEpisode() throws Exception {
+        assertMemoryLeak(() -> {
+            // A transport state breaks a consecutive capability-gap episode.
+            // After 15 gaps and one transport error, the drainer must observe a
+            // fresh run of 16 gaps before quarantining the slot.
             int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
             CountingListener listener = new CountingListener();
             AtomicInteger sweeps = new AtomicInteger();
@@ -732,30 +768,24 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertNull(out);
             assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
             assertEquals(1, listener.persistentFailures.get());
-            assertEquals("transport blip must not restart the episode",
+            assertEquals("the fresh episode must exhaust its own full attempt budget",
                     cap, listener.lastPersistentTotalAttempts.get());
-            // 15 gap + 1 transport + 1 gap = 17 sweeps total.
-            assertEquals(cap + 1, factory.attempts());
+            // 15 gaps + 1 transport + a fresh 16-gap episode.
+            assertEquals(2 * cap, factory.attempts());
+            assertEquals(2 * (cap - 1), listener.unavailableAttempts.size());
+            assertEquals("attempt numbering must restart after transport",
+                    1, (int) listener.unavailableAttempts.get(cap - 1));
             assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
         });
     }
 
     @Test
-    public void testTransportWindowDoesNotBurnCapabilityGapWallClock() throws Exception {
+    public void testTransportWindowResetsCapabilityGapWallClock() throws Exception {
         assertMemoryLeak(() -> {
-            // Red-first: the wall-clock half of the settle budget is anchored at
-            // gap #1, and a transport window BETWEEN gap sweeps must PAUSE it --
-            // only gap-to-gap time is the cluster "failing to settle". Under the
-            // bug the deadline keeps ticking while the cluster is unreachable:
-            // gap #1 anchors the deadline, the cluster then drops off the network
-            // for longer than the entire budget (transport errors are retried
-            // "forever" and charge nothing else), and when it comes back still
-            // briefly gapped, gap #2 observes an expired deadline and quarantines
-            // the slot after just 2 gap sweeps -- contradicting both the
-            // 16-attempt settle intent and Invariant B's "transients never
-            // consume the budget". Evasion is not a concern: the attempt counter
-            // survives the window untouched, which
-            // testTransportErrorDoesNotResetCapabilityGapEpisode pins.
+            // The wall-clock half of the settle budget is anchored at gap #1.
+            // A transport window breaks that episode completely, so the next gap
+            // receives a fresh clock rather than inheriting time accumulated before
+            // or during the unrelated outage.
             // Here the cluster actually settles after the outage (two more gap
             // sweeps, then durable-ack-capable), so the drain must proceed --
             // no escalation, no sentinel.
