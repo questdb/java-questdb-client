@@ -102,10 +102,12 @@ public class SenderErrorDispatcherTest {
         // and admit the new one. The latest entry is always the most
         // informative, so the FIFO head loses, not the new arrival.
         CountDownLatch unblock = new CountDownLatch(1);
+        CountDownLatch handlerEntered = new CountDownLatch(1);
         List<SenderError> received = new ArrayList<>();
         Object lock = new Object();
         CountDownLatch allDelivered = new CountDownLatch(5);
         try (SenderErrorDispatcher d = new SenderErrorDispatcher(err -> {
+            handlerEntered.countDown();
             try {
                 unblock.await();
             } catch (InterruptedException ignored) {
@@ -116,13 +118,15 @@ public class SenderErrorDispatcherTest {
             }
             allDelivered.countDown();
         }, /*capacity=*/ 4)) {
-            // First offer starts the dispatcher and lands in the handler
-            // immediately (and blocks there). Now we can fill the bounded
-            // inbox to capacity, then overflow.
+            // The first offer lazily starts the dispatcher thread, which
+            // takes the head into the handler and blocks there. Wait for
+            // that handoff: once the handler has entered, error 0 is out
+            // of the inbox, so the fill below starts from an empty queue.
+            // A fixed sleep here raced the lazy thread start on loaded CI
+            // agents and produced a third drop (expected 2, got 3).
             Assert.assertTrue(d.offer(buildError(0)));
-            // Give the dispatcher a moment to take the head into the
-            // handler so subsequent offers don't get an extra slot.
-            TimeUnit.MILLISECONDS.sleep(50);
+            Assert.assertTrue("handler should take the head within 5s",
+                    handlerEntered.await(5, TimeUnit.SECONDS));
             for (int i = 1; i <= 4; i++) {
                 Assert.assertTrue("inbox should accept offer " + i,
                         d.offer(buildError(i)));
