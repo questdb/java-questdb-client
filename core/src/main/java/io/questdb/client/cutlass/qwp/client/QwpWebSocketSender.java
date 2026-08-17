@@ -141,9 +141,13 @@ public class QwpWebSocketSender implements Sender {
     // on by default so a long-lived sender's dictionary does not grow without
     // bound.
     public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
-    // Default for symbol_dict_reset_max_wait_millis: upper bound, in millis, the
-    // recycle waits for an opportunistic (idle) window before forcing the
-    // rebuild. 0 means opportunistic-only -- never forced.
+    // Default for symbol_dict_reset_max_wait_millis: once a recycle has been
+    // armed longer than this window without an opportunistic (idle) drain,
+    // the next row-start call (table()) blocks the calling thread for up to
+    // this many millis waiting for the backlog to drain, then recycles; on
+    // timeout that call gives up (still armed, retried opportunistically
+    // later) instead of blocking further. 0 disables blocking entirely --
+    // opportunistic-only.
     public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 30_000L;
     // Default for symbol_dict_reset_threshold: distinct-symbol count that
     // triggers a recycle once symbol_dict_reset is on.
@@ -406,9 +410,13 @@ public class QwpWebSocketSender implements Sender {
     // registered, bounding unbounded dictionary growth on a long-lived sender
     // (connect-string key symbol_dict_reset).
     private boolean resetEnabled = DEFAULT_SYMBOL_DICT_RESET_ENABLED;
-    // Upper bound, in millis, the recycle waits for an opportunistic (idle)
-    // window before forcing the rebuild; 0 means opportunistic-only, never
-    // forced (connect-string key symbol_dict_reset_max_wait_millis).
+    // Once a recycle has been armed longer than this window without an
+    // opportunistic (idle) drain, the next row-start call (table()) blocks
+    // the calling thread for up to this many millis waiting for the backlog
+    // to drain, then recycles; on timeout that call gives up (still armed,
+    // retried opportunistically later) instead of blocking further. 0
+    // disables blocking entirely -- opportunistic-only (connect-string key
+    // symbol_dict_reset_max_wait_millis).
     private long resetMaxWaitMillis = DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
     // Distinct-symbol count that triggers a recycle once resetEnabled is on
     // (connect-string key symbol_dict_reset_threshold).
@@ -4616,7 +4624,7 @@ public class QwpWebSocketSender implements Sender {
             if (System.nanoTime() >= deadlineNanos) {
                 symbolDictResetStarvationTimeouts++;
                 LOG.warn("symbol dictionary reset starved: backlog not drained within {} ms; "
-                        + "re-arming opportunistically", resetMaxWaitMillis);
+                        + "staying armed", resetMaxWaitMillis);
                 return;
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);

@@ -1924,10 +1924,19 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
-         * Upper bound, in milliseconds, a triggered symbol-dictionary recycle waits
-         * for an opportunistic (idle) window before forcing the rebuild. {@code 0}
-         * means opportunistic-only: the recycle never forces, it only takes idle
-         * windows as they occur.
+         * Upper bound, in milliseconds, on how long a triggered symbol-dictionary
+         * recycle stays armed before it may block the calling thread to force
+         * progress. Once a recycle has been armed for longer than this window
+         * without an opportunistic (idle) drain, the NEXT row-start call
+         * ({@code table(...)}) blocks the calling thread for up to this many
+         * millis waiting for the outstanding backlog to drain, then recycles
+         * before returning. If the backlog still has not drained by the
+         * deadline, that call gives up (logging a warning) and returns without
+         * blocking further -- the recycle stays armed and is retried
+         * opportunistically on a later {@code table(...)} call that happens to
+         * find the backlog already drained. {@code 0} disables blocking
+         * entirely (opportunistic-only): the recycle then only ever runs when a
+         * {@code table(...)} call finds the backlog already drained on its own.
          * <p>
          * Default {@code 30_000} (30 s). WebSocket transport only.
          */

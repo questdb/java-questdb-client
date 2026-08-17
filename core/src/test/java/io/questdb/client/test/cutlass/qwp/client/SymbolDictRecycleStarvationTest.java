@@ -130,7 +130,11 @@ public class SymbolDictRecycleStarvationTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 int port = server.getPort();
-                long maxWaitMillis = 400;
+                // Generous relative to releaseDelayMs below: the recycle itself
+                // (I/O loop join, engine close, rebuild, fresh handshake) needs
+                // headroom on top of the release delay, or the elapsedMs<maxWaitMillis
+                // assertion below is flake-prone on a loaded machine.
+                long maxWaitMillis = 700;
                 String cfg = "ws::addr=localhost:" + port
                         + ";symbol_dict_reset_threshold=2"
                         + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis + ";";
@@ -164,10 +168,16 @@ public class SymbolDictRecycleStarvationTest {
                     });
                     releaser.start();
 
-                    long t0 = System.nanoTime();
-                    sender.table("t"); // blocks, then recycles once the ack lands
-                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-                    releaser.join();
+                    long elapsedMs;
+                    try {
+                        long t0 = System.nanoTime();
+                        sender.table("t"); // blocks, then recycles once the ack lands
+                        elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    } finally {
+                        // Join even if table() throws unexpectedly, so an assertion
+                        // failure below never leaks a non-daemon thread.
+                        releaser.join();
+                    }
 
                     Assert.assertTrue("must have actually blocked for roughly the release delay "
                                     + "(" + releaseDelayMs + "ms), got " + elapsedMs + "ms",
@@ -238,12 +248,15 @@ public class SymbolDictRecycleStarvationTest {
                     Assert.assertEquals("no recycle happened -- only the wait gave up",
                             0L, ws.getSymbolDictEpochForTest());
 
-                    // Ingest continues: more rows can still be appended and flushed
-                    // without the sender getting stuck.
-                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
-
-                    // At most one blocking wait per armed window: this table() call
-                    // must NOT re-block even though the backlog is still undrained.
+                    // At most one blocking wait per armed window: pendingRowCount is
+                    // still 0 here (nothing added since the flush above) and the ring
+                    // is still undrained, so this table() call reaches
+                    // maybeBlockForStarvedReset() again -- but starvationWaitDoneThisArm
+                    // is already set from the call above, so it must NOT re-block. (A
+                    // probe placed after a pending row would short-circuit on the
+                    // pendingRowCount!=0 guard in maybeRecycleForDictReset() before ever
+                    // reaching the wait, making the "must not re-block" assertion true
+                    // for the wrong reason.)
                     long t1 = System.nanoTime();
                     sender.table("t");
                     long secondElapsedMs = (System.nanoTime() - t1) / 1_000_000;
@@ -252,6 +265,10 @@ public class SymbolDictRecycleStarvationTest {
                             secondElapsedMs < 100);
                     Assert.assertEquals("still just the one timeout from before",
                             1L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+
+                    // Ingest continues: more rows can still be appended and flushed
+                    // without the sender getting stuck.
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
 
                     // Now let the backlog actually drain: the still-armed recycle
                     // must fire opportunistically on the next table() call, with no
@@ -327,15 +344,21 @@ public class SymbolDictRecycleStarvationTest {
                     });
                     poisoner.start();
 
-                    long t0 = System.nanoTime();
                     LineSenderException thrown = null;
+                    long elapsedMs;
                     try {
-                        sender.table("t");
-                    } catch (LineSenderException e) {
-                        thrown = e;
+                        long t0 = System.nanoTime();
+                        try {
+                            sender.table("t");
+                        } catch (LineSenderException e) {
+                            thrown = e;
+                        }
+                        elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    } finally {
+                        // Join even if something unexpected escapes above, so an
+                        // assertion failure never leaks a non-daemon thread.
+                        poisoner.join();
                     }
-                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-                    poisoner.join();
 
                     Assert.assertNotNull("a terminal error latched during the wait must propagate "
                                     + "out of table(), not be swallowed into an indefinite hang",
