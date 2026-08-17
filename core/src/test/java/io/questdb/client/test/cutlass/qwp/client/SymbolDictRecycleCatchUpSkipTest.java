@@ -70,10 +70,10 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * <p>
  * No production change is expected to make these pass. A failure here means
  * either the fresh-mirror seeding regressed (a post-recycle connection
- * started paying for catch-up again) or {@code
- * resetSymbolDictStateForNewConnection()} grew a second job (folding the
- * recycle's own state reset into itself and clobbering {@code
- * sentMaxSymbolId} on an ordinary reconnect).
+ * started paying for catch-up again) or the recycle's {@code
+ * sentMaxSymbolId} reset ({@code recycleForDictReset()}'s step 5) leaked
+ * onto the ordinary reconnect path, which today never touches that
+ * baseline.
  */
 public class SymbolDictRecycleCatchUpSkipTest {
 
@@ -166,12 +166,15 @@ public class SymbolDictRecycleCatchUpSkipTest {
                             Arrays.asList("c", "d"), handler.dictFor(3));
 
                     // --- Pin 4: the plain reconnect preserved sentMaxSymbolId. A NEW
-                    // symbol registered after it must ship with a delta start ABOVE 0 --
-                    // resetSymbolDictStateForNewConnection only clears currentBatchMaxSymbolId,
-                    // so the producer's baseline (c, d already at ids 0, 1) survives the
-                    // wire boundary and e resumes at id 2. A regression that folded the
-                    // recycle's sentMaxSymbolId reset into this general reconnect path
-                    // would instead re-ship the whole dictionary from deltaStart 0.
+                    // symbol registered after it must ship with a delta start ABOVE 0.
+                    // Nothing on this I/O-thread reconnect path touches sentMaxSymbolId
+                    // (resetSymbolDictStateForNewConnection runs only on the foreground
+                    // initial-connect path, guarded by the connected flag, and never
+                    // fires here), so the producer's baseline (c, d already at ids 0, 1)
+                    // survives the wire boundary and e resumes at id 2. Only
+                    // recycleForDictReset()'s step 5 ever zeroes that baseline; a
+                    // regression that folded the reset into a path this reconnect DOES
+                    // run would re-ship the whole dictionary from deltaStart 0.
                     sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();
                     long fsn3 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-reconnect row must still get acked",
