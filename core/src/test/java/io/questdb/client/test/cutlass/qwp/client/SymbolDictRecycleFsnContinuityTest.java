@@ -52,33 +52,54 @@ import java.util.concurrent.atomic.AtomicReference;
  * by translating {@code external = fsnEpochBase + raw} (negative sentinels
  * pass untranslated). The recycle machinery itself lands in a later task --
  * these tests exercise the translation seam ({@code rollFsnEpochBaseForTest})
- * directly, either on a single already-connected sender (for the sender-level
- * surfaces, which read the live {@code fsnEpochBase} field regardless of when
- * the I/O loop was built) or by rolling a fresh sender's base BEFORE its
- * first connect (for the loop-level surfaces -- the progress dispatcher and
- * {@link SenderError} spans -- whose {@code externalFsnBase} is frozen at
- * loop construction).
+ * directly.
+ * <p>
+ * Every test that rolls the base does so on a sender BEFORE its first connect
+ * (via {@link #createRolledSender}), never on an already-connected one:
+ * {@code rollFsnEpochBase}'s precondition forbids rolling while a live
+ * {@code CursorWebSocketSendLoop} is attached (its {@code externalFsnBase} is a
+ * construction-time snapshot, never updated on a live loop -- see that method's
+ * javadoc). Tests that need a realistic pre-roll FSN to roll by first drive a
+ * SEPARATE, ordinarily-connected sender against the same server to publish and
+ * ack a batch, close it, then hand that FSN to {@code createRolledSender} for a
+ * second, fresh sender/engine -- modelling the post-recycle engine that
+ * restarts its raw FSNs at 0.
  */
 public class SymbolDictRecycleFsnContinuityTest {
 
+    /**
+     * Rolls a FRESH sender/engine (never published-to raw watermark starts at -1), not
+     * the already-connected one that produced {@code fsn1}: {@code rollFsnEpochBase}'s
+     * precondition forbids rolling while a live loop is attached (see its javadoc), and
+     * -- independent of that -- an already-connected sender's engine keeps its raw
+     * watermark across the roll, which would make this test pass even with the
+     * translation deleted (raw {@code ackedFsn() == fsn1 >= fsn1} regardless of any
+     * epoch math). Only a genuinely fresh engine (raw {@code ackedFsn() == -1}) makes
+     * the pre-roll short-circuit the ONLY way {@code awaitAckedFsn(fsn1, 0)} can return
+     * true here.
+     */
     @Test
     public void testPreRollTargetAnswersTrueAfterRoll() throws Exception {
         try (TestWebSocketServer server = ackingServer()) {
-            try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender.table("t").longColumn("v", 1L).atNow();
-                long fsn1 = sender.flushAndGetSequence();
+            long fsn1;
+            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                sender1.table("t").longColumn("v", 1L).atNow();
+                fsn1 = sender1.flushAndGetSequence();
                 Assert.assertTrue("setup: the batch must actually be acked before the roll",
-                        sender.drain(5_000));
+                        sender1.drain(5_000));
+            }
 
-                sender.rollFsnEpochBaseForTest(fsn1);
-
+            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
+            try {
                 long t0 = System.nanoTime();
                 Assert.assertTrue("a target FSN from a pre-recycle epoch must be reported acked "
                                 + "immediately -- it was proven acked before the swap",
-                        sender.awaitAckedFsn(fsn1, 0));
+                        sender2.awaitAckedFsn(fsn1, 0));
                 long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
                 Assert.assertTrue("must short-circuit, not poll: took " + elapsedMs + "ms",
                         elapsedMs < 200);
+            } finally {
+                sender2.close();
             }
         }
     }
@@ -86,28 +107,33 @@ public class SymbolDictRecycleFsnContinuityTest {
     @Test
     public void testPostRollSequencesExceedAllPreRoll() throws Exception {
         try (TestWebSocketServer server = ackingServer()) {
-            try (QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender.table("t").longColumn("v", 1L).atNow();
-                long fsn1 = sender.flushAndGetSequence();
-                Assert.assertTrue(sender.drain(5_000));
+            long fsn1;
+            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                sender1.table("t").longColumn("v", 1L).atNow();
+                fsn1 = sender1.flushAndGetSequence();
+                Assert.assertTrue(sender1.drain(5_000));
+            }
 
-                sender.rollFsnEpochBaseForTest(fsn1);
-                long newBase = sender.getFsnEpochBaseForTest();
+            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
+            try {
+                long newBase = sender2.getFsnEpochBaseForTest();
                 Assert.assertEquals(fsn1 + 1, newBase);
 
-                sender.table("t").longColumn("v", 2L).atNow();
-                long fsn2 = sender.flushAndGetSequence();
-                Assert.assertTrue(sender.drain(5_000));
+                sender2.table("t").longColumn("v", 2L).atNow();
+                long fsn2 = sender2.flushAndGetSequence();
+                Assert.assertTrue(sender2.drain(5_000));
 
                 Assert.assertTrue("post-roll FSN must exceed every pre-roll FSN: fsn2=" + fsn2
                                 + " fsn1=" + fsn1,
                         fsn2 > fsn1);
-                // Raw FSNs increment by 1 per single-row flush, so the raw watermark right
-                // after this second flush is fsn1+1 (the same raw value the roll consumed
-                // plus one) -- fsn2 must be the epoch base plus that raw value, not just
-                // greater than fsn1 (a bug that dropped the translation entirely would still
-                // pass the ">" check above because the underlying raw engine never resets).
-                Assert.assertEquals(newBase + fsn1 + 1, fsn2);
+                // sender2's engine is genuinely fresh (raw publishedFsn() starts at -1), so
+                // its first-ever flush publishes raw 0. The exact-equality check is strictly
+                // stronger than ">" alone: it also catches an off-by-one in the roll formula
+                // (e.g. fsnEpochBase += lastPublishedFsn instead of + 1L), which the ">"
+                // check above would not.
+                Assert.assertEquals(newBase, fsn2);
+            } finally {
+                sender2.close();
             }
         }
     }
@@ -168,12 +194,12 @@ public class SymbolDictRecycleFsnContinuityTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg(server));
+            // Roll well past the raw FSNs this fresh engine will ever publish, so a
+            // missing translation in drain() would make its raw target look pre-roll.
+            // Must roll before the sender's first connect (see rollFsnEpochBase's
+            // precondition: cursorSendLoop must be null).
+            QwpWebSocketSender sender = createRolledSender(server, 999L);
             try {
-                // Roll well past the raw FSNs this fresh engine will ever publish, so a
-                // missing translation in drain() would make its raw target look pre-roll.
-                sender.rollFsnEpochBaseForTest(999L);
-
                 sender.table("foo").longColumn("v", 1L).atNow();
                 boolean drainedEarly = sender.drain(200);
                 Assert.assertFalse("drain() must not spuriously report the new frame acked just "
@@ -289,26 +315,31 @@ public class SymbolDictRecycleFsnContinuityTest {
 
     @Test
     public void testLatchedErrorStillThrowsForOldEpochTarget() throws Exception {
+        // Acks the first frame it ever receives (from sender1, producing fsn1), then
+        // terminal-NACKs everything after (sender2's frame, on its own fresh connection).
         AckFirstThenTerminalNackHandler handler = new AckFirstThenTerminalNackHandler();
         try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg(server));
+            long fsn1;
+            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                sender1.table("foo").longColumn("v", 1L).atNow();
+                fsn1 = sender1.flushAndGetSequence();
+                Assert.assertTrue(sender1.drain(5_000));
+            }
+
+            // Roll before sender2's first connect (rollFsnEpochBase's precondition), then
+            // force sender2's own loop to latch a terminal via the handler's NACK.
+            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
             try {
-                sender.table("foo").longColumn("v", 1L).atNow();
-                long fsn1 = sender.flushAndGetSequence();
-                Assert.assertTrue(sender.drain(5_000));
-
-                sender.rollFsnEpochBaseForTest(fsn1);
-
-                sender.table("foo").longColumn("v", 2L).atNow();
-                sender.flush();
-                waitFor(() -> sender.getLastTerminalError() != null, 5_000);
+                sender2.table("foo").longColumn("v", 2L).atNow();
+                sender2.flush();
+                waitFor(() -> sender2.getLastTerminalError() != null, 5_000);
 
                 LineSenderException thrown = null;
                 try {
-                    boolean acked = sender.awaitAckedFsn(fsn1, 0);
+                    boolean acked = sender2.awaitAckedFsn(fsn1, 0);
                     Assert.fail("awaitAckedFsn must throw on a latched terminal error, but "
                             + "returned " + acked);
                 } catch (LineSenderException e) {
@@ -319,7 +350,7 @@ public class SymbolDictRecycleFsnContinuityTest {
                         + "pre-roll short-circuit", thrown);
             } finally {
                 try {
-                    sender.close();
+                    sender2.close();
                 } catch (LineSenderException ignored) {
                 }
             }

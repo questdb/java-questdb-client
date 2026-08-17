@@ -2111,7 +2111,9 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Test-only entry point for {@link #rollFsnEpochBase}, the same private
      * roll the symbol-dict recycle swap calls in production once the engine
-     * rebuild has committed.
+     * rebuild has committed. See that method's precondition: {@code cursorSendLoop}
+     * must be {@code null} -- roll before the sender's first connect (e.g. via
+     * {@link #createForTesting}), never on an already-connected sender.
      */
     @TestOnly
     public void rollFsnEpochBaseForTest(long lastPublishedFsn) {
@@ -2125,8 +2127,23 @@ public class QwpWebSocketSender implements Sender {
      * nothing), so the next raw FSN the fresh engine hands out --
      * {@code 0} -- maps to external {@code lastPublishedFsn + 1 + 0}, one
      * past the last external FSN this sender ever reported.
+     * <p>
+     * <b>Precondition: {@code cursorSendLoop} must be {@code null}.</b> A live loop's
+     * {@code externalFsnBase} is a construction-time snapshot -- it is never updated
+     * on an already-built loop -- so rolling while one is attached would silently
+     * desynchronize the two: {@link #getAckedFsn()} / {@link #flushAndGetSequence()}
+     * would report post-roll values while every {@code SenderProgressHandler} advance
+     * and {@link SenderError} span the loop emits would stay pinned at pre-roll
+     * values. The recycle swap must call this strictly between tearing the old loop
+     * down and constructing the new one.
      */
     private void rollFsnEpochBase(long lastPublishedFsn) {
+        if (cursorSendLoop != null) {
+            throw new IllegalStateException("rollFsnEpochBase must run while cursorSendLoop"
+                    + " is null -- the loop's externalFsnBase is a construction-time snapshot,"
+                    + " never updated on a live loop; roll strictly between tearing the old"
+                    + " loop down and building the new one");
+        }
         fsnEpochBase += lastPublishedFsn + 1L;
     }
 
