@@ -262,6 +262,12 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // by the server -- holding stale watermarks across the wire boundary
     // would falsely advance trim before re-confirmation.
     private final CharSequenceLongHashMap durableTableWatermarks = new CharSequenceLongHashMap();
+    // Per-table dir name tracking for incarnation change detection.
+    // Updated from STATUS_DURABLE_ACK frame entries alongside the watermark.
+    // When the dir name for a table changes (drop/recreate), the watermark
+    // is reset for that table since the new incarnation starts from a low
+    // seqTxn that must not be covered by the old incarnation's high watermark.
+    private final java.util.HashMap<String, String> durableTableDirNames = new java.util.HashMap<>();
     // Pre-converted to nanos. Consulted only by the orphan terminal policy. Zero disables
     // the dwell entirely (count-only escalation at MAX_CATCHUP_CAP_GAP_ATTEMPTS); the
     // user-facing 5-minute default is applied at the config layer.
@@ -1630,7 +1636,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         int n = response.getTableEntryCount();
         for (int i = 0; i < n; i++) {
             String name = response.getTableName(i);
+            String dirName = response.getTableDirName(i);
             long seqTxn = response.getTableSeqTxn(i);
+            // Incarnation change detection: when the table's dir name differs
+            // from what we last saw on this connection, the table was dropped
+            // and re-created under the same name. The old incarnation's high
+            // watermark must not cover the new incarnation's low seqTxns, so
+            // reset this table's watermark before applying the new value.
+            String lastDirName = durableTableDirNames.get(name);
+            if (lastDirName != null && !lastDirName.equals(dirName)) {
+                durableTableWatermarks.put(name, -1L);
+            }
+            durableTableDirNames.put(name, dirName);
             long current = durableTableWatermarks.get(name);
             if (seqTxn > current) {
                 durableTableWatermarks.put(name, seqTxn);
@@ -1663,6 +1680,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             releasePendingEntry(pendingDurable.pollFirst());
         }
         durableTableWatermarks.clear();
+        durableTableDirNames.clear();
         // Reset the keepalive throttle so the new connection can prod the
         // server immediately rather than waiting out the leftover interval
         // from before the reconnect.
