@@ -316,6 +316,17 @@ public class QwpWebSocketSender implements Sender {
     private SenderErrorHandler errorHandler = DefaultSenderErrorHandler.INSTANCE;
     private int errorInboxCapacity = SenderErrorDispatcher.DEFAULT_CAPACITY;
     private long firstPendingRowTimeNanos;
+    // Additive offset applied to every user-visible FSN this sender reports
+    // (flushAndGetSequence, awaitAckedFsn's target, getAckedFsn, drain's
+    // watermark, and every FSN the I/O loop surfaces through the progress
+    // and error dispatchers). Stays 0 until a later symbol-dict recycle
+    // rebuilds the cursor engine and restarts its internal FSNs at 0 --
+    // rollFsnEpochBaseForTest (and its production counterpart in the
+    // recycle path) advance it past every FSN already handed out, so the
+    // external sequence stays strictly monotone across the internal reset.
+    // Rule everywhere it is applied: external = fsnEpochBase + raw: raw
+    // -1 (no-data) sentinels are never translated.
+    private long fsnEpochBase = 0;
     private boolean hasDeferredMessages;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
@@ -1015,6 +1026,14 @@ public class QwpWebSocketSender implements Sender {
             cursorSendLoop.checkError();
         }
         checkConnectionError();
+        if (targetFsn >= 0) {
+            long internalTarget = targetFsn - fsnEpochBase;
+            if (internalTarget < 0) {
+                // target belongs to a pre-recycle epoch: proven acked before the swap
+                return true;
+            }
+            targetFsn = internalTarget;
+        }
         if (cursorEngine.ackedFsn() >= targetFsn) {
             return true;
         }
@@ -1722,7 +1741,7 @@ public class QwpWebSocketSender implements Sender {
         checkConnectionError();
 
         long afterFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
-        return afterFsn > beforeFsn ? afterFsn : -1L;
+        return afterFsn > beforeFsn ? fsnEpochBase + afterFsn : -1L;
     }
 
     /**
@@ -1752,7 +1771,8 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public boolean drain(long timeoutMillis) {
         flush();
-        long targetFsn = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        long targetRaw = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
+        long targetFsn = targetRaw < 0 ? targetRaw : fsnEpochBase + targetRaw;
         return awaitAckedFsn(targetFsn, timeoutMillis);
     }
 
@@ -1839,7 +1859,7 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public long getAckedFsn() {
-        return cursorEngine != null ? cursorEngine.ackedFsn() : -1L;
+        return cursorEngine != null ? fsnEpochBase + cursorEngine.ackedFsn() : -1L;
     }
 
     /**
@@ -2080,6 +2100,34 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public boolean isSymbolDictResetEnabled() {
         return resetEnabled;
+    }
+
+    /** Current value of {@link #fsnEpochBase}. */
+    @TestOnly
+    public long getFsnEpochBaseForTest() {
+        return fsnEpochBase;
+    }
+
+    /**
+     * Test-only entry point for {@link #rollFsnEpochBase}, the same private
+     * roll the symbol-dict recycle swap calls in production once the engine
+     * rebuild has committed.
+     */
+    @TestOnly
+    public void rollFsnEpochBaseForTest(long lastPublishedFsn) {
+        rollFsnEpochBase(lastPublishedFsn);
+    }
+
+    /**
+     * Advances {@link #fsnEpochBase} past every FSN handed out under the
+     * epoch that just ended. {@code lastPublishedFsn} is the highest raw FSN
+     * the outgoing cursor engine ever published ({@code -1} if it published
+     * nothing), so the next raw FSN the fresh engine hands out --
+     * {@code 0} -- maps to external {@code lastPublishedFsn + 1 + 0}, one
+     * past the last external FSN this sender ever reported.
+     */
+    private void rollFsnEpochBase(long lastPublishedFsn) {
+        fsnEpochBase += lastPublishedFsn + 1L;
     }
 
     /**
@@ -3932,7 +3980,8 @@ public class QwpWebSocketSender implements Sender {
                     maxFrameRejections,
                     poisonMinEscalationWindowMillis,
                     catchUpCapGapMinEscalationWindowMillis,
-                    CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND);
+                    CursorWebSocketSendLoop.ReconnectPolicy.FOREGROUND,
+                    fsnEpochBase);
             // Plug the async-delivery sink before start() so the I/O thread
             // never observes a null dispatcher between recordFatal and
             // notification — the test for null in dispatchError handles

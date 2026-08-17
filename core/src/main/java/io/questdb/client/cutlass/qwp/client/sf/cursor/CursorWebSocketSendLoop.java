@@ -415,6 +415,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // it is engine.ackedFsn() + 1, so the first replayed frame on the new
     // connection is wireSeq=0 and server-side cumulative ACKs still line up.
     private long fsnAtZero;
+    // Third coordinate: additive offset applied on top of the engine FSN
+    // (fsnAtZero already folded in) to produce the FSN this loop hands to a
+    // user-visible surface -- the progress dispatcher and every SenderError
+    // [fromFsn,toFsn] span. Fixed for the lifetime of one loop instance: 0
+    // for a loop built directly against a live engine, or the sender's
+    // fsnEpochBase snapshot when a symbol-dict recycle rebuilt the engine and
+    // restarted its internal FSNs at 0. Rule: external = externalFsnBase + raw.
+    private final long externalFsnBase;
     // Bounded-await backstop budget for close() (see
     // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS). Overridable via
     // setShutdownAwaitTimeoutMillis so tests can exercise the timeout branch
@@ -712,7 +720,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
-                CatchUpCapGapPolicy.RETRY_FOREVER);
+                CatchUpCapGapPolicy.RETRY_FOREVER, 0L);
     }
 
     /**
@@ -730,7 +738,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis,
-                                   CatchUpCapGapPolicy catchUpCapGapPolicy) {
+                                   CatchUpCapGapPolicy catchUpCapGapPolicy,
+                                   long externalFsnBase) {
         if (maxHeadFrameRejections < 1) {
             throw new IllegalArgumentException(
                     "maxHeadFrameRejections must be >= 1: " + maxHeadFrameRejections);
@@ -882,6 +891,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // always outlive their borrower. Any growth copy-on-writes into loop-owned memory
         // (ensureSentDictCapacity), and releaseSentDictBytes frees only what the loop owns.
         this.fsnAtZero = fsnAtZero;
+        this.externalFsnBase = externalFsnBase;
         this.parkNanos = parkNanos;
         this.reconnectFactory = reconnectFactory;
         this.reconnectInitialBackoffMillis = reconnectInitialBackoffMillis;
@@ -923,6 +933,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * establishing its first connection, then retries endpoint-policy failures
      * indefinitely after it has been live. An orphan drainer returns such failures
      * to its owner so the slot can follow its settle/quarantine policy.
+     * <p>
+     * {@code externalFsnBase} is the additive offset this loop folds into every
+     * user-visible FSN it produces (progress-dispatcher advances and
+     * {@link SenderError} spans) -- see {@link #externalFsnBase}. Pass {@code 0L}
+     * unless the caller is replacing an engine a symbol-dict recycle rebuilt.
      */
     public CursorWebSocketSendLoop(WebSocketClient client, CursorSendEngine engine,
                                    long fsnAtZero, long parkNanos,
@@ -934,13 +949,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                                    int maxHeadFrameRejections,
                                    long poisonMinEscalationWindowMillis,
                                    long catchUpCapGapMinEscalationWindowMillis,
-                                   ReconnectPolicy reconnectPolicy) {
+                                   ReconnectPolicy reconnectPolicy,
+                                   long externalFsnBase) {
         this(client, engine, fsnAtZero, parkNanos, reconnectFactory,
                 reconnectInitialBackoffMillis,
                 reconnectMaxBackoffMillis, durableAckMode,
                 durableAckKeepaliveIntervalMillis, maxHeadFrameRejections,
                 poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
-                catchUpPolicyFor(reconnectPolicy));
+                catchUpPolicyFor(reconnectPolicy), externalFsnBase);
     }
 
     private static CatchUpCapGapPolicy catchUpPolicyFor(ReconnectPolicy reconnectPolicy) {
@@ -1786,8 +1802,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     // role rejects are classified into the transient branch below.
                     LOG.error("terminal upgrade error during {} -- won't retry: {}",
                             phase, e.getMessage());
-                    long fromFsn = engine.ackedFsn() + 1L;
-                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    long fromFsn = externalFsnBase + engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, externalFsnBase + engine.publishedFsn());
                     SenderError err = new SenderError(
                             SenderError.Category.SECURITY_ERROR,
                             SenderError.Policy.TERMINAL,
@@ -1826,8 +1842,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                         // volatile first-writer-wins latch observed by the owner.
                         capabilityGapTerminal = e;
                     }
-                    long fromFsn = engine.ackedFsn() + 1L;
-                    long toFsn = Math.max(fromFsn, engine.publishedFsn());
+                    long fromFsn = externalFsnBase + engine.ackedFsn() + 1L;
+                    long toFsn = Math.max(fromFsn, externalFsnBase + engine.publishedFsn());
                     SenderError err = new SenderError(
                             SenderError.Category.PROTOCOL_VIOLATION,
                             SenderError.Policy.TERMINAL,
@@ -1958,7 +1974,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * producer stays alive and no data is at risk.
      */
     private void dispatchRetriedEndpointPolicyFailure(SenderError.Category category, String message) {
-        long fromFsn = engine.ackedFsn() + 1L;
+        long fromFsn = externalFsnBase + engine.ackedFsn() + 1L;
         dispatchError(new SenderError(
                 category,
                 SenderError.Policy.RETRIABLE,
@@ -1966,7 +1982,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 message,
                 SenderError.NO_MESSAGE_SEQUENCE,
                 fromFsn,
-                Math.max(fromFsn, engine.publishedFsn()),
+                Math.max(fromFsn, externalFsnBase + engine.publishedFsn()),
                 null,
                 System.nanoTime()
         ));
@@ -2072,9 +2088,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // the operator at those bytes would misattribute the poison. The
         // caller supplies the span end: a NACK names the exact frame, so the
         // span is that single frame; a non-orderly close cannot single one
-        // out, so it spans to publishedFsn.
-        long fromFsn = poisonFsn;
-        long toFsn = Math.max(fromFsn, toFsnHint);
+        // out, so it spans to publishedFsn. poisonFsn and toFsnHint are both
+        // raw internal FSNs (fsnAtZero already folded in by the caller where
+        // relevant); rebase both by externalFsnBase here.
+        long fromFsn = externalFsnBase + poisonFsn;
+        long toFsn = Math.max(fromFsn, externalFsnBase + toFsnHint);
         String msg = "frame at fsn=" + fromFsn + " rejected " + poisonStrikes
                 + " consecutive times with no acceptance at or beyond it -- poisoned frame, replay cannot succeed (last: "
                 + lastRejection + ')';
@@ -2098,12 +2116,14 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * Notify the progress dispatcher that the ack watermark advanced to
      * {@code ackedFsn}. Caller must already have observed the advance via
      * {@link CursorSendEngine#acknowledge}'s boolean return; this method
-     * does no further filtering.
+     * does no further filtering. {@code ackedFsn} is the engine-relative FSN
+     * (fsnAtZero already folded in by the caller); this rebases it by
+     * {@link #externalFsnBase} before it reaches the user-visible dispatcher.
      */
     private void dispatchProgress(long ackedFsn) {
         SenderProgressDispatcher d = progressDispatcher;
         if (d != null) {
-            d.offer(ackedFsn);
+            d.offer(externalFsnBase + ackedFsn);
         }
     }
 
@@ -3842,8 +3862,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // protocol-violation close path uses (see onClose above): there
             // is no FSN we can attribute the rejection to, so we report
             // the unacked range the producer can correlate against.
-            long fromFsn = engine.ackedFsn() + 1L;
-            long toFsn = Math.max(fromFsn, engine.publishedFsn());
+            long fromFsn = externalFsnBase + engine.ackedFsn() + 1L;
+            long toFsn = Math.max(fromFsn, externalFsnBase + engine.publishedFsn());
             String tableName = response.getTableEntryCount() == 1
                     ? response.getTableName(0)
                     : null;
@@ -3966,8 +3986,8 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     status & 0xFF,
                     response.getErrorMessage(),
                     wireSeq,
-                    fsn,
-                    fsn,
+                    externalFsnBase + fsn,
+                    externalFsnBase + fsn,
                     tableName,
                     System.nanoTime()
             );
