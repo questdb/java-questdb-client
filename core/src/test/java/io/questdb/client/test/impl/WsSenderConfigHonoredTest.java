@@ -78,6 +78,9 @@ public class WsSenderConfigHonoredTest {
         assertHonored("poison_min_escalation_window_millis=7500", "poison_min_escalation_window_millis", 7500L);
         assertHonored("catch_up_cap_gap_min_escalation_window_millis=90000",
                 "catch_up_cap_gap_min_escalation_window_millis", 90000L);
+        assertHonored("symbol_dict_reset=off", "symbol_dict_reset", false);
+        assertHonored("symbol_dict_reset_threshold=250000", "symbol_dict_reset_threshold", 250000);
+        assertHonored("symbol_dict_reset_max_wait_millis=45000", "symbol_dict_reset_max_wait_millis", 45000L);
         assertHonored("error_inbox_capacity=128", "error_inbox_capacity", 128);
         assertHonored("connection_listener_inbox_capacity=64", "connection_listener_inbox_capacity", 64);
         assertHonored("token=ey.abc", "token", "ey.abc");

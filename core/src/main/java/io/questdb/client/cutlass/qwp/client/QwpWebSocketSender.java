@@ -137,6 +137,17 @@ public class QwpWebSocketSender implements Sender {
     // Finite fallback (ms) for BACKGROUND (drainer) TCP connects when the
     // user left connect_timeout unset. See effectiveConnectTimeoutMs.
     public static final int DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS = 15_000;
+    // Default for symbol_dict_reset -- periodic symbol-dictionary recycling is
+    // on by default so a long-lived sender's dictionary does not grow without
+    // bound.
+    public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
+    // Default for symbol_dict_reset_max_wait_millis: upper bound, in millis, the
+    // recycle waits for an opportunistic (idle) window before forcing the
+    // rebuild. 0 means opportunistic-only -- never forced.
+    public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 30_000L;
+    // Default for symbol_dict_reset_threshold: distinct-symbol count that
+    // triggers a recycle once symbol_dict_reset is on.
+    public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
     private static final int DEFAULT_BUFFER_SIZE = 8192;
     private static final int DEFAULT_MICROBATCH_BUFFER_SIZE = 1024 * 1024; // 1MB
     private static final Logger LOG = LoggerFactory.getLogger(QwpWebSocketSender.class);
@@ -379,6 +390,18 @@ public class QwpWebSocketSender implements Sender {
     // CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS.
     private long catchUpCapGapMinEscalationWindowMillis =
             CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
+    // Whether the producer periodically recycles (rebuilds) its symbol
+    // dictionary once resetThresholdSymbols distinct symbols have been
+    // registered, bounding unbounded dictionary growth on a long-lived sender
+    // (connect-string key symbol_dict_reset).
+    private boolean resetEnabled = DEFAULT_SYMBOL_DICT_RESET_ENABLED;
+    // Upper bound, in millis, the recycle waits for an opportunistic (idle)
+    // window before forcing the rebuild; 0 means opportunistic-only, never
+    // forced (connect-string key symbol_dict_reset_max_wait_millis).
+    private long resetMaxWaitMillis = DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
+    // Distinct-symbol count that triggers a recycle once resetEnabled is on
+    // (connect-string key symbol_dict_reset_threshold).
+    private int resetThresholdSymbols = DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -758,12 +781,17 @@ public class QwpWebSocketSender implements Sender {
                 connectionListener, connectionListenerInboxCapacity,
                 CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                 CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
-                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS);
+                CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
+                DEFAULT_SYMBOL_DICT_RESET_ENABLED,
+                DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
     }
 
     /**
      * Master connect overload — also accepts the poison-frame detector
-     * threshold ({@code max_frame_rejections}): consecutive server-active
+     * threshold ({@code max_frame_rejections}) and the symbol-dictionary
+     * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
+     * {@code symbol_dict_reset_max_wait_millis}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
      * between, before the loop escalates to a typed terminal.
      */
@@ -790,7 +818,10 @@ public class QwpWebSocketSender implements Sender {
             int connectionListenerInboxCapacity,
             int maxFrameRejections,
             long poisonMinEscalationWindowMillis,
-            long catchUpCapGapMinEscalationWindowMillis
+            long catchUpCapGapMinEscalationWindowMillis,
+            boolean symbolDictResetEnabled,
+            int symbolDictResetThresholdSymbols,
+            long symbolDictResetMaxWaitMillis
     ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
@@ -809,6 +840,9 @@ public class QwpWebSocketSender implements Sender {
             sender.maxFrameRejections = maxFrameRejections;
             sender.poisonMinEscalationWindowMillis = poisonMinEscalationWindowMillis;
             sender.catchUpCapGapMinEscalationWindowMillis = catchUpCapGapMinEscalationWindowMillis;
+            sender.resetEnabled = symbolDictResetEnabled;
+            sender.resetThresholdSymbols = symbolDictResetThresholdSymbols;
+            sender.resetMaxWaitMillis = symbolDictResetMaxWaitMillis;
             sender.initialConnectMode = initialConnectMode == null
                     ? Sender.InitialConnectMode.OFF
                     : initialConnectMode;
@@ -1978,6 +2012,18 @@ public class QwpWebSocketSender implements Sender {
         return serverMaxBatchSize;
     }
 
+    /** Resolved value of {@code symbol_dict_reset_max_wait_millis}. */
+    @TestOnly
+    public long getSymbolDictResetMaxWaitMillis() {
+        return resetMaxWaitMillis;
+    }
+
+    /** Resolved value of {@code symbol_dict_reset_threshold}. */
+    @TestOnly
+    public int getSymbolDictResetThreshold() {
+        return resetThresholdSymbols;
+    }
+
     @TestOnly
     public QwpTableBuffer getTableBuffer(String tableName) {
         QwpTableBuffer buffer = tableBuffers.get(tableName);
@@ -2000,6 +2046,12 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public boolean isDeltaDictEnabledForTest() {
         return deltaDictEnabled;
+    }
+
+    /** Resolved value of {@code symbol_dict_reset}. */
+    @TestOnly
+    public boolean isSymbolDictResetEnabled() {
+        return resetEnabled;
     }
 
     /**

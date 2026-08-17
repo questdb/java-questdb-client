@@ -27,11 +27,15 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.test.AbstractTest;
+import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
+
+import java.util.concurrent.TimeUnit;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -267,6 +271,67 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 Sender.builder("ws::addr=localhost:9000;")
                         .wsConfigSnapshotForTest()
                         .get("catch_up_cap_gap_min_escalation_window_millis"));
+    }
+
+    @Test
+    public void testSymbolDictResetDefaults() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=" + LOCALHOST + ":" + port + ";")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue(ws.isSymbolDictResetEnabled());
+                    Assert.assertEquals(100_000, ws.getSymbolDictResetThreshold());
+                    Assert.assertEquals(30_000L, ws.getSymbolDictResetMaxWaitMillis());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSymbolDictResetConfigStringRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            })) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig("ws::addr=" + LOCALHOST + ":" + port
+                        + ";symbol_dict_reset=off;symbol_dict_reset_threshold=500;"
+                        + "symbol_dict_reset_max_wait_millis=0;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertFalse(ws.isSymbolDictResetEnabled());
+                    Assert.assertEquals(500, ws.getSymbolDictResetThreshold());
+                    Assert.assertEquals(0L, ws.getSymbolDictResetMaxWaitMillis());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSymbolDictResetThresholdRejectsBadValues() {
+        assertThrows("symbol_dict_reset_threshold must be > 0",
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold=0;"));
+        assertThrows("symbol_dict_reset_threshold must be > 0",
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold=-5;"));
+        assertThrows("symbol_dict_reset_threshold must be > 0 and <= " + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold="
+                        + (QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE + 1) + ";"));
+        assertThrows("symbol_dict_reset_max_wait_millis must be >= 0: -1",
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_max_wait_millis=-1;"));
+    }
+
+    @Test
+    public void testSymbolDictResetRejectedForNonWebSocketTransport() {
+        assertThrows("symbol_dict_reset is only supported for WebSocket transport",
+                () -> Sender.builder("http::addr=" + LOCALHOST + ":9000;symbol_dict_reset=on;"));
+        assertThrows("symbol_dict_reset_threshold is only supported for WebSocket transport",
+                () -> Sender.builder("http::addr=" + LOCALHOST + ":9000;symbol_dict_reset_threshold=500;"));
+        assertThrows("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport",
+                () -> Sender.builder("http::addr=" + LOCALHOST + ":9000;symbol_dict_reset_max_wait_millis=0;"));
     }
 
     @Test

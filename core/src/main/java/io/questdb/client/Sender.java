@@ -45,6 +45,7 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionExcep
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SfSanitizedResidueException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfStringParser;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -1087,6 +1088,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
         private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long catchUpCapGapMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
+        private boolean symbolDictReset = true;
+        private int symbolDictResetThreshold = PARAMETER_NOT_SET_EXPLICITLY;
+        private long symbolDictResetMaxWaitMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1545,6 +1549,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         catchUpCapGapMinEscalationWindowMillis != PARAMETER_NOT_SET_EXPLICITLY
                                 ? catchUpCapGapMinEscalationWindowMillis
                                 : CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS;
+                int actualSymbolDictResetThreshold = symbolDictResetThreshold != PARAMETER_NOT_SET_EXPLICITLY
+                        ? symbolDictResetThreshold
+                        : QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS;
+                long actualSymbolDictResetMaxWaitMillis = symbolDictResetMaxWaitMillis != PARAMETER_NOT_SET_EXPLICITLY
+                        ? symbolDictResetMaxWaitMillis
+                        : QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
 
                 // sfDir is the parent (group root); the actual slot lives
                 // under sfDir/senderId. This is what the engine sees — the
@@ -1674,7 +1684,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualConnectionListenerInboxCapacity,
                                     actualMaxFrameRejections,
                                     actualPoisonMinEscalationWindowMillis,
-                                    actualCatchUpCapGapMinEscalationWindowMillis
+                                    actualCatchUpCapGapMinEscalationWindowMillis,
+                                    symbolDictReset,
+                                    actualSymbolDictResetThreshold,
+                                    actualSymbolDictResetMaxWaitMillis
                             );
                         } catch (UnreplayableSlotException e) {
                             // The one failure build() recovers from. The slot's frames reference ids
@@ -1864,6 +1877,59 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 throw new LineSenderException("catch_up_cap_gap_min_escalation_window_millis must be >= 0: ").put(millis);
             }
             this.catchUpCapGapMinEscalationWindowMillis = millis;
+            return this;
+        }
+
+        /**
+         * Enables periodic recycling (rebuilding) of the sender's symbol dictionary
+         * once it reaches {@link #symbolDictResetThreshold(int)} distinct symbols,
+         * so a long-lived sender's dictionary does not grow without bound.
+         * <p>
+         * Default {@code true} (on). WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictReset(boolean enabled) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset is only supported for WebSocket transport");
+            }
+            this.symbolDictReset = enabled;
+            return this;
+        }
+
+        /**
+         * Number of distinct symbols the sender's dictionary may accumulate before
+         * {@link #symbolDictReset(boolean)} triggers a recycle. Must be greater than
+         * {@code 0} and no larger than {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}.
+         * <p>
+         * Default {@code 100_000}. WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictResetThreshold(int threshold) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset_threshold is only supported for WebSocket transport");
+            }
+            if (threshold <= 0 || threshold > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE) {
+                throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
+                        .put(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE).put(": ").put(threshold);
+            }
+            this.symbolDictResetThreshold = threshold;
+            return this;
+        }
+
+        /**
+         * Upper bound, in milliseconds, a triggered symbol-dictionary recycle waits
+         * for an opportunistic (idle) window before forcing the rebuild. {@code 0}
+         * means opportunistic-only: the recycle never forces, it only takes idle
+         * windows as they occur.
+         * <p>
+         * Default {@code 30_000} (30 s). WebSocket transport only.
+         */
+        public LineSenderBuilder symbolDictResetMaxWaitMillis(long maxWaitMillis) {
+            if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport");
+            }
+            if (maxWaitMillis < 0) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis must be >= 0: ").put(maxWaitMillis);
+            }
+            this.symbolDictResetMaxWaitMillis = maxWaitMillis;
             return this;
         }
 
@@ -3870,6 +3936,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     }
                     pos = getValue(configurationString, pos, sink, "catch_up_cap_gap_min_escalation_window_millis");
                     catchUpCapGapMinEscalationWindowMillis(parseLongValue(sink, "catch_up_cap_gap_min_escalation_window_millis"));
+                } else if (Chars.equals("symbol_dict_reset", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset");
+                    if (Chars.equalsIgnoreCase("on", sink)) {
+                        symbolDictReset(true);
+                    } else if (Chars.equalsIgnoreCase("off", sink)) {
+                        symbolDictReset(false);
+                    } else {
+                        throw new LineSenderException("invalid symbol_dict_reset [value=").put(sink).put(", allowed-values=[on, off]]");
+                    }
+                } else if (Chars.equals("symbol_dict_reset_threshold", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset_threshold is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset_threshold");
+                    symbolDictResetThreshold(parseIntValue(sink, "symbol_dict_reset_threshold"));
+                } else if (Chars.equals("symbol_dict_reset_max_wait_millis", sink)) {
+                    if (protocol != PROTOCOL_WEBSOCKET) {
+                        throw new LineSenderException("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport");
+                    }
+                    pos = getValue(configurationString, pos, sink, "symbol_dict_reset_max_wait_millis");
+                    symbolDictResetMaxWaitMillis(parseLongValue(sink, "symbol_dict_reset_max_wait_millis"));
                 } else if (Chars.equals("initial_connect_retry", sink)) {
                     if (protocol != PROTOCOL_WEBSOCKET) {
                         throw new LineSenderException("initial_connect_retry is only supported for WebSocket transport");
@@ -4145,6 +4235,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (view.has("catch_up_cap_gap_min_escalation_window_millis")) {
                     catchUpCapGapMinEscalationWindowMillis(wsLong(view, v, "catch_up_cap_gap_min_escalation_window_millis"));
                 }
+                if (view.has("symbol_dict_reset_threshold")) {
+                    symbolDictResetThreshold(wsInt(view, v, "symbol_dict_reset_threshold"));
+                }
+                if (view.has("symbol_dict_reset_max_wait_millis")) {
+                    symbolDictResetMaxWaitMillis(wsLong(view, v, "symbol_dict_reset_max_wait_millis"));
+                }
                 if (view.has("sf_append_deadline_millis")) {
                     sfAppendDeadlineMillis(wsLong(view, v, "sf_append_deadline_millis"));
                 }
@@ -4212,6 +4308,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         initialConnectMode(InitialConnectMode.ASYNC);
                     } else {
                         throw new LineSenderException("invalid initial_connect_retry [value=").put(s).put(", allowed-values=[on, off, true, false, sync, async]]");
+                    }
+                }
+                s = view.getStr("symbol_dict_reset");
+                if (s != null) {
+                    if (s.equalsIgnoreCase("on")) {
+                        symbolDictReset(true);
+                    } else if (s.equalsIgnoreCase("off")) {
+                        symbolDictReset(false);
+                    } else {
+                        throw new LineSenderException("invalid symbol_dict_reset [value=").put(s).put(", allowed-values=[on, off]]");
                     }
                 }
                 return this;
@@ -4329,6 +4435,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             m.put("max_frame_rejections", maxFrameRejections);
             m.put("poison_min_escalation_window_millis", poisonMinEscalationWindowMillis);
             m.put("catch_up_cap_gap_min_escalation_window_millis", catchUpCapGapMinEscalationWindowMillis);
+            m.put("symbol_dict_reset", symbolDictReset);
+            m.put("symbol_dict_reset_threshold", symbolDictResetThreshold);
+            m.put("symbol_dict_reset_max_wait_millis", symbolDictResetMaxWaitMillis);
             m.put("error_inbox_capacity", errorInboxCapacity);
             m.put("connection_listener_inbox_capacity", connectionListenerInboxCapacity);
             m.put("token", httpToken);
