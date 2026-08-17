@@ -1618,12 +1618,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // at the original slotPath, so the replacement starts on a genuinely empty
                     // directory with nothing left to skip -- it cannot throw the same way
                     // twice, which is what makes looping unnecessary here.
-                    boolean quarantined = false;
-                    CursorSendEngine cursorEngine = constructEngineOnSlotLocked(
+                    ConstructedEngine constructed = constructEngineOnSlotLocked(
                             sfDir, senderId, slotPath,
                             actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
                             actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
                             errorHandler);
+                    // Seeded from constructEngineOnSlotLocked's own verdict, not
+                    // hardcoded false: if construction already quarantined this
+                    // slot, the connect loop below must count that as the one
+                    // quarantine build() allows per attempt (see its "quarantined
+                    // || slotPath == null" guard) rather than starting blind and
+                    // risking a second quarantineTornSlot pass on what should be
+                    // an immediate close-and-rethrow.
+                    boolean quarantined = constructed.quarantined;
+                    CursorSendEngine cursorEngine = constructed.engine;
                     int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                             ? errorInboxCapacity
                             : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -3092,12 +3100,30 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Result of {@link #constructEngineOnSlotLocked}: the constructed engine, plus
+         * whether construction itself had to quarantine a torn slot to produce it.
+         * {@link #build} folds {@code quarantined} into its own connect-loop retry
+         * guard, so a construction-time quarantine still counts toward the one
+         * quarantine build() allows per attempt -- the invariant a single shared
+         * {@code quarantined} local enforced before this method existed.
+         */
+        static final class ConstructedEngine {
+            final CursorSendEngine engine;
+            final boolean quarantined;
+
+            ConstructedEngine(CursorSendEngine engine, boolean quarantined) {
+                this.engine = engine;
+                this.quarantined = quarantined;
+            }
+        }
+
+        /**
          * Constructs a {@code CursorSendEngine} on {@code slotPath}, quarantining a torn
          * slot exactly as {@link #build}'s connect loop does when the constructor itself
          * hits a terminal recovery verdict. Assumes the caller already holds
          * {@code slotPath}'s logical lock (or {@code slotPath == null}, memory mode).
          */
-        static CursorSendEngine constructEngineOnSlotLocked(
+        static ConstructedEngine constructEngineOnSlotLocked(
                 String sfDir, String senderId, String slotPath,
                 long maxSegmentBytes, long maxTotalBytes,
                 long appendDeadlineNanos, long syncIntervalNanos,
@@ -3173,7 +3199,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         maxTotalBytes, appendDeadlineNanos,
                         syncIntervalNanos, errorHandler);
             }
-            return cursorEngine;
+            return new ConstructedEngine(cursorEngine, quarantined);
         }
 
         /**
@@ -3181,7 +3207,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
          * its own lock spans the connect loop too, see the comment at its call site --
          * this entry point is for callers that only need a freshly (re)built engine on
-         * an already-owned slot, such as a symbol-dictionary epoch rebuild.
+         * an already-owned slot, such as a symbol-dictionary epoch rebuild. Discards the
+         * quarantined verdict: a recycle rebuild latches terminal on connect failure
+         * rather than quarantining, so it has no connect-loop retry guard to seed.
          */
         static CursorSendEngine constructEngineOnSlot(
                 String sfDir, String senderId, String slotPath,
@@ -3192,7 +3220,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     ? null : SlotLock.acquireLogical(slotPath)) {
                 return constructEngineOnSlotLocked(sfDir, senderId, slotPath,
                         maxSegmentBytes, maxTotalBytes, appendDeadlineNanos,
-                        syncIntervalNanos, errorHandler);
+                        syncIntervalNanos, errorHandler).engine;
             }
         }
 
