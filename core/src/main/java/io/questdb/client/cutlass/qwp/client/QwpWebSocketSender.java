@@ -286,6 +286,18 @@ public class QwpWebSocketSender implements Sender {
     // while the producer thread reads it from sendRow without
     // holding the sender monitor.
     private volatile int effectiveAutoFlushBytes;
+    /**
+     * Rebuilds a fresh {@link CursorSendEngine} on this sender's own slot, going
+     * through the identical construct/quarantine code path
+     * {@link Sender.LineSenderBuilder#build} uses.
+     */
+    public interface EngineRebuildFactory {
+        CursorSendEngine rebuild();
+    }
+
+    // Installed by build() once connect() succeeds; null for a sender that
+    // has never connected. See setEngineRebuildFactory.
+    private EngineRebuildFactory engineRebuildFactory;
     private volatile SenderErrorDispatcher errorDispatcher;
     // Async-delivery sink for SenderError notifications. Default-constructed
     // here with the loud-not-silent default handler; a builder hook can swap
@@ -2531,6 +2543,10 @@ public class QwpWebSocketSender implements Sender {
                 live.getQuick(i).setListener(listener);
             }
         }
+    }
+
+    public void setEngineRebuildFactory(EngineRebuildFactory factory) {
+        this.engineRebuildFactory = factory;
     }
 
     /**

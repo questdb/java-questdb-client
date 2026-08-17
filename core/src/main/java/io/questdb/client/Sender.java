@@ -1619,57 +1619,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // directory with nothing left to skip -- it cannot throw the same way
                     // twice, which is what makes looping unnecessary here.
                     boolean quarantined = false;
-                    CursorSendEngine cursorEngine;
-                    try {
-                        try {
-                            cursorEngine = new CursorSendEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        } catch (SfSanitizedResidueException first) {
-                            // NOT terminal, and it must be intercepted ahead of its
-                            // SfRecoveryException parent below. Recovery durably zeroed
-                            // proven-dead sealed residue BEFORE failing closed, so the
-                            // chain on disk is already healed: quarantining here would
-                            // set aside a slot whose backlog replays perfectly. Retry
-                            // once over the healed chain; a repeat is genuine and takes
-                            // the terminal arm.
-                            LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
-                                            + "retrying over the healed chain",
-                                    slotPath, first.getMessage());
-                            cursorEngine = new CursorSendEngine(
-                                    slotPath, actualSfMaxSegmentBytes,
-                                    actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                    actualSfSyncIntervalNanos);
-                        }
-                    } catch (UnreplayableSlotException | SfRecoveryException
-                             | MmapSegmentCorruptionException e) {
-                        // The terminal recovery verdicts, and the only ones build()
-                        // sets a slot aside for. UnreplayableSlotException says the
-                        // symbol dictionary cannot be rebuilt from any source;
-                        // SfRecoveryException and MmapSegmentCorruptionException say
-                        // the durable chain itself is proven corrupt or incomplete.
-                        // None of the three clears on a retry, and senderId is stable
-                        // with a not-fully-drained slot retained on close -- so
-                        // without this arm every restart re-recovers the same slot and
-                        // throws again, and the application cannot construct a Sender
-                        // at all, not even to BUFFER new rows.
-                        //
-                        // Deliberately NOT catching plain MmapSegmentException or
-                        // SfOperationalException: those are operational (EMFILE,
-                        // ENOMEM, an unreadable-but-possibly-intact file). Aborting
-                        // startup on them is correct; quarantining on them would
-                        // convert a transient into the permanent loss of a healthy
-                        // slot's durable frames.
-                        if (slotPath == null) {
-                            throw e;
-                        }
-                        quarantined = true;
-                        cursorEngine = quarantineTornSlot(
-                                null, e, sfDir, senderId, slotPath, actualSfMaxSegmentBytes,
-                                actualSfMaxTotalBytes, actualSfAppendDeadlineNanos,
-                                actualSfSyncIntervalNanos, errorHandler);
-                    }
+                    CursorSendEngine cursorEngine = constructEngineOnSlotLocked(
+                            sfDir, senderId, slotPath,
+                            actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                            actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                            errorHandler);
                     int actualErrorInboxCapacity = errorInboxCapacity != PARAMETER_NOT_SET_EXPLICITLY
                             ? errorInboxCapacity
                             : io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher.DEFAULT_CAPACITY;
@@ -1765,6 +1719,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // dispatcher daemon, drainer pool, microbatch buffers and
                 // WebSocketClient inside the abandoned `connected`.
                 connected.setTransactional(transactional);
+                connected.setEngineRebuildFactory(() -> LineSenderBuilder.constructEngineOnSlot(
+                        sfDir, senderId, slotPath,
+                        actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                        actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                        errorHandler));
                 try {
                     // Install the drainer listener BEFORE startOrphanDrainers
                     // below: drainers must see the listener at submit time so
@@ -3129,6 +3088,111 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 return n * multiplier;
             } catch (NumericException e) {
                 throw new LineSenderException("invalid ").put(name).put(" [value=").put(value).put("]");
+            }
+        }
+
+        /**
+         * Constructs a {@code CursorSendEngine} on {@code slotPath}, quarantining a torn
+         * slot exactly as {@link #build}'s connect loop does when the constructor itself
+         * hits a terminal recovery verdict. Assumes the caller already holds
+         * {@code slotPath}'s logical lock (or {@code slotPath == null}, memory mode).
+         */
+        static CursorSendEngine constructEngineOnSlotLocked(
+                String sfDir, String senderId, String slotPath,
+                long maxSegmentBytes, long maxTotalBytes,
+                long appendDeadlineNanos, long syncIntervalNanos,
+                SenderErrorHandler errorHandler) {
+            // The constructor's own recovery seed can also fail terminally, and
+            // not only as UnreplayableSlotException: when SegmentRing.openExisting
+            // had to skip an unreadable segment it throws SfRecoveryException (it
+            // constructs UnreplayableSlotException nowhere), and where it cannot
+            // even prove the chain's identity -- no manifest -- it quarantines the
+            // corrupt files and returns an EMPTY recovery rather than refusing.
+            // Either way the frame range cannot be shown already-acked, so recovery
+            // sets the slot aside rather than risk seeding the ack cursor past
+            // frames that were never delivered. All three types below are load
+            // bearing; narrowing this catch to UnreplayableSlotException would
+            // restore the permanent build() brick for the segment-skip case. That verdict gets
+            // the exact same quarantine-and-continue treatment as the connect()-time
+            // verdict below -- constructing cursorEngine is not inside the loop below,
+            // so a throw here would otherwise escape build() entirely, uncaught.
+            // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
+            // (not just the unreadable segment file) before building the replacement
+            // at the original slotPath, so the replacement starts on a genuinely empty
+            // directory with nothing left to skip -- it cannot throw the same way
+            // twice, which is what makes looping unnecessary here.
+            boolean quarantined = false;
+            CursorSendEngine cursorEngine;
+            try {
+                try {
+                    cursorEngine = new CursorSendEngine(
+                            slotPath, maxSegmentBytes,
+                            maxTotalBytes, appendDeadlineNanos,
+                            syncIntervalNanos);
+                } catch (SfSanitizedResidueException first) {
+                    // NOT terminal, and it must be intercepted ahead of its
+                    // SfRecoveryException parent below. Recovery durably zeroed
+                    // proven-dead sealed residue BEFORE failing closed, so the
+                    // chain on disk is already healed: quarantining here would
+                    // set aside a slot whose backlog replays perfectly. Retry
+                    // once over the healed chain; a repeat is genuine and takes
+                    // the terminal arm.
+                    LOG.info("sf slot {}: sealed residue sanitized during recovery ({}); "
+                                    + "retrying over the healed chain",
+                            slotPath, first.getMessage());
+                    cursorEngine = new CursorSendEngine(
+                            slotPath, maxSegmentBytes,
+                            maxTotalBytes, appendDeadlineNanos,
+                            syncIntervalNanos);
+                }
+            } catch (UnreplayableSlotException | SfRecoveryException
+                     | MmapSegmentCorruptionException e) {
+                // The terminal recovery verdicts, and the only ones build()
+                // sets a slot aside for. UnreplayableSlotException says the
+                // symbol dictionary cannot be rebuilt from any source;
+                // SfRecoveryException and MmapSegmentCorruptionException say
+                // the durable chain itself is proven corrupt or incomplete.
+                // None of the three clears on a retry, and senderId is stable
+                // with a not-fully-drained slot retained on close -- so
+                // without this arm every restart re-recovers the same slot and
+                // throws again, and the application cannot construct a Sender
+                // at all, not even to BUFFER new rows.
+                //
+                // Deliberately NOT catching plain MmapSegmentException or
+                // SfOperationalException: those are operational (EMFILE,
+                // ENOMEM, an unreadable-but-possibly-intact file). Aborting
+                // startup on them is correct; quarantining on them would
+                // convert a transient into the permanent loss of a healthy
+                // slot's durable frames.
+                if (slotPath == null) {
+                    throw e;
+                }
+                quarantined = true;
+                cursorEngine = quarantineTornSlot(
+                        null, e, sfDir, senderId, slotPath, maxSegmentBytes,
+                        maxTotalBytes, appendDeadlineNanos,
+                        syncIntervalNanos, errorHandler);
+            }
+            return cursorEngine;
+        }
+
+        /**
+         * {@link #constructEngineOnSlotLocked} wrapped in its own narrow acquisition of
+         * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
+         * its own lock spans the connect loop too, see the comment at its call site --
+         * this entry point is for callers that only need a freshly (re)built engine on
+         * an already-owned slot, such as a symbol-dictionary epoch rebuild.
+         */
+        static CursorSendEngine constructEngineOnSlot(
+                String sfDir, String senderId, String slotPath,
+                long maxSegmentBytes, long maxTotalBytes,
+                long appendDeadlineNanos, long syncIntervalNanos,
+                SenderErrorHandler errorHandler) {
+            try (SlotLock logicalSlotLock = slotPath == null
+                    ? null : SlotLock.acquireLogical(slotPath)) {
+                return constructEngineOnSlotLocked(sfDir, senderId, slotPath,
+                        maxSegmentBytes, maxTotalBytes, appendDeadlineNanos,
+                        syncIntervalNanos, errorHandler);
             }
         }
 
