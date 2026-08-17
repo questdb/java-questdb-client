@@ -690,6 +690,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
 
     /**
+     * Advisory request to start a fresh symbol-dictionary epoch. The reset
+     * happens at the next safe point (all published data acknowledged, no row
+     * in progress); it may be deferred indefinitely under sustained load. No-op
+     * on transports without a symbol dictionary.
+     */
+    default void resetSymbolDictionary() {
+    }
+
+    /**
      * Clear the internal buffers, discarding any unsent data.
      * <br>
      * This method discards all buffered data that hasn't been sent to the server yet,

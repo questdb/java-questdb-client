@@ -402,6 +402,24 @@ public class QwpWebSocketSender implements Sender {
     // Distinct-symbol count that triggers a recycle once resetEnabled is on
     // (connect-string key symbol_dict_reset_threshold).
     private int resetThresholdSymbols = DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS;
+    // Wall-clock time (System.nanoTime()) at which resetArmed last flipped
+    // false -> true. Recorded by armIfEligible so a later task's opportunistic
+    // wait can measure how long the recycle has been armed against
+    // resetMaxWaitMillis.
+    private long armedSinceNanos;
+    // Set by resetSymbolDictionary() (the public advisory API) and never
+    // cleared by armIfEligible itself -- once a caller asks for a fresh epoch,
+    // every later armIfEligible call keeps arming until the recycle actually
+    // runs and consumes the request.
+    private boolean manualResetRequested;
+    // True once armIfEligible has determined a recycle should happen. Consumed
+    // by the (later-task) recycle trigger; set only at the tail of
+    // resetTableBuffersAfterFlush, never on the per-symbol registration path.
+    private boolean resetArmed;
+    // Cleared on the false -> true armed transition; a later task's
+    // opportunistic-wait step sets it once it has waited out its window for
+    // THIS arm cycle, so a subsequent forced-wait check does not re-wait.
+    private boolean starvationWaitDoneThisArm;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -2048,6 +2066,16 @@ public class QwpWebSocketSender implements Sender {
         return deltaDictEnabled;
     }
 
+    /**
+     * Whether the symbol-dictionary recycle is currently armed. Set by
+     * {@link #armIfEligible()} at the tail of every flush (and immediately by
+     * {@link #resetSymbolDictionary()} when no row or flush is in progress).
+     */
+    @TestOnly
+    public boolean isResetArmed() {
+        return resetArmed;
+    }
+
     /** Resolved value of {@code symbol_dict_reset}. */
     @TestOnly
     public boolean isSymbolDictResetEnabled() {
@@ -2464,6 +2492,24 @@ public class QwpWebSocketSender implements Sender {
         currentTableName = null;
         cachedTimestampColumn = null;
         cachedTimestampNanosColumn = null;
+    }
+
+    /**
+     * Advisory request to start a fresh symbol-dictionary epoch. Sets
+     * {@link #manualResetRequested}; if no row is currently in progress and no
+     * flush is in flight ({@code pendingRowCount == 0}), re-evaluates arming
+     * immediately so a caller that requests a reset between batches does not
+     * have to wait for a later flush to observe {@code isResetArmed()}. A
+     * request made mid-batch is picked up by the next
+     * {@code resetTableBuffersAfterFlush} instead.
+     */
+    @Override
+    public void resetSymbolDictionary() {
+        checkNotClosed();
+        manualResetRequested = true;
+        if (pendingRowCount == 0) {
+            armIfEligible();
+        }
     }
 
     /**
@@ -4354,6 +4400,32 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = 0;
         pendingRowCount = 0;
         firstPendingRowTimeNanos = 0;
+        armIfEligible();
+    }
+
+    /**
+     * Re-evaluates whether the symbol-dictionary recycle should be armed:
+     * {@code resetEnabled} is on AND either the global dictionary has reached
+     * {@code resetThresholdSymbols} distinct entries or a caller requested a
+     * reset via {@link #resetSymbolDictionary()}. Deliberately ignores
+     * {@code deltaDictEnabled} -- a producer degraded to full self-sufficient
+     * frames still benefits from bounding its dictionary size, and a manual
+     * request is honoured regardless of mode.
+     * <p>
+     * Called only from the tail of {@link #resetTableBuffersAfterFlush()} (a
+     * safe point: no row in progress, this flush's data already handed to the
+     * engine), never from the per-symbol registration path
+     * ({@link #getOrAddGlobalSymbol}) -- arming mid-row or mid-encode would
+     * observe a dictionary size that has not yet settled for this batch.
+     */
+    private void armIfEligible() {
+        boolean shouldArm = resetEnabled
+                && (globalSymbolDictionary.size() >= resetThresholdSymbols || manualResetRequested);
+        if (shouldArm && !resetArmed) {
+            armedSinceNanos = System.nanoTime();
+            starvationWaitDoneThisArm = false;
+        }
+        resetArmed = shouldArm;
     }
 
     /**
