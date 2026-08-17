@@ -431,6 +431,17 @@ public class QwpWebSocketSender implements Sender {
     // opportunistic-wait step sets it once it has waited out its window for
     // THIS arm cycle, so a subsequent forced-wait check does not re-wait.
     private boolean starvationWaitDoneThisArm;
+    // Set (once) by recycleForDictReset's catch block when the recycle swap
+    // itself fails -- everything was acked before the swap tore the old
+    // engine down, so no data is at risk, but this sender can no longer make
+    // progress (no cursor engine, no I/O loop) and refuses further use.
+    // checkRecycleFailure() rethrows a fresh LineSenderException wrapping
+    // this cause on every later table()/flush-family call; close() still
+    // works normally.
+    private Throwable recycleFailure;
+    // Incremented once per completed symbol-dictionary recycle. 0 until the
+    // first recycle commits.
+    private long symbolDictEpoch;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -1013,6 +1024,7 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         checkNotClosed();
+        checkRecycleFailure();
         if (cursorEngine == null) {
             return targetFsn < 0L;
         }
@@ -1692,6 +1704,7 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public void flush() {
+        checkRecycleFailure();
         flushAndGetSequence();
     }
 
@@ -1710,6 +1723,7 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public long flushAndGetSequence() {
         checkNotClosed();
+        checkRecycleFailure();
         if (cursorEngine != null) {
             cursorEngine.checkDurability();
         }
@@ -1770,6 +1784,7 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public boolean drain(long timeoutMillis) {
+        checkRecycleFailure();
         flush();
         long targetRaw = cursorEngine != null ? cursorEngine.publishedFsn() : -1L;
         long targetFsn = targetRaw < 0 ? targetRaw : fsnEpochBase + targetRaw;
@@ -2106,6 +2121,15 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public long getFsnEpochBaseForTest() {
         return fsnEpochBase;
+    }
+
+    /**
+     * Number of symbol-dictionary recycles this sender has completed.
+     * Incremented by {@link #recycleForDictReset()} once the swap commits.
+     */
+    @TestOnly
+    public long getSymbolDictEpochForTest() {
+        return symbolDictEpoch;
     }
 
     /**
@@ -2920,6 +2944,10 @@ public class QwpWebSocketSender implements Sender {
     @Override
     public QwpWebSocketSender table(CharSequence tableName) {
         checkNotClosed();
+        checkRecycleFailure();
+        if (resetArmed) {
+            maybeRecycleForDictReset();
+        }
         // Fast path: if table name matches current, skip hashmap lookup
         if (currentTableName != null && currentTableBuffer != null && Chars.equals(tableName, currentTableName)) {
             return this;
@@ -3620,6 +3648,24 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException("Sender is closed");
         }
         checkConnectionError();
+    }
+
+    /**
+     * Terminal latch for a failed symbol-dictionary recycle swap
+     * ({@link #recycleForDictReset()}). Everything was acked before the swap
+     * tore the old engine down, so no data is at risk -- but the swap itself
+     * left this sender without a cursor engine or I/O loop, so it refuses
+     * further use. Checked by {@link #table(CharSequence)} and the
+     * flush-family entry points ({@link #flush()}, {@link #flushAndGetSequence()},
+     * {@link #drain(long)}, {@link #awaitAckedFsn(long, long)}) -- deliberately
+     * NOT by {@link #close()}, which must still be able to tear down a
+     * latched sender.
+     */
+    private void checkRecycleFailure() {
+        if (recycleFailure != null) {
+            throw new LineSenderException(recycleFailure)
+                    .put("sender is terminal: symbol dictionary recycle failed");
+        }
     }
 
     private void checkTableSelected() {
@@ -4492,6 +4538,145 @@ public class QwpWebSocketSender implements Sender {
             starvationWaitDoneThisArm = false;
         }
         resetArmed = shouldArm;
+    }
+
+    /**
+     * True once every FSN this engine has published has also been
+     * server-acknowledged (or nothing has been published yet). The barrier
+     * {@link #recycleForDictReset()} waits for: the swap tears the cursor
+     * engine down, so it must never run while a frame is still in flight.
+     * <p>
+     * Read order matters: {@code publishedFsn} (producer-written, cannot move
+     * during this call -- we ARE the producer) first, then {@code ackedFsn}
+     * (monotone, I/O-thread-written) second. Reading them in the other order
+     * could observe a published advance without its matching ack and falsely
+     * report drained.
+     */
+    private boolean isRingDrained() {
+        long published = cursorEngine.publishedFsn();
+        return published < 0 || cursorEngine.ackedFsn() >= published;
+    }
+
+    /**
+     * Placeholder for the opportunistic/forced starvation-wait policy a later
+     * task fills in: when the ring is NOT drained at arming time, this
+     * decides whether to wait out an idle window before forcing the recycle
+     * regardless. No-op here -- an armed sender with a non-empty backlog
+     * simply stays armed and re-checks on the next {@link #table(CharSequence)}
+     * call.
+     */
+    private void maybeBlockForStarvedReset() {
+    }
+
+    /**
+     * Evaluates whether the barrier in {@link #table(CharSequence)} may run
+     * the symbol-dictionary recycle right now. Only ever called with
+     * {@link #resetArmed} true.
+     * <p>
+     * Refuses when there is producer-side state the swap cannot safely tear
+     * down: no connection yet (a V4 sender that has never sent is never
+     * pre-connected here), a flush in flight ({@code pendingRowCount != 0}),
+     * or a row under construction. Otherwise proceeds to the ring-drained
+     * check: if the backlog is empty, recycle immediately; if not, defer to
+     * the (later-task) starvation-wait policy instead of blocking the caller
+     * indefinitely here.
+     */
+    private void maybeRecycleForDictReset() {
+        if (!connected
+                || pendingRowCount != 0
+                || (currentTableBuffer != null && currentTableBuffer.hasInProgressRow())) {
+            return;
+        }
+        if (isRingDrained()) {
+            recycleForDictReset();
+        } else {
+            maybeBlockForStarvedReset();
+        }
+    }
+
+    /**
+     * The symbol-dictionary recycle swap. Runs synchronously on the producer
+     * thread from the {@link #table(CharSequence)} barrier, once
+     * {@link #maybeRecycleForDictReset()} has proven the ring is drained.
+     * Eight steps, strictly ordered:
+     * <ol>
+     *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
+     *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
+     *       closes the WebSocket client.</li>
+     *   <li>Fully-drained close of the outgoing cursor engine. Everything was
+     *       proven acked by the barrier, so {@code close()} (== {@code close(true)})
+     *       takes the reclaim branch: it empties the slot AND unlinks the
+     *       parent-anchored logical slot lock (see {@code CursorSendEngine.close}'s
+     *       javadoc) -- this sender holds no other lock on the slot at this
+     *       point, so releasing it here is safe.</li>
+     *   <li>Roll {@link #fsnEpochBase} past every FSN the outgoing epoch ever
+     *       handed out. Must run with {@code cursorSendLoop == null} (step 2
+     *       already guarantees this -- see {@link #rollFsnEpochBase}'s
+     *       precondition).</li>
+     *   <li>Producer-side state swap: a fresh {@link GlobalSymbolDictionary}
+     *       (replaced, not cleared -- nothing else retains the old instance),
+     *       both symbol-id watermarks reset, the epoch counter advanced, and
+     *       the arming flags consumed.</li>
+     *   <li>Rebuild the cursor engine on the now-empty slot via
+     *       {@link #engineRebuildFactory}, the identical construct path
+     *       {@code Sender.build()} uses. {@code deltaDictEnabled} is re-derived
+     *       from the fresh engine, mirroring (not calling) {@link #setCursorEngine}
+     *       -- that method's guards refuse a second engine.</li>
+     *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
+     *       against the rolled {@link #fsnEpochBase}.</li>
+     * </ol>
+     * A throw at any step is caught, latches {@link #recycleFailure} (step 8),
+     * and rethrows: every frame that existed before this call was already
+     * proven acked, so no data is at risk, but the sender that made the throw
+     * observe a torn-down engine/loop refuses further use from here on --
+     * {@link #checkRecycleFailure()} enforces that at every later
+     * {@link #table(CharSequence)} and flush-family call.
+     */
+    private void recycleForDictReset() {
+        final long lastPublishedFsn = cursorEngine.publishedFsn(); // step 1
+        final int dictSizeAtSwap = globalSymbolDictionary.size();
+        final long startNanos = System.nanoTime();
+        try {
+            // step 2: close the loop - joins the I/O thread, closes the client
+            if (cursorSendLoop != null) {
+                cursorSendLoop.close();
+                cursorSendLoop = null;
+            }
+            client = null;
+            // step 3: fully-drained close of the engine - empties the slot.
+            // Holds NO logical slot lock here: close(true) unlinks the logical
+            // lock file (CursorSendEngine close javadoc).
+            cursorEngine.close();
+            cursorEngine = null;
+            // step 4: roll the external FSN base (-1 no-publish case adds 0)
+            rollFsnEpochBase(lastPublishedFsn);
+            // step 5: producer state swap - replace, don't clear()
+            globalSymbolDictionary = new GlobalSymbolDictionary();
+            sentMaxSymbolId = -1;
+            currentBatchMaxSymbolId = -1;
+            symbolDictEpoch++;
+            resetArmed = false;
+            manualResetRequested = false;
+            // step 6: rebuild the engine on the now-empty slot
+            cursorEngine = engineRebuildFactory.rebuild();
+            ownsCursorEngine = true;
+            deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
+            // step 7: reconnect - rebuilds the loop with the rolled base
+            connected = false;
+            ensureConnected();
+            LOG.info("symbol dictionary recycled [epoch={}, dictSizeAtSwap={}, pauseMicros={}]",
+                    symbolDictEpoch, dictSizeAtSwap, (System.nanoTime() - startNanos) / 1000L);
+        } catch (Throwable t) {
+            // step 8: terminal latch - everything was acked before step 2,
+            // so no data is at risk; the sender refuses further use.
+            recycleFailure = t;
+            LOG.error("symbol dictionary recycle failed; sender is now terminal "
+                    + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, t);
+            if (t instanceof LineSenderException) {
+                throw (LineSenderException) t;
+            }
+            throw new LineSenderException(t).put("symbol dictionary recycle failed");
+        }
     }
 
     /**
