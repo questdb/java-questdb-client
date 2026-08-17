@@ -28,6 +28,9 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
 import io.questdb.client.test.tools.TestUtils;
@@ -38,6 +41,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -75,21 +79,17 @@ public class SymbolDictRecycleArmingTest {
     }
 
     /**
-     * Decision 5: arming ignores {@code deltaDictEnabled}. Proving this by
-     * crossing {@code symbol_dict_reset_threshold} while degraded (as
-     * {@link #testArmsAtThreshold} does for the default delta-dict mode) would
-     * additionally need a custom low threshold on a hand-built
-     * {@code CursorSendEngine} carrying the fault-injecting {@code FilesFacade}
-     * (fault injection requires bypassing {@code Sender.fromConfig}, which
-     * offers no {@code FilesFacade} seam) -- reaching both together needs
-     * {@code QwpWebSocketSender}'s widest 27-parameter {@code connect()}
-     * overload. Substituting the manual {@link Sender#resetSymbolDictionary()}
-     * advisory request for "cross the threshold" reaches the identical
-     * {@code armIfEligible()} branch -- the other arm of the same {@code ||} --
-     * through the same 9-parameter {@code connect()} overload
-     * {@code MmapFaultDegradesTest} itself uses, with no loss of coverage:
-     * {@code armIfEligible()} does not special-case either trigger on
-     * {@code deltaDictEnabled}.
+     * Decision 5: arming ignores {@code deltaDictEnabled} -- threshold-based
+     * arming must still fire once the sender has degraded to full self-sufficient
+     * frames. Reaching a custom low {@code symbol_dict_reset_threshold} on a
+     * sender that also carries the fault-injecting {@code FilesFacade} needs
+     * {@code QwpWebSocketSender}'s widest {@code connect(List<Endpoint>, ...)}
+     * overload: {@code Sender.fromConfig} has no {@code FilesFacade} seam, and
+     * every narrower {@code connect(host, port, ...)} overload hard-codes the
+     * default threshold (100,000). That overload sets
+     * {@code sender.resetThresholdSymbols} directly and also accepts the
+     * hand-built {@code CursorSendEngine}, so both requirements are reachable
+     * together.
      */
     @Test
     public void testArmsInFullDictMode() throws Exception {
@@ -107,10 +107,33 @@ public class SymbolDictRecycleArmingTest {
                         slot, 4L * 1024 * 1024, 64L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS, ff);
                 QwpWebSocketSender sender = QwpWebSocketSender.connect(
-                        "localhost", port, null, 0, 0, 0L, null, false, engine);
+                        Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", port)),
+                        null, // tlsConfig
+                        0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
+                        null, // authorizationHeader
+                        false, // requestDurableAck
+                        engine,
+                        5_000L, // closeFlushTimeoutMillis
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS,
+                        Sender.InitialConnectMode.OFF,
+                        null, // errorHandler
+                        SenderErrorDispatcher.DEFAULT_CAPACITY,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS,
+                        0, // connectTimeoutMs
+                        null, // connectionListener
+                        SenderConnectionDispatcher.DEFAULT_CAPACITY,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
+                        true, // symbolDictResetEnabled
+                        3, // symbolDictResetThresholdSymbols -- low, deliberately crossed below
+                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
                 try {
                     ff.armed = true; // next dictionary mmap growth raises a recognised fault
-                    sender.table("m").symbol("s", "boom").longColumn("v", 1L).atNow();
+                    sender.table("m").symbol("s", "a").longColumn("v", 1L).atNow();
                     try {
                         sender.flush();
                         Assert.fail("expected the injected mmap fault to fail this flush");
@@ -121,15 +144,27 @@ public class SymbolDictRecycleArmingTest {
                     Assert.assertFalse("a recognised mmap access fault must degrade the sender "
                                     + "to full-dict mode",
                             sender.isDeltaDictEnabledForTest());
-
-                    // The fault facade disarms itself after firing once, so this retry
-                    // succeeds and clears pendingRowCount back to 0.
-                    sender.flush();
-                    Assert.assertFalse("neither threshold nor manual request has fired yet",
+                    Assert.assertFalse("dictionary has only 1 entry, below the threshold of 3",
                             sender.isResetArmed());
 
-                    sender.resetSymbolDictionary();
-                    Assert.assertTrue("manual reset request must arm even in full-dict mode",
+                    // The fault facade disarms itself after firing once, so this retry
+                    // succeeds and clears pendingRowCount back to 0; "a" is now published.
+                    sender.flush();
+                    Assert.assertFalse("still degraded, dictionary still below threshold",
+                            sender.isDeltaDictEnabledForTest());
+                    Assert.assertFalse(sender.isResetArmed());
+
+                    sender.table("m").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertFalse("dictionary has 2 entries, still below the threshold of 3",
+                            sender.isResetArmed());
+
+                    // No manual resetSymbolDictionary() call anywhere in this test: crossing
+                    // the threshold alone must arm the recycle, even while degraded.
+                    sender.table("m").symbol("s", "c").longColumn("v", 3L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("threshold-based arming must fire even in full-dict mode "
+                                    + "(Decision 5: arming ignores deltaDictEnabled)",
                             sender.isResetArmed());
                 } finally {
                     sender.close();
