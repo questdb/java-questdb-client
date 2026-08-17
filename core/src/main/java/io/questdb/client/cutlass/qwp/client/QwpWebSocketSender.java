@@ -431,6 +431,10 @@ public class QwpWebSocketSender implements Sender {
     // opportunistic-wait step sets it once it has waited out its window for
     // THIS arm cycle, so a subsequent forced-wait check does not re-wait.
     private boolean starvationWaitDoneThisArm;
+    // Incremented once per completed starvation wait that timed out without
+    // the backlog draining (maybeBlockForStarvedReset's deadline branch). 0
+    // until the first such timeout.
+    private long symbolDictResetStarvationTimeouts;
     // Set (once) by recycleForDictReset's catch block when the recycle swap
     // itself fails -- everything was acked before the swap tore the old
     // engine down, so no data is at risk, but this sender can no longer make
@@ -2130,6 +2134,15 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public long getSymbolDictEpochForTest() {
         return symbolDictEpoch;
+    }
+
+    /**
+     * Number of times {@link #maybeBlockForStarvedReset()} has timed out
+     * without the backlog draining. 0 until the first such timeout.
+     */
+    @TestOnly
+    public long getSymbolDictResetStarvationTimeoutsForTest() {
+        return symbolDictResetStarvationTimeouts;
     }
 
     /**
@@ -4561,14 +4574,54 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Placeholder for the opportunistic/forced starvation-wait policy a later
-     * task fills in: when the ring is NOT drained at arming time, this
-     * decides whether to wait out an idle window before forcing the recycle
-     * regardless. No-op here -- an armed sender with a non-empty backlog
-     * simply stays armed and re-checks on the next {@link #table(CharSequence)}
-     * call.
+     * Starvation policy: when the ring is NOT drained at arming time, waits
+     * out an opportunistic window before giving up for this armed window.
+     * Refuses (returns immediately) in three cases: {@code resetMaxWaitMillis
+     * <= 0} (blocking disabled), a wait already ran for this arm cycle
+     * ({@link #starvationWaitDoneThisArm} -- at most one blocking wait per
+     * armed window), or a deferred-commit group is open
+     * ({@link #hasDeferredMessages}). That last guard is a data-safety
+     * requirement, not an optimisation: the server withholds acks for
+     * {@code FLAG_DEFER_COMMIT} frames by design until the closing commit
+     * lands, and this producer thread is the only one that could ever send
+     * that commit -- blocking here would just run out the clock every time,
+     * while starving the caller of the thread it needs to actually close the
+     * group.
+     * <p>
+     * Otherwise waits (parked, {@code awaitAckedFsn}-shaped) until either the
+     * ring drains -- in which case the recycle runs synchronously before
+     * returning -- or {@code resetMaxWaitMillis} elapses from THIS call, in
+     * which case it gives up, counts the timeout, and leaves
+     * {@link #resetArmed} set so a later drained {@link #table(CharSequence)}
+     * call can still recycle opportunistically.
      */
     private void maybeBlockForStarvedReset() {
+        if (resetMaxWaitMillis <= 0 || starvationWaitDoneThisArm) {
+            return;
+        }
+        if (hasDeferredMessages) {
+            return;
+        }
+        if (System.nanoTime() - armedSinceNanos < resetMaxWaitMillis * 1_000_000L) {
+            return;
+        }
+        starvationWaitDoneThisArm = true;
+        long deadlineNanos = System.nanoTime() + resetMaxWaitMillis * 1_000_000L;
+        while (!isRingDrained()) {
+            cursorEngine.checkDurability();
+            if (cursorSendLoop != null) {
+                cursorSendLoop.checkError();
+            }
+            checkConnectionError();
+            if (System.nanoTime() >= deadlineNanos) {
+                symbolDictResetStarvationTimeouts++;
+                LOG.warn("symbol dictionary reset starved: backlog not drained within {} ms; "
+                        + "re-arming opportunistically", resetMaxWaitMillis);
+                return;
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        }
+        recycleForDictReset();
     }
 
     /**
