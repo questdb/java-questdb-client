@@ -28,6 +28,9 @@ import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -42,6 +45,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
@@ -121,6 +125,95 @@ public class SymbolDictRecycleTest {
         });
     }
 
+    /**
+     * {@code engineRebuildFactory} is only installed by {@code Sender.build()}
+     * ({@code Sender.java:1752}) -- every public {@code QwpWebSocketSender.connect(...)}
+     * overload leaves it null. Since the recycle feature is default-on and
+     * {@code resetSymbolDictionary()} is a public advisory API, a connect()-built
+     * sender can become "armed" with no way to ever act on it.
+     * {@code maybeRecycleForDictReset()} must refuse before any teardown in that
+     * case, not attempt step 6 and NPE into a latched terminal state -- covers
+     * both ways a sender can arm: the manual request and threshold crossing.
+     */
+    @Test
+    public void testConnectBuiltSenderNeverRecyclesWithoutFactory() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                int port = server.getPort();
+
+                // Manual reset request on the simplest connect() overload.
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", port)) {
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue("a manual request arms immediately (no row/flush in flight)",
+                            sender.isResetArmed());
+
+                    // Drained instant (nothing published yet, no row in progress): with a
+                    // real factory this table() call would recycle. With none installed it
+                    // must simply do nothing and let the row through normally.
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("sender must keep working even though it can never recycle",
+                            sender.awaitAckedFsn(fsn, 5_000));
+                    Assert.assertEquals("no factory -> the recycle can never actually run",
+                            0, sender.getSymbolDictEpochForTest());
+                    Assert.assertTrue("stays armed forever -- nothing ever consumes the request",
+                            sender.isResetArmed());
+                }
+
+                // Threshold-based arming needs a custom low threshold, only reachable (without
+                // routing through Sender.build(), which WOULD install a factory) via the
+                // widest connect() overload -- mirrors SymbolDictRecycleArmingTest.testArmsInFullDictMode.
+                CursorSendEngine engine = new CursorSendEngine(
+                        null, 4L * 1024 * 1024, 128L * 1024 * 1024,
+                        CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
+                QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        Collections.singletonList(new QwpWebSocketSender.Endpoint("localhost", port)),
+                        null, // tlsConfig
+                        0, 0, 0L, // autoFlushRows, autoFlushBytes, autoFlushIntervalNanos
+                        null, // authorizationHeader
+                        false, // requestDurableAck
+                        engine,
+                        5_000L, // closeFlushTimeoutMillis
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_BACKOFF_MILLIS,
+                        Sender.InitialConnectMode.OFF,
+                        null, // errorHandler
+                        SenderErrorDispatcher.DEFAULT_CAPACITY,
+                        CursorWebSocketSendLoop.DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS,
+                        QwpWebSocketSender.DEFAULT_AUTH_TIMEOUT_MS,
+                        0, // connectTimeoutMs
+                        null, // connectionListener
+                        SenderConnectionDispatcher.DEFAULT_CAPACITY,
+                        CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
+                        CursorWebSocketSendLoop.DEFAULT_POISON_MIN_ESCALATION_WINDOW_MILLIS,
+                        CursorWebSocketSendLoop.DEFAULT_CATCHUP_CAP_GAP_MIN_ESCALATION_WINDOW_MILLIS,
+                        true, // symbolDictResetEnabled
+                        2, // symbolDictResetThresholdSymbols -- low, deliberately crossed below
+                        QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+                try {
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
+                    Assert.assertTrue("threshold=2 crossed by a, b", sender.isResetArmed());
+
+                    // Drained instant again: must not recycle, must not throw.
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    long fsn2 = sender.flushAndGetSequence();
+                    Assert.assertTrue("sender must keep working with no factory installed",
+                            sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("no factory -> the recycle can never actually run",
+                            0, sender.getSymbolDictEpochForTest());
+                    Assert.assertTrue("stays armed -- nothing ever consumes the threshold arming",
+                            sender.isResetArmed());
+                } finally {
+                    sender.close();
+                }
+            }
+        });
+    }
+
     @Test
     public void testPostRecycleSlotContents() throws Exception {
         assertMemoryLeak(() -> {
@@ -150,8 +243,17 @@ public class SymbolDictRecycleTest {
                     CursorSendEngine after = ws.getCursorEngineForTesting();
                     Assert.assertNotSame("recycle must swap in a fresh engine instance",
                             before, after);
-                    Assert.assertTrue("the rebuilt engine must create its own initial segment",
-                            Files.exists(slot + "/sf-initial.sfa"));
+                    // A bare Files.exists(".../sf-initial.sfa") proves nothing on its own --
+                    // that name is fixed and the outgoing engine had one too. Prove the
+                    // rebuilt slot's structure instead: exactly the well-known set of state
+                    // files a brand-new (never-recovered) slot has, nothing left over from
+                    // the outgoing epoch's segments.
+                    List<String> freshSlotFiles = Arrays.asList(
+                            ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
+                            "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
+                    Assert.assertEquals("post-recycle slot must contain exactly a fresh engine's "
+                                    + "own state files",
+                            freshSlotFiles, listDir(slot));
                     Assert.assertEquals("post-recycle dictionary must start empty, not continue "
                                     + "the outgoing epoch's 2 entries",
                             0, after.getPersistedSymbolDict().size());
@@ -308,6 +410,28 @@ public class SymbolDictRecycleTest {
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
+    }
+
+    /** Sorted list of entry names directly inside {@code dir} (no recursion, no "."/".."). */
+    private static List<String> listDir(String dir) {
+        List<String> names = new ArrayList<>();
+        long find = Files.findFirst(dir);
+        if (find > 0) {
+            try {
+                int rc = 1;
+                while (rc > 0) {
+                    String name = Files.utf8ToString(Files.findName(find));
+                    if (name != null && !".".equals(name) && !"..".equals(name)) {
+                        names.add(name);
+                    }
+                    rc = Files.findNext(find);
+                }
+            } finally {
+                Files.findClose(find);
+            }
+        }
+        Collections.sort(names);
+        return names;
     }
 
     private static void assertRethrowsWithCause(Throwable expectedCause, ThrowingRunnable action)

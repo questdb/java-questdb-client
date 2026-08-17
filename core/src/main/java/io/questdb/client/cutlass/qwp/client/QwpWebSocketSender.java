@@ -3655,11 +3655,14 @@ public class QwpWebSocketSender implements Sender {
      * ({@link #recycleForDictReset()}). Everything was acked before the swap
      * tore the old engine down, so no data is at risk -- but the swap itself
      * left this sender without a cursor engine or I/O loop, so it refuses
-     * further use. Checked by {@link #table(CharSequence)} and the
-     * flush-family entry points ({@link #flush()}, {@link #flushAndGetSequence()},
-     * {@link #drain(long)}, {@link #awaitAckedFsn(long, long)}) -- deliberately
-     * NOT by {@link #close()}, which must still be able to tear down a
-     * latched sender.
+     * further use. Checked by {@link #table(CharSequence)}, the flush-family
+     * entry points ({@link #flush()}, {@link #flushAndGetSequence()},
+     * {@link #drain(long)}, {@link #awaitAckedFsn(long, long)}), and
+     * {@code sendRow()} (closing the fluent-chain corner where a caller
+     * continues {@code .symbol(...).atNow()} against a {@code currentTableBuffer}
+     * selected before the latch, without an intervening {@code table()} call)
+     * -- deliberately NOT by {@link #close()}, which must still be able to
+     * tear down a latched sender.
      */
     private void checkRecycleFailure() {
         if (recycleFailure != null) {
@@ -4573,8 +4576,18 @@ public class QwpWebSocketSender implements Sender {
      * the symbol-dictionary recycle right now. Only ever called with
      * {@link #resetArmed} true.
      * <p>
-     * Refuses when there is producer-side state the swap cannot safely tear
-     * down: no connection yet (a V4 sender that has never sent is never
+     * Refuses before any teardown when the rebuild itself is impossible or
+     * unsafe: no {@link #engineRebuildFactory} (every public
+     * {@code QwpWebSocketSender.connect(...)} overload leaves it null --
+     * only {@code Sender.build()} installs one -- and the recycle feature is
+     * default-on, so a connect()-built sender must simply stay unarmed rather
+     * than NPE at step 6 and latch terminal), or a cursor engine this sender
+     * does not own ({@code setCursorEngine(engine, false)}'s contract: the
+     * caller retains ownership, so closing it out from under them at step 3
+     * would be a use-after-free from the caller's point of view).
+     * <p>
+     * Also refuses when there is producer-side state the swap cannot safely
+     * tear down: no connection yet (a V4 sender that has never sent is never
      * pre-connected here), a flush in flight ({@code pendingRowCount != 0}),
      * or a row under construction. Otherwise proceeds to the ring-drained
      * check: if the backlog is empty, recycle immediately; if not, defer to
@@ -4582,6 +4595,9 @@ public class QwpWebSocketSender implements Sender {
      * indefinitely here.
      */
     private void maybeRecycleForDictReset() {
+        if (engineRebuildFactory == null || !ownsCursorEngine) {
+            return;
+        }
         if (!connected
                 || pendingRowCount != 0
                 || (currentTableBuffer != null && currentTableBuffer.hasInProgressRow())) {
@@ -4615,13 +4631,15 @@ public class QwpWebSocketSender implements Sender {
      *       precondition).</li>
      *   <li>Producer-side state swap: a fresh {@link GlobalSymbolDictionary}
      *       (replaced, not cleared -- nothing else retains the old instance),
-     *       both symbol-id watermarks reset, the epoch counter advanced, and
-     *       the arming flags consumed.</li>
+     *       both symbol-id watermarks reset, {@code lastCommitBoundaryFsn}
+     *       reset (it held a raw old-epoch FSN that does not survive the
+     *       roll), the epoch counter advanced, and the arming flags consumed.</li>
      *   <li>Rebuild the cursor engine on the now-empty slot via
      *       {@link #engineRebuildFactory}, the identical construct path
      *       {@code Sender.build()} uses. {@code deltaDictEnabled} is re-derived
-     *       from the fresh engine, mirroring (not calling) {@link #setCursorEngine}
-     *       -- that method's guards refuse a second engine.</li>
+     *       from the fresh engine and its slot-lock-release listener rewired,
+     *       mirroring (not calling) {@link #setCursorEngine} -- that method's
+     *       guards refuse a second engine.</li>
      *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
      *       against the rolled {@link #fsnEpochBase}.</li>
      * </ol>
@@ -4654,6 +4672,7 @@ public class QwpWebSocketSender implements Sender {
             globalSymbolDictionary = new GlobalSymbolDictionary();
             sentMaxSymbolId = -1;
             currentBatchMaxSymbolId = -1;
+            lastCommitBoundaryFsn = -1L;
             symbolDictEpoch++;
             resetArmed = false;
             manualResetRequested = false;
@@ -4661,6 +4680,7 @@ public class QwpWebSocketSender implements Sender {
             cursorEngine = engineRebuildFactory.rebuild();
             ownsCursorEngine = true;
             deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
+            cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
             // step 7: reconnect - rebuilds the loop with the rolled base
             connected = false;
             ensureConnected();
@@ -5324,6 +5344,7 @@ public class QwpWebSocketSender implements Sender {
      * Rows buffer until flush (explicit or auto-flush).
      */
     private void sendRow() {
+        checkRecycleFailure();
         ensureConnected();
 
         // Hard guard: a single row whose bytes exceed the server's wire cap
