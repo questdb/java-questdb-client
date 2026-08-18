@@ -33,6 +33,7 @@ import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -367,7 +368,7 @@ public class QuestDBBuilderTest {
             Assert.assertNotNull("timed out waiting for an Authorization header", header);
             Assert.assertTrue("duplicate Authorization header: " + header, actual.add(header));
         }
-        Assert.assertEquals(Set.of(expected), actual);
+        Assert.assertEquals(new HashSet<>(Arrays.asList(expected)), actual);
     }
 
     private static void assertTokenProviderAuthRejected(String config, HttpTokenProvider provider) {
