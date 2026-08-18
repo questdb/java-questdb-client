@@ -103,13 +103,16 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *     ack that landed on the wire a moment before the process died, before step
  *     2 of the recycle ever started.</li>
  *     <li>(b) drives a real recycle through all 7 steps, then closes IMMEDIATELY,
- *     before any flush touches the freshly-rebuilt engine. {@code finishClose}
- *     treats {@code publishedFsn() < 0} as fully drained exactly like the
- *     everything-acked case, so this close unlinks every file step 6 just
- *     created -- the slot ends up in the same empty state that step 3 alone
- *     (on the OLD engine) would have left between tearing down and rebuilding.
- *     No rebuild-then-immediately-empty distinction survives on disk, since an
- *     empty directory carries no provenance.</li>
+ *     before any flush touches the freshly-rebuilt engine. {@code
+ *     close(boolean)} classifies {@code publishedFsn() < 0} as fully drained
+ *     exactly like the everything-acked case (that check lives there, not in
+ *     {@code finishClose}, which only receives the resulting flag), so this
+ *     close unlinks every SF state file step 6 just created -- everything but
+ *     the reusable {@code .lock}/{@code .lock.pid} pair, which no close in this
+ *     suite ever removes -- leaving the slot in the same empty state that step
+ *     3 alone (on the OLD engine) would have left between tearing down and
+ *     rebuilding. No rebuild-then-immediately-empty distinction survives on
+ *     disk, since an empty directory carries no provenance.</li>
  *     <li>(c) also drives a real recycle to completion, but instead of closing
  *     it, snapshots the freshly-rebuilt slot's bytes to the side FIRST. The
  *     live sender is then closed normally -- for accounting purposes only, so
@@ -117,7 +120,13 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *     empty except for the reusable lock pair) directory. This is the only way
  *     to freeze that state: there is no supported way to release just the
  *     slot's OS flock without running {@code finishClose}'s unlink, and
- *     {@code finishClose} is exactly what this arm needs to NOT run.</li>
+ *     {@code finishClose} is exactly what this arm needs to NOT run. One
+ *     immaterial divergence: {@code close()} also reclaims the LOGICAL slot
+ *     lock, which lives outside the slot dir in the sibling {@code
+ *     .slot-locks/} directory and so is untouched by the snapshot/restore -- a
+ *     real post-step-7 crash would leave that file present with its flock
+ *     kernel-released, but {@code acquireLogical} recreates a missing one, so
+ *     nothing observable changes.</li>
  *     <li>(d) drives a real recycle, appends more rows in the new epoch against
  *     a handler that stops acking after the first connection, then closes fast
  *     -- the established at-least-once backlog idiom, now exercised one epoch
@@ -127,14 +136,17 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * <h2>(b) and (c) are NOT the same recoverable state</h2>
  * Both look empty of data and both replay nothing, but they are not
  * byte-identical on disk, and a restarted engine can tell them apart. Arm (b)'s
- * directory holds nothing this engine ever created (no manifest, no segment).
- * Arm (c)'s directory holds the fresh rebuild's own {@code sf-manifest.bin}
- * (boundaries collapsed at 0) and its zero-frame {@code sf-initial.sfa} /
- * {@code sf-...0000.sfa} pair. {@code SegmentRing.recover()}'s manifest branch
- * (the {@code chain.size() == 0} check) accepts a manifest whose {@code
- * headBase == activeBase} alongside a same-based, zero-frame active segment as
- * a RECOVERED (if empty) chain -- it does not collapse that case to EMPTY the
- * way a manifest with NO segment files at all does. So {@code
+ * directory holds nothing this engine ever created -- no manifest, no segment.
+ * (The crashed sender's own fully-drained close already removed {@code
+ * sf-manifest.bin} along with the last segment, so recovery finds NO {@code
+ * .sfa} files and NO manifest, and falls straight through to {@code
+ * Recovery.empty()}.) Arm (c)'s directory holds the fresh rebuild's own
+ * {@code sf-manifest.bin} (boundaries collapsed at 0) and its zero-frame
+ * {@code sf-initial.sfa} / {@code sf-...0000.sfa} pair. {@code
+ * SegmentRing.recover()}'s manifest branch (the {@code chain.size() == 0}
+ * check) accepts a manifest whose {@code headBase == activeBase} alongside a
+ * same-based, zero-frame active segment as a RECOVERED (if empty) chain -- a
+ * different branch entirely from the one arm (b) falls through to. So {@code
  * wasRecoveredFromDisk()} comes back {@code false} for (b) and {@code true} for
  * (c): the pinned, distinguishing observable between the two, asserted
  * explicitly below instead of writing two assertion-for-assertion duplicate
@@ -151,6 +163,16 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * count).
  */
 public class SymbolDictRecycleCrashWindowsTest {
+
+    /**
+     * The exact file set a freshly-rebuilt (never-flushed) engine's own slot
+     * holds -- matches {@code SymbolDictRecycleTest#testPostRecycleSlotContents}'s
+     * {@code freshSlotFiles}. Shared by arm (c)'s pre-snapshot wait and its
+     * post-restore assertion so the two can never drift apart.
+     */
+    private static final List<String> FRESH_REBUILD_FILES = Arrays.asList(
+            ".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
+            "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin");
 
     @Rule
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
@@ -206,9 +228,9 @@ public class SymbolDictRecycleCrashWindowsTest {
                     Assert.assertTrue("the watermark stamp must seed ackedFsn at least up to "
                                     + "the only published fsn -- nothing left to replay",
                             recovered.ackedFsn() >= fsn);
-                    Assert.assertTrue("the recovered producer must resume epoch 0's a, b "
-                                    + "dictionary, not restart at -1",
-                            recovered.recoveredMaxSymbolId() >= 1);
+                    Assert.assertEquals("the recovered producer must resume epoch 0's a, b "
+                                    + "dictionary (ids 0, 1), not restart at -1",
+                            1L, recovered.recoveredMaxSymbolId());
 
                     successor.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     long fsn2 = successor.flushAndGetSequence();
@@ -236,8 +258,7 @@ public class SymbolDictRecycleCrashWindowsTest {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("crash-b-mid-swap").toString();
             String slot = Paths.get(sfDir, "default").toString();
-            AckAllHandler crashedHandler = new AckAllHandler();
-            try (TestWebSocketServer crashed = startedServer(crashedHandler)) {
+            try (TestWebSocketServer crashed = startedServer(new AckAllHandler())) {
                 String cfg = "ws::addr=localhost:" + crashed.getPort() + ";sf_dir=" + sfDir
                         + ";symbol_dict_reset_threshold=2;";
                 try (Sender sender = Sender.fromConfig(cfg)) {
@@ -255,11 +276,17 @@ public class SymbolDictRecycleCrashWindowsTest {
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
                     // close() below: the fresh engine has published nothing, so
-                    // finishClose's "never published" branch is fully-drained too --
-                    // it unlinks everything step 6 just created, leaving the slot as
-                    // empty as it was right after step 3 alone emptied the OLD engine.
+                    // close(boolean)'s "never published" check (CursorSendEngine's
+                    // publishedFsn() < 0 branch) classifies it fully-drained too --
+                    // finishClose unlinks every SF state file step 6 just created
+                    // (everything but .lock/.lock.pid), leaving the slot as empty
+                    // as it was right after step 3 alone emptied the OLD engine.
                 }
             }
+            Assert.assertEquals("a crash between steps 3 and 6 leaves the slot dir "
+                            + "holding only the reusable lock pair -- this is the "
+                            + "disk image this arm exists to pin",
+                    Arrays.asList(".lock", ".lock.pid"), listDir(slot));
 
             AckAllHandler freshHandler = new AckAllHandler();
             try (TestWebSocketServer fresh = startedServer(freshHandler)) {
@@ -283,10 +310,12 @@ public class SymbolDictRecycleCrashWindowsTest {
                                 + "the pre-crash a, b survive",
                         Arrays.asList("d"), freshHandler.dict());
             }
-            Assert.assertFalse("the slot dir must hold nothing from the emptied-and-abandoned "
-                            + "rebuild once the successor's own recovery has cleaned up any "
-                            + "stale (collapsed-boundary) manifest",
-                    Files.exists(slot + "/sf-manifest.bin"));
+            // The successor's own row is fully acked by now, so its own close is
+            // fully drained too and the slot settles back to the same lock-only
+            // image -- confirms the cycle is stable, not a one-shot coincidence.
+            Assert.assertEquals("the successor's fully-drained close leaves the slot "
+                            + "dir back down to just the reusable lock pair",
+                    Arrays.asList(".lock", ".lock.pid"), listDir(slot));
         });
     }
 
@@ -303,8 +332,7 @@ public class SymbolDictRecycleCrashWindowsTest {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("crash-c-post-swap").toString();
             String slot = Paths.get(sfDir, "default").toString();
             Map<String, byte[]> snapshot;
-            AckAllHandler crashedHandler = new AckAllHandler();
-            try (TestWebSocketServer crashed = startedServer(crashedHandler)) {
+            try (TestWebSocketServer crashed = startedServer(new AckAllHandler())) {
                 String cfg = "ws::addr=localhost:" + crashed.getPort() + ";sf_dir=" + sfDir
                         + ";symbol_dict_reset_threshold=2;";
                 try (Sender sender = Sender.fromConfig(cfg)) {
@@ -319,6 +347,15 @@ public class SymbolDictRecycleCrashWindowsTest {
                     Assert.assertFalse(ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
 
+                    // The manager worker provisions the fresh engine's hot-spare
+                    // segment asynchronously (its own service pass, off the
+                    // producer thread), so the slot is not guaranteed to have
+                    // settled to its steady rebuilt-engine file set the instant
+                    // table() returns. Wait for it before snapshotting -- a
+                    // mid-provision snapshot could capture a zero-magic spare
+                    // that recovery would then hard-fail on.
+                    awaitExactFileSet(slot, FRESH_REBUILD_FILES);
+
                     // The true pre-first-flush crash image, frozen before the
                     // upcoming close() would otherwise unlink it (arm (b)).
                     snapshot = snapshotDir(slot);
@@ -328,9 +365,7 @@ public class SymbolDictRecycleCrashWindowsTest {
 
             Assert.assertEquals("the restored image is exactly a freshly rebuilt (never "
                             + "flushed) engine's own state files",
-                    Arrays.asList(".ack-watermark", ".lock", ".lock.pid", ".symbol-dict",
-                            "sf-0000000000000000.sfa", "sf-initial.sfa", "sf-manifest.bin"),
-                    listDir(slot));
+                    FRESH_REBUILD_FILES, listDir(slot));
 
             AckAllHandler freshHandler = new AckAllHandler();
             try (TestWebSocketServer fresh = startedServer(freshHandler)) {
@@ -412,9 +447,9 @@ public class SymbolDictRecycleCrashWindowsTest {
                     CursorSendEngine recovered = ws2.getCursorEngineForTesting();
                     Assert.assertTrue("epoch 1's unacked c, d segment must be recovered",
                             recovered.wasRecoveredFromDisk());
-                    Assert.assertTrue("epoch 1's own dictionary (c, d only) must be recovered, "
+                    Assert.assertEquals("epoch 1's own dictionary (c, d only) must be recovered, "
                                     + "never epoch 0's a, b -- the recycle's slot wipe erased them",
-                            recovered.recoveredMaxSymbolId() >= 1);
+                            1L, recovered.recoveredMaxSymbolId());
 
                     Assert.assertTrue("the recovered sender must replay the backlog and "
                                     + "get it acked",
@@ -457,6 +492,25 @@ public class SymbolDictRecycleCrashWindowsTest {
         return names;
     }
 
+    /**
+     * Polls {@code listDir(dir)} until it equals {@code expected} or a 5s
+     * deadline elapses, then asserts the final state -- the manager worker
+     * provisions a fresh engine's hot-spare segment asynchronously (its own
+     * service pass, off the producer thread), so the slot dir is not
+     * guaranteed to hold its steady-state file set the instant a producer-side
+     * call returns. Same shape as the deadline loops in
+     * {@code DeltaDictRecoveryTest}.
+     */
+    private static void awaitExactFileSet(String dir, List<String> expected) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline && !expected.equals(listDir(dir))) {
+            Thread.sleep(20);
+        }
+        Assert.assertEquals("slot dir must settle to its steady-state file set "
+                        + "before it can be snapshotted",
+                expected, listDir(dir));
+    }
+
     /** Copies every file directly inside {@code dir} (by name -> bytes) for later {@link #restoreDir}. */
     private static Map<String, byte[]> snapshotDir(String dir) throws IOException {
         Map<String, byte[]> snapshot = new LinkedHashMap<>();
@@ -479,16 +533,6 @@ public class SymbolDictRecycleCrashWindowsTest {
         server.start();
         Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
         return server;
-    }
-
-    /**
-     * Mirrors {@code QwpWireTestUtils.tableCount} -- the wire header's table
-     * count, a little-endian uint16 at offset 6. That method is package-private
-     * and this suite lives one package below {@code QwpWireTestUtils}
-     * ({@code ...client.sf.cursor} vs {@code ...client}), so it cannot reach it.
-     */
-    private static int tableCount(byte[] frame) {
-        return (frame[6] & 0xFF) | ((frame[7] & 0xFF) << 8);
     }
 
     /** Directly stamps {@code <slotDir>/.ack-watermark}, mirroring DeltaDictRecoveryTest#writeAckWatermark. */
@@ -553,7 +597,7 @@ public class SymbolDictRecycleCrashWindowsTest {
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
             QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
-            if (tableCount(data) > 0) {
+            if (QwpWireTestUtils.tableCount(data) > 0) {
                 dataFrameCount++;
             }
             try {
