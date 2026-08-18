@@ -24,13 +24,19 @@
 
 package io.questdb.client.test;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QuestDB;
 import io.questdb.client.QuestDBBuilder;
+import io.questdb.client.Query;
+import io.questdb.client.Sender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 public class QuestDBBuilderTest {
@@ -76,6 +82,77 @@ public class QuestDBBuilderTest {
         try (QuestDB ignored = QuestDB.connect(
                 "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;")) {
             Assert.assertNotNull(ignored);
+        }
+    }
+
+    @Test
+    public void testConnectTokenProviderSuppliesBothPoolsAndPoolGrowth() throws Exception {
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
+            server.setSendServerInfo(true);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            AtomicInteger tokenCalls = new AtomicInteger();
+            HttpTokenProvider provider = () -> "ROTATING-" + tokenCalls.incrementAndGet();
+            String cfg = "ws::addr=localhost:" + server.getPort() + ";"
+                    + "sender_pool_min=1;sender_pool_max=2;"
+                    + "query_pool_min=1;query_pool_max=2;"
+                    + "auth_timeout_ms=2000;";
+
+            try (QuestDB db = QuestDB.connect(cfg, provider)) {
+                // Each prewarmed connection must obtain its own current token.
+                // Pool startup order is deliberately not part of the contract.
+                assertAuthorizationHeaders(
+                        server,
+                        "Bearer ROTATING-1",
+                        "Bearer ROTATING-2");
+
+                // Exhaust each prewarmed slot so the elastic pools grow. The
+                // newly created sender and query client must pull again rather
+                // than reuse either token captured during prewarm.
+                try (Sender sender1 = db.borrowSender(); Sender sender2 = db.borrowSender()) {
+                    Assert.assertNotNull(sender1);
+                    Assert.assertNotNull(sender2);
+                    assertAuthorizationHeaders(server, "Bearer ROTATING-3");
+                }
+                try (Query query1 = db.borrowQuery(); Query query2 = db.borrowQuery()) {
+                    Assert.assertNotNull(query1);
+                    Assert.assertNotNull(query2);
+                    assertAuthorizationHeaders(server, "Bearer ROTATING-4");
+                }
+            }
+            Assert.assertEquals(4, tokenCalls.get());
+        }
+    }
+
+    @Test
+    public void testTokenProviderRejectsFixedConfigCredentialsBeforePoolCreation() {
+        HttpTokenProvider provider = () -> "TOKEN";
+        assertTokenProviderAuthRejected(
+                "ws::addr=127.0.0.1:1;token=fixed;sender_pool_min=0;query_pool_min=0;",
+                provider);
+        assertTokenProviderAuthRejected(
+                "ws::addr=127.0.0.1:1;username=user;password=pass;sender_pool_min=0;query_pool_min=0;",
+                provider);
+    }
+
+    @Test
+    public void testTokenProviderRejectsNull() {
+        try {
+            QuestDB.builder().httpTokenProvider(null);
+            Assert.fail("expected a null provider to be rejected");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("must not be null"));
+        }
+
+        try {
+            QuestDB.connect(
+                    "ws::addr=127.0.0.1:1;sender_pool_min=0;query_pool_min=0;",
+                    null).close();
+            Assert.fail("expected a null provider to be rejected");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("must not be null"));
         }
     }
 
@@ -277,6 +354,32 @@ public class QuestDBBuilderTest {
             // as IllegalArgumentException -- both are RuntimeException.
             Assert.assertNotNull(e.getMessage());
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
+        }
+    }
+
+    private static void assertAuthorizationHeaders(
+            TestWebSocketServer server,
+            String... expected
+    ) throws InterruptedException {
+        Set<String> actual = new HashSet<>();
+        for (int i = 0; i < expected.length; i++) {
+            String header = server.pollAuthorizationHeader(5, TimeUnit.SECONDS);
+            Assert.assertNotNull("timed out waiting for an Authorization header", header);
+            Assert.assertTrue("duplicate Authorization header: " + header, actual.add(header));
+        }
+        Assert.assertEquals(Set.of(expected), actual);
+    }
+
+    private static void assertTokenProviderAuthRejected(String config, HttpTokenProvider provider) {
+        try {
+            QuestDB.builder()
+                    .fromConfig(config)
+                    .httpTokenProvider(provider)
+                    .build()
+                    .close();
+            Assert.fail("expected fixed credentials and the token provider to be mutually exclusive");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("cannot be combined"));
         }
     }
 

@@ -1,5 +1,6 @@
 package com.example.sender;
 
+import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 
@@ -28,17 +29,18 @@ public class OidcDeviceFlowExample {
         try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
             auth.signIn(); // sign in once (prompts on first use, then caches and refreshes silently)
 
-            // 1. Ingest with the QuestDB client over ILP-over-HTTP, presenting the token as a Bearer.
-            //    Pass a provider, not the fixed token, so a long-lived sender follows silent refreshes.
-            try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-                    .address("questdb.example.com:9000")
-                    .enableTls()
-                    .httpTokenProvider(auth::getToken)
-                    .build()) {
-                sender.table("trades")
-                        .symbol("symbol", "ETH-USD")
-                        .doubleColumn("price", 2615.54)
-                        .atNow();
+            // 1. Use one pooled QWP handle for ingest and queries. The provider is shared by both
+            //    pools and queried again on each reconnect, so long-lived clients follow silent refreshes.
+            try (QuestDB db = QuestDB.connect(
+                    "wss::addr=questdb.example.com:9000;",
+                    auth::getToken)) {
+                try (Sender sender = db.borrowSender()) {
+                    sender.table("trades")
+                            .symbol("symbol", "ETH-USD")
+                            .doubleColumn("price", 2615.54)
+                            .atNow();
+                }
+                // db.borrowQuery() uses the same rotating bearer-token provider.
             }
 
             // 2. Query the REST API directly: send the token in the Authorization header.

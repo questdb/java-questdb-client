@@ -28,30 +28,34 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.std.Chars;
 
 /**
- * Supplies an HTTP authentication token to a {@link Sender} on demand, so a provider returning a
- * freshly refreshed token - e.g. {@code OidcDeviceAuth::getToken} - keeps a long-lived sender
- * authenticated as the token rotates, without rebuilding it. Over HTTP the sender calls
- * {@link #getToken()} as it builds each request; over WebSocket it calls it once per connection
- * handshake, on the initial connect and again on every reconnect.
+ * Supplies an HTTP authentication token to a {@link Sender} or pooled {@link QuestDB} connection on
+ * demand, so a provider returning a freshly refreshed token - e.g. {@code OidcDeviceAuth::getToken}
+ * - keeps long-lived ingest and query connections authenticated as the token rotates, without
+ * rebuilding them. An HTTP sender calls {@link #getToken()} as it builds each request; WebSocket
+ * ingest and query clients call it once per connection handshake, on the initial connect and again
+ * on every reconnect.
  * <p>
- * {@link #getToken()} runs on the sender's flush and reconnect paths: it must return promptly and must
- * not block on interactive input. A quick silent token refresh is fine, but it must not start an
- * interactive sign-in; a provider that coordinates a shared token store across processes (for example
- * {@code OidcDeviceAuth} with a {@code FileTokenStore}) may add a brief, bounded wait to acquire that
- * store's cross-process lock before such a refresh, which still counts as a quick silent refresh. Note
- * that "quick" bounds the interactive wait, not the network: the silent refresh is a synchronous HTTP
- * round-trip to the token endpoint, and its connection phase (DNS, TCP connect, TLS) is bounded by the OS,
- * not by the client timeout - so a black-holed token endpoint can stall a refresh for the OS connect
- * timeout (commonly ~2 minutes on Linux). A producer sizing flush backpressure against this call should
- * expect that worst case. An exception from {@link #getToken()} fails the in-flight flush (HTTP) or the
- * connection attempt (WebSocket).
+ * {@link #getToken()} runs on HTTP flush and pooled connection/reconnection paths. Different pooled
+ * connections may call it concurrently, so implementations must be thread-safe. It must return
+ * promptly and must not block on interactive input. A quick silent token refresh is fine, but it must
+ * not start an interactive sign-in; a provider that coordinates a shared token store across processes
+ * (for example {@code OidcDeviceAuth} with a {@code FileTokenStore}) may add a brief, bounded wait to
+ * acquire that store's cross-process lock before such a refresh, which still counts as a quick silent
+ * refresh. Note that "quick" bounds the interactive wait, not the network: the silent refresh is a
+ * synchronous HTTP round-trip to the token endpoint, and its connection phase (DNS, TCP connect, TLS)
+ * is bounded by the OS, not by the client timeout - so a black-holed token endpoint can stall a refresh
+ * for the OS connect timeout (commonly ~2 minutes on Linux). A producer sizing flush backpressure
+ * against this call should expect that worst case. An exception from {@link #getToken()} fails the
+ * in-flight flush (HTTP) or the connection attempt (WebSocket).
  *
+ * @see QuestDB#connect(CharSequence, HttpTokenProvider)
+ * @see QuestDBBuilder#httpTokenProvider(HttpTokenProvider)
  * @see Sender.LineSenderBuilder#httpTokenProvider(HttpTokenProvider)
  */
 @FunctionalInterface
 public interface HttpTokenProvider {
     /**
-     * Validates a token returned by {@link #getToken()} before the sender writes it into an
+     * Validates a token returned by {@link #getToken()} before the client writes it into an
      * {@code Authorization: Bearer} header. Rejects a null, empty or blank token, and any token
      * carrying a control or non-ASCII character (outside {@code 0x20}-{@code 0x7e}): a real bearer
      * token is printable ASCII, so a stray CR/LF (which would inject into the HTTP request line) or a
@@ -76,9 +80,9 @@ public interface HttpTokenProvider {
     }
 
     /**
-     * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the sender
+     * Returns the current HTTP authentication token, without the {@code "Bearer "} prefix (the client
      * adds it). Must not return null or empty, and must contain only printable ASCII (no control or
-     * non-ASCII characters) - the sender splices the value verbatim into an {@code Authorization:
+     * non-ASCII characters) - the client splices the value verbatim into an {@code Authorization:
      * Bearer} header and rejects a token that violates this (see {@link #validateToken(CharSequence)}).
      *
      * @return the current HTTP authentication token

@@ -392,6 +392,7 @@ For QuestDB Enterprise instances secured with OIDC, `OidcDeviceAuth` signs a use
 On first use it prints a verification URL and a short code, and opens the URL in your default browser when one is available; authorize there (or open the URL on any device, such as your phone), enter the code, and the token is cached in memory and refreshed silently on later calls.
 
 ```java
+import io.questdb.client.QuestDB;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 
@@ -399,23 +400,24 @@ import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
     auth.signIn(); // sign in once: prompts on first use, then caches and refreshes
 
-    // Pass a token provider, not a fixed string: the sender pulls a freshly refreshed token on each
-    // request, so a long-lived sender keeps working as the token rotates. getToken() refreshes
-    // silently and never prompts on the flush path.
-    try (Sender sender = Sender.builder(Sender.Transport.HTTP)
-            .address("questdb.example.com:9000")
-            .enableTls()
-            .httpTokenProvider(auth::getToken)
-            .build()) {
-        sender.table("trades")
-                .symbol("symbol", "ETH-USD")
-                .doubleColumn("price", 2615.54)
-                .atNow();
+    // The provider is shared by the ingest and query pools. It is queried for
+    // every initial WebSocket upgrade and reconnect, so both pools follow token
+    // rotation without putting a credential in the configuration string.
+    try (QuestDB db = QuestDB.connect(
+            "wss::addr=questdb.example.com:9000;",
+            auth::getToken)) {
+        try (Sender sender = db.borrowSender()) {
+            sender.table("trades")
+                    .symbol("symbol", "ETH-USD")
+                    .doubleColumn("price", 2615.54)
+                    .atNow();
+        }
+        // db.borrowQuery() uses the same provider for query connections.
     }
 }
 ```
 
-Prefer `httpTokenProvider(auth::getToken)` for a long-lived sender: it pulls a freshly refreshed token on every request, so the sender keeps working as the token rotates. A fixed `httpToken(token)` captures the token once, so a sender that outlives the token's lifetime starts failing with 401s. Either way, hand the token to the client through the builder (or the header/password fields below), not by embedding it in a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
+For a standalone sender, use `httpTokenProvider(auth::getToken)` for the same rotating-token behavior. A fixed `httpToken(token)` or `token=` connect-string value captures the token once, so a client that reconnects after that token expires starts failing authentication. Hand rotating credentials to the provider API, not a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
 
 By default the prompt prints the verification URL and code to `System.out` **and** tries to open the URL in your default browser. The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in — the URL and code are always printed too, so a remote or browserless process still works. To disable the browser launch for a whole process (a server, automation, CI), set the system property `-Dquestdb.client.oidc.open.browser=false`. To print only (no browser) for a single client, pass `DeviceCodePrompt.SYSTEM_OUT`; to render the challenge yourself (a clickable link or QR code in a notebook), pass any `DeviceCodePrompt`:
 

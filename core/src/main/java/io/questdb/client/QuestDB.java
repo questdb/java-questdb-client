@@ -79,6 +79,37 @@ public interface QuestDB extends Closeable {
     }
 
     /**
+     * Connects with a token supplied on demand for every initial WebSocket
+     * upgrade and reconnect. Use this overload for rotating credentials such
+     * as an OIDC device-flow token ({@code auth::getToken}); unlike a fixed
+     * {@code token=} value in the configuration string, the provider is queried
+     * again whenever either the ingest or query pool establishes a connection.
+     * <p>
+     * The caller owns the provider and anything it captures. In particular,
+     * this handle does not close an {@code OidcDeviceAuth}; declare/close the
+     * {@code QuestDB} handle before closing the auth object. The provider may be
+     * called concurrently by different pooled connections and must be
+     * thread-safe. Interactive sign-in must happen before this call when the
+     * pools connect eagerly because token providers run on connection paths and
+     * must not prompt.
+     * <p>
+     * The configuration must not contain {@code token}, {@code username}, or
+     * {@code password}; those fixed credentials are mutually exclusive with a
+     * token provider.
+     *
+     * @param configurationString a {@code ws}/{@code wss} config string
+     * @param tokenProvider       supplies the current bearer token without the
+     *                            {@code "Bearer "} prefix
+     * @return a connected QuestDB handle
+     */
+    static QuestDB connect(CharSequence configurationString, HttpTokenProvider tokenProvider) {
+        return builder()
+                .fromConfig(configurationString)
+                .httpTokenProvider(tokenProvider)
+                .build();
+    }
+
+    /**
      * Borrows a {@link Query} handle from the pool. The caller MUST call
      * {@link Query#close()} on the returned instance to release it back to the
      * pool (typically via try-with-resources). The handle leases one pooled

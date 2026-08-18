@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QueryException;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import org.jetbrains.annotations.TestOnly;
@@ -91,6 +92,7 @@ public final class QueryClientPool implements AutoCloseable {
     private final int maxSize;
     private final int minSize;
     private final AtomicInteger nextSlotIndex = new AtomicInteger();
+    private final HttpTokenProvider tokenProvider;
     private final Condition workerReleased;
     private volatile boolean closed;
     // Upper bound on the Query.close() drain wait; see
@@ -113,7 +115,7 @@ public final class QueryClientPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, null, null);
     }
 
     // Constructor exposing the connectHook seam. Production (QuestDBImpl) passes
@@ -131,7 +133,7 @@ public final class QueryClientPool implements AutoCloseable {
             Consumer<QwpQueryClient> connectHook
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, connectHook, null);
+                idleTimeoutMillis, maxLifetimeMillis, connectHook, null, null);
     }
 
     // Constructor exposing both the connectHook and startHook seams. Production
@@ -149,11 +151,27 @@ public final class QueryClientPool implements AutoCloseable {
             Consumer<QwpQueryClient> connectHook,
             Consumer<QueryWorker> startHook
     ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, connectHook, startHook, null);
+    }
+
+    QueryClientPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            Consumer<QwpQueryClient> connectHook,
+            Consumer<QueryWorker> startHook,
+            HttpTokenProvider tokenProvider
+    ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
             throw new IllegalArgumentException("invalid pool sizing: min=" + minSize + ", max=" + maxSize);
         }
         this.connectHook = connectHook != null ? connectHook : QwpQueryClient::connect;
         this.startHook = startHook != null ? startHook : QueryWorker::start;
+        this.tokenProvider = tokenProvider;
         this.configurationString = configurationString;
         this.minSize = minSize;
         this.maxSize = maxSize;
@@ -578,6 +596,9 @@ public final class QueryClientPool implements AutoCloseable {
     private QueryWorker createUnlocked() {
         QwpQueryClient client = QwpQueryClient.fromConfig(configurationString);
         try {
+            if (tokenProvider != null) {
+                client.withBearerTokenProvider(tokenProvider);
+            }
             connectHook.accept(client);
         } catch (Throwable e) {
             // Catch Throwable, not just RuntimeException: connect() runs a heavy
