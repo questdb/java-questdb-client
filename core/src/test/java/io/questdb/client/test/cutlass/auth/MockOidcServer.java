@@ -105,7 +105,16 @@ public class MockOidcServer implements Closeable {
     }
 
     public static MockResponse dribble() {
-        MockResponse response = new MockResponse(200, "", true);
+        return dribble(200);
+    }
+
+    /**
+     * A dribbled chunked body under an arbitrary status, so a test can drive the response-body read bound
+     * on the ERROR path (where the status is the verdict and the body is only detail) as well as on the
+     * success path.
+     */
+    public static MockResponse dribble(int status) {
+        MockResponse response = new MockResponse(status, "", true);
         response.dribble = true;
         return response;
     }
@@ -316,8 +325,10 @@ public class MockOidcServer implements Closeable {
             // recvOrDie makes progress (gets a byte) within its shrinking budget, so a client that only re-armed
             // a per-read timeout would loop forever, while one bounding the whole read aborts on its deadline.
             // A modest digit count keeps the accumulated chunk size within a long. Stop once the client aborts
-            // and closes the socket (the write throws).
-            out.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+            // and closes the socket (the write throws). The status is whatever the test asked dribble()
+            // for, so the same dribble drives the success path and the error path.
+            out.write(("HTTP/1.1 " + response.status + " STATUS\r\nContent-Type: application/json\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
             out.flush();
             try {
                 for (int i = 0; i < 100; i++) {

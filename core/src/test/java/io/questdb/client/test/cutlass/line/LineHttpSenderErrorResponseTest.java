@@ -30,6 +30,8 @@ import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
@@ -84,35 +86,83 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
-    public void testFlushResponseBodyDribbleAbortsOnRequestTimeout() throws Exception {
+    public void testDribbledBodyUnderA2xxDoesNotResendTheBatch() throws Exception {
         assertMemoryLeak(() -> {
             // A flush whose response BODY dribbles (chunked headers sent, then the chunk-size line one byte at
-            // a time, never completing) must abort the read on the configured request timeout: the no-arg
-            // recv() the flush uses now bounds the WHOLE body read, not each socket read. Drives that bound end
-            // to end over a real socket from a real flush (the Response classes are unit-tested in isolation;
-            // the ILP flush path - consumeChunkedResponse -> recv() - is covered here). Without the whole-read
-            // bound the dribble would re-arm the per-read timeout forever and this test would hit its @Test
-            // timeout.
-            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.dribble())) {
+            // a time, never completing) aborts the read on the configured request timeout: the no-arg recv()
+            // the flush uses bounds the WHOLE body read, not each socket read. Drives that bound end to end
+            // over a real socket from a real flush (the Response classes are unit-tested in isolation; the ILP
+            // flush path - consumeChunkedResponse -> recv() - is covered here). Without the whole-read bound
+            // the dribble would re-arm the per-read timeout forever and this test would hit its @Test timeout.
+            //
+            // The status here is 200, so the server ALREADY COMMITTED these rows. The abort must therefore not
+            // reach flush0's catch, which treats HttpClientException as a transport error and re-sends the
+            // whole batch - duplicate rows on data the server accepted, with a retry budget that keeps trying.
+            // The bound is what made this reachable at all: base re-armed per socket read, so a
+            // dribbling-but-progressing body never aborted here.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble();
+            })) {
                 try (Sender sender = Sender.builder(Sender.Transport.HTTP)
                         .address("127.0.0.1:" + server.port())
                         .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
                         .httpTimeoutMillis(1_000)                    // the whole-body-read bound the no-arg recv() applies
-                        .retryTimeoutMillis(0)                       // give up after the first aborted read, not retry to a deadline
+                        .retryTimeoutMillis(3_000)                   // a budget a re-send would visibly spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    sender.flush();
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // aborted on the ~1s whole-read bound. The mock dribbles for ~10s, so a per-read re-arm
+                    // would not abort until ~11s (then the 30s @Test timeout); the < 5s ceiling fails on that
+                    // path while giving the 1s bound generous CI headroom.
+                    Assert.assertTrue("returned too fast to be the 1s read bound: " + elapsedMillis + "ms", elapsedMillis >= 500);
+                    Assert.assertTrue("returned too slowly - re-armed per-read, or retried? " + elapsedMillis + "ms", elapsedMillis < 5_000);
+                    Assert.assertEquals("a committed batch must be sent exactly once; a drain failure after a "
+                            + "2xx must not re-send it", 1, requests.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDribbledBodyUnderAnErrorStatusStillSurfacesTheStatus() throws Exception {
+        assertMemoryLeak(() -> {
+            // The mirror of the 2xx case on the error path. The STATUS is the verdict; the body is only detail
+            // for the message. Reading that body can now abort on the whole-read bound, and if the abort
+            // escapes it reaches flush0's catch, which reclassifies a definitive 401 as a transport failure:
+            // the sender then burns the whole retry budget re-sending against an endpoint that will keep
+            // refusing, and finally reports "Connection Failed", with the real status nowhere in the message.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble(401);
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(3_000)
                         .disableAutoFlush()
                         .build()) {
                     sender.table("t").longColumn("v", 1L).atNow();
                     long startNanos = System.nanoTime();
                     try {
                         sender.flush();
-                        Assert.fail("expected the dribbled response-body read to abort the flush");
+                        Assert.fail("expected the 401 to surface");
                     } catch (LineSenderException e) {
                         long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
-                        // aborted on the ~1s whole-read bound. The mock dribbles for ~10s, so the old per-read
-                        // re-arm behavior would not abort until ~11s (then the 30s @Test timeout); the < 5s
-                        // ceiling fails on that path while giving the 1s bound generous CI headroom.
-                        Assert.assertTrue("aborted too fast to be the 1s read bound: " + elapsedMillis + "ms", elapsedMillis >= 500);
-                        Assert.assertTrue("aborted too slowly - re-armed per-read instead of bounding the whole read? " + elapsedMillis + "ms", elapsedMillis < 5_000);
+                        String msg = e.getMessage();
+                        Assert.assertTrue("the real status must reach the caller: " + msg,
+                                msg.contains("http-status=401"));
+                        Assert.assertFalse("a definitive 401 must not be reported as a transport failure: " + msg,
+                                msg.contains("Connection Failed"));
+                        Assert.assertTrue("a definitive status must not spend the retry budget: "
+                                + elapsedMillis + "ms", elapsedMillis < 3_000);
+                        Assert.assertEquals("a definitive status must not be retried", 1, requests.get());
                     }
                 }
             }

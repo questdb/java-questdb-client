@@ -743,9 +743,22 @@ public abstract class AbstractLineHttpSender implements Sender {
                     // still-progressing chunked body. This bounds each read, not the whole body cumulatively -
                     // fine here because the ILP server is trusted (unlike OidcDeviceAuth.parseBody, which also
                     // caps total bytes and wall-clock time against an untrusted identity provider).
-                    consumeChunkedResponse(response, actualTimeoutMillis); // if any
-                    if (keepAliveDisabled(response)) {
-                        // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
+                    // A 2xx IS the commit: the server already has these rows. Draining its response body
+                    // afterwards is only bookkeeping to keep the connection reusable, so a failure there must
+                    // not escape into the catch below, which treats HttpClientException as a transport error
+                    // and re-sends the whole batch -- duplicate rows on data the server accepted. Base could
+                    // not reach this, because recv() re-armed its timeout on every socket read and a
+                    // dribbling-but-progressing body never aborted; bounding the whole call means it now can.
+                    // On abort the body is left unconsumed, which would mis-frame the next response on this
+                    // connection, so drop the connection and report the flush as what it was: a success.
+                    boolean drained = true;
+                    try {
+                        consumeChunkedResponse(response, actualTimeoutMillis); // if any
+                    } catch (HttpClientException e) {
+                        drained = false;
+                    }
+                    // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
+                    if (!drained || keepAliveDisabled(response)) {
                         client.disconnect();
                     }
                     lastFlushFailed = false;
@@ -890,6 +903,23 @@ public abstract class AbstractLineHttpSender implements Sender {
     }
 
     private void throwOnHttpErrorResponse(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable, int timeoutMillis) {
+        // The STATUS is the verdict; the body is detail for the message. A body read that aborts must not
+        // escape into flush0's catch, which treats HttpClientException as a transport failure: a definitive
+        // 401/403/405 would be reclassified as a network error, retried for the whole retry budget, and
+        // finally surfaced as "Connection Failed: timed out reading the chunked response body" with the real
+        // status nowhere in it. Report the status we already have instead, and say the body was unreadable
+        // rather than inventing detail. LineSenderException is a sibling of HttpClientException, not a
+        // subclass, so the intended throw passes through this catch untouched.
+        try {
+            throwOnHttpErrorResponse0(statusCode, response, retryable, timeoutMillis);
+        } catch (HttpClientException e) {
+            client.disconnect();
+            throw new LineSenderException("Could not flush buffer: could not read the error response body", retryable)
+                    .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence()).put(']');
+        }
+    }
+
+    private void throwOnHttpErrorResponse0(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable, int timeoutMillis) {
         CharSequence statusAscii = statusCode.asAsciiCharSequence();
         if (Chars.equals("405", statusAscii)) {
             consumeChunkedResponse(response, timeoutMillis);
