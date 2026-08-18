@@ -81,7 +81,7 @@ public class SymbolDictRecycleStarvationTest {
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
                     sender.flush(); // unacked forever -- handler never releases
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
-                    Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                    Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeouts());
 
                     // Repeated table() calls, spread over time, must every one of
                     // them return fast: resetMaxWaitMillis<=0 is checked BEFORE the
@@ -102,8 +102,8 @@ public class SymbolDictRecycleStarvationTest {
                             ws.isResetArmed());
                     Assert.assertEquals("must never recycle -- the ring never drained and "
                                     + "blocking is disabled",
-                            0L, ws.getSymbolDictEpochForTest());
-                    Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            0L, ws.getSymbolDictEpoch());
+                    Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeouts());
 
                     // Release before the try-with-resources closes the sender below,
                     // or close()'s own drain would hang on this still-unacked batch --
@@ -187,9 +187,9 @@ public class SymbolDictRecycleStarvationTest {
                             elapsedMs < maxWaitMillis);
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals("recycle must have run exactly once",
-                            1L, ws.getSymbolDictEpochForTest());
+                            1L, ws.getSymbolDictEpoch());
                     Assert.assertEquals("a successful drain-and-recycle is not a timeout",
-                            0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            0L, ws.getSymbolDictResetStarvationTimeouts());
                 }
             }
         });
@@ -241,12 +241,12 @@ public class SymbolDictRecycleStarvationTest {
                     Assert.assertTrue("must not hang far past its own deadline, got " + elapsedMs + "ms",
                             elapsedMs < maxWaitMillis + 5_000);
                     Assert.assertEquals("a timed-out wait must record exactly one starvation timeout",
-                            1L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            1L, ws.getSymbolDictResetStarvationTimeouts());
                     Assert.assertTrue("timing out must not consume the arming -- the recycle is "
                                     + "still owed once the backlog eventually drains",
                             ws.isResetArmed());
                     Assert.assertEquals("no recycle happened -- only the wait gave up",
-                            0L, ws.getSymbolDictEpochForTest());
+                            0L, ws.getSymbolDictEpoch());
 
                     // At most one blocking wait per armed window: pendingRowCount is
                     // still 0 here (nothing added since the flush above) and the ring
@@ -264,7 +264,7 @@ public class SymbolDictRecycleStarvationTest {
                                     + "re-block, took " + secondElapsedMs + "ms",
                             secondElapsedMs < 100);
                     Assert.assertEquals("still just the one timeout from before",
-                            1L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            1L, ws.getSymbolDictResetStarvationTimeouts());
 
                     // Ingest continues: more rows can still be appended and flushed
                     // without the sender getting stuck.
@@ -287,9 +287,9 @@ public class SymbolDictRecycleStarvationTest {
                     Assert.assertFalse("the still-armed recycle must fire now that the backlog "
                                     + "has drained",
                             ws.isResetArmed());
-                    Assert.assertEquals(1L, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1L, ws.getSymbolDictEpoch());
                     Assert.assertEquals("draining later must not add another timeout",
-                            1L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            1L, ws.getSymbolDictResetStarvationTimeouts());
                 }
             }
         });
@@ -371,7 +371,7 @@ public class SymbolDictRecycleStarvationTest {
                                     + "healthy connection",
                             ws.isResetArmed());
                     Assert.assertEquals("a thrown wait is not a timeout",
-                            0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            0L, ws.getSymbolDictResetStarvationTimeouts());
                 } finally {
                     try {
                         sender.close();
@@ -430,8 +430,8 @@ public class SymbolDictRecycleStarvationTest {
                     Assert.assertTrue("must still be armed -- neither the wait nor the recycle ran",
                             ws.isResetArmed());
                     Assert.assertEquals("the futility guard is not a timeout",
-                            0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
-                    Assert.assertEquals(0L, ws.getSymbolDictEpochForTest());
+                            0L, ws.getSymbolDictResetStarvationTimeouts());
+                    Assert.assertEquals(0L, ws.getSymbolDictEpoch());
 
                     // Close the deferred group: commit, and wait for its ack.
                     ws.setDeferCommit(false);
@@ -445,9 +445,9 @@ public class SymbolDictRecycleStarvationTest {
                     Assert.assertFalse("the still-armed recycle must fire once the group is "
                                     + "committed and acked",
                             ws.isResetArmed());
-                    Assert.assertEquals(1L, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1L, ws.getSymbolDictEpoch());
                     Assert.assertEquals("no wait ever ran in this test",
-                            0L, ws.getSymbolDictResetStarvationTimeoutsForTest());
+                            0L, ws.getSymbolDictResetStarvationTimeouts());
                 }
             }
         });

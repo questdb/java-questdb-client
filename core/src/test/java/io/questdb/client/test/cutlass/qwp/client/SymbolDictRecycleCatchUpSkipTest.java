@@ -119,14 +119,14 @@ public class SymbolDictRecycleCatchUpSkipTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=3", ws.isResetArmed());
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Ring drained: this table() call recycles synchronously onto a fresh
                     // connection (2), a fresh (empty) engine/dictionary/epoch, and "c" is
                     // then the new epoch's own first symbol.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals("recycle must open a fresh connection",
                             2, server.handshakeCount());
 
@@ -229,7 +229,7 @@ public class SymbolDictRecycleCatchUpSkipTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Recycles synchronously on the producer thread for steps 1-6; step
                     // 7's reconnect just re-arms the ASYNC path -- the actual handshake
@@ -237,7 +237,7 @@ public class SymbolDictRecycleCatchUpSkipTest {
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm immediately (producer-side state)",
                             ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();

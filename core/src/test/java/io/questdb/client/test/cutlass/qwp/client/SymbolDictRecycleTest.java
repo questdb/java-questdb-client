@@ -90,7 +90,7 @@ public class SymbolDictRecycleTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // The ring is drained (everything acked) and no row is in
                     // progress, so this table() call must recycle synchronously.
@@ -103,7 +103,7 @@ public class SymbolDictRecycleTest {
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals("recycle must open a fresh connection",
                             2, server.handshakeCount());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
@@ -155,7 +155,7 @@ public class SymbolDictRecycleTest {
                     Assert.assertTrue("sender must keep working even though it can never recycle",
                             sender.awaitAckedFsn(fsn, 5_000));
                     Assert.assertEquals("no factory -> the recycle can never actually run",
-                            0, sender.getSymbolDictEpochForTest());
+                            0, sender.getSymbolDictEpoch());
                     Assert.assertTrue("stays armed forever -- nothing ever consumes the request",
                             sender.isResetArmed());
                 }
@@ -204,7 +204,7 @@ public class SymbolDictRecycleTest {
                     Assert.assertTrue("sender must keep working with no factory installed",
                             sender.awaitAckedFsn(fsn2, 5_000));
                     Assert.assertEquals("no factory -> the recycle can never actually run",
-                            0, sender.getSymbolDictEpochForTest());
+                            0, sender.getSymbolDictEpoch());
                     Assert.assertTrue("stays armed -- nothing ever consumes the threshold arming",
                             sender.isResetArmed());
                 } finally {
@@ -298,7 +298,7 @@ public class SymbolDictRecycleTest {
 
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals("recycle must open a fresh connection",
                             2, server.handshakeCount());
 

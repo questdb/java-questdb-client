@@ -55,7 +55,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * normally and NOT recycle, until that condition clears -- at which point
  * the still-armed request fires as a positive control in the same test.
  * Every test asserts both halves: no recycle (connection count and
- * {@code getSymbolDictEpochForTest()} unchanged) AND that ingestion keeps
+ * {@code getSymbolDictEpoch()} unchanged) AND that ingestion keeps
  * working (a row lands and gets acked) both before and after the eventual
  * recycle.
  */
@@ -94,13 +94,13 @@ public class SymbolDictRecycleRefusalTest {
                     long fsn1 = sender.flushAndGetSequence(); // ack withheld by the handler
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
                     Assert.assertEquals(1, server.handshakeCount());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     for (int i = 0; i < 5; i++) {
                         sender.table("t");
                         Assert.assertTrue("recycle must not fire while the arming batch is unacked",
                                 ws.isResetArmed());
-                        Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                        Assert.assertEquals(0, ws.getSymbolDictEpoch());
                         Assert.assertEquals(1, server.handshakeCount());
                         Thread.sleep(30);
                     }
@@ -113,7 +113,7 @@ public class SymbolDictRecycleRefusalTest {
 
                     sender.table("t");
                     Assert.assertFalse("recycle must fire once the backlog drains", ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals("recycle must open a fresh connection",
                             2, server.handshakeCount());
 
@@ -162,7 +162,7 @@ public class SymbolDictRecycleRefusalTest {
                     // lets execution fall through so a new row can be buffered.
                     sender.table("t");
                     Assert.assertTrue(ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // A third row, committed but never flushed: pendingRowCount=1,
                     // far under auto_flush_rows=10, so it stays buffered.
@@ -178,7 +178,7 @@ public class SymbolDictRecycleRefusalTest {
                         Assert.assertTrue("recycle must not fire while a row is buffered "
                                         + "unflushed, even with the ring otherwise drained",
                                 ws.isResetArmed());
-                        Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                        Assert.assertEquals(0, ws.getSymbolDictEpoch());
                         Assert.assertEquals(1, server.handshakeCount());
                         Thread.sleep(30);
                     }
@@ -192,7 +192,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertFalse("recycle must fire once the buffered batch is flushed "
                                     + "and acked",
                             ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
@@ -233,7 +233,7 @@ public class SymbolDictRecycleRefusalTest {
                     // into the dictionary immediately, yet the row itself stays
                     // in progress until atNow() runs.
                     sender.table("t").symbol("s", "a");
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Arm WHILE the row is in progress: pendingRowCount is still
                     // 0 (an in-progress row is not counted as pending), so the
@@ -246,7 +246,7 @@ public class SymbolDictRecycleRefusalTest {
                         sender.table("t"); // same name -- fast path would skip past everything
                         Assert.assertTrue("recycle must not fire while a row is in progress",
                                 ws.isResetArmed());
-                        Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                        Assert.assertEquals(0, ws.getSymbolDictEpoch());
                         Assert.assertEquals(1, server.handshakeCount());
                         Thread.sleep(20);
                     }
@@ -264,7 +264,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertTrue("the failed table-switch attempt must not have consumed "
                                     + "the arming",
                             ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
                     Assert.assertEquals(1, server.handshakeCount());
 
                     // Complete the row: ingestion still works after both refusals.
@@ -272,7 +272,7 @@ public class SymbolDictRecycleRefusalTest {
                     long fsn1 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("nothing yet consumed the arming", ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Positive control: with the row complete and the batch
                     // acked, the still-armed recycle fires on the next call.
@@ -280,7 +280,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertFalse("recycle must fire once the row completes and the ring "
                                     + "drains",
                             ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 2L).atNow();
@@ -329,7 +329,7 @@ public class SymbolDictRecycleRefusalTest {
                                         + "recycle fire -- the server withholds its ack until "
                                         + "the closing commit",
                                 ws.isResetArmed());
-                        Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                        Assert.assertEquals(0, ws.getSymbolDictEpoch());
                         Assert.assertEquals(1, server.handshakeCount());
                         Thread.sleep(30);
                     }
@@ -345,7 +345,7 @@ public class SymbolDictRecycleRefusalTest {
                     sender.table("t");
                     Assert.assertFalse("recycle must fire once the group is committed and acked",
                             ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
@@ -397,7 +397,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertTrue("a manual request arms immediately, independent of "
                                     + "connection state",
                             sender.isResetArmed());
-                    Assert.assertEquals(0, sender.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, sender.getSymbolDictEpoch());
                     Assert.assertEquals(0, server.handshakeCount());
 
                     // table()'s barrier check runs here while still pre-connect
@@ -406,7 +406,7 @@ public class SymbolDictRecycleRefusalTest {
                     sender.table("t").longColumn("v", 1L).atNow();
                     Assert.assertTrue("still armed -- deferred, not consumed",
                             sender.isResetArmed());
-                    Assert.assertEquals(0, sender.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, sender.getSymbolDictEpoch());
                     Assert.assertEquals(1, server.handshakeCount());
 
                     long fsn1 = sender.flushAndGetSequence();
@@ -414,7 +414,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertTrue("flush alone does not consume the arming -- only table() "
                                     + "does",
                             sender.isResetArmed());
-                    Assert.assertEquals(0, sender.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, sender.getSymbolDictEpoch());
 
                     // Positive control: now connected and drained, the
                     // deferred request executes on the next table() call.
@@ -422,7 +422,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertFalse("the deferred request must execute once connected and "
                                     + "drained",
                             sender.isResetArmed());
-                    Assert.assertEquals(1, sender.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, sender.getSymbolDictEpoch());
                     Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").longColumn("v", 2L).atNow();
@@ -488,7 +488,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertTrue(ws.isResetArmed());
                     sender.table("t"); // refused: row "c" is in progress
                     Assert.assertTrue(ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
                     Assert.assertEquals(1, server.handshakeCount());
 
                     // Discard the buffered row -- reset() drops the
@@ -503,7 +503,7 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertFalse("the armed swap fires once reset() clears the blocking "
                                     + "in-progress row",
                             ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(2, server.handshakeCount());
 
                     // Ingestion continues correctly post-swap: a fresh row

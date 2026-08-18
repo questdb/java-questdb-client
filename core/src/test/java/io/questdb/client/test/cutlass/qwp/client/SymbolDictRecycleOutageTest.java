@@ -110,7 +110,7 @@ public class SymbolDictRecycleOutageTest {
                     Assert.assertTrue("setup: the arming batch must be acked before the outage",
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Kill the connection AND the listener -- a real outage, not
                     // just a dropped socket the same server would re-accept
@@ -161,7 +161,7 @@ public class SymbolDictRecycleOutageTest {
 
                         Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                         Assert.assertEquals("recycle must complete despite the outage",
-                                1, ws.getSymbolDictEpochForTest());
+                                1, ws.getSymbolDictEpoch());
                         Assert.assertTrue("revived server must observe a fresh handshake",
                                 revived.handshakeCount() >= 1);
 
@@ -255,13 +255,13 @@ public class SymbolDictRecycleOutageTest {
                     long fsn1 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Recycle fires synchronously here, tearing down + rebuilding
                     // ONLY the foreground's own cursor engine/I/O loop.
                     sender.table("t").symbol("s", "post-c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-recycle row must land on the fresh connection",

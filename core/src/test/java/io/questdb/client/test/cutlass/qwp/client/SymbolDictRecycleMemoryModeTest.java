@@ -81,7 +81,7 @@ public class SymbolDictRecycleMemoryModeTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Ring drained, no row in progress: this table() call must
                     // recycle synchronously, exactly as in SF mode.
@@ -89,7 +89,7 @@ public class SymbolDictRecycleMemoryModeTest {
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals("recycle must open a fresh connection",
                             2, server.handshakeCount());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
@@ -144,7 +144,7 @@ public class SymbolDictRecycleMemoryModeTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("threshold=2 crossed well before the 4th symbol",
                             ws.isResetArmed());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Ring drained: the FIRST post-recycle table() call recycles
                     // synchronously, then the row it is building lands on the
@@ -154,7 +154,7 @@ public class SymbolDictRecycleMemoryModeTest {
                         sender.table("t").symbol("s", symbol).longColumn("v", 2L).atNow();
                         if (first) {
                             Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                            Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                            Assert.assertEquals(1, ws.getSymbolDictEpoch());
                             first = false;
                         }
                     }
@@ -229,7 +229,7 @@ public class SymbolDictRecycleMemoryModeTest {
                             sender.awaitAckedFsn(fsn1, 5_000));
                     Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
-                    Assert.assertEquals(0, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Ring drained: this table() call recycles synchronously on
                     // the producer thread for steps 1-6, but step 7's reconnect
@@ -241,7 +241,7 @@ public class SymbolDictRecycleMemoryModeTest {
                             ws.isResetArmed());
                     Assert.assertEquals("recycle must advance the epoch immediately (producer-side "
                                     + "state, not gated on the wire)",
-                            1, ws.getSymbolDictEpochForTest());
+                            1, ws.getSymbolDictEpoch());
 
                     // Don't gate on a connection counter here -- rows queue on
                     // the (memory-mode) cursor ring regardless of wire state in

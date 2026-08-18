@@ -454,6 +454,13 @@ public class QwpWebSocketSender implements Sender {
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits.
     private long symbolDictEpoch;
+    // Incremented once per completed symbol-dictionary recycle swap, beside
+    // symbolDictEpoch (recycleForDictReset step 5). The two move together
+    // today -- the only way symbolDictEpoch advances is through a committed
+    // recycle swap -- but they count different things (dictionary generation
+    // vs. completed swaps) and are incremented independently in case a
+    // future change ever rolls the epoch by some path other than a recycle.
+    private long symbolDictResetsPerformed;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -2136,20 +2143,41 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Number of symbol-dictionary recycles this sender has completed.
-     * Incremented by {@link #recycleForDictReset()} once the swap commits.
+     * Number of symbol-dictionary recycles this sender has completed. Advances
+     * by one at step 5 of {@link #recycleForDictReset()}, the instant the swap
+     * commits to the new epoch -- before the engine rebuild (step 6) or the
+     * reconnect (step 7), so a later rebuild/reconnect failure that latches
+     * {@link #recycleFailure} still leaves this incremented. Not synchronized:
+     * like the other symbol-dictionary-recycle fields, it is written only from
+     * the producer thread inside {@code recycleForDictReset()}, so a read from
+     * any other thread is an eventually-consistent snapshot, not a
+     * linearizable one.
      */
-    @TestOnly
-    public long getSymbolDictEpochForTest() {
+    public long getSymbolDictEpoch() {
         return symbolDictEpoch;
     }
 
     /**
-     * Number of times {@link #maybeBlockForStarvedReset()} has timed out
-     * without the backlog draining. 0 until the first such timeout.
+     * Number of symbol-dictionary recycle swaps this sender has completed.
+     * Incremented alongside {@link #getSymbolDictEpoch()} at step 5 of
+     * {@link #recycleForDictReset()}. The two counts move together today --
+     * the only way the epoch advances is through a completed recycle swap --
+     * but they are defined, and incremented, independently: this one counts
+     * completed swaps, {@code getSymbolDictEpoch()} counts the dictionary
+     * generation. They would diverge if a future change ever rolled the epoch
+     * by some path other than a recycle swap. Same thread-safety caveat as
+     * {@link #getSymbolDictEpoch()}.
      */
-    @TestOnly
-    public long getSymbolDictResetStarvationTimeoutsForTest() {
+    public long getSymbolDictResetsPerformed() {
+        return symbolDictResetsPerformed;
+    }
+
+    /**
+     * Number of times {@link #maybeBlockForStarvedReset()} has timed out
+     * without the backlog draining. 0 until the first such timeout. Same
+     * thread-safety caveat as {@link #getSymbolDictEpoch()}.
+     */
+    public long getSymbolDictResetStarvationTimeouts() {
         return symbolDictResetStarvationTimeouts;
     }
 
@@ -4694,7 +4722,8 @@ public class QwpWebSocketSender implements Sender {
      *       (replaced, not cleared -- nothing else retains the old instance),
      *       both symbol-id watermarks reset, {@code lastCommitBoundaryFsn}
      *       reset (it held a raw old-epoch FSN that does not survive the
-     *       roll), the epoch counter advanced, and the arming flags consumed.</li>
+     *       roll), the epoch counter and the completed-swap counter both
+     *       advanced, and the arming flags consumed.</li>
      *   <li>Rebuild the cursor engine on the now-empty slot via
      *       {@link #engineRebuildFactory}, the identical construct path
      *       {@code Sender.build()} uses. {@code deltaDictEnabled} is re-derived
@@ -4735,6 +4764,7 @@ public class QwpWebSocketSender implements Sender {
             currentBatchMaxSymbolId = -1;
             lastCommitBoundaryFsn = -1L;
             symbolDictEpoch++;
+            symbolDictResetsPerformed++;
             resetArmed = false;
             manualResetRequested = false;
             // step 6: rebuild the engine on the now-empty slot

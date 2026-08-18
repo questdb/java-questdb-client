@@ -274,7 +274,7 @@ public class SymbolDictRecycleCrashWindowsTest {
                     // so steps 1-7 run to completion with nothing left pending to flush.
                     sender.table("t");
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     // close() below: the fresh engine has published nothing, so
                     // close(boolean)'s "never published" check (CursorSendEngine's
                     // publishedFsn() < 0 branch) classifies it fully-drained too --
@@ -345,7 +345,7 @@ public class SymbolDictRecycleCrashWindowsTest {
 
                     sender.table("t"); // bare call: drives steps 1-7, nothing left pending
                     Assert.assertFalse(ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     // The manager worker provisions the fresh engine's hot-spare
                     // segment asynchronously (its own service pass, off the
@@ -431,7 +431,7 @@ public class SymbolDictRecycleCrashWindowsTest {
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     Assert.assertFalse(ws.isResetArmed());
-                    Assert.assertEquals(1, ws.getSymbolDictEpochForTest());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     sender.flushAndGetSequence();
                     // Not drained (connection 2 never acks): close_flush_timeout_millis=0
                     // returns immediately without unlinking, preserving c, d's segment
