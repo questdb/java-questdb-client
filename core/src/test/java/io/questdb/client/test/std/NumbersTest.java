@@ -271,28 +271,28 @@ public class NumbersTest {
     }
 
     @Test
-    public void testParseHexLongChecked() {
+    public void testParseHexLongRejectsOverflowRatherThanWrapping() {
         // the boundary itself must be accepted...
-        assertEquals(Long.MAX_VALUE, Numbers.parseHexLongChecked("7fffffffffffffff"));
-        assertEquals(0L, Numbers.parseHexLongChecked("0"));
-        assertEquals(0xacL, Numbers.parseHexLongChecked("ac"));
+        assertEquals(Long.MAX_VALUE, Numbers.parseHexLong("7fffffffffffffff"));
+        assertEquals(0L, Numbers.parseHexLong("0"));
+        assertEquals(0xacL, Numbers.parseHexLong("ac"));
         // ...and leading zeros must not be mistaken for magnitude
-        assertEquals(1L, Numbers.parseHexLongChecked("000000000000000000001"));
+        assertEquals(1L, Numbers.parseHexLong("000000000000000000001"));
         // range form
-        assertEquals(0xf0L, Numbers.parseHexLongChecked("xxF0yy", 2, 4));
+        assertEquals(0xf0L, Numbers.parseHexLong("xxF0yy", 2, 4));
 
         // ...while everything past it is rejected rather than wrapped. The three residues matter
-        // separately: unchecked accumulation turns them into a negative size, a zero (which an HTTP chunk
-        // parser reads as the terminal chunk, truncating the body) and a short positive count.
+        // separately: unchecked accumulation turned them into a negative value, a zero (which the HTTP
+        // chunk parser reads as the terminal chunk, truncating the body) and a short positive count.
         assertHexLongRejected("8000000000000000");  // negative residue, and the smallest overflow
-        assertHexLongRejected("ffffffffffffffff");  // the full 64-bit word parseHexLong returns as -1
         assertHexLongRejected("10000000000000000"); // zero residue
         assertHexLongRejected("10000000000000001"); // positive residue
         assertHexLongRejected("");
 
-        // parseHexLong is deliberately left wrapping: reading a 16-digit sequence as a two's-complement
-        // 64-bit word is a legitimate use, and it is exported API.
-        assertEquals(-1L, Numbers.parseHexLong("ffffffffffffffff"));
+        // The deliberate cost of the check: a full-width word with the high bit set used to read as -1 and
+        // is now rejected. Nothing in this library parsed one, and a caller wanting two's-complement
+        // wrap-around has to accumulate it itself.
+        assertHexLongRejected("ffffffffffffffff");
     }
 
     @Test
@@ -739,7 +739,7 @@ public class NumbersTest {
 
     private static void assertHexLongRejected(String hex) {
         try {
-            long parsed = Numbers.parseHexLongChecked(hex);
+            long parsed = Numbers.parseHexLong(hex);
             Assert.fail("expected [" + hex + "] to be rejected, got " + parsed);
         } catch (NumericException expected) {
         }

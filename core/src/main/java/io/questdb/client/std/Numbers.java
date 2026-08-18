@@ -343,56 +343,34 @@ public final class Numbers {
         return parseHexLong(sequence, 0, sequence.length());
     }
 
-    public static long parseHexLong(CharSequence sequence, int lo, int hi) throws NumericException {
-        if (hi == 0) {
-            throw NumericException.instance().put("empty hex string");
-        }
-
-        long val = 0;
-        long r;
-        for (int i = lo; i < hi; i++) {
-            int c = sequence.charAt(i);
-            long n = val << 4;
-            r = n + hexToDecimal(c);
-            val = r;
-        }
-        return val;
-    }
-
     /**
      * Parses a hexadecimal sequence into a NON-NEGATIVE long, rejecting anything above
-     * {@link Long#MAX_VALUE} instead of silently wrapping.
+     * {@link Long#MAX_VALUE} rather than wrapping.
      * <p>
-     * {@link #parseHexLong(CharSequence, int, int)} accumulates {@code val << 4} unchecked, so it reads a
-     * 16-digit sequence as a two's-complement 64-bit word (a legitimate use, and why that method is left
-     * alone) and quietly discards the high bits of anything longer. Wrapping is indefensible wherever the
-     * digits are a COUNT chosen by a remote peer: an HTTP chunk size of {@code 10000000000000000} wraps to
-     * zero and reads as the terminal chunk, truncating the response, while other lengths wrap to short
-     * positive counts that mis-frame everything after them.
-     *
-     * @param sequence the characters to parse
-     * @return the parsed value, in {@code [0, Long.MAX_VALUE]}
-     * @throws NumericException if the sequence is empty, holds a non-hex character, or denotes a value above
-     *                          {@link Long#MAX_VALUE}
-     */
-    public static long parseHexLongChecked(CharSequence sequence) throws NumericException {
-        return parseHexLongChecked(sequence, 0, sequence.length());
-    }
-
-    /**
-     * Range form of {@link #parseHexLongChecked(CharSequence)}.
+     * This used to accumulate {@code val << 4} unchecked, which silently discarded the high bits of any
+     * sequence long enough to overflow. That is indefensible wherever the digits are a COUNT chosen by a
+     * remote peer, and every residue is wrong in its own way: an HTTP chunk size of
+     * {@code 8000000000000000} wrapped negative and hung the framing state machine, one of
+     * {@code 10000000000000000} wrapped to zero and read as the terminal chunk (a truncated body reported
+     * as complete), and longer values wrapped to short positive counts that mis-framed everything after
+     * them.
+     * <p>
+     * The cost of the check is that a full-width 16-digit word with the high bit set -- {@code
+     * ffffffffffffffff}, previously read as {@code -1} -- is now rejected. Nothing in this library parsed
+     * one; a caller that wants two's-complement wrap-around must do its own accumulation.
      *
      * @param sequence the characters to parse
      * @param lo       inclusive start
      * @param hi       exclusive end
      * @return the parsed value, in {@code [0, Long.MAX_VALUE]}
-     * @throws NumericException if the range is empty, holds a non-hex character, or denotes a value above
-     *                          {@link Long#MAX_VALUE}
+     * @throws NumericException if the sequence is empty, holds a non-hex character, or denotes a value
+     *                          above {@link Long#MAX_VALUE}
      */
-    public static long parseHexLongChecked(CharSequence sequence, int lo, int hi) throws NumericException {
-        if (hi <= lo) {
+    public static long parseHexLong(CharSequence sequence, int lo, int hi) throws NumericException {
+        if (hi == 0) {
             throw NumericException.instance().put("empty hex string");
         }
+
         long val = 0;
         for (int i = lo; i < hi; i++) {
             int digit = hexToDecimal(sequence.charAt(i));

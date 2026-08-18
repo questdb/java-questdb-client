@@ -147,18 +147,16 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                         // at this stage we consumed the chunk size end (CRLF)
                         chunkSize.of(dataLo, res + 1);
                         try {
-                            // Checked, not parseHexLong: that one accumulates val << 4 unchecked, so a
-                            // chunk-size line of 16 or more hex digits wraps, and every residue is wrong in
-                            // its own way. A negative one (8000000000000000 is the smallest) matches neither
-                            // the "size > 0" data branch nor the "size == 0" terminator below, so the state
-                            // machine loops on it forever. Zero (10000000000000000) reads as the TERMINAL
-                            // chunk, so the response is truncated and the connection's framing is lost for
-                            // the next keep-alive response. A positive residue frames a short data chunk and
-                            // mis-reads everything after it. Rejecting only the negative case left the two
-                            // quiet ones -- which are the dangerous ones, since they look like success. The
-                            // size line is chosen by the server, which for an OIDC discovery or token
-                            // response is untrusted.
-                            size = Numbers.parseHexLongChecked(chunkSize.asAsciiCharSequence());
+                            // parseHexLong rejects an overflowing size rather than wrapping it, so nothing
+                            // is needed here beyond catching NumericException below. Each residue used to
+                            // break framing its own way: a negative one (8000000000000000 is the smallest)
+                            // matched neither the "size > 0" data branch nor the "size == 0" terminator
+                            // below, so the state machine looped on it forever; zero (10000000000000000)
+                            // read as the TERMINAL chunk, truncating the response and losing framing for
+                            // the next keep-alive response on the connection; a positive residue framed a
+                            // short data chunk and mis-read everything after it. The size line is chosen by
+                            // the server, which for an OIDC discovery or token response is untrusted.
+                            size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
                             consumed = 0;
                             // consume data buffer ignoring chunk size value and its furniture
                             state = STATE_CHUNK_DATA;
