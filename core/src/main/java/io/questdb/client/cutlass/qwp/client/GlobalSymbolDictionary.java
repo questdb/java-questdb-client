@@ -155,7 +155,8 @@ public class GlobalSymbolDictionary {
                             + ". Rows using already-registered symbol values continue to work. To start a fresh "
                             + "dictionary, close this sender and build a new one (with store-and-forward the "
                             + "buffered backlog drains first). For unbounded-cardinality data use varchar "
-                            + "columns instead of symbol");
+                            + "columns instead of symbol. Alternatively enable the automatic dictionary reset "
+                            + "(symbol_dict_reset, symbol_dict_reset_threshold) or call Sender.resetSymbolDictionary().");
         }
 
         // Assign new ID — toString() only for new symbols that must be stored

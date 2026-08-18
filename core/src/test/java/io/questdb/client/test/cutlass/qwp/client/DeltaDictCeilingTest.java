@@ -45,7 +45,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 /**
  * The producer-side dictionary cap ({@code MAX_SYMBOL_DICTIONARY_SIZE}) as the
  * application sees it: {@code symbol()} with a value that would create the
- * 1,000,001st distinct entry throws BEFORE the row is buffered, the row is
+ * 2,000,001st distinct entry throws BEFORE the row is buffered, the row is
  * cancellable, and the sender keeps working with already-registered values --
  * the wire never carries the refused symbol.
  */
@@ -76,7 +76,7 @@ public class DeltaDictCeilingTest {
                         sender.table("t").symbol("s", "one-too-many");
                         Assert.fail("expected LineSenderException past the dictionary cap");
                     } catch (LineSenderException expected) {
-                        Assert.assertTrue(expected.getMessage().contains("1000000"));
+                        Assert.assertTrue(expected.getMessage().contains(String.valueOf(MAX_SYMBOL_DICTIONARY_SIZE)));
                     }
                     Assert.assertEquals("the refusal must not have grown the dictionary",
                             MAX_SYMBOL_DICTIONARY_SIZE, dict.size());
@@ -94,6 +94,47 @@ public class DeltaDictCeilingTest {
                 Assert.assertEquals(2, wireDict.size());
                 Assert.assertEquals("f0", wireDict.get(0));
                 Assert.assertEquals("f1", wireDict.get(1));
+            }
+        });
+    }
+
+    /**
+     * A threshold configured AT the cap, with automatic reset DISABLED, must
+     * behave exactly like the undecorated cap: the refusal still fires, and
+     * its message still names the reset valve even though this particular
+     * sender has it switched off -- the valve is documented for senders that
+     * want it, not conditioned on this sender having chosen it.
+     */
+    @Test
+    public void testCapReachedWithResetDisabledStillThrowsAndNamesTheResetValve() throws Exception {
+        assertMemoryLeak(() -> {
+            AckAllHandler handler = new AckAllHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
+                        + ";symbol_dict_reset=off;symbol_dict_reset_threshold=" + MAX_SYMBOL_DICTIONARY_SIZE + ";")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    GlobalSymbolDictionary dict = ws.getGlobalSymbolDictionaryForTest();
+                    for (int i = 0; i < MAX_SYMBOL_DICTIONARY_SIZE; i++) {
+                        dict.getOrAddSymbol("f" + i);
+                    }
+                    Assert.assertFalse("reset disabled must never arm", ws.isResetArmed());
+
+                    try {
+                        sender.table("t").symbol("s", "one-too-many");
+                        Assert.fail("expected LineSenderException past the dictionary cap");
+                    } catch (LineSenderException expected) {
+                        String message = expected.getMessage();
+                        Assert.assertTrue("message names the limit: " + message,
+                                message.contains(String.valueOf(MAX_SYMBOL_DICTIONARY_SIZE)));
+                        Assert.assertTrue("message points at the reset valve: " + message,
+                                message.contains("symbol_dict_reset") && message.contains("resetSymbolDictionary()"));
+                    }
+                    Assert.assertFalse("still not armed after the refusal", ws.isResetArmed());
+                }
             }
         });
     }

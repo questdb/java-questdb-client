@@ -93,7 +93,7 @@ public final class QwpConstants {
      * NOT the result-direction cap: {@code QwpResultBatchDecoder.MAX_CONN_DICT_SIZE}
      * (8,388,608) governs server-to-client result batches and is unrelated.
      */
-    public static final int MAX_SYMBOL_DICTIONARY_SIZE = 1_000_000;
+    public static final int MAX_SYMBOL_DICTIONARY_SIZE = 2_000_000;
     /**
      * Maximum table name length in bytes. Mirrors the server's same-named
      * constant; used by the decoder to reject malformed wire bytes.
