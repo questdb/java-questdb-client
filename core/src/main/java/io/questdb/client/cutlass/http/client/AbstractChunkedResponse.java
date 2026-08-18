@@ -147,16 +147,18 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
                         // at this stage we consumed the chunk size end (CRLF)
                         chunkSize.of(dataLo, res + 1);
                         try {
-                            size = Numbers.parseHexLong(chunkSize.asAsciiCharSequence());
-                            if (size < 0) {
-                                // parseHexLong accumulates val << 4 with no overflow check, so a chunk-size
-                                // line of 16 or more hex digits (8000000000000000 is the smallest) wraps to a
-                                // negative value. A negative size matches neither the "size > 0" data branch
-                                // nor the "size == 0" terminator below, so the state machine would loop on it
-                                // forever - and the size line is chosen by the server, which for an OIDC
-                                // discovery or token response is untrusted. Reject it as malformed.
-                                throw new HttpClientException("malformed chunk size");
-                            }
+                            // Checked, not parseHexLong: that one accumulates val << 4 unchecked, so a
+                            // chunk-size line of 16 or more hex digits wraps, and every residue is wrong in
+                            // its own way. A negative one (8000000000000000 is the smallest) matches neither
+                            // the "size > 0" data branch nor the "size == 0" terminator below, so the state
+                            // machine loops on it forever. Zero (10000000000000000) reads as the TERMINAL
+                            // chunk, so the response is truncated and the connection's framing is lost for
+                            // the next keep-alive response. A positive residue frames a short data chunk and
+                            // mis-reads everything after it. Rejecting only the negative case left the two
+                            // quiet ones -- which are the dangerous ones, since they look like success. The
+                            // size line is chosen by the server, which for an OIDC discovery or token
+                            // response is untrusted.
+                            size = Numbers.parseHexLongChecked(chunkSize.asAsciiCharSequence());
                             consumed = 0;
                             // consume data buffer ignoring chunk size value and its furniture
                             state = STATE_CHUNK_DATA;

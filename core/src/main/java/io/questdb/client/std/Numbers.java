@@ -359,6 +359,54 @@ public final class Numbers {
         return val;
     }
 
+    /**
+     * Parses a hexadecimal sequence into a NON-NEGATIVE long, rejecting anything above
+     * {@link Long#MAX_VALUE} instead of silently wrapping.
+     * <p>
+     * {@link #parseHexLong(CharSequence, int, int)} accumulates {@code val << 4} unchecked, so it reads a
+     * 16-digit sequence as a two's-complement 64-bit word (a legitimate use, and why that method is left
+     * alone) and quietly discards the high bits of anything longer. Wrapping is indefensible wherever the
+     * digits are a COUNT chosen by a remote peer: an HTTP chunk size of {@code 10000000000000000} wraps to
+     * zero and reads as the terminal chunk, truncating the response, while other lengths wrap to short
+     * positive counts that mis-frame everything after them.
+     *
+     * @param sequence the characters to parse
+     * @return the parsed value, in {@code [0, Long.MAX_VALUE]}
+     * @throws NumericException if the sequence is empty, holds a non-hex character, or denotes a value above
+     *                          {@link Long#MAX_VALUE}
+     */
+    public static long parseHexLongChecked(CharSequence sequence) throws NumericException {
+        return parseHexLongChecked(sequence, 0, sequence.length());
+    }
+
+    /**
+     * Range form of {@link #parseHexLongChecked(CharSequence)}.
+     *
+     * @param sequence the characters to parse
+     * @param lo       inclusive start
+     * @param hi       exclusive end
+     * @return the parsed value, in {@code [0, Long.MAX_VALUE]}
+     * @throws NumericException if the range is empty, holds a non-hex character, or denotes a value above
+     *                          {@link Long#MAX_VALUE}
+     */
+    public static long parseHexLongChecked(CharSequence sequence, int lo, int hi) throws NumericException {
+        if (hi <= lo) {
+            throw NumericException.instance().put("empty hex string");
+        }
+        long val = 0;
+        for (int i = lo; i < hi; i++) {
+            int digit = hexToDecimal(sequence.charAt(i));
+            // Test BEFORE shifting: the shift is what loses the high bits, so afterwards there is nothing
+            // left to detect. val*16 + digit <= MAX_VALUE  <=>  val <= (MAX_VALUE - digit) >> 4, and both
+            // sides stay non-negative, so this cannot itself overflow.
+            if (val > (Long.MAX_VALUE - digit) >> 4) {
+                throw NumericException.instance().put("hex value exceeds Long.MAX_VALUE");
+            }
+            val = (val << 4) + digit;
+        }
+        return val;
+    }
+
     public static int parseIPv4(CharSequence sequence) throws NumericException {
         if (sequence == null || Chars.equalsIgnoreCase("null", sequence)) {
             return IPv4_NULL;

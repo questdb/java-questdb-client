@@ -271,6 +271,31 @@ public class NumbersTest {
     }
 
     @Test
+    public void testParseHexLongChecked() {
+        // the boundary itself must be accepted...
+        assertEquals(Long.MAX_VALUE, Numbers.parseHexLongChecked("7fffffffffffffff"));
+        assertEquals(0L, Numbers.parseHexLongChecked("0"));
+        assertEquals(0xacL, Numbers.parseHexLongChecked("ac"));
+        // ...and leading zeros must not be mistaken for magnitude
+        assertEquals(1L, Numbers.parseHexLongChecked("000000000000000000001"));
+        // range form
+        assertEquals(0xf0L, Numbers.parseHexLongChecked("xxF0yy", 2, 4));
+
+        // ...while everything past it is rejected rather than wrapped. The three residues matter
+        // separately: unchecked accumulation turns them into a negative size, a zero (which an HTTP chunk
+        // parser reads as the terminal chunk, truncating the body) and a short positive count.
+        assertHexLongRejected("8000000000000000");  // negative residue, and the smallest overflow
+        assertHexLongRejected("ffffffffffffffff");  // the full 64-bit word parseHexLong returns as -1
+        assertHexLongRejected("10000000000000000"); // zero residue
+        assertHexLongRejected("10000000000000001"); // positive residue
+        assertHexLongRejected("");
+
+        // parseHexLong is deliberately left wrapping: reading a 16-digit sequence as a two's-complement
+        // 64-bit word is a legitimate use, and it is exported API.
+        assertEquals(-1L, Numbers.parseHexLong("ffffffffffffffff"));
+    }
+
+    @Test
     public void testIntEdge() {
         Numbers.append(sink, Integer.MAX_VALUE);
         assertEquals(Integer.MAX_VALUE, Numbers.parseInt(sink));
@@ -709,6 +734,14 @@ public class NumbersTest {
             Numbers.parseLong(input);
             Assert.fail();
         } catch (NumericException ignore) {
+        }
+    }
+
+    private static void assertHexLongRejected(String hex) {
+        try {
+            long parsed = Numbers.parseHexLongChecked(hex);
+            Assert.fail("expected [" + hex + "] to be rejected, got " + parsed);
+        } catch (NumericException expected) {
         }
     }
 }

@@ -221,19 +221,51 @@ public class ChunkedResponseTest {
 
     @Test(timeout = 30_000)
     public void testOverflowingChunkSizeIsRejectedRatherThanSpun() {
-        // A chunk-size line of 16 or more hex digits overflows Numbers.parseHexLong (val << 4, unchecked)
-        // to a NEGATIVE size, which matches neither the "size > 0" data branch nor the "size == 0"
-        // terminator - so the state machine breaks straight back to the top of the loop. The preceding
-        // chunk left receive == false with bytes still buffered, so the read gate is skipped too, and the
-        // loop spins with nothing to stop it. defaultTimeout is -1 here on purpose: no deadline can rescue
-        // this call, so the test passes only because the size itself is rejected. The server chooses that
-        // size line, and for a discovery or token response that server is untrusted.
+        // A chunk-size line of 16 or more hex digits overflows an unchecked val << 4 accumulation, and the
+        // residue decides how the damage shows up. All three must be rejected; only the first one was.
+        //
+        //   8000000000000000  -> NEGATIVE. Matches neither the "size > 0" data branch nor the "size == 0"
+        //                        terminator, so the state machine breaks straight back to the top of the
+        //                        loop. The preceding chunk left receive == false with bytes still buffered,
+        //                        so the read gate is skipped too and the loop spins with nothing to stop it.
+        //   10000000000000000 -> ZERO, and 10000000000000001 -> 1; both report success with the wrong
+        //                        bytes, and get their own tests below. Rejecting only the negative case
+        //                        left those two, which are the dangerous ones: a spin is at least visible,
+        //                        whereas truncated JSON parses.
+        //
+        // defaultTimeout is -1 on purpose, so no deadline can rescue the spinning case and the test passes
+        // only because the size itself is rejected. The server chooses that size line, and for a discovery
+        // or token response that server is untrusted.
+        // a trailing byte keeps dataLo < dataHi so the read gate stays shut and the spin is reachable
+        assertChunkSizeRejected("8000000000000000", "X", "negative overflow residue");
+    }
+
+    @Test(timeout = 30_000)
+    public void testZeroWrappingChunkSizeIsRejectedRatherThanTruncating() {
+        // 10000000000000000 wraps to ZERO, which the state machine reads as the terminal chunk: recv()
+        // returns null and the caller sees a complete-looking body that is actually truncated. Worse than
+        // the spin the negative residue causes, because nothing looks wrong -- truncated JSON parses, and
+        // the connection's framing is lost for the next keep-alive response on it. The size line is chosen
+        // by the server, untrusted for an OIDC discovery or token response.
+        // A proper CRLF terminator here, so the pre-fix parser really does complete the body rather than
+        // stall waiting for one.
+        assertChunkSizeRejected("10000000000000000", "\r\n", "zero overflow residue");
+    }
+
+    @Test(timeout = 30_000)
+    public void testPositiveWrappingChunkSizeIsRejectedRatherThanMisframing() {
+        // 10000000000000001 wraps to 1: a one-byte data chunk that frames the following bytes as chunk
+        // furniture. Like the zero residue this reports success, just with the wrong bytes.
+        assertChunkSizeRejected("10000000000000001", "X", "positive overflow residue");
+    }
+
+    private static void assertChunkSizeRejected(String sizeLine, String tail, String what) {
         final long memSize = 128;
         final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
         try {
             // one well-formed chunk (leaves receive == false), then the overflowing size line, then a
             // trailing byte so dataLo < dataHi holds the read gate shut
-            final String wire = "1\r\nA\r\n8000000000000000\r\nX";
+            final String wire = "1\r\nA\r\n" + sizeLine + "\r\n" + tail;
             final AbstractChunkedResponse rsp = new AbstractChunkedResponse(mem, mem + memSize, -1) {
                 boolean delivered;
 
@@ -251,13 +283,16 @@ public class ChunkedResponseTest {
             };
             rsp.begin(mem, mem);
             Fragment first = rsp.recv();
-            Assert.assertNotNull("the first chunk must still be delivered", first);
+            Assert.assertNotNull(what + ": the first chunk must still be delivered", first);
             Assert.assertEquals('A', (char) Unsafe.getUnsafe().getByte(first.lo()));
             try {
-                rsp.recv();
-                Assert.fail("expected the overflowing chunk size to be rejected as malformed");
+                Fragment second = rsp.recv();
+                Assert.fail(what + ": expected the overflowing chunk size to be rejected as malformed, got "
+                        + (second == null ? "a terminal chunk (a truncated body reported as complete)"
+                        : "a data chunk"));
             } catch (HttpClientException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("malformed chunk size"));
+                Assert.assertTrue(what + ": " + e.getMessage(),
+                        e.getMessage().contains("malformed chunk size"));
             }
         } finally {
             Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
