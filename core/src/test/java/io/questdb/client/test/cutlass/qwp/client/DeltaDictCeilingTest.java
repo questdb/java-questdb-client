@@ -104,6 +104,15 @@ public class DeltaDictCeilingTest {
      * its message still names the reset valve even though this particular
      * sender has it switched off -- the valve is documented for senders that
      * want it, not conditioned on this sender having chosen it.
+     * <p>
+     * Out of scope here: whether {@code symbol_dict_reset=off} actually keeps
+     * {@code armIfEligible()} from arming. That only runs from the tail of a
+     * completed {@code flush()}, which this test never performs (the fill
+     * goes through the raw dictionary test accessor, and the one
+     * {@code Sender}-routed call throws inside {@code symbol()} before a row
+     * completes) -- an {@code isResetArmed()} assertion here would pass
+     * regardless of the knob, proving nothing. That arming-vs-flush property
+     * is pinned in {@code SymbolDictRecycleArmingTest.testArmsAtThreshold}.
      */
     @Test
     public void testCapReachedWithResetDisabledStillThrowsAndNamesTheResetValve() throws Exception {
@@ -121,7 +130,6 @@ public class DeltaDictCeilingTest {
                     for (int i = 0; i < MAX_SYMBOL_DICTIONARY_SIZE; i++) {
                         dict.getOrAddSymbol("f" + i);
                     }
-                    Assert.assertFalse("reset disabled must never arm", ws.isResetArmed());
 
                     try {
                         sender.table("t").symbol("s", "one-too-many");
@@ -133,7 +141,6 @@ public class DeltaDictCeilingTest {
                         Assert.assertTrue("message points at the reset valve: " + message,
                                 message.contains("symbol_dict_reset") && message.contains("resetSymbolDictionary()"));
                     }
-                    Assert.assertFalse("still not armed after the refusal", ws.isResetArmed());
                 }
             }
         });
