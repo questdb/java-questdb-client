@@ -237,6 +237,34 @@ public abstract class AbstractLineHttpSender implements Sender {
         );
     }
 
+    /**
+     * Provider-less form of the overload below, kept so callers compiled against the pre-{@code
+     * httpTokenProvider} signature keep linking. Mirrors the single-host overload above, which delegates
+     * with the same {@code null} provider.
+     */
+    @SuppressWarnings("unused")
+    public static AbstractLineHttpSender createLineSender(
+            ObjList<String> hosts,
+            IntList ports,
+            String path,
+            HttpClientConfiguration clientConfiguration,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            String authToken,
+            String username,
+            String password,
+            int maxNameLength,
+            long maxRetriesNanos,
+            int maxBackoffMillis,
+            long minRequestThroughput,
+            long flushIntervalNanos,
+            int protocolVersion
+    ) {
+        return createLineSender(hosts, ports, path, clientConfiguration, tlsConfig, autoFlushRows,
+                authToken, username, password, maxNameLength, maxRetriesNanos, maxBackoffMillis,
+                minRequestThroughput, flushIntervalNanos, protocolVersion, null);
+    }
+
     public static AbstractLineHttpSender createLineSender(
             ObjList<String> hosts,
             IntList ports,

@@ -709,7 +709,7 @@ public class QwpWebSocketSender implements Sender {
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs
     ) {
-        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
                 requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
@@ -720,11 +720,60 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Constant-credential form of the connection-listener variant below, kept so callers compiled against
+     * the {@code String authorizationHeader} signature keep linking after the parameter became a
+     * {@link Supplier}. Wraps the header with {@link #fixedAuthHeader(String)}, which also tags it as a
+     * CONSTANT credential for the store-and-forward drainer's terminal policy -- the same thing the older
+     * signature implied.
+     * <p>
+     * A rotating credential goes to {@code connectWithCredentialSupplier} instead, which carries a distinct
+     * name precisely so this form keeps its exact descriptor and a bare {@code null} credential stays
+     * unambiguous.
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity);
+    }
+
+    /**
      * Multi-endpoint variant that also accepts the async connection-event
      * listener and its dispatcher inbox capacity. Uses the default
      * poison-frame detector threshold.
+     * <p>
+     * Named apart from {@code connect} rather than overloading it: the constant-credential
+     * {@code connect(..., String, ...)} form must keep its exact descriptor for callers compiled against
+     * it, and a {@code String} / {@code Supplier<String>} overload pair of equal arity makes a bare
+     * {@code null} credential argument ambiguous -- neither parameter type is more specific than the
+     * other. A distinct name keeps both forms callable with no cast.
      */
-    public static QwpWebSocketSender connect(
+    public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,
             ClientTlsConfiguration tlsConfig,
             int autoFlushRows,
@@ -746,7 +795,7 @@ public class QwpWebSocketSender implements Sender {
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
-        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
                 autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck,
                 cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -759,12 +808,65 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Master connect overload — also accepts the poison-frame detector
+     * Constant-credential form of the master overload below, kept so callers compiled against the
+     * {@code String authorizationHeader} signature keep linking after the parameter became a
+     * {@link Supplier}. Wraps the header with {@link #fixedAuthHeader(String)}, which also tags it as a
+     * CONSTANT credential for the store-and-forward drainer's terminal policy -- the same thing the older
+     * signature implied.
+     * <p>
+     * A rotating credential goes to {@code connectWithCredentialSupplier} instead, which carries a distinct
+     * name precisely so this form keeps its exact descriptor and a bare {@code null} credential stays
+     * unambiguous.
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis);
+    }
+
+    /**
+     * Master connect entry point — also accepts the poison-frame detector
      * threshold ({@code max_frame_rejections}): consecutive server-active
      * rejections of the same head-of-line frame, with no ack progress in
      * between, before the loop escalates to a typed terminal.
+     * <p>
+     * Named apart from {@code connect} for the reason given on
+     * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
+     * boolean, CursorSendEngine, long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler,
+     * int, long, long, int, SenderConnectionListener, int)}.
      */
-    public static QwpWebSocketSender connect(
+    public static QwpWebSocketSender connectWithCredentialSupplier(
             List<Endpoint> endpoints,
             ClientTlsConfiguration tlsConfig,
             int autoFlushRows,

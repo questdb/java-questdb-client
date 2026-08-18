@@ -39,9 +39,20 @@ public interface Response {
      * Receives the next fragment of response data. A positive {@code timeout} bounds the whole call to that
      * many milliseconds in total (not per socket read), so a server dribbling the body one byte at a time
      * cannot keep a single call running past it; a non-positive {@code timeout} disables the bound.
+     * <p>
+     * Defaulted rather than abstract for compatibility: this interface is exported, ships with a javadoc
+     * jar, and gained {@code recv(int)} after {@link #recv()}, so an implementation written against the
+     * earlier interface must keep both compiling and linking. The default ignores the bound and defers to
+     * {@link #recv()} -- precisely what such an implementation did before this overload existed.
+     * <p>
+     * Every implementation in this library overrides it, and any implementation that wants the bound
+     * honoured must do the same. An overriding implementation must not then implement {@link #recv()} by
+     * calling back into this default, which would recurse.
      *
      * @param timeout the receive timeout in milliseconds
      * @return the received fragment, or null once the body has been fully read
      */
-    Fragment recv(int timeout);
+    default Fragment recv(int timeout) {
+        return recv();
+    }
 }

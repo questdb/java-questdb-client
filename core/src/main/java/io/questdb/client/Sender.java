@@ -1691,7 +1691,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // still rescue, so build() waits for that verdict rather than pre-judging it.
                     while (connected == null) {
                         try {
-                            connected = QwpWebSocketSender.connect(
+                            connected = QwpWebSocketSender.connectWithCredentialSupplier(
                                     wsEndpoints,
                                     wsTlsConfig,
                                     actualAutoFlushRows,
