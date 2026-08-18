@@ -441,8 +441,10 @@ public class QwpWebSocketSender implements Sender {
     private boolean starvationWaitDoneThisArm;
     // Incremented once per completed starvation wait that timed out without
     // the backlog draining (maybeBlockForStarvedReset's deadline branch). 0
-    // until the first such timeout.
-    private long symbolDictResetStarvationTimeouts;
+    // until the first such timeout. volatile: this is public API (see
+    // getSymbolDictResetStarvationTimeouts()), and a monitoring thread is
+    // its obvious reader.
+    private volatile long symbolDictResetStarvationTimeouts;
     // Set (once) by recycleForDictReset's catch block when the recycle swap
     // itself fails -- everything was acked before the swap tore the old
     // engine down, so no data is at risk, but this sender can no longer make
@@ -452,15 +454,17 @@ public class QwpWebSocketSender implements Sender {
     // works normally.
     private Throwable recycleFailure;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
-    // first recycle commits.
-    private long symbolDictEpoch;
+    // first recycle commits. volatile: this is public API (see
+    // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
+    private volatile long symbolDictEpoch;
     // Incremented once per completed symbol-dictionary recycle swap, beside
     // symbolDictEpoch (recycleForDictReset step 5). The two move together
     // today -- the only way symbolDictEpoch advances is through a committed
     // recycle swap -- but they count different things (dictionary generation
     // vs. completed swaps) and are incremented independently in case a
     // future change ever rolls the epoch by some path other than a recycle.
-    private long symbolDictResetsPerformed;
+    // volatile for the same reason as symbolDictEpoch.
+    private volatile long symbolDictResetsPerformed;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -2147,11 +2151,13 @@ public class QwpWebSocketSender implements Sender {
      * by one at step 5 of {@link #recycleForDictReset()}, the instant the swap
      * commits to the new epoch -- before the engine rebuild (step 6) or the
      * reconnect (step 7), so a later rebuild/reconnect failure that latches
-     * {@link #recycleFailure} still leaves this incremented. Not synchronized:
-     * like the other symbol-dictionary-recycle fields, it is written only from
-     * the producer thread inside {@code recycleForDictReset()}, so a read from
-     * any other thread is an eventually-consistent snapshot, not a
-     * linearizable one.
+     * {@link #recycleFailure} still leaves this incremented. volatile: a
+     * concurrent read sees the latest write the producer thread completed,
+     * but there is no atomicity across the three symbol-dictionary-recycle
+     * counters -- a reader on another thread can observe this one already
+     * advanced while {@link #getSymbolDictResetsPerformed()} still reflects
+     * the prior value, even though the producer thread writes them on
+     * adjacent lines.
      */
     public long getSymbolDictEpoch() {
         return symbolDictEpoch;
@@ -2160,13 +2166,16 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Number of symbol-dictionary recycle swaps this sender has completed.
      * Incremented alongside {@link #getSymbolDictEpoch()} at step 5 of
-     * {@link #recycleForDictReset()}. The two counts move together today --
-     * the only way the epoch advances is through a completed recycle swap --
-     * but they are defined, and incremented, independently: this one counts
+     * {@link #recycleForDictReset()} -- before the engine rebuild (step 6) or
+     * the reconnect (step 7), so, like the epoch counter, a later
+     * rebuild/reconnect failure that latches {@link #recycleFailure} still
+     * leaves this incremented. The two counts move together today -- the
+     * only way the epoch advances is through a completed recycle swap -- but
+     * they are defined, and incremented, independently: this one counts
      * completed swaps, {@code getSymbolDictEpoch()} counts the dictionary
-     * generation. They would diverge if a future change ever rolled the epoch
-     * by some path other than a recycle swap. Same thread-safety caveat as
-     * {@link #getSymbolDictEpoch()}.
+     * generation. They would diverge if a future change ever rolled the
+     * epoch by some path other than a recycle swap. Same thread-safety
+     * caveat as {@link #getSymbolDictEpoch()}.
      */
     public long getSymbolDictResetsPerformed() {
         return symbolDictResetsPerformed;
@@ -2174,8 +2183,11 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Number of times {@link #maybeBlockForStarvedReset()} has timed out
-     * without the backlog draining. 0 until the first such timeout. Same
-     * thread-safety caveat as {@link #getSymbolDictEpoch()}.
+     * without the backlog draining. 0 until the first such timeout. volatile,
+     * written only from the producer thread inside
+     * {@link #maybeBlockForStarvedReset()}: same thread-safety caveat as
+     * {@link #getSymbolDictEpoch()} -- a concurrent read sees the latest
+     * completed write, with no atomicity across the three counters.
      */
     public long getSymbolDictResetStarvationTimeouts() {
         return symbolDictResetStarvationTimeouts;

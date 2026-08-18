@@ -165,6 +165,10 @@ public class SymbolDictRecycleHealingTest {
                         Assert.fail("expected the injected mmap fault to fail this flush");
                     } catch (LineSenderException expected) {
                         // same guard MmapFaultDegradesTest pins
+                        Assert.assertTrue("the fault must be reported as a sender error, not a "
+                                        + "raw InternalError: " + expected.getMessage(),
+                                expected.getMessage().contains(
+                                        "failed to persist symbol dictionary before publish"));
                     }
                     Assert.assertFalse("a recognised mmap access fault must degrade the sender",
                             sender.isDeltaDictEnabledForTest());
@@ -186,12 +190,24 @@ public class SymbolDictRecycleHealingTest {
                     Assert.assertEquals(1, sender.getSymbolDictEpoch());
                     Assert.assertEquals(1, sender.getSymbolDictResetsPerformed());
 
-                    // The fresh engine re-derives delta-dict mode against the healed facade.
-                    Assert.assertTrue("a healed facade must let the fresh engine re-derive delta mode",
-                            sender.isDeltaDictEnabledForTest());
+                    // The rebuilt engine re-derives delta-dict mode from scratch (a fresh,
+                    // empty dictionary always opens cleanly at construction -- see this
+                    // test's persistent-fault sibling for why this alone does not prove the
+                    // facade was healed). The discriminating check is below, after the first
+                    // post-recycle append.
+                    Assert.assertTrue(sender.isDeltaDictEnabledForTest());
 
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+
+                    // Discriminating check: fsn2's flush was the fresh engine's first
+                    // append. A still-armed facade would have degraded it there (as the
+                    // persistent-fault sibling proves against the identical setup) -- staying
+                    // true here is real evidence the heal took effect, not just an artifact
+                    // of fresh-engine construction never touching mmap.
+                    Assert.assertTrue("a healed facade must let the fresh engine's first "
+                                    + "post-recycle append succeed and keep delta mode enabled",
+                            sender.isDeltaDictEnabledForTest());
 
                     sender.table("m").symbol("s", "c").longColumn("v", 3L).atNow();
                     long fsn3 = sender.flushAndGetSequence();
@@ -258,6 +274,10 @@ public class SymbolDictRecycleHealingTest {
                         Assert.fail("expected the injected mmap fault to fail this flush");
                     } catch (LineSenderException expected) {
                         // expected -- same guard as MmapFaultDegradesTest
+                        Assert.assertTrue("the fault must be reported as a sender error, not a "
+                                        + "raw InternalError: " + expected.getMessage(),
+                                expected.getMessage().contains(
+                                        "failed to persist symbol dictionary before publish"));
                     }
                     Assert.assertFalse(sender.isDeltaDictEnabledForTest());
                     long fsn1 = sender.flushAndGetSequence(); // retry succeeds in full-dict mode
@@ -284,6 +304,10 @@ public class SymbolDictRecycleHealingTest {
                         Assert.fail("expected the still-armed facade to fault the post-recycle append too");
                     } catch (LineSenderException expected) {
                         // degrade, not break: a normal, catchable sender error
+                        Assert.assertTrue("the fault must be reported as a sender error, not a "
+                                        + "raw InternalError: " + expected.getMessage(),
+                                expected.getMessage().contains(
+                                        "failed to persist symbol dictionary before publish"));
                     }
                     Assert.assertFalse("the fresh engine must degrade again, not stay in delta mode",
                             sender.isDeltaDictEnabledForTest());
@@ -356,10 +380,20 @@ public class SymbolDictRecycleHealingTest {
 
     /** ACKs every frame it receives; does not otherwise inspect the wire. */
     private static class AckAllHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private TestWebSocketServer.ClientHandler currentClient;
         private final AtomicLong nextSeq = new AtomicLong(0);
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                // A rebuilt engine restarts its raw FSNs at 0 (externalFsnBase absorbs the
+                // offset), and the ack sequence below is applied as a raw engine FSN -- so
+                // acking a recycle's fresh connection against the outgoing connection's
+                // sequence would ack frames that were never published. Reset per connection,
+                // matching CapturingAckHandler below.
+                currentClient = client;
+                nextSeq.set(0);
+            }
             try {
                 client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
             } catch (IOException e) {
