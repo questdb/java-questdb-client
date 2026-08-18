@@ -2009,6 +2009,23 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Test seam over {@link #hasDynamicCredential()}: whether this sender's configured
+     * credential is re-derived per handshake (an {@code httpTokenProvider}) rather than
+     * captured once (an {@code httpToken} or {@code httpUsernamePassword}).
+     * <p>
+     * The tag is set by the builder, several classes away from the orphan drainer whose
+     * terminal policy consumes it, and a mis-tag is silent at build time. Tagging a
+     * rotating credential as fixed makes the first {@code 401} of an orphan drain drop a
+     * {@code .failed} sentinel that nothing in production clears -- replayable rows
+     * abandoned for good over a token the next pull would have refreshed. Hence a seam a
+     * test can assert on a real, built sender.
+     */
+    @TestOnly
+    public boolean isCredentialDynamic() {
+        return hasDynamicCredential();
+    }
+
+    /**
      * Whether this sender is still in delta-encoded mode. Flips to {@code false}
      * permanently once {@link #disableDeltaDict} fires (a persisted-dictionary
      * write failure, including a recognised mmap access fault) -- every later

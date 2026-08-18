@@ -27,6 +27,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.auth.OidcAuthException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
@@ -42,6 +43,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -57,6 +59,46 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * Each test runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class WebSocketTokenProviderTest {
+
+    @Test
+    public void testCredentialKindTaggedForTheOrphanDrainerTerminalPolicy() throws Exception {
+        assertMemoryLeak(() -> {
+            // The builder routes a CONSTANT credential through QwpWebSocketSender.fixedAuthHeader
+            // and an httpTokenProvider through a bare lambda. That type difference is the whole
+            // signal: hasDynamicCredential() reads it, and BackgroundDrainer.connectWithDurableAckRetry
+            // decides on it whether a 401 during an orphan drain may quarantine the slot.
+            //
+            // A mis-tag is silent at build time and asymmetric in cost. Tagging a rotating credential
+            // as fixed makes the first 401 of an orphan drain drop a .failed sentinel that nothing in
+            // production clears, permanently abandoning replayable rows over a token the next pull
+            // would have refreshed. The other direction only delays the operator's signal: a wrong
+            // fixed password rides out the attempt threshold and the dwell floor before quarantining.
+            //
+            // Nothing connected the builder half to the drainer half, so assert both on a real built
+            // sender: the header the server actually received (a tag asserted alone would still pass
+            // if the credential reached the wire by some other route) and the tag itself, read both
+            // directly and through the background reconnect factory the drainer is handed.
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                assertCredentialKind(server, port, "Bearer static-token", false,
+                        b -> b.httpToken("static-token"));
+                assertCredentialKind(server, port,
+                        "Basic " + Base64.getEncoder().encodeToString(
+                                "user:pass".getBytes(StandardCharsets.UTF_8)),
+                        false,
+                        b -> b.httpUsernamePassword("user", "pass"));
+                assertCredentialKind(server, port, "Bearer rotating-token", true,
+                        b -> b.httpTokenProvider(() -> "rotating-token"));
+                // No credential at all: nothing to refresh, so a rejection is never
+                // a window a later pull can close.
+                assertCredentialKind(server, port, "", false, b -> {
+                });
+            }
+        });
+    }
 
     @Test
     public void testProviderRequeriedOnEveryReconnect() throws Exception {
@@ -648,6 +690,31 @@ public class WebSocketTokenProviderTest {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException(e);
             }
+        }
+    }
+
+    private static void assertCredentialKind(
+            TestWebSocketServer server,
+            int port,
+            String expectedHeader,
+            boolean expectedDynamic,
+            Consumer<Sender.LineSenderBuilder> credential
+    ) throws Exception {
+        Sender.LineSenderBuilder builder = Sender.builder(Sender.Transport.WEBSOCKET)
+                .address("localhost:" + port);
+        credential.accept(builder);
+        try (Sender sender = builder.build()) {
+            Assert.assertEquals("the configured credential must reach the upgrade header",
+                    expectedHeader, server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+            QwpWebSocketSender qwp = (QwpWebSocketSender) sender;
+            Assert.assertEquals("credential tag for [" + expectedHeader + "]",
+                    expectedDynamic, qwp.isCredentialDynamic());
+            // The value BackgroundDrainer.connectWithDurableAckRetry actually reads:
+            // ReconnectFactory.hasDynamicCredential() on the background factory an
+            // orphan drainer is handed.
+            Assert.assertEquals("drainer-visible credential tag for [" + expectedHeader + "]",
+                    expectedDynamic,
+                    qwp.newBackgroundReconnectFactory(() -> false).hasDynamicCredential());
         }
     }
 }
