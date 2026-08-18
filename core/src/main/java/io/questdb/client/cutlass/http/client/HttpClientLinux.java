@@ -36,10 +36,18 @@ public class HttpClientLinux extends HttpClient {
 
     public HttpClientLinux(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        epoll = new Epoll(
-                configuration.getEpollFacade(),
-                configuration.getWaitQueueCapacity()
-        );
+        // The base constructor already took a socket and two native buffers. If epoll_create fails here -
+        // fd exhaustion is exactly when it does - this object never reaches the caller, so nothing ever
+        // closes it and those stay lost. Roll the base back before rethrowing.
+        try {
+            epoll = new Epoll(
+                    configuration.getEpollFacade(),
+                    configuration.getWaitQueueCapacity()
+            );
+        } catch (Throwable t) {
+            super.close();
+            throw t;
+        }
     }
 
     @Override

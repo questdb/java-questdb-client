@@ -37,7 +37,14 @@ public class HttpClientWindows extends HttpClient {
 
     public HttpClientWindows(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        this.fdSet = new FDSet(configuration.getWaitQueueCapacity());
+        // See HttpClientLinux: an allocation failure here would strand the socket and native buffers the
+        // base constructor already took, on an object nobody can close.
+        try {
+            this.fdSet = new FDSet(configuration.getWaitQueueCapacity());
+        } catch (Throwable t) {
+            super.close();
+            throw t;
+        }
         this.sf = configuration.getSelectFacade();
     }
 

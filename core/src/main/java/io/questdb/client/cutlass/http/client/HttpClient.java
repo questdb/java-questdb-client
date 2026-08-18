@@ -83,16 +83,40 @@ public abstract class HttpClient implements QuietCloseable {
 
     public HttpClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         this.nf = configuration.getNetworkFacade();
-        this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
         this.connectTimeout = configuration.getConnectTimeout();
         this.bufferSize = configuration.getInitialRequestBufferSize();
         this.maxBufferSize = configuration.getMaximumRequestBufferSize();
         this.responseParserBufSize = configuration.getResponseBufferSize();
         this.fixBrokenConnection = configuration.fixBrokenConnection();
-        this.bufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseHeaders = new ResponseHeaders(responseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        // Stage every acquisition and roll the lot back on any throw. A constructor that fails partway
+        // leaves an object nobody can close: it never reaches the caller, so no finally, no try-with-resources
+        // and no close() ever runs on it, and whatever it had already taken is lost for the life of the
+        // process. The two mallocs and ResponseHeaders' own buffer are native, so the loss is native memory,
+        // and the trigger is the same condition that makes these fail in the first place - memory pressure, or
+        // fd exhaustion in the socket factory. Retrying then compounds it. Kqueue already guards its
+        // constructor this way; this one did not.
+        Socket stagedSocket = null;
+        long stagedBufLo = 0;
+        long stagedResponseParserBufLo = 0;
+        try {
+            stagedSocket = socketFactory.newInstance(nf, LOG);
+            stagedBufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
+            stagedResponseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseHeaders = new ResponseHeaders(stagedResponseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        } catch (Throwable t) {
+            if (stagedResponseParserBufLo != 0) {
+                Unsafe.free(stagedResponseParserBufLo, responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (stagedBufLo != 0) {
+                Unsafe.free(stagedBufLo, bufferSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            Misc.free(stagedSocket);
+            throw t;
+        }
+        this.socket = stagedSocket;
+        this.bufLo = stagedBufLo;
+        this.responseParserBufLo = stagedResponseParserBufLo;
     }
 
     @Override
