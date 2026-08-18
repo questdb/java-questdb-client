@@ -1154,7 +1154,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
         accessToken = token.getAccessToken();
         idToken = token.getIdToken();
-        // keep the current refresh token when the file carries none, mirroring storeTokens(). A file with a
+        // keep the current refresh token when the file carries none, mirroring the REFRESH branch of
+        // storeTokens() -- a stored entry is the same authorization read back, never a new one, so the
+        // grant-specific clearing that a fresh device grant does has no counterpart here. A file with a
         // valid served token but no refresh_token - a cross-language peer that never received one, or a
         // tampered file - must not null a live in-memory refresh token: doing so would make a later
         // tryRefresh() urlEncode(null) and throw an uncaught NPE (aborting the sign-in) instead of refreshing
@@ -1362,7 +1364,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         // is not trusted (the non-2xx is classified below instead)
         if (isHttpStatusSuccess()) {
             if (tokenParser.accessToken.length() > 0 || tokenParser.idToken.length() > 0) {
-                storeTokens(tokenParser);
+                storeTokens(tokenParser, false);
                 return POLL_SUCCESS;
             }
             // a 2xx with neither a token nor an OAuth error is a definitive but malformed answer
@@ -1571,7 +1573,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         return new PersistedToken(accessToken, idToken, refreshToken, expiresAtMillis, tokenTtlMillis);
     }
 
-    private void storeTokens(TokenResponseParser parser) {
+    /**
+     * @param isRefreshGrant true for a refresh_token grant, false for a fresh device grant. Decides what an
+     *                       OMITTED refresh_token means, which is not the same question for the two grants.
+     */
+    private void storeTokens(TokenResponseParser parser, boolean isRefreshGrant) {
         // reject a token with control or non-ASCII chars before caching: getToken() serves it verbatim as an
         // HTTP Authorization header value and a PG-wire password, where a decoded CR/LF would inject into the
         // request line sent to the trusted QuestDB server. Validate only the kind getToken() actually serves
@@ -1590,9 +1596,20 @@ public class OidcDeviceAuth implements QuietCloseable {
         // the sender's own HttpTokenProvider.validateToken (Chars.isBlank).
         accessToken = Chars.isBlank(parser.accessToken) ? null : parser.accessToken.toString();
         idToken = Chars.isBlank(parser.idToken) ? null : parser.idToken.toString();
-        // a refresh response usually omits a new refresh token; keep the current one in that case
+        // What an omitted refresh_token means depends on the grant, so the two must not share a policy.
+        // A refresh response usually omits one (RFC 6749 6 makes it optional) and is the SAME authorization
+        // continuing, so the current token stays valid and is kept -- dropping it would send a human back
+        // through the device flow every time a non-rotating provider answers.
+        // A device grant is a NEW authorization and may be a DIFFERENT human. Keeping the previous user's
+        // refresh token across it is cross-account confusion: user A's refresh fails, user B completes the
+        // device flow without a refresh token, B's access token expires, and the next silent refresh presents
+        // A's retained token and resumes as A -- no prompt, no error, nothing in any log to say the identity
+        // changed. So an omission here clears it: this authorization has no refresh token, and the honest
+        // outcome is that getToken() asks for an interactive sign-in.
         if (parser.refreshToken.length() > 0) {
             refreshToken = parser.refreshToken.toString();
+        } else if (!isRefreshGrant) {
+            refreshToken = null;
         }
         // clamp like the device-side expires_in: default for a non-positive value, cap an absurd one, so a
         // hostile or buggy token TTL cannot cache the token for decades (the server still enforces the real
@@ -1651,7 +1668,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 && tokenParser.error.length() == 0;
         if (hasRequiredToken) {
             try {
-                storeTokens(tokenParser);
+                storeTokens(tokenParser, true);
             } catch (OidcAuthException e) {
                 // storeTokens -> validateTokenChars rejects a refreshed served token carrying a control or
                 // non-ASCII char (reachable now that JsonLexer decodes an escaped \r/\n in the response into a

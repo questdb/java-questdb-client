@@ -222,6 +222,85 @@ public class OidcDeviceAuthPersistenceTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testDeviceGrantWithoutRefreshTokenClearsPreviousUsersRefreshToken() throws Exception {
+        assertMemoryLeak(() -> {
+            // Cross-account confusion. storeTokens() keeps the current refresh token whenever a response
+            // omits one -- correct for a REFRESH response, which RFC 6749 6 lets omit it, but wrong for a
+            // fresh device grant. A device grant is a NEW authorization and may be a DIFFERENT human: if it
+            // returns no refresh token, the previous user's must not survive it, or the next silent refresh
+            // signs back in as them with no interaction and no signal.
+            //
+            // A: persisted, expired access token plus a live refresh token.
+            // B: signs in interactively after A's refresh hits a transient IdP failure, and B's grant carries
+            // no refresh token of its own.
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger refreshCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    // A's refresh token is live, not revoked -- the first attempt just lands on a 503. That is
+                    // what makes this a confusion bug rather than a dead credential: the token still works, so
+                    // any later use of it silently resumes A's session.
+                    if (refreshCalls.incrementAndGet() == 1) {
+                        return MockOidcServer.json(503, "{}");
+                    }
+                    return MockOidcServer.json(200, tokenJson("ACCESS-A2", null, "REFRESH-A", 3600));
+                }
+                // B's device grant: a served token and deliberately NO refresh token. expires_in=1 so B's
+                // token goes stale inside the test without stubbing the clock.
+                return MockOidcServer.json(200, tokenJson("ACCESS-B", null, null, 1));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.stored = new PersistedToken("ACCESS-A", null, "REFRESH-A", System.currentTimeMillis() - 1, 3600_000);
+
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("A's refresh fails, so B signs in interactively",
+                            "ACCESS-B", auth.signIn());
+                    Assert.assertEquals("the device flow must have run for B", 1, device.get());
+
+                    // B's token is issued for 1s and effectiveSkewMillis caps the skew at half that, so it
+                    // reads as stale ~500ms in. Wait past that, then ask for a token the way the sender does.
+                    Thread.sleep(1_000L);
+                    try {
+                        String served = auth.getToken();
+                        Assert.fail("B's expired token must not be refreshed with A's retained refresh token; "
+                                + "getToken() served [" + served + "] after " + refreshCalls.get() + " refresh calls");
+                    } catch (OidcAuthException e) {
+                        Assert.assertTrue("expected a prompt to sign in again, got: " + e.getMessage(),
+                                e.getMessage().contains("could not be refreshed without an interactive sign-in"));
+                    }
+                    Assert.assertEquals("no refresh may be attempted once B's grant carried no refresh token",
+                            1, refreshCalls.get());
+                }
+
+                // Persistence half: A's refresh token must not outlive B's sign-in on disk either, or the next
+                // process start adopts it and resumes as A.
+                Assert.assertNotNull("B's grant must have been persisted over A's entry", fake.stored);
+                Assert.assertNull("A's refresh token must not survive in the store: " + fake.stored.getRefreshToken(),
+                        fake.stored.getRefreshToken());
+
+                // Restart over the same store.
+                int refreshesBeforeRestart = refreshCalls.get();
+                try (OidcDeviceAuth restarted = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        String served = restarted.getToken();
+                        Assert.fail("a restart must not resume A's session; getToken() served [" + served + "]");
+                    } catch (OidcAuthException e) {
+                        Assert.assertTrue("expected a sign-in prompt after restart, got: " + e.getMessage(),
+                                e.getMessage().contains("could not be refreshed without an interactive sign-in"));
+                    }
+                }
+                Assert.assertEquals("a restart must not refresh with A's token either",
+                        refreshesBeforeRestart, refreshCalls.get());
+            }
+        });
+    }
+
     @Test
     public void testDefaultInLockRunsTheAction() {
         // TokenStore.inLock has a default that simply runs the action (no cross-process coordination). It is a
