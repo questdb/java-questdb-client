@@ -45,7 +45,9 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -537,6 +539,114 @@ public class FileTokenStoreTest {
                     "openid", "api://billing", true);
             Assert.assertEquals("5193f668130b28cd9430f5271011f1044b3b1c1e78bfc4f45d7688a3d9b1ceb0", groups.hash());
             Assert.assertNotEquals(withAudience.hash(), groups.hash());
+        });
+    }
+
+    @Test
+    public void testInLockAbandonsFileLockWaitOnInterrupt() throws Exception {
+        assertMemoryLeak(() -> {
+            // The lock-file poll used Os.sleep, which catches InterruptedException, keeps sleeping to its own
+            // deadline and never re-asserts the flag - so a cancellation aimed at this wait was swallowed and
+            // the whole budget elapsed regardless. The budget maxes out at 30s, the same as QWP's close()
+            // shutdown budget, so a caller stuck here made close() time out and delegate the teardown of the
+            // native client, the cursor engine and the store-and-forward slot lock.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            // a live peer's stamped lock: not empty, so the empty-lock grace does not apply, and far inside
+            // the staleness window, so it is never stolen - the waiter can only poll
+            Files.write(lock, "live-peer-nonce".getBytes(StandardCharsets.UTF_8));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            AtomicReference<Boolean> result = new AtomicReference<>();
+            AtomicBoolean flagLeftSet = new AtomicBoolean();
+            CountDownLatch entered = new CountDownLatch(1);
+            Thread waiter = new Thread(() -> {
+                entered.countDown();
+                result.set(store.inLock(key, () -> {
+                    ran.set(true);
+                    return true;
+                }));
+                flagLeftSet.set(Thread.currentThread().isInterrupted());
+            }, "file-lock-waiter");
+            waiter.setDaemon(true);
+            waiter.start();
+            Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Thread.sleep(200); // let it settle into the poll loop
+
+            long start = System.currentTimeMillis();
+            waiter.interrupt();
+            waiter.join(10_000);
+            long elapsed = System.currentTimeMillis() - start;
+
+            Assert.assertFalse("the waiter must not still be polling out the 30s budget", waiter.isAlive());
+            Assert.assertTrue("the interrupt must cut the poll short, took " + elapsed + "ms", elapsed < 5_000);
+            Assert.assertFalse("the refresh must not start once the wait was cancelled", ran.get());
+            Assert.assertEquals("an abandoned wait reports no refresh", Boolean.FALSE, result.get());
+            Assert.assertFalse("an interrupt that arrived during the wait is consumed by acting on it, so it "
+                    + "cannot go on to break the teardown it was sent to enable", flagLeftSet.get());
+            Assert.assertTrue("the peer's live lock must be left alone", Files.exists(lock));
+        });
+    }
+
+    @Test
+    public void testInLockAbandonsProcessLockWaitOnInterrupt() throws Exception {
+        assertMemoryLeak(() -> {
+            // The in-process lock that serializes same-identity threads was taken with lock(), which no
+            // interrupt can break. A peer thread holds it for a whole refresh round trip, so a caller behind
+            // it was unreachable by the one lever QWP's ConnectCancellation has.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore holderStore = new FileTokenStore(dir, 30_000, 600_000);
+            FileTokenStore waiterStore = new FileTokenStore(dir, 30_000, 600_000);
+            TokenStoreKey key = sampleKey();
+
+            CountDownLatch holding = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            Thread holder = new Thread(() -> holderStore.inLock(key, () -> {
+                holding.countDown();
+                try {
+                    release.await(30, TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                return true;
+            }), "process-lock-holder");
+            holder.setDaemon(true);
+            holder.start();
+            Assert.assertTrue("the holder must enter its critical section", holding.await(5, TimeUnit.SECONDS));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            AtomicReference<Boolean> result = new AtomicReference<>();
+            CountDownLatch entered = new CountDownLatch(1);
+            Thread waiter = new Thread(() -> {
+                entered.countDown();
+                result.set(waiterStore.inLock(key, () -> {
+                    ran.set(true);
+                    return true;
+                }));
+            }, "process-lock-waiter");
+            waiter.setDaemon(true);
+            waiter.start();
+            Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Thread.sleep(200); // let it settle onto the process lock
+
+            long start = System.currentTimeMillis();
+            waiter.interrupt();
+            waiter.join(10_000);
+            long elapsed = System.currentTimeMillis() - start;
+
+            Assert.assertFalse("the waiter must not still be blocked on the process lock", waiter.isAlive());
+            Assert.assertTrue("the interrupt must break the process-lock wait, took " + elapsed + "ms",
+                    elapsed < 5_000);
+            Assert.assertFalse("the refresh must not start once the wait was cancelled", ran.get());
+            Assert.assertEquals("an abandoned wait reports no refresh", Boolean.FALSE, result.get());
+
+            release.countDown();
+            holder.join(10_000);
+            Assert.assertFalse("the holder must finish its critical section", holder.isAlive());
         });
     }
 

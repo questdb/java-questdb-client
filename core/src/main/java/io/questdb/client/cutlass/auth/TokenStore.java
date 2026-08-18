@@ -70,10 +70,18 @@ public interface TokenStore {
      * {@code OidcDeviceAuth} (for example {@code signIn()}/{@code getToken()}) from {@code inLock},
      * {@code load}, or {@code save}, and must not block waiting on another thread that could need that
      * instance lock - either would re-enter or deadlock. Do the store I/O only.
+     * <p>
+     * An implementation that waits for its lock must make that wait INTERRUPTIBLE and, on an interrupt,
+     * return {@code false} without running {@code action}. The wait can outlast the caller's own shutdown
+     * budget - QWP's connect cancellation interrupts a thread stuck in a credential pull precisely so
+     * {@code close()} can reclaim its native resources - and an uninterruptible wait defeats that, leaving
+     * the client, the cursor engine and the store-and-forward slot lock to a delegated teardown. The
+     * {@code false} return reads as "no refresh happened", which {@code OidcDeviceAuth} already handles.
      *
      * @param key    the identity to lock
      * @param action the critical section; its boolean result is returned unchanged
-     * @return whatever {@code action} returned
+     * @return whatever {@code action} returned, or {@code false} if an interrupt abandoned the wait before
+     * {@code action} could run
      */
     default boolean inLock(TokenStoreKey key, CriticalSection action) {
         return action.run();

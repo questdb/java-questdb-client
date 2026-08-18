@@ -285,32 +285,59 @@ public final class FileTokenStore implements TokenStore {
         // subject to the file lock's degrade. ReentrantLock is safe even though inLock's contract forbids
         // nesting - a mistaken re-entry cannot self-deadlock.
         final ReentrantLock processLock = PROCESS_LOCKS.computeIfAbsent(key.hash(), k -> new ReentrantLock());
-        processLock.lock();
+        // lockInterruptibly, never lock(): a peer thread on this identity holds this for a whole refresh round
+        // trip, and an interrupt is the ONLY lever that reaches a caller stuck behind it. QWP's
+        // ConnectCancellation.cancel() interrupts a thread inside a credential pull precisely so close() can
+        // unstick it; an uninterruptible acquire here sleeps through that, outlives close()'s shutdown budget,
+        // and leaves the native client, the cursor engine and the slot lock to a delegated teardown.
         try {
+            processLock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            // Interrupted WAITING for the process lock: a live cancellation, acted on by abandoning the
+            // refresh. Not re-asserted - the signal has been consumed by doing what it asked. The caller
+            // learns through the false return (OidcDeviceAuth turns it into a credential failure), while
+            // leaving the flag set would break every later blocking call on this thread, including the
+            // teardown the interrupt was sent to enable.
+            return false;
+        }
+        try {
+            // An interrupt CARRIED ON ENTRY is the caller's own state, not a signal aimed at this wait:
+            // preserve it and abort before touching any lock file. The previous code instead cleared it to
+            // push the FileChannel I/O through (a set flag turns that into ClosedByInterruptException) and
+            // ran the refresh anyway; acquiring a lock for a critical section we should not start only
+            // delays the caller and risks stranding a lock file for its whole staleness window.
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
             Path lock = null;
             // the unique owner nonce stamped into the lock when we acquired it, or null if we did not (or could
             // not) acquire one and are running lock-free; releaseLock deletes the lock only when it still carries
             // this nonce, so we never delete a lock a peer has since stolen
             String nonce = null;
-            // acquireLock does FileChannel I/O, so shield it from a carried interrupt flag exactly as load()
-            // does - but shield ONLY the lock bookkeeping, never action.run(). The critical section is the
-            // caller's own token refresh, and an interrupt is precisely the lever close() uses to break it.
-            boolean wasInterrupted = Thread.interrupted();
+            // set when an interrupt arrives while we poll for the cross-process lock; see acquireLock
+            boolean cancelled = false;
             try {
                 ensureDirectory();
                 lock = lockFile(key);
                 nonce = acquireLock(lock);
+            } catch (InterruptedException e) {
+                // Arrived DURING the poll, so it is a live cancellation rather than carried state. Consumed
+                // for the same reason as the process-lock wait above.
+                cancelled = true;
             } catch (IOException e) {
                 // could not prepare the lock directory or file; run without the cross-process lock. Layer-1
                 // atomic replacement still keeps every reader consistent - only a rotating-refresh-token race
                 // across processes is left unguarded for this one refresh.
                 nonce = null;
-            } finally {
-                if (wasInterrupted) {
-                    Thread.currentThread().interrupt();
-                }
             }
             try {
+                // The critical section is a fresh HTTP round trip - exactly the work a cancellation is trying
+                // to stop - so never start it once an interrupt has been observed. isInterrupted() rather than
+                // interrupted() for the late arrival: we did not catch that one, so it is not ours to clear.
+                if (cancelled || Thread.currentThread().isInterrupted()) {
+                    return false;
+                }
                 return action.run();
             } finally {
                 if (nonce != null) {
@@ -776,7 +803,7 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private String acquireLock(Path lock) {
+    private String acquireLock(Path lock) throws InterruptedException {
         // returns the unique owner nonce stamped into the lock on success, or null if it could not be acquired
         // within the budget. releaseLock uses the nonce to verify ownership before deleting, so a hold that
         // outran lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
@@ -798,7 +825,11 @@ public final class FileTokenStore implements TokenStore {
                 if (System.currentTimeMillis() >= deadline) {
                     return null; // give up and run without the lock rather than stall a sign-in
                 }
-                Os.sleep(LOCK_POLL_SLICE_MILLIS);
+                // Thread.sleep, not Os.sleep: Os.sleep catches InterruptedException and keeps sleeping to its
+                // deadline WITHOUT re-asserting the flag, so a cancellation aimed at this poll was swallowed
+                // outright and the whole budget elapsed regardless. Propagate it and let inLock abandon the
+                // refresh - the budget can be tens of seconds, far past a QWP close()'s shutdown window.
+                Thread.sleep(LOCK_POLL_SLICE_MILLIS);
             } catch (IOException e) {
                 // Do NOT delete the lock here. That used to be justified by "the exclusive create succeeded
                 // and only the nonce write failed, so the file is ours" - true for one of the failures this
