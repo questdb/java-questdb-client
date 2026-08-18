@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -143,44 +144,164 @@ public class SymbolDictRecycleOutageTest {
                     }, "recycle-trigger");
                     trigger.start();
 
-                    // Resolve the outage shortly after -- well inside
-                    // reconnect_max_duration_millis=6000 -- on the SAME port.
-                    Thread.sleep(150);
+                    try {
+                        // Resolve the outage shortly after -- well inside
+                        // reconnect_max_duration_millis=6000 -- on the SAME port.
+                        Thread.sleep(150);
+                        OutageRecycleHandler revivedHandler = new OutageRecycleHandler();
+                        try (TestWebSocketServer revived =
+                                     new TestWebSocketServer(revivedHandler, false, null, port)) {
+                            revived.start();
+                            Assert.assertTrue(revived.awaitStart(5, TimeUnit.SECONDS));
+
+                            trigger.join(10_000);
+                            Assert.assertFalse("recycle-trigger thread must have finished once the "
+                                            + "endpoint accepts again", trigger.isAlive());
+                            Assert.assertNull("triggering table() must not throw once the outage "
+                                            + "resolves within budget: " + triggerFailure.get(),
+                                    triggerFailure.get());
+
+                            Assert.assertFalse("recycle must disarm", ws.isResetArmed());
+                            Assert.assertEquals("recycle must complete despite the outage",
+                                    1, ws.getSymbolDictEpoch());
+                            // Deliberately >= 1, not == 1: the pre-recycle I/O thread is
+                            // banging on the refused port when the revive binds, and
+                            // nothing orders step 2's close+join against that bind, so a
+                            // stray handshake from the outgoing loop is legal here.
+                            Assert.assertTrue("revived server must observe a fresh handshake",
+                                    revived.handshakeCount() >= 1);
+
+                            // The "c" row was built (atNow()) inside the triggering
+                            // call but not yet flushed -- flush now and prove it
+                            // lands on the fresh connection.
+                            long fsn2 = sender.flushAndGetSequence();
+                            Assert.assertTrue("post-recycle row must land once reconnected",
+                                    sender.awaitAckedFsn(fsn2, 5_000));
+                            Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN",
+                                    fsn2 > fsn1);
+
+                            Assert.assertEquals("the fresh connection's first frame must carry a "
+                                            + "fresh (empty) dictionary, not a, b",
+                                    0, revivedHandler.firstFrameDeltaStart);
+                            Assert.assertEquals("post-recycle dictionary must hold only the new "
+                                            + "epoch's symbol, nothing lost or duplicated from "
+                                            + "before the outage",
+                                    Collections.singletonList("c"), revivedHandler.dict());
+                        }
+                    } finally {
+                        // Never leave the trigger thread running past this test:
+                        // a thread still inside the sender on an assert-failure
+                        // path muddies assertMemoryLeak's diagnostics.
+                        trigger.join(10_000);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Default configuration: no {@code reconnect_*} knob and no
+     * {@code initial_connect_retry}, so the builder resolves
+     * {@code initialConnectMode} to OFF and step 7's {@code ensureConnected()}
+     * is a single-shot connect that fails outright while the endpoint refuses.
+     * Steps 1-6 have already committed by then, so latching {@code
+     * recycleFailure} here would brick the sender permanently over an ordinary
+     * transient outage -- the shipped default for every sender that crosses
+     * the threshold.
+     * <p>
+     * Proves the step-7 failure reaches the caller WITHOUT latching, that the
+     * swap committed exactly one epoch, and that the very next send recovers
+     * through the existing {@code sendRow() -> ensureConnected()} path once
+     * the endpoint is back -- reconnecting only, never re-running a teardown
+     * step and never swapping a second time.
+     */
+    @Test
+    public void testDefaultConfigRecycleSurvivesFailedReconnect() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("default-config-outage").toString();
+            AckAllHandler firstHandler = new AckAllHandler();
+            int port;
+            try (TestWebSocketServer server = new TestWebSocketServer(firstHandler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                port = server.getPort();
+                String cfg = "ws::addr=localhost:" + port + ";sf_dir=" + sfDir
+                        + ";symbol_dict_reset_threshold=2;";
+
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue("the recycle must be on under a default configuration",
+                            ws.isSymbolDictResetEnabled());
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: the arming batch must be acked before the outage",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+                    Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
+
+                    // Kill the listener AND the live connection. The ring is
+                    // drained, so the sender-level connected flag is still true
+                    // and the next table() call fires the recycle into a wire
+                    // that is already down.
+                    server.close();
+
+                    LineSenderException triggering = null;
+                    try {
+                        sender.table("t");
+                        Assert.fail("step 7's single-shot connect must throw while the endpoint "
+                                + "refuses connections");
+                    } catch (LineSenderException e) {
+                        triggering = e;
+                    }
+                    Assert.assertNotNull(triggering);
+
+                    Assert.assertEquals("the swap committed exactly one epoch before the connect "
+                                    + "failed", 1, ws.getSymbolDictEpoch());
+                    Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
+                    Assert.assertFalse("a committed swap disarms even when its reconnect fails",
+                            ws.isResetArmed());
+
+                    // Endpoint back on the SAME port. The sender must not be
+                    // terminal: the next send reconnects on its own.
                     OutageRecycleHandler revivedHandler = new OutageRecycleHandler();
                     try (TestWebSocketServer revived =
                                  new TestWebSocketServer(revivedHandler, false, null, port)) {
                         revived.start();
                         Assert.assertTrue(revived.awaitStart(5, TimeUnit.SECONDS));
 
-                        trigger.join(10_000);
-                        Assert.assertFalse("recycle-trigger thread must have finished once the "
-                                        + "endpoint accepts again", trigger.isAlive());
-                        Assert.assertNull("triggering table() must not throw once the outage "
-                                        + "resolves within budget: " + triggerFailure.get(),
-                                triggerFailure.get());
-
-                        Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                        Assert.assertEquals("recycle must complete despite the outage",
-                                1, ws.getSymbolDictEpoch());
-                        Assert.assertTrue("revived server must observe a fresh handshake",
-                                revived.handshakeCount() >= 1);
-
-                        // The "c" row was built (atNow()) inside the triggering
-                        // call but not yet flushed -- flush now and prove it
-                        // lands on the fresh connection.
+                        // "d" registers BEFORE the deferred connect -- symbol()
+                        // runs ahead of sendRow(), which is what finally
+                        // performs it -- so this first batch is the one that
+                        // proves the connect left the batch's symbol watermark
+                        // alone on its way through.
+                        sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                         long fsn2 = sender.flushAndGetSequence();
-                        Assert.assertTrue("post-recycle row must land once reconnected",
+                        Assert.assertTrue("a sender whose step-7 connect failed must still ingest "
+                                        + "once the endpoint returns",
                                 sender.awaitAckedFsn(fsn2, 5_000));
                         Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN",
                                 fsn2 > fsn1);
+                        Assert.assertEquals("the recovery reconnects only -- it must not run a "
+                                        + "second swap", 1, ws.getSymbolDictEpoch());
+                        Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
 
-                        Assert.assertEquals("the fresh connection's first frame must carry a "
+                        Assert.assertEquals("the recovered connection's first frame must carry a "
                                         + "fresh (empty) dictionary, not a, b",
                                 0, revivedHandler.firstFrameDeltaStart);
-                        Assert.assertEquals("post-recycle dictionary must hold only the new "
-                                        + "epoch's symbol, nothing lost or duplicated from "
-                                        + "before the outage",
-                                Collections.singletonList("c"), revivedHandler.dict());
+                        Assert.assertEquals("the recovered stream must define every symbol its "
+                                        + "rows reference: a deferred connect that cleared the "
+                                        + "batch watermark would ship a row pointing at an id "
+                                        + "the server never received",
+                                Collections.singletonList("d"), revivedHandler.dict());
+
+                        // And the epoch keeps extending normally from there.
+                        sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();
+                        long fsn3 = sender.flushAndGetSequence();
+                        Assert.assertTrue(sender.awaitAckedFsn(fsn3, 5_000));
+                        Assert.assertEquals("later batches must extend the same fresh dictionary",
+                                Arrays.asList("d", "e"), revivedHandler.dict());
                     }
                 }
             }

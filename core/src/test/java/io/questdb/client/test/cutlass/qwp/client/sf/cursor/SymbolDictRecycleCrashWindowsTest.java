@@ -191,8 +191,7 @@ public class SymbolDictRecycleCrashWindowsTest {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("crash-a-pre-swap").toString();
             String slot = Paths.get(sfDir, "default").toString();
             long fsn;
-            SilentHandler crashedHandler = new SilentHandler();
-            try (TestWebSocketServer crashed = startedServer(crashedHandler)) {
+            try (TestWebSocketServer crashed = startedServer(new SilentHandler())) {
                 String cfg = "ws::addr=localhost:" + crashed.getPort() + ";sf_dir=" + sfDir
                         + ";symbol_dict_reset_threshold=2;close_flush_timeout_millis=0;";
                 try (Sender sender = Sender.fromConfig(cfg)) {

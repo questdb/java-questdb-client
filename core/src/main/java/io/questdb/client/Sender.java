@@ -694,6 +694,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * happens at the next safe point (all published data acknowledged, no row
      * in progress); it may be deferred indefinitely under sustained load. No-op
      * on transports without a symbol dictionary.
+     * <p>
+     * Also a permanent no-op on a sender configured with
+     * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
+     * that knob gates the arming path this request feeds, so the request is
+     * accepted and never acted on.
      */
     default void resetSymbolDictionary() {
     }
@@ -1097,7 +1102,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private int maxFrameRejections = PARAMETER_NOT_SET_EXPLICITLY;
         private long poisonMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private long catchUpCapGapMinEscalationWindowMillis = PARAMETER_NOT_SET_EXPLICITLY;
-        private boolean symbolDictReset = true;
+        private boolean symbolDictReset = QwpWebSocketSender.DEFAULT_SYMBOL_DICT_RESET_ENABLED;
         private int symbolDictResetThreshold = PARAMETER_NOT_SET_EXPLICITLY;
         private long symbolDictResetMaxWaitMillis = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpPath;
@@ -1893,6 +1898,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * Enables periodic recycling (rebuilding) of the sender's symbol dictionary
          * once it reaches {@link #symbolDictResetThreshold(int)} distinct symbols,
          * so a long-lived sender's dictionary does not grow without bound.
+         * <p>
+         * Switching it off also disables the manual valve:
+         * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
+         * because arming gates on this knob.
          * <p>
          * Default {@code true} (on). WebSocket transport only.
          */

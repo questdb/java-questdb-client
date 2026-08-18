@@ -446,12 +446,14 @@ public class QwpWebSocketSender implements Sender {
     // its obvious reader.
     private volatile long symbolDictResetStarvationTimeouts;
     // Set (once) by recycleForDictReset's catch block when the recycle swap
-    // itself fails -- everything was acked before the swap tore the old
-    // engine down, so no data is at risk, but this sender can no longer make
-    // progress (no cursor engine, no I/O loop) and refuses further use.
-    // checkRecycleFailure() rethrows a fresh LineSenderException wrapping
+    // itself fails in steps 2-6 -- everything was acked before the swap tore
+    // the old engine down, so no data is at risk, but this sender can no
+    // longer make progress (no cursor engine, no I/O loop) and refuses further
+    // use. checkRecycleFailure() rethrows a fresh LineSenderException wrapping
     // this cause on every later table()/flush-family call; close() still
-    // works normally.
+    // works normally. A step-7 (reconnect) failure deliberately does NOT set
+    // this: the swap has already committed there, so the sender is coherent
+    // and merely disconnected, and the next send retries the connect.
     private Throwable recycleFailure;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits. volatile: this is public API (see
@@ -2150,8 +2152,11 @@ public class QwpWebSocketSender implements Sender {
      * Number of symbol-dictionary recycles this sender has completed. Advances
      * by one at step 5 of {@link #recycleForDictReset()}, the instant the swap
      * commits to the new epoch -- before the engine rebuild (step 6) or the
-     * reconnect (step 7), so a later rebuild/reconnect failure that latches
-     * {@link #recycleFailure} still leaves this incremented. volatile: a
+     * reconnect (step 7), so a later step-6 rebuild failure that latches
+     * {@link #recycleFailure}, and a step-7 reconnect failure that does not,
+     * both still leave this incremented. Unlike the per-send-loop
+     * {@code getTotal*} counters, it is scoped to the sender's whole lifetime
+     * and never resets. volatile: a
      * concurrent read sees the latest write the producer thread completed,
      * but there is no atomicity across the three symbol-dictionary-recycle
      * counters -- a reader on another thread can observe this one already
@@ -2168,8 +2173,9 @@ public class QwpWebSocketSender implements Sender {
      * Incremented alongside {@link #getSymbolDictEpoch()} at step 5 of
      * {@link #recycleForDictReset()} -- before the engine rebuild (step 6) or
      * the reconnect (step 7), so, like the epoch counter, a later
-     * rebuild/reconnect failure that latches {@link #recycleFailure} still
-     * leaves this incremented. The two counts move together today -- the
+     * rebuild/reconnect failure still leaves this incremented, latched or not.
+     * Also like the epoch counter, it is scoped to the sender's whole lifetime
+     * and never resets. The two counts move together today -- the
      * only way the epoch advances is through a completed recycle swap -- but
      * they are defined, and incremented, independently: this one counts
      * completed swaps, {@code getSymbolDictEpoch()} counts the dictionary
@@ -2295,9 +2301,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Cumulative count of frames re-sent during post-reconnect catch-up
-     * windows. Zero in steady state; a sustained nonzero rate signals
-     * flapping where every reconnect replays meaningful work.
+     * Count of frames re-sent during post-reconnect catch-up windows since the
+     * last symbol-dictionary recycle. Zero in steady state; a sustained nonzero
+     * rate signals flapping where every reconnect replays meaningful work.
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()} /
+     * {@link #getSymbolDictResetsPerformed()}, which never reset.
      */
     public long getTotalFramesReplayed() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2305,7 +2317,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total binary frames the cursor I/O loop has issued to the wire.
+     * Binary frames the cursor I/O loop has issued to the wire since the last
+     * symbol-dictionary recycle.
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()} /
+     * {@link #getSymbolDictResetsPerformed()}, which never reset.
      */
     public long getTotalFramesSent() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2313,9 +2332,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Number of reconnect attempts the cursor I/O loop has issued —
-     * succeeded plus failed. Diverges from {@link #getTotalReconnectsSucceeded}
-     * when the server is flapping. Returns 0 if no I/O loop is running.
+     * Number of reconnect attempts the cursor I/O loop has issued since the
+     * last symbol-dictionary recycle -- succeeded plus failed. Diverges from
+     * {@link #getTotalReconnectsSucceeded} when the server is flapping.
+     * Returns 0 if no I/O loop is running.
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()} /
+     * {@link #getSymbolDictResetsPerformed()}, which never reset.
      */
     public long getTotalReconnectAttempts() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2323,7 +2349,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Number of successful reconnects. Returns 0 if no I/O loop is running.
+     * Number of successful reconnects since the last symbol-dictionary
+     * recycle. Returns 0 if no I/O loop is running.
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()} /
+     * {@link #getSymbolDictResetsPerformed()}, which never reset.
      */
     public long getTotalReconnectsSucceeded() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2331,7 +2364,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total errors observed by the I/O loop (retriable and terminal combined).
+     * Errors the I/O loop has observed since the last symbol-dictionary
+     * recycle (retriable and terminal combined).
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()} /
+     * {@link #getSymbolDictResetsPerformed()}, which never reset.
      */
     public long getTotalServerErrors() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2652,6 +2692,10 @@ public class QwpWebSocketSender implements Sender {
      * have to wait for a later flush to observe {@code isResetArmed()}. A
      * request made mid-batch is picked up by the next
      * {@code resetTableBuffersAfterFlush} instead.
+     * <p>
+     * A permanent no-op while {@code symbol_dict_reset} is off: arming gates
+     * on that knob, so a sender configured with the recycle disabled never
+     * acts on the request, however many times it is made.
      */
     @Override
     public void resetSymbolDictionary() {
@@ -3712,11 +3756,14 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Terminal latch for a failed symbol-dictionary recycle swap
-     * ({@link #recycleForDictReset()}). Everything was acked before the swap
-     * tore the old engine down, so no data is at risk -- but the swap itself
-     * left this sender without a cursor engine or I/O loop, so it refuses
-     * further use. Checked by {@link #table(CharSequence)}, the flush-family
+     * Terminal latch for a symbol-dictionary recycle swap that failed in steps
+     * 2-6 ({@link #recycleForDictReset()}). Everything was acked before the
+     * swap tore the old engine down, so no data is at risk -- but the swap
+     * itself left this sender without a cursor engine or I/O loop, so it
+     * refuses further use. A step-7 reconnect failure is NOT latched (the swap
+     * has committed by then and the sender is coherent, just disconnected --
+     * see {@link #recycleForDictReset()}). Checked by
+     * {@link #table(CharSequence)}, the flush-family
      * entry points ({@link #flush()}, {@link #flushAndGetSequence()},
      * {@link #drain(long)}, {@link #awaitAckedFsn(long, long)}), and
      * {@code sendRow()} (closing the fluent-chain corner where a caller
@@ -4180,10 +4227,11 @@ public class QwpWebSocketSender implements Sender {
                     ep.host, ep.port, endpoints.size());
         }
         // Server starts fresh on each connection, so reset the per-batch
-        // symbol-dict watermark. Every frame still carries its full inline schema,
-        // and the fresh server's dictionary is re-established either by a full-dict
-        // frame (full-dict mode) or by an I/O-thread catch-up frame before replay
-        // (delta mode), so post-reconnect replay needs no producer-side reset signal.
+        // symbol-dict watermark when nothing is staged against it. Every frame
+        // still carries its full inline schema, and the fresh server's dictionary
+        // is re-established either by a full-dict frame (full-dict mode) or by an
+        // I/O-thread catch-up frame before replay (delta mode), so post-reconnect
+        // replay needs no producer-side reset signal.
         resetSymbolDictStateForNewConnection();
         connectionError.set(null);
 
@@ -4588,11 +4636,13 @@ public class QwpWebSocketSender implements Sender {
      * frames still benefits from bounding its dictionary size, and a manual
      * request is honoured regardless of mode.
      * <p>
-     * Called only from the tail of {@link #resetTableBuffersAfterFlush()} (a
-     * safe point: no row in progress, this flush's data already handed to the
-     * engine), never from the per-symbol registration path
-     * ({@link #getOrAddGlobalSymbol}) -- arming mid-row or mid-encode would
-     * observe a dictionary size that has not yet settled for this batch.
+     * Called from two safe points only: the tail of
+     * {@link #resetTableBuffersAfterFlush()} (no row in progress, this flush's
+     * data already handed to the engine) and {@link #resetSymbolDictionary()}
+     * when nothing is in flight ({@code pendingRowCount == 0}). Never from the
+     * per-symbol registration path ({@link #getOrAddGlobalSymbol}) -- arming
+     * mid-row or mid-encode would observe a dictionary size that has not yet
+     * settled for this batch.
      */
     private void armIfEligible() {
         boolean shouldArm = resetEnabled
@@ -4743,14 +4793,29 @@ public class QwpWebSocketSender implements Sender {
      *       mirroring (not calling) {@link #setCursorEngine} -- that method's
      *       guards refuse a second engine.</li>
      *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
-     *       against the rolled {@link #fsnEpochBase}.</li>
+     *       against the rolled {@link #fsnEpochBase}. Runs OUTSIDE the latching
+     *       try -- see below.</li>
      * </ol>
-     * A throw at any step is caught, latches {@link #recycleFailure} (step 8),
+     * A throw in steps 1-6 is caught, latches {@link #recycleFailure} (step 8),
      * and rethrows: every frame that existed before this call was already
      * proven acked, so no data is at risk, but the sender that made the throw
-     * observe a torn-down engine/loop refuses further use from here on --
+     * observe a half-swapped engine/loop refuses further use from here on --
      * {@link #checkRecycleFailure()} enforces that at every later
      * {@link #table(CharSequence)} and flush-family call.
+     * <p>
+     * Step 7 is deliberately exempt from that latch. By then the swap has
+     * committed, so a failed connect leaves a fully coherent sender that is
+     * merely disconnected: {@code connected == false}, loop and client already
+     * closed and nulled by {@link #ensureConnected()}'s own catch, the fresh
+     * engine attached, and the step-5 counters ({@link #symbolDictEpoch},
+     * {@link #symbolDictResetsPerformed}) correctly left incremented because
+     * the swap really did happen. It rethrows loudly to the triggering caller
+     * but the sender stays usable, and the ordinary
+     * {@code sendRow() -> ensureConnected()} path retries the connect -- and
+     * only the connect -- on the next send. Nothing can fire a second swap
+     * meanwhile: the fresh dictionary is below threshold,
+     * {@code manualResetRequested} was consumed at step 5, and
+     * {@link #maybeRecycleForDictReset()} requires {@code connected}.
      */
     private void recycleForDictReset() {
         final long lastPublishedFsn = cursorEngine.publishedFsn(); // step 1
@@ -4784,11 +4849,6 @@ public class QwpWebSocketSender implements Sender {
             ownsCursorEngine = true;
             deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
             cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
-            // step 7: reconnect - rebuilds the loop with the rolled base
-            connected = false;
-            ensureConnected();
-            LOG.info("symbol dictionary recycled [epoch={}, dictSizeAtSwap={}, pauseMicros={}]",
-                    symbolDictEpoch, dictSizeAtSwap, (System.nanoTime() - startNanos) / 1000L);
         } catch (Throwable t) {
             // step 8: terminal latch - everything was acked before step 2,
             // so no data is at risk; the sender refuses further use.
@@ -4800,6 +4860,32 @@ public class QwpWebSocketSender implements Sender {
             }
             throw new LineSenderException(t).put("symbol dictionary recycle failed");
         }
+        // step 7: reconnect - rebuilds the loop with the rolled base. OUTSIDE
+        // the latching try on purpose: the swap has already committed, so a
+        // connect failure here leaves a coherent fresh-epoch sender that is
+        // merely disconnected, not a half-swapped one. It throws loudly to the
+        // caller but does NOT latch -- ensureConnected's own catch has already
+        // closed and nulled the loop and the client, the epoch and swap
+        // counters incremented at step 5 stay incremented (the swap really did
+        // happen), the sender stays disarmed (a fresh dictionary is below
+        // threshold and manualResetRequested was consumed, so nothing can fire
+        // a second swap while disconnected), and the next sendRow() retries the
+        // connect - and ONLY the connect - through ensureConnected.
+        connected = false;
+        try {
+            ensureConnected();
+        } catch (Throwable t) {
+            LOG.warn("symbol dictionary swap committed but its reconnect failed; sender stays "
+                            + "disconnected on the fresh epoch and retries the connect on the "
+                            + "next send [epoch={}, dictSizeAtSwap={}]",
+                    symbolDictEpoch, dictSizeAtSwap, t);
+            if (t instanceof LineSenderException) {
+                throw (LineSenderException) t;
+            }
+            throw new LineSenderException(t).put("symbol dictionary recycle reconnect failed");
+        }
+        LOG.info("symbol dictionary recycled [epoch={}, dictSizeAtSwap={}, pauseMicros={}]",
+                symbolDictEpoch, dictSizeAtSwap, (System.nanoTime() - startNanos) / 1000L);
     }
 
     /**
@@ -5225,14 +5311,28 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void resetSymbolDictStateForNewConnection() {
-        // Runs on the foreground (initial) connect only -- NOT on the I/O thread's
-        // reconnect/failover path. The per-batch watermark is drained state, so
-        // clearing it here is harmless. sentMaxSymbolId is deliberately left
+        // Runs on the foreground connect only -- NOT on the I/O thread's
+        // reconnect/failover path. sentMaxSymbolId is deliberately left
         // untouched: in delta mode the I/O thread re-registers the whole
         // dictionary with a catch-up frame on reconnect, so the producer's
         // monotonic baseline must survive the wire boundary; resetting it would
         // desync the producer from the I/O thread's sent-dictionary count.
-        currentBatchMaxSymbolId = -1;
+        //
+        // currentBatchMaxSymbolId is batch-scoped, not connection-scoped: a
+        // flush ships exactly [sentMaxSymbolId+1 .. currentBatchMaxSymbolId],
+        // so clearing it while a batch already references those ids ships a
+        // delta that OMITS them and puts rows on the wire pointing at symbol
+        // ids the server never received. Clearing it used to be unconditional
+        // and harmless because build() connects before the application can
+        // register anything. That no longer holds: a symbol-dictionary recycle
+        // whose step-7 connect failed defers the connect to the next
+        // sendRow(), which runs after symbol() has registered the ids of the
+        // row being built. Reset only from the drained state the old code
+        // assumed.
+        if (pendingRowCount == 0
+                && (currentTableBuffer == null || !currentTableBuffer.hasInProgressRow())) {
+            currentBatchMaxSymbolId = -1;
+        }
     }
 
     /**

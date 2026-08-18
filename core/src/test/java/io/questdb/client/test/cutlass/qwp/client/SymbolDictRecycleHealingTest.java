@@ -378,7 +378,17 @@ public class SymbolDictRecycleHealingTest {
         return new int[]{deltaStart, deltaCount};
     }
 
-    /** ACKs every frame it receives; does not otherwise inspect the wire. */
+    /**
+     * ACKs every frame it receives; does not otherwise inspect the wire.
+     * <p>
+     * WARNING -- recycle-only handler, do not copy into a plain-reconnect test.
+     * The per-connection sequence reset below assumes every connection change
+     * is a recycle, i.e. that a fresh engine is behind the new connection and
+     * its raw FSNs really do restart at 0. On an ordinary reconnect the SAME
+     * engine survives and keeps counting, so resetting here would ack frames
+     * the sender never published and silently advance its watermark past
+     * unsent data.
+     */
     private static class AckAllHandler implements TestWebSocketServer.WebSocketServerHandler {
         private TestWebSocketServer.ClientHandler currentClient;
         private final AtomicLong nextSeq = new AtomicLong(0);
