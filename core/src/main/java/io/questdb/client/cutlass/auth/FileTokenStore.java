@@ -325,10 +325,17 @@ public final class FileTokenStore implements TokenStore {
                 // Arrived DURING the poll, so it is a live cancellation rather than carried state. Consumed
                 // for the same reason as the process-lock wait above.
                 cancelled = true;
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
                 // could not prepare the lock directory or file; run without the cross-process lock. Layer-1
                 // atomic replacement still keeps every reader consistent - only a rotating-refresh-token race
                 // across processes is left unguarded for this one refresh.
+                //
+                // RuntimeException as well as IOException: this is lock BOOKKEEPING, and none of it is a
+                // reason to fail a sign-in the caller could otherwise complete. A SecurityManager denying
+                // the directory or the lock file throws SecurityException, and a filesystem that cannot
+                // carry POSIX permissions throws UnsupportedOperationException - both unchecked, both
+                // previously escaping past the caller's degrade path and aborting signIn()/getToken()
+                // outright, which is the opposite of what a best-effort store should do.
                 nonce = null;
             }
             try {
@@ -349,6 +356,15 @@ public final class FileTokenStore implements TokenStore {
                     boolean wasInterruptedInSection = Thread.interrupted();
                     try {
                         releaseLock(lock, nonce);
+                    } catch (RuntimeException e) {
+                        // This runs in a finally, AFTER the critical section returned. A throw here would
+                        // replace the caller's completed refresh with an exception - the refresh happened,
+                        // the token is live, and the caller would be told the sign-in failed. releaseLock
+                        // already absorbs IOException; a SecurityManager denying the delete throws
+                        // SecurityException, which is unchecked and was escaping. Same operator-visible
+                        // warning, same degrade: peers run unserialized until the lock goes stale.
+                        LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free "
+                                + "refresh until it goes stale [error={}]", e.getMessage());
                     } finally {
                         if (wasInterruptedInSection) {
                             Thread.currentThread().interrupt();

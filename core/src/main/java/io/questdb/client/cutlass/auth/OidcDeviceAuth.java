@@ -1750,9 +1750,44 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (tokenStore == null) {
             return tryRefresh();
         }
-        // serialise the read-refresh-write across processes (and adopt a peer's just-rotated refresh token)
-        // through the store's per-identity lock; a store that does not coordinate just runs the refresh
-        return tokenStore.inLock(storeKey, this::refreshUnderLock);
+        // Serialise the read-refresh-write across processes (and adopt a peer's just-rotated refresh token)
+        // through the store's per-identity lock; a store that does not coordinate just runs the refresh.
+        //
+        // TokenStore is a user-implemented SPI and persistence is documented best-effort, so a store that
+        // throws must not take the sign-in down with it - it did, because inLock was called bare. What the
+        // right degrade is depends entirely on whether the refresh already ran, which only the action
+        // itself can report:
+        //   - the store threw BEFORE the action ran: nothing was refreshed, so run ONE uncoordinated
+        //     refresh. Exactly one: the point of the lock is that a rotating refresh token must not be
+        //     POSTed twice, and a reuse-detecting provider answers a replay by revoking the whole family.
+        //   - the store threw AFTER the action completed (releasing a lock, closing a handle): the refresh
+        //     HAPPENED and the token is live. Report what the action returned; re-running it would be that
+        //     same double-POST, and throwing would tell the caller a completed sign-in failed.
+        //   - the action itself threw: that is the refresh's own failure, not the store's. Never swallow
+        //     it and never replay it - let it propagate exactly as it did before.
+        // Error is deliberately not caught: an OutOfMemoryError is not a store fault to degrade around.
+        final boolean[] actionEntered = new boolean[1];
+        final boolean[] actionCompleted = new boolean[1];
+        final boolean[] actionResult = new boolean[1];
+        try {
+            return tokenStore.inLock(storeKey, () -> {
+                actionEntered[0] = true;
+                boolean refreshed = refreshUnderLock();
+                actionResult[0] = refreshed;
+                actionCompleted[0] = true;
+                return refreshed;
+            });
+        } catch (RuntimeException e) {
+            if (actionCompleted[0]) {
+                warnPersistence("lock release", e);
+                return actionResult[0];
+            }
+            if (actionEntered[0]) {
+                throw e;
+            }
+            warnPersistence("lock", e);
+            return tryRefresh();
+        }
     }
 
     private void warnPersistence(String operation, Throwable cause) {

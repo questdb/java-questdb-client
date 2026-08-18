@@ -673,6 +673,56 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testStoreThrowingBeforeTheActionDegradesToOneUncoordinatedRefresh() throws Exception {
+        assertMemoryLeak(() -> {
+            // TokenStore is a user-implemented SPI and persistence is documented best-effort, but inLock was
+            // called bare: a store that threw took the whole sign-in down with it and refreshed nothing, even
+            // though the client held a perfectly good refresh token. The degrade is a single uncoordinated
+            // refresh - exactly one, because the lock exists to stop a rotating refresh token being POSTed
+            // twice, and a reuse-detecting provider answers a replay by revoking the whole family.
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-REFRESHED", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.stored = new PersistedToken("ACCESS-STALE", null, "REFRESH-1", System.currentTimeMillis() - 1, 300_000);
+                fake.throwBeforeAction = new RuntimeException("LOCK-DOWN");
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("a throwing store must not fail a sign-in it cannot help with",
+                            "ACCESS-REFRESHED", auth.getToken());
+                }
+                Assert.assertEquals("the degrade must still refresh", 1, token.get());
+                Assert.assertEquals("the interactive flow must not be needed", 0, device.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testStoreThrowingAfterTheActionKeepsTheCompletedRefresh() throws Exception {
+        assertMemoryLeak(() -> {
+            // The mirror case, and the one where a blind retry does real damage. The store threw on the way
+            // OUT - releasing its lock, closing a handle - so the refresh already happened and the token is
+            // live. Re-running it would be the duplicate POST of a rotating refresh token the lock exists to
+            // prevent, and propagating would tell the caller a completed sign-in failed.
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-REFRESHED", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.stored = new PersistedToken("ACCESS-STALE", null, "REFRESH-1", System.currentTimeMillis() - 1, 300_000);
+                fake.throwAfterAction = new RuntimeException("RELEASE-FAILED");
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("a completed refresh must be reported, not undone by a bookkeeping throw",
+                            "ACCESS-REFRESHED", auth.getToken());
+                }
+                Assert.assertEquals("the refresh must not be replayed after it already completed",
+                        1, token.get());
+                Assert.assertEquals("the interactive flow must not be needed", 0, device.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testStoreLoadedAtMostOncePerInstance() throws Exception {
         assertMemoryLeak(() -> {
             MockOidcServer.Handler handler = (method, path, body) -> {
@@ -1082,6 +1132,8 @@ public class OidcDeviceAuthPersistenceTest {
         PersistedToken loadReturns;
         PersistedToken peerInstallsOnLock;
         PersistedToken stored;
+        RuntimeException throwAfterAction;
+        RuntimeException throwBeforeAction;
 
         @Override
         public void clear(TokenStoreKey key) {
@@ -1092,12 +1144,21 @@ public class OidcDeviceAuthPersistenceTest {
         @Override
         public boolean inLock(TokenStoreKey key, CriticalSection action) {
             locks.incrementAndGet();
+            if (throwBeforeAction != null) {
+                throw throwBeforeAction;
+            }
             if (peerInstallsOnLock != null) {
                 // simulate a peer process refreshing and writing a fresh entry while we hold the lock
                 stored = peerInstallsOnLock;
                 peerInstallsOnLock = null;
             }
-            return action.run();
+            boolean result = action.run();
+            if (throwAfterAction != null) {
+                // a bookkeeping failure on the way out - releasing the lock, closing a handle - AFTER the
+                // critical section already completed
+                throw throwAfterAction;
+            }
+            return result;
         }
 
         @Override

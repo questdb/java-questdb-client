@@ -71,6 +71,16 @@ public interface TokenStore {
      * {@code load}, or {@code save}, and must not block waiting on another thread that could need that
      * instance lock - either would re-enter or deadlock. Do the store I/O only.
      * <p>
+     * Like {@code load} and {@code save}, this is BEST-EFFORT: an implementation that throws must not be
+     * able to fail a sign-in the caller could otherwise complete. {@code OidcDeviceAuth} therefore degrades
+     * on a throw rather than propagating it, and what it does depends on whether {@code action} ran: a
+     * throw before the action runs falls back to a single uncoordinated refresh, while a throw after the
+     * action completed - releasing a lock, closing a handle - keeps the action's result, because the
+     * refresh already happened and re-running it is the duplicate POST of a rotating refresh token this
+     * lock exists to prevent. An exception from {@code action} itself is the caller's own and propagates
+     * untouched. An implementation should still absorb its own bookkeeping failures and degrade to running
+     * {@code action} unlocked, rather than lean on that fallback.
+     * <p>
      * An implementation that waits for its lock must make that wait INTERRUPTIBLE and, on an interrupt,
      * return {@code false} without running {@code action}. The wait can outlast the caller's own shutdown
      * budget - QWP's connect cancellation interrupts a thread stuck in a credential pull precisely so
