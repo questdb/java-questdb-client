@@ -837,6 +837,110 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testDiscoveryRejectsMalformedStatusWithoutEchoingIt() throws Exception {
+        assertMemoryLeak(() -> {
+            // The header parser copies the status-line token verbatim apart from SP/CR/LF, so a non-digit
+            // byte means a malformed or hostile status line. It must not be read as a 2xx by its leading
+            // digit, and none of it may reach the exception message, which lands in logs and terminals.
+            // A short all-digit status is malformed too, for the same "leading digit is not the class"
+            // reason.
+            // A COMPLETE, otherwise-valid settings body, so the only thing standing between this response
+            // and a working instance is the status gate. A partial body would fail later on a missing key
+            // and prove nothing about the status.
+            for (String statusToken : new String[]{"2\u001b[31m0", "2"}) {
+                AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+                MockOidcServer.Handler handler = (method, path, requestBody) -> {
+                    MockOidcServer server = serverRef.get();
+                    if (SETTINGS_PATH.equals(path)) {
+                        String settings = settingsJson(true, true,
+                                server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH));
+                        return MockOidcServer.raw(
+                                "HTTP/1.1 " + statusToken + " OK\r\n"
+                                        + "Content-Type: application/json\r\n"
+                                        + "Content-Length: " + settings.length() + "\r\n\r\n"
+                                        + settings);
+                    }
+                    return MockOidcServer.json(200, tokenJson("ACCESS-X", "ID-X", null, 3600));
+                };
+                try (MockOidcServer server = new MockOidcServer(handler)) {
+                    serverRef.set(server);
+                    try {
+                        OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()).close();
+                        Assert.fail("a malformed status [" + statusToken + "] must not gate discovery open");
+                    } catch (OidcAuthException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("malformed HTTP status code"));
+                        Assert.assertFalse("the raw status must not be echoed: " + e.getMessage(),
+                                e.getMessage().indexOf('\u001b') >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testSettingsUnderErrorStatusNotTrustedAsConfig() throws Exception {
+        assertMemoryLeak(() -> {
+            // /settings was parsed without looking at the status, so a body carrying the right keys was
+            // read as configuration whatever the response claimed to be. A 500 is not a settings document:
+            // an error envelope, a proxy's branded page or a captive portal could supply the endpoints the
+            // user then signs in against, and the refresh token is POSTed to. The status gate must refuse
+            // it before the body is parsed at all.
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(500,
+                            settingsJson(true, true, server.httpUrl(TOKEN_PATH), server.httpUrl(DEVICE_PATH)));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-X", "ID-X", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure());
+                    Assert.fail("a 500 /settings body must not be trusted as OIDC configuration");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("did not return its settings"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus=500"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testWellKnownUnderErrorStatusNotTrustedAsDiscoveryDoc() throws Exception {
+        assertMemoryLeak(() -> {
+            // The same hole on the .well-known fallback, which is what a pinned issuer falls back to when
+            // /settings advertises no device endpoint. A 404 body is not a discovery document - a
+            // tenant-not-found stub is exactly the shape that reaches this path - so it must not be able to
+            // name the token and device endpoints.
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(TOKEN_PATH), null));
+                }
+                if (WELL_KNOWN_PATH.equals(path)) {
+                    return MockOidcServer.json(404,
+                            wellKnownJson(server.httpUrl(DEVICE_PATH), server.httpUrl(TOKEN_PATH), server.httpUrl("")));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-X", "ID-X", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB(
+                        server.httpUrl(""), insecure().issuer(server.httpUrl("")))) {
+                    Assert.fail("a 404 .well-known body must not be trusted as a discovery document");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(),
+                            e.getMessage().contains("did not return an OIDC discovery document"));
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus=404"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDiscoveryIgnoresArrayWrappedConfig() throws Exception {
         assertMemoryLeak(() -> {
             // a tampered /settings wraps the config object in an ARRAY - {"config":[{...}]} - so the config

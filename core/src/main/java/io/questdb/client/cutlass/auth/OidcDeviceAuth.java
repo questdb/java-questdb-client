@@ -663,13 +663,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         requireSecureIdpEndpoint(endpoint, "OIDC issuer", url, allowInsecureTransport);
         fetchJson(endpoint, endpoint.path, tlsConfig, parser,
                 "could not reach the identity provider to discover OIDC settings",
-                "could not parse the identity provider discovery document");
+                "could not parse the identity provider discovery document",
+                "the identity provider did not return an OIDC discovery document");
     }
 
     private static void discoverSettings(Endpoint server, ClientTlsConfiguration tlsConfig, SettingsDiscoveryParser parser) {
         fetchJson(server, appendSettingsPath(server.path), tlsConfig, parser,
                 "could not reach the QuestDB server to discover OIDC settings",
-                "could not parse the QuestDB /settings response");
+                "could not parse the QuestDB /settings response",
+                "the QuestDB server did not return its settings");
     }
 
     private static OidcAuthException endpointNotUnderIssuer(String label, String url, String issuer) {
@@ -711,7 +713,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         return false;
     }
 
-    private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError) {
+    private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError, String statusError) {
         HttpClient client = endpoint.isTls
                 ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
                 : HttpClientFactory.newPlainTextInstance(HTTP_CONFIG);
@@ -729,6 +731,14 @@ public class OidcDeviceAuth implements QuietCloseable {
             HttpClient.ResponseHeaders response = request.send(DEFAULT_HTTP_TIMEOUT_MILLIS);
             response.await(DEFAULT_HTTP_TIMEOUT_MILLIS);
             Response body = response.getResponse();
+            // A discovery document decides WHERE the user signs in and where the refresh token is POSTed,
+            // so it must be read only out of a response that actually claims to carry one. Parsing
+            // regardless of status let an error page supply that configuration: a 500 from /settings or a
+            // 404 from .well-known whose body happens to hold the right keys - an error envelope, a proxy's
+            // branded page, a captive portal, a tenant-not-found stub - constructed a working instance
+            // pointed wherever those keys said. The token and device-authorization paths already gate on
+            // status; this one did not.
+            requireSuccessStatus(client, response, body, statusError);
             // parseBody enforces a wall-clock deadline and a byte cap so an untrusted server cannot wedge
             // discovery, and its parseLast rejects a truncated document
             parseBody(body, lexer, parser, DEFAULT_HTTP_TIMEOUT_MILLIS);
@@ -929,6 +939,57 @@ public class OidcDeviceAuth implements QuietCloseable {
         sink.clear();
         if (!Chars.equals("null", tag)) {
             sink.put(tag);
+        }
+    }
+
+    /**
+     * Requires a well-formed 2xx status before a discovery body is trusted as configuration.
+     * <p>
+     * The status is validated to be exactly three bare digits BEFORE any of it is echoed: the header parser
+     * copies the status-line token verbatim apart from SP/CR/LF, so a non-digit byte means a malformed or
+     * hostile status line that must not splice ESC or other control bytes into a message, a log or a
+     * terminal. A short all-digit status ({@code 2}, {@code 5}) is malformed too, and must not be read as a
+     * 2xx class by its leading digit. Mirrors the check {@code readResponse} applies on the token path.
+     * <p>
+     * On rejection the body is drained within the usual bound so the keep-alive connection stays usable; a
+     * body too large or too slow to drain leaves unconsumed bytes, so the connection is dropped instead of
+     * mis-framing the next request's response.
+     */
+    private static void requireSuccessStatus(
+            HttpClient client,
+            HttpClient.ResponseHeaders response,
+            Response body,
+            String statusError
+    ) {
+        DirectUtf8Sequence statusCode = response.getStatusCode();
+        StringSink status = new StringSink();
+        boolean malformed = statusCode == null;
+        if (!malformed) {
+            CharSequence raw = statusCode.asAsciiCharSequence();
+            for (int i = 0, n = raw.length(); i < n; i++) {
+                char c = raw.charAt(i);
+                if (c < '0' || c > '9') {
+                    malformed = true;
+                    break;
+                }
+                status.put(c);
+            }
+            malformed |= status.length() != 3;
+        }
+        if (malformed) {
+            if (!discardBody(body, DEFAULT_HTTP_TIMEOUT_MILLIS)) {
+                client.disconnect();
+            }
+            throw new OidcAuthException().put(statusError)
+                    .put("; the response carried a malformed HTTP status code");
+        }
+        if (status.charAt(0) != '2') {
+            if (!discardBody(body, DEFAULT_HTTP_TIMEOUT_MILLIS)) {
+                client.disconnect();
+            }
+            // the status is proven to be bare digits, so echoing it cannot smuggle control bytes
+            throw new OidcAuthException().put(statusError)
+                    .put(" [httpStatus=").put(status).put(']');
         }
     }
 
