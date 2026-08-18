@@ -2682,12 +2682,15 @@ public class QwpWebSocketSender implements Sender {
             // Install the user listener as the pool's submit-time default so
             // the drainers submitted below observe it from their first event.
             drainerPool.setListener(this.drainerListener);
-            // Route drainer data-loss reports through the sender's own error
+            // Route the drainers' reports through the sender's own error
             // dispatcher: async, bounded, and contained exactly like every
-            // other SenderError. The dispatcher field is read lazily because
-            // it is created on connect, which can complete after this pool is
-            // built; a null dispatcher (never connected) leaves the site's own
-            // LOG line as the only announcement, same as before this sink.
+            // other SenderError. Two kinds arrive -- the data-loss report when a
+            // drainer abandons a slot, and the non-terminal faults its drain loop
+            // rides out (above all a credential the token provider cannot supply,
+            // which nothing else would ever surface). The dispatcher field is read
+            // lazily because it is created on connect, which can complete after
+            // this pool is built; a null dispatcher (never connected) leaves the
+            // site's own LOG line as the only announcement, same as before this sink.
             drainerPool.setErrorSink(err -> {
                 SenderErrorDispatcher d = errorDispatcher;
                 if (d != null) {

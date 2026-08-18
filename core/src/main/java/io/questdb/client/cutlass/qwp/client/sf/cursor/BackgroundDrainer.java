@@ -29,6 +29,7 @@ import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -137,10 +138,13 @@ public final class BackgroundDrainer implements Runnable {
      * reference an already-closed engine once the drain ends.
      */
     private volatile CursorSendEngine engineForTesting;
-    // Sink for SenderError.dataLoss reports fired when this drainer
-    // permanently abandons a slot behind a .failed sentinel. Volatile for the
-    // same reason as `listener`: applied by the pool at submit time, read on
-    // the drainer thread. Null means the abandonment is announced only via
+    // Sink for this drainer's SenderError reports. Two feeds: the dataLoss fired
+    // when it permanently abandons a slot behind a .failed sentinel, and the
+    // non-TERMINAL reports of the drain loop itself -- an unobtainable credential
+    // above all, plus the server rejections it replays through -- which run()
+    // forwards by handing the loop a SenderErrorDispatcher over this sink.
+    // Volatile for the same reason as `listener`: applied by the pool at submit
+    // time, read on the drainer thread. Null means both are announced only via
     // LOG -- a NOP for apps without an slf4j binding -- which is exactly the
     // silence this sink exists to break.
     private volatile SenderErrorHandler errorSink;
@@ -521,6 +525,11 @@ public final class BackgroundDrainer implements Runnable {
                 // WebSocketUpgradeException) and is intentionally retried under
                 // Invariant B -- but it is NOT a transport outage, so log it
                 // truthfully below rather than mislabelling it "cluster unreachable".
+                // The same holds for a credential the client cannot ACQUIRE
+                // (QwpCredentialUnavailableException extends LineSenderException, so it
+                // matches none of the typed arms above): retried indefinitely here, for
+                // the reason CursorWebSocketSendLoop's matching arm spells out, but
+                // named for what it is.
                 lastErrorMessage = t.getMessage();
                 // This unrelated state breaks the consecutive capability-gap
                 // run. Restart both halves of the settle budget so a later gap
@@ -543,6 +552,18 @@ public final class BackgroundDrainer implements Runnable {
                         LOG.warn("drainer slot {}: every reachable endpoint advertises an unsupported "
                                         + "QWP protocol version ({}); retrying (rolling-upgrade window) -- "
                                         + "if this persists the client is version-incompatible with the cluster",
+                                slotPath, t.getMessage());
+                    } else if (t instanceof QwpCredentialUnavailableException) {
+                        // Nothing was attempted on the wire: the configured token provider
+                        // threw instead of handing over a credential (a failed silent
+                        // refresh, a revoked or expired refresh token, an unreachable IdP,
+                        // or an interactive sign-in not finished yet). The cluster may be
+                        // perfectly healthy, so "cluster unreachable" sends the operator
+                        // after a network fault that does not exist while the slot's rows
+                        // sit undrained. Point at the credential instead.
+                        LOG.warn("drainer slot {}: the token provider failed to supply a credential ({}); "
+                                        + "retrying after backoff -- the slot stays un-drained until a token "
+                                        + "is available",
                                 slotPath, t.getMessage());
                     } else {
                         LOG.warn("drainer slot {}: cluster unreachable ({}), retrying after backoff",
@@ -691,6 +712,12 @@ public final class BackgroundDrainer implements Runnable {
         CursorSendEngine engine = null;
         WebSocketClient client = null;
         CursorWebSocketSendLoop loop = null;
+        // Async delivery arm for the drain loop's own SenderError reports. Built
+        // only when a sink is installed, and only once per run() -- it outlives
+        // the mid-drain loop recycles below, which would otherwise churn a thread
+        // per wire session. Closed by the finally, after loop.close(), so errors
+        // dispatched during the loop's shutdown still reach the sink.
+        SenderErrorDispatcher loopErrorDispatcher = null;
         try {
             // Scanner results are only snapshots. Serialize adoption against
             // a producer's close -> quarantine rename -> fresh-slot recreate
@@ -834,6 +861,31 @@ public final class BackgroundDrainer implements Runnable {
                 // already dropped on the FAILED path.
                 return;
             }
+            // Read the sink once: like `listener` it is volatile because the pool
+            // applies it at submit time and it is consumed on the drainer thread.
+            SenderErrorHandler sink = errorSink;
+            if (sink != null) {
+                // The I/O thread must never run the sink inline -- it is caller-supplied
+                // code and may block -- so it reaches the sink through the same bounded,
+                // drop-oldest, off-thread arm the foreground sender uses.
+                //
+                // TERMINAL is dropped on the way through: on an ORPHAN loop it does not
+                // mean what it means to a foreground producer. It is the loop handing the
+                // slot back to this drainer, which then decides -- ride the fault out and
+                // finish the drain, or quarantine and report the abandonment itself with
+                // dispatchDataLoss. Forwarding it would announce a dead producer for a
+                // rotating credential the very next sweep accepts, and would double-report
+                // the quarantine the drainer already names. Everything the loop rides out
+                // (RETRIABLE / RETRIABLE_OTHER) has no such owner and is forwarded verbatim.
+                loopErrorDispatcher = new SenderErrorDispatcher(
+                        err -> {
+                            if (err.getAppliedPolicy() != SenderError.Policy.TERMINAL) {
+                                sink.onError(err);
+                            }
+                        },
+                        SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");
+            }
+
             // One iteration per wire session. Re-entered ONLY when a mid-drain
             // reconnect sweep hit a durable-ack CAPABILITY gap: that is the
             // exact rolling-upgrade condition the settle budget in
@@ -856,6 +908,17 @@ public final class BackgroundDrainer implements Runnable {
                         poisonMinEscalationWindowMillis,
                         catchUpCapGapMinEscalationWindowMillis,
                         CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                // Without this the loop's ridden-out reports -- above all
+                // "credential-unavailable", the one endpoint-policy failure an ORPHAN
+                // loop retries rather than latching -- are dispatched into a null, and
+                // the outage is announced only by a throttled slf4j WARN, which is a
+                // NOP in an app with no binding configured. The foreground sender wires
+                // the same arm (QwpWebSocketSender.buildAndConnect /
+                // startCursorSendLoop); an orphan drainer rides out the same faults and
+                // must be just as observable, or a revoked token reads as a disk-sizing
+                // problem once SF fills. Null when no sink is installed, which
+                // setErrorDispatcher accepts and dispatchError treats as before.
+                loop.setErrorDispatcher(loopErrorDispatcher);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {
@@ -1017,6 +1080,19 @@ public final class BackgroundDrainer implements Runnable {
                     ioThreadStopped = false;
                     LOG.warn("drainer slot {}: I/O thread did not stop during close ({}); "
                                     + "delegating client/engine teardown to its exit path",
+                            slotPath, e.getMessage());
+                }
+            }
+            if (loopErrorDispatcher != null) {
+                // After loop.close() so anything the I/O loop reported on its way
+                // out is still admitted, and before the sink can outlive this run.
+                // Safe on the failed-stop path above too: a still-live I/O thread's
+                // later offer() is rejected by the closed dispatcher rather than
+                // resurrecting its delivery thread.
+                try {
+                    loopErrorDispatcher.close();
+                } catch (Throwable e) {
+                    LOG.warn("drainer slot {}: error dispatcher close failed ({})",
                             slotPath, e.getMessage());
                 }
             }
