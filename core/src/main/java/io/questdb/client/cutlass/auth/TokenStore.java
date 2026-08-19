@@ -42,7 +42,7 @@ package io.questdb.client.cutlass.auth;
  * store does that and coordinates a rotating refresh token across processes.
  * <p>
  * A store reports a failure by throwing; {@code OidcDeviceAuth} treats persistence as best-effort and a
- * thrown failure as non-fatal - it logs a warning to {@code System.err} and continues with the in-memory
+ * thrown failure as non-fatal - it logs a warning through SLF4J at WARN and continues with the in-memory
  * token, which is valid regardless of whether it could be saved.
  */
 public interface TokenStore {

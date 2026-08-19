@@ -545,7 +545,9 @@ Resolved:
   the audited `signIn`/`getToken`/`tryRefresh` gate.
 - **Plaintext JSON**, confidentiality via file permissions; encryption only via the SPI
   (Q1).
-- **`System.err`** for the one best-effort persistence-failure warning.
+- **SLF4J at `WARN`** for the one best-effort persistence-failure warning (the Java client ships
+  `slf4j-api` only, so an application without a binding sees nothing; a client in another language
+  should use whatever its own ecosystem's equivalent warning channel is).
 - **Opt-in** (no store unless the caller sets one).
 - **Ship `FileTokenStore`** as the default; keychain/KMS via the SPI.
 - **Frozen on-disk contract** (path, hash, schema, atomic write, lock-file protocol),

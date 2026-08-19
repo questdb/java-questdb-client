@@ -319,6 +319,48 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testQuestDbRowErrorRendersTheDecodedNewlineAsAnEscape() throws Exception {
+        assertMemoryLeak(() -> {
+            // Pins the rendering of the single most common ILP failure. QuestDB's own
+            // LineHttpProcessorState builds its error as error.put("\nerror in line ")... - a REAL newline -
+            // and escapeJsonStr sends it as the JSON escape \n. Before the lexer decoded escapes the client
+            // copied those two characters through verbatim; now it decodes them to a newline and
+            // putAsPrintable re-escapes it, so the text a user (and their log scraper) sees changed from
+            // a two-character JSON escape to a six-character unicode escape. Neither form leaks a raw
+            // newline, which is the point of putAsPrintable, but the
+            // rendering is user-visible and nothing pinned it: the sibling tests here assert only that
+            // fragments either side of the newline survive, which holds under both.
+            String errorBody = "{"
+                    + "\"code\":\"invalid\","
+                    + "\"message\":\"invalid field format\\nerror in line 1: table: t, column: v\","
+                    + "\"line\":1,"
+                    + "\"errorId\":\"ABC-1\""
+                    + "}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's row error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue("the newline must render as its unicode escape: " + msg,
+                                msg.contains("invalid field format\\u000aerror in line 1: table: t, column: v"));
+                        Assert.assertFalse("the raw JSON escape must not survive undecoded: " + msg,
+                                msg.contains("format\\nerror"));
+                        Assert.assertFalse("and no raw newline may reach the message: " + msg,
+                                msg.indexOf('\n') >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testServerJsonErrorControlCharsAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // the server's error body carries control characters as JSON escapes: an ESC and a newline in
