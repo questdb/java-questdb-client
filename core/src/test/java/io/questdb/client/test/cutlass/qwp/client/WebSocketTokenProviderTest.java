@@ -78,6 +78,11 @@ public class WebSocketTokenProviderTest {
             // sender: the header the server actually received (a tag asserted alone would still pass
             // if the credential reached the wire by some other route) and the tag itself, read both
             // directly and through the background reconnect factory the drainer is handed.
+            //
+            // This is the ONLY test of the classification itself: the drainer's own suites
+            // (BackgroundDrainerDurableAckRetryTest, BackgroundDrainerMidDrainAuthRejectTest) stub
+            // hasDynamicCredential() on a scripted factory, because what they pin is the terminal policy
+            // each verdict produces. Delete this test and both verdicts become assumptions.
             try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
                 int port = server.getPort();
                 server.start();

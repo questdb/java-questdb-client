@@ -125,7 +125,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         Files.remove(slotPath);
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testCallbackArgumentsCarrySlotPathAndAttemptNumber() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -144,7 +144,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testEscalatesAfterMaxAttemptsAndDropsSentinel() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -170,7 +170,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testListenerThrowingOnPersistentFailureStillMarksFailed() throws Exception {
         assertMemoryLeak(() -> {
             BackgroundDrainerListener throwing = new BackgroundDrainerListener() {
@@ -196,7 +196,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testListenerThrowingOnUnavailableContinuesRetrying() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger unavailableCalls = new AtomicInteger();
@@ -225,7 +225,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testNoListenerNoNullPointerOnEscalation() throws Exception {
         assertMemoryLeak(() -> {
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(
@@ -239,7 +239,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testTerminalUpgradeMarksFailedImmediately() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -277,7 +277,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testFixedCredentialAuthRejectionStillQuarantinesImmediately() throws Exception {
         assertMemoryLeak(() -> {
             // A 401 against a CONSTANT credential is a permanent misconfiguration: re-presenting the same
@@ -301,7 +301,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted() throws Exception {
         assertMemoryLeak(() -> {
             // The settle budget must be BOUNDED, not "retry forever". Quarantine is permitted only once both
@@ -338,7 +338,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRotatingCredentialAuthRejectionRidesPastAttemptThresholdBeforeDwellFloor() throws Exception {
         assertMemoryLeak(() -> {
             // Six fast 401s must not strand the slot while the configured self-healing window is still open.
@@ -364,7 +364,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRotatingCredentialAuthRejectionRidesOutBoundedBudget() throws Exception {
         assertMemoryLeak(() -> {
             // With a ROTATING credential the Authorization header is re-derived from the token provider on
@@ -391,7 +391,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRotatingCredentialAuthDwellIsClampedSoEscalationStaysReachable() {
         // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE is the documented way
         // to ask a reconnect never to give up. TimeUnit saturates it, so the dwell half of the rotating-401
@@ -546,7 +546,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testReturnsClientOnSuccessFirstAttempt() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -563,7 +563,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRetriesOnDurableAckMismatchThenSucceeds() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -585,7 +585,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testStopRequestedDuringRetryAbortsWithStoppedOutcome() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -620,7 +620,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testWallTimeBudgetEscalatesBeforeAttemptCap() throws Exception {
         assertMemoryLeak(() -> {
             CountingListener listener = new CountingListener();
@@ -653,7 +653,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testAllReplicaWindowNeverEscalatesInvariantB() throws Exception {
         assertMemoryLeak(() -> {
             // INVARIANT B (orphan drainer): a store-and-forward drainer must NEVER
@@ -725,7 +725,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testTransportErrorNeverQuarantinesInvariantB() throws Exception {
         assertMemoryLeak(() -> {
             // INVARIANT B (orphan drainer): a fully-unreachable cluster (server down,
@@ -788,7 +788,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testJvmErrorEscapesConnectRetryLoop() throws Exception {
         assertMemoryLeak(() -> {
             // Regression (M3): catch (Throwable) in connectWithDurableAckRetry used
@@ -820,7 +820,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRoleRejectChurnDoesNotConsumeCapabilityGapBudgetInvariantB() throws Exception {
         assertMemoryLeak(() -> {
             // Rolling-upgrade interleave: a long all-replica window (role rejects),
@@ -867,7 +867,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testFailoverWindowDoesNotBurnCapabilityGapWallClockInvariantB() throws Exception {
         assertMemoryLeak(() -> {
             // The wall-clock half of the settle budget must be anchored at the
@@ -910,7 +910,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRoleRejectResetsCapabilityGapEpisode() throws Exception {
         assertMemoryLeak(() -> {
             // An intervening role reject proves the topology changed (the node
@@ -956,7 +956,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRoleRejectAndCapabilityGapLandOnSeparateStreams() throws Exception {
         assertMemoryLeak(() -> {
             // M10 discriminator: gap -> role reject -> gap -> success. The
@@ -994,7 +994,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testSaturatingCapabilityGapBudgetDoesNotQuarantineOnTheFirstSweep() throws Exception {
         assertMemoryLeak(() -> {
             // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE
@@ -1020,7 +1020,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testTransportErrorResetsCapabilityGapEpisode() throws Exception {
         assertMemoryLeak(() -> {
             // A transport state breaks a consecutive capability-gap episode.
@@ -1053,7 +1053,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testTransportWindowResetsCapabilityGapWallClock() throws Exception {
         assertMemoryLeak(() -> {
             // The wall-clock half of the settle budget is anchored at gap #1.
@@ -1098,7 +1098,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRoleRejectGrantsFreshWallClockToNextGapEpisode() {
         // Companion to testRoleRejectResetsCapabilityGapEpisode, which pins the
         // ATTEMPT-counter half of the episode reset but runs under a 60s budget
@@ -1157,7 +1157,7 @@ public class BackgroundDrainerDurableAckRetryTest {
         assertEquals(Collections.singletonList(1), listener.primaryUnavailableAttempts);
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void testRequestStopInterruptsLongBackoffParkPromptly() throws Exception {
         // Pins the stop-promptness contract of the backoff park: requestStop()
         // must break the drainer out of a LONG park (unpark, backstopped by
@@ -1334,6 +1334,17 @@ public class BackgroundDrainerDurableAckRetryTest {
             return calls.get();
         }
 
+        /**
+         * The signal BackgroundDrainer branches its terminal policy on. Stubbed here, deliberately: these
+         * tests pin the POLICY (fail fast on a constant credential, ride out the settle budget on a rotating
+         * one), not the classification. What decides it in production is
+         * {@code QwpWebSocketSender.hasDynamicCredential()} - a {@code FixedAuthHeader} identity check on the
+         * configured supplier - and that is pinned on a real built sender, for httpToken,
+         * httpUsernamePassword, httpTokenProvider and no-credential alike, by
+         * {@code WebSocketTokenProviderTest.testCredentialKindTaggedForTheOrphanDrainerTerminalPolicy},
+         * which reads it both directly and through the background reconnect factory a drainer is handed.
+         * Neither half means much without the other: keep them named in each other's comments.
+         */
         @Override
         public boolean hasDynamicCredential() {
             return dynamicCredential;

@@ -1753,11 +1753,17 @@ public class OidcDeviceAuthTest {
                          .build()) {
                 auth.signIn(); // sign in once: caches ACCESS-1 and a refresh token
                 expireCachedToken(auth); // so the refresher thread's getToken() takes the refresh path
+                // The refresher is not scenery: it is the thread that holds the lock, performs the refresh
+                // and produces ACCESS-2. Swallowing its failure let the test pass on a run where the refresh
+                // never happened - the waiter would simply refresh for itself and still see ACCESS-2, so
+                // every assertion below still held while the contention this test exists for never occurred.
+                AtomicReference<Throwable> refresherError = new AtomicReference<>();
+                AtomicReference<String> refresherResult = new AtomicReference<>();
                 Thread refresher = new Thread(() -> {
                     try {
-                        auth.getToken();
-                    } catch (Throwable ignore) {
-                        // the refresh completes once released; a late error here is irrelevant to this test
+                        refresherResult.set(auth.getToken());
+                    } catch (Throwable t) {
+                        refresherError.set(t);
                     }
                 }, "oidc-silent-refresh");
                 refresher.setDaemon(true);
@@ -1800,6 +1806,10 @@ public class OidcDeviceAuthTest {
                     refresher.join(10_000);
                 }
                 // once the peer's refresh completed and released the lock, the waiter served the fresh token
+                Assert.assertNull("the refresher itself failed, so the wait was never behind a real refresh: "
+                        + refresherError.get(), refresherError.get());
+                Assert.assertEquals("the refresher must have completed the refresh it was holding the lock for",
+                        "ACCESS-2", refresherResult.get());
                 Assert.assertNull("getToken() must not throw when it waits out a peer's refresh: " + waiterError.get(),
                         waiterError.get());
                 Assert.assertEquals("getToken() must serve the freshly refreshed token after waiting", "ACCESS-2", waiterResult.get());

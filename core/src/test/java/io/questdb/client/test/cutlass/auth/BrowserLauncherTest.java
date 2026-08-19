@@ -55,10 +55,15 @@ public class BrowserLauncherTest {
 
     @Test
     public void testOpenRespectsDisableProperty() throws Exception {
-        // the kill-switch itself is asserted via isBrowserOpenEnabled() - a real browser launch is
-        // unobservable (no-op on a headless JVM either way), so asserting the property read directly is the
-        // only way to prove the gate actually flips. A VALID http(s) URL confirms the no-op under "false"
-        // below is the kill-switch, not URL rejection; this gate also keeps the suite from popping a browser.
+        // SCOPE: this test proves the property READ flips, and nothing more. A browser launch is
+        // unobservable from here, and on a headless JVM open() is a no-op whether or not it ever consulted
+        // the flag - so the invokeOpen call below would stay green against an open() that ignored the
+        // kill-switch outright (verified: removing the gate from open() leaves every assertion in this class
+        // passing). What open() DOES with the flag is pinned by
+        // DesktopFreeModulePathTest.testTheBrowserKillSwitchIsHonouredByOpenItself, which runs it where
+        // java.desktop is absent: reaching Desktop throws there, so the two directions become distinguishable
+        // - quiet with the kill-switch off, LinkageError with it on. A VALID http(s) URL is used below so the
+        // no-op under "false" is at least not URL rejection, and so this class never pops a browser.
         String validUrl = "https://idp.example.com/device?user_code=ABCD";
         Assert.assertNotNull("the URL must be one open() would otherwise launch", invokeSafeHttpUri(validUrl));
         String prop = "questdb.client.oidc.open.browser";

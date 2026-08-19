@@ -296,19 +296,30 @@ public class FileTokenStoreTest {
                 return true;
             };
 
+            // A contender that THREW instead of running would die on its own thread and leave the counts
+            // below looking like a clean degrade, so carry the first failure back to the test thread.
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
             Thread[] ts = new Thread[threads];
             for (int i = 0; i < threads; i++) {
                 // a generous acquire budget so a contender waits for the lock rather than giving up early
                 FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
-                ts[i] = new Thread(() -> store.inLock(key, section));
+                ts[i] = new Thread(() -> {
+                    try {
+                        store.inLock(key, section);
+                    } catch (Throwable t) {
+                        workerError.compareAndSet(null, t);
+                    }
+                }, "steal-contender-" + i);
             }
             for (Thread t : ts) {
                 t.start();
             }
             for (Thread t : ts) {
-                t.join();
+                joinOrFail(t, "a steal contender");
             }
 
+            Assert.assertNull("a contender failed instead of running its critical section: " + workerError.get(),
+                    workerError.get());
             Assert.assertEquals("every contender must run its critical section", threads, ran.get());
             // Teeth the run count alone does not have: threads==ran holds even with the whole acquire deleted,
             // since inLock() runs the section lock-free when it cannot get a lock. A contender that never
@@ -366,7 +377,7 @@ public class FileTokenStoreTest {
                 t.start();
             }
             for (Thread t : ts) {
-                t.join();
+                joinOrFail(t, "a stealer");
             }
 
             Assert.assertNull("a stealer failed outright: " + failure.get(), failure.get());
@@ -563,20 +574,31 @@ public class FileTokenStoreTest {
                 return true;
             };
 
+            // A contender that THREW would never enter the section, so `inside` never rises and the
+            // exclusion assertions below pass on a test that proved nothing. Carry the first failure back.
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
             Thread[] ts = new Thread[threads];
             for (int i = 0; i < threads; i++) {
                 // a generous acquire budget so a contender waits for the lock rather than degrading to a
                 // lock-free run (a degraded action runs without the lock and could legitimately overlap)
                 FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
-                ts[i] = new Thread(() -> store.inLock(key, section));
+                ts[i] = new Thread(() -> {
+                    try {
+                        store.inLock(key, section);
+                    } catch (Throwable t) {
+                        workerError.compareAndSet(null, t);
+                    }
+                }, "same-process-contender-" + i);
             }
             for (Thread t : ts) {
                 t.start();
             }
             for (Thread t : ts) {
-                t.join();
+                joinOrFail(t, "a same-process contender");
             }
 
+            Assert.assertNull("a contender failed instead of running its critical section: " + workerError.get(),
+                    workerError.get());
             Assert.assertEquals("every contender must run its critical section", threads, ran.get());
             Assert.assertEquals("same-process contenders must never overlap (PROCESS_LOCKS serializes them)", 0, overlaps.get());
             Assert.assertEquals("at most one holder at a time", 1, maxInside.get());
@@ -850,26 +872,38 @@ public class FileTokenStoreTest {
 
             AtomicBoolean ran = new AtomicBoolean();
             AtomicReference<Boolean> result = new AtomicReference<>();
+            AtomicReference<Throwable> waiterError = new AtomicReference<>();
             AtomicBoolean flagLeftSet = new AtomicBoolean();
-            CountDownLatch entered = new CountDownLatch(1);
             Thread waiter = new Thread(() -> {
-                entered.countDown();
-                result.set(store.inLock(key, () -> {
-                    ran.set(true);
-                    return true;
-                }));
-                flagLeftSet.set(Thread.currentThread().isInterrupted());
+                try {
+                    result.set(store.inLock(key, () -> {
+                        ran.set(true);
+                        return true;
+                    }));
+                    flagLeftSet.set(Thread.currentThread().isInterrupted());
+                } catch (Throwable t) {
+                    // without this the throw dies on this thread and the assertions below read it as
+                    // "result was never set" - a null-vs-FALSE mismatch that names nothing
+                    waiterError.compareAndSet(null, t);
+                }
             }, "file-lock-waiter");
+            waiter.setUncaughtExceptionHandler((t, e) -> waiterError.compareAndSet(null, e));
             waiter.setDaemon(true);
             waiter.start();
-            Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
-            Thread.sleep(200); // let it settle into the poll loop
+            // Read off the waiter's own stack that it is INSIDE the poll before interrupting it. The latch
+            // this replaced counted down at the top of the thread body, so it proved only that the thread had
+            // been scheduled: an interrupt landing before the call becomes a CARRIED flag, which inLock
+            // answers by returning false without ever entering the wait, and every assertion below would then
+            // pass on a path this test does not mean to exercise.
+            awaitInside(waiter, "acquireLock");
 
             long start = System.currentTimeMillis();
             waiter.interrupt();
             waiter.join(10_000);
             long elapsed = System.currentTimeMillis() - start;
 
+            Assert.assertNull("the waiter failed instead of abandoning its wait: " + waiterError.get(),
+                    waiterError.get());
             Assert.assertFalse("the waiter must not still be polling out the 30s budget", waiter.isAlive());
             Assert.assertTrue("the interrupt must cut the poll short, took " + elapsed + "ms", elapsed < 5_000);
             Assert.assertFalse("the refresh must not start once the wait was cancelled", ran.get());
@@ -909,24 +943,33 @@ public class FileTokenStoreTest {
 
             AtomicBoolean ran = new AtomicBoolean();
             AtomicReference<Boolean> result = new AtomicReference<>();
-            CountDownLatch entered = new CountDownLatch(1);
+            AtomicReference<Throwable> waiterError = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
-                entered.countDown();
-                result.set(waiterStore.inLock(key, () -> {
-                    ran.set(true);
-                    return true;
-                }));
+                try {
+                    result.set(waiterStore.inLock(key, () -> {
+                        ran.set(true);
+                        return true;
+                    }));
+                } catch (Throwable t) {
+                    // see the sibling test: a throw here must arrive as itself, not as a missing result
+                    waiterError.compareAndSet(null, t);
+                }
             }, "process-lock-waiter");
+            waiter.setUncaughtExceptionHandler((t, e) -> waiterError.compareAndSet(null, e));
             waiter.setDaemon(true);
             waiter.start();
-            Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
-            Thread.sleep(200); // let it settle onto the process lock
+            // inside inLock is the right point here: it is where the process lock is taken, and inLock's
+            // carried-interrupt check has already run by then, so the interrupt below is unambiguously the
+            // LIVE cancellation this test is about. See the sibling test for what the latch could not prove.
+            awaitInside(waiter, "inLock");
 
             long start = System.currentTimeMillis();
             waiter.interrupt();
             waiter.join(10_000);
             long elapsed = System.currentTimeMillis() - start;
 
+            Assert.assertNull("the waiter failed instead of abandoning its wait: " + waiterError.get(),
+                    waiterError.get());
             Assert.assertFalse("the waiter must not still be blocked on the process lock", waiter.isAlive());
             Assert.assertTrue("the interrupt must break the process-lock wait, took " + elapsed + "ms",
                     elapsed < 5_000);
@@ -1108,8 +1151,8 @@ public class FileTokenStoreTest {
             });
             tA.start();
             tB.start();
-            tA.join();
-            tB.join();
+            joinOrFail(tA, "contender A");
+            joinOrFail(tB, "contender B");
 
             // capture a worker throwable on the main thread: without this, a contender that THREW instead of
             // waiting would die silently and leave the other holder looking (falsely) like correct exclusion
@@ -1794,6 +1837,30 @@ public class FileTokenStoreTest {
                 Assert.fail("a steal must not leak a capture temp file: " + p.getFileName());
             }
         }
+    }
+
+    private static void awaitInside(Thread t, String method) throws InterruptedException {
+        // poll the thread's own stack for the named FileTokenStore frame: the only evidence that a helper
+        // thread has actually ENTERED the call, as opposed to having been scheduled at all
+        final long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            for (StackTraceElement frame : t.getStackTrace()) {
+                if (FileTokenStore.class.getName().equals(frame.getClassName())
+                        && method.equals(frame.getMethodName())) {
+                    return;
+                }
+            }
+            Thread.sleep(5);
+        }
+        Assert.fail("the waiter never entered FileTokenStore." + method + " [state=" + t.getState() + ']');
+    }
+
+    private static void joinOrFail(Thread t, String what) throws InterruptedException {
+        // never a bare join(): a contender that wedges on a lock it should have degraded out of would hang
+        // the suite until the 20-minute surefire timeout, reported as an opaque stall with no failing
+        // assertion. Bounded, then asserted, so the wedge fails as itself.
+        t.join(30_000);
+        Assert.assertFalse(what + " did not finish within 30s [state=" + t.getState() + ']', t.isAlive());
     }
 
     private Path lockFile(Path dir, TokenStoreKey key) {
