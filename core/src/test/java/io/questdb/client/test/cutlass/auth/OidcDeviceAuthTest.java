@@ -731,6 +731,70 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testMalformedResponseHeadDuringDiscoveryIsAnOidcAuthException() throws Exception {
+        assertMemoryLeak(() -> {
+            // HttpHeaderParser rejects a response head it cannot parse - here a header block past its fixed
+            // 4096-byte buffer, the shape a WAF or proxy stacking Set-Cookie/CSP produces - by throwing
+            // HttpException. That is a SIBLING of HttpClientException, not a subclass, so it escaped both of
+            // fetchJson's catches and left fromQuestDB throwing a type its own javadoc does not name, past
+            // every caller's catch (OidcAuthException) degrade handler.
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (SETTINGS_PATH.equals(path)) {
+                    StringBuilder padding = new StringBuilder();
+                    for (int i = 0; i < 5000; i++) {
+                        padding.append('A');
+                    }
+                    return MockOidcServer.raw("HTTP/1.1 200 OK\r\n"
+                            + "X-Pad: " + padding + "\r\n"
+                            + "Content-Length: 0\r\n\r\n");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-X", "ID-X", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                try {
+                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()).close();
+                    Assert.fail("an unparseable response head must not gate discovery open");
+                } catch (OidcAuthException expected) {
+                    // the documented type; an HttpException escaping here is the regression
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testMalformedResponseHeadDuringPollingIsTransient() throws Exception {
+        assertMemoryLeak(() -> {
+            // The same unparseable head on the TOKEN endpoint, mid-poll. Escaping as HttpException it missed
+            // postForm's catch and the client.disconnect() with it, so the cached keep-alive connection kept a
+            // half-read response for the next poll to parse as its own; it also missed pollForToken's
+            // classification, aborting the whole interactive sign-in on a condition the same loop rides out
+            // when it arrives as a transport error. One malformed answer must not end a sign-in.
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (tokenCalls.incrementAndGet() == 1) {
+                    StringBuilder padding = new StringBuilder();
+                    for (int i = 0; i < 5000; i++) {
+                        padding.append('A');
+                    }
+                    return MockOidcServer.raw("HTTP/1.1 200 OK\r\n"
+                            + "X-Pad: " + padding + "\r\n"
+                            + "Content-Length: 0\r\n\r\n");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-AFTER-RECOVERY", "ID-X", null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-AFTER-RECOVERY", auth.signIn());
+                Assert.assertTrue("the poll must have retried after the malformed head, on a clean connection",
+                        tokenCalls.get() >= 2);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testNonNumericStatusCodeRejected() throws Exception {
         assertMemoryLeak(() -> {
             // a hostile or MITM'd identity provider returns a status line whose status-code token carries an

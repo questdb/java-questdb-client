@@ -27,6 +27,7 @@ package io.questdb.client.cutlass.auth;
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.DefaultHttpClientConfiguration;
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.cutlass.http.HttpException;
 import io.questdb.client.cutlass.http.client.Fragment;
 import io.questdb.client.cutlass.http.client.HttpClient;
 import io.questdb.client.cutlass.http.client.HttpClientException;
@@ -742,7 +743,12 @@ public class OidcDeviceAuth implements QuietCloseable {
             // parseBody enforces a wall-clock deadline and a byte cap so an untrusted server cannot wedge
             // discovery, and its parseLast rejects a truncated document
             parseBody(body, lexer, parser, DEFAULT_HTTP_TIMEOUT_MILLIS);
-        } catch (HttpClientException e) {
+        } catch (HttpClientException | HttpException e) {
+            // HttpException covers a malformed or oversized RESPONSE HEAD rejected by HttpHeaderParser (see
+            // postForm). It is a sibling of HttpClientException, not a subclass, so it escaped both catches
+            // here and left fromQuestDB throwing a type its own javadoc does not name - past every caller's
+            // catch (OidcAuthException) degrade handler. Discovery reaching an unusable response is the same
+            // outcome either way, so report it the same way.
             throw new OidcAuthException(e).put(reachError);
         } catch (JsonException e) {
             throw new OidcAuthException(e).put(parseError);
@@ -1487,6 +1493,25 @@ public class OidcDeviceAuth implements QuietCloseable {
             // disconnect-on-failure handling in AbstractLineHttpSender.flush0.
             client.disconnect();
             throw e;
+        } catch (HttpException e) {
+            // The RESPONSE HEAD was malformed or oversized, so HttpHeaderParser rejected it: a header block
+            // past the fixed 4096-byte parse buffer (a WAF or proxy stacking Set-Cookie/CSP), a malformed
+            // Content-Length, or a status line that is not HTTP/1.x. HttpException is a SIBLING of
+            // HttpClientException, not a subclass, so it missed the catch above - and with it the disconnect,
+            // leaving this CACHED keep-alive connection holding a half-read response for the next poll to
+            // parse as its own, exactly the corruption that catch exists to prevent. It also missed every
+            // classification downstream, aborting an interactive sign-in outright on a condition the same
+            // code rides out when it arrives as a transport error, and surfacing a type fromQuestDB/signIn
+            // do not document. The identity provider is untrusted here, so this is a response shape it can
+            // choose at will.
+            //
+            // Both are "the response is unusable", so answer identically: drop the connection and re-report
+            // as the transport-class failure every caller already handles. The message is a parser constant,
+            // never response bytes, so it carries no untrusted text. Copying it out also detaches the
+            // thread-local flyweight HttpException.instance() hands back, whose message the next
+            // HttpException on this thread would overwrite.
+            client.disconnect();
+            throw new HttpClientException("malformed response from the identity provider: " + e.getMessage());
         }
     }
 
