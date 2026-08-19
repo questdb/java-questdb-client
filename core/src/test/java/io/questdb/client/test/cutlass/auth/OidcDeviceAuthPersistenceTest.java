@@ -437,6 +437,88 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testGetTokenDeclinesTheRefreshOnAnInterruptCarryingThreadWithoutLatchingTheBackOff() throws Exception {
+        assertMemoryLeak(() -> {
+            // A cancelled caller must not drive a network round trip, must keep its cancellation signal, must
+            // be told what actually happened, and must not suppress the next five seconds of legitimate
+            // refreshes for every other thread sharing this instance.
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                tokenCalls.incrementAndGet();
+                return MockOidcServer.json(200, tokenJson("ACCESS-REFRESHED", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-1",
+                        System.currentTimeMillis() - 1, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Thread.currentThread().interrupt();
+                    final boolean flagSurvived;
+                    final String message;
+                    try {
+                        auth.getToken();
+                        Assert.fail("a cancelled caller must not get a token out of a network refresh");
+                        return;
+                    } catch (OidcAuthException e) {
+                        message = e.getMessage();
+                        flagSurvived = Thread.currentThread().isInterrupted();
+                    } finally {
+                        Thread.interrupted(); // do not leak the flag into the next test
+                    }
+
+                    Assert.assertEquals("no refresh may be attempted on a cancelled thread", 0, tokenCalls.get());
+                    Assert.assertTrue("the message must name the interrupt, not blame the credential: " + message,
+                            message.contains("interrupted"));
+                    Assert.assertFalse("it must not send the user to re-authenticate: " + message,
+                            message.contains("call signIn()"));
+                    Assert.assertTrue("the caller's cancellation signal must survive getToken()", flagSurvived);
+
+                    // and the decline must not have latched the back-off: a clean caller refreshes at once
+                    Assert.assertEquals("ACCESS-REFRESHED", auth.getToken());
+                    Assert.assertEquals(1, tokenCalls.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testGetTokenDeclinesTheRefreshOnAnInterruptCarryingThreadWithNoTokenStore() throws Exception {
+        assertMemoryLeak(() -> {
+            // The only interrupt guard used to live inside FileTokenStore.inLock, so with NO store configured
+            // a cancelled thread POSTed to the token endpoint regardless. The guard is in getToken() now, so
+            // both shapes behave the same.
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                tokenCalls.incrementAndGet();
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = baseBuilder(server).build()) {
+                Assert.assertEquals("ACCESS-1", auth.signIn()); // one device grant, one token call
+                Assert.assertEquals(1, tokenCalls.get());
+                OidcDeviceAuthTest.expireCachedToken(auth);
+
+                Thread.currentThread().interrupt();
+                try {
+                    auth.getToken();
+                    Assert.fail("a cancelled caller must not drive a refresh even with no token store");
+                } catch (OidcAuthException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("interrupted"));
+                } finally {
+                    Thread.interrupted();
+                }
+                Assert.assertEquals("no refresh may be attempted on a cancelled thread", 1, tokenCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGetTokenAsFirstCallAfterRestore() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

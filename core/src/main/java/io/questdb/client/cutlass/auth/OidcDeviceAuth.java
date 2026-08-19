@@ -553,6 +553,25 @@ public class OidcDeviceAuth implements QuietCloseable {
             // so a revoked token or an unreachable IdP otherwise meant one full token-endpoint round trip per
             // attempt - a request flood at the provider, and a producer blocked for each round trip. The
             // failure is still reported on every call; only the network attempt is rate-limited.
+            // A caller whose thread is already interrupted is cancelled, and a silent refresh is a network
+            // round trip - exactly the work a cancellation is trying to stop. Decline it here, once, for
+            // three reasons the old shape got wrong:
+            //
+            //   - the only interrupt guard was inside FileTokenStore.inLock, so this held ONLY when a token
+            //     store was configured. Without one, tryRefreshCoordinated() went straight to tryRefresh()
+            //     and POSTed to the token endpoint on a cancelled thread.
+            //   - when the store's guard did decline, the fall-through reported "the cached token expired
+            //     and could not be refreshed without an interactive sign-in; call signIn()". The endpoint was
+            //     reachable and the lock free; the caller's own interrupt was the reason. That sends a user
+            //     to re-authenticate over a credential that is fine.
+            //   - it then latched the refresh back-off below, so one interrupt-carrying caller suppressed
+            //     the next five seconds of legitimate refreshes for every thread sharing this instance.
+            //
+            // isInterrupted(), never interrupted(): the flag is the caller's cancellation signal and must
+            // survive this call, exactly as FileTokenStore.load()/save() preserve it.
+            if (refreshToken != null && Thread.currentThread().isInterrupted()) {
+                throw new OidcAuthException("the calling thread is interrupted, so no silent token refresh was attempted; retry on an uninterrupted thread");
+            }
             if (refreshToken != null && !isRefreshBackedOff() && tryRefreshCoordinated()) {
                 refreshFailedAtMillis = 0;
                 return selectToken();

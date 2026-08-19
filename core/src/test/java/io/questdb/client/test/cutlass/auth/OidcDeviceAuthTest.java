@@ -3829,7 +3829,11 @@ public class OidcDeviceAuthTest {
     // signIn()/getToken() takes the silent-refresh (or interactive re-sign-in) path. Reflection
     // because the field is private and there is no configurable clock skew to lean on anymore; the client is
     // an open module, so this reaches it without widening production visibility for the test.
-    private static void expireCachedToken(OidcDeviceAuth auth) throws Exception {
+    // package-private, not private: OidcDeviceAuthPersistenceTest needs the same thing and a second copy of
+    // this reflection would be the third in the package. There is no non-reflective route - expires_in is
+    // clamped to a default when non-positive, and the smallest usable value still leaves a live window that
+    // would have to be slept out.
+    static void expireCachedToken(OidcDeviceAuth auth) throws Exception {
         Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
         f.setAccessible(true);
         f.setLong(auth, 0L); // any "now" is past 0 minus the (capped, non-negative) skew, so the token reads as expired
