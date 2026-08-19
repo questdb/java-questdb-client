@@ -157,6 +157,24 @@ public final class BackgroundDrainer implements Runnable {
     private final String slotPath;
     private final long syncIntervalNanos;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
+    /**
+     * Escalation counters for the two bounded ride-outs, held per DRAIN rather than per call.
+     * <p>
+     * They were locals of {@link #connectWithDurableAckRetry()}, which {@link #run()} re-enters after every
+     * mid-drain terminal - so each recycle refilled the budget it is supposed to spend. A cluster that
+     * flaps (connect accepted, drop, {@code 401}, recycle, repeat) looped forever with no ack progress: the
+     * escalation never arrived, the slot lock was never released, and one of {@code max_background_drainers}
+     * workers - four by default - stayed pinned, so four such slots starve every other orphan slot of a
+     * drainer. No data is lost, but none is delivered either, and no operator ever sees the quarantine.
+     * <p>
+     * The wall-clock helpers beside them ({@code capabilityGapElapsedNanos}, {@code lastCapabilityGapNanos})
+     * deliberately stay per-call: they measure an UNINTERRUPTED run, and a successful connect plus a drain
+     * is an interruption, so a fresh call should start their accounting over. These three measure the whole
+     * drain, which is the span a quarantine decision is about.
+     */
+    private int capabilityGapAttempts;
+    private int dynamicCredentialAuthAttempts;
+    private long firstDynamicCredentialAuthFailureNanos;
     private volatile long ackedFsn = -1L;
     /**
      * Engine constructed by {@link #run()}, captured for test observation
@@ -365,7 +383,7 @@ public final class BackgroundDrainer implements Runnable {
         // intervening role or transport state resets the episode: after the
         // cluster leaves the capability-gap state, later gaps must establish a
         // fresh consecutive run before quarantine is permitted.
-        int capabilityGapAttempts = 0;
+        // (capabilityGapAttempts is a field - see its declaration)
         // 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
         // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Not reset by the transient arms below, so a
         // credential alternating rejected/unreachable inside ONE connect attempt cannot refill it and
@@ -373,20 +391,16 @@ public final class BackgroundDrainer implements Runnable {
         // the dwell anchor beside it, which does restart because it measures persistence rather than
         // count.
         //
-        // It is a local, though, not per-DRAIN: a mid-drain terminal recycles the wire and re-enters
-        // connectWithDurableAckRetry(), which starts it at zero again. So a credential that is accepted at
-        // connect and only rejected mid-drain, repeatedly, defers the escalation indefinitely. That is the
-        // tolerable direction - the slot keeps its replayable rows and no .failed sentinel is dropped on a
-        // fault that may still heal - and it is the same off-by-one the capability-gap recycle carries.
-        // Making it per-drain means hoisting it to a field, which quarantines such a slot sooner; that is a
-        // behaviour change, not a comment fix, so it is deliberately not made here.
-        int dynamicCredentialAuthAttempts = 0;
+        // It is a FIELD, so a mid-drain recycle cannot refill it - see its declaration.
+        // (dynamicCredentialAuthAttempts is a field)
         // The rotating-auth wall-clock floor is anchored at the first 401/403 of the CURRENT run of
         // rejections: a transient class in between (role reject, transport, credential-unavailable) restarts
         // it, because the dwell measures how long the rejection persisted, not how long the drainer has been
-        // running. The attempt threshold, unlike this, never resets during the drain. A zero value means no
-        // rejection has been observed.
-        long firstDynamicCredentialAuthFailureNanos = 0L;
+        // running. A recycle is NOT such an interruption for this anchor: it is a field, so the dwell spans
+        // recycles, which is what lets a flapping credential reach the escalation at all - the attempt
+        // threshold alone cannot, because the gate is an AND. The attempt threshold, unlike this, never
+        // resets during the drain. A zero value means no rejection has been observed.
+        // (firstDynamicCredentialAuthFailureNanos is a field)
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
         // reconnectBudgetNanos (or the attempt cap fires first).

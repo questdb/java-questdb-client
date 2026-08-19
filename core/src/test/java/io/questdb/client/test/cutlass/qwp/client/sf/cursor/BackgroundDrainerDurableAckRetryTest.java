@@ -493,6 +493,54 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testFlappingCredentialEscalatesAcrossMidDrainRecycles() throws Exception {
+        assertMemoryLeak(() -> {
+            // run() re-enters connectWithDurableAckRetry() after every mid-drain terminal. While the
+            // escalation counters were locals, each recycle refilled the budget it is meant to spend, so a
+            // cluster that flaps - connect accepted, drop, 401, recycle, repeat - looped forever with no ack
+            // progress: no quarantine, the slot lock never released, and one of max_background_drainers
+            // workers (four by default) pinned, starving every other orphan slot of a drainer.
+            //
+            // Driven by calling connectWithDurableAckRetry() repeatedly, which is what the recycle does.
+            final AtomicInteger calls = new AtomicInteger();
+            CursorWebSocketSendLoop.ReconnectFactory flapping = new CursorWebSocketSendLoop.ReconnectFactory() {
+                @Override
+                public boolean hasDynamicCredential() {
+                    return true;
+                }
+
+                @Override
+                public WebSocketClient reconnect() {
+                    // reject once, then let the connect through - the shape that recycles forever
+                    if (calls.incrementAndGet() % 2 == 1) {
+                        throw new QwpAuthFailedException(401, "127.0.0.1", 9000);
+                    }
+                    return stubClient();
+                }
+            };
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    flapping, 25L, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+
+            WebSocketClient out = null;
+            int recycles = 0;
+            for (; recycles < 40; recycles++) {
+                out = drainer.connectWithDurableAckRetry();
+                if (out == null) {
+                    break;
+                }
+                Os.sleep(2); // stand in for the drain between two mid-drain terminals
+            }
+
+            assertNull("a flapping credential must reach the escalation instead of recycling forever", out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertTrue("it must escalate once both thresholds are met, not at the very first recycle "
+                            + "[recycles=" + recycles + "]",
+                    recycles >= BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS - 1);
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
     @Test
     public void testReturnsClientOnSuccessFirstAttempt() throws Exception {
         assertMemoryLeak(() -> {
@@ -1161,7 +1209,7 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     private BackgroundDrainer newDrainerWithBudgets(
-            ScriptedFactory factory,
+            CursorWebSocketSendLoop.ReconnectFactory factory,
             long reconnectMaxDurationMillis,
             long backoffInitMillis,
             long backoffMaxMillis) {
