@@ -532,6 +532,14 @@ public final class BackgroundDrainer implements Runnable {
                 // stays terminal for the drainer -- give the cluster a bounded
                 // settle budget (rolling upgrade), then quarantine the slot.
                 capabilityGapAttempts++;
+                // Symmetry with the arm above, which restarts the capability-gap episode because an auth
+                // rejection says nothing about a node's batch cap: a capability gap says nothing about the
+                // credential either. We reached a node and it answered - it simply cannot do durable ack -
+                // so this is not time the credential spent REJECTED, and charging it to the rotating-401
+                // dwell would let a rolling upgrade satisfy that floor for free. The settle budget below can
+                // legitimately run for the whole reconnect budget, which is exactly the span the dwell is
+                // meant to require of an uninterrupted rejection.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 long now = System.nanoTime();
                 if (lastCapabilityGapNanos != 0L) {
                     // Charge only the interval since the PREVIOUS gap sweep,

@@ -454,6 +454,45 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testCapabilityGapDoesNotCountTowardTheRotating401Dwell() throws Exception {
+        assertMemoryLeak(() -> {
+            // The same defect as the transient case, in the one arm that arm did not cover. A durable-ack
+            // capability gap means we REACHED a node and it answered - it simply cannot do durable ack - so
+            // it is not time the credential spent rejected. Its own settle budget can legitimately run for
+            // the whole reconnect budget, which is exactly the span the rotating-401 dwell is meant to
+            // require of an UNINTERRUPTED rejection, so charging it lets a rolling upgrade satisfy that
+            // floor for free and quarantine a slot over a credential rejected for seconds.
+            final long dwellMillis = 100L;
+            AtomicInteger scripted = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+                if (scripted.incrementAndGet() == 6) {
+                    // one gap sweep, longer than the whole dwell. The first gap charges nothing to the
+                    // capability-gap episode (lastCapabilityGapNanos is still 0), so it cannot escalate on
+                    // its own and the rotating-401 accounting is what this observes.
+                    Os.sleep(dwellMillis * 3);
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+                }
+                return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+            }).withDynamicCredential();
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, dwellMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            assertNull(drainer.connectWithDurableAckRetry());
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+
+            // five 401s, the gap, then the sixth 401 - attempt seven overall. Charging the gap to the dwell
+            // quarantines exactly there; restarting it means the sixth rejection must be followed by a fresh
+            // dwell of uninterrupted 401s first.
+            assertTrue("a capability gap must not have satisfied the dwell [attempts="
+                            + factory.attempts() + "]",
+                    factory.attempts() > 7);
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+        });
+    }
+
     @Test
     public void testReturnsClientOnSuccessFirstAttempt() throws Exception {
         assertMemoryLeak(() -> {
