@@ -54,6 +54,44 @@ public class LineHttpSenderErrorResponseTest {
     private static final char RLO = 0x202e;
 
     @Test(timeout = 30_000)
+    public void testMalformedResponseHeadOnFlushIsRetriedAsATransportError() throws Exception {
+        assertMemoryLeak(() -> {
+            // HttpHeaderParser rejects a response head it cannot parse - here a header block past its fixed
+            // 4096-byte buffer, the shape an intermediary stacking Set-Cookie/CSP produces - by throwing
+            // HttpException, a SIBLING of HttpClientException rather than a subclass. Uncaught it escaped
+            // flush0's retry arm and with it the retry, the address rotation and the client.disconnect()
+            // that keeps the next flush off a connection holding a half-read response, and left flush()
+            // throwing a raw HttpException instead of the LineSenderException its contract promises.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                StringBuilder padding = new StringBuilder();
+                for (int i = 0; i < 5000; i++) {
+                    padding.append('A');
+                }
+                return MockOidcServer.raw("HTTP/1.1 204 No Content\r\n"
+                        + "X-Pad: " + padding + "\r\n\r\n");
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // only the flush hits the mock
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(100)                     // exhaust the retry budget quickly
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("an unparseable response head must fail the flush");
+                    } catch (LineSenderException e) {
+                        // the documented type, reached through the retry arm; a raw HttpException here is
+                        // the regression
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("Connection Failed"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testProtocolDetectionErrorBodyControlAndBidiAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // when the caller does not pin a protocol version, build() probes the server for one; a

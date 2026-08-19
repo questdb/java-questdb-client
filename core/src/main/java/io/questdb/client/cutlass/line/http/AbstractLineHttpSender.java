@@ -31,6 +31,7 @@ import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.HttpConstants;
+import io.questdb.client.cutlass.http.HttpException;
 import io.questdb.client.cutlass.http.HttpKeywords;
 import io.questdb.client.cutlass.http.client.Fragment;
 import io.questdb.client.cutlass.http.client.HttpClient;
@@ -784,8 +785,18 @@ public abstract class AbstractLineHttpSender implements Sender {
                     continue;
                 }
                 throwOnHttpErrorResponse(statusCode, response, false, actualTimeoutMillis);
-            } catch (HttpClientException e) {
-                // this is a network error, we can retry
+            } catch (HttpClientException | HttpException e) {
+                // this is a network error, we can retry.
+                //
+                // HttpException too: response.await() above hands the response head to HttpHeaderParser,
+                // which rejects one it cannot parse - a header block past its fixed 4096-byte buffer (an
+                // intermediary stacking Set-Cookie/CSP), a malformed Content-Length, a status line that is
+                // not HTTP/1.x - by throwing HttpException. That is a SIBLING of HttpClientException, not a
+                // subclass, so it escaped this catch and with it the retry, the address rotation and the
+                // client.disconnect() that keeps the next flush off a connection holding a half-read
+                // response. It also left flush() throwing a raw HttpException rather than the
+                // LineSenderException its contract promises, past every caller's catch. An unparseable head
+                // is the response being unusable, which is exactly what this arm already handles.
                 lastFlushFailed = true;
                 client.disconnect(); // forces reconnect
                 long nowNanos = System.nanoTime();
