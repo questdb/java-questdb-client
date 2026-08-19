@@ -386,34 +386,35 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
-    @Test(timeout = 60_000)
-    public void testRotatingCredentialAuthRideOutTerminatesOnAnUnboundedBudget() throws Exception {
-        assertMemoryLeak(() -> {
-            // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE is the documented
-            // way to ask a reconnect never to give up. TimeUnit saturates it, so the dwell half of the
-            // rotating-401 gate - an AND, unlike the capability-gap gate's OR - could never be satisfied and
-            // the ride-out never ended: the drainer swept forever, never wrote the .failed sentinel, never
-            // reported DATA_LOSS, and pinned the slot lock plus one worker of a FIXED-size drainer pool for
-            // the life of the process, starving every other orphan slot. Without the ceiling this call does
-            // not return and the test times out.
-            ScriptedFactory factory = ScriptedFactory
-                    .alwaysFailing(() -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
-                    .withDynamicCredential();
-            BackgroundDrainer drainer = newDrainerWithBudgets(
-                    factory, Long.MAX_VALUE, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
-            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
-            drainer.setErrorSink(captured::add);
+    @Test
+    public void testRotatingCredentialAuthDwellIsClampedSoEscalationStaysReachable() {
+        // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE is the documented way
+        // to ask a reconnect never to give up. TimeUnit saturates it, so the dwell half of the rotating-401
+        // gate - an AND, unlike the capability-gap gate's OR - became unsatisfiable and the ride-out never
+        // ended: the drainer swept forever, never wrote the .failed sentinel, never reported DATA_LOSS, and
+        // pinned the slot lock plus one worker of a FIXED-size drainer pool for the life of the process.
+        //
+        // Asserted on the clamp directly rather than end to end: proving it through connectWithDurableAckRetry
+        // means waiting out the ceiling, five minutes of wall clock. The other half of the argument - that a
+        // FINITE dwell does quarantine - is what testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted
+        // drives, with a 25ms budget. Finite dwell quarantines, and the dwell is always finite.
+        long ceilingNanos = TimeUnit.MILLISECONDS.toNanos(
+                BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS);
 
-            WebSocketClient out = drainer.connectWithDurableAckRetry();
-
-            assertNull(out);
-            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
-            assertEquals("the ceiling, not the unsatisfiable dwell, must end the ride-out",
-                    BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING, factory.attempts());
-            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
-            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
-            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
-        });
+        assertEquals("a saturated budget must not saturate the dwell",
+                ceilingNanos, BackgroundDrainer.dynamicCredentialAuthDwellNanos(Long.MAX_VALUE));
+        assertTrue("and the clamped dwell must be reachable at all",
+                BackgroundDrainer.dynamicCredentialAuthDwellNanos(Long.MAX_VALUE) < Long.MAX_VALUE);
+        assertEquals("a budget above the ceiling is clamped to it", ceilingNanos,
+                BackgroundDrainer.dynamicCredentialAuthDwellNanos(
+                        BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS * 10));
+        // a smaller configured budget is honoured as-is, so tuning down still works - and this is the value
+        // the existing end-to-end quarantine tests rely on
+        assertEquals("a budget below the ceiling is used as configured",
+                TimeUnit.MILLISECONDS.toNanos(25L), BackgroundDrainer.dynamicCredentialAuthDwellNanos(25L));
+        assertEquals("including the default, which IS the ceiling", ceilingNanos,
+                BackgroundDrainer.dynamicCredentialAuthDwellNanos(
+                        CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS));
     }
 
     @Test(timeout = 60_000)
@@ -445,10 +446,10 @@ public class BackgroundDrainerDurableAckRetryTest {
             // five 401s, the outage, then the sixth 401 - attempt seven overall. Charging the outage to the
             // dwell quarantines exactly there; restarting it means the sixth rejection must be followed by a
             // fresh dwell of uninterrupted 401s first.
+            // The configured dwell here is far below MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS, so the clamp
+            // is inert and the dwell is unambiguously what ends the ride-out.
             assertTrue("the outage must not have satisfied the dwell [attempts=" + factory.attempts() + "]",
                     factory.attempts() > 7);
-            assertTrue("and the ceiling must not be what ended it [attempts=" + factory.attempts() + "]",
-                    factory.attempts() < BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING);
             assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
         });
     }

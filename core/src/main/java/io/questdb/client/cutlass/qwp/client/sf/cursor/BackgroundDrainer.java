@@ -110,22 +110,27 @@ public final class BackgroundDrainer implements Runnable {
      */
     public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
     /**
-     * Hard ceiling on rotating-credential {@code 401}/{@code 403} sweeps, whatever the wall-clock dwell
-     * says. The dwell below is an AND with the attempt threshold - both must be exhausted - and it is
-     * derived from {@code reconnect_max_duration_millis}, which is validated only as {@code > 0} and whose
-     * documented way to ask for "never give up" on reconnect is {@code Long.MAX_VALUE}. {@code TimeUnit}
-     * saturates that to {@code Long.MAX_VALUE} nanos, so the dwell conjunct could never be satisfied and
-     * the ride-out never ended: the drainer swept forever, never wrote the {@code .failed} sentinel, never
-     * reported {@code DATA_LOSS}, and pinned the slot lock plus one worker of a FIXED-size
-     * {@link BackgroundDrainerPool} for the life of the process - starving every other orphan slot. The
-     * capability-gap gate below is an OR, so its attempt cap already survives the same saturation; this is
-     * the equivalent guarantee for a gate that cannot be an OR without losing its dwell floor.
+     * Ceiling on the rotating-credential {@code 401}/{@code 403} wall-clock dwell, independent of the user
+     * knob it is otherwise derived from.
      * <p>
-     * Sized far above any legitimate ride-out rather than as a second threshold: at the default
-     * {@code reconnect_max_backoff_millis} of 5s, the default 5-minute dwell is satisfied in roughly 60
-     * sweeps, so this only bites after four times that - by which point the credential is not healing.
+     * The dwell is an AND with the attempt threshold - both must be exhausted before an orphan slot is
+     * quarantined - and it is taken from {@code reconnect_max_duration_millis}, which is validated only as
+     * {@code > 0} and whose documented way to ask a reconnect never to give up is {@code Long.MAX_VALUE}.
+     * {@code TimeUnit} saturates that, so the dwell conjunct became unsatisfiable and the ride-out never
+     * ended: the drainer swept forever, never wrote the {@code .failed} sentinel, never reported
+     * {@code DATA_LOSS}, and pinned the slot lock plus one worker of a FIXED-size
+     * {@link BackgroundDrainerPool} for the life of the process, starving every other orphan slot. The
+     * capability-gap gate below survives the same saturation because it is an OR; this gate cannot be an OR
+     * without losing the dwell floor that stops a healing credential being abandoned in the seconds capped
+     * backoff needs to spend six attempts, so it is clamped instead.
+     * <p>
+     * Set to the DEFAULT reconnect budget rather than a new figure: five minutes is already what this design
+     * calls a settle budget, and a larger configured value is a statement about reconnect persistence, not
+     * about how long a credential failure may stay hidden from an operator. A smaller configured value is
+     * honoured as-is, so tuning down still works.
      */
-    public static final int MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING = 240;
+    public static final long MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
     /** How often to wake and re-check ackedFsn vs target. */
     private static final long POLL_NANOS = 50_000_000L; // 50 ms
@@ -325,6 +330,23 @@ public final class BackgroundDrainer implements Runnable {
      * @return a fresh durable-ack-capable client, or {@code null} if
      *         {@link #outcome} has been set to FAILED or STOPPED
      */
+    /**
+     * The effective wall-clock dwell the rotating-credential {@code 401} ride-out uses: the configured
+     * reconnect budget, clamped to {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} so that an
+     * "effectively unbounded" configuration cannot disable the escalation entirely.
+     * <p>
+     * Public and pure so the clamp can be asserted directly. The alternative - proving it end to end - means
+     * waiting out the ceiling, which is five minutes of wall clock in a test.
+     *
+     * @param reconnectMaxDurationMillis the configured {@code reconnect_max_duration_millis}
+     * @return the dwell in nanoseconds, always finite
+     */
+    public static long dynamicCredentialAuthDwellNanos(long reconnectMaxDurationMillis) {
+        return Math.min(
+                TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis),
+                TimeUnit.MILLISECONDS.toNanos(MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS));
+    }
+
     public WebSocketClient connectWithDurableAckRetry() {
         // run() already set runnerThread; setting it again here is a no-op
         // on that path but wires up direct callers so requestStop()
@@ -370,6 +392,11 @@ public final class BackgroundDrainer implements Runnable {
         // conversion guards the same way for the same reason.
         final long reconnectBudgetNanos =
                 TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis);
+        // The rotating-401 gate needs its own, clamped copy: it is an AND, so an unbounded value there is
+        // not "effectively unbounded" but "never escalates". The capability-gap gate below keeps the raw
+        // budget - it is an OR, so its attempt cap fires regardless.
+        final long dynamicCredentialAuthDwellNanos =
+                dynamicCredentialAuthDwellNanos(reconnectMaxDurationMillis);
         // Observability-only counter for the transient all-replica window;
         // never consulted for escalation (Invariant B).
         int roleRejectAttempts = 0;
@@ -409,15 +436,13 @@ public final class BackgroundDrainer implements Runnable {
                         firstDynamicCredentialAuthFailureNanos = now;
                     }
                     dynamicCredentialAuthElapsedNanos = now - firstDynamicCredentialAuthFailureNanos;
-                    // The ceiling is a conjunct, not a third alternative: the ride-out still needs BOTH
-                    // the attempt threshold and the dwell floor to quarantine, so a healing credential is
-                    // never abandoned early. It exists only so an unsatisfiable dwell - a saturated
-                    // reconnect_max_duration_millis, see MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING -
-                    // cannot turn "ride it out" into "never escalate".
+                    // Both thresholds still gate the quarantine - a healing credential is never abandoned
+                    // early - but the dwell is the CLAMPED one, so a saturated reconnect_max_duration_millis
+                    // cannot make the second conjunct unsatisfiable and turn "ride it out" into "never
+                    // escalate". See MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS.
                     retryDynamicCredentialAuth =
-                            dynamicCredentialAuthAttempts < MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING
-                                    && (dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
-                                    || dynamicCredentialAuthElapsedNanos < reconnectBudgetNanos);
+                            dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
+                                    || dynamicCredentialAuthElapsedNanos < dynamicCredentialAuthDwellNanos;
                 }
                 if (retryDynamicCredentialAuth) {
                     lastErrorMessage = e.getMessage();
@@ -468,7 +493,8 @@ public final class BackgroundDrainer implements Runnable {
                 // a credential that was only rejected for seconds - abandoning replayable rows behind a
                 // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
                 // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
-                // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING backstops the escalation regardless.
+                // the clamped dwell (MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS) keeps the escalation reachable
+                // regardless of what reconnect_max_duration_millis is set to.
                 firstDynamicCredentialAuthFailureNanos = 0L;
                 BackgroundDrainerListener l = listener;
                 if (l != null) {
@@ -579,7 +605,8 @@ public final class BackgroundDrainer implements Runnable {
                 // a credential that was only rejected for seconds - abandoning replayable rows behind a
                 // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
                 // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
-                // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING backstops the escalation regardless.
+                // the clamped dwell (MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS) keeps the escalation reachable
+                // regardless of what reconnect_max_duration_millis is set to.
                 firstDynamicCredentialAuthFailureNanos = 0L;
                 long nowWarn = System.nanoTime();
                 if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {
