@@ -77,6 +77,11 @@ public class DesktopFreeModulePathTest {
 
         ProcessBuilder pb = new ProcessBuilder(
                 javaBin,
+                // Second net under the child's own desktop-free check, and independent of it: should
+                // java.desktop ever be present, Desktop.isDesktopSupported() answers false in headless mode,
+                // so nothing can reach a real browser on a developer's machine. It does not weaken the test -
+                // headless changes what Desktop ANSWERS, not whether the class reference links.
+                "-Djava.awt.headless=true",
                 "--module-path", clientLocation.getPath() + File.pathSeparator + slf4jLocation.getPath(),
                 // the universe: io.questdb.client and the closure of its MANDATORY requires, and nothing
                 // else. This is what makes the child desktop-free - and what makes a mandatory
@@ -88,7 +93,8 @@ public class DesktopFreeModulePathTest {
                 DesktopFreePromptMain.class.getName());
         // deliberately NOT setting questdb.client.oidc.open.browser=false: the kill-switch returns before
         // BrowserLauncher touches java.awt.Desktop, so a run with it set would never reach the LinkageError
-        // this exists to exercise. Nothing can pop a browser in a JVM with no java.desktop.
+        // this exists to exercise. What keeps a browser from opening is the child's own precondition - it
+        // only runs the prompt in the arm that proved Desktop unreachable - plus the headless flag above.
         pb.redirectErrorStream(true);
         Process process = pb.start();
         String output = readFully(process.getInputStream());

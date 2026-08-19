@@ -65,15 +65,20 @@ public final class DesktopFreePromptMain {
                     + "io.questdb.client must declare `requires static java.desktop`, not a mandatory requires");
             System.exit(EXIT_DESKTOP_REACHABLE);
         } catch (ClassNotFoundException expected) {
-            // desktop-free, as intended - the module resolved without java.desktop
+            // Desktop-free, as intended - the module resolved without java.desktop. The prompt runs HERE, in
+            // the arm that proved it, and not after the try: this is the one place in the suite that drives
+            // the real openBrowser() with the questdb.client.oidc.open.browser kill-switch left enabled, so
+            // "we checked first" must be structural rather than a matter of statement order that a later
+            // edit could undo. A reachable Desktop can then never reach the launch below - and the test
+            // that starts this JVM passes -Djava.awt.headless=true as a second, independent net.
+            //
+            // The promise DeviceCodePrompt.openBrowser() documents: the browser open is best-effort and
+            // "skipped on a runtime without the java.desktop module", never fatal. Reaching BrowserLauncher
+            // throws a LinkageError here, which openBrowser() swallows, leaving the printed URL and code.
+            DeviceCodePrompt.openBrowser().promptUser(new DeviceAuthorizationChallenge(
+                    "WDJB-MJHT", "https://verify.example/device", null, 300, 5));
+
+            System.out.println(SUCCESS_MARKER);
         }
-
-        // The promise DeviceCodePrompt.openBrowser() documents: the browser open is best-effort and
-        // "skipped on a runtime without the java.desktop module", never fatal. Reaching BrowserLauncher
-        // throws a LinkageError here, which openBrowser() swallows, leaving the printed URL and code.
-        DeviceCodePrompt.openBrowser().promptUser(new DeviceAuthorizationChallenge(
-                "WDJB-MJHT", "https://verify.example/device", null, 300, 5));
-
-        System.out.println(SUCCESS_MARKER);
     }
 }
