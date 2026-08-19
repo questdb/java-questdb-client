@@ -169,6 +169,7 @@ public final class FileTokenStore implements TokenStore {
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
     // (compareAndSet, so a race between two threads still prints a single warning)
     private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
+    private static final AtomicBoolean warnedTightenedStoreDir = new AtomicBoolean();
     private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
     private final Path directory;
     private final long lockAcquireBudgetMillis;
@@ -399,8 +400,11 @@ public final class FileTokenStore implements TokenStore {
                         // already absorbs IOException; a SecurityManager denying the delete throws
                         // SecurityException, which is unchecked and was escaping. Same operator-visible
                         // warning, same degrade: peers run unserialized until the lock goes stale.
+                        // sanitized: an IO error message embeds the operator-supplied store path, which is
+                        // the one untrusted string these warnings put in front of a terminal
                         LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free "
-                                + "refresh until it goes stale [error={}]", e.getMessage());
+                                + "refresh until it goes stale [error={}]",
+                                OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
                     } finally {
                         if (wasInterruptedInSection) {
                             Thread.currentThread().interrupt();
@@ -776,8 +780,9 @@ public final class FileTokenStore implements TokenStore {
             // peer degrades to an unserialized refresh meanwhile: the rotating-refresh-token race this lock
             // exists to prevent. That is worth a line an operator can find, rather than surfacing later as
             // unexplained repeated sign-ins.
+            // sanitized: see the sibling warning in inLock - the message embeds the store path
             LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free refresh until "
-                    + "it goes stale [error={}]", e.getMessage());
+                    + "it goes stale [error={}]", OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
         }
     }
 
@@ -837,6 +842,15 @@ public final class FileTokenStore implements TokenStore {
             final boolean wasOtherWritable = perms.contains(PosixFilePermission.GROUP_WRITE)
                     || perms.contains(PosixFilePermission.OTHERS_WRITE);
             if (!DIR_PERMS.equals(perms)) {
+                // Tightening is load-bearing - it IS the at-rest protection of the plaintext token files, so
+                // it stays unconditional - but it changes a directory the operator chose and may share with
+                // something else, so it must not be silent. Once per JVM, and never naming the path.
+                if (warnedTightenedStoreDir.compareAndSet(false, true)) {
+                    LOG.warn("the OIDC token store directory was not owner-only and has been tightened to "
+                            + "0700; it holds plaintext refresh tokens, so it must not be shared with "
+                            + "anything else. Point questdb.client.oidc.token.store.dir at a directory of "
+                            + "its own if another tool needs access to that path.");
+                }
                 Files.setPosixFilePermissions(directory, DIR_PERMS);
             }
             return !wasOtherWritable;
@@ -961,8 +975,10 @@ public final class FileTokenStore implements TokenStore {
                 // A lock we genuinely did leave half-created is EMPTY, and stealIfStale already reclaims an
                 // empty lock on the short EMPTY_LOCK_STEAL_GRACE_MILLIS grace, so leaving it behind costs at
                 // most that grace. Degrade to a lock-free refresh instead.
+                // sanitized: see the sibling warning in inLock - the message embeds the store path
                 LOG.warn("could not acquire the OIDC token store lock; running this refresh without "
-                        + "cross-process coordination [error={}]", e.getMessage());
+                        + "cross-process coordination [error={}]",
+                        OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
                 return null;
             }
         }

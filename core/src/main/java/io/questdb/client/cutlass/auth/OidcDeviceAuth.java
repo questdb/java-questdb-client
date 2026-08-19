@@ -50,7 +50,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.UnsupportedEncodingException;
+import java.net.InetAddress;
 import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -910,9 +912,38 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static boolean isLoopbackHost(String host) {
-        // loopback traffic never leaves the host, so a plaintext /settings fetch to it has no network
-        // interception risk; match localhost and the whole IPv4 127.0.0.0/8 block
-        return host != null && (host.equalsIgnoreCase("localhost") || (host.startsWith("127.") && isDottedIpv4(host)));
+        // loopback traffic never leaves the host, so a plaintext fetch to it has no network interception
+        // risk; match the whole IPv4 127.0.0.0/8 block and the name "localhost"
+        if (host == null) {
+            return false;
+        }
+        // an address literal needs no resolution: it IS the address, and nobody can point it elsewhere
+        if (host.startsWith("127.") && isDottedIpv4(host)) {
+            return true;
+        }
+        if (!host.equalsIgnoreCase("localhost")) {
+            return false;
+        }
+        // "localhost" is a NAME. RFC 6761 says it must resolve to loopback, and every normal host honours
+        // that - but a minimal image with no /etc/hosts entry leaves it to DNS, and this exemption is
+        // precisely what allows the device code and the refresh token to travel in cleartext. Confirm what
+        // it actually resolves to rather than trusting the spelling, and require EVERY answer to be
+        // loopback: one non-loopback address is enough to send the credential off the machine.
+        try {
+            final InetAddress[] resolved = InetAddress.getAllByName(host);
+            if (resolved.length == 0) {
+                return false;
+            }
+            for (int i = 0; i < resolved.length; i++) {
+                if (!resolved[i].isLoopbackAddress()) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (UnknownHostException e) {
+            // fail CLOSED: the caller then requires https, which is never the less safe answer
+            return false;
+        }
     }
 
     private static boolean isSameOrigin(Endpoint a, Endpoint b) {
@@ -1075,7 +1106,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private static String sanitizeForDisplay(String value) {
+    // package-private, not private: FileTokenStore needs the same treatment for the operator-supplied path
+    // its IO errors embed, and a second copy of this walk in the same package would be the thing to avoid.
+    static String sanitizeForDisplay(String value) {
         if (value == null) {
             return null;
         }

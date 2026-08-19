@@ -2389,6 +2389,15 @@ public class OidcDeviceAuthTest {
         for (String s : loopback) {
             Assert.assertTrue("expected loopback: [" + s + "]", invokeIsLoopbackHost(s));
         }
+        // The name is now accepted on the strength of what it RESOLVES to, not how it is spelt: RFC 6761
+        // says localhost must be loopback, but a host with no /etc/hosts entry leaves that to DNS, and this
+        // exemption is what lets a device code and a refresh token travel in cleartext. The assertions above
+        // therefore also pin that the resolution path still accepts the normal case - break it and every
+        // loopback form spelt as a name fails closed, which would be safe but would refuse a working local
+        // dev setup. The hostile half (localhost resolving OFF loopback) cannot be reached from a test
+        // without rewriting the host's resolver, so it is unasserted by design rather than by omission.
+        Assert.assertFalse("a name that does not resolve must fail closed",
+                invokeIsLoopbackHost("no-such-host.invalid"));
     }
 
     @Test(timeout = 30_000)
