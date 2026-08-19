@@ -1903,6 +1903,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
          * because arming gates on this knob.
          * <p>
+         * Switching it off removes the only bound on dictionary growth below
+         * the hard cap ({@link io.questdb.client.cutlass.qwp.protocol.QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE},
+         * 2,000,000). Servers released before QuestDB 10.0.0 cap the
+         * dictionary at 1,000,000 and reject anything beyond it as a terminal
+         * parse error, so with the recycle off against a pre-10.0.0 server
+         * keep symbol cardinality below 1M.
+         * <p>
          * Default {@code true} (on). WebSocket transport only.
          */
         public LineSenderBuilder symbolDictReset(boolean enabled) {

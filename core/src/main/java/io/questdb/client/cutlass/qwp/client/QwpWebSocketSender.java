@@ -159,6 +159,13 @@ public class QwpWebSocketSender implements Sender {
     // sf-client.md section 4.4 floor: drop-oldest under bursts needs a wide
     // enough window to preserve the trailing category distribution.
     private static final int MIN_ERROR_INBOX_CAPACITY = 16;
+    // Upper bound on how long recycleForDictReset step 3 waits for a DEFERRED
+    // engine close (SF worker wedged in a syscall past SegmentManager's
+    // bounded join) to release the slot flock before giving up and latching
+    // the sender terminal. Sized well past any transient disk/NFS stall the
+    // deferred-close machinery exists to survive; a worker still wedged after
+    // this long is treated as a genuinely dead disk.
+    private static final long RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS = 30_000L;
     private static final String WRITE_PATH = "/write/v4";
     private final String authorizationHeader;
     private final int autoFlushBytes;
@@ -301,15 +308,6 @@ public class QwpWebSocketSender implements Sender {
     // while the producer thread reads it from sendRow without
     // holding the sender monitor.
     private volatile int effectiveAutoFlushBytes;
-    /**
-     * Rebuilds a fresh {@link CursorSendEngine} on this sender's own slot, going
-     * through the identical construct/quarantine code path
-     * {@link Sender.LineSenderBuilder#build} uses.
-     */
-    public interface EngineRebuildFactory {
-        CursorSendEngine rebuild();
-    }
-
     // Installed by build() once connect() succeeds; null for a sender that
     // has never connected. See setEngineRebuildFactory.
     private EngineRebuildFactory engineRebuildFactory;
@@ -432,8 +430,10 @@ public class QwpWebSocketSender implements Sender {
     // runs and consumes the request.
     private boolean manualResetRequested;
     // True once armIfEligible has determined a recycle should happen. Consumed
-    // by the (later-task) recycle trigger; set only at the tail of
-    // resetTableBuffersAfterFlush, never on the per-symbol registration path.
+    // by the recycle trigger; set only from armIfEligible's two safe call
+    // points (the tail of resetTableBuffersAfterFlush, and
+    // resetSymbolDictionary() when no flush is in flight), never on the
+    // per-symbol registration path.
     private boolean resetArmed;
     // Cleared on the false -> true armed transition; a later task's
     // opportunistic-wait step sets it once it has waited out its window for
@@ -445,6 +445,19 @@ public class QwpWebSocketSender implements Sender {
     // getSymbolDictResetStarvationTimeouts()), and a monitoring thread is
     // its obvious reader.
     private volatile long symbolDictResetStarvationTimeouts;
+    // External-scale FSN of the last frame proven durably acked by a recycle's
+    // barrier, recorded at recycleForDictReset step 1 before any teardown.
+    // -1 until the first recycle that had published anything. Lets the
+    // monitoring accessors (getAckedFsn, awaitAckedFsn's null-engine branch)
+    // keep reporting the durable watermark instead of collapsing to -1 while
+    // cursorEngine is transiently null mid-swap or permanently null after a
+    // failed recycle -- all pre-swap data really is acked, so the watermark
+    // stays truthful.
+    private long lastRecycleDurableFsn = -1L;
+    // Budget for recycleForDictReset's deferred-close await (see
+    // RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS); non-final only so tests can
+    // shrink it to drive the timeout branch.
+    private long recycleDeferredCloseMaxWaitMillis = RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS;
     // Set (once) by recycleForDictReset's catch block when the recycle swap
     // itself fails in steps 2-6 -- everything was acked before the swap tore
     // the old engine down, so no data is at risk, but this sender can no
@@ -1050,10 +1063,16 @@ public class QwpWebSocketSender implements Sender {
     public boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
         checkNotClosed();
         checkRecycleFailure();
-        if (cursorEngine == null) {
-            return targetFsn < 0L;
+        // Snapshot: the recycle transitions cursorEngine non-null -> null ->
+        // non-null on the producer thread; reading the field once keeps this
+        // method from dereferencing a half-swapped null. While it is null,
+        // anything at or below the watermark the recycle barrier proved
+        // durable is truthfully "acked".
+        CursorSendEngine engine = cursorEngine;
+        if (engine == null) {
+            return targetFsn < 0L || targetFsn <= lastRecycleDurableFsn;
         }
-        cursorEngine.checkDurability();
+        engine.checkDurability();
         // Surface latched errors before any early-return path, so a caller
         // polling with timeoutMillis <= 0 to drive their own loop sees the
         // throw instead of an indefinite "not yet". The durability latch
@@ -1071,15 +1090,15 @@ public class QwpWebSocketSender implements Sender {
             }
             targetFsn = internalTarget;
         }
-        if (cursorEngine.ackedFsn() >= targetFsn) {
+        if (engine.ackedFsn() >= targetFsn) {
             return true;
         }
         if (timeoutMillis <= 0L) {
             return false;
         }
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
-        while (cursorEngine.ackedFsn() < targetFsn) {
-            cursorEngine.checkDurability();
+        while (engine.ackedFsn() < targetFsn) {
+            engine.checkDurability();
             if (cursorSendLoop != null) {
                 cursorSendLoop.checkError();
             }
@@ -1899,7 +1918,13 @@ public class QwpWebSocketSender implements Sender {
      */
     @Override
     public long getAckedFsn() {
-        return cursorEngine != null ? fsnEpochBase + cursorEngine.ackedFsn() : -1L;
+        // Snapshot: the recycle transitions cursorEngine non-null -> null ->
+        // non-null on the producer thread, so read the field once. While it
+        // is null (mid-swap, or for good after a failed swap) report the last
+        // watermark a recycle barrier proved durable instead of collapsing
+        // to -1 -- all pre-swap data really is acked.
+        CursorSendEngine engine = cursorEngine;
+        return engine != null ? fsnEpochBase + engine.ackedFsn() : lastRecycleDurableFsn;
     }
 
     /**
@@ -2686,11 +2711,13 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. Sets
-     * {@link #manualResetRequested}; if no row is currently in progress and no
-     * flush is in flight ({@code pendingRowCount == 0}), re-evaluates arming
-     * immediately so a caller that requests a reset between batches does not
-     * have to wait for a later flush to observe {@code isResetArmed()}. A
-     * request made mid-batch is picked up by the next
+     * {@link #manualResetRequested}; if no flush is in flight
+     * ({@code pendingRowCount == 0} -- a first row may still be under
+     * construction; arming is harmless there because the recycle trigger
+     * itself refuses to run mid-row), re-evaluates arming immediately so a
+     * caller that requests a reset between batches does not have to wait for
+     * a later flush to observe {@code isResetArmed()}. A request made
+     * mid-batch is picked up by the next
      * {@code resetTableBuffersAfterFlush} instead.
      * <p>
      * A permanent no-op while {@code symbol_dict_reset} is off: arming gates
@@ -2868,6 +2895,11 @@ public class QwpWebSocketSender implements Sender {
                     + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
+    }
+
+    @TestOnly
+    public void setRecycleDeferredCloseMaxWaitMillisForTesting(long millis) {
+        this.recycleDeferredCloseMaxWaitMillis = millis;
     }
 
     public void setTransactional(boolean transactional) {
@@ -3832,7 +3864,11 @@ public class QwpWebSocketSender implements Sender {
                     slotLockReleased = false;
                     retainedEngine = engine;
                 }
-            } else {
+            } else if (retainedEngine == null) {
+                // No engine and nothing retained: no flock left to report. A
+                // non-null retainedEngine (a recycle's deferred-close await
+                // timed out) still holds the slot flock, so leave the flag
+                // false and let isSlotLockReleased() re-probe it.
                 slotLockReleased = true;
             }
             if (errorDispatcher != null) {
@@ -4655,6 +4691,48 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * Recycle step 3's deferred-close await. A fully-drained engine close
+     * normally completes inline ({@code isCloseCompleted()} true on return),
+     * making this a single volatile read. When the SF worker was wedged in a
+     * syscall past {@code SegmentManager}'s bounded join, the close instead
+     * returned with the slot flock retained and its release deferred to the
+     * worker's exit path -- exactly the transient disk stall the
+     * deferred-close machinery exists to survive. Park (the same
+     * {@code awaitAckedFsn}-shaped wait the starvation policy uses) until the
+     * deferred cleanup confirms the release; each pass also re-arms the
+     * shared flock-release retry driver for the close-ran-but-release-failed
+     * case, mirroring {@link #isSlotLockReleased()}'s re-probe.
+     * <p>
+     * Exhausting {@link #recycleDeferredCloseMaxWaitMillis} means the worker
+     * is genuinely dead (not stalled), so throw -- the recycle's catch then
+     * latches the sender terminal. Before throwing, hand the still-locked
+     * engine to {@link #retainedEngine} so a pool re-probe
+     * ({@link #isSlotLockReleased()}) can still recover the slot's capacity
+     * if the worker ever exits.
+     */
+    private void awaitDeferredEngineClose(CursorSendEngine outgoing) {
+        if (outgoing.isCloseCompleted()) {
+            return;
+        }
+        LOG.warn("symbol dictionary recycle waiting for a deferred engine close: the SF worker "
+                + "did not quiesce, so the slot lock is still held [maxWaitMillis={}]",
+                recycleDeferredCloseMaxWaitMillis);
+        long deadlineNanos = System.nanoTime() + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
+        while (!outgoing.isCloseCompleted()) {
+            if (System.nanoTime() >= deadlineNanos) {
+                retainedEngine = outgoing;
+                slotLockReleased = false;
+                throw new LineSenderException("symbol dictionary recycle could not reclaim its "
+                        + "slot: the outgoing engine's deferred close did not release the slot "
+                        + "lock within " + recycleDeferredCloseMaxWaitMillis
+                        + " ms (SF worker wedged)");
+            }
+            outgoing.ensureFlockReleaseRetryScheduled();
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        }
+    }
+
+    /**
      * True once every FSN this engine has published has also been
      * server-acknowledged (or nothing has been published yet). The barrier
      * {@link #recycleForDictReset()} waits for: the swap tears the cursor
@@ -4765,7 +4843,7 @@ public class QwpWebSocketSender implements Sender {
      * The symbol-dictionary recycle swap. Runs synchronously on the producer
      * thread from the {@link #table(CharSequence)} barrier, once
      * {@link #maybeRecycleForDictReset()} has proven the ring is drained.
-     * Eight steps, strictly ordered:
+     * Seven steps, strictly ordered:
      * <ol>
      *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
      *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
@@ -4796,12 +4874,24 @@ public class QwpWebSocketSender implements Sender {
      *       against the rolled {@link #fsnEpochBase}. Runs OUTSIDE the latching
      *       try -- see below.</li>
      * </ol>
-     * A throw in steps 1-6 is caught, latches {@link #recycleFailure} (step 8),
+     * A throw in steps 2-6 is caught, latches {@link #recycleFailure},
      * and rethrows: every frame that existed before this call was already
      * proven acked, so no data is at risk, but the sender that made the throw
      * observe a half-swapped engine/loop refuses further use from here on --
      * {@link #checkRecycleFailure()} enforces that at every later
-     * {@link #table(CharSequence)} and flush-family call.
+     * {@link #table(CharSequence)} and flush-family call. (Step 1 is a pair
+     * of plain reads and runs before the latching try.)
+     * <p>
+     * Step 3 mirrors {@code close()}'s deferred-close discipline: when the
+     * outgoing engine's close could not confirm SF-worker quiescence it
+     * returns with the slot flock retained and {@code isCloseCompleted()}
+     * false, releasing both from the worker's exit path. Step 3 then awaits
+     * that deferred release (bounded by
+     * {@link #RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS}) before step 6 rebuilds
+     * on the slot -- rebuilding against the retained flock would throw
+     * {@code SlotLockContentionException} and needlessly latch the sender
+     * terminal for what is usually a transient disk stall. Only exhausting
+     * the await budget (a genuinely dead worker) latches terminal.
      * <p>
      * Step 7 is deliberately exempt from that latch. By then the swap has
      * committed, so a failed connect leaves a fully coherent sender that is
@@ -4821,6 +4911,12 @@ public class QwpWebSocketSender implements Sender {
         final long lastPublishedFsn = cursorEngine.publishedFsn(); // step 1
         final int dictSizeAtSwap = globalSymbolDictionary.size();
         final long startNanos = System.nanoTime();
+        if (lastPublishedFsn >= 0) {
+            // The barrier proved every published frame acked, so this is the
+            // durable watermark the monitoring accessors keep reporting while
+            // cursorEngine is null (mid-swap, or for good after a failed swap).
+            lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
+        }
         try {
             // step 2: close the loop - joins the I/O thread, closes the client
             if (cursorSendLoop != null) {
@@ -4830,9 +4926,14 @@ public class QwpWebSocketSender implements Sender {
             client = null;
             // step 3: fully-drained close of the engine - empties the slot.
             // Holds NO logical slot lock here: close(true) unlinks the logical
-            // lock file (CursorSendEngine close javadoc).
-            cursorEngine.close();
+            // lock file (CursorSendEngine close javadoc). When the SF worker
+            // is wedged in a syscall the close defers flock release to the
+            // worker's exit path -- await it (bounded) rather than let step 6
+            // throw SlotLockContentionException on the retained flock.
+            CursorSendEngine outgoing = cursorEngine;
+            outgoing.close();
             cursorEngine = null;
+            awaitDeferredEngineClose(outgoing);
             // step 4: roll the external FSN base (-1 no-publish case adds 0)
             rollFsnEpochBase(lastPublishedFsn);
             // step 5: producer state swap - replace, don't clear()
@@ -4847,10 +4948,24 @@ public class QwpWebSocketSender implements Sender {
             // step 6: rebuild the engine on the now-empty slot
             cursorEngine = engineRebuildFactory.rebuild();
             ownsCursorEngine = true;
+            if (cursorEngine.wasRecoveredFromDisk()) {
+                // close(true) above emptied the slot, so a rebuild that found
+                // a persisted dictionary to recover from means the outgoing
+                // close's empties-the-slot contract was breached -- the fresh
+                // producer dictionary and the slot's on-disk state have
+                // diverged, so refuse to run on it.
+                throw new LineSenderException(
+                        "symbol dictionary recycle rebuilt on a non-empty slot: "
+                                + "the outgoing engine's fully-drained close did not empty it");
+            }
             deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
             cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
+            // The fresh engine holds the slot flock again; step 3's release
+            // flipped slotLockReleased true via the outgoing engine's
+            // listener, which no longer describes this sender's state.
+            slotLockReleased = false;
         } catch (Throwable t) {
-            // step 8: terminal latch - everything was acked before step 2,
+            // terminal latch - everything was acked before step 2,
             // so no data is at risk; the sender refuses further use.
             recycleFailure = t;
             LOG.error("symbol dictionary recycle failed; sender is now terminal "
@@ -5672,6 +5787,15 @@ public class QwpWebSocketSender implements Sender {
             this.host = host;
             this.port = port;
         }
+    }
+
+    /**
+     * Rebuilds a fresh {@link CursorSendEngine} on this sender's own slot, going
+     * through the identical construct/quarantine code path
+     * {@link Sender.LineSenderBuilder#build} uses.
+     */
+    public interface EngineRebuildFactory {
+        CursorSendEngine rebuild();
     }
 
     private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {

@@ -45,6 +45,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
 /**
  * FSN epoch-base continuity across a symbol-dict recycle. Task 5's engine
  * rebuild restarts the internal cursor engine's raw FSNs at 0; every
@@ -80,103 +82,109 @@ public class SymbolDictRecycleFsnContinuityTest {
      */
     @Test
     public void testPreRollTargetAnswersTrueAfterRoll() throws Exception {
-        try (TestWebSocketServer server = ackingServer()) {
-            long fsn1;
-            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender1.table("t").longColumn("v", 1L).atNow();
-                fsn1 = sender1.flushAndGetSequence();
-                Assert.assertTrue("setup: the batch must actually be acked before the roll",
-                        sender1.drain(5_000));
-            }
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                long fsn1;
+                try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                    sender1.table("t").longColumn("v", 1L).atNow();
+                    fsn1 = sender1.flushAndGetSequence();
+                    Assert.assertTrue("setup: the batch must actually be acked before the roll",
+                            sender1.drain(5_000));
+                }
 
-            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
-            try {
-                long t0 = System.nanoTime();
-                Assert.assertTrue("a target FSN from a pre-recycle epoch must be reported acked "
-                                + "immediately -- it was proven acked before the swap",
-                        sender2.awaitAckedFsn(fsn1, 0));
-                long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
-                Assert.assertTrue("must short-circuit, not poll: took " + elapsedMs + "ms",
-                        elapsedMs < 200);
-            } finally {
-                sender2.close();
+                QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
+                try {
+                    long t0 = System.nanoTime();
+                    Assert.assertTrue("a target FSN from a pre-recycle epoch must be reported acked "
+                                    + "immediately -- it was proven acked before the swap",
+                            sender2.awaitAckedFsn(fsn1, 0));
+                    long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    Assert.assertTrue("must short-circuit, not poll: took " + elapsedMs + "ms",
+                            elapsedMs < 200);
+                } finally {
+                    sender2.close();
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testPostRollSequencesExceedAllPreRoll() throws Exception {
-        try (TestWebSocketServer server = ackingServer()) {
-            long fsn1;
-            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender1.table("t").longColumn("v", 1L).atNow();
-                fsn1 = sender1.flushAndGetSequence();
-                Assert.assertTrue(sender1.drain(5_000));
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                long fsn1;
+                try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                    sender1.table("t").longColumn("v", 1L).atNow();
+                    fsn1 = sender1.flushAndGetSequence();
+                    Assert.assertTrue(sender1.drain(5_000));
+                }
+
+                QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
+                try {
+                    long newBase = sender2.getFsnEpochBaseForTest();
+                    Assert.assertEquals(fsn1 + 1, newBase);
+
+                    sender2.table("t").longColumn("v", 2L).atNow();
+                    long fsn2 = sender2.flushAndGetSequence();
+                    Assert.assertTrue(sender2.drain(5_000));
+
+                    Assert.assertTrue("post-roll FSN must exceed every pre-roll FSN: fsn2=" + fsn2
+                                    + " fsn1=" + fsn1,
+                            fsn2 > fsn1);
+                    // sender2's engine is genuinely fresh (raw publishedFsn() starts at -1), so
+                    // its first-ever flush publishes raw 0. The exact-equality check is strictly
+                    // stronger than ">" alone: it also catches an off-by-one in the roll formula
+                    // (e.g. fsnEpochBase += lastPublishedFsn instead of + 1L), which the ">"
+                    // check above would not.
+                    Assert.assertEquals(newBase, fsn2);
+                } finally {
+                    sender2.close();
+                }
             }
-
-            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
-            try {
-                long newBase = sender2.getFsnEpochBaseForTest();
-                Assert.assertEquals(fsn1 + 1, newBase);
-
-                sender2.table("t").longColumn("v", 2L).atNow();
-                long fsn2 = sender2.flushAndGetSequence();
-                Assert.assertTrue(sender2.drain(5_000));
-
-                Assert.assertTrue("post-roll FSN must exceed every pre-roll FSN: fsn2=" + fsn2
-                                + " fsn1=" + fsn1,
-                        fsn2 > fsn1);
-                // sender2's engine is genuinely fresh (raw publishedFsn() starts at -1), so
-                // its first-ever flush publishes raw 0. The exact-equality check is strictly
-                // stronger than ">" alone: it also catches an off-by-one in the roll formula
-                // (e.g. fsnEpochBase += lastPublishedFsn instead of + 1L), which the ">"
-                // check above would not.
-                Assert.assertEquals(newBase, fsn2);
-            } finally {
-                sender2.close();
-            }
-        }
+        });
     }
 
     @Test
     public void testGetAckedFsnMonotoneAcrossRoll() throws Exception {
-        try (TestWebSocketServer server = ackingServer()) {
-            long w;
-            long lastPublishedFsn;
-            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender1.table("t").longColumn("v", 1L).atNow();
-                long fsn1 = sender1.flushAndGetSequence();
-                Assert.assertTrue(sender1.drain(5_000));
-                w = sender1.getAckedFsn();
-                lastPublishedFsn = fsn1;
-                Assert.assertEquals("sanity: single-batch acked watermark must match its own FSN",
-                        fsn1, w);
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                long w;
+                long lastPublishedFsn;
+                try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                    sender1.table("t").longColumn("v", 1L).atNow();
+                    long fsn1 = sender1.flushAndGetSequence();
+                    Assert.assertTrue(sender1.drain(5_000));
+                    w = sender1.getAckedFsn();
+                    lastPublishedFsn = fsn1;
+                    Assert.assertEquals("sanity: single-batch acked watermark must match its own FSN",
+                            fsn1, w);
+                }
+
+                // A fresh sender/engine models the post-recycle engine that restarts its
+                // internal FSNs at 0; rolling its epoch base by the outgoing epoch's last
+                // published FSN is exactly what the recycle swap does in production.
+                QwpWebSocketSender sender2 = createRolledSender(server, lastPublishedFsn);
+                try {
+                    long newBase = sender2.getFsnEpochBaseForTest();
+                    Assert.assertEquals(lastPublishedFsn + 1, newBase);
+
+                    Assert.assertEquals("before any new ack, getAckedFsn must read the synthetic "
+                                    + "watermark: one past the last external FSN the outgoing epoch "
+                                    + "ever reported",
+                            newBase - 1, sender2.getAckedFsn());
+                    Assert.assertTrue(sender2.getAckedFsn() >= w);
+
+                    sender2.table("t").longColumn("v", 2L).atNow();
+                    sender2.flush();
+                    Assert.assertTrue(sender2.drain(5_000));
+                    Assert.assertTrue("a new ack must advance the watermark past the synthetic "
+                                    + "post-roll value",
+                            sender2.getAckedFsn() > newBase - 1);
+                } finally {
+                    sender2.close();
+                }
             }
-
-            // A fresh sender/engine models the post-recycle engine that restarts its
-            // internal FSNs at 0; rolling its epoch base by the outgoing epoch's last
-            // published FSN is exactly what the recycle swap does in production.
-            QwpWebSocketSender sender2 = createRolledSender(server, lastPublishedFsn);
-            try {
-                long newBase = sender2.getFsnEpochBaseForTest();
-                Assert.assertEquals(lastPublishedFsn + 1, newBase);
-
-                Assert.assertEquals("before any new ack, getAckedFsn must read the synthetic "
-                                + "watermark: one past the last external FSN the outgoing epoch "
-                                + "ever reported",
-                        newBase - 1, sender2.getAckedFsn());
-                Assert.assertTrue(sender2.getAckedFsn() >= w);
-
-                sender2.table("t").longColumn("v", 2L).atNow();
-                sender2.flush();
-                Assert.assertTrue(sender2.drain(5_000));
-                Assert.assertTrue("a new ack must advance the watermark past the synthetic "
-                                + "post-roll value",
-                        sender2.getAckedFsn() > newBase - 1);
-            } finally {
-                sender2.close();
-            }
-        }
+        });
     }
 
     /**
@@ -189,31 +197,33 @@ public class SymbolDictRecycleFsnContinuityTest {
      */
     @Test
     public void testDrainAfterRollWaitsForNewFrames() throws Exception {
-        GatedAckHandler handler = new GatedAckHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            GatedAckHandler handler = new GatedAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            // Roll well past the raw FSNs this fresh engine will ever publish, so a
-            // missing translation in drain() would make its raw target look pre-roll.
-            // Must roll before the sender's first connect (see rollFsnEpochBase's
-            // precondition: cursorSendLoop must be null).
-            QwpWebSocketSender sender = createRolledSender(server, 999L);
-            try {
-                sender.table("foo").longColumn("v", 1L).atNow();
-                boolean drainedEarly = sender.drain(200);
-                Assert.assertFalse("drain() must not spuriously report the new frame acked just "
-                                + "because its raw FSN is smaller than the rolled epoch base",
-                        drainedEarly);
+                // Roll well past the raw FSNs this fresh engine will ever publish, so a
+                // missing translation in drain() would make its raw target look pre-roll.
+                // Must roll before the sender's first connect (see rollFsnEpochBase's
+                // precondition: cursorSendLoop must be null).
+                QwpWebSocketSender sender = createRolledSender(server, 999L);
+                try {
+                    sender.table("foo").longColumn("v", 1L).atNow();
+                    boolean drainedEarly = sender.drain(200);
+                    Assert.assertFalse("drain() must not spuriously report the new frame acked just "
+                                    + "because its raw FSN is smaller than the rolled epoch base",
+                            drainedEarly);
 
-                handler.releaseAcks();
-                Assert.assertTrue("drain() must return true once the real ack arrives",
-                        sender.drain(5_000));
-            } finally {
-                handler.releaseAcks();
-                sender.close();
+                    handler.releaseAcks();
+                    Assert.assertTrue("drain() must return true once the real ack arrives",
+                            sender.drain(5_000));
+                } finally {
+                    handler.releaseAcks();
+                    sender.close();
+                }
             }
-        }
+        });
     }
 
     /**
@@ -225,136 +235,142 @@ public class SymbolDictRecycleFsnContinuityTest {
      */
     @Test
     public void testSenderErrorSpansCarryExternalFsns() throws Exception {
-        TerminalNackHandler handler = new TerminalNackHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            TerminalNackHandler handler = new TerminalNackHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            AtomicReference<SenderError> asyncError = new AtomicReference<>();
-            QwpWebSocketSender sender = createRolledSender(server, 41L);
-            long base = sender.getFsnEpochBaseForTest();
-            sender.setErrorHandler(e -> asyncError.compareAndSet(null, e));
-            try {
-                sender.table("foo").longColumn("v", 1L).atNow();
-                sender.flush();
-
-                waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
-                waitFor(() -> sender.getLastTerminalError() != null, 5_000);
-
-                LineSenderServerException thrown = null;
+                AtomicReference<SenderError> asyncError = new AtomicReference<>();
+                QwpWebSocketSender sender = createRolledSender(server, 41L);
+                long base = sender.getFsnEpochBaseForTest();
+                sender.setErrorHandler(e -> asyncError.compareAndSet(null, e));
                 try {
-                    sender.table("foo").longColumn("v", 2L).atNow();
+                    sender.table("foo").longColumn("v", 1L).atNow();
                     sender.flush();
-                } catch (LineSenderServerException e) {
-                    thrown = e;
-                }
-                Assert.assertNotNull("expected the latched terminal to surface synchronously",
-                        thrown);
-                SenderError err = thrown.getServerError();
-                Assert.assertEquals("fromFsn must be the external (epoch-rebased) FSN, not raw",
-                        base, err.getFromFsn());
-                Assert.assertEquals("toFsn must be the external (epoch-rebased) FSN, not raw",
-                        base, err.getToFsn());
 
-                waitFor(() -> asyncError.get() != null, 5_000);
-                SenderError asyncErr = asyncError.get();
-                Assert.assertEquals("async error handler must observe the same fromFsn as the "
-                                + "synchronous throw",
-                        err.getFromFsn(), asyncErr.getFromFsn());
-                Assert.assertEquals("async error handler must observe the same toFsn as the "
-                                + "synchronous throw",
-                        err.getToFsn(), asyncErr.getToFsn());
-            } finally {
-                try {
-                    sender.close();
-                } catch (LineSenderException ignored) {
+                    waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
+                    waitFor(() -> sender.getLastTerminalError() != null, 5_000);
+
+                    LineSenderServerException thrown = null;
+                    try {
+                        sender.table("foo").longColumn("v", 2L).atNow();
+                        sender.flush();
+                    } catch (LineSenderServerException e) {
+                        thrown = e;
+                    }
+                    Assert.assertNotNull("expected the latched terminal to surface synchronously",
+                            thrown);
+                    SenderError err = thrown.getServerError();
+                    Assert.assertEquals("fromFsn must be the external (epoch-rebased) FSN, not raw",
+                            base, err.getFromFsn());
+                    Assert.assertEquals("toFsn must be the external (epoch-rebased) FSN, not raw",
+                            base, err.getToFsn());
+
+                    waitFor(() -> asyncError.get() != null, 5_000);
+                    SenderError asyncErr = asyncError.get();
+                    Assert.assertEquals("async error handler must observe the same fromFsn as the "
+                                    + "synchronous throw",
+                            err.getFromFsn(), asyncErr.getFromFsn());
+                    Assert.assertEquals("async error handler must observe the same toFsn as the "
+                                    + "synchronous throw",
+                            err.getToFsn(), asyncErr.getToFsn());
+                } finally {
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignored) {
+                    }
                 }
             }
-        }
+        });
     }
 
     @Test
     public void testProgressStreamMonotoneAcrossRoll() throws Exception {
-        try (TestWebSocketServer server = ackingServer()) {
-            List<Long> observed = Collections.synchronizedList(new ArrayList<Long>());
-            SenderProgressHandler collector = observed::add;
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                List<Long> observed = Collections.synchronizedList(new ArrayList<Long>());
+                SenderProgressHandler collector = observed::add;
 
-            long lastPublishedFsn;
-            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender1.setProgressHandler(collector);
-                sender1.table("t").longColumn("v", 1L).atNow();
-                lastPublishedFsn = sender1.flushAndGetSequence();
-                Assert.assertTrue(sender1.drain(5_000));
-            }
-            waitFor(() -> !observed.isEmpty(), 5_000);
-            int preRollCount = observed.size();
-
-            // Roll BEFORE this sender's first connect so its loop's frozen
-            // externalFsnBase actually carries the roll (see class javadoc).
-            QwpWebSocketSender sender2 = createRolledSender(server, lastPublishedFsn);
-            sender2.setProgressHandler(collector);
-            try {
-                sender2.table("t").longColumn("v", 2L).atNow();
-                sender2.flush();
-                Assert.assertTrue(sender2.drain(5_000));
-                waitFor(() -> observed.size() > preRollCount, 5_000);
-
-                List<Long> snapshot = new ArrayList<>(observed);
-                for (int i = 1; i < snapshot.size(); i++) {
-                    Assert.assertTrue("progress stream must be non-decreasing across the roll, "
-                                    + "got " + snapshot,
-                            snapshot.get(i) >= snapshot.get(i - 1));
+                long lastPublishedFsn;
+                try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                    sender1.setProgressHandler(collector);
+                    sender1.table("t").longColumn("v", 1L).atNow();
+                    lastPublishedFsn = sender1.flushAndGetSequence();
+                    Assert.assertTrue(sender1.drain(5_000));
                 }
-                Assert.assertTrue("post-roll progress must exceed the pre-roll watermark",
-                        snapshot.get(snapshot.size() - 1) > lastPublishedFsn);
-            } finally {
-                sender2.close();
+                waitFor(() -> !observed.isEmpty(), 5_000);
+                int preRollCount = observed.size();
+
+                // Roll BEFORE this sender's first connect so its loop's frozen
+                // externalFsnBase actually carries the roll (see class javadoc).
+                QwpWebSocketSender sender2 = createRolledSender(server, lastPublishedFsn);
+                sender2.setProgressHandler(collector);
+                try {
+                    sender2.table("t").longColumn("v", 2L).atNow();
+                    sender2.flush();
+                    Assert.assertTrue(sender2.drain(5_000));
+                    waitFor(() -> observed.size() > preRollCount, 5_000);
+
+                    List<Long> snapshot = new ArrayList<>(observed);
+                    for (int i = 1; i < snapshot.size(); i++) {
+                        Assert.assertTrue("progress stream must be non-decreasing across the roll, "
+                                        + "got " + snapshot,
+                                snapshot.get(i) >= snapshot.get(i - 1));
+                    }
+                    Assert.assertTrue("post-roll progress must exceed the pre-roll watermark",
+                            snapshot.get(snapshot.size() - 1) > lastPublishedFsn);
+                } finally {
+                    sender2.close();
+                }
             }
-        }
+        });
     }
 
     @Test
     public void testLatchedErrorStillThrowsForOldEpochTarget() throws Exception {
-        // Acks the first frame it ever receives (from sender1, producing fsn1), then
-        // terminal-NACKs everything after (sender2's frame, on its own fresh connection).
-        AckFirstThenTerminalNackHandler handler = new AckFirstThenTerminalNackHandler();
-        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+        assertMemoryLeak(() -> {
+            // Acks the first frame it ever receives (from sender1, producing fsn1), then
+            // terminal-NACKs everything after (sender2's frame, on its own fresh connection).
+            AckFirstThenTerminalNackHandler handler = new AckFirstThenTerminalNackHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
-            long fsn1;
-            try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
-                sender1.table("foo").longColumn("v", 1L).atNow();
-                fsn1 = sender1.flushAndGetSequence();
-                Assert.assertTrue(sender1.drain(5_000));
-            }
-
-            // Roll before sender2's first connect (rollFsnEpochBase's precondition), then
-            // force sender2's own loop to latch a terminal via the handler's NACK.
-            QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
-            try {
-                sender2.table("foo").longColumn("v", 2L).atNow();
-                sender2.flush();
-                waitFor(() -> sender2.getLastTerminalError() != null, 5_000);
-
-                LineSenderException thrown = null;
-                try {
-                    boolean acked = sender2.awaitAckedFsn(fsn1, 0);
-                    Assert.fail("awaitAckedFsn must throw on a latched terminal error, but "
-                            + "returned " + acked);
-                } catch (LineSenderException e) {
-                    thrown = e;
+                long fsn1;
+                try (QwpWebSocketSender sender1 = (QwpWebSocketSender) Sender.fromConfig(cfg(server))) {
+                    sender1.table("foo").longColumn("v", 1L).atNow();
+                    fsn1 = sender1.flushAndGetSequence();
+                    Assert.assertTrue(sender1.drain(5_000));
                 }
-                Assert.assertNotNull("a latched terminal error must surface even for a "
-                        + "pre-recycle-epoch target -- the error check must run before the "
-                        + "pre-roll short-circuit", thrown);
-            } finally {
+
+                // Roll before sender2's first connect (rollFsnEpochBase's precondition), then
+                // force sender2's own loop to latch a terminal via the handler's NACK.
+                QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
                 try {
-                    sender2.close();
-                } catch (LineSenderException ignored) {
+                    sender2.table("foo").longColumn("v", 2L).atNow();
+                    sender2.flush();
+                    waitFor(() -> sender2.getLastTerminalError() != null, 5_000);
+
+                    LineSenderException thrown = null;
+                    try {
+                        boolean acked = sender2.awaitAckedFsn(fsn1, 0);
+                        Assert.fail("awaitAckedFsn must throw on a latched terminal error, but "
+                                + "returned " + acked);
+                    } catch (LineSenderException e) {
+                        thrown = e;
+                    }
+                    Assert.assertNotNull("a latched terminal error must surface even for a "
+                            + "pre-recycle-epoch target -- the error check must run before the "
+                            + "pre-roll short-circuit", thrown);
+                } finally {
+                    try {
+                        sender2.close();
+                    } catch (LineSenderException ignored) {
+                    }
                 }
             }
-        }
+        });
     }
 
     private static TestWebSocketServer ackingServer() throws Exception {

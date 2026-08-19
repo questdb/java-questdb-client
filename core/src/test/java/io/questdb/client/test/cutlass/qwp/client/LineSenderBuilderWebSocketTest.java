@@ -334,6 +334,64 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 () -> Sender.builder("http::addr=" + LOCALHOST + ":9000;symbol_dict_reset_max_wait_millis=0;"));
     }
 
+    /**
+     * The three fluent setters carry the same transport guard as the
+     * connect-string keys, but sit on a separate code path -- pin them
+     * directly so a guard dropped from the setters alone cannot ship green.
+     */
+    @Test
+    public void testSymbolDictResetFluentSettersRejectNonWebSocketTransport() {
+        assertThrows("symbol_dict_reset is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.HTTP).symbolDictReset(true));
+        assertThrows("symbol_dict_reset_threshold is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.HTTP).symbolDictResetThreshold(500));
+        assertThrows("symbol_dict_reset_max_wait_millis is only supported for WebSocket transport",
+                () -> Sender.builder(Sender.Transport.HTTP).symbolDictResetMaxWaitMillis(0));
+    }
+
+    /**
+     * {@code symbol_dict_reset=on} must survive the parse as {@code true} --
+     * distinct from the default-true path, which passes with the parse branch
+     * deleted. Contrast against {@code off} on an otherwise identical builder.
+     */
+    @Test
+    public void testSymbolDictResetOnParsesTrue() {
+        Assert.assertEquals(Boolean.TRUE,
+                Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset=on;")
+                        .wsConfigSnapshotForTest()
+                        .get("symbol_dict_reset"));
+        Assert.assertEquals(Boolean.FALSE,
+                Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset=off;")
+                        .wsConfigSnapshotForTest()
+                        .get("symbol_dict_reset"));
+    }
+
+    @Test
+    public void testSymbolDictResetRejectsInvalidValue() {
+        assertThrows("invalid symbol_dict_reset [value=banana, allowed-values=[on, off]]",
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset=banana;"));
+    }
+
+    /**
+     * The accepted upper edge: exactly {@code MAX_SYMBOL_DICTIONARY_SIZE}
+     * (2M) must pass validation -- a {@code >} -> {@code >=} regression at
+     * the bound would reject it. Both the connect-string and the fluent
+     * setter paths.
+     */
+    @Test
+    public void testSymbolDictResetThresholdAcceptsHardCapBoundary() {
+        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+                Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold="
+                                + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE + ";")
+                        .wsConfigSnapshotForTest()
+                        .get("symbol_dict_reset_threshold"));
+        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+                Sender.builder(Sender.Transport.WEBSOCKET)
+                        .symbolDictResetThreshold(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE)
+                        .wsConfigSnapshotForTest()
+                        .get("symbol_dict_reset_threshold"));
+    }
+
     @Test
     public void testConnectionRefused() throws Exception {
         assertMemoryLeak(() -> {
