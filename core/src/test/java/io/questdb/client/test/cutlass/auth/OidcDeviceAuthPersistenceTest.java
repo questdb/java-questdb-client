@@ -1228,6 +1228,84 @@ public class OidcDeviceAuthPersistenceTest {
         });
     }
 
+    @Test(timeout = 30_000)
+    public void testRepeatedStoreLoadFailureIsThrottledNotRetriedOnEveryCall() throws Exception {
+        assertMemoryLeak(() -> {
+            // A store that never becomes readable - a chmod or uid mismatch in a container, EIO/ESTALE on an
+            // NFS home - must not cost a blocking read on every call. maybeLoadFromStore() runs on the
+            // getToken() path AHEAD of the cache check, and getToken() runs once per ILP flush, so without a
+            // back-off the producer thread paid a file open, two stack trace fills and a WARN line per flush,
+            // forever, while holding this instance's lock.
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // never recovers, unlike the single transient fault above
+                fake.failLoadTimes = Integer.MAX_VALUE;
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    for (int i = 0; i < 25; i++) {
+                        try {
+                            auth.getToken();
+                            Assert.fail("an unreadable store leaves no token to serve");
+                        } catch (OidcAuthException expected) {
+                            // every call still reports the failure - only the store read is rate-limited
+                        }
+                    }
+                    // two reads, not 25: the first failure, plus the free retry it arms so a one-shot fault
+                    // still recovers at once. The second failure arms the real back-off, which the remaining
+                    // 23 calls run inside of.
+                    Assert.assertEquals("25 getToken() calls must not mean 25 store reads", 2, fake.loads.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testSignInClearsTheStoreLoadBackOff() throws Exception {
+        assertMemoryLeak(() -> {
+            // The back-off must never strand a caller: signIn() is the explicit action a user takes to
+            // recover, and sending a human through the device flow over a refresh token that is sitting on
+            // disk - readable again by then - is exactly what persistence exists to avoid.
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // the two getToken() reads fail, arming the back-off; the store is readable again by the time
+                // signIn() is called
+                fake.failLoadTimes = 2;
+                fake.loadReturns = new PersistedToken("ACCESS-PERSISTED", null, "REFRESH-1",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    for (int i = 0; i < 2; i++) {
+                        try {
+                            auth.getToken();
+                            Assert.fail("the store read failed, so there is no token to serve yet");
+                        } catch (OidcAuthException expected) {
+                            // the second failure arms the back-off
+                        }
+                    }
+                    Assert.assertEquals(2, fake.loads.get());
+
+                    Assert.assertEquals("ACCESS-PERSISTED", auth.signIn());
+                    Assert.assertEquals("signIn() must re-read a store the back-off is holding off",
+                            3, fake.loads.get());
+                    Assert.assertEquals("a readable store must not force the interactive device flow",
+                            0, device.get());
+                }
+            }
+        });
+    }
+
     private static OidcDeviceAuth.Builder baseBuilder(MockOidcServer server) {
         return OidcDeviceAuth.builder()
                 .clientId("questdb")

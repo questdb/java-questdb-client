@@ -168,6 +168,14 @@ public class OidcDeviceAuth implements QuietCloseable {
      * {@link #clearCache()} clears the latch outright.
      */
     private static final long MIN_REFRESH_RETRY_INTERVAL_MILLIS = 5_000L;
+    // First non-zero back-off between token store reads; it doubles per consecutive failure, up to
+    // MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS. Same floor as the refresh back-off above, and the same kind of
+    // stampede guard. The FIRST failure arms a ZERO-length back-off, so the very next call still re-reads the
+    // store: a one-shot fault - notably a carried interrupt flag, which makes the InterruptibleChannel under
+    // FileTokenStore throw on a thread that merely carries it - must recover on the next call rather than wait
+    // this out. Anything that survives that free retry needs an operator (a chmod, a remount), so waiting is
+    // no longer costing a recovery that was about to happen anyway.
+    private static final long MIN_STORE_LOAD_RETRY_INTERVAL_MILLIS = 5_000L;
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
@@ -184,6 +192,13 @@ public class OidcDeviceAuth implements QuietCloseable {
     // cap bytes drained per response so a hostile/MITM'd server cannot stream an endless body and
     // wedge the thread; far above any real OIDC JSON response
     private static final int MAX_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
+    // Ceiling on the back-off between token store reads. maybeLoadFromStore() runs on the getToken() path,
+    // which an ILP producer calls once per flush, so a store that is permanently unreadable - a chmod or uid
+    // mismatch in a container, EIO/ESTALE on an NFS home - otherwise cost a blocking file open, two exception
+    // fills and a WARN line on EVERY flush, on the producer thread and under this instance's lock. A store
+    // that simply has nothing to return is unaffected: load() reports that by returning null rather than by
+    // throwing, and that latches storeLoadAttempted outright.
+    private static final long MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS = 60_000L;
     private static final int POLL_PENDING = 1;
     private static final long POLL_SLEEP_SLICE_MILLIS = 100;
     private static final int POLL_SLOW_DOWN = 2;
@@ -220,10 +235,16 @@ public class OidcDeviceAuth implements QuietCloseable {
     private volatile boolean interactiveSignInInProgress;
     private JsonLexer jsonLexer;
     private String lastPersistedRefreshToken;
+    // earliest wall-clock millis at which maybeLoadFromStore() may re-read the store after a read threw; 0
+    // until the first failure. See isStoreLoadBackedOff()
+    private long nextStoreLoadAttemptMillis;
     private HttpClient plainClient;
     private long refreshFailedAtMillis;
     private String refreshToken;
     private boolean storeLoadAttempted;
+    // back-off applied to the NEXT failed store read, doubling from MIN_ to MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS;
+    // 0 while no read has failed yet, which is what makes the first retry immediate
+    private long storeLoadRetryIntervalMillis;
     private HttpClient tlsClient;
     // lifetime in millis of the currently cached token (its clamped TTL); effectiveSkewMillis() caps the
     // clock skew at half of this so a short-lived token is not treated as expired the instant it is issued
@@ -603,6 +624,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         lock.lock();
         try {
             throwIfClosed();
+            // signIn() is an explicit user action, and it is about to spend a whole interactive device flow -
+            // so it is never the caller the store-read back-off exists to throttle. Clear that back-off, for
+            // the same reason the refresh back-off is cleared further down: a store that has become readable
+            // again must be re-read here, rather than have a human sent through the device flow over a refresh
+            // token that is sitting on disk.
+            nextStoreLoadAttemptMillis = 0;
+            storeLoadRetryIntervalMillis = 0;
             maybeLoadFromStore();
             // only the kind of token signIn() actually serves counts as a cache hit; a grant that
             // returned the other kind (access token when the server wants the id token, or vice versa)
@@ -1429,8 +1457,17 @@ public class OidcDeviceAuth implements QuietCloseable {
         return elapsed >= 0 && elapsed < MIN_REFRESH_RETRY_INTERVAL_MILLIS;
     }
 
+    private boolean isStoreLoadBackedOff() {
+        final long remaining = nextStoreLoadAttemptMillis - System.currentTimeMillis();
+        // Unlike isRefreshBackedOff(), a zero remaining span does NOT count as backed off: the first failure
+        // arms a zero-length back-off on purpose, so a same-millisecond retry still re-reads the store.
+        // A span longer than the cap cannot have been armed here, so it means the clock jumped BACKWARDS -
+        // release the latch rather than pin the store unreadable until the clock catches up.
+        return remaining > 0 && remaining <= MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS;
+    }
+
     private void maybeLoadFromStore() {
-        if (tokenStore == null || storeLoadAttempted) {
+        if (tokenStore == null || storeLoadAttempted || isStoreLoadBackedOff()) {
             return;
         }
         PersistedToken token;
@@ -1438,10 +1475,21 @@ public class OidcDeviceAuth implements QuietCloseable {
             token = tokenStore.load(storeKey);
         } catch (RuntimeException e) {
             // Best-effort: a store read failure must not break sign-in. Leave storeLoadAttempted UNSET so a
-            // transient failure is retried on the next call. Latching it here instead would make one failed
+            // transient failure is retried on a later call. Latching it here instead would make one failed
             // read disable persistence for the whole life of this instance - so a process that owns a
             // perfectly good refresh token on disk would re-run the interactive device flow, which for a
             // headless getToken() consumer is a hard failure rather than a degraded one.
+            //
+            // Retried, but not on EVERY call: this runs on the getToken() path ahead of the cache check, so
+            // without a back-off a store that never becomes readable costs a blocking file open, two stack
+            // trace fills and a WARN line per ILP flush, forever, on the producer thread and under the lock.
+            // The first failure arms a zero-length back-off (an immediate retry, for the one-shot faults
+            // above), then each consecutive failure doubles it up to MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS.
+            final long backOffMillis = storeLoadRetryIntervalMillis;
+            storeLoadRetryIntervalMillis = backOffMillis == 0
+                    ? MIN_STORE_LOAD_RETRY_INTERVAL_MILLIS
+                    : Math.min(backOffMillis * 2, MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS);
+            nextStoreLoadAttemptMillis = System.currentTimeMillis() + backOffMillis;
             warnPersistence("load", e);
             return;
         }

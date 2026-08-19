@@ -102,6 +102,11 @@ public interface TokenStore {
      * entry, or an entry that does not match {@code key}, or one that cannot be read as a valid token).
      * A {@code null} return makes {@code OidcDeviceAuth} fall back to a refresh or an interactive sign-in,
      * so an unreadable or stale entry is recoverable rather than fatal.
+     * <p>
+     * Returning {@code null} is the definitive answer, and ends the reads for the life of that
+     * {@code OidcDeviceAuth}. Throwing is not: it reads as a transient fault and is retried - immediately
+     * once, then behind a back-off that grows to a minute, so an implementation that can never succeed is
+     * not re-entered on every {@code getToken()} call (which an ILP producer makes once per flush).
      *
      * @param key the identity to load
      * @return the persisted token, or {@code null}
