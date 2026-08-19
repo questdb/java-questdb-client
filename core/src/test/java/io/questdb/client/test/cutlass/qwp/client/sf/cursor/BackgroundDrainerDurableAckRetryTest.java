@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.std.Os;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
@@ -412,6 +413,43 @@ public class BackgroundDrainerDurableAckRetryTest {
             assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
             assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
             assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testTransientOutageDoesNotCountTowardTheRotating401Dwell() throws Exception {
+        assertMemoryLeak(() -> {
+            // The dwell measures how long the REJECTION persisted, so an unrelated outage in the middle of a
+            // 401 run is not part of it. Anchored at the first 401 and never restarted, a 401, then an outage
+            // outlasting the dwell, then a sixth rejection satisfied both thresholds at once and quarantined
+            // the slot on a credential that had been rejected for seconds - abandoning replayable rows behind
+            // a .failed sentinel nothing in production clears.
+            final long dwellMillis = 100L;
+            AtomicInteger scripted = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+                if (scripted.incrementAndGet() == 6) {
+                    // an unrelated cluster outage, longer than the whole dwell
+                    Os.sleep(dwellMillis * 3);
+                    return new RuntimeException("cluster unreachable");
+                }
+                return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+            }).withDynamicCredential();
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, dwellMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            assertNull(drainer.connectWithDurableAckRetry());
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+
+            // five 401s, the outage, then the sixth 401 - attempt seven overall. Charging the outage to the
+            // dwell quarantines exactly there; restarting it means the sixth rejection must be followed by a
+            // fresh dwell of uninterrupted 401s first.
+            assertTrue("the outage must not have satisfied the dwell [attempts=" + factory.attempts() + "]",
+                    factory.attempts() > 7);
+            assertTrue("and the ceiling must not be what ended it [attempts=" + factory.attempts() + "]",
+                    factory.attempts() < BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING);
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
         });
     }
 

@@ -346,8 +346,11 @@ public final class BackgroundDrainer implements Runnable {
         // rejected/unreachable cannot refill it indefinitely and stall the quarantine that an operator
         // needs to see.
         int dynamicCredentialAuthAttempts = 0;
-        // The rotating-auth wall-clock floor is anchored at the first 401/403 and, like the attempt
-        // threshold, never resets during this drain. A zero value means no rejection has been observed.
+        // The rotating-auth wall-clock floor is anchored at the first 401/403 of the CURRENT run of
+        // rejections: a transient class in between (role reject, transport, credential-unavailable) restarts
+        // it, because the dwell measures how long the rejection persisted, not how long the drainer has been
+        // running. The attempt threshold, unlike this, never resets during the drain. A zero value means no
+        // rejection has been observed.
         long firstDynamicCredentialAuthFailureNanos = 0L;
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
@@ -458,6 +461,15 @@ public final class BackgroundDrainer implements Runnable {
                 capabilityGapAttempts = 0;
                 capabilityGapElapsedNanos = 0L;
                 lastCapabilityGapNanos = 0L;
+                // The rotating-401 dwell measures how long the REJECTION has persisted, so time spent in
+                // an unrelated state is not part of it. Restart its anchor for the same reason the
+                // capability-gap episode restarts above: without this, a 401, then an outage outlasting the
+                // dwell, then a sixth rejection satisfies both thresholds at once and quarantines a slot on
+                // a credential that was only rejected for seconds - abandoning replayable rows behind a
+                // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
+                // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
+                // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING backstops the escalation regardless.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 BackgroundDrainerListener l = listener;
                 if (l != null) {
                     try {
@@ -560,6 +572,15 @@ public final class BackgroundDrainer implements Runnable {
                 capabilityGapAttempts = 0;
                 capabilityGapElapsedNanos = 0L;
                 lastCapabilityGapNanos = 0L;
+                // The rotating-401 dwell measures how long the REJECTION has persisted, so time spent in
+                // an unrelated state is not part of it. Restart its anchor for the same reason the
+                // capability-gap episode restarts above: without this, a 401, then an outage outlasting the
+                // dwell, then a sixth rejection satisfies both thresholds at once and quarantines a slot on
+                // a credential that was only rejected for seconds - abandoning replayable rows behind a
+                // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
+                // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
+                // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING backstops the escalation regardless.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 long nowWarn = System.nanoTime();
                 if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {
                     if (t instanceof QwpVersionMismatchException) {
