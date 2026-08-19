@@ -169,6 +169,7 @@ public final class FileTokenStore implements TokenStore {
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
     // (compareAndSet, so a race between two threads still prints a single warning)
     private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
+    private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
     private final Path directory;
     private final long lockAcquireBudgetMillis;
     private final long lockStaleMillis;
@@ -424,6 +425,36 @@ public final class FileTokenStore implements TokenStore {
         // store's reads stop being collateral damage.
         final boolean wasInterrupted = Thread.interrupted();
         try {
+            // Assert the directory on the READ path too, not only on the write paths. adopt() rejects an
+            // entry carrying only a refresh token, but a COMPLETE planted entry - a dummy access token, the
+            // attacker's refresh token, and an expiry already in the past - takes the normal path and the
+            // next silent refresh presents their credential. Closing that needs the container checked as
+            // well as the artefact: a store directory another local user can write is one whose contents
+            // were never ours to trust. Fail closed - a null return is the documented outcome for any
+            // unusable entry and degrades to a refresh or an interactive sign-in.
+            final boolean isDirectoryTrusted;
+            try {
+                isDirectoryTrusted = ensureDirectory();
+            } catch (IOException e) {
+                warnUnprotectedStoreDirOnce("it could not be restricted to owner-only access");
+                return null;
+            }
+            if (!isDirectoryTrusted) {
+                // The directory was WRITABLE by other local users until the tightening a moment ago, so
+                // anything already in it may have been planted rather than written by us. Tightening protects
+                // what we write from here on and says nothing about what was there before. Discard the entry
+                // rather than merely skip it: leaving it would hand the very same file to the next load,
+                // which now sees an owner-only directory and would trust it.
+                warnUnprotectedStoreDirOnce("it was writable by other local users; the entry found in it was "
+                        + "discarded rather than trusted, and a fresh sign-in is required");
+                try {
+                    Files.deleteIfExists(tokenFile(key));
+                } catch (IOException ignore) {
+                    // best-effort: a delete failure must not turn an untrusted entry into a thrown load
+                }
+                sweepTempFiles(key.hash(), 0L);
+                return null;
+            }
             Path file = tokenFile(key);
             byte[] bytes;
             try {
@@ -790,16 +821,29 @@ public final class FileTokenStore implements TokenStore {
      * inherited ACL as before (owner-only hardening there, via AclFileAttributeView, is a separate follow-up).
      *
      * @param directory the store directory, which must already exist
+     * @return {@code true} when the directory's content may be trusted, {@code false} when it was writable
+     *         by group or other, so another local user could have planted an entry before this call
+     *         tightened it
      * @throws IOException if the directory exists but its permissions cannot be read or set
      */
-    private static void restrictToOwner(Path directory) throws IOException {
+    private static boolean restrictToOwner(Path directory) throws IOException {
         try {
-            if (!DIR_PERMS.equals(Files.getPosixFilePermissions(directory))) {
+            final Set<PosixFilePermission> perms = Files.getPosixFilePermissions(directory);
+            // Writable by group or other is the state that decides TRUST, and it is narrower than "not
+            // owner-only": only write permission on a directory lets another local user create or replace an
+            // entry in it, which is what load() would then adopt. The 0755 a default umask produces exposes
+            // no token - the files themselves are 0600 - and everything in it was still put there by us, so
+            // it is tightened for defence in depth but its content stays trusted.
+            final boolean wasOtherWritable = perms.contains(PosixFilePermission.GROUP_WRITE)
+                    || perms.contains(PosixFilePermission.OTHERS_WRITE);
+            if (!DIR_PERMS.equals(perms)) {
                 Files.setPosixFilePermissions(directory, DIR_PERMS);
             }
+            return !wasOtherWritable;
         } catch (UnsupportedOperationException e) {
             // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
             warnNoPosixPermsOnce();
+            return true;
         }
     }
 
@@ -837,6 +881,19 @@ public final class FileTokenStore implements TokenStore {
         LOG.warn("the OIDC token store could not enforce owner-only (0600/0700) permissions on this "
                 + "filesystem; the persisted refresh token is protected only by the directory's default ACL. "
                 + "Back the store with an OS keychain for at-rest encryption.");
+    }
+
+    private static void warnUnprotectedStoreDirOnce(String reason) {
+        // once per JVM, like warnNoPosixPermsOnce: the condition is a property of the directory, which every
+        // identity in this process shares, and load() sits on the flush path via OidcDeviceAuth.getToken().
+        // ASCII-only and never the path itself - an operator-supplied path can carry terminal-spoofing
+        // characters, which is why warnNoPosixPermsOnce omits it too.
+        if (!warnedUnprotectedStoreDir.compareAndSet(false, true)) {
+            return;
+        }
+        LOG.warn("the OIDC token store directory is not owner-only, so a persisted token there cannot be "
+                + "trusted: {}. Point questdb.client.oidc.token.store.dir at a directory only this user "
+                + "can write, or supply a TokenStore backed by an OS keychain.", reason);
     }
 
     private static void writeAndFlush(Path file, byte[] content) throws IOException {
@@ -921,7 +978,13 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private void ensureDirectory() throws IOException {
+    /**
+     * Creates the store directory owner-only when absent, and asserts it is owner-only either way.
+     *
+     * @return {@code true} when the directory's content may be trusted - see {@link #restrictToOwner(Path)}
+     * @throws IOException if the directory cannot be created, or exists and cannot be made owner-only
+     */
+    private boolean ensureDirectory() throws IOException {
         if (!Files.isDirectory(directory)) {
             try {
                 Files.createDirectories(directory, DIR_ATTRS);
@@ -937,7 +1000,7 @@ public final class FileTokenStore implements TokenStore {
         // createDirectories" is not evidence the directory is ours. That window is exactly the hostile
         // local pre-create this method exists to defeat. Re-asserting here also covers ordinary drift on a
         // pre-existing directory (another tool, a permissive umask), which is what the old branch handled.
-        restrictToOwner(directory);
+        return restrictToOwner(directory);
     }
 
     private boolean isOlderThan(Path lock, long thresholdMillis) {

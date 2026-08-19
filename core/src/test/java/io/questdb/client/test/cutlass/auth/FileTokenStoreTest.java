@@ -1012,6 +1012,63 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testLoadRejectsAndDiscardsAnEntryFromAWorldWritableDirectory() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("baseline: an entry written into an owner-only directory is trusted",
+                    store.load(key));
+
+            // adopt() already rejects an entry carrying ONLY a refresh token, but a COMPLETE plant - a dummy
+            // access token, the attacker's refresh token, an expiry already in the past - takes the normal
+            // path and the next silent refresh presents their credential. Closing that needs the container
+            // checked too: an entry sitting in a directory other local users can WRITE was never ours to
+            // trust, whatever it contains.
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+
+            Assert.assertNull("an entry from a directory other local users could write must not be adopted",
+                    store.load(key));
+            Assert.assertFalse("the untrusted entry must be discarded, not left for the next load to adopt",
+                    Files.exists(tokenFile(dir, key)));
+            Assert.assertEquals("load() must tighten the store directory, as the write paths already do",
+                    PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(dir));
+            Assert.assertNull(store.load(key));
+
+            // the store stays usable: a fresh sign-in persists and loads normally over the tightened directory
+            store.save(key, sampleToken("ACCESS-2", "REFRESH-2"));
+            PersistedToken reloaded = store.load(key);
+            Assert.assertNotNull(reloaded);
+            Assert.assertEquals("REFRESH-2", reloaded.getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testLoadTrustsAWorldREADABLEDirectory() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The 0755 a default umask produces is NOT the attack surface: no other user can create or
+            // replace a file in it, and the entry itself is 0600. Distrusting it would discard honest tokens
+            // - and make every negative assertion in this suite pass for the wrong reason.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
+
+            PersistedToken loaded = store.load(key);
+            Assert.assertNotNull("a merely world-READABLE directory must not invalidate its entry", loaded);
+            Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+            Assert.assertEquals("and it is still tightened on the way through",
+                    PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(dir));
+        });
+    }
+
+    @Test
     public void testLockFilePermissionsOwnerOnly() throws Exception {
         Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         assertMemoryLeak(() -> {
