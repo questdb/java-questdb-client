@@ -353,8 +353,22 @@ public abstract class HttpClient implements QuietCloseable {
             }
         }
 
+        /**
+         * The address of the request's content section, or {@code 0} when no content section has been
+         * started - deliberately NOT the {@code -1} sentinel the field carries in that state.
+         * <p>
+         * Callers pair this with {@link #getContentLength()}, which already reports 0 for the same state, so
+         * handing back {@code -1} here produced a view that is empty by length but whose base address is a
+         * non-zero, unusable pointer: a {@code ptr() != 0} test reads as true, and pointer arithmetic on it
+         * is nonsense. That state became reachable when withContent() started being deferred - an ILP
+         * request with an httpTokenProvider sits at the header stage until the first row stamps the
+         * Authorization header - so {@code Sender.bufferView()} returned it between every flush and the next
+         * row. {@code trimContentToLen} was guarded against the same sentinel; this accessor was not.
+         *
+         * @return the content-section address, or 0 when there is no content section
+         */
         public long getContentStart() {
-            return contentStart;
+            return contentStart < 0 ? 0 : contentStart;
         }
 
         public long getPtr() {

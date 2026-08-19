@@ -26,6 +26,7 @@ package io.questdb.client.test.cutlass.line;
 
 import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
+import io.questdb.client.std.bytes.DirectByteSlice;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.std.str.Utf8String;
@@ -56,6 +57,32 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class LineHttpSenderTokenProviderTest {
+
+    @Test
+    public void testBufferViewIsEmptyNotSentinelWhileTheTokenIsPending() {
+        // With a provider configured, newRequest() leaves the request at the header stage - withContent() is
+        // deferred until the first row stamps the Authorization header - so contentStart holds its -1
+        // sentinel between every flush and the next row. getContentLength() already reported 0 for that
+        // state, so bufferView() handed out a view that is empty by length but whose base address is a
+        // non-zero, unusable pointer: a ptr() != 0 test reads as true, and arithmetic on it is nonsense.
+        try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                .address("127.0.0.1:1")
+                .httpTokenProvider(() -> "TOKEN")
+                .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                .disableAutoFlush()
+                .build()) {
+            DirectByteSlice pending = sender.bufferView();
+            Assert.assertEquals("an empty buffer must report a zero base address, not the -1 sentinel",
+                    0L, pending.ptr());
+            Assert.assertEquals(0, pending.size());
+
+            // and once a row stamps the token and opens the content section, the view is real again
+            sender.table("t").longColumn("v", 1L).atNow();
+            DirectByteSlice afterRow = sender.bufferView();
+            Assert.assertTrue("a stamped request must expose a usable base address", afterRow.ptr() > 0);
+            Assert.assertTrue("and a non-empty buffer", afterRow.size() > 0);
+        }
+    }
 
     @Test(timeout = 30_000)
     public void testAtWithoutTableDoesNotCorruptTheAuthorizationHeader() throws Exception {
