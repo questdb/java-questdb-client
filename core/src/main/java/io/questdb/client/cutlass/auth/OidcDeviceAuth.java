@@ -153,6 +153,19 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
     private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
+    /**
+     * Floor on how often {@link #getToken()} will re-attempt a silent refresh after one failed. Without it a
+     * revoked refresh token, or an IdP outage, cost a full token-endpoint round trip on EVERY call - and
+     * getToken() is called once per ILP flush and once per WebSocket (re)connect, so a producer retrying its
+     * rows drove a sustained request flood at the identity provider (enough to trip its rate limits and
+     * lengthen the very outage being retried) while each call blocked the producer for the round trip, up to
+     * the OS TCP-connect timeout against a black-holed endpoint.
+     * <p>
+     * Deliberately short: this is a stampede guard, not a circuit breaker. A credential that comes back
+     * within seconds is picked up on the next call, and any explicit {@link #signIn()} or
+     * {@link #clearCache()} clears the latch outright.
+     */
+    private static final long MIN_REFRESH_RETRY_INTERVAL_MILLIS = 5_000L;
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
@@ -206,6 +219,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     private JsonLexer jsonLexer;
     private String lastPersistedRefreshToken;
     private HttpClient plainClient;
+    private long refreshFailedAtMillis;
     private String refreshToken;
     private boolean storeLoadAttempted;
     private HttpClient tlsClient;
@@ -421,6 +435,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             expiresAtMillis = 0;
             tokenTtlMillis = 0;
             lastPersistedRefreshToken = null;
+            refreshFailedAtMillis = 0;
             if (tokenStore != null) {
                 try {
                     tokenStore.clear(storeKey);
@@ -492,8 +507,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * the flush for the whole device-code lifetime): if such a sign-in holds the lock it fails fast, and the
      * caller should retry once the sign-in completes. It does, however, wait briefly behind another thread's
      * quick cached read or silent refresh rather than fail every concurrent caller sharing this instance on
-     * each token refresh - the {@code HttpTokenProvider} contract permits that bounded wait, capped here by
-     * {@link Builder#httpTimeoutMillis(int)} and still failing fast the moment an interactive sign-in or
+     * each token refresh - the {@code HttpTokenProvider} contract permits that bounded wait, capped here at
+     * FOUR times {@link Builder#httpTimeoutMillis(int)} (two minutes at the 30s default), which is the
+     * holder's own worst case: a silent refresh under the lock runs a send, an await and a body parse, each
+     * separately bounded by that timeout, so a peer waiting only one would fail every concurrent caller
+     * behind a refresh that was going to succeed. Size flush backpressure against the four-times figure, not
+     * against {@code httpTimeoutMillis} itself. It still fails fast the moment an interactive sign-in or
      * {@link #close()} begins meanwhile. It is not, otherwise, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint (and, with a
      * coordinating {@link TokenStore}, may first wait to acquire the store's per-identity lock before that
@@ -529,8 +548,17 @@ public class OidcDeviceAuth implements QuietCloseable {
             // available - including the case where a prior grant returned only the OTHER kind, leaving the served
             // kind null: a refresh may yield the served kind and avoid forcing an interactive sign-in. selectToken()
             // reports a clear error if the refresh still did not produce the kind the server expects.
-            if (refreshToken != null && tryRefreshCoordinated()) {
+            // Back off after a failed refresh instead of re-attempting on every call. getToken() runs once
+            // per ILP flush and once per (re)connect, and a producer retrying rows calls it in a tight loop,
+            // so a revoked token or an unreachable IdP otherwise meant one full token-endpoint round trip per
+            // attempt - a request flood at the provider, and a producer blocked for each round trip. The
+            // failure is still reported on every call; only the network attempt is rate-limited.
+            if (refreshToken != null && !isRefreshBackedOff() && tryRefreshCoordinated()) {
+                refreshFailedAtMillis = 0;
                 return selectToken();
+            }
+            if (refreshToken != null) {
+                refreshFailedAtMillis = System.currentTimeMillis();
             }
             if (cachedToken != null) {
                 throw new OidcAuthException("the cached token expired and could not be refreshed without an interactive sign-in; call signIn() to sign in again");
@@ -570,6 +598,10 @@ public class OidcDeviceAuth implements QuietCloseable {
             // used to, meant such an entry always re-prompted. A refresh that does not yield the served kind
             // returns false and falls straight through to the flow below, so this costs at most one wasted
             // request and cannot loop.
+            // No back-off here, and the latch is cleared either way: signIn() is an explicit user action, it
+            // falls through to the interactive flow when the refresh fails, and it is exactly the call a user
+            // makes to recover from the failure getToken() is backing off from.
+            refreshFailedAtMillis = 0;
             if (refreshToken != null && tryRefreshCoordinated()) {
                 return selectToken();
             }
@@ -1333,6 +1365,18 @@ public class OidcDeviceAuth implements QuietCloseable {
         return responseStatus.length() == 3 && (responseStatus.charAt(0) == '5' || Chars.equals(HTTP_STATUS_TOO_MANY_REQUESTS, responseStatus));
     }
 
+    private boolean isRefreshBackedOff() {
+        if (refreshFailedAtMillis == 0) {
+            return false;
+        }
+        // elapsed == 0 is the COMMON case, not an edge one: a producer retrying rows calls getToken() many
+        // times within the same millisecond, and that is exactly the flood this exists to stop - so zero
+        // counts as backed off. Only a NEGATIVE span, which means the clock jumped backwards, releases the
+        // latch early rather than pinning it until the clock catches up.
+        final long elapsed = System.currentTimeMillis() - refreshFailedAtMillis;
+        return elapsed >= 0 && elapsed < MIN_REFRESH_RETRY_INTERVAL_MILLIS;
+    }
+
     private void maybeLoadFromStore() {
         if (tokenStore == null || storeLoadAttempted) {
             return;
@@ -1839,7 +1883,7 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void warnPersistence(String operation, Throwable cause) {
-        // best-effort persistence: report to System.err and carry on with the in-memory token. The store never
+        // best-effort persistence: warn through SLF4J and carry on with the in-memory token. The store never
         // puts token bytes in its messages, but an IO error can carry the operator-supplied store path, which
         // could itself hold terminal-spoofing characters - sanitize the detail before printing, as every other
         // untrusted display string is sanitized (sanitizeForDisplay is null-safe).

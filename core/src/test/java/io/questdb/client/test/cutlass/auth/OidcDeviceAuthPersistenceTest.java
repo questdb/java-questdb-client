@@ -366,6 +366,77 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testGetTokenBacksOffAfterAFailedRefreshInsteadOfFloodingTheIdp() throws Exception {
+        assertMemoryLeak(() -> {
+            // getToken() runs once per ILP flush and once per (re)connect, and a producer retrying its rows
+            // calls it in a tight loop. Without a back-off a revoked refresh token cost a full
+            // token-endpoint round trip on EVERY call: a sustained request flood at the provider - enough to
+            // trip its rate limits and lengthen the outage being retried - and a producer blocked for each
+            // round trip, up to the OS TCP-connect timeout against a black-holed endpoint.
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                tokenCalls.incrementAndGet();
+                // the shape of a revoked refresh token
+                return MockOidcServer.json(400, "{\"error\":\"invalid_grant\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-REVOKED",
+                        System.currentTimeMillis() - 1, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    for (int i = 0; i < 25; i++) {
+                        try {
+                            auth.getToken();
+                            Assert.fail("a revoked refresh token must not yield a usable token");
+                        } catch (OidcAuthException expected) {
+                            // every call still reports the failure - only the network attempt is rate-limited
+                        }
+                    }
+                }
+                Assert.assertEquals("25 getToken() calls must not mean 25 token-endpoint round trips",
+                        1, tokenCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testSignInClearsTheRefreshBackOff() throws Exception {
+        assertMemoryLeak(() -> {
+            // The back-off must never strand a caller: signIn() is the explicit action a user takes to
+            // recover, so it re-attempts immediately and falls through to the device flow.
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                if (body != null && body.contains("REFRESH-REVOKED")) {
+                    return MockOidcServer.json(400, "{\"error\":\"invalid_grant\"}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-NEW", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-REVOKED",
+                        System.currentTimeMillis() - 1, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        auth.getToken();
+                        Assert.fail("expected the revoked refresh to fail");
+                    } catch (OidcAuthException expected) {
+                        // now latched
+                    }
+                    Assert.assertEquals("ACCESS-FRESH", auth.signIn());
+                    Assert.assertTrue("signIn() must not be held off by the back-off", device.get() >= 1);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testGetTokenAsFirstCallAfterRestore() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
