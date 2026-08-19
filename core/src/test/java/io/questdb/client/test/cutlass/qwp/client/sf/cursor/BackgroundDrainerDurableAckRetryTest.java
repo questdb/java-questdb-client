@@ -385,6 +385,36 @@ public class BackgroundDrainerDurableAckRetryTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testRotatingCredentialAuthRideOutTerminatesOnAnUnboundedBudget() throws Exception {
+        assertMemoryLeak(() -> {
+            // reconnect_max_duration_millis is validated only as > 0, and Long.MAX_VALUE is the documented
+            // way to ask a reconnect never to give up. TimeUnit saturates it, so the dwell half of the
+            // rotating-401 gate - an AND, unlike the capability-gap gate's OR - could never be satisfied and
+            // the ride-out never ended: the drainer swept forever, never wrote the .failed sentinel, never
+            // reported DATA_LOSS, and pinned the slot lock plus one worker of a FIXED-size drainer pool for
+            // the life of the process, starving every other orphan slot. Without the ceiling this call does
+            // not return and the test times out.
+            ScriptedFactory factory = ScriptedFactory
+                    .alwaysFailing(() -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
+                    .withDynamicCredential();
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, Long.MAX_VALUE, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("the ceiling, not the unsatisfiable dwell, must end the ride-out",
+                    BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
     @Test
     public void testReturnsClientOnSuccessFirstAttempt() throws Exception {
         assertMemoryLeak(() -> {

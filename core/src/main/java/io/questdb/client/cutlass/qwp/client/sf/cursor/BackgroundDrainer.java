@@ -109,6 +109,23 @@ public final class BackgroundDrainer implements Runnable {
      * condition that is not healing.
      */
     public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
+    /**
+     * Hard ceiling on rotating-credential {@code 401}/{@code 403} sweeps, whatever the wall-clock dwell
+     * says. The dwell below is an AND with the attempt threshold - both must be exhausted - and it is
+     * derived from {@code reconnect_max_duration_millis}, which is validated only as {@code > 0} and whose
+     * documented way to ask for "never give up" on reconnect is {@code Long.MAX_VALUE}. {@code TimeUnit}
+     * saturates that to {@code Long.MAX_VALUE} nanos, so the dwell conjunct could never be satisfied and
+     * the ride-out never ended: the drainer swept forever, never wrote the {@code .failed} sentinel, never
+     * reported {@code DATA_LOSS}, and pinned the slot lock plus one worker of a FIXED-size
+     * {@link BackgroundDrainerPool} for the life of the process - starving every other orphan slot. The
+     * capability-gap gate below is an OR, so its attempt cap already survives the same saturation; this is
+     * the equivalent guarantee for a gate that cannot be an OR without losing its dwell floor.
+     * <p>
+     * Sized far above any legitimate ride-out rather than as a second threshold: at the default
+     * {@code reconnect_max_backoff_millis} of 5s, the default 5-minute dwell is satisfied in roughly 60
+     * sweeps, so this only bites after four times that - by which point the credential is not healing.
+     */
+    public static final int MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING = 240;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
     /** How often to wake and re-check ackedFsn vs target. */
     private static final long POLL_NANOS = 50_000_000L; // 50 ms
@@ -389,9 +406,15 @@ public final class BackgroundDrainer implements Runnable {
                         firstDynamicCredentialAuthFailureNanos = now;
                     }
                     dynamicCredentialAuthElapsedNanos = now - firstDynamicCredentialAuthFailureNanos;
+                    // The ceiling is a conjunct, not a third alternative: the ride-out still needs BOTH
+                    // the attempt threshold and the dwell floor to quarantine, so a healing credential is
+                    // never abandoned early. It exists only so an unsatisfiable dwell - a saturated
+                    // reconnect_max_duration_millis, see MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING -
+                    // cannot turn "ride it out" into "never escalate".
                     retryDynamicCredentialAuth =
-                            dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
-                                    || dynamicCredentialAuthElapsedNanos < reconnectBudgetNanos;
+                            dynamicCredentialAuthAttempts < MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_CEILING
+                                    && (dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
+                                    || dynamicCredentialAuthElapsedNanos < reconnectBudgetNanos);
                 }
                 if (retryDynamicCredentialAuth) {
                     lastErrorMessage = e.getMessage();
