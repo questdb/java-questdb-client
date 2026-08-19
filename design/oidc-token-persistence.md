@@ -449,7 +449,15 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   / `open(p,"x")`) is a plain filesystem primitive that interoperates trivially. The contract
   mandates the lock-file scheme; OS advisory locks are out.
 - **Lock file:** `<hex>.lock` beside the token file, containing a unique per-acquisition
-  owner stamp — the holder's `pid@host`, a creation timestamp, and a random nonce.
+  owner stamp — a creation timestamp, a random nonce, and OPTIONALLY the holder's `pid@host`.
+  The nonce alone carries the uniqueness the protocol needs; `pid@host` is a debugging aid, and a
+  client MUST NOT obtain it in any way that can block the acquire. Python's `socket.gethostname()`
+  is `gethostname(2)` and is free, so the Python client includes it; Java has no cheap equivalent —
+  `ManagementFactory.getRuntimeMXBean().getName()` resolves the local hostname through
+  `InetAddress.getLocalHost()`, measured at 3.2s on a host with a cold mDNS cache, inside a 200ms
+  acquire budget and on a producer's flush path — so the Java client omits it rather than break the
+  bound below. Since no implementation parses another's stamp (see "Release verifies ownership"),
+  the two shapes interoperate unchanged.
   Acquire by an exclusive-create (`O_CREAT|O_EXCL`) and write the owner stamp through that same
   open handle — see the empty-lock note below for the window this leaves; on contention, spin
   with short backoff up to a small acquire budget (~3s); if it still cannot be acquired,

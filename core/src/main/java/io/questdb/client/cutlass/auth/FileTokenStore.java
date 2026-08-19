@@ -38,7 +38,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -60,7 +59,6 @@ import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -147,17 +145,28 @@ public final class FileTokenStore implements TokenStore {
     // waiter degrades long before it could begin stealing live locks.
     private static final long MAX_LOCK_ACQUIRE_BUDGET_MILLIS = 30_000L;
     // reject a lock file larger than this before reading it: the <hash>.lock file sits in the same
-    // attacker-writable directory as the token file, and a real owner stamp (pid@host + millis + UUID) is a
-    // few hundred bytes, so anything past this cap is corrupt or hostile and is not read into memory
+    // attacker-writable directory as the token file, and a real owner stamp (millis + UUID) is a few dozen
+    // bytes, so anything past this cap is corrupt or hostile and is not read into memory
     private static final int MAX_LOCK_FILE_BYTES = 1 << 12;
-    // Serializes same-identity critical sections WITHIN this JVM, keyed on the identity fingerprint. Two
-    // OidcDeviceAuth instances for one identity in a single process (e.g. an ILP Sender and a QwpQueryClient)
-    // have separate instance locks, so only this shared lock stops them running the read-refresh-write
-    // concurrently and double-POSTing the same parent refresh token - which a reuse-detecting IdP revokes the
-    // whole token family for. The cross-process file lock's lock-free degrade must not license an intra-process
-    // race, so this in-process lock is taken first and is never subject to that degrade. Bounded by identity
-    // count (a handful), so it never grows unbounded.
-    private static final ConcurrentHashMap<String, ReentrantLock> PROCESS_LOCKS = new ConcurrentHashMap<>();
+    // Serializes same-identity critical sections WITHIN this JVM. Two OidcDeviceAuth instances for one
+    // identity in a single process (e.g. an ILP Sender and a QwpQueryClient) have separate instance locks, so
+    // only this shared lock stops them running the read-refresh-write concurrently and double-POSTing the same
+    // parent refresh token - which a reuse-detecting IdP revokes the whole token family for. The cross-process
+    // file lock's lock-free degrade must not license an intra-process race, so this in-process lock is taken
+    // first and is never subject to that degrade.
+    //
+    // A fixed STRIPE TABLE, not a map keyed on the identity fingerprint. TokenStoreKey is public and inLock()
+    // is public API, so how many distinct identities a process mints is the caller's business - one per end
+    // user in a multi-tenant service is a perfectly ordinary shape - and the
+    // ConcurrentHashMap<String, ReentrantLock> this replaced rooted a 64-char hash plus a lock for every one
+    // of them, for the life of the JVM, with nothing ever removing an entry. Striping is the right trade
+    // rather than reference-counted removal, because the lock only has to serialize AT LEAST every
+    // same-identity pair: two unrelated identities that land on one stripe merely wait for each other, which
+    // costs one of them the refresh round trip a same-identity peer would have cost anyway, while
+    // UNDER-serializing double-POSTs a rotating refresh token. Over-serializing is cheap and safe,
+    // under-serializing is neither - so a fixed table buys the bound for free, and with no removal race to
+    // get wrong. Keep the length a power of two: processLockFor() masks rather than divides.
+    private static final ReentrantLock[] PROCESS_LOCKS = newProcessLockTable(64);
     // Windows can fail the atomic token-file rename with a transient AccessDeniedException (a sharing violation)
     // when a concurrent reader in any process holds the target open; retry the rename this many times on a short
     // backoff before giving up, so a routine read/write overlap does not needlessly degrade persistence. Kept
@@ -322,7 +331,7 @@ public final class FileTokenStore implements TokenStore {
             Thread.currentThread().interrupt();
             return false;
         }
-        final ReentrantLock processLock = PROCESS_LOCKS.computeIfAbsent(key.hash(), k -> new ReentrantLock());
+        final ReentrantLock processLock = processLockFor(key);
         // lockInterruptibly, never lock(): a peer thread on this identity holds this for a whole refresh round
         // trip, and an interrupt is the ONLY lever that reaches a caller stuck behind it. QWP's
         // ConnectCancellation.cancel() interrupts a thread inside a credential pull precisely so close() can
@@ -550,12 +559,36 @@ public final class FileTokenStore implements TokenStore {
     }
 
     private static String newLockNonce() {
-        // a per-acquisition owner stamp: the pid@host and the acquire time are human-readable debugging aids,
-        // and the random UUID guarantees two acquisitions never share a stamp even within one pid and one
-        // millisecond, so releaseLock's ownership check is exact rather than probabilistic
-        return ManagementFactory.getRuntimeMXBean().getName() // typically pid@host
-                + ' ' + System.currentTimeMillis()
-                + ' ' + UUID.randomUUID();
+        // A per-acquisition owner stamp: the acquire time is a human-readable debugging aid, and the random
+        // UUID guarantees two acquisitions never share a stamp even within one pid and one millisecond, so
+        // releaseLock's ownership check is exact rather than probabilistic.
+        //
+        // NO pid@host, deliberately. The obvious way to get one on Java 8 is
+        // ManagementFactory.getRuntimeMXBean().getName(), and that RESOLVES THE LOCAL HOSTNAME:
+        // VMManagementImpl.getVmId() calls InetAddress.getLocalHost(), a full resolver round trip. Measured
+        // at 3162ms on a macOS dev box whose mDNS cache was cold - inside an acquire whose entire budget was
+        // 200ms, on the producer thread, holding this store's in-process lock and the caller's
+        // OidcDeviceAuth lock. That is the documented bound (inLock degrades to a lock-free refresh after
+        // lockAcquireBudgetMillis) broken by a debugging aid, and it is a once-per-JVM surprise: the value is
+        // cached inside the MXBean afterwards, so the very first credential refresh in a process paid for it
+        // and nothing later did. Java has no cheap hostname - unlike Python's socket.gethostname(), which is
+        // gethostname(2) and does not resolve - so the field goes rather than the bound. Nothing reads it:
+        // releaseLock and stealIfStale compare the stamp byte-wise against their own, and the cross-language
+        // contract has each implementation check only its own stamp (design/oidc-token-persistence.md).
+        //
+        // Not even Compat.currentPid(), which SlotLock uses for exactly this kind of diagnostic: its Java 9+
+        // variant is a free ProcessHandle.current().pid(), but its Java 8 variant IS the getName() call above,
+        // parsed for the part before the '@'. The bound has to hold on every runtime this artifact supports,
+        // not only on modern ones, so the stamp carries no process identity at all.
+        return System.currentTimeMillis() + " " + UUID.randomUUID();
+    }
+
+    private static ReentrantLock[] newProcessLockTable(int stripes) {
+        final ReentrantLock[] locks = new ReentrantLock[stripes];
+        for (int i = 0; i < stripes; i++) {
+            locks[i] = new ReentrantLock();
+        }
+        return locks;
     }
 
     private static boolean nullableEquals(String keyValue, StringSink fileValue) {
@@ -698,6 +731,15 @@ public final class FileTokenStore implements TokenStore {
         sink.put(',');
         putName(sink, name);
         putString(sink, value);
+    }
+
+    private static ReentrantLock processLockFor(TokenStoreKey key) {
+        // key.hash() is a hex SHA-256, so its bits are already uniform and String.hashCode inherits that;
+        // spread anyway - the standard HashMap mix - so a table this small never rides on the low bits alone.
+        // Masking with length-1 is why the length must stay a power of two, and it handles a negative
+        // hashCode (including Integer.MIN_VALUE) without the Math.abs trap.
+        final int h = key.hash().hashCode();
+        return PROCESS_LOCKS[(h ^ (h >>> 16)) & (PROCESS_LOCKS.length - 1)];
     }
 
     private static byte[] readBounded(Path file) throws IOException {

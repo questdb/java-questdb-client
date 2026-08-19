@@ -38,6 +38,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
@@ -52,10 +53,13 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -264,7 +268,7 @@ public class FileTokenStoreTest {
             // under a lock it actually holds, and no atomic-capture temp file leaks.
             //
             // SCOPE NOTE: these four contenders do NOT race at the file-lock layer. inLock() takes the
-            // in-process PROCESS_LOCKS ReentrantLock on key.hash() before any lock-file logic, and that map is
+            // in-process PROCESS_LOCKS stripe for key.hash() before any lock-file logic, and that table is
             // static, so four distinct FileTokenStore instances on one identity are serialized whatever the
             // file lock does - the first reclaims the abandoned lock, and each of the rest finds the path free
             // and creates its own. The genuinely concurrent capture race is
@@ -369,6 +373,61 @@ public class FileTokenStoreTest {
             Assert.assertFalse("the abandoned lock must be gone - one stealer captures it and drops it, and a "
                     + "loser must not restore what it never captured", Files.exists(lock));
             assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
+    public void testProcessLocksDoNotGrowWithTheIdentityCount() throws Exception {
+        assertMemoryLeak(() -> {
+            // TokenStoreKey is public and inLock() is public API, so a process mints as many identities as its
+            // caller needs - one per end user in a multi-tenant service. The ConcurrentHashMap<String,
+            // ReentrantLock> this replaced rooted a 64-char hash plus a lock for each of them, permanently:
+            // nothing removed an entry, and the comment claiming it was "bounded by identity count (a
+            // handful)" was a statement about the expected caller, not about the data structure.
+            Field field = FileTokenStore.class.getDeclaredField("PROCESS_LOCKS");
+            field.setAccessible(true);
+            Object before = field.get(null);
+            Assert.assertTrue("the in-process locks must be a FIXED table, not a per-identity map: " + before,
+                    before instanceof ReentrantLock[]);
+            final int stripes = ((ReentrantLock[]) before).length;
+
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
+            AtomicInteger ran = new AtomicInteger();
+            // far more identities than stripes, so a map-backed implementation would visibly outgrow the table
+            for (int i = 0; i < 500; i++) {
+                TokenStoreKey key = new TokenStoreKey("client-" + i, "https://idp.example.com:443/token",
+                        "https://idp.example.com:443/device", "openid", null, false);
+                Assert.assertTrue(store.inLock(key, () -> {
+                    ran.incrementAndGet();
+                    return true;
+                }));
+            }
+            Assert.assertEquals("every identity must still have run its critical section", 500, ran.get());
+
+            Object after = field.get(null);
+            Assert.assertSame("the stripe table must not be rebuilt", before, after);
+            Assert.assertEquals("the stripe table must not grow with the identity count",
+                    stripes, ((ReentrantLock[]) after).length);
+            // and it must be usable, not merely present: a fresh identity still serializes
+            Assert.assertTrue(store.inLock(sampleKey(), () -> true));
+
+            // The index must actually spread. Nothing about correctness rests on it - landing every identity
+            // on one stripe still serializes same-identity pairs, which is all the lock owes anyone - but it
+            // would quietly serialize every unrelated identity in the process behind one another's refresh
+            // round trips, so a broken mask (an & 0, a constant) is worth catching here rather than in
+            // production latency.
+            Method processLockFor = FileTokenStore.class.getDeclaredMethod("processLockFor", TokenStoreKey.class);
+            processLockFor.setAccessible(true);
+            Set<ReentrantLock> distinct = new HashSet<>();
+            for (int i = 0; i < 500; i++) {
+                distinct.add((ReentrantLock) processLockFor.invoke(null,
+                        new TokenStoreKey("client-" + i, "https://idp.example.com:443/token",
+                                "https://idp.example.com:443/device", "openid", null, false)));
+            }
+            Assert.assertTrue("500 identities must not all collide onto one stripe (got " + distinct.size()
+                    + " of " + stripes + ")", distinct.size() > stripes / 2);
         });
     }
 
@@ -478,8 +537,8 @@ public class FileTokenStoreTest {
             Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
 
             // Two threads of the SAME JVM contend for the one abandoned lock. SCOPE NOTE: the mutual exclusion
-            // asserted below (overlaps==0, maxInside==1) is provided by the in-process PROCESS_LOCKS
-            // ReentrantLock, which inLock() takes on key.hash() BEFORE any file-lock logic - so it would hold
+            // asserted below (overlaps==0, maxInside==1) is provided by the in-process PROCESS_LOCKS stripe,
+            // which inLock() takes for key.hash() BEFORE any file-lock logic - so it would hold
             // even if the file-lock steal were broken. What this test genuinely proves is that two same-process
             // contenders each steal the stale lock and run their critical section (ran==2), serialized, without
             // leaving an orphaned capture temp (assertNoCaptureTempFiles). The CROSS-process capture-verify in
@@ -881,6 +940,46 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testInLockHonoursItsAcquireBudgetBehindALivePeerLock() throws Exception {
+        assertMemoryLeak(() -> {
+            // The budget is a PROMISE to the caller: inLock waits at most lockAcquireBudgetMillis for a peer's
+            // lock and then runs the critical section lock-free, because getToken() reaches this on an ILP
+            // producer's flush path. Anything blocking added inside the acquire breaks that promise silently -
+            // as ManagementFactory.getRuntimeMXBean().getName() did in the owner stamp, resolving the local
+            // hostname (InetAddress.getLocalHost()) for 3.2s inside a 200ms budget, once per JVM, on the first
+            // credential refresh. That one was caught end-to-end by
+            // OidcDeviceAuthPersistenceTest.testGetTokenDegradesWhenStoreLockHeld; this pins the same bound
+            // directly on the store, where such a call would live.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir, 200, 600_000);
+            TokenStoreKey key = sampleKey();
+            // a live peer's stamped lock: neither the empty-lock grace nor the staleness steal applies, so the
+            // acquire can only poll it out and degrade
+            Files.write(lockFile(dir, key), "live-peer-nonce".getBytes(StandardCharsets.UTF_8));
+
+            AtomicBoolean ran = new AtomicBoolean();
+            long start = System.nanoTime();
+            boolean result = store.inLock(key, () -> {
+                ran.set(true);
+                return true;
+            });
+            long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+
+            Assert.assertTrue("a peer's lock must not stop the critical section, only unserialize it", ran.get());
+            Assert.assertTrue(result);
+            Assert.assertTrue("the whole budget must be spent polling, was " + elapsedMillis + "ms",
+                    elapsedMillis >= 200);
+            // Generous, because this is a wall-clock bound on a shared machine: it must ride out a GC pause or
+            // a scheduling hiccup, while still failing on the kind of multi-second blocking call it exists to
+            // keep out of the acquire.
+            Assert.assertTrue("the acquire must degrade on its budget, not stall, was " + elapsedMillis + "ms",
+                    elapsedMillis < 2_000);
+            Assert.assertTrue("the peer's live lock must be left alone", Files.exists(lockFile(dir, key)));
+        });
+    }
+
+    @Test
     public void testInLockPreservesACarriedInterruptFlag() throws Exception {
         assertMemoryLeak(() -> {
             FileTokenStore store = new FileTokenStore(storeDir());
@@ -1275,8 +1374,8 @@ public class FileTokenStoreTest {
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
             Path lock = lockFile(dir, key);
-            // the lock file is created owner-only too: it briefly records pid@host and sits beside the 0600
-            // token file, so it must not widen the directory's exposure. Assert while the lock is held; inLock
+            // the lock file is created owner-only too: it briefly records an owner stamp and sits beside the
+            // 0600 token file, so it must not widen the directory's exposure. Assert while the lock is held; inLock
             // deletes it on return and propagates a thrown AssertionError after releasing it.
             store.inLock(key, () -> {
                 try {
