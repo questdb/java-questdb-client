@@ -740,13 +740,24 @@ public final class FileTokenStore implements TokenStore {
         throw lastDenied;
     }
 
-    private static void restrictToOwner(Path directory) {
-        // best-effort: the at-rest protection of the plaintext token files is exactly these owner-only
-        // directory permissions, so re-tighten a pre-existing directory another tool/umask left loose rather
-        // than trust whatever it had. ensureDirectory runs this on every save and every inLock, so only chmod
-        // on detected drift - skip the write syscall in the common case where the permissions already match. On
-        // a non-POSIX filesystem (Windows) this is unsupported and falls back to the directory's existing ACL
-        // (owner-only hardening there, via AclFileAttributeView, is a separate follow-up)
+    /**
+     * Re-asserts owner-only permissions on the store directory. The at-rest protection of the plaintext token
+     * files is exactly these permissions, so a pre-existing directory another tool or a permissive umask left
+     * loose is tightened rather than trusted as it stands. ensureDirectory runs this on every save and every
+     * inLock, so it chmods only on detected drift - the common case costs one stat and no write syscall.
+     * <p>
+     * NOT best-effort on the failure that matters. An {@code IOException} here means the directory is not ours
+     * to chmod, which is precisely the state in which the documented {@code 0700} protection does not hold and
+     * another local user can create, replace or delete entries in it. Swallowing it left every caller believing
+     * the protection applied. Callers degrade on the throw, each in the way that suits it: {@code save} refuses
+     * to write a plaintext refresh token into a directory it cannot protect, {@code inLock} runs lock-free.
+     * On a non-POSIX filesystem (Windows) the check is unavailable rather than failed, so it falls back to the
+     * inherited ACL as before (owner-only hardening there, via AclFileAttributeView, is a separate follow-up).
+     *
+     * @param directory the store directory, which must already exist
+     * @throws IOException if the directory exists but its permissions cannot be read or set
+     */
+    private static void restrictToOwner(Path directory) throws IOException {
         try {
             if (!DIR_PERMS.equals(Files.getPosixFilePermissions(directory))) {
                 Files.setPosixFilePermissions(directory, DIR_PERMS);
@@ -754,8 +765,6 @@ public final class FileTokenStore implements TokenStore {
         } catch (UnsupportedOperationException e) {
             // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
             warnNoPosixPermsOnce();
-        } catch (IOException ignore) {
-            // the directory is not ours to inspect/chmod: keep the existing permissions
         }
     }
 
@@ -878,19 +887,22 @@ public final class FileTokenStore implements TokenStore {
     }
 
     private void ensureDirectory() throws IOException {
-        if (Files.isDirectory(directory)) {
-            // re-assert owner-only permissions on a pre-existing directory: createDirectories applies
-            // DIR_ATTRS only when it creates the directory, so one left world/group-accessible by another
-            // tool, a permissive umask, or a hostile local pre-create would otherwise expose the token files
-            restrictToOwner(directory);
-            return;
+        if (!Files.isDirectory(directory)) {
+            try {
+                Files.createDirectories(directory, DIR_ATTRS);
+            } catch (UnsupportedOperationException e) {
+                warnNoPosixPermsOnce();
+                Files.createDirectories(directory);
+            }
         }
-        try {
-            Files.createDirectories(directory, DIR_ATTRS);
-        } catch (UnsupportedOperationException e) {
-            warnNoPosixPermsOnce();
-            Files.createDirectories(directory);
-        }
+        // Verify UNCONDITIONALLY, including immediately after our own create, rather than only on the
+        // pre-existing branch. createDirectories is a no-op when the directory already exists, and it applies
+        // DIR_ATTRS only to directories it actually creates - so a peer that won the race between the
+        // isDirectory check above and the call keeps whatever permissions IT chose, and "we called
+        // createDirectories" is not evidence the directory is ours. That window is exactly the hostile
+        // local pre-create this method exists to defeat. Re-asserting here also covers ordinary drift on a
+        // pre-existing directory (another tool, a permissive umask), which is what the old branch handled.
+        restrictToOwner(directory);
     }
 
     private boolean isOlderThan(Path lock, long thresholdMillis) {
