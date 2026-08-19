@@ -1196,6 +1196,29 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (fileRefreshToken == null) {
                 return false; // nothing usable in this entry at all
             }
+            if (token.getAccessToken() == null && token.getIdToken() == null) {
+                // NEITHER kind present, only a refresh token. That is not the legitimate shape above - it is
+                // positive evidence the entry was not written by this client, so reject the whole thing for
+                // the same reason the tampered-served-token branch below does.
+                //
+                // No grant this client stores can produce it. The device path reaches storeTokens only behind
+                // "accessToken.length() > 0 || idToken.length() > 0", the refresh path only behind a non-blank
+                // served kind, and persistIfRotated runs solely at the tail of storeTokens - so every entry we
+                // write carries at least one token kind. A file with a refresh token and nothing else came
+                // from somewhere else.
+                //
+                // Left adopted, it is the cheapest credential swap there is: an attacker who can WRITE the
+                // store directory - never needing to read our 0600 file - drops in a file whose fingerprint
+                // fields are all derivable from public config, and the next silent refresh presents THEIR
+                // refresh token. The client then ingests and queries as them, with no prompt, no error, and
+                // nothing in any log recording that the identity changed. Unlike a directory-permission check
+                // this holds on every filesystem, Windows included, where owner-only permissions cannot be
+                // enforced at all.
+                //
+                // The cost when it fires on an honest file is one interactive sign-in. design/oidc-token-
+                // persistence.md states the rule for cross-language writers.
+                return false;
+            }
             accessToken = null;
             idToken = null;
             refreshToken = fileRefreshToken;

@@ -330,6 +330,41 @@ public class OidcDeviceAuthPersistenceTest {
         Assert.assertTrue("the default inLock must return the action's result", result);
     }
 
+    @Test
+    public void testEntryWithNoTokenOfEitherKindIsNotAdopted() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicBoolean sawPlantedRefreshToken = new AtomicBoolean();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                if (body != null && body.contains("REFRESH-PLANTED")) {
+                    sawPlantedRefreshToken.set(true);
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // The cheapest credential swap there is: an entry carrying ONLY a refresh token. Every entry
+                // this client writes carries at least one token kind, so this shape came from somewhere else -
+                // an attacker who can WRITE the store directory, without ever reading our 0600 file. Adopted,
+                // the next silent refresh would present THEIR refresh token and the client would resume as
+                // them, with no prompt and nothing in any log recording the change of identity.
+                fake.loadReturns = new PersistedToken(null, null, "REFRESH-PLANTED",
+                        System.currentTimeMillis() + 300_000, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("ACCESS-FRESH", auth.signIn());
+                }
+                Assert.assertFalse("the planted refresh token must never reach the token endpoint",
+                        sawPlantedRefreshToken.get());
+                Assert.assertTrue("a rejected entry must fall back to the device flow, not to a silent refresh",
+                        device.get() >= 1);
+            }
+        });
+    }
+
     @Test(timeout = 30_000)
     public void testGetTokenAsFirstCallAfterRestore() throws Exception {
         assertMemoryLeak(() -> {

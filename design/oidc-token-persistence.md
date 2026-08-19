@@ -398,6 +398,17 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
   anywhere (for example a top-level `[ {…} ]` wrapper) or a non-object root - rather than
   extract fields from a malformed structure. The Python client MUST do the same.
 
+  At least one of `access_token` / `id_token` MUST be present. A writer MUST NOT persist an
+  entry carrying only a `refresh_token`, and a reader MUST reject one - the whole entry,
+  refresh token included. No conforming grant produces that shape (RFC 6749 5.1 requires
+  `access_token` in a token response, and a client stores an entry only after a grant it could
+  serve), so a file in that shape was not written by a conforming client. Adopting it is a
+  silent credential swap: an attacker who can write the store directory - without ever reading
+  the 0600 file - plants an entry whose fingerprint fields are all derivable from public
+  config, and the reader's next silent refresh presents the attacker's refresh token and
+  resumes as them, with no prompt and no log line recording the change of identity. The cost
+  of the rule when it fires on an honest file is one interactive sign-in.
+
   The numeric fields (`v`, `expires_at_millis`, `token_ttl_millis`) are **plain JSON integers**:
   an optional leading `-` followed by bare digits. A reader MUST NOT accept its own language's
   numeric extensions here — QuestDB's `Numbers.parseLong` would otherwise take `1_000` and `5L`,
