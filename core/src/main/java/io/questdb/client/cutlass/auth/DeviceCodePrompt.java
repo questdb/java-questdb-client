@@ -66,6 +66,14 @@ public interface DeviceCodePrompt {
      * non-http(s) URL, and never prevents sign-in. Intended for a local terminal; on a remote or
      * headless host the printed URL and code remain the way in. This is the default prompt when none
      * is configured.
+     * <p>
+     * {@code io.questdb.client} declares {@code requires static java.desktop}, so the module is a
+     * compile-time dependency only and its absence at run time is just another reason to skip the
+     * browser. One consequence is worth knowing: a static requires is not followed during module
+     * resolution, so an application that runs this client as an EXPLICIT module gets the browser launch
+     * only when {@code java.desktop} is in its module graph anyway - because it requires it, or because
+     * the launch adds it ({@code --add-modules java.desktop}). Class-path applications are unaffected,
+     * {@code java.desktop} being resolved by default there.
      *
      * @return a prompt that prints the challenge and opens the verification URL in a browser
      */
