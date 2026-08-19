@@ -1269,19 +1269,25 @@ public class OidcDeviceAuth implements QuietCloseable {
         // (LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x in total, the same figure the FileTokenStore lock-stale floor is
         // derived from), so a peer that waited only one httpTimeoutMillis would fail every concurrent caller
         // behind a refresh that is going to succeed.
-        final long deadline = System.currentTimeMillis()
-                + (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
+        // nanoTime, not currentTimeMillis: this bound is an ELAPSED budget on the producer thread, and the
+        // wall clock is adjustable. An NTP step or an operator setting the date back stretches a millis-based
+        // deadline by the size of the jump, so the flush path this exists to protect would stall for however
+        // long the clock moved rather than the documented multiple of httpTimeoutMillis. The body reads
+        // (discardBody, parseBody) and the device-code poll already bound themselves this way. Compare by
+        // DIFFERENCE rather than by ordering, so the arithmetic stays correct across nanoTime's wraparound.
+        final long deadlineNanos = System.nanoTime()
+                + (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis * 1_000_000L;
         while (true) {
             throwIfClosed();
             if (interactiveSignInInProgress) {
                 throw new OidcAuthException("an interactive sign-in is in progress on another thread; no token is available without blocking - retry once it completes");
             }
-            final long remaining = deadline - System.currentTimeMillis();
-            if (remaining <= 0) {
+            final long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
                 throw new OidcAuthException("a token refresh is already in progress on another thread and no token became available in time; retry shortly");
             }
             try {
-                if (lock.tryLock(Math.min(remaining, GET_TOKEN_LOCK_POLL_SLICE_MILLIS), TimeUnit.MILLISECONDS)) {
+                if (lock.tryLock(Math.min(remainingNanos, GET_TOKEN_LOCK_POLL_SLICE_MILLIS * 1_000_000L), TimeUnit.NANOSECONDS)) {
                     return;
                 }
             } catch (InterruptedException e) {

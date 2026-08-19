@@ -939,7 +939,13 @@ public final class FileTokenStore implements TokenStore {
         // within the budget. releaseLock uses the nonce to verify ownership before deleting, so a hold that
         // outran lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
         final String nonce = newLockNonce();
-        final long deadline = System.currentTimeMillis() + lockAcquireBudgetMillis;
+        // nanoTime, not currentTimeMillis: this is an elapsed budget, and the wall clock is adjustable. An
+        // NTP step or an operator setting the date back stretches a millis-based deadline by the size of the
+        // jump, so a caller that documents a bounded degrade - inLock() promises to fall back to a lock-free
+        // refresh after lockAcquireBudgetMillis - would sit here for however long the clock moved instead.
+        // nanoTime is monotonic and immune to that. Compare by DIFFERENCE rather than by ordering, so the
+        // arithmetic stays correct across nanoTime's wraparound.
+        final long deadlineNanos = System.nanoTime() + lockAcquireBudgetMillis * 1_000_000L;
         while (true) {
             try {
                 // exclusive-create then stamp on the same open channel: the empty-file window between the two is
@@ -953,7 +959,7 @@ public final class FileTokenStore implements TokenStore {
                 // through to the bounded wait below rather than retry immediately: a steal contest between
                 // several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin.
                 stealIfStale(lock);
-                if (System.currentTimeMillis() >= deadline) {
+                if (System.nanoTime() - deadlineNanos >= 0) {
                     return null; // give up and run without the lock rather than stall a sign-in
                 }
                 // Thread.sleep, not Os.sleep: Os.sleep catches InterruptedException and keeps sleeping to its
