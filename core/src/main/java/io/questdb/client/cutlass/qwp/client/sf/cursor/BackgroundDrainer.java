@@ -99,11 +99,15 @@ public final class BackgroundDrainer implements Runnable {
      * ({@link CursorWebSocketSendLoop.ReconnectFactory#hasDynamicCredential()}). Against a constant
      * credential a rejection stays terminal on the first sweep, as it always was.
      * <p>
-     * The attempt threshold is necessary but not sufficient: the rejection must also persist for at
-     * least {@code reconnectMaxDurationMillis}, measured from the first rejection. This wall-clock floor
-     * gives IdP signing-key and resource-server JWKS caches time to converge even when capped backoff can
-     * accumulate six attempts in only a few seconds. A credential that stays rejected still reaches a
-     * human after both thresholds are met rather than pinning the slot and a drainer-pool worker forever.
+     * The attempt threshold is necessary but not sufficient: the rejection must also PERSIST for at least
+     * the dwell returned by {@link #dynamicCredentialAuthDwellNanos(long)} - {@code
+     * reconnectMaxDurationMillis}, clamped so an unbounded configuration cannot disable the escalation -
+     * measured from the first rejection of the current uninterrupted run. A transient in between (role
+     * reject, transport, credential-unavailable) restarts that measurement, because time the drainer spent
+     * unable to reach anyone is not time the credential spent rejected. This wall-clock floor gives IdP
+     * signing-key and resource-server JWKS caches time to converge even when capped backoff can accumulate
+     * six attempts in only a few seconds. A credential that stays rejected still reaches a human after both
+     * thresholds are met rather than pinning the slot and a drainer-pool worker forever.
      * Note it cannot repair a PERSISTENT clock skew: the provider keeps serving the same cached token, so
      * those sweeps eventually exhaust both thresholds and quarantine, which is the right end state for a
      * condition that is not healing.
@@ -363,10 +367,19 @@ public final class BackgroundDrainer implements Runnable {
         // fresh consecutive run before quarantine is permitted.
         int capabilityGapAttempts = 0;
         // 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
-        // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Never reset: unlike the capability-gap episode
-        // this threshold is per-drain, not per-episode, so a credential that alternates
-        // rejected/unreachable cannot refill it indefinitely and stall the quarantine that an operator
-        // needs to see.
+        // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Not reset by the transient arms below, so a
+        // credential alternating rejected/unreachable inside ONE connect attempt cannot refill it and
+        // stall the quarantine an operator needs to see - unlike the capability-gap episode, and unlike
+        // the dwell anchor beside it, which does restart because it measures persistence rather than
+        // count.
+        //
+        // It is a local, though, not per-DRAIN: a mid-drain terminal recycles the wire and re-enters
+        // connectWithDurableAckRetry(), which starts it at zero again. So a credential that is accepted at
+        // connect and only rejected mid-drain, repeatedly, defers the escalation indefinitely. That is the
+        // tolerable direction - the slot keeps its replayable rows and no .failed sentinel is dropped on a
+        // fault that may still heal - and it is the same off-by-one the capability-gap recycle carries.
+        // Making it per-drain means hoisting it to a field, which quarantines such a slot sooner; that is a
+        // behaviour change, not a comment fix, so it is deliberately not made here.
         int dynamicCredentialAuthAttempts = 0;
         // The rotating-auth wall-clock floor is anchored at the first 401/403 of the CURRENT run of
         // rejections: a transient class in between (role reject, transport, credential-unavailable) restarts
