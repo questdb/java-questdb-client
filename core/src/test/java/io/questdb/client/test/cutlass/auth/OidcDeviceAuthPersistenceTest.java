@@ -552,13 +552,28 @@ public class OidcDeviceAuthPersistenceTest {
                         new PersistedToken("OLD-ACCESS", null, "REFRESH-1", System.currentTimeMillis() - 60_000, 300_000));
                 // a peer holds the per-identity lock: getToken() must wait out only its short acquire budget,
                 // then degrade to a lock-free refresh rather than stall the flush path or fail
-                Files.createFile(dir.resolve(keyFor(server).hash() + ".lock"));
-                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(new FileTokenStore(dir, 200, 600_000)).build()) {
+                final int acquireBudgetMillis = 200;
+                Path lock = dir.resolve(keyFor(server).hash() + ".lock");
+                Files.createFile(lock);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(
+                        new FileTokenStore(dir, acquireBudgetMillis, 600_000)).build()) {
                     long start = System.currentTimeMillis();
                     Assert.assertEquals("ACCESS-2", auth.getToken());
                     long elapsed = System.currentTimeMillis() - start;
-                    Assert.assertTrue("getToken must degrade promptly, not stall, was " + elapsed, elapsed < 10_000);
+                    // Bounded on BOTH sides, because one side alone cannot tell a degrade from an acquire.
+                    // Below: the whole acquire budget must have been spent polling for a lock this call never
+                    // gets - a run that skipped the wait (or took the lock) returns in single-digit millis.
+                    // The peer's lock is empty, so only the 5s EMPTY_LOCK_STEAL_GRACE_MILLIS governs a steal,
+                    // and a 200ms budget cannot reach it: the wait is deterministic, not racy.
+                    Assert.assertTrue("getToken must wait out the acquire budget before degrading, was " + elapsed,
+                            elapsed >= acquireBudgetMillis);
+                    // Above: budget + one loopback refresh, with a wide margin. The old bound was 10s, which
+                    // a regression to the 3s DEFAULT acquire budget would have sailed through.
+                    Assert.assertTrue("getToken must degrade promptly, not stall, was " + elapsed, elapsed < 2_000);
                 }
+                // the definitive degrade-vs-acquire evidence: had getToken() acquired (or stolen) the lock, it
+                // would have deleted the file on release
+                Assert.assertTrue("the peer's lock must be left exactly where it was", Files.exists(lock));
                 Assert.assertEquals("device flow must not run; getToken degrades to a lock-free refresh", 0, device.get());
                 Assert.assertTrue("the refresh must hit the token endpoint", token.get() >= 1);
             }

@@ -67,10 +67,10 @@ import static org.junit.Assert.fail;
  * the dead engine.
  *
  * <p>The test injects an NPE into {@code ring.close()} by reflectively
- * setting the engine's {@code ring} field to {@code null}. The current
- * code propagates the NPE before reaching slotLock cleanup. After the
- * fix (wrap the close steps in try/finally so slotLock.close() always
- * runs), the slot is releasable by a fresh sender and the test goes green.
+ * setting the engine's {@code ring} field to {@code null}. A close that
+ * propagates that NPE before reaching slotLock cleanup is the regression
+ * this pins; the close steps run under try/finally so slotLock.close()
+ * always runs, which is what leaves the slot releasable by a fresh sender.
  *
  * <p>The end-to-end signal is "can a fresh {@code SlotLock.acquire} on
  * the same slot dir succeed?" — the user-visible consequence of a leaked

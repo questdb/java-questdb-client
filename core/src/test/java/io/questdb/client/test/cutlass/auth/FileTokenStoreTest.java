@@ -37,14 +37,22 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
@@ -54,6 +62,27 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
+/**
+ * Coverage for {@link FileTokenStore}.
+ * <p>
+ * PLATFORM SCOPE. CI runs Linux only, so the store's Windows-motivated arms are covered here to the extent a
+ * POSIX host can reach them, and no further:
+ * <ul>
+ *     <li>the {@code AccessDeniedException} retry in {@code replaceTarget} - the sharing violation a Windows
+ *     reader holding the target open produces - IS exercised, by denying the rename with directory
+ *     permissions instead (testReplaceTargetRetriesADeniedRenameThenSucceeds and its give-up sibling). Those
+ *     two skip when the process is root, which bypasses the permission bits they rely on;</li>
+ *     <li>the {@code UnsupportedOperationException} fallbacks around {@code FILE_ATTRS}/{@code DIR_ATTRS}
+ *     ({@code createTempFile}, {@code createLockFile}, {@code ensureDirectory}, {@code restrictToOwner}) are
+ *     NOT exercised. They fire only where the filesystem cannot carry POSIX permissions, which a POSIX host
+ *     cannot produce without a synthetic {@code FileSystemProvider}; the suite has no such fixture and none
+ *     of these tests reach them;</li>
+ *     <li>the {@code AtomicMoveNotSupportedException} fallback in {@code replaceTarget} is likewise
+ *     unreachable here - every filesystem these tests run on supports an atomic rename.</li>
+ * </ul>
+ * Closing the last two needs a Windows CI agent, or a filesystem-provider fixture that reports neither POSIX
+ * attributes nor atomic moves.
+ */
 public class FileTokenStoreTest {
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
@@ -230,20 +259,34 @@ public class FileTokenStoreTest {
             Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
             Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
 
-            // several "processes" race to steal the one abandoned lock. This exercises the steal path under
-            // N-way contention and asserts it degrades CLEANLY: every contender eventually runs its critical
-            // section (none is starved or wedged) and no atomic-capture temp file leaks. It deliberately does
-            // NOT assert strict mutual exclusion. stealIfStale is best-effort by design and documents a
-            // three-actor residual - a peer recreating the lock in the isStale->capture gap while a second
-            // captures that fresh live lock and a third claims the momentarily-free path, all at once - under
-            // which two holders can briefly run concurrently. That residual needs three or more contenders and
-            // degrades only to one extra token refresh (a re-prompt on a rotating-refresh-token IdP), never a
-            // torn or forged credential, since the Layer-1 atomic-rename write is independent of the lock.
+            // Several "processes" run the FULL inLock path against the one abandoned lock, and it must
+            // degrade CLEANLY: every contender runs its critical section (none is starved or wedged), each
+            // under a lock it actually holds, and no atomic-capture temp file leaks.
+            //
+            // SCOPE NOTE: these four contenders do NOT race at the file-lock layer. inLock() takes the
+            // in-process PROCESS_LOCKS ReentrantLock on key.hash() before any lock-file logic, and that map is
+            // static, so four distinct FileTokenStore instances on one identity are serialized whatever the
+            // file lock does - the first reclaims the abandoned lock, and each of the rest finds the path free
+            // and creates its own. The genuinely concurrent capture race is
+            // testConcurrentStealersLeaveExactlyOneWinner, which drives stealIfStale directly because that is
+            // the only way to reach it inside one JVM.
+            //
+            // It deliberately does NOT assert strict mutual exclusion. stealIfStale is best-effort by design
+            // and documents a three-actor residual - a peer recreating the lock in the isStale->capture gap
+            // while a second captures that fresh live lock and a third claims the momentarily-free path, all
+            // at once - under which two holders can briefly run concurrently. That residual needs three or
+            // more contenders and degrades only to one extra token refresh (a re-prompt on a
+            // rotating-refresh-token IdP), never a torn or forged credential, since the Layer-1 atomic-rename
+            // write is independent of the lock.
             // testSameProcessContendersSerializeAndBothStealStaleLock covers the two-contender same-JVM case
             // (where PROCESS_LOCKS, not the file-lock capture, provides the exclusion it asserts).
             final int threads = 4;
             AtomicInteger ran = new AtomicInteger();
+            // the stamp on the lock file while each contender runs, so the assertions below can tell an
+            // acquisition apart from a no-op
+            List<String> stampWhileRunning = Collections.synchronizedList(new ArrayList<>());
             TokenStore.CriticalSection section = () -> {
+                stampWhileRunning.add(readLockStamp(lock));
                 Os.sleep(100);
                 ran.incrementAndGet();
                 return true;
@@ -263,7 +306,163 @@ public class FileTokenStoreTest {
             }
 
             Assert.assertEquals("every contender must run its critical section", threads, ran.get());
+            // Teeth the run count alone does not have: threads==ran holds even with the whole acquire deleted,
+            // since inLock() runs the section lock-free when it cannot get a lock. A contender that never
+            // acquired would have run with the crashed holder's stamp still in place (or with no lock file at
+            // all), so require a live stamp - one that is neither absent nor the crashed holder's - under
+            // every critical section.
+            Assert.assertEquals(threads, stampWhileRunning.size());
+            for (String stamp : stampWhileRunning) {
+                Assert.assertNotNull("a contender ran with no lock file at all, so it never acquired one", stamp);
+                Assert.assertNotEquals("a contender ran while the crashed holder's lock was still in place",
+                        "crashed-holder-stamp", stamp);
+            }
+            Assert.assertFalse("the last holder must have released its lock", Files.exists(lock));
             assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
+    public void testConcurrentStealersLeaveExactlyOneWinner() throws Exception {
+        assertMemoryLeak(() -> {
+            // The capture race stealIfStale is written for: several stealers judge the same abandoned lock
+            // stale at once, exactly one wins the ATOMIC_MOVE capture and drops it, and the losers take the
+            // NoSuchFileException arm and fall back to the wait rather than deleting anything. inLock() cannot
+            // reach this race inside one JVM - PROCESS_LOCKS serializes same-identity threads ahead of every
+            // lock-file syscall - so drive the steal itself. Reflection is the seam: the test tree is a
+            // separate io.questdb.client.test.* package with its own module-info, so package-private access
+            // is structurally unavailable.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
+
+            Method stealIfStale = FileTokenStore.class.getDeclaredMethod("stealIfStale", Path.class);
+            stealIfStale.setAccessible(true);
+
+            final int stealers = 8;
+            CyclicBarrier start = new CyclicBarrier(stealers);
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread[] ts = new Thread[stealers];
+            for (int i = 0; i < stealers; i++) {
+                // one store per "process", as in the sibling test
+                FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
+                ts[i] = new Thread(() -> {
+                    try {
+                        start.await(10, TimeUnit.SECONDS);
+                        stealIfStale.invoke(store, lock);
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                }, "steal-contender");
+            }
+            for (Thread t : ts) {
+                t.start();
+            }
+            for (Thread t : ts) {
+                t.join();
+            }
+
+            Assert.assertNull("a stealer failed outright: " + failure.get(), failure.get());
+            Assert.assertFalse("the abandoned lock must be gone - one stealer captures it and drops it, and a "
+                    + "loser must not restore what it never captured", Files.exists(lock));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
+    public void testReplaceTargetGivesUpAfterTheRetryBudget() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to deny the rename",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Assume.assumeFalse("a root process bypasses the directory permissions this denial relies on",
+                "root".equals(System.getProperty("user.name")));
+        assertMemoryLeak(() -> {
+            // The other half of the Windows sharing-violation arm: a denial that never clears must surface,
+            // not be retried forever or swallowed. save() turns the throw into its best-effort degrade.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
+            Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
+
+            Method replaceTarget = FileTokenStore.class.getDeclaredMethod("replaceTarget", Path.class, Path.class);
+            replaceTarget.setAccessible(true);
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
+            try {
+                long start = System.currentTimeMillis();
+                try {
+                    replaceTarget.invoke(null, tmp, target);
+                    Assert.fail("a rename denied on every attempt must be reported, not swallowed");
+                } catch (InvocationTargetException e) {
+                    Assert.assertTrue("the LAST denial must be the one rethrown, was: " + e.getCause(),
+                            e.getCause() instanceof AccessDeniedException);
+                }
+                // 5 attempts means 4 backoff sleeps of 20ms; a shape that gave up on the first denial
+                // (the pre-retry behaviour, and what Windows would routinely trip over) returns at once
+                long elapsed = System.currentTimeMillis() - start;
+                Assert.assertTrue("it must have spent the whole retry budget, took " + elapsed + "ms",
+                        elapsed >= 80);
+            } finally {
+                // restore, or the temp-folder rule cannot delete the tree
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+            }
+            Assert.assertEquals("a failed replace must leave the previous entry intact",
+                    "OLD", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+        });
+    }
+
+    @Test
+    public void testReplaceTargetRetriesADeniedRenameThenSucceeds() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to deny the rename",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Assume.assumeFalse("a root process bypasses the directory permissions this denial relies on",
+                "root".equals(System.getProperty("user.name")));
+        assertMemoryLeak(() -> {
+            // replaceTarget retries a denied rename because on WINDOWS a concurrent reader holding the target
+            // open makes the atomic replace fail transiently with AccessDeniedException. CI is Linux-only, so
+            // the denial is produced the one way a POSIX host can: rename(2) needs write permission on the
+            // containing directory, so taking it away denies the move exactly as the sharing violation does,
+            // and restoring it mid-retry stands in for the Windows reader closing its handle.
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
+            Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
+
+            Method replaceTarget = FileTokenStore.class.getDeclaredMethod("replaceTarget", Path.class, Path.class);
+            replaceTarget.setAccessible(true);
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
+            // Prove the denial is real on THIS host before the test rests on it. Without this the whole test
+            // passes vacuously wherever the mode bits do not bite - the first attempt inside replaceTarget
+            // simply succeeds and no retry is ever exercised.
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                Assert.fail("the rename must be denied while the store directory is not writable");
+            } catch (AccessDeniedException expected) {
+                // exactly what a Windows sharing violation produces, and what the retry loop is written for
+            }
+            Thread reopener = new Thread(() -> {
+                // after the first backoff (20ms) but well inside the 5-attempt budget
+                Os.sleep(30);
+                try {
+                    Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+                } catch (IOException e) {
+                    throw new AssertionError("could not restore the directory permissions", e);
+                }
+            }, "denial-clearer");
+            reopener.setDaemon(true);
+            reopener.start();
+            try {
+                replaceTarget.invoke(null, tmp, target);
+            } finally {
+                reopener.join(10_000);
+                // whatever happened above, leave the tree deletable
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+            }
+
+            Assert.assertEquals("the retry must complete the replace once the denial clears",
+                    "NEW", new String(Files.readAllBytes(target), StandardCharsets.UTF_8));
+            Assert.assertFalse("an atomic move consumes the temp file", Files.exists(tmp));
         });
     }
 
@@ -1500,6 +1699,16 @@ public class FileTokenStoreTest {
 
     private Path lockFile(Path dir, TokenStoreKey key) {
         return dir.resolve(key.hash() + ".lock");
+    }
+
+    private String readLockStamp(Path lock) {
+        // the owner nonce a live holder stamped into the lock, or null when there is no lock file at all. An
+        // IO error here is a harness fault, so it fails loudly rather than reading as "no lock"
+        try {
+            return Files.exists(lock) ? new String(Files.readAllBytes(lock), StandardCharsets.UTF_8) : null;
+        } catch (IOException e) {
+            throw new AssertionError("could not read the lock stamp: " + lock, e);
+        }
     }
 
     private Path storeDir() {

@@ -310,7 +310,12 @@ public class BackgroundDrainerDurableAckRetryTest {
             ScriptedFactory factory = ScriptedFactory
                     .alwaysFailing(() -> new QwpAuthFailedException(401, "127.0.0.1", 9000))
                     .withDynamicCredential();
-            long authDwellFloorMillis = 25L;
+            // Far above what the six attempts cost on their own (six capped backoffs of 1-4ms, ~15ms
+            // total): at the 25ms this used to use, the assertion below cleared the floor with ~10ms of
+            // margin, so a machine that merely ran the attempts slowly satisfied it without the dwell being
+            // honoured at all. A quarter second is still a quarter second of test time, and an elapsed of
+            // ~15ms against it is unmistakable.
+            long authDwellFloorMillis = 250L;
             BackgroundDrainer drainer = newDrainerWithBudgets(
                     factory, authDwellFloorMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
             List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
@@ -666,11 +671,12 @@ public class BackgroundDrainerDurableAckRetryTest {
             // problem and stays terminal. This test uses a role reject (every
             // endpoint is a replica right now), which must NOT be terminal.
             //
-            // Red-first: connectWithDurableAckRetry() currently lumps role rejects in
-            // with the durable-ack-mismatch give-up, so after the 16-attempt cap /
-            // the budget it markFailed()s and returns -> the helper thread dies. Goes
-            // green once the drainer treats an all-replica window as retry-forever
-            // (split the catch: role reject -> retry; capability gap -> quarantine).
+            // The regression this pins: lumping role rejects in with the
+            // durable-ack-mismatch give-up. Under that shape the 16-attempt cap or
+            // the wall-clock budget markFailed()s and returns, so the helper thread
+            // started below dies inside the observation window. The drainer keeps the
+            // two apart - a role reject backs off and retries, a capability gap
+            // quarantines - which is what the still-alive assertions rest on.
             CountingListener listener = new CountingListener();
             AtomicInteger attempts = new AtomicInteger();
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
@@ -731,11 +737,12 @@ public class BackgroundDrainerDurableAckRetryTest {
             // (CursorWebSocketSendLoop.connectLoop: a transport error backs off and
             // retries), which the orphan drainer must match.
             //
-            // Red-first: connectWithDurableAckRetry() currently routes any non-role,
-            // non-durable-ack Throwable (including "all endpoints unreachable") to an
-            // IMMEDIATE markFailed / .failed sentinel on the first attempt. Green once
-            // transport errors are retried indefinitely like connectLoop. (Genuine
-            // terminals -- auth / non-421 upgrade -- must still fail fast.)
+            // The regression this pins: routing any non-role, non-durable-ack
+            // Throwable - "all endpoints unreachable" included - to an IMMEDIATE
+            // markFailed / .failed sentinel on the first attempt. The catch-all
+            // retries a transport failure indefinitely, exactly as connectLoop does;
+            // the genuine terminals (auth, non-421 upgrade, durable-ack capability
+            // gap) are caught ahead of it and still fail fast.
             CountingListener listener = new CountingListener();
             AtomicInteger attempts = new AtomicInteger();
             ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {

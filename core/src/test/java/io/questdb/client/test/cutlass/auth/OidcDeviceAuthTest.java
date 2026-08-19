@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -82,13 +83,8 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertEquals("access_denied", e.getOauthError());
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("the user declined"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "the user declined");
+                Assert.assertEquals("access_denied", e.getOauthError());
             }
         });
     }
@@ -145,12 +141,8 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an all-control verification_uri to be rejected as incomplete");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("incomplete"));
-                }
+                assertOidcFails(auth::signIn, "incomplete",
+                        "expected an all-control verification_uri to be rejected as incomplete");
             }
         });
     }
@@ -685,13 +677,8 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(400, "{\"error\":\"invalid_client\",\"error_description\":\"unknown client\"}");
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertEquals("invalid_client", e.getOauthError());
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unknown client"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "unknown client");
+                Assert.assertEquals("invalid_client", e.getOauthError());
             }
         });
     }
@@ -855,14 +842,10 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a malformed status code on the poll path to be rejected");
-                } catch (OidcAuthException e) {
-                    String msg = e.getMessage();
-                    Assert.assertTrue(msg, msg.contains("malformed HTTP status code"));
-                    Assert.assertFalse("raw ESC must not leak into the message: " + msg, msg.indexOf('\u001b') >= 0);
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "malformed HTTP status code",
+                        "expected a malformed status code on the poll path to be rejected");
+                String msg = e.getMessage();
+                Assert.assertFalse("raw ESC must not leak into the message: " + msg, msg.indexOf('\u001b') >= 0);
             }
         });
     }
@@ -928,14 +911,12 @@ public class OidcDeviceAuthTest {
                 };
                 try (MockOidcServer server = new MockOidcServer(handler)) {
                     serverRef.set(server);
-                    try {
-                        OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()).close();
-                        Assert.fail("a malformed status [" + statusToken + "] must not gate discovery open");
-                    } catch (OidcAuthException e) {
-                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("malformed HTTP status code"));
-                        Assert.assertFalse("the raw status must not be echoed: " + e.getMessage(),
-                                e.getMessage().indexOf('\u001b') >= 0);
-                    }
+                    OidcAuthException e = assertOidcFails(
+                            () -> OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()),
+                            "malformed HTTP status code",
+                            "a malformed status [" + statusToken + "] must not gate discovery open");
+                    Assert.assertFalse("the raw status must not be echoed: " + e.getMessage(),
+                            e.getMessage().indexOf('\u001b') >= 0);
                 }
             }
         });
@@ -960,13 +941,11 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure());
-                    Assert.fail("a 500 /settings body must not be trusted as OIDC configuration");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("did not return its settings"));
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus=500"));
-                }
+                OidcAuthException e = assertOidcFails(
+                        () -> OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()),
+                        "did not return its settings",
+                        "a 500 /settings body must not be trusted as OIDC configuration");
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus=500"));
             }
         });
     }
@@ -1027,12 +1006,8 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 serverRef.set(server);
-                try {
-                    OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure());
-                    Assert.fail("array-wrapped config must not be trusted as OIDC config");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("OIDC is not enabled"));
-                }
+                assertOidcFails(() -> OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure()),
+                        "OIDC is not enabled", "array-wrapped config must not be trusted as OIDC config");
             }
         });
     }
@@ -1165,24 +1140,27 @@ public class OidcDeviceAuthTest {
     public void testDiscoveryTransportFailureDoesNotLeakNativeMemory() throws Exception {
         // discoverSettings allocates a JSON lexer (NATIVE_TEXT_PARSER_RSS) and an HTTP client (NATIVE_DEFAULT
         // buffers) and frees both in a finally; a transport failure during discovery must not leak either.
-        // The module's assertMemoryLeak does not reliably flag single-tag growth, so measure both tags
-        // directly. Measuring only the parser tag (as an earlier version did) was blind to a leak of the
-        // HTTP client's native buffers - the resource most likely to be left dangling on the failure path.
-        int deadPort;
-        try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            deadPort = probe.getLocalPort();
-        } // closed now - nothing listens on deadPort
-        long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
-        long clientMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
-        try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, insecure())) {
-            Assert.fail("expected discovery to fail against a dead port");
-        } catch (OidcAuthException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not reach the QuestDB server"));
-        }
-        Assert.assertEquals("the discovery JSON lexer native buffer leaked",
-                parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
-        Assert.assertEquals("the discovery HTTP client native buffers leaked",
-                clientMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT));
+        // assertMemoryLeak covers EVERY tag - its LeakCheck asserts per-tag equality across the whole
+        // MemoryTag range, then total equality - so it is the outer guard here rather than something to work
+        // around. The two explicit tag assertions stay because they name the buffer that leaked, which a
+        // blanket "total native memory" mismatch does not.
+        assertMemoryLeak(() -> {
+            int deadPort;
+            try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+                deadPort = probe.getLocalPort();
+            } // closed now - nothing listens on deadPort
+            long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
+            long clientMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT);
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.fromQuestDB("http://127.0.0.1:" + deadPort, insecure())) {
+                Assert.fail("expected discovery to fail against a dead port");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not reach the QuestDB server"));
+            }
+            Assert.assertEquals("the discovery JSON lexer native buffer leaked",
+                    parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+            Assert.assertEquals("the discovery HTTP client native buffers leaked",
+                    clientMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_DEFAULT));
+        });
     }
 
     @Test(timeout = 30_000)
@@ -1356,15 +1334,10 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertEquals("access_denied", e.getOauthError());
-                    // the escapes are decoded, not shown literally
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("it\"s a / test"));
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("\\/"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "it\"s a / test");
+                Assert.assertEquals("access_denied", e.getOauthError());
+                // the escapes are decoded, not shown literally
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("\\/"));
             }
         });
     }
@@ -1693,15 +1666,11 @@ public class OidcDeviceAuthTest {
                     // getToken() must return control promptly (here: throw), NOT block ~10s until
                     // the device code expires and signIn() releases the lock
                     long startNanos = System.nanoTime();
-                    try {
-                        auth.getToken();
-                        Assert.fail("expected getToken() to fail fast while a sign-in is in progress");
-                    } catch (OidcAuthException e) {
-                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
-                        Assert.assertTrue("getToken() blocked " + elapsedMillis + "ms behind the in-flight sign-in",
-                                elapsedMillis < 2_000);
-                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("in progress"));
-                    }
+                    OidcAuthException e = assertOidcFails(auth::getToken, "in progress",
+                            "expected getToken() to fail fast while a sign-in is in progress");
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    Assert.assertTrue("getToken() blocked " + elapsedMillis + "ms behind the in-flight sign-in",
+                            elapsedMillis < 2_000);
                 } finally {
                     auth.close();        // cancel the in-flight sign-in
                     signIn.join(10_000); // let the daemon thread unwind before the leak check
@@ -1798,9 +1767,7 @@ public class OidcDeviceAuthTest {
                 // a refresh holds the lock now; a second getToken() must WAIT for it, not fail fast
                 AtomicReference<String> waiterResult = new AtomicReference<>();
                 AtomicReference<Throwable> waiterError = new AtomicReference<>();
-                CountDownLatch waiterStarted = new CountDownLatch(1);
                 Thread waiter = new Thread(() -> {
-                    waiterStarted.countDown(); // signal we are about to enter getToken()
                     try {
                         waiterResult.set(auth.getToken());
                     } catch (Throwable t) {
@@ -1809,14 +1776,20 @@ public class OidcDeviceAuthTest {
                 }, "oidc-getToken-waiter");
                 waiter.setDaemon(true);
                 waiter.start();
-                Assert.assertTrue("the waiter thread did not start", waiterStarted.await(10, TimeUnit.SECONDS));
+                // Wait until the waiter is genuinely INSIDE getToken(), read off its own stack. The latch this
+                // replaced counted down as the first statement of the thread body - BEFORE the call it claimed
+                // to gate - so it proved only that the thread had been scheduled, and every "still blocked"
+                // assertion below rested on the sleep that follows instead.
+                Assert.assertTrue("the waiter never entered getToken()", awaitInside(waiter, "getToken", 10_000));
                 try {
-                    // give the waiter time to (wrongly) fail fast if it were going to; while the refresh is held it
-                    // must instead still be BLOCKED - proven by isAlive() (a fail-fast throw would have finished the
-                    // thread), so this cannot pass merely because the waiter had not started yet
+                    // give the waiter time to (wrongly) fail fast if it were going to; while the refresh is held
+                    // it must instead still be blocked INSIDE getToken() - a fail-fast throw would have left that
+                    // frame (and finished the thread)
                     Thread.sleep(500);
                     Assert.assertTrue("getToken() must still be blocked behind the peer's refresh, not finished",
                             waiter.isAlive());
+                    Assert.assertTrue("getToken() must still be inside the call, waiting out the peer's refresh",
+                            isInside(waiter, "getToken"));
                     Assert.assertNull("getToken() must not fail fast behind a silent refresh, but threw: " + waiterError.get(),
                             waiterError.get());
                     Assert.assertNull("getToken() must wait, not return, while the peer's refresh is still in flight",
@@ -1856,12 +1829,8 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) { // groupsInToken=true
-                try {
-                    auth.signIn();
-                    Assert.fail("signIn() must reject a grant with no id_token when groups are encoded in the token");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no id_token"));
-                }
+                assertOidcFails(auth::signIn, "no id_token",
+                        "signIn() must reject a grant with no id_token when groups are encoded in the token");
                 // the partial grant left a refresh token in memory; getToken() must refresh to obtain the id_token
                 Assert.assertEquals("ID-2", auth.getToken());
                 Assert.assertEquals("getToken() must have performed a silent refresh", 1, refreshCalls.get());
@@ -1892,12 +1861,7 @@ public class OidcDeviceAuthTest {
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, ch -> promptCalls.incrementAndGet())) {
                 // before any sign-in, getToken() must not prompt - it throws
-                try {
-                    auth.getToken();
-                    Assert.fail("expected getToken() to fail before sign-in");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no token"));
-                }
+                assertOidcFails(auth::getToken, "no token", "expected getToken() to fail before sign-in");
                 // sign in once interactively
                 Assert.assertEquals("ACCESS-1", auth.signIn());
                 expireCachedToken(auth);
@@ -1906,12 +1870,8 @@ public class OidcDeviceAuthTest {
                 // now make the refresh fail; getToken() must throw, not start the device flow
                 refreshOk.set(false);
                 expireCachedToken(auth);
-                try {
-                    auth.getToken();
-                    Assert.fail("expected getToken() to fail when the refresh is rejected");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("interactive sign-in"));
-                }
+                assertOidcFails(auth::getToken, "interactive sign-in",
+                        "expected getToken() to fail when the refresh is rejected");
                 // the device flow ran exactly once (the initial signIn), and the user was prompted once
                 Assert.assertEquals(1, deviceCalls.get());
                 Assert.assertEquals(1, promptCalls.get());
@@ -1934,12 +1894,8 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected signIn() to reject a blank served token from the wire");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no access_token"));
-                }
+                assertOidcFails(auth::signIn, "no access_token",
+                        "expected signIn() to reject a blank served token from the wire");
             }
         });
     }
@@ -1992,12 +1948,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no id_token"));
-                }
+                assertOidcFails(auth::signIn, "no id_token");
             }
         });
     }
@@ -2106,12 +2057,7 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(200, "{\"device_code\":\"DEV\",\"expires_in\":300,\"interval\":1}");
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("incomplete device authorization"));
-                }
+                assertOidcFails(auth::signIn, "incomplete device authorization");
             }
         });
     }
@@ -2465,7 +2411,7 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testRejectedBuildDoesNotLeakNativeMemory() {
+    public void testRejectedBuildDoesNotLeakNativeMemory() throws Exception {
         // A build rejected during validation must not leak. build() parses and validates every endpoint
         // BEFORE the constructor runs, and the constructor allocates the native JSON lexer LAST (after
         // urlEncode and the TokenStoreKey build, either of which can throw), so a rejected build never
@@ -2473,42 +2419,47 @@ public class OidcDeviceAuthTest {
         // parseable-but-rejected config - endpoints that parse cleanly but fail the https requirement - so the
         // rejection lands AFTER endpoint parsing, exercising more of build() than a syntactically bad url
         // would. testSuccessfulBuildAndCloseDoNotLeakNativeMemory covers the complementary lexer-allocated
-        // path. Measure the parser tag directly; the module's assertMemoryLeak does not flag a single-tag growth.
-        long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
-        try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
-                .clientId("c")
-                .deviceAuthorizationEndpoint("http://idp.example/device") // parses fine, but plaintext http to a non-loopback host
-                .tokenEndpoint("https://idp.example/token")
-                .allowInsecureTransport(false)
-                .build()
-        ) {
-            Assert.fail("expected the https requirement to reject the plaintext device endpoint");
-        } catch (OidcAuthException e) {
-            Assert.assertTrue(e.getMessage(), e.getMessage().contains("use an https url"));
-        }
-        Assert.assertEquals("a rejected build must not leak the JSON lexer native buffer",
-                parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+        // path. assertMemoryLeak guards every tag; the parser-tag assertion stays because it names the buffer.
+        assertMemoryLeak(() -> {
+            long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
+            try (OidcDeviceAuth ignored = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("http://idp.example/device") // parses fine, but plaintext http to a non-loopback host
+                    .tokenEndpoint("https://idp.example/token")
+                    .allowInsecureTransport(false)
+                    .build()
+            ) {
+                Assert.fail("expected the https requirement to reject the plaintext device endpoint");
+            } catch (OidcAuthException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("use an https url"));
+            }
+            Assert.assertEquals("a rejected build must not leak the JSON lexer native buffer",
+                    parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+        });
     }
 
     @Test(timeout = 30_000)
-    public void testSuccessfulBuildAndCloseDoNotLeakNativeMemory() {
+    public void testSuccessfulBuildAndCloseDoNotLeakNativeMemory() throws Exception {
         // The complement to the rejected-build case: a SUCCESSFUL build is the only path that allocates the
         // native JSON lexer, so this is the block that actually exercises a lexer-allocated instance, and
         // close() must free it. Loop a few build->close cycles so any per-cycle leak accrues, then assert the
         // parser tag returns to its baseline. build() does no network I/O (discovery is separate), so valid
-        // co-located https endpoints construct offline.
-        long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
-        for (int i = 0; i < 4; i++) {
-            try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
-                    .clientId("c")
-                    .deviceAuthorizationEndpoint("https://idp.example/device")
-                    .tokenEndpoint("https://idp.example/token")
-                    .build()) {
-                Assert.assertNotNull(auth);
+        // co-located https endpoints construct offline. assertMemoryLeak guards every tag; the parser-tag
+        // assertion stays because it names the buffer.
+        assertMemoryLeak(() -> {
+            long parserMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS);
+            for (int i = 0; i < 4; i++) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                        .clientId("c")
+                        .deviceAuthorizationEndpoint("https://idp.example/device")
+                        .tokenEndpoint("https://idp.example/token")
+                        .build()) {
+                    Assert.assertNotNull(auth);
+                }
             }
-        }
-        Assert.assertEquals("close() must free the JSON lexer native buffer allocated by a successful build",
-                parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+            Assert.assertEquals("close() must free the JSON lexer native buffer allocated by a successful build",
+                    parserMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TEXT_PARSER_RSS));
+        });
     }
 
     @Test(timeout = 30_000)
@@ -2523,12 +2474,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no access_token"));
-                }
+                assertOidcFails(auth::signIn, "no access_token");
             }
         });
     }
@@ -2544,12 +2490,8 @@ public class OidcDeviceAuthTest {
             AtomicBoolean prompted = new AtomicBoolean(false);
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, challenge -> prompted.set(true))) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected the non-2xx device authorization response to be rejected");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unexpected response from the device authorization endpoint"));
-                }
+                assertOidcFails(auth::signIn, "unexpected response from the device authorization endpoint",
+                        "expected the non-2xx device authorization response to be rejected");
                 Assert.assertFalse("the user must not be prompted on a rejected device authorization response", prompted.get());
             }
         });
@@ -2568,13 +2510,11 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    String token = auth.signIn();
-                    Assert.fail("a JSON null access_token must not be served as the literal token \"null\" [got=" + token + "]");
-                } catch (OidcAuthException e) {
-                    // null is absent, so a 2xx with no token is a definitive but malformed answer
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unexpected response"));
-                }
+                // null is absent, so a 2xx with no token is a definitive but malformed answer. The token the
+                // call would have served, had it wrongly served the literal "null", is in the failure message
+                // assertOidcFails builds.
+                assertOidcFails(auth::signIn, "unexpected response",
+                        "a JSON null access_token must not be served as the literal token \"null\"");
             }
         });
     }
@@ -2639,16 +2579,11 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(400, "{\"error\":\"access_denied\",\"error_description\":\"" + desc + "\"}");
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertEquals("access_denied", e.getOauthError());
-                    String msg = e.getMessage();
-                    assertNoUnsafeDisplayChars(msg);
-                    Assert.assertTrue(msg, msg.contains("access_denied"));
-                    Assert.assertTrue(msg, msg.contains("deniedreversedend")); // readable text survives, controls gone
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "access_denied");
+                Assert.assertEquals("access_denied", e.getOauthError());
+                String msg = e.getMessage();
+                assertNoUnsafeDisplayChars(msg);
+                Assert.assertTrue(msg, msg.contains("deniedreversedend")); // readable text survives, controls gone
             }
         });
     }
@@ -2663,16 +2598,11 @@ public class OidcDeviceAuthTest {
                     MockOidcServer.json(400, "{\"error\":\"access_denied\",\"error_description\":\"" + desc + "\"}");
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertEquals("access_denied", e.getOauthError());
-                    String msg = e.getMessage();
-                    assertNoControlChars(msg);
-                    Assert.assertTrue(msg, msg.contains("access_denied"));
-                    Assert.assertTrue(msg, msg.contains("FAKE: paste your token")); // readable text survives
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "access_denied");
+                Assert.assertEquals("access_denied", e.getOauthError());
+                String msg = e.getMessage();
+                assertNoControlChars(msg);
+                Assert.assertTrue(msg, msg.contains("FAKE: paste your token")); // readable text survives
             }
         });
     }
@@ -2777,12 +2707,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, shown::set)) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected the device code to expire");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
-                }
+                assertOidcFails(auth::signIn, "device code expired", "expected the device code to expire");
                 Assert.assertEquals(60, shown.get().getIntervalSeconds());
             }
         });
@@ -2826,13 +2751,9 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected the device code to expire while the token endpoint kept returning 429");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "device code expired",
+                        "expected the device code to expire while the token endpoint kept returning 429");
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
             }
         });
     }
@@ -2883,13 +2804,9 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected the device code to expire while the token endpoint returned 503");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("device code expired"));
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "device code expired",
+                        "expected the device code to expire while the token endpoint returned 503");
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("rejected the request"));
             }
         });
     }
@@ -2907,13 +2824,9 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a terminal 4xx to fail fast");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("rejected the request"));
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("device code expired"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "rejected the request",
+                        "expected a terminal 4xx to fail fast");
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("device code expired"));
             }
         });
     }
@@ -3221,12 +3134,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a timeout");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("timed out"));
-                }
+                assertOidcFails(auth::signIn, "timed out", "expected a timeout");
             }
         });
     }
@@ -3294,14 +3202,9 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertFalse("the token must not leak into the message: " + e.getMessage(),
-                            e.getMessage().contains(secret));
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("httpStatus="));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "httpStatus=");
+                Assert.assertFalse("the token must not leak into the message: " + e.getMessage(),
+                        e.getMessage().contains(secret));
             }
         });
     }
@@ -3398,13 +3301,9 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a token under a 400 to be rejected, not accepted");
-                } catch (OidcAuthException e) {
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-BE-USED"));
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("rejected the request"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "rejected the request",
+                        "expected a token under a 400 to be rejected, not accepted");
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-BE-USED"));
             }
         });
     }
@@ -3425,14 +3324,10 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a token with control characters to be rejected");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("disallowed control or non-ASCII"));
-                    // the token bytes must never leak into the message
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("X-Injected"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "disallowed control or non-ASCII",
+                        "expected a token with control characters to be rejected");
+                // the token bytes must never leak into the message
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("X-Injected"));
             }
         });
     }
@@ -3453,14 +3348,10 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected a token with a non-ASCII character to be rejected");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("disallowed control or non-ASCII"));
-                    // the token bytes must never leak into the message
-                    Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-LEAK"));
-                }
+                OidcAuthException e = assertOidcFails(auth::signIn, "disallowed control or non-ASCII",
+                        "expected a token with a non-ASCII character to be rejected");
+                // the token bytes must never leak into the message
+                Assert.assertFalse(e.getMessage(), e.getMessage().contains("SHOULD-NOT-LEAK"));
             }
         });
     }
@@ -3520,12 +3411,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("could not parse"));
-                }
+                assertOidcFails(auth::signIn, "could not parse");
             }
         });
     }
@@ -3542,12 +3428,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("unexpected response"));
-                }
+                assertOidcFails(auth::signIn, "unexpected response");
             }
         });
     }
@@ -3590,12 +3471,7 @@ public class OidcDeviceAuthTest {
                 .build()
         ) {
             auth.close();
-            try {
-                auth.signIn();
-                Assert.fail("expected signIn() after close() to be rejected");
-            } catch (OidcAuthException e) {
-                Assert.assertTrue(e.getMessage(), e.getMessage().contains("closed"));
-            }
+            assertOidcFails(auth::signIn, "closed", "expected signIn() after close() to be rejected");
             try {
                 auth.clearCache();
                 Assert.fail("expected clearCache() after close() to be rejected");
@@ -3662,12 +3538,7 @@ public class OidcDeviceAuthTest {
             };
             try (MockOidcServer server = new MockOidcServer(handler);
                  OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) {
-                try {
-                    auth.signIn();
-                    Assert.fail("expected an OidcAuthException on the first call");
-                } catch (OidcAuthException e) {
-                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no id_token"));
-                }
+                assertOidcFails(auth::signIn, "no id_token", "expected an OidcAuthException on the first call");
                 // the unusable grant must NOT be cached as valid: the next call re-runs the flow and succeeds
                 Assert.assertEquals("ID-2", auth.signIn());
                 Assert.assertEquals("the interactive flow must run twice (failed first, recovered second)", 2, deviceCalls.get());
@@ -3709,6 +3580,52 @@ public class OidcDeviceAuthTest {
             Assert.assertFalse("display-unsafe char U+" + Integer.toHexString(cp) + " at index " + i + " in '" + value + "'", unsafe);
             i += Character.charCount(cp);
         }
+    }
+
+    /**
+     * Asserts that {@code call} - a {@code signIn()}, a {@code getToken()} or a discovery that must not
+     * succeed - throws an {@link OidcAuthException} whose message carries {@code expectedMessage}, and hands
+     * that exception back so a caller with more to check keeps asserting on it. Same idiom as
+     * {@link #assertBuildFails}, applied to the seven-line try/fail/catch this file used to stamp out at
+     * roughly thirty sites.
+     */
+    private static OidcAuthException assertOidcFails(Supplier<?> call, String expectedMessage) {
+        return assertOidcFails(call, expectedMessage, "the call must not succeed");
+    }
+
+    private static OidcAuthException assertOidcFails(Supplier<?> call, String expectedMessage, String whatMustFail) {
+        final Object returned;
+        try {
+            returned = call.get();
+        } catch (OidcAuthException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
+            return e;
+        }
+        // The call SUCCEEDED. Close what it handed back before failing - a construction that should have been
+        // rejected must not leak past the assertion - then report the value itself, which on a token path IS
+        // the credential an over-permissive check let through.
+        if (returned instanceof AutoCloseable) {
+            try {
+                ((AutoCloseable) returned).close();
+            } catch (Exception ignore) {
+                // the failure below is the one that matters
+            }
+        }
+        throw new AssertionError(whatMustFail + " [expected an OidcAuthException containing \"" + expectedMessage
+                + "\", got " + returned + ']');
+    }
+
+    private static boolean awaitInside(Thread t, String method, long timeoutMillis) throws InterruptedException {
+        // poll the thread's own stack until the named OidcDeviceAuth frame shows up: the only evidence that a
+        // helper thread has actually ENTERED a call, as opposed to having been scheduled at all
+        final long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            if (isInside(t, method)) {
+                return true;
+            }
+            Thread.sleep(10);
+        }
+        return false;
     }
 
     private static String deviceAuthorizationJson(int interval, int expiresIn) {
@@ -3870,6 +3787,16 @@ public class OidcDeviceAuthTest {
         Method m = OidcDeviceAuth.class.getDeclaredMethod("isLoopbackHost", String.class);
         m.setAccessible(true);
         return (boolean) m.invoke(null, host);
+    }
+
+    private static boolean isInside(Thread t, String method) {
+        for (StackTraceElement frame : t.getStackTrace()) {
+            if (OidcDeviceAuth.class.getName().equals(frame.getClassName())
+                    && method.equals(frame.getMethodName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // builds a JSON unicode escape (backslash-u-XXXX) for a BMP code point without writing one literally

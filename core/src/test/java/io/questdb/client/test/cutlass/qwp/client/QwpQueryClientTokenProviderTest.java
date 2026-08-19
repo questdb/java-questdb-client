@@ -32,20 +32,16 @@ import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
 import io.questdb.client.cutlass.qwp.client.QwpEgressMsgKind;
 import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -245,58 +241,26 @@ public class QwpQueryClientTokenProviderTest {
             // drive the REAL connect path (connect() -> resolveAuthorizationHeader -> runUpgradeWithTimeout),
             // not the test hook: the upgrade request must carry the freshly pulled "Bearer <token>". The mock
             // answers 404 (not auth-failed, not terminal) so connect() fails fast after the header was sent.
-            List<String> authHeaders = Collections.synchronizedList(new ArrayList<>());
-            ServerSocket listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-            int port = listener.getLocalPort();
-            byte[] respBytes = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
-            Thread serverThread = new Thread(() -> {
-                while (!listener.isClosed()) {
-                    try {
-                        Socket s = listener.accept();
-                        Thread handler = new Thread(() -> {
-                            try (Socket sock = s) {
-                                byte[] buf = new byte[8192];
-                                int n = sock.getInputStream().read(buf);
-                                if (n < 0) {
-                                    return;
-                                }
-                                String request = new String(buf, 0, n, StandardCharsets.US_ASCII);
-                                for (String line : request.split("\r\n")) {
-                                    if (line.regionMatches(true, 0, "Authorization:", 0, "Authorization:".length())) {
-                                        authHeaders.add(line.substring("Authorization:".length()).trim());
-                                    }
-                                }
-                                OutputStream os = sock.getOutputStream();
-                                os.write(respBytes);
-                                os.flush();
-                            } catch (Exception ignored) {
-                            }
-                        }, "qwp-token-upgrade-handler");
-                        handler.setDaemon(true);
-                        handler.start();
-                    } catch (Exception ignored) {
-                        return;
-                    }
-                }
-            }, "qwp-token-upgrade-server");
-            serverThread.setDaemon(true);
-            serverThread.start();
-
-            try (QwpQueryClient client = QwpQueryClient.fromConfig("ws::addr=127.0.0.1:" + port + ";failover=off;target=any;")
-                    .withBearerTokenProvider(() -> "tok-0")) {
+            // MockOidcServer is the harness for this: it records the Authorization header of every request it
+            // reads and resurfaces a handler throwable on close(), where the hand-rolled listener this
+            // replaced swallowed every harness fault into `catch (Exception ignored)` - so an accept, read or
+            // write that broke arrived as a MISSING header, i.e. as a product regression.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(404, ""));
+                 QwpQueryClient client = QwpQueryClient
+                         .fromConfig("ws::addr=127.0.0.1:" + server.port() + ";failover=off;target=any;")
+                         .withBearerTokenProvider(() -> "tok-0")) {
                 try {
                     client.connect();
                     Assert.fail("expected connect to fail on a 404 upgrade");
                 } catch (HttpClientException expected) {
                     // 404 is neither auth-failed nor terminal: the endpoint is exhausted and connect() fails -
-                    // but the upgrade request already carried the Bearer header captured above
+                    // but the upgrade request already carried the Bearer header captured below
                 }
-            } finally {
-                listener.close();
-                serverThread.join(500);
+                List<String> authHeaders = server.requestAuthHeaders();
+                Assert.assertEquals("the provider's token must reach the real upgrade request",
+                        1, authHeaders.size());
+                Assert.assertEquals("Bearer tok-0", authHeaders.get(0));
             }
-            Assert.assertEquals("the provider's token must reach the real upgrade request", 1, authHeaders.size());
-            Assert.assertEquals("Bearer tok-0", authHeaders.get(0));
         });
     }
 
