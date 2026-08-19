@@ -252,28 +252,52 @@ public final class FileTokenStore implements TokenStore {
         if (!Files.isDirectory(directory)) {
             return; // nothing is persisted yet; do not create the directory just to clear it
         }
-        // delete under the cross-process lock, like the read-refresh-write, so a peer's in-flight refresh
-        // cannot resurrect the entry by atomically renaming a fresh file in just after we delete. inLock cleans
-        // up its own lock file and degrades to lock-free if it cannot acquire one. Cross-process clear is still
-        // best-effort: a peer holding a live in-memory token may legitimately re-persist later - clearing forces
-        // a fresh sign-in for THIS process regardless, since the caller resets its in-memory token state.
-        inLock(key, () -> {
-            try {
-                Files.deleteIfExists(tokenFile(key));
-            } catch (IOException e) {
-                throw new OidcAuthException(e).put("could not remove the OIDC token store file");
+        // Interrupt-neutral, for the reason load() and save() are, and more sharply. Those two abandon file
+        // I/O; this one is a local DELETE whose entire purpose is to erase a secret, so there is nothing to
+        // abandon on a cancellation and "we were cancelled" is not a reason to leave a plaintext refresh token
+        // behind. Routed through inLock, a merely CARRIED interrupt flag - the standard state of a cancelled
+        // or shutting-down thread, which is exactly where a sign-out runs - made inLock skip the action and
+        // return false, which this method discarded: clear() returned normally, clearCache() reported success,
+        // the file stayed on disk, and the next process start silently resumed the old identity.
+        final boolean wasInterrupted = Thread.interrupted();
+        try {
+            // delete under the cross-process lock, like the read-refresh-write, so a peer's in-flight refresh
+            // cannot resurrect the entry by atomically renaming a fresh file in just after we delete. inLock
+            // cleans up its own lock file and degrades to lock-free if it cannot acquire one. Cross-process
+            // clear is still best-effort: a peer holding a live in-memory token may legitimately re-persist
+            // later - clearing forces a fresh sign-in for THIS process regardless, since the caller resets its
+            // in-memory token state.
+            final CriticalSection delete = () -> {
+                try {
+                    Files.deleteIfExists(tokenFile(key));
+                } catch (IOException e) {
+                    throw new OidcAuthException(e).put("could not remove the OIDC token store file");
+                }
+                // Also remove any write temp for this identity. A crash between createTempFile and the atomic
+                // rename orphans a <hash><random>.tmp holding the FULL serialized entry - access, id and
+                // refresh tokens in plaintext - and until now nothing here reclaimed it: sweepStaleTempFiles
+                // runs only from save(), so a caller that clears and never signs in again left a live refresh
+                // token on disk indefinitely, contradicting this method's contract. Sweep at ANY age, unlike
+                // save()'s staleness-bounded sweep: clear() is an explicit "forget this credential", and a
+                // temp a concurrent save is mid-rename on is a benign loser - its rename fails, persistence
+                // is best-effort, and the caller is discarding the credential anyway.
+                sweepTempFiles(key.hash(), 0L);
+                return true;
+            };
+            if (!inLock(key, delete)) {
+                // inLock declined to RUN the action - a live cancellation, or it could not coordinate at all.
+                // It returns false only when the action never ran (this action always returns true), so this
+                // cannot double-delete. Run it uncoordinated rather than return with the credential still on
+                // disk: the cross-process lock only orders us against a peer's in-flight refresh, and losing
+                // that ordering costs at worst a peer re-persisting later, which this method already documents
+                // as best-effort. Leaving the secret behind is not a trade this call may make.
+                delete.run();
             }
-            // Also remove any write temp for this identity. A crash between createTempFile and the atomic
-            // rename orphans a <hash><random>.tmp holding the FULL serialized entry - access, id and refresh
-            // tokens in plaintext - and until now nothing here reclaimed it: sweepStaleTempFiles runs only
-            // from save(), so a caller that clears and never signs in again left a live refresh token on
-            // disk indefinitely, contradicting this method's contract. Sweep at ANY age, unlike save()'s
-            // staleness-bounded sweep: clear() is an explicit "forget this credential", and a temp a
-            // concurrent save is mid-rename on is a benign loser - its rename fails, persistence is
-            // best-effort, and the caller is discarding the credential anyway.
-            sweepTempFiles(key.hash(), 0L);
-            return true;
-        });
+        } finally {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     @Override
@@ -284,6 +308,18 @@ public final class FileTokenStore implements TokenStore {
         // rotating refresh token and get the whole family revoked on a reuse-detecting IdP). This lock is not
         // subject to the file lock's degrade. ReentrantLock is safe even though inLock's contract forbids
         // nesting - a mistaken re-entry cannot self-deadlock.
+        // An interrupt CARRIED ON ENTRY is the caller's own state, not a signal aimed at any wait below:
+        // preserve it and abort before touching a lock. This has to be tested BEFORE the acquire, not after
+        // it: ReentrantLock.lockInterruptibly() begins with Thread.interrupted(), so it throws even on a FREE,
+        // UNCONTENDED lock and CLEARS the flag - a carried interrupt was therefore misread as a live
+        // cancellation by the catch below, which does not re-assert, so the caller's cancellation signal was
+        // destroyed and the critical section skipped on a lock nobody held. Aborting here also avoids
+        // acquiring a lock for a critical section we should not start, which would only delay the caller and
+        // risk stranding a lock file for its whole staleness window.
+        if (Thread.interrupted()) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
         final ReentrantLock processLock = PROCESS_LOCKS.computeIfAbsent(key.hash(), k -> new ReentrantLock());
         // lockInterruptibly, never lock(): a peer thread on this identity holds this for a whole refresh round
         // trip, and an interrupt is the ONLY lever that reaches a caller stuck behind it. QWP's
@@ -301,11 +337,10 @@ public final class FileTokenStore implements TokenStore {
             return false;
         }
         try {
-            // An interrupt CARRIED ON ENTRY is the caller's own state, not a signal aimed at this wait:
-            // preserve it and abort before touching any lock file. The previous code instead cleared it to
-            // push the FileChannel I/O through (a set flag turns that into ClosedByInterruptException) and
-            // ran the refresh anyway; acquiring a lock for a critical section we should not start only
-            // delays the caller and risks stranding a lock file for its whole staleness window.
+            // A LIVE interrupt that landed between the acquire above and here - the carried case is already
+            // handled before the acquire. Same answer either way: preserve it and abort before touching any
+            // lock file, rather than clear it to push the FileChannel I/O through (a set flag turns that into
+            // ClosedByInterruptException) and run the critical section anyway.
             if (Thread.interrupted()) {
                 Thread.currentThread().interrupt();
                 return false;

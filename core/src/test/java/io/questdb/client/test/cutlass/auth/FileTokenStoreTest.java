@@ -177,6 +177,37 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testClearErasesTheEntryOnAnInterruptCarryingThread() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-SECRET"));
+            Assert.assertTrue(Files.exists(tokenFile(dir, key)));
+
+            // A sign-out runs on shutdown and cleanup paths, which is exactly where a thread carries an
+            // interrupt flag - the standard cancellation idiom re-asserts it. Routed through inLock, the
+            // carried flag made the delete never run, and clear() discarded the false return: the plaintext
+            // refresh token stayed on disk with no exception and no warning, and the next process start
+            // silently resumed the old identity. A local delete has nothing to abandon on a cancellation.
+            Thread.currentThread().interrupt();
+            final boolean flagSurvived;
+            try {
+                store.clear(key);
+                flagSurvived = Thread.currentThread().isInterrupted();
+            } finally {
+                Thread.interrupted(); // do not leak the flag into the next test
+            }
+
+            // erasure first: it is the claim this test exists for, so it is the one a regression must break
+            Assert.assertFalse("clear() must erase the credential even on an interrupt-carrying thread",
+                    Files.exists(tokenFile(dir, key)));
+            Assert.assertNull(store.load(key));
+            Assert.assertTrue("the caller's cancellation signal must survive clear()", flagSurvived);
+        });
+    }
+
+    @Test
     public void testClearOnEmptyStoreIsNoOp() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir(); // a non-existent subdirectory
@@ -647,6 +678,37 @@ public class FileTokenStoreTest {
             release.countDown();
             holder.join(10_000);
             Assert.assertFalse("the holder must finish its critical section", holder.isAlive());
+        });
+    }
+
+    @Test
+    public void testInLockPreservesACarriedInterruptFlag() throws Exception {
+        assertMemoryLeak(() -> {
+            FileTokenStore store = new FileTokenStore(storeDir());
+            AtomicBoolean ran = new AtomicBoolean();
+
+            // The root cause behind clear() losing a credential, pinned on its own. The lock is FREE and
+            // uncontended here, so nothing is being waited on: a carried flag is the caller's own state and
+            // must survive. ReentrantLock.lockInterruptibly() begins with Thread.interrupted(), so testing
+            // the flag only after the acquire read it as a live cancellation and consumed it - which also
+            // made getToken() report "could not be refreshed" on a reachable endpoint while destroying the
+            // caller's signal.
+            Thread.currentThread().interrupt();
+            boolean result;
+            boolean flagSurvived;
+            try {
+                result = store.inLock(sampleKey(), () -> {
+                    ran.set(true);
+                    return true;
+                });
+                flagSurvived = Thread.currentThread().isInterrupted();
+            } finally {
+                Thread.interrupted(); // do not leak the flag into the next test
+            }
+
+            Assert.assertTrue("a carried interrupt must survive inLock", flagSurvived);
+            Assert.assertFalse("inLock must not start the critical section for a cancelled caller", ran.get());
+            Assert.assertFalse("and must report that the action did not run", result);
         });
     }
 
