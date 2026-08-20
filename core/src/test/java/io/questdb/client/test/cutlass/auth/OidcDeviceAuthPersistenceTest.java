@@ -468,6 +468,71 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testSignInDeclinesOnAnInterruptCarryingThread() throws Exception {
+        assertMemoryLeak(() -> {
+            // The interrupt guard used to live only inside FileTokenStore.inLock, so signIn()'s behaviour
+            // depended on whether a store was configured - and was wrong in OPPOSITE directions either way.
+            //
+            //   with a FileTokenStore: inLock declined the carried interrupt by returning false, signIn()
+            //   read that as "the refresh failed" and started the DEVICE FLOW - a browser prompt and a poll
+            //   loop Os.sleep cannot be interrupted out of, so the cancelled caller was parked for up to the
+            //   device-code lifetime, having skipped a refresh it could have completed;
+            //
+            //   with no store: tryRefreshCoordinated() went straight to tryRefresh() and POSTed to the token
+            //   endpoint on that same cancelled thread.
+            //
+            // Driven twice in one test on purpose: the defect was the ASYMMETRY, so the two configurations
+            // agreeing is the property worth pinning. Both halves reach signIn() holding a usable refresh
+            // token and an expired access token, so each has real network work to decline rather than a
+            // cache hit to serve.
+            for (boolean withStore : new boolean[]{true, false}) {
+                AtomicInteger device = new AtomicInteger();
+                AtomicInteger token = new AtomicInteger();
+                MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-2", "REFRESH-2");
+                try (MockOidcServer server = new MockOidcServer(handler)) {
+                    OidcDeviceAuth.Builder builder = baseBuilder(server);
+                    if (withStore) {
+                        // a REAL FileTokenStore, not a double: its inLock is what declines a carried
+                        // interrupt, and that decline is the half of the asymmetry that ended in a prompt
+                        Path dir = storeDir();
+                        new FileTokenStore(dir).save(keyFor(server),
+                                new PersistedToken("ACCESS-STALE", null, "REFRESH-OK",
+                                        System.currentTimeMillis() - 1, 300_000));
+                        builder.tokenStore(new FileTokenStore(dir));
+                    }
+                    try (OidcDeviceAuth auth = builder.build()) {
+                        if (!withStore) {
+                            // nothing on disk to restore from, so earn a refresh token the ordinary way
+                            Assert.assertEquals("ACCESS-1", auth.signIn());
+                            OidcDeviceAuthTest.expireCachedToken(auth);
+                        }
+                        final int deviceBefore = device.get();
+                        final int tokenBefore = token.get();
+
+                        Thread.currentThread().interrupt();
+                        try {
+                            String served = auth.signIn();
+                            Assert.fail("a cancelled caller must not be signed in [withStore=" + withStore
+                                    + ", served=" + served + ", deviceFlows=" + (device.get() - deviceBefore)
+                                    + ", tokenCalls=" + (token.get() - tokenBefore) + "]");
+                        } catch (OidcAuthException e) {
+                            Assert.assertTrue("withStore=" + withStore + ": " + e.getMessage(),
+                                    e.getMessage().contains("interrupted"));
+                        } finally {
+                            Assert.assertTrue("the caller's cancellation signal must survive signIn() "
+                                    + "[withStore=" + withStore + "]", Thread.interrupted());
+                        }
+                        Assert.assertEquals("no device flow may be started on a cancelled thread "
+                                + "[withStore=" + withStore + "]", deviceBefore, device.get());
+                        Assert.assertEquals("no token-endpoint round trip may be made on a cancelled thread "
+                                + "[withStore=" + withStore + "]", tokenBefore, token.get());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testSignInClearsTheRefreshBackOff() throws Exception {
         assertMemoryLeak(() -> {
             // The back-off must never strand a caller: signIn() is the explicit action a user takes to

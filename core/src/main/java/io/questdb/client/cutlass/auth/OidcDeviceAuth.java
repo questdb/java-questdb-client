@@ -629,8 +629,10 @@ public class OidcDeviceAuth implements QuietCloseable {
      * when the server expects groups encoded in the token, the access token otherwise.
      *
      * @return a non-null, non-empty token
-     * @throws OidcAuthException if the interactive flow fails, times out, or the identity provider
-     *                           does not return the expected token
+     * @throws OidcAuthException if the interactive flow fails, times out, the identity provider does not
+     *                           return the expected token, or the calling thread carries an interrupt and
+     *                           no valid cached token is available - a cancelled caller is not sent through
+     *                           a silent refresh or a device flow, both of which are network work
      */
     public String signIn() {
         lock.lock();
@@ -651,6 +653,26 @@ public class OidcDeviceAuth implements QuietCloseable {
             final String cachedToken = groupsInToken ? idToken : accessToken;
             if (cachedToken != null && System.currentTimeMillis() < expiresAtMillis - effectiveSkewMillis()) {
                 return cachedToken;
+            }
+            // A cached token needs no network and was served above whatever the caller's state; everything
+            // from here on is a network round trip, which is the work a cancellation is trying to stop. So
+            // decline it, for the same reason and with the same test getToken() applies further up.
+            //
+            // Checked HERE rather than left to the store, because leaving it there made the outcome depend
+            // on whether a TokenStore was configured, and the two branches were wrong in OPPOSITE
+            // directions. With no store, tryRefreshCoordinated() went straight to tryRefresh() and POSTed to
+            // the token endpoint on a cancelled thread. With a FileTokenStore, inLock declined the carried
+            // interrupt by returning false - which reads here as "the refresh failed", so signIn() skipped a
+            // refresh it could have completed and started the DEVICE FLOW instead: a human prompt and a poll
+            // loop that is far more work than the round trip just declined, and that runs to the device-code
+            // lifetime (up to MAX_DEVICE_CODE_TTL_SECONDS) because sleepBetweenPolls uses Os.sleep, which
+            // ignores interrupts. A caller who cancelled got a browser prompt and a thread parked for half
+            // an hour.
+            //
+            // isInterrupted(), never interrupted(): the flag is the caller's cancellation signal and must
+            // survive this call, exactly as getToken() and FileTokenStore.load()/save() preserve it.
+            if (Thread.currentThread().isInterrupted()) {
+                throw new OidcAuthException("the calling thread is interrupted, so no sign-in was attempted; retry on an uninterrupted thread");
             }
             // Spend a silent refresh before prompting, whenever a refresh token is available - the same rule
             // getToken() applies. That deliberately includes a null served kind: a restored entry whose grant
