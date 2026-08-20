@@ -3047,6 +3047,63 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testRefreshWithoutIdTokenAdoptsRotatedRefreshToken() throws Exception {
+        assertMemoryLeak(() -> {
+            // A refresh may legally answer 2xx without an id_token (RFC 6749 6; OIDC Core 12.2), which a
+            // groupsInToken client cannot serve - but that response is still a clean grant, and a ROTATING
+            // provider has already invalidated the refresh token we presented. Dropping the whole response
+            // therefore keeps a spent credential: every later refresh replays it, and a reuse-detecting
+            // provider answers a replay by revoking the entire token family.
+            //
+            // The observable is what reaches the wire: each refresh records the refresh_token it presented,
+            // so a replay shows up as the same value twice. The device endpoint is available for the FIRST
+            // sign-in only - afterwards it errors, so the interactive fallback cannot mint a fresh refresh
+            // token and mask which one the refresh path kept.
+            StringSink presented = new StringSink();
+            AtomicInteger deviceAuthCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    if (deviceAuthCalls.getAndIncrement() == 0) {
+                        return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                    }
+                    return MockOidcServer.json(400, "{\"error\":\"access_denied\"}");
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    if (presented.length() > 0) {
+                        presented.put(',');
+                    }
+                    presented.put(refreshTokenParam(body));
+                    // a clean 2xx, no id_token, and the refresh token ROTATES
+                    return MockOidcServer.json(200, tokenJson("ACCESS-R", null, "REFRESH-2", 3600));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", "ID-1", "REFRESH-1", 1));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) {
+                Assert.assertEquals("ID-1", auth.signIn());
+
+                // signIn() attempts the silent refresh BEFORE prompting, so each of these two calls puts
+                // exactly one refresh on the wire and then fails over to a device endpoint that refuses.
+                for (int i = 0; i < 2; i++) {
+                    expireCachedToken(auth);
+                    try {
+                        auth.signIn();
+                        Assert.fail("the device endpoint refuses after the first sign-in");
+                    } catch (OidcAuthException expected) {
+                        Assert.assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("access_denied"));
+                    }
+                }
+
+                Assert.assertEquals("the rotated refresh token must replace the one the provider burned; "
+                                + "presenting the same value twice is the replay a reuse-detecting provider "
+                                + "answers by revoking the whole token family",
+                        "REFRESH-1,REFRESH-2", presented.toString());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRefreshWithoutIdTokenFallsBackToInteractiveFlow() throws Exception {
         assertMemoryLeak(() -> {
             // groups are encoded in the token (the default enterprise config), so signIn() serves the
@@ -4005,6 +4062,20 @@ public class OidcDeviceAuthTest {
      * The sink's WHOLE backing array as a String - past the write position too, which is where a cleared but
      * unwiped secret survives.
      */
+    // Reads the refresh_token the client actually presented, so a test can tell a rotation from a replay.
+    // The form body is "grant_type=refresh_token&refresh_token=<value>&client_id=...", so the leading '&'
+    // is what separates the parameter from the grant_type value that shares its name.
+    private static String refreshTokenParam(String body) {
+        final String marker = "&refresh_token=";
+        final int at = body.indexOf(marker);
+        if (at < 0) {
+            return "<absent>";
+        }
+        final int from = at + marker.length();
+        final int to = body.indexOf('&', from);
+        return to < 0 ? body.substring(from) : body.substring(from, to);
+    }
+
     private static String sinkContents(StringSink sink) throws Exception {
         Field buffer = StringSink.class.getDeclaredField("buffer");
         buffer.setAccessible(true);

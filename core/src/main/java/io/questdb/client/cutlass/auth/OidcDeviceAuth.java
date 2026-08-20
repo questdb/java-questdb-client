@@ -1453,6 +1453,37 @@ public class OidcDeviceAuth implements QuietCloseable {
         return true;
     }
 
+    /**
+     * Adopts a rotated {@code refresh_token} from a refresh response that did NOT carry the served token
+     * kind, so the rotation is not lost with the rest of the response.
+     * <p>
+     * A refresh response may legally omit the served kind - RFC 6749 6 makes {@code id_token} optional, and
+     * OIDC Core 12.2 says the refresh response is the token response "except that it might not contain an
+     * id_token" - which is exactly the shape a {@code groupsInToken} client meets against a provider that
+     * only mints an id token at authorization time. That response is still a clean 2xx, and the
+     * {@code refresh_token} in it is authoritative: a rotating provider has already invalidated the one we
+     * presented. Keeping the old token would replay a spent credential on every later refresh, which a
+     * reuse-detecting provider answers by revoking the whole token family - so the caller loses the
+     * credential entirely rather than merely failing to refresh it once.
+     * <p>
+     * Only the refresh token is taken. The served kind did not arrive, so the cached tokens and the expiry
+     * stay as they were: the entry reads as expired, {@code tryRefresh()} still reports failure, and the
+     * caller falls back to the interactive flow exactly as before - now holding a refresh token that is
+     * still live, so the NEXT refresh can succeed on its own.
+     */
+    private void adoptRotatedRefreshToken() {
+        if (tokenParser.refreshToken.length() == 0) {
+            return;
+        }
+        refreshToken = tokenParser.refreshToken.toString();
+        // Persist it, for the same reason it is adopted at all. Without this the on-disk entry keeps the
+        // token the provider just burned, so the next process start adopts a dead credential and re-prompts
+        // a human who did not need to be asked. persistIfRotated() writes the snapshot's stale served token
+        // and past expiry alongside it, which adopt() reads back as expired and refreshes - one silent
+        // round trip, against a refresh token that works.
+        persistIfRotated();
+    }
+
     private void appendEncodedParam(StringSink sink, String name, String encodedValue) {
         sink.putAscii('&').putAscii(name).putAscii('=').putAscii(encodedValue);
     }
@@ -1973,11 +2004,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         // served kind with Chars.isBlank, the SAME contract storeTokens/adopt use to fold a blank token to null:
         // gating on length() > 0 here would pass a whitespace-only token, which storeTokens then nulls, so
         // tryRefresh would report success while selectToken() throws "no token" instead of falling back.
+        //
+        // Split the "this response is a clean grant" half out: it is what decides whether a rotated
+        // refresh_token in the SAME body is authoritative, and that question outlives the served-kind test
+        // below. See adoptRotatedRefreshToken().
+        final boolean isCleanGrant = isHttpStatusSuccess() && tokenParser.error.length() == 0;
         boolean hasRequiredToken = (groupsInToken
                 ? !Chars.isBlank(tokenParser.idToken)
                 : !Chars.isBlank(tokenParser.accessToken))
-                && isHttpStatusSuccess()
-                && tokenParser.error.length() == 0;
+                && isCleanGrant;
         if (hasRequiredToken) {
             try {
                 storeTokens(tokenParser, true);
@@ -1991,6 +2026,12 @@ public class OidcDeviceAuth implements QuietCloseable {
                 return false;
             }
             return true;
+        }
+        if (isCleanGrant) {
+            // The provider accepted our refresh token and answered 2xx; it simply did not return the kind
+            // getToken() serves. Take the rotated refresh_token before dropping the rest of the response -
+            // see adoptRotatedRefreshToken() for why keeping the old one is worse than failing this refresh.
+            adoptRotatedRefreshToken();
         }
         // the refresh token expired or was revoked, or did not return the token we need; fall back to the
         // interactive flow
