@@ -335,6 +335,14 @@ public class QwpWebSocketSender implements Sender {
     // awaitAckedFsn: a stale base paired with a fresh engine would report
     // an FSN dip to -1 (same reasoning as symbolDictEpoch).
     private volatile long fsnEpochBase = 0;
+    // Latched true the first time ensureConnected() completes. Once set,
+    // every later ensureConnected() -- today only the recycle's step 7 and
+    // its retry-on-next-send path -- takes the deferred (ASYNC-style)
+    // branch regardless of initialConnectMode: the store-and-forward
+    // contract scopes foreground connectivity errors to initialization
+    // only, so post-initial (re)connects belong to the I/O loop's
+    // indefinite retry (Invariant B), never to the producer thread.
+    private boolean hasConnectedOnce;
     private boolean hasDeferredMessages;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
@@ -4150,7 +4158,14 @@ public class QwpWebSocketSender implements Sender {
                     connectionListener, connectionListenerInboxCapacity);
         }
         CursorWebSocketSendLoop.ReconnectFactory reconnectFactory = newReconnectFactory();
-        switch (initialConnectMode) {
+        // initialConnectMode is an *initialization* policy. After the first
+        // successful connect the SF contract forbids foreground connects on
+        // the producer thread, so re-entries (the recycle's step 7, or its
+        // retry after a failed loop start) always defer to the I/O thread.
+        Sender.InitialConnectMode effectiveMode = hasConnectedOnce
+                ? Sender.InitialConnectMode.ASYNC
+                : initialConnectMode;
+        switch (effectiveMode) {
             case SYNC:
                 client = CursorWebSocketSendLoop.connectWithRetry(
                         reconnectFactory,
@@ -4168,9 +4183,10 @@ public class QwpWebSocketSender implements Sender {
                 // a future version bump must account for that. Transport
                 // failures retry indefinitely on the I/O thread (Invariant B).
                 // But a terminal auth, upgrade or capability rejection on this
-                // initial connect -- before the wire is ever up -- is surfaced
-                // to the async SenderErrorHandler and latched for a close()
-                // rethrow, not retried.
+                // deferred connect (the initial one, or a later re-entry such
+                // as the recycle's step 7) -- before the wire is ever up -- is
+                // surfaced to the async SenderErrorHandler and latched for a
+                // close() rethrow, not retried.
                 client = null;
                 break;
             case OFF:
@@ -4279,6 +4295,7 @@ public class QwpWebSocketSender implements Sender {
         connectionError.set(null);
 
         connected = true;
+        hasConnectedOnce = true;
     }
 
     private void ensureNoInProgressRow() {
@@ -4878,7 +4895,8 @@ public class QwpWebSocketSender implements Sender {
      *       mirroring (not calling) {@link #setCursorEngine} -- that method's
      *       guards refuse a second engine.</li>
      *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
-     *       against the rolled {@link #fsnEpochBase}. Runs OUTSIDE the latching
+     *       against the rolled {@link #fsnEpochBase} and defers the socket
+     *       connect itself to the I/O thread. Runs OUTSIDE the latching
      *       try -- see below.</li>
      * </ol>
      * A throw in steps 2-6 is caught, latches {@link #recycleFailure},
@@ -4982,17 +5000,18 @@ public class QwpWebSocketSender implements Sender {
             }
             throw new LineSenderException(t).put("symbol dictionary recycle failed");
         }
-        // step 7: reconnect - rebuilds the loop with the rolled base. OUTSIDE
-        // the latching try on purpose: the swap has already committed, so a
-        // connect failure here leaves a coherent fresh-epoch sender that is
-        // merely disconnected, not a half-swapped one. It throws loudly to the
-        // caller but does NOT latch -- ensureConnected's own catch has already
-        // closed and nulled the loop and the client, the epoch and swap
-        // counters incremented at step 5 stay incremented (the swap really did
-        // happen), the sender stays disarmed (a fresh dictionary is below
-        // threshold and manualResetRequested was consumed, so nothing can fire
-        // a second swap while disconnected), and the next sendRow() retries the
-        // connect - and ONLY the connect - through ensureConnected.
+        // step 7: reconnect - rebuilds the loop with the rolled base, deferring
+        // the socket connect to the I/O thread (hasConnectedOnce forces
+        // ensureConnected's ASYNC branch): the loop retries indefinitely with
+        // backoff while the producer keeps buffering into the fresh slot, so a
+        // transient outage in this window never surfaces to the producer and
+        // never imposes a reconnect budget on it (the store-and-forward
+        // contract). OUTSIDE the latching try on purpose: the swap has already
+        // committed, so the residual failures here (dispatcher construction,
+        // loop build/start -- environmental, not transport) leave a coherent
+        // fresh-epoch sender that is merely disconnected. They throw loudly
+        // but do NOT latch; the next sendRow() retries the deferred setup --
+        // and ONLY that -- through ensureConnected.
         connected = false;
         try {
             ensureConnected();
