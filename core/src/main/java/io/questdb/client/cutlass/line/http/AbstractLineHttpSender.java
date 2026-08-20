@@ -888,9 +888,9 @@ public abstract class AbstractLineHttpSender implements Sender {
             // could splice a CR/LF into the "Authorization: Bearer" header (request.authToken writes it verbatim,
             // with no CR/LF filtering). The scan is O(token length) and is dwarfed by the flush's network
             // round-trip; the WebSocket auth path validates on every pull for the same reason.
-            CharSequence token;
+            CharSequence pulled;
             try {
-                token = httpTokenProvider.getToken();
+                pulled = httpTokenProvider.getToken();
             } catch (LineSenderException e) {
                 throw e;
             } catch (RuntimeException e) {
@@ -900,6 +900,14 @@ public abstract class AbstractLineHttpSender implements Sender {
                                 : e.getMessage(),
                         e);
             }
+            // Snapshot BEFORE validating, so the bytes that are checked are the bytes that are sent. Without
+            // it validateToken scans the provider's sequence and authToken then re-reads it - two reads of a
+            // buffer the provider owns and, per the paragraph above, is invited to reuse. A mutation landing
+            // between them passes the check and splices the mutated content, CR/LF included, into the
+            // Authorization header. One String per FLUSH (not per row), dwarfed by the round-trip that
+            // follows. Null-safe: a null pull must still reach validateToken's "null or empty" message
+            // rather than NPE here.
+            CharSequence token = pulled == null ? null : pulled.toString();
             HttpTokenProvider.validateToken(token);
             request.authToken(token);
             request.withContent();

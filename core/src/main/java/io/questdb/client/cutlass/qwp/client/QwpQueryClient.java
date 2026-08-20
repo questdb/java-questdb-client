@@ -1912,9 +1912,9 @@ public class QwpQueryClient implements QuietCloseable {
         // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet)
         // fails connect()/reconnect as a LineSenderException, preserving the provider failure as its cause.
         if (tokenProvider != null) {
-            CharSequence token;
+            CharSequence pulled;
             try {
-                token = tokenProvider.getToken();
+                pulled = tokenProvider.getToken();
             } catch (LineSenderException e) {
                 throw e;
             } catch (RuntimeException e) {
@@ -1924,6 +1924,9 @@ public class QwpQueryClient implements QuietCloseable {
                                 : e.getMessage(),
                         e);
             }
+            // snapshot before validating, for the reason HttpTokenProvider.validateToken gives: the
+            // concatenation below re-reads the sequence, and the provider may be reusing its buffer
+            CharSequence token = pulled == null ? null : pulled.toString();
             HttpTokenProvider.validateToken(token);
             return "Bearer " + token;
         }

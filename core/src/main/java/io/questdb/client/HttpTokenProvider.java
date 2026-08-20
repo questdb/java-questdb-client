@@ -56,7 +56,16 @@ import io.questdb.client.std.Chars;
 public interface HttpTokenProvider {
     /**
      * Validates a token returned by {@link #getToken()} before the client writes it into an
-     * {@code Authorization: Bearer} header. Rejects a null, empty or blank token, and any token
+     * {@code Authorization: Bearer} header.
+     * <p>
+     * Callers must pass a value that cannot change between this check and the write that follows it.
+     * {@code getToken()} may return a reused buffer, so validating the provider's sequence and then
+     * re-reading it to build the header reads it twice: a mutation in between passes the check and
+     * splices the mutated bytes - a CR/LF among them - into the header. Snapshot with
+     * {@link Object#toString()} first, then validate and send the snapshot. Every call site in this
+     * library does.
+     * <p>
+     * Rejects a null, empty or blank token, and any token
      * carrying a control or non-ASCII character (outside {@code 0x20}-{@code 0x7e}): a real bearer
      * token is printable ASCII, so a stray CR/LF (which would inject into the HTTP request line) or a
      * non-ASCII byte (silently truncated to one byte by the ASCII header writer, yielding a corrupt
@@ -84,6 +93,15 @@ public interface HttpTokenProvider {
      * adds it). Must not return null or empty, and must contain only printable ASCII (no control or
      * non-ASCII characters) - the client splices the value verbatim into an {@code Authorization:
      * Bearer} header and rejects a token that violates this (see {@link #validateToken(CharSequence)}).
+     * <p>
+     * Returning a reused, mutable {@link CharSequence} - the idiomatic zero-allocation style - is
+     * supported and expected: the client re-validates every pulled token rather than trusting instance
+     * identity, so a buffer whose contents changed since the last call is checked again. What an
+     * implementation must not do is mutate a sequence it has already returned <i>while the client is
+     * still reading it</i>. The client snapshots each returned value before validating it, so a
+     * concurrent mutation cannot slip past the check into the header; an implementation that mutates
+     * mid-call is nonetheless racing with a reader and may see its own token dropped for the one the
+     * snapshot captured. Mutate between calls, not during one.
      *
      * @return the current HTTP authentication token
      */

@@ -3438,7 +3438,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // than send a malformed or CR/LF-injected "Bearer " header
                 final HttpTokenProvider provider = httpTokenProvider;
                 return () -> {
-                    CharSequence token = provider.getToken();
+                    // snapshot before validating: the concatenation below re-reads the sequence, and a
+                    // provider is free to reuse a mutable buffer, so validating the live sequence checks
+                    // bytes the header need not carry. See HttpTokenProvider.validateToken.
+                    CharSequence pulled = provider.getToken();
+                    CharSequence token = pulled == null ? null : pulled.toString();
                     HttpTokenProvider.validateToken(token);
                     return "Bearer " + token;
                 };

@@ -330,6 +330,39 @@ public class LineHttpSenderTokenProviderTest {
     }
 
     @Test
+    public void testTokenMutatedBetweenValidationAndTheHeaderCannotSplice() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sibling test above covers a buffer mutated BETWEEN flushes, which re-validation catches.
+            // This is the window inside ONE flush: validateToken scanned the provider's sequence and
+            // authToken then re-read it, so a mutation landing between those two reads passed the check and
+            // was spliced verbatim into the Authorization header. HttpTokenProvider.getToken() explicitly
+            // invites a reused mutable buffer, and the SPI is exported, so the reader has to be the one that
+            // makes this safe: the pulled value is snapshotted before it is validated, and the bytes checked
+            // are the bytes sent.
+            //
+            // HandOffToken swaps its content the instant a full scan completes - i.e. exactly when
+            // validateToken finishes - so every later read sees the CR/LF splice.
+            final String clean = "GOODTOKEN";
+            final String spliced = "abc" + (char) 0x0d + (char) 0x0a + "X-Injected: pwned";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .httpTokenProvider(() -> new HandOffToken(clean, spliced))
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush();
+                }
+                List<String> auth = server.requestAuthHeaders();
+                Assert.assertEquals(1, auth.size());
+                Assert.assertEquals("the header must carry the bytes that were validated, not a value "
+                        + "swapped in after the scan", "Bearer " + clean, auth.get(0));
+            }
+        });
+    }
+
+    @Test
     public void testNullOrEmptyProviderTokenIsRejected() throws Exception {
         assertMemoryLeak(() -> {
             // the HttpTokenProvider contract forbids a null or empty token; the sender must reject it with a
@@ -433,6 +466,49 @@ public class LineHttpSenderTokenProviderTest {
             } catch (LineSenderException e) {
                 Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
             }
+        }
+    }
+
+    /**
+     * A provider buffer that hands off its content the moment a full scan of it completes: the first
+     * traversal reads {@code clean}, and every read after that reads {@code spliced}. That is the shape of a
+     * reused zero-allocation buffer refreshed by another thread the instant the validating scan finishes -
+     * the narrowest version of the window, and the one a reader that validates and then re-reads loses.
+     */
+    private static final class HandOffToken implements CharSequence {
+        private final String spliced;
+        private CharSequence current;
+        private boolean handedOff;
+
+        HandOffToken(String clean, String spliced) {
+            this.current = clean;
+            this.spliced = spliced;
+        }
+
+        @Override
+        public char charAt(int index) {
+            final char c = current.charAt(index);
+            if (!handedOff && index == current.length() - 1) {
+                handedOff = true;
+                current = spliced;
+            }
+            return c;
+        }
+
+        @Override
+        public int length() {
+            return current.length();
+        }
+
+        @Override
+        public CharSequence subSequence(int start, int end) {
+            return current.subSequence(start, end);
+        }
+
+        @Override
+        public String toString() {
+            // what a StringBuilder-backed buffer does: materialise whatever it currently holds
+            return current.toString();
         }
     }
 }
