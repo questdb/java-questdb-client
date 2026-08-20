@@ -431,6 +431,68 @@ public class FileTokenStoreTest {
     }
 
     @Test(timeout = 60_000)
+    public void testSameIdentityInDifferentDirectoriesDoesNotSerialize() throws Exception {
+        assertMemoryLeak(() -> {
+            // The mirror of testUnrelatedIdentitiesDoNotSerializeOnEachOther, along the other axis. That one
+            // varies the identity within one directory; this one keeps the identity and varies the
+            // directory - which is the shape this class's javadoc and the README actually prescribe for
+            // signing several application users in at once: "a store each, on a per-user directory".
+            //
+            // Those two stores hold DIFFERENT files, so serializing them buys nothing and costs everything
+            // the sibling test describes: the lock spans a whole token-endpoint round trip, its acquire has
+            // no budget, and getToken() sits on the ILP flush path.
+            //
+            // Same CyclicBarrier trick: it trips only when both callers are inside their critical section at
+            // once, which two callers sharing one lock can never be.
+            // distinct directories, not storeDir() twice - that helper returns one fixed path, and two
+            // stores over ONE directory are the case that must keep serializing
+            Path dirA = temp.getRoot().toPath().resolve("oidc-tokens-user-a");
+            Path dirB = temp.getRoot().toPath().resolve("oidc-tokens-user-b");
+            createStoreDir(dirA);
+            createStoreDir(dirB);
+            FileTokenStore storeA = new FileTokenStore(dirA, 30_000, 600_000);
+            FileTokenStore storeB = new FileTokenStore(dirB, 30_000, 600_000);
+            TokenStoreKey key = sampleKey();
+
+            CyclicBarrier bothInside = new CyclicBarrier(2);
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
+            AtomicInteger ran = new AtomicInteger();
+            TokenStore.CriticalSection section = () -> {
+                try {
+                    ran.incrementAndGet();
+                    bothInside.await(20, TimeUnit.SECONDS);
+                    return true;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            };
+
+            Thread tA = new Thread(() -> {
+                try {
+                    Assert.assertTrue(storeA.inLock(key, section));
+                } catch (Throwable t) {
+                    workerError.compareAndSet(null, t);
+                }
+            }, "store-a");
+            Thread tB = new Thread(() -> {
+                try {
+                    Assert.assertTrue(storeB.inLock(key, section));
+                } catch (Throwable t) {
+                    workerError.compareAndSet(null, t);
+                }
+            }, "store-b");
+            tA.start();
+            tB.start();
+            joinOrFail(tA, "store A");
+            joinOrFail(tB, "store B");
+
+            Assert.assertNull("one identity in two directories must not queue on a single in-process lock; "
+                    + "the barrier times out when they share one", workerError.get());
+            Assert.assertEquals("both critical sections must have run", 2, ran.get());
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testUnrelatedIdentitiesDoNotSerializeOnEachOther() throws Exception {
         assertMemoryLeak(() -> {
             // The in-process lock owes exactly one guarantee: two callers on the SAME identity must not run

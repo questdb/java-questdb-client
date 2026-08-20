@@ -212,6 +212,14 @@ public final class FileTokenStore implements TokenStore {
     private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
     private final Path directory;
     private final long lockAcquireBudgetMillis;
+    // Namespaces this store's entries in PROCESS_LOCKS, so two stores over DIFFERENT directories never
+    // contend even when they share one OIDC configuration. Normalized once here rather than per acquire:
+    // "a" and "./a" must not mint two locks over one directory, which would be the dangerous direction.
+    // toAbsolutePath().normalize() rather than toRealPath(): the directory may not exist yet (the store
+    // creates it lazily), and a key that changed once it did would be worse than one that ignores symlinks.
+    // Two stores reaching one directory through different symlinks therefore still get separate in-process
+    // locks; the cross-process lock file, which they DO share, remains the guard for that shape.
+    private final String lockNamespace;
     private final long lockStaleMillis;
 
     public FileTokenStore(Path directory) {
@@ -263,6 +271,7 @@ public final class FileTokenStore implements TokenStore {
             throw new OidcAuthException("the token store lockStaleMillis must be positive");
         }
         this.directory = directory;
+        this.lockNamespace = directory.toAbsolutePath().normalize().toString();
         this.lockAcquireBudgetMillis = lockAcquireBudgetMillis;
         this.lockStaleMillis = lockStaleMillis;
     }
@@ -363,7 +372,14 @@ public final class FileTokenStore implements TokenStore {
         }
         // Retain before the acquire and release in the outermost finally, so every exit - the interrupted
         // acquire below included - gives the claim back exactly once.
-        final ProcessLock processLock = retainProcessLock(key);
+        // Namespaced by DIRECTORY as well as identity. TokenStoreKey names a CONFIGURATION and carries no
+        // directory, so keying on it alone made two stores over per-user directories - the multi-user recipe
+        // this class and the README both prescribe - queue on one lock while touching different files. That
+        // lock is held across a whole token-endpoint round trip and its acquire has no budget, so one user's
+        // stalled refresh blocked another's getToken() on the flush path, for exactly the reason the stripe
+        // table considered above was rejected.
+        final String lockIdentity = processLockIdentity(key);
+        final ProcessLock processLock = retainProcessLock(lockIdentity);
         // lockInterruptibly, never lock(): a peer thread on this identity holds this for a whole refresh round
         // trip, and an interrupt is the ONLY lever that reaches a caller stuck behind it. QWP's
         // ConnectCancellation.cancel() interrupts a thread inside a credential pull precisely so close() can
@@ -377,7 +393,7 @@ public final class FileTokenStore implements TokenStore {
             // learns through the false return (OidcDeviceAuth turns it into a credential failure), while
             // leaving the flag set would break every later blocking call on this thread, including the
             // teardown the interrupt was sent to enable.
-            releaseProcessLock(key); // the acquire never happened, so give the claim straight back
+            releaseProcessLock(lockIdentity); // the acquire never happened, so give the claim straight back
             return false;
         }
         try {
@@ -460,7 +476,7 @@ public final class FileTokenStore implements TokenStore {
             }
         } finally {
             processLock.lock.unlock();
-            releaseProcessLock(key);
+            releaseProcessLock(lockIdentity);
         }
     }
 
@@ -794,15 +810,15 @@ public final class FileTokenStore implements TokenStore {
 
     // Drops this caller's claim on the identity's lock, retiring the entry when it was the last one, so the
     // map never outgrows the identities actually in flight. Pairs with retainProcessLock in a finally.
-    private static void releaseProcessLock(TokenStoreKey key) {
-        PROCESS_LOCKS.computeIfPresent(key.hash(), (identity, held) -> --held.users == 0 ? null : held);
+    private static void releaseProcessLock(String identity) {
+        PROCESS_LOCKS.computeIfPresent(identity, (k, held) -> --held.users == 0 ? null : held);
     }
 
     // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
     // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
     // it - which is what makes the retirement in releaseProcessLock safe.
-    private static ProcessLock retainProcessLock(TokenStoreKey key) {
-        return PROCESS_LOCKS.compute(key.hash(), (identity, existing) -> {
+    private static ProcessLock retainProcessLock(String identity) {
+        return PROCESS_LOCKS.compute(identity, (k, existing) -> {
             final ProcessLock held = existing != null ? existing : new ProcessLock();
             held.users++;
             return held;
@@ -1200,6 +1216,23 @@ public final class FileTokenStore implements TokenStore {
 
     private Path lockFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".lock");
+    }
+
+    /**
+     * The key this store's entry for {@code key} takes in {@link #PROCESS_LOCKS}: the normalized store
+     * directory and the identity fingerprint, NUL-separated.
+     * <p>
+     * Both halves are load-bearing. The fingerprint alone over-serializes, because it names a
+     * <em>configuration</em> and says nothing about where the entry lives - so two stores following the
+     * documented per-user-directory recipe would queue on one lock while touching different files, and that
+     * lock is held across a whole token-endpoint round trip with no acquire budget. The directory alone
+     * under-serializes, letting two identities in one directory run their read-refresh-write concurrently.
+     * <p>
+     * NUL is the separator for the reason {@code TokenStoreKey} uses it: a path can contain almost anything
+     * else, and two different (directory, identity) pairs must never render to one string.
+     */
+    private String processLockIdentity(TokenStoreKey key) {
+        return lockNamespace + '\0' + key.hash();
     }
 
     private void stealIfStale(Path lock) {
