@@ -520,8 +520,19 @@ public final class FileTokenStore implements TokenStore {
             try {
                 isDirectoryTrusted = ensureDirectory();
             } catch (IOException e) {
+                // THROW, do not return null. load()'s contract makes the two mean opposite things: null is
+                // the definitive "there is nothing here", which latches storeLoadAttempted and ends the
+                // reads for the life of the OidcDeviceAuth, while a throw reads as a transient fault and is
+                // retried under the store-load back-off. What ensureDirectory() reports here is squarely
+                // transient - Files.createDirectories failing because a home directory is not mounted yet,
+                // EIO/ESTALE on an NFS home, a momentarily read-only or full filesystem - so answering null
+                // told every later call that a store holding a perfectly good refresh token was empty. The
+                // process then re-runs the interactive device flow, and for the headless getToken()
+                // consumer this persistence exists to serve, that is a hard failure with no recovery short
+                // of a restart. The sibling arm below already throws for readBounded's IOException, and
+                // save() lets this very exception propagate; only this path disagreed.
                 warnUnprotectedStoreDirOnce("it could not be restricted to owner-only access");
-                return null;
+                throw new OidcAuthException(e).put("could not prepare the OIDC token store directory");
             }
             if (!isDirectoryTrusted) {
                 // The directory was WRITABLE by other local users until the tightening a moment ago, so

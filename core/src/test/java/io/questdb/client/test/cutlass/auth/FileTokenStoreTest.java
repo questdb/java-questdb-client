@@ -1674,6 +1674,34 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testLoadThrowsRatherThanReportsEmptyWhenTheDirectoryIsUnusable() throws Exception {
+        assertMemoryLeak(() -> {
+            // Same fixture as testInLockDegradesWhenDirectoryUnusable: a regular file standing where the
+            // store directory's parent must be makes ensureDirectory throw IOException. That fault is
+            // TRANSIENT in the field - a home directory not mounted yet, EIO/ESTALE on an NFS home, a
+            // momentarily read-only or full filesystem.
+            Path blocker = temp.getRoot().toPath().resolve("blocker");
+            Files.write(blocker, new byte[]{1});
+            FileTokenStore store = new FileTokenStore(blocker.resolve("oidc-tokens"));
+
+            try {
+                PersistedToken token = store.load(sampleKey());
+                Assert.fail("load must not report a definitive empty store for a transient directory fault; "
+                        + "returned " + token);
+            } catch (OidcAuthException expected) {
+                Assert.assertTrue(expected.getMessage(),
+                        expected.getMessage().contains("could not prepare the OIDC token store directory"));
+            }
+            // Why the distinction is not cosmetic: null is load()'s DEFINITIVE answer. OidcDeviceAuth
+            // latches storeLoadAttempted on it and never reads the store again for the life of the
+            // instance, so a momentary mount fault at the first getToken() would send a process that owns a
+            // good refresh token back through the interactive device flow - a hard failure for the headless
+            // consumer this persistence exists to serve. A throw is retried under the store-load back-off.
+            // save() already lets this same exception propagate; only load() disagreed.
+        });
+    }
+
+    @Test
     public void testLoadTrustsAWorldREADABLEDirectory() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
