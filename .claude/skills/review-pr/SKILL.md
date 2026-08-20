@@ -95,6 +95,7 @@ Capture the PR identifier in `$PR` after stripping the level token, then fetch m
 PR='<PR number or URL from $ARGUMENTS, with any level token removed>'
 gh pr view "$PR" --json number,title,body,labels,state
 gh pr diff "$PR"
+gh pr diff "$PR" --numstat   # binary files show as `-<TAB>-<TAB><path>`
 gh pr view "$PR" --comments
 BASE=$(gh pr view "$PR" --json baseRefOid --jq .baseRefOid)
 ```
@@ -110,6 +111,7 @@ HEAD='<head from --range, or empty for the working tree>'
 git diff "$BASE"${HEAD:+"...$HEAD"} --stat
 git diff "$BASE"${HEAD:+"...$HEAD"}
 git diff "$BASE"${HEAD:+"...$HEAD"} --name-only
+git diff "$BASE"${HEAD:+"...$HEAD"} --numstat   # binary files show as `-<TAB>-<TAB><path>`
 ```
 
 With `<head>` empty the diff includes uncommitted working-tree changes, which is
@@ -124,6 +126,17 @@ still the entry point, callsite analysis still walks outward beyond the changed
 files, and findings are still classified by the same rubric. Restricting the
 review to the changed files would disable the out-of-diff breakage analysis that
 is the most valuable part of this skill.
+
+### Committed-binary gate (mandatory at every level, both modes)
+
+Scan the `--numstat` output for any added or modified file git reports as
+binary (`-`/`-` in the added and deleted columns). This repo builds its native
+libraries from source in CI (`ci/build_native.yaml`, guarded by
+`.github/scripts/check-glibc-floor.sh`) and does not commit build outputs, so
+such a file is a **Critical** finding regardless of review level — report it
+even at level 0, and even when every other step is skipped. See the "Committed
+build artifacts" checklist for the rationale and the only acceptable
+exceptions.
 
 ## Step 2: PR title and description
 
@@ -281,7 +294,7 @@ The diff plus surface map can be large — write them to a shared file (e.g., un
 
 Use the following as a role catalog. Select only the roles allowed by the chosen level and change surface; do not launch the whole catalog.
 
-**Agent 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the QWP ingress / role-gating path, an in-place switch or failover, a `questdb` submodule bump that carries client or ingress changes, or the `questdb-ent/e2e` failover/switch suites, also verify the "Store-and-forward & pool startup invariants" checklist — a change that lets a running SF drainer surface transport errors to the producer, imposes a reconnect time budget on it, or hard-fails it on a transient outage is a Critical (data-loss) finding.
+**Agent 1 — Correctness & bugs:** NULL handling, edge cases, logic errors, off-by-one, operator precedence, error paths. Cross-reference every changed symbol against its callsite inventory and verify the new behavior is correct at each callsite. When the diff touches the store-and-forward sender, the async drainer / send loop, primary reconnect/failover, pool startup (`lazy_connect` / `initial_connect_retry` / `SenderPool` / `QueryClientPool`), or the QWP upgrade / role-gating path, also verify the "Store-and-forward & pool startup invariants" checklist — a running drainer that propagates a transport error to the caller, imposes a reconnect time budget, or hard-fails on a transient outage is a Critical (data-loss) finding.
 
 **Agent 2 — Concurrency:** Race conditions, shared mutable state, missing volatile, lock ordering, thread-safety of data structures. Use the implicit contract list (lock order, thread-affinity) and check every callsite from 2.5b for violations of the new contract.
 
@@ -325,7 +338,7 @@ that amplifies an otherwise-acceptable cost.
 
 **Agent 5 — Test review & coverage:** Coverage gaps, error path tests, NULL tests, boundary conditions, regression tests, test quality, `assertMemoryLeak()` usage. Cross-reference 2.5d: every cross-context exposure should have a test that exercises the changed symbol from that context. For each missing cross-context test, add an `UNTESTED` Step 2.6 row; do not predetermine its severity or publication. Consume the Step 2.6 coverage map: re-verify every claimed test and failure link (read the assertion, don't trust the map), and hunt for behavioral changes the map missed. Then run a **mutation spot-check**: pick the 3-5 most dangerous changed lines (boundary comparisons, error handling, null checks, off-by-one candidates) and ask, per line, "which test fails if this line is wrong — inverted condition, off-by-one, dropped null check?" When no assertion would catch a mutation, add an `UNTESTED` map row even if a test nominally executes the line; classify it under Step 2.6 and publish it only after Step 3b admission. **Enforce the "SQL test assertions (builder API — strict)" checklist on every added/modified test line: any new `assertSql(...)`/`assertPlanNoLeakCheck(...)`/`getPlan(...)`/`TestUtils.assertSql(...)` is Critical; any new `.returnsOnce(...)` on a deterministic (non-RNG, non-time-varying) query is Critical; a lone `assertQuery(...)` wrapped in `assertMemoryLeak(...)` is a finding.** Test *efficacy* (whether tests actually exercise the change and could fail) and test-*code* quality are handled by Agents 12-14 — here, focus only on whether coverage exists for every new or changed path.
 
-**Agent 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies. **Also check for unclosed LOG statements**: QuestDB logging uses a builder pattern (`LOG.info().$("msg").$()`) and every chain MUST end with `.$()` or `.I$()`. A missing close holds a ring buffer slot forever, causing other log producer threads to busy-wait in `nextBully()`, and the log consumer `logging_0` thread cannot progress either. Also watch for `.put()` instead of `.$()` in LOG chains — `.put()` returns `Utf16Sink`, not `LogRecord`, breaking the chain. Also flag throw-capable expressions inside LOG chains (`LOG.info().$(func()).$()`): arguments are evaluated after the ring slot is acquired, so a throwing `func()` unwinds past the terminator and leaks the slot; the call must be hoisted into a local before the chain starts.
+**Agent 6 — Code quality & standards:** Code smell, member ordering, naming conventions, modern Java features, dead code, third-party dependencies. **Also check for unclosed LOG statements**: QuestDB logging uses a builder pattern (`LOG.info().$("msg").$()`) and every chain MUST end with `.$()` or `.I$()`. A missing close holds a ring buffer slot forever, causing other log producer threads to busy-wait in `nextBully()`, and the log consumer `logging_0` thread cannot progress either. Also watch for `.put()` instead of `.$()` in LOG chains — `.put()` returns `Utf16Sink`, not `LogRecord`, breaking the chain. Also flag throw-capable expressions inside LOG chains (`LOG.info().$(func()).$()`): arguments are evaluated after the ring slot is acquired, so a throwing `func()` unwinds past the terminator and leaks the slot; the call must be hoisted into a local before the chain starts. Also scan the diff for any committed compiled binary / build artifact (read the `--numstat` output captured in Step 1 and flag every file git reports as binary) — the native libraries are built from source in CI, so a committed build output is a **Critical** finding (see the "Committed build artifacts" checklist).
 
 **Agent 7 — PR metadata & conventions:** Title format, description quality, commit messages, labels, SQL style in tests.
 
@@ -577,6 +590,30 @@ of the two categories it lands in, per the magnitude rule in Step 4.
 - Code smell: overly complex methods, deep nesting, unclear intent, dead code
 - No third-party Java dependencies on data paths
 
+### Committed build artifacts
+- **A newly committed compiled binary is always Critical.** This repo builds its
+  native libraries from source in CI (`ci/build_native.yaml`, guarded by
+  `.github/scripts/check-glibc-floor.sh`) and does not commit build outputs. A
+  binary added or modified in the diff cannot be reviewed, audited, or
+  reproduced from source, can smuggle in unaudited or malicious code, and bloats
+  the repo history irreversibly — so it blocks the merge.
+- Detect it structurally, not by extension alone: read the `--numstat` output
+  from Step 1 (or run `git diff --stat`) and flag every added/modified file git
+  reports as binary (`numstat` shows `-`/`-` for added/deleted lines; `--stat`
+  shows a `Bin ... -> ... bytes` marker). Typical offenders: `.so`, `.dylib`,
+  `.dll`, `.a`, `.o`, `.lib`, `.exe`, `.class`, `.jar`, `.war`, `.wasm`,
+  `.node`, `.bin`.
+- The finding stands even when the binary "looks" legitimate (e.g. a rebuilt
+  `libquestdb.*`): the correct source of these artifacts is the CI native-build
+  pipeline plus release packaging, never a PR diff.
+- **The only acceptable exceptions** are files that are inputs rather than
+  outputs: genuine test fixtures/resources (data a test reads), and the
+  checked-in CI tool jar (`ci/cover-checker-*.jar`) whose version bumps are a
+  pre-existing, deliberate decision. Both still need justifying in the PR; a
+  new binary outside these two classes never does.
+- Suggested fix: drop the binary from the PR, confirm a `.gitignore` entry
+  covers it, and let CI native-build + release packaging produce it.
+
 ### QuestDB coding standards
 - Class members grouped by kind (static vs instance) and visibility
 - Boolean names use `is...` / `has...` prefix
@@ -607,16 +644,13 @@ For each new or changed allocation site, verify:
 - **Nested SQL inherits the outer tracker.** Subqueries, the mat-view refresh inner SELECT, and WAL apply inner SQL must inherit the tracker already bound on the context, not acquire their own. A new acquisition site that acquires unconditionally (instead of only when no outer tracker is present) double-counts — flag it.
 - **Coverage has a test.** A newly wired allocator needs a `*MemoryTrackerTest` proving (a) a breach throws the per-query out-of-memory message, (b) an under-limit run succeeds, and (c) a `getCursor()`-to-close leak loop stays balanced. Record a missing tracker test or an unpinned factory-class routing guard as an `UNTESTED` Step 2.6 row; classify and publish it only through the normal proportionality and admission gates.
 
-### Store-and-forward & pool startup invariants (QWP client contract)
-Apply this whenever the diff touches the QWP ingress path (upgrade/role
-gating, in-place demote / lifecycle switch, connection handling on role
-change), replication failover, a `questdb` submodule bump that carries
-client (`java-questdb-client`) or ingress changes, or tests that drive a
-producer through a failover/switch window (e.g. the `questdb-ent/e2e`
-failover/switch suites). These are the CLIENT's store-and-forward
-guarantees (the client code lives in the nested `questdb/java-questdb-client`
-submodule); server-side changes and tests in this repo must be reviewed
-against them. A violation here is a **Critical** finding: the whole point of
+### Store-and-forward & pool startup invariants (QWP facade)
+Apply this whenever the diff touches the SF sender, the async drainer / send
+loop, primary reconnect/failover, `SenderPool` / `QueryClientPool` startup,
+`lazy_connect` or `initial_connect_retry`, the QWP upgrade / role-gating path
+and connection handling on a role change, or any test that drives a producer
+through a failover/switch window. These are this client's own store-and-forward
+guarantees. A violation here is a **Critical** finding: the whole point of
 store-and-forward is that a running producer never loses data and never
 hard-fails on a transient outage.
 
@@ -673,27 +707,33 @@ hard-fails on a transient outage.
 - `lazy_connect=true`: `build()` MUST succeed with **no server present**. The
   producing `Sender` must work immediately (writes buffer via SF), and once the
   server comes up the read side must also connect and read (reads are deferred,
-  not disabled).
+  not disabled). Verify `build()` does not fail-fast, the sender does not throw
+  on the first write while the server is down, and a later `borrowQuery()`
+  succeeds once the server is up.
 - `lazy_connect=false` (default): `build()` / the initial connect MUST expose
   connectivity problems to the caller — DNS errors, connect-refused /
   unreachable, TLS/cert, authentication/authorization, and connect/upgrade
   timeouts must all surface as a thrown exception at startup, not be swallowed.
+  Verify each of those failure classes reaches the user during initialization.
 - **In BOTH modes the boundary is the same:** connectivity errors are only
   ever the caller's problem DURING initialization. Once the client has
   connected and is past initialization, the running drainer reverts to the
   steady-state contract above — it must NEVER expose transport problems, NEVER
   impose a reconnect time budget, and NEVER hard-fail on a transient outage.
+  Anything that undermines the store-and-forward guarantee past init is
+  Critical.
 
-**Server-side & test application (this repo).**
-- The server MUST NOT rely on producer-visible role errors: an in-place
-  demote CLOSES QWP ingress connections (no per-write SECURITY_ERROR to an SF
-  sender). A server change that reintroduces per-write role errors on the QWP
-  ingress path breaks the containment contract above.
-- Flag any test (unit, integration, or e2e) that uses QWP producer-visible
-  role errors as evidence of the REPLICA write gate — under the containment
-  contract the producer is silent by design. Write-gate evidence belongs on
-  pg-wire probes, frozen commit counts on the settled replica, and
-  post-promotion SF drain (durable-ack await barriers + dense oracles).
+**Role changes on the wire (what the client may assume).**
+- The server does NOT surface a role change as a per-write error: an in-place
+  demote CLOSES the QWP ingress connection rather than answering an SF sender
+  with a per-write SECURITY_ERROR. Client code that treats a demote as a
+  per-write security failure — latching terminal, dropping the batch, or
+  propagating to the producer — is reading a signal the server does not send;
+  the correct handling is the transport-close path (reconnect, keep buffering).
+  Flag any client change that reintroduces that assumption.
+- Flag any test (unit or integration) that uses producer-visible role errors as
+  evidence of a write gate — under the containment contract the producer is
+  silent by design, so such a test asserts a signal that will not arrive.
 - Dense/count oracles over rows produced through an SF sender must account
   for at-least-once replay: durably ack (await) seed rows before the
   disturbance, or use a DEDUP table — otherwise the oracle reports replay
@@ -800,6 +840,7 @@ Severity is a function of **what the user loses**, not of which checklist the fi
 - **wrong or missing data** — incorrect query results, silent truncation, lost or duplicated rows, corrupted on-disk state, divergent replica, wrong materialized-view content;
 - **a crash, hang, or unavailability** — panic, deadlock, livelock, unbounded loop, OOM, fd/thread/connection exhaustion, or a leak that grows without bound under a repeatable operation;
 - **a security or ACL failure** — privilege bypass, permission not enforced, credential or cross-tenant data exposure;
+- **unauditable code shipped to users** — a compiled binary or other build output committed in the diff: it cannot be reviewed, reproduced from source, or audited, so unvetted (or malicious) code reaches the released artifact;
 - **a broken or misleading failure mode** — an operation that fails with no error or the wrong error, an error message the user cannot act on, an exception swallowed so failure looks like success, a fault lost or unlogged such that an incident cannot be diagnosed;
 - **a compatibility break** — on-disk format, wire protocol, public/SQL/JNI API, or config semantics changed so existing clients, existing data, or a rolling upgrade break;
 - **a performance or IO regression the user can feel** — per the magnitude rule below;
@@ -843,6 +884,8 @@ Blocking issues introduced or exposed by this PR, ordered worst user impact firs
 - For out-of-diff-breakage: the callsite that triggers it, plus the violated contract — cite it from 2.5c at level 2+, or state it inline at levels 0-1 where 2.5c is not built
 - For performance findings: the magnitude statement (the multiplier and what it multiplies)
 - Suggested fix, written to be applied in THIS PR
+
+**A newly committed compiled binary or other build artifact is always Critical**, no matter how legitimate it looks — native libraries are built from source in CI, so a build output in the diff is never acceptable (see the "Committed build artifacts" checklist). This one is a supply-chain gate rather than a behavioral defect: the `--numstat` evidence from Step 1 is the whole proof, so the net determination and the base-behavior check are recorded as `N/A — static`.
 
 Pre-existing/not-attributed observations are never Critical; a fully proved one belongs under Adjacent findings instead.
 
