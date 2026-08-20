@@ -1108,8 +1108,12 @@ public class QwpWebSocketSender implements Sender {
         // throw instead of an indefinite "not yet". The durability latch
         // above is transient: it throws while latched, and clears once a
         // later periodic sync pass fully succeeds so producers can resume.
-        if (cursorSendLoop != null) {
-            cursorSendLoop.checkError();
+        // Snapshot for the same reason as engine above: the recycle nulls
+        // cursorSendLoop on the producer thread, so a double read here could
+        // NPE between the check and the call.
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        if (loop != null) {
+            loop.checkError();
         }
         checkConnectionError();
         if (targetFsn >= 0) {
@@ -1129,8 +1133,9 @@ public class QwpWebSocketSender implements Sender {
         long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         while (engine.ackedFsn() < targetFsn) {
             engine.checkDurability();
-            if (cursorSendLoop != null) {
-                cursorSendLoop.checkError();
+            loop = cursorSendLoop;
+            if (loop != null) {
+                loop.checkError();
             }
             checkConnectionError();
             if (System.nanoTime() >= deadlineNanos) {
@@ -4954,15 +4959,17 @@ public class QwpWebSocketSender implements Sender {
      * the await budget (a genuinely dead worker) latches terminal.
      * <p>
      * Step 7 is deliberately exempt from that latch. By then the swap has
-     * committed, so a failed connect leaves a fully coherent sender that is
+     * committed, so a failed step-7 setup (dispatcher construction, loop
+     * build/start -- environmental, since the socket connect itself is
+     * deferred to the I/O thread) leaves a fully coherent sender that is
      * merely disconnected: {@code connected == false}, loop and client already
      * closed and nulled by {@link #ensureConnected()}'s own catch, the fresh
      * engine attached, and the step-5 counters ({@link #symbolDictEpoch},
      * {@link #symbolDictResetsPerformed}) correctly left incremented because
      * the swap really did happen. It rethrows loudly to the triggering caller
      * but the sender stays usable, and the ordinary
-     * {@code sendRow() -> ensureConnected()} path retries the connect -- and
-     * only the connect -- on the next send. Nothing can fire a second swap
+     * {@code sendRow() -> ensureConnected()} path retries the deferred setup
+     * -- and only that -- on the next send. Nothing can fire a second swap
      * meanwhile: the fresh dictionary is below threshold,
      * {@code manualResetRequested} was consumed at step 5, and
      * {@link #maybeRecycleForDictReset()} requires {@code connected}.
@@ -5060,9 +5067,9 @@ public class QwpWebSocketSender implements Sender {
         try {
             ensureConnected();
         } catch (Throwable t) {
-            LOG.warn("symbol dictionary swap committed but its reconnect failed; sender stays "
-                            + "disconnected on the fresh epoch and retries the connect on the "
-                            + "next send [epoch={}, dictSizeAtSwap={}]",
+            LOG.warn("symbol dictionary swap committed but starting its deferred reconnect "
+                            + "failed; sender stays disconnected on the fresh epoch and retries "
+                            + "the setup on the next send [epoch={}, dictSizeAtSwap={}]",
                     symbolDictEpoch, dictSizeAtSwap, t);
             if (t instanceof LineSenderException) {
                 throw (LineSenderException) t;
