@@ -121,19 +121,21 @@ public class SymbolDictRecycleCatchUpSkipTest {
                     Assert.assertEquals(1, handler.connectionsAccepted.get());
                     Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
-                    // Ring drained: this table() call recycles synchronously onto a fresh
-                    // connection (2), a fresh (empty) engine/dictionary/epoch, and "c" is
-                    // then the new epoch's own first symbol.
+                    // Ring drained: this table() call recycles synchronously (steps 1-6:
+                    // fresh empty engine/dictionary/epoch), and "c" is then the new
+                    // epoch's own first symbol. The fresh connection (2) itself is the
+                    // I/O thread's job and completes asynchronously -- confirmed below,
+                    // after an acked post-recycle frame proves it is up.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals("recycle must open a fresh connection",
-                            2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("epoch-1 batch must be acked before the unplanned drop",
                             sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("recycle must open a fresh connection",
+                            2, server.handshakeCount());
 
                     // --- Pin 1 + 2: zero catch-up frames, dictionary tiles from 0. ---
                     // Connection 2 is the FIRST connection after the recycle: its loop's

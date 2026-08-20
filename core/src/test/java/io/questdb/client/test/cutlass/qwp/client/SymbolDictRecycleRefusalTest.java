@@ -114,14 +114,14 @@ public class SymbolDictRecycleRefusalTest {
                     sender.table("t");
                     Assert.assertFalse("recycle must fire once the backlog drains", ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals("recycle must open a fresh connection",
-                            2, server.handshakeCount());
 
                     // Ingestion continues on the fresh epoch.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-recycle batch must still get acked",
                             sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("recycle must open a fresh connection",
+                            2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > fsn1);
                 }
             }
@@ -193,11 +193,11 @@ public class SymbolDictRecycleRefusalTest {
                                     + "and acked",
                             ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn3 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn3, 5_000));
+                    Assert.assertEquals(2, server.handshakeCount());
                     Assert.assertTrue(fsn3 > fsn2);
                 }
             }
@@ -281,11 +281,11 @@ public class SymbolDictRecycleRefusalTest {
                                     + "drains",
                             ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 2L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals(2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > fsn1);
                 }
             }
@@ -346,11 +346,11 @@ public class SymbolDictRecycleRefusalTest {
                     Assert.assertFalse("recycle must fire once the group is committed and acked",
                             ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals(2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > commitFsn);
                 }
             }
@@ -423,11 +423,11 @@ public class SymbolDictRecycleRefusalTest {
                                     + "drained",
                             sender.isResetArmed());
                     Assert.assertEquals(1, sender.getSymbolDictEpoch());
-                    Assert.assertEquals(2, server.handshakeCount());
 
                     sender.table("t").longColumn("v", 2L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals(2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > fsn1);
                 } finally {
                     sender.close();
@@ -504,13 +504,13 @@ public class SymbolDictRecycleRefusalTest {
                                     + "in-progress row",
                             ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(2, server.handshakeCount());
 
                     // Ingestion continues correctly post-swap: a fresh row
                     // lands and gets acked with no exception.
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals(2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > fsn1);
                 }
             }

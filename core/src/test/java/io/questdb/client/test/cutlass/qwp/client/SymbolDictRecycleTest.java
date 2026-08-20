@@ -60,8 +60,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * barrier hook + {@code recycleForDictReset()}): tears the cursor engine and
  * I/O loop down once the ring is proven drained, replaces the producer's
  * global symbol dictionary, and rebuilds the engine on the same (now-empty)
- * slot before reconnecting -- all synchronously inside a single
- * {@code table()} call.
+ * slot -- all synchronously inside a single {@code table()} call. The fresh
+ * WebSocket handshake itself (the reconnect) is deferred to the I/O thread
+ * and completes asynchronously.
  */
 public class SymbolDictRecycleTest {
 
@@ -94,21 +95,19 @@ public class SymbolDictRecycleTest {
 
                     // The ring is drained (everything acked) and no row is in
                     // progress, so this table() call must recycle synchronously.
-                    // ensureConnected() performs the fresh WebSocket handshake
-                    // synchronously as part of the swap, before any data is sent --
-                    // handshakeCount (not the handler's own onBinaryMessage-driven
-                    // counter, which only advances once a frame actually arrives)
-                    // observes that handshake immediately.
+                    // The fresh WebSocket handshake is the I/O thread's job and
+                    // completes asynchronously -- it is asserted below, after an
+                    // acked post-recycle frame proves the connection is up.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals("recycle must open a fresh connection",
-                            2, server.handshakeCount());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-recycle batch must still get acked",
                             sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("recycle must open a fresh connection",
+                            2, server.handshakeCount());
                     Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
                                     + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']',
                             fsn2 > fsn1);
@@ -236,8 +235,9 @@ public class SymbolDictRecycleTest {
                     CursorSendEngine before = ws.getCursorEngineForTesting();
 
                     // Synchronous swap: by the time table() returns, the old engine
-                    // is gone and a fresh one is rebuilt and reconnected. Asserting
-                    // right here needs no polling -- there is no window to race.
+                    // is gone and a fresh one is rebuilt (the reconnect itself defers
+                    // to the I/O thread). Asserting engine identity right here needs
+                    // no polling -- there is no window to race for that.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
 
                     CursorSendEngine after = ws.getCursorEngineForTesting();
@@ -299,14 +299,14 @@ public class SymbolDictRecycleTest {
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals("recycle must open a fresh connection",
-                            2, server.handshakeCount());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-recycle batch must still get durably acked on the "
                                     + "fresh connection",
                             sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("recycle must open a fresh connection",
+                            2, server.handshakeCount());
                     Assert.assertTrue(fsn2 > fsn1);
                 }
             }

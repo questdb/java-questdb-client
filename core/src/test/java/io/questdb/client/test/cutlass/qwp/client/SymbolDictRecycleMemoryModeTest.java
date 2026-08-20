@@ -84,17 +84,20 @@ public class SymbolDictRecycleMemoryModeTest {
                     Assert.assertEquals(0, ws.getSymbolDictEpoch());
 
                     // Ring drained, no row in progress: this table() call must
-                    // recycle synchronously, exactly as in SF mode.
+                    // recycle synchronously, exactly as in SF mode. The fresh
+                    // WebSocket handshake is the I/O thread's job and completes
+                    // asynchronously -- it is asserted below, after an acked
+                    // post-recycle frame proves the connection is up.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                    Assert.assertEquals("recycle must open a fresh connection",
-                            2, server.handshakeCount());
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
 
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue("post-recycle batch must still get acked",
                             sender.awaitAckedFsn(fsn2, 5_000));
+                    Assert.assertEquals("recycle must open a fresh connection",
+                            2, server.handshakeCount());
                     Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
                                     + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']',
                             fsn2 > fsn1);
@@ -187,15 +190,14 @@ public class SymbolDictRecycleMemoryModeTest {
      * {@code initial_connect_retry=async} defers even the FIRST connect to the
      * I/O thread ({@code ensureConnected()}'s {@code ASYNC} arm leaves
      * {@code client == null} and lets {@code CursorWebSocketSendLoop} dial in the
-     * background) -- and {@code recycleForDictReset()}'s step 7 reconnect reuses
-     * the exact same {@code initialConnectMode} switch, so the post-recycle
-     * connection is ALSO dialled asynchronously rather than inline on the
-     * producer thread that called {@code table()}. Only the producer-side halves
-     * of the swap (steps 4-6: FSN epoch roll, dictionary swap, engine rebuild)
-     * are guaranteed synchronous by the time {@code table()} returns; the fresh
-     * handshake itself must be awaited separately here, unlike the SYNC-mode
-     * tests above where {@code server.handshakeCount()} is already correct the
-     * instant {@code table()} returns.
+     * background). {@code recycleForDictReset()}'s step 7 reconnect defers to
+     * the I/O thread on every sender regardless of {@code initialConnectMode}
+     * (a re-entry past the sender's first {@code ensureConnected()} completion
+     * always takes the {@code ASYNC} branch) -- this test just happens to also
+     * start out that way. Only the producer-side halves of the swap (steps
+     * 4-6: FSN epoch roll, dictionary swap, engine rebuild) are guaranteed
+     * synchronous by the time {@code table()} returns; the fresh handshake
+     * itself must always be awaited separately, exactly like the tests above.
      */
     @Test
     public void testRecycleUnderAsyncInitialConnect() throws Exception {
@@ -271,11 +273,12 @@ public class SymbolDictRecycleMemoryModeTest {
 
     /**
      * Spins until the I/O thread has completed the deferred ASYNC initial
-     * connect. Needed only for the async test above: SYNC/OFF-mode recycle
-     * blocks {@code table()} until the fresh handshake completes, so those
-     * tests observe connectedness synchronously, but ASYNC mode hands the
-     * connect off to the I/O thread and returns control to the caller before
-     * it necessarily lands.
+     * connect. Needed only for the async test above, to let its first connect
+     * land before driving any traffic through it -- {@code
+     * recycleForDictReset()}'s step 7 reconnect always defers to the I/O
+     * thread regardless of {@code initialConnectMode}, so waiting for THAT
+     * handshake is instead done via the post-recycle {@code awaitAckedFsn}
+     * throughout this file, not this helper.
      */
     private static void awaitWasEverConnected(QwpWebSocketSender ws) {
         long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
