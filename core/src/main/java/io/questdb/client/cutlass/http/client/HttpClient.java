@@ -585,6 +585,19 @@ public abstract class HttpClient implements QuietCloseable {
             return ss.toString();
         }
 
+        /**
+         * Rewinds the write pointer to {@code contentLen} bytes into the content section, discarding
+         * whatever was written past it.
+         * <p>
+         * A request that has not reached {@code withContent()} yet has no content section to rewind, and
+         * the sentinel guard below is the only thing standing between that state and a SIGSEGV: without it
+         * the pointer becomes {@code -1 + contentLen} and the next write to the buffer takes the process
+         * down. That state is ordinary, not exotic - an ILP request with an {@code httpTokenProvider} sits
+         * at the header stage between every flush and the next row - and {@code Request} is exported, so an
+         * external caller can reach it too. {@code HttpClientRequestTrimTest} pins it.
+         *
+         * @param contentLen the content length to rewind to
+         */
         public void trimContentToLen(int contentLen) {
             if (contentStart < 0) {
                 // withContent() has not started a content section yet, so contentStart is the -1 sentinel

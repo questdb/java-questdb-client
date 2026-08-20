@@ -487,15 +487,12 @@ public abstract class AbstractLineHttpSender implements Sender {
     @Override
     public void cancelRow() {
         validateNotClosed();
-        if (isTokenPending) {
-            // newRequest() left the request at the header stage with the provider token deferred, so
-            // withContent() has not run and contentStart is still -1 (getContentLength() reads 0): no row
-            // bytes were written, so there is nothing to trim. trimContentToLen(0) would set the write
-            // pointer to contentStart + 0 == -1 and the next buffer write would segfault. Just reset the
-            // row state and leave the token pending for the next row.
-            state = RequestState.EMPTY;
-            return;
-        }
+        // While isTokenPending, newRequest() has left the request at the header stage: withContent() has not
+        // run, contentStart is still the -1 sentinel, and no row bytes exist to trim. trimContentToLen is
+        // guarded against exactly that state and no-ops, so this needs no second guard of its own - one that
+        // could never be observed to be missing, since the other one masks it. The guard that survives is
+        // the one that protects every caller of an exported method, not just this one; it is pinned by
+        // HttpClientRequestTrimTest. Do not re-add a check here: add coverage there instead.
         request.trimContentToLen(rowBookmark);
         state = RequestState.EMPTY;
     }
