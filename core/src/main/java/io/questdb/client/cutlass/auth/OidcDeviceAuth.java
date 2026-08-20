@@ -855,7 +855,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             // pointed wherever those keys said. The token and device-authorization paths already gate on
             // status; this one did not.
             requireSuccessStatus(client, response, body, statusError);
-            // parseBody enforces a wall-clock deadline and a byte cap so an untrusted server cannot wedge
+            // parseBody enforces an elapsed-time deadline and a byte cap so an untrusted server cannot wedge
             // discovery, and its parseLast rejects a truncated document
             parseBody(body, lexer, parser, DEFAULT_HTTP_TIMEOUT_MILLIS);
         } catch (HttpClientException | HttpException e) {
@@ -1021,8 +1021,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private static void parseBody(Response body, JsonLexer lexer, JsonParser parser, int timeoutMillis) throws JsonException {
-        // read and parse the whole body, bounded by a wall-clock deadline and a cumulative byte cap, so a
-        // hostile or stalled server cannot wedge the thread by dribbling or endlessly streaming
+        // read and parse the whole body, bounded by an elapsed-time deadline and a cumulative byte cap, so a
+        // hostile or stalled server cannot wedge the thread by dribbling or endlessly streaming. nanoTime,
+        // not the wall clock: an NTP step or an operator setting the date back must not stretch this bound,
+        // which is the only thing standing between a dribbling identity provider and a wedged caller.
         final long deadlineNanos = System.nanoTime() + timeoutMillis * 1_000_000L;
         long totalBytes = 0;
         while (true) {
@@ -1686,7 +1688,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             response.await(httpTimeoutMillis);
             readResponse(client, response, parser);
         } catch (HttpClientException e) {
-            // a transport failure, or a bounded-read abort in parseBody (its wall-clock deadline or the
+            // a transport failure, or a bounded-read abort in parseBody (its elapsed-time deadline or the
             // MAX_RESPONSE_BODY_BYTES cap), leaves the response half-read with unconsumed bytes in this
             // cached keep-alive connection. Drop it so the next poll or refresh reconnects with a clean
             // socket instead of parsing the previous response's leftovers - which pollForToken would

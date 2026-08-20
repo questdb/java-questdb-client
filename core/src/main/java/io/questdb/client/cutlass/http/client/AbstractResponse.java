@@ -69,7 +69,7 @@ public abstract class AbstractResponse implements Response, Fragment {
             // without consuming the full timeout - e.g. an incomplete TLS record that decrypts to no
             // application bytes - so without one shared deadline a server dribbling such reads would
             // re-arm the full timeout on every iteration and keep this recv() running without bound,
-            // defeating a caller's wall-clock bound (e.g. OidcDeviceAuth.parseBody). A non-positive
+            // defeating a caller's elapsed-time bound (e.g. OidcDeviceAuth.parseBody). A non-positive
             // timeout keeps the legacy "no bound" behaviour.
             final boolean bounded = timeout > 0;
             final long startNanos = bounded ? System.nanoTime() : 0L;

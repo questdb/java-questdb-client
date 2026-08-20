@@ -739,7 +739,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                     // tuned-low request_timeout paired with request_min_throughput would abort a large,
                     // still-progressing chunked body. This bounds each read, not the whole body cumulatively -
                     // fine here because the ILP server is trusted (unlike OidcDeviceAuth.parseBody, which also
-                    // caps total bytes and wall-clock time against an untrusted identity provider).
+                    // caps total bytes and elapsed time against an untrusted identity provider).
                     // A 2xx IS the commit: the server already has these rows. Draining its response body
                     // afterwards is only bookkeeping to keep the connection reusable, so a failure there must
                     // not escape into the catch below, which treats HttpClientException as a transport error
