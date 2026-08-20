@@ -491,13 +491,17 @@ public final class BackgroundDrainer implements Runnable {
                     capabilityGapAttempts = 0;
                     capabilityGapElapsedNanos = 0L;
                     lastCapabilityGapNanos = 0L;
+                    // the CLAMPED dwell, which is the one the gate above just applied. Reporting the raw
+                    // reconnect_max_duration_millis here was misleading exactly where the clamp matters: a
+                    // saturated budget rendered as "dwell 12ms/9223372036854775807ms", telling an operator the
+                    // ride-out would never end when it was in fact bounded at the ceiling.
                     LOG.warn("drainer slot {} attempt {} (threshold {}, dwell {}ms/{}ms): "
                                     + "the rotating credential was rejected ({}); retrying with a freshly pulled "
                                     + "token after backoff",
                             slotPath, dynamicCredentialAuthAttempts,
                             DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS,
                             dynamicCredentialAuthElapsedNanos / 1_000_000L,
-                            reconnectMaxDurationMillis, e.getMessage());
+                            dynamicCredentialAuthDwellNanos / 1_000_000L, e.getMessage());
                     // fall through to the shared capped-backoff block
                 } else {
                     String msg = e.getMessage();
@@ -750,6 +754,27 @@ public final class BackgroundDrainer implements Runnable {
     /** True once {@link #requestStop()} has been called. */
     public boolean isStopRequested() {
         return stopRequested;
+    }
+
+    /**
+     * Pre-ages the rotating-credential rejection anchor so a test can reach the
+     * {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} ceiling without waiting it out in real time.
+     * <p>
+     * The clamp on the connect loop's dwell is otherwise unobservable end to end. Every other drainer test
+     * configures a dwell far below the ceiling, where {@code Math.min} returns its first argument either
+     * way, so the loop reverting to the raw budget leaves them all green - while a saturated
+     * {@code reconnect_max_duration_millis} makes the gate's second conjunct unsatisfiable and an orphan
+     * drainer sweeps forever, pinning the slot lock and one pool worker. Proving it honestly instead means
+     * waiting out the ceiling, which is five minutes of wall clock per run.
+     *
+     * @param ageNanos how long ago the current run of rejections should appear to have begun
+     */
+    @TestOnly
+    public void ageDynamicCredentialAuthAnchorForTesting(long ageNanos) {
+        long anchor = System.nanoTime() - ageNanos;
+        // 0 is the "no rejection observed yet" sentinel, and the connect loop overwrites it on the next
+        // rejection - which would silently undo the ageing and make the test pass for the wrong reason.
+        firstDynamicCredentialAuthFailureNanos = anchor != 0L ? anchor : 1L;
     }
 
     /**

@@ -389,10 +389,12 @@ public class BackgroundDrainerDurableAckRetryTest {
         // ended: the drainer swept forever, never wrote the .failed sentinel, never reported DATA_LOSS, and
         // pinned the slot lock plus one worker of a FIXED-size drainer pool for the life of the process.
         //
-        // Asserted on the clamp directly rather than end to end: proving it through connectWithDurableAckRetry
-        // means waiting out the ceiling, five minutes of wall clock. The other half of the argument - that a
-        // FINITE dwell does quarantine - is what testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted
-        // drives, with a 25ms budget. Finite dwell quarantines, and the dwell is always finite.
+        // This pins the clamp as a FUNCTION. On its own that proves nothing about the connect loop, which
+        // could go on using the raw budget - so testConnectLoopAppliesTheClampedRotating401Dwell drives the
+        // loop itself against a saturated reconnect_max_duration_millis, pre-ageing the rejection anchor past
+        // the ceiling rather than waiting out five minutes of wall clock. Keep the two together: neither
+        // half is worth much alone. The third leg - that a FINITE dwell does quarantine - is
+        // testRotatingCredentialAuthRejectionQuarantinesOnceBudgetExhausted, with a 250ms budget.
         long ceilingNanos = TimeUnit.MILLISECONDS.toNanos(
                 BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS);
 
@@ -410,6 +412,58 @@ public class BackgroundDrainerDurableAckRetryTest {
         assertEquals("including the default, which IS the ceiling", ceilingNanos,
                 BackgroundDrainer.dynamicCredentialAuthDwellNanos(
                         CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS));
+    }
+
+    @Test(timeout = 60_000)
+    public void testConnectLoopAppliesTheClampedRotating401Dwell() throws Exception {
+        assertMemoryLeak(() -> {
+            // The clamp asserted above is a pure function; this asserts the CALL SITE applies it. Nothing
+            // else does: every other end-to-end test here configures a dwell far below the ceiling, where
+            // Math.min returns its first argument either way, so the connect loop reverting to the raw
+            // TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis) leaves all of them green - and
+            // reconnect_max_duration_millis is validated only as > 0, with Long.MAX_VALUE the documented way
+            // to ask a reconnect never to give up. Saturated, the dwell conjunct can never be satisfied, so
+            // the ride-out never ends: no .failed sentinel, no DATA_LOSS report, and the slot lock plus one
+            // worker of a FIXED-size drainer pool pinned for the life of the process.
+            //
+            // Reaching the ceiling honestly costs five minutes of wall clock, so the rejection anchor is
+            // pre-aged past it instead and the loop runs for real against it.
+            final long anchorAgeMillis = BackgroundDrainer.MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS * 2;
+            // Bounds the counterfactual: unclamped, the loop never escalates, and without this it would run
+            // to the test timeout with nothing to say. Stopping it turns that into a named assertion
+            // failure on outcome() instead. Well clear of the six attempts a clamped run needs.
+            final int stopAfterAttempts = BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS * 5;
+            final BackgroundDrainer[] ref = new BackgroundDrainer[1];
+            AtomicInteger scripted = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+                if (scripted.incrementAndGet() >= stopAfterAttempts) {
+                    ref[0].requestStop();
+                }
+                return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+            }).withDynamicCredential();
+
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, Long.MAX_VALUE, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            ref[0] = drainer;
+            drainer.ageDynamicCredentialAuthAnchorForTesting(
+                    TimeUnit.MILLISECONDS.toNanos(anchorAgeMillis));
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            assertNull(drainer.connectWithDurableAckRetry());
+            // FAILED, not STOPPED: STOPPED means the loop was still riding out rejections when the factory
+            // pulled the plug, which is precisely what an unclamped dwell does.
+            assertEquals("a saturated reconnect_max_duration_millis must not disable the escalation - the "
+                            + "connect loop has to use the CLAMPED dwell [attempts=" + factory.attempts() + "]",
+                    BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            // The dwell was already satisfied before the first sweep, so the attempt threshold is what the
+            // quarantine waited for - it must fire on exactly that attempt, not later.
+            assertEquals("quarantine must fall on the attempt threshold once the dwell is behind it",
+                    BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
     }
 
     @Test(timeout = 60_000)
