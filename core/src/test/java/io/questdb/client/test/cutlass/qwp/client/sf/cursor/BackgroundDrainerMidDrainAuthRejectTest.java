@@ -90,7 +90,7 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
     private static final long FAST_BACKOFF_MILLIS = 1L;
     private static final long RECONNECT_MAX_DURATION_MILLIS = 25L;
     private static final int SEEDED_FRAMES = 5;
-    private static final long SEGMENT_SIZE_BYTES = 16384L;
+    private static final long SEGMENT_SIZE_BYTES = 16_384L;
     private static final long SF_MAX_TOTAL_BYTES = 1L << 20;
 
     private String slotPath;

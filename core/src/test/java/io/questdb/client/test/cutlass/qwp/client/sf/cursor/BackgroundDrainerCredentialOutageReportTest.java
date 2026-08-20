@@ -95,7 +95,7 @@ public class BackgroundDrainerCredentialOutageReportTest {
     private static final String PROVIDER_FAILURE_MESSAGE = "refresh token revoked by the IdP";
     private static final long RECONNECT_MAX_DURATION_MILLIS = 25L;
     private static final int SEEDED_FRAMES = 5;
-    private static final long SEGMENT_SIZE_BYTES = 16384L;
+    private static final long SEGMENT_SIZE_BYTES = 16_384L;
     private static final long SF_MAX_TOTAL_BYTES = 1L << 20;
     private static final String TABLE = "trades";
 
