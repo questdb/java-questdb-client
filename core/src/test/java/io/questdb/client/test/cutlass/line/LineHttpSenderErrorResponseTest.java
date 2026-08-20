@@ -198,6 +198,13 @@ public class LineHttpSenderErrorResponseTest {
                                 msg.contains("http-status=401"));
                         Assert.assertFalse("a definitive 401 must not be reported as a transport failure: " + msg,
                                 msg.contains("Connection Failed"));
+                        // and WHY the body could not be read, which is the half the status cannot supply:
+                        // a read that timed out, a peer that vanished and a mangled chunk all arrive here
+                        // as the same status, and only this tells an operator which one to act on
+                        Assert.assertTrue("the reason the body read failed must reach the caller: " + msg,
+                                msg.contains("reason=") && !msg.contains("reason=<none>"));
+                        Assert.assertTrue("and it must be the read abort, not something invented: " + msg,
+                                msg.contains("timed out"));
                         Assert.assertTrue("a definitive status must not spend the retry budget: "
                                 + elapsedMillis + "ms", elapsedMillis < 3_000);
                         Assert.assertEquals("a definitive status must not be retried", 1, requests.get());

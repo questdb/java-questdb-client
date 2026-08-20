@@ -926,8 +926,19 @@ public abstract class AbstractLineHttpSender implements Sender {
             throwOnHttpErrorResponse0(statusCode, response, retryable, timeoutMillis);
         } catch (HttpClientException e) {
             client.disconnect();
+            // Carry the reason across. The status is the verdict, but WHY the body could not be read is the
+            // actionable half, and the three shapes call for different responses: "timed out reading the
+            // chunked response body" points at the flush timeout, "peer disconnect [errno=54]" at the
+            // connection, "malformed chunk size" at an intermediary mangling the framing. Binding e and
+            // dropping it left an operator a status and no way to tell those apart, on a path that has
+            // already disconnected. Plain put, not putAsPrintable: HttpClientException's messages are
+            // client-authored constants plus an errno, so unlike the status beside them they carry no
+            // server-supplied bytes.
+            final String reason = e.getMessage();
             throw new LineSenderException("Could not flush buffer: could not read the error response body", retryable)
-                    .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence()).put(']');
+                    .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence())
+                    .put(", reason=").put(reason != null ? reason : "<none>")
+                    .put(']');
         }
     }
 
