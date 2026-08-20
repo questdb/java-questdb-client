@@ -1029,15 +1029,6 @@ public abstract class AbstractLineHttpSender implements Sender {
     }
 
     /**
-     * Rejects a row terminator that no row precedes. Subclasses MUST call this before writing the first byte
-     * of a terminator, not after: with an httpTokenProvider configured, newRequest() leaves the request at the
-     * header stage (withContent() deferred until the first row stamps the Authorization header), so a write
-     * that lands here while the state is EMPTY goes into the HTTP HEADER block, not the request body. Those
-     * bytes then start a line that folds the following "Authorization: Bearer ..." into the previous header
-     * (RFC 7230 obs-fold), and the request ships with no credential at all. cancelRow() cannot undo it either:
-     * trimContentToLen only rewinds within the content section.
-     */
-    /**
      * Writes the row terminator and closes the row, WITHOUT re-checking that a row was started - the caller
      * has already done it.
      * <p>
@@ -1056,6 +1047,15 @@ public abstract class AbstractLineHttpSender implements Sender {
         }
     }
 
+    /**
+     * Rejects a row terminator that no row precedes. Subclasses MUST call this before writing the first byte
+     * of a terminator, not after: with an httpTokenProvider configured, newRequest() leaves the request at the
+     * header stage (withContent() deferred until the first row stamps the Authorization header), so a write
+     * that lands here while the state is EMPTY goes into the HTTP HEADER block, not the request body. Those
+     * bytes then start a line that folds the following "Authorization: Bearer ..." into the previous header
+     * (RFC 7230 obs-fold), and the request ships with no credential at all. cancelRow() cannot undo it either:
+     * trimContentToLen only rewinds within the content section.
+     */
     protected void validateRowStarted() {
         switch (state) {
             case EMPTY:

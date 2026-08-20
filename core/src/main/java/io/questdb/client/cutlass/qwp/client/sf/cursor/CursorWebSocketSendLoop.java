@@ -88,16 +88,6 @@ import java.util.concurrent.locks.LockSupport;
 public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
-     * Default cadence for the keepalive PING the I/O loop emits while
-     * waiting on STATUS_DURABLE_ACK frames. See
-     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
-     * server only flushes pending durable-ack frames on inbound recv
-     * events, so an opted-in idle client has to prod it. {@code 200} ms
-     * trades one PING per 200 ms per idle opted-in connection for
-     * sub-second confirmation latency once the upload completes
-     * server-side. {@code 0} or negative disables the keepalive entirely.
-     */
-    /**
      * Bounded-await backstop for {@link #close()}: the maximum time close()
      * waits for the I/O thread to stop (count down {@code shutdownLatch})
      * before it loud-fails and delegates final teardown to the I/O thread's
@@ -120,6 +110,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * rather than waiting it out.
      */
     public static final long DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS = 30_000L;
+    /**
+     * Default cadence for the keepalive PING the I/O loop emits while
+     * waiting on STATUS_DURABLE_ACK frames. See
+     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
+     * server only flushes pending durable-ack frames on inbound recv
+     * events, so an opted-in idle client has to prod it. {@code 200} ms
+     * trades one PING per 200 ms per idle opted-in connection for
+     * sub-second confirmation latency once the upload completes
+     * server-side. {@code 0} or negative disables the keepalive entirely.
+     */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**

@@ -330,6 +330,23 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * The effective wall-clock dwell the rotating-credential {@code 401} ride-out uses: the configured
+     * reconnect budget, clamped to {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} so that an
+     * "effectively unbounded" configuration cannot disable the escalation entirely.
+     * <p>
+     * Public and pure so the clamp can be asserted directly. The alternative - proving it end to end - means
+     * waiting out the ceiling, which is five minutes of wall clock in a test.
+     *
+     * @param reconnectMaxDurationMillis the configured {@code reconnect_max_duration_millis}
+     * @return the dwell in nanoseconds, always finite
+     */
+    public static long dynamicCredentialAuthDwellNanos(long reconnectMaxDurationMillis) {
+        return Math.min(
+                TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis),
+                TimeUnit.MILLISECONDS.toNanos(MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS));
+    }
+
+    /**
      * Budgeted connect with retry on whole-cluster durable-ack unavailability:
      * the initial connect, and re-entered from {@link #run()} whenever a
      * mid-drain reconnect sweep hits the same capability gap (each re-entry
@@ -364,23 +381,6 @@ public final class BackgroundDrainer implements Runnable {
      * @return a fresh durable-ack-capable client, or {@code null} if
      *         {@link #outcome} has been set to FAILED or STOPPED
      */
-    /**
-     * The effective wall-clock dwell the rotating-credential {@code 401} ride-out uses: the configured
-     * reconnect budget, clamped to {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} so that an
-     * "effectively unbounded" configuration cannot disable the escalation entirely.
-     * <p>
-     * Public and pure so the clamp can be asserted directly. The alternative - proving it end to end - means
-     * waiting out the ceiling, which is five minutes of wall clock in a test.
-     *
-     * @param reconnectMaxDurationMillis the configured {@code reconnect_max_duration_millis}
-     * @return the dwell in nanoseconds, always finite
-     */
-    public static long dynamicCredentialAuthDwellNanos(long reconnectMaxDurationMillis) {
-        return Math.min(
-                TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis),
-                TimeUnit.MILLISECONDS.toNanos(MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS));
-    }
-
     public WebSocketClient connectWithDurableAckRetry() {
         // run() already set runnerThread; setting it again here is a no-op
         // on that path but wires up direct callers so requestStop()

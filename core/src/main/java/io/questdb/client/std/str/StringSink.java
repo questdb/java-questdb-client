@@ -122,6 +122,11 @@ public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
 
     /* Either IDEA or FireBug complain, annotation galore */
     @NotNull
+    @Override
+    public String toString() {
+        return new String(buffer, 0, pos);
+    }
+
     /**
      * Empties the sink AND overwrites its whole backing buffer, so nothing it has held remains readable
      * through it. Best-effort hygiene for a sink that carried a secret - a bearer token, a refresh token, a
@@ -139,11 +144,6 @@ public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
     public void wipe() {
         Arrays.fill(buffer, (char) 0);
         pos = 0;
-    }
-
-    @Override
-    public String toString() {
-        return new String(buffer, 0, pos);
     }
 
     private void checkCapacity(int extra) {

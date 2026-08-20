@@ -3117,11 +3117,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
-     * Production path delegates to {@link WebSocketClientFactory}; tests may
-     * install {@link #clientFactoryOverride} to substitute a stub.
-     */
-    /**
      * Best-effort close for a client being abandoned because a JVM Error is
      * about to be rethrown: under OOM {@code close()} itself can throw, and a
      * secondary failure must not mask the original Error. {@code close()} is
@@ -3135,6 +3130,11 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
+     * Production path delegates to {@link WebSocketClientFactory}; tests may
+     * install {@link #clientFactoryOverride} to substitute a stub.
+     */
     private WebSocketClient newWebSocketClient() {
         java.util.function.Supplier<WebSocketClient> override = clientFactoryOverride;
         if (override != null) {
@@ -4586,6 +4586,29 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * On-wire byte cost of one symbol-dictionary entry, exactly as
+     * {@code NativeBufferWriter.putString} writes it: {@code [varint utf8Len][utf8]}.
+     * Both of that method's branches (the ASCII fast path, which reserves
+     * {@code varintSize(charLen) == varintSize(utf8Len)}, and the two-pass fallback)
+     * produce this size, so the chunker below sizes frames against the same
+     * arithmetic the encoder will use rather than an independent estimate.
+     */
+    private int dictionaryEntryWireBytes(int id) {
+        int utf8Len = NativeBufferWriter.utf8Length(globalSymbolDictionary.getSymbol(id));
+        return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
+    }
+
+    /**
+     * Whether the {@code Authorization} header is re-derived on every handshake from a caller-supplied
+     * token provider, rather than being a constant captured once. A rotating credential makes a
+     * {@code 401} potentially recoverable, which the orphan drainer's terminal policy depends on; see
+     * {@link #fixedAuthHeader(String)}.
+     */
+    private boolean hasDynamicCredential() {
+        return authorizationHeaderSupplier != null && !(authorizationHeaderSupplier instanceof FixedAuthHeader);
+    }
+
+    /**
      * Writes the ids the surviving frames contributed above the persisted prefix back
      * into {@code .symbol-dict}, immediately, before any new frame can be published.
      * <p>
@@ -4609,29 +4632,6 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Healing here, eagerly and in full, restores the invariant before the window opens.
      */
-    /**
-     * On-wire byte cost of one symbol-dictionary entry, exactly as
-     * {@code NativeBufferWriter.putString} writes it: {@code [varint utf8Len][utf8]}.
-     * Both of that method's branches (the ASCII fast path, which reserves
-     * {@code varintSize(charLen) == varintSize(utf8Len)}, and the two-pass fallback)
-     * produce this size, so the chunker below sizes frames against the same
-     * arithmetic the encoder will use rather than an independent estimate.
-     */
-    private int dictionaryEntryWireBytes(int id) {
-        int utf8Len = NativeBufferWriter.utf8Length(globalSymbolDictionary.getSymbol(id));
-        return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
-    }
-
-    /**
-     * Whether the {@code Authorization} header is re-derived on every handshake from a caller-supplied
-     * token provider, rather than being a constant captured once. A rotating credential makes a
-     * {@code 401} potentially recoverable, which the orphan drainer's terminal policy depends on; see
-     * {@link #fixedAuthHeader(String)}.
-     */
-    private boolean hasDynamicCredential() {
-        return authorizationHeaderSupplier != null && !(authorizationHeaderSupplier instanceof FixedAuthHeader);
-    }
-
     private void healPersistedDictionary(PersistedSymbolDict pd) {
         if (pd == null || !deltaDictEnabled) {
             return;
