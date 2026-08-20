@@ -760,7 +760,10 @@ public final class SenderPool implements AutoCloseable {
      * minutes-long block a {@code reconnect_*}-tuned config used to cause (M1).
      * One residual window remains and is NOT closed here: a single in-flight
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
-     * (the transport exposes no application-level connect timeout to clamp it).
+     * (the transport exposes no application-level connect timeout to clamp it),
+     * and unlike the credential pull that a token provider adds ahead of it - a
+     * wait of up to four times httpTimeoutMillis plus a token-store lock wait -
+     * it blocks in a syscall that the stop path's interrupt cannot break.
      * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly
      * after {@code close()} returns. No data is lost (the slot stays durable on
@@ -1707,6 +1710,15 @@ public final class SenderPool implements AutoCloseable {
             }
             try {
                 startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                if (startupRecoveryThread.isAlive()) {
+                    // Same escalation, and for the same reason, as PoolHousekeeper.stop(): the closed flag
+                    // reaches the driver only between steps, so a step blocked inside a recovery build's
+                    // credential pull outlives this join and returns while still holding the slot flock.
+                    // The pull's waits are interruptible, so an interrupt unwinds it and lets the driver
+                    // release the flock before close() returns.
+                    startupRecoveryThread.interrupt();
+                    startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

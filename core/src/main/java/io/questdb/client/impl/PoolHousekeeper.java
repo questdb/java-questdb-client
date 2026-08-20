@@ -36,10 +36,13 @@ final class PoolHousekeeper {
     // in flight when close() arrives finishes well within this join (C1 fix).
     // The recovery build that precedes the drain is bounded separately --
     // recoverers force initial_connect_mode=OFF, so the build makes at most one
-    // connect attempt rather than a SYNC reconnect-budget retry (M1). The lone
-    // case that can still overrun this join is an in-flight connect to a
-    // black-holed host (no application-level connect timeout in the transport);
-    // see the residual-window note on SenderPool.recoverOneSlotStep.
+    // connect attempt rather than a SYNC reconnect-budget retry (M1). A recovery
+    // build also pulls a credential when a token provider is configured, and
+    // that wait dwarfs this join; stop() escalates to an interrupt for it. The
+    // lone case that survives even that is an in-flight connect to a black-holed
+    // host, which blocks in a syscall no interrupt breaks (the transport exposes
+    // no application-level connect timeout); see the residual-window note on
+    // SenderPool.recoverOneSlotStep.
     static final long STOP_TIMEOUT_MILLIS = 2_000;
 
     private final long intervalMillis;
@@ -68,6 +71,24 @@ final class PoolHousekeeper {
         }
         try {
             thread.join(STOP_TIMEOUT_MILLIS);
+            if (thread.isAlive()) {
+                // The stop flag only reaches the loop BETWEEN steps. A step blocked inside a recovery
+                // build is unreachable by it, and since recovery builds acquired a token provider the
+                // longest such block is a credential pull: OidcDeviceAuth.getToken() documents a wait of up
+                // to four times httpTimeoutMillis behind a peer's refresh, plus a token-store lock wait,
+                // which together dwarf this join. Returning anyway leaves the recoverer holding its
+                // store-and-forward slot flock after close() has returned, so an immediate reopen fails
+                // with "sf slot already in use" and the detached build's engine, mmaps and I/O thread leak
+                // -- the very window this pool's per-slot ids and the drain_orphans(false) forced on
+                // recovery builds exist to eliminate.
+                //
+                // Interrupt and re-join. Every wait on that path is interruptible: acquireForGetToken polls
+                // a timed tryLock, and FileTokenStore's two lock waits abandon and re-assert the flag. The
+                // pull then throws, the step's caller swallows it (recovery is best-effort), and the loop
+                // reaches its stop check and releases the flock on its own.
+                thread.interrupt();
+                thread.join(STOP_TIMEOUT_MILLIS);
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -84,9 +105,10 @@ final class PoolHousekeeper {
             // forced OFF (at most one connect attempt, never a SYNC
             // reconnect-budget retry -- M1), and we re-check stop every step, so
             // a close() landing mid-recovery normally only waits out a single
-            // bounded drain and the join in stop() does not time out. The sole
-            // residual overrun is an in-flight connect to a black-holed host;
-            // see SenderPool.recoverOneSlotStep.
+            // bounded drain and the join in stop() does not time out. A step
+            // blocked in a credential pull is broken by stop()'s interrupt; the
+            // sole residual overrun is an in-flight connect to a black-holed
+            // host, which no interrupt breaks. See SenderPool.recoverOneSlotStep.
             // While recovery still has work we skip the idle wait so the backlog
             // drains promptly; once done we fall back to the normal interval.
             // No-op once recovery completes or the pool is closing. Best-effort:

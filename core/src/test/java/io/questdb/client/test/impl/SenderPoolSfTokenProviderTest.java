@@ -43,7 +43,9 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -121,6 +123,85 @@ public class SenderPoolSfTokenProviderTest {
                             awaitAtLeast(handler.frames, 2, 10_000));
                 }
                 Assert.assertEquals("one token pull per pooled SF sender", 2, tokenCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testCloseBreaksARecoveryDelegateStuckInACredentialPull() throws Exception {
+        // A recovery build pulls a credential before it connects, and that pull can block far longer than
+        // close()'s join: OidcDeviceAuth.getToken() documents a wait of up to four times httpTimeoutMillis
+        // behind a peer's refresh, and FileTokenStore's in-process lock wait has no budget at all, against a
+        // PoolHousekeeper.STOP_TIMEOUT_MILLIS of 2s. The stop flag reaches the recovery loop only BETWEEN
+        // steps, so it cannot reach a step parked inside the pull.
+        //
+        // Returning from close() anyway leaves the recoverer holding its slot flock, which is what the
+        // pool's per-slot ids and the drain_orphans(false) forced on recovery builds exist to prevent: an
+        // immediate reopen fails with "sf slot already in use", and the detached build's engine, mmaps and
+        // I/O thread are leaked. So the stop path escalates to an interrupt, which every wait on that path
+        // honours.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1 -- strand unacked frames on disk, so phase 2 has recovery work to do.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir + ";"
+                        + "sender_pool_min=1;sender_pool_max=1;"
+                        + "query_pool_min=0;query_pool_max=1;"
+                        + "close_flush_timeout_millis=500;";
+                try (QuestDB db = QuestDB.connect(cfg, () -> "PHASE1-TOKEN")) {
+                    try (Sender s = db.borrowSender()) {
+                        for (int i = 0; i < 3; i++) {
+                            s.table("recover").longColumn("v", i).atNow();
+                            s.flush();
+                        }
+                    }
+                }
+            }
+            Assert.assertTrue("unacked data must persist on disk for recovery to have work",
+                    hasSegmentFile(sfDir + "/default-0"));
+
+            // Phase 2 -- a provider that parks the way a contended token-store lock wait does.
+            CountDownLatch pullEntered = new CountDownLatch(1);
+            AtomicBoolean pullInterrupted = new AtomicBoolean();
+            HttpTokenProvider blockingProvider = () -> {
+                pullEntered.countDown();
+                try {
+                    Thread.sleep(TimeUnit.MINUTES.toMillis(5));
+                } catch (InterruptedException e) {
+                    pullInterrupted.set(true);
+                    Thread.currentThread().interrupt();
+                    // what OidcDeviceAuth.getToken() does on a cancelled wait: report, do not hang
+                    throw new RuntimeException("credential pull cancelled");
+                }
+                return "NEVER-ARRIVES";
+            };
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";"
+                        + "sender_pool_min=0;sender_pool_max=1;"
+                        + "query_pool_min=0;query_pool_max=1;";
+
+                QuestDB db = QuestDB.connect(cfg, blockingProvider);
+                Assert.assertTrue("the recovery delegate must reach the credential pull",
+                        pullEntered.await(20, TimeUnit.SECONDS));
+
+                long startNanos = System.nanoTime();
+                db.close();
+                long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+
+                // The load-bearing assertion. Without the escalation close() joins its budget, gives up and
+                // returns with the pull still parked -- so this stays false and the flock is still held.
+                Assert.assertTrue("close() must interrupt a recovery delegate parked in a credential pull, "
+                                + "or it returns while that delegate still holds the slot flock",
+                        pullInterrupted.get());
+                // Bounded well above the two joins so a loaded box does not turn this red, and far below
+                // the provider's 5-minute park, which is what an un-escalated close() would wait out.
+                Assert.assertTrue("close() must not wait out the parked pull; took " + elapsedMillis + "ms",
+                        elapsedMillis < 30_000);
             }
         });
     }
