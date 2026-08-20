@@ -1514,6 +1514,25 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     }
 
     /**
+     * Called by the sender before {@link #start()} when a prior loop of the
+     * same sender already reached the server: restores Invariant B's
+     * past-initialization classification (see {@link
+     * #endpointPolicyFailureIsTerminal()}) across a symbol-dict recycle's
+     * loop rebuild, where the constructor would otherwise seed a fresh
+     * {@code hasEverConnected = false} for the new loop instance (ASYNC
+     * startup always hands the constructor a null client). Public rather
+     * than package-private only because the owning sender lives in a
+     * different package; it is not part of the public {@code Sender} API.
+     * {@code hasEverConnected} is volatile, so this write needs no extra
+     * synchronization to be visible to the I/O thread -- callers still call
+     * it before {@code start()} so the invariant is established before the
+     * loop can observe any endpoint-policy failure.
+     */
+    public void markEverConnected() {
+        hasEverConnected = true;
+    }
+
+    /**
      * Plug an async-delivery sink for {@link SenderConnectionEvent}
      * notifications. Connection events fire from
      * {@code QwpWebSocketSender.buildAndConnect} directly into this dispatcher;

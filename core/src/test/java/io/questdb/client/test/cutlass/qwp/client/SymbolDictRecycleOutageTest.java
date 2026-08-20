@@ -222,6 +222,11 @@ public class SymbolDictRecycleOutageTest {
                     // connect that cleared the batch watermark would ship a row
                     // pointing at an id the server never received.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    Assert.assertTrue("wasEverConnected() must stay sticky across the recycle's "
+                                    + "rebuilt loop while the endpoint is still down -- the fresh "
+                                    + "loop must not report 'never connected' just because it is a "
+                                    + "new loop instance",
+                            ws.wasEverConnected());
                     Assert.assertEquals("the swap must commit exactly one epoch",
                             1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());

@@ -335,6 +335,7 @@ public class QwpWebSocketSender implements Sender {
     // awaitAckedFsn: a stale base paired with a fresh engine would report
     // an FSN dip to -1 (same reasoning as symbolDictEpoch).
     private volatile long fsnEpochBase = 0;
+    private boolean hasDeferredMessages;
     // Latched true the first time ensureConnected() completes. Once set,
     // every later ensureConnected() -- today only the recycle's step 7 and
     // its retry-on-next-send path -- takes the deferred (ASYNC-style)
@@ -342,8 +343,22 @@ public class QwpWebSocketSender implements Sender {
     // contract scopes foreground connectivity errors to initialization
     // only, so post-initial (re)connects belong to the I/O loop's
     // indefinite retry (Invariant B), never to the producer thread.
-    private boolean hasConnectedOnce;
-    private boolean hasDeferredMessages;
+    private boolean hasInitialConnectRun;
+    // Sender-lifetime sticky OR of every rebuilt loop's own hasEverConnected:
+    // once ANY loop instance owned by this sender has reached the server,
+    // this stays true even after a symbol-dict recycle rebuilds the loop.
+    // Latched in two places -- ensureConnected()'s tail on a successful
+    // foreground (client != null) connect, and recycleForDictReset()'s step
+    // 2, which OR's in the outgoing loop's own hasEverConnected() before
+    // closing it (covers an ASYNC-initial sender whose only connect ever
+    // happened on the I/O thread, so this method never observed client !=
+    // null). ensureConnected() seeds it into the freshly built loop via
+    // markEverConnected() before start(), so a post-recycle loop rebuild
+    // does not reset CursorWebSocketSendLoop's own hasEverConnected back to
+    // false -- which would wrongly re-arm its startup-terminal
+    // classification (endpointPolicyFailureIsTerminal()) and misclassify
+    // wasEverConnected() for the whole post-recycle outage window.
+    private boolean hasLoopEverConnected;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
     // the server withholds their acks by design (their rows are rolled back on
@@ -4162,7 +4177,7 @@ public class QwpWebSocketSender implements Sender {
         // successful connect the SF contract forbids foreground connects on
         // the producer thread, so re-entries (the recycle's step 7, or its
         // retry after a failed loop start) always defer to the I/O thread.
-        Sender.InitialConnectMode effectiveMode = hasConnectedOnce
+        Sender.InitialConnectMode effectiveMode = hasInitialConnectRun
                 ? Sender.InitialConnectMode.ASYNC
                 : initialConnectMode;
         switch (effectiveMode) {
@@ -4238,6 +4253,16 @@ public class QwpWebSocketSender implements Sender {
             // the loop no longer fires a terminal budget-exhaustion event -- it
             // retries indefinitely.)
             cursorSendLoop.setConnectionDispatcher(connectionDispatcher);
+            // Seed the fresh loop's own hasEverConnected before it can observe
+            // any endpoint-policy failure: without this, a symbol-dict
+            // recycle's rebuilt loop starts believing it has never connected
+            // (ASYNC startup always hands the constructor a null client),
+            // which would wrongly re-arm endpointPolicyFailureIsTerminal()'s
+            // startup-terminal branch for a FOREGROUND sender that already
+            // reached the server in a prior loop instance.
+            if (hasLoopEverConnected) {
+                cursorSendLoop.markEverConnected();
+            }
             cursorSendLoop.start();
         } catch (Throwable t) {
             // start() (or dispatcher construction) failed after cursorSendLoop was
@@ -4276,14 +4301,24 @@ public class QwpWebSocketSender implements Sender {
             // client; same path runs on every reconnect.
             LOG.info("Connected to WebSocket [host={}, port={}, qwpVersion={}, serverMaxBatchSize={}, effectiveAutoFlushBytes={}]",
                     host, port, client.getServerQwpVersion(), serverMaxBatchSize, effectiveAutoFlushBytes);
+            hasLoopEverConnected = true;
         } else {
-            // Async mode: I/O thread will drive the connect. Encoder uses
-            // its default version (V1). The per-batch symbol-dict watermark still
-            // gets reset for consistency with the sync path; the post-connect
-            // replay path needs no producer-side reset signal (see below).
+            // Deferred connect: the I/O thread will drive it, on the sender's
+            // true initial connect (hasInitialConnectRun still false here) or
+            // on a post-initial re-entry such as the recycle's step 7. Either
+            // way the encoder keeps whatever version was already negotiated
+            // (V1 -- the only supported wire version today); a re-entry never
+            // resets it. The per-batch symbol-dict watermark still gets reset
+            // for consistency with the sync path; the post-connect replay
+            // path needs no producer-side reset signal (see below).
             Endpoint ep = endpoints.get(0);
-            LOG.info("Async initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
-                    ep.host, ep.port, endpoints.size());
+            if (hasInitialConnectRun) {
+                LOG.info("Reconnect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
+                        ep.host, ep.port, endpoints.size());
+            } else {
+                LOG.info("Initial connect deferred to I/O thread [firstHost={}, firstPort={}, endpointCount={}]",
+                        ep.host, ep.port, endpoints.size());
+            }
         }
         // Server starts fresh on each connection, so reset the per-batch
         // symbol-dict watermark when nothing is staged against it. Every frame
@@ -4295,7 +4330,7 @@ public class QwpWebSocketSender implements Sender {
         connectionError.set(null);
 
         connected = true;
-        hasConnectedOnce = true;
+        hasInitialConnectRun = true;
     }
 
     private void ensureNoInProgressRow() {
@@ -4943,8 +4978,14 @@ public class QwpWebSocketSender implements Sender {
             lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
         }
         try {
-            // step 2: close the loop - joins the I/O thread, closes the client
+            // step 2: close the loop - joins the I/O thread, closes the client.
+            // Capture the outgoing loop's own ever-connected state into the
+            // sender-lifetime sticky OR BEFORE closing it: this is the only
+            // place an ASYNC-initial sender's connect (which happens only on
+            // the I/O thread, never observed by ensureConnected's client !=
+            // null branch) reaches hasLoopEverConnected.
             if (cursorSendLoop != null) {
+                hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
                 cursorSendLoop.close();
                 cursorSendLoop = null;
             }
@@ -5001,8 +5042,11 @@ public class QwpWebSocketSender implements Sender {
             throw new LineSenderException(t).put("symbol dictionary recycle failed");
         }
         // step 7: reconnect - rebuilds the loop with the rolled base, deferring
-        // the socket connect to the I/O thread (hasConnectedOnce forces
-        // ensureConnected's ASYNC branch): the loop retries indefinitely with
+        // the socket connect to the I/O thread (hasInitialConnectRun forces
+        // ensureConnected's ASYNC branch, and hasLoopEverConnected -- if this
+        // sender ever reached the server -- seeds the fresh loop's own
+        // hasEverConnected so Invariant B's classification survives the
+        // rebuild): the loop retries indefinitely with
         // backoff while the producer keeps buffering into the fresh slot, so a
         // transient outage in this window never surfaces to the producer and
         // never imposes a reconnect budget on it (the store-and-forward
