@@ -452,12 +452,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         lock.lock();
         try {
             throwIfClosed();
-            accessToken = null;
-            idToken = null;
-            refreshToken = null;
+            // the same sweep close() runs: nulling the served token is not enough on its own, since the raw
+            // response and request bytes are still legible in the reusable sinks that carried them
+            wipeCredentialState();
             expiresAtMillis = 0;
             tokenTtlMillis = 0;
-            lastPersistedRefreshToken = null;
             refreshFailedAtMillis = 0;
             if (tokenStore != null) {
                 try {
@@ -500,6 +499,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         closed = true;
         lock.lock();
         try {
+            // Drop the credential material FIRST. Every token operation is already refused by the closed flag
+            // above, so nothing here can be needed again - and nulling a String or overwriting a sink cannot
+            // throw, whereas an HttpClient close conceivably can, so doing it first means a failing free
+            // cannot leave a refresh token legible in this instance for the rest of the JVM's life.
+            wipeCredentialState();
             // free the native lexer first: its close() is a bare Unsafe.free that cannot throw, whereas an
             // HttpClient close conceivably could - freeing the native buffer first means such a throw cannot
             // strand it (Misc.free nulls each field, so a second close() is still a safe no-op)
@@ -1988,6 +1992,32 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private void wipeCredentialState() {
+        // Best effort, and worth being precise about what that means.
+        //
+        // Nulling the four String fields is all Java offers for a String - the characters live on until the
+        // GC reclaims them - but it does stop this instance from handing them back.
+        //
+        // The sinks are the part a plain null misses. formSink carries the request body, which on the refresh
+        // path is literally "refresh_token=<the token>"; the two parsers hold every field of the last
+        // response, tokens and device code included. All of them are REUSED, and clear() only rewinds the
+        // write position, so a long secret followed by a short write stays legible in the tail. wipe()
+        // overwrites the whole backing array instead.
+        //
+        // What it cannot reach: any String already handed to a caller, and the HTTP client's native receive
+        // buffers, where the raw token bytes also passed. Freeing those returns the pages to the allocator
+        // without zeroing them. A caller who needs more than this should not be persisting tokens in this
+        // process at all.
+        accessToken = null;
+        idToken = null;
+        refreshToken = null;
+        lastPersistedRefreshToken = null;
+        formSink.wipe();
+        responseStatus.wipe();
+        deviceAuthParser.wipe();
+        tokenParser.wipe();
+    }
+
     private void warnPersistence(String operation, Throwable cause) {
         // best-effort persistence: warn through SLF4J and carry on with the in-memory token. The store never
         // puts token bytes in its messages, but an IO error can carry the operator-supplied store path, which
@@ -2274,6 +2304,18 @@ public class OidcDeviceAuth implements QuietCloseable {
         private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
+
+        void wipe() {
+            // clear() rewinds; this overwrites. The device code is a credential until it expires, and the
+            // verification URIs carry the user code, so none of it should outlive the instance that read it.
+            deviceCode.wipe();
+            error.wipe();
+            errorDescription.wipe();
+            userCode.wipe();
+            verificationUri.wipe();
+            verificationUriComplete.wipe();
+            clear();
+        }
 
         @Override
         public void clear() {
@@ -2640,6 +2682,17 @@ public class OidcDeviceAuth implements QuietCloseable {
         private int arrayDepth;
         private int depth;
         private int field = FIELD_NONE;
+
+        void wipe() {
+            // clear() rewinds; this overwrites. These five sinks hold the raw grant: the access token, the id
+            // token and the refresh token, exactly as the identity provider sent them.
+            accessToken.wipe();
+            error.wipe();
+            errorDescription.wipe();
+            idToken.wipe();
+            refreshToken.wipe();
+            clear();
+        }
 
         @Override
         public void clear() {

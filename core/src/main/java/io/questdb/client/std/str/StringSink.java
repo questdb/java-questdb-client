@@ -28,6 +28,8 @@ import io.questdb.client.std.Chars;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.Arrays;
+
 public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
 
     private char[] buffer;
@@ -120,6 +122,19 @@ public class StringSink implements MutableUtf16Sink, CharSequence, Utf16Sink {
 
     /* Either IDEA or FireBug complain, annotation galore */
     @NotNull
+    /**
+     * Empties the sink AND overwrites its whole backing buffer, so nothing it has held remains readable
+     * through it. Best-effort hygiene for a sink that carried a secret - a bearer token, a refresh token, a
+     * device code - where {@link #clear()} is not enough: clear only rewinds the write position, leaving
+     * every character past that position in the array, so a long secret followed by a short write stays
+     * legible in the tail. It cannot reach a copy already handed out (a {@link #toString()} result, anything
+     * downstream wrote elsewhere), only this sink's own storage.
+     */
+    public void wipe() {
+        Arrays.fill(buffer, (char) 0);
+        pos = 0;
+    }
+
     @Override
     public String toString() {
         return new String(buffer, 0, pos);

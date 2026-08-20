@@ -44,6 +44,7 @@ import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.util.concurrent.CountDownLatch;
@@ -1131,6 +1132,66 @@ public class OidcDeviceAuthTest {
                     Assert.fail("expected discovery to fail");
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseWipesCredentialState() throws Exception {
+        assertMemoryLeak(() -> {
+            // close() disables every token operation, so nothing it holds can be needed again - yet the
+            // instance went on holding all of it: the served token and refresh token in their String fields,
+            // and the raw grant in the sinks that carried it. formSink keeps the last request body, which on
+            // the refresh path is literally "refresh_token=<the token>"; the two response parsers keep every
+            // field of the last response, device code included. All are reused, and clear() only rewinds the
+            // write position, so a long secret followed by a short write stays legible in the tail.
+            //
+            // The walk below is deliberately reflective and generic rather than a list of field names: a sink
+            // added to this class or to either parser later is covered without anyone remembering to extend
+            // the test.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEVCODE-WIPE-ME\","
+                            + "\"user_code\":\"USERCODE-WIPE-ME\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"expires_in\":300,\"interval\":1}");
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    return MockOidcServer.json(200,
+                            tokenJson("ACCESS-REFRESHED-WIPE-ME", "ID-REFRESHED-WIPE-ME", "REFRESH-2-WIPE-ME", 3600));
+                }
+                return MockOidcServer.json(200,
+                        tokenJson("ACCESS-WIPE-ME", "ID-WIPE-ME", "REFRESH-1-WIPE-ME", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                OidcDeviceAuth auth = newAuth(server, false, noopPrompt());
+                try {
+                    Assert.assertEquals("ACCESS-WIPE-ME", auth.signIn());
+                    expireCachedToken(auth);
+                    // spend the refresh token too, so it passes through formSink as a request parameter
+                    Assert.assertEquals("ACCESS-REFRESHED-WIPE-ME", auth.getToken());
+                    Assert.assertEquals(1, deviceCalls.get());
+                    // the state is genuinely there before the close - otherwise the sweep below proves nothing
+                    assertHoldsSomewhere(auth, "REFRESH-2-WIPE-ME");
+                } finally {
+                    auth.close();
+                }
+
+                Assert.assertNull("the served access token must not survive close()",
+                        readField(auth, "accessToken"));
+                Assert.assertNull("the id token must not survive close()", readField(auth, "idToken"));
+                Assert.assertNull("the refresh token must not survive close()", readField(auth, "refreshToken"));
+                Assert.assertNull("the last-persisted refresh token must not survive close()",
+                        readField(auth, "lastPersistedRefreshToken"));
+                for (String secret : new String[]{
+                        "ACCESS-WIPE-ME", "ID-WIPE-ME", "REFRESH-1-WIPE-ME",
+                        "ACCESS-REFRESHED-WIPE-ME", "ID-REFRESHED-WIPE-ME", "REFRESH-2-WIPE-ME",
+                        "DEVCODE-WIPE-ME", "USERCODE-WIPE-ME"}) {
+                    assertHoldsNowhere(auth, secret);
                 }
             }
         });
@@ -3569,6 +3630,22 @@ public class OidcDeviceAuthTest {
         }
     }
 
+    /**
+     * Fails unless NO sink or String reachable from {@code instance} - its own fields, and the fields of any
+     * client object they point at - still carries {@code secret}. A StringSink is read through its whole
+     * backing array, not just up to its write position, because that tail is precisely what a plain clear()
+     * leaves behind.
+     */
+    private static void assertHoldsNowhere(Object instance, String secret) throws Exception {
+        String holder = findHolderOf(instance, secret);
+        Assert.assertNull("close() left \"" + secret + "\" readable in " + holder, holder);
+    }
+
+    private static void assertHoldsSomewhere(Object instance, String secret) throws Exception {
+        Assert.assertNotNull("the state this test is about was never there: no field holds \"" + secret + '"',
+                findHolderOf(instance, secret));
+    }
+
     private static void assertNoControlChars(String value) {
         for (int i = 0; i < value.length(); i++) {
             Assert.assertFalse("control char at index " + i + " in '" + value + "'", Character.isISOControl(value.charAt(i)));
@@ -3776,6 +3853,12 @@ public class OidcDeviceAuthTest {
     }
 
     // Reads the cached token's absolute expiry (epoch millis) so a test can assert the lifetime clamp directly.
+    private static Object readField(Object instance, String name) throws Exception {
+        Field f = instance.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(instance);
+    }
+
     private static long readExpiresAtMillis(OidcDeviceAuth auth) throws Exception {
         Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
         f.setAccessible(true);
@@ -3785,6 +3868,48 @@ public class OidcDeviceAuthTest {
     // isEndpointUnderIssuerPath is a private static security check (it scopes a /settings-advertised endpoint
     // to the pinned issuer's path); the client is an open module, so reflection reaches it without widening
     // production visibility for the test
+    /**
+     * Returns a description of the first field holding {@code secret}, or null when none does. Walks the
+     * instance's declared fields and, one level deeper, the fields of any {@code io.questdb.client} object
+     * among them - which is what reaches the sinks inside the two response parsers.
+     */
+    private static String findHolderOf(Object instance, String secret) throws Exception {
+        for (Field f : instance.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) {
+                continue;
+            }
+            f.setAccessible(true);
+            Object value = f.get(instance);
+            if (value == null) {
+                continue;
+            }
+            if (value instanceof StringSink && sinkContents((StringSink) value).contains(secret)) {
+                return instance.getClass().getSimpleName() + '.' + f.getName();
+            }
+            if (value instanceof String && ((String) value).contains(secret)) {
+                return instance.getClass().getSimpleName() + '.' + f.getName();
+            }
+            if (value != instance && value.getClass().getName().startsWith("io.questdb.client.")
+                    && !(value instanceof StringSink)) {
+                for (Field nested : value.getClass().getDeclaredFields()) {
+                    if (Modifier.isStatic(nested.getModifiers())) {
+                        continue;
+                    }
+                    nested.setAccessible(true);
+                    Object nestedValue = nested.get(value);
+                    if (nestedValue instanceof StringSink
+                            && sinkContents((StringSink) nestedValue).contains(secret)) {
+                        return f.getName() + '.' + nested.getName();
+                    }
+                    if (nestedValue instanceof String && ((String) nestedValue).contains(secret)) {
+                        return f.getName() + '.' + nested.getName();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     private static boolean invokeIsEndpointUnderIssuerPath(String endpointUrl, String issuer) throws Exception {
         Method m = OidcDeviceAuth.class.getDeclaredMethod("isEndpointUnderIssuerPath", String.class, String.class);
         m.setAccessible(true);
@@ -3840,6 +3965,16 @@ public class OidcDeviceAuthTest {
             lexer.parse(address + split, address + len, NOOP_JSON_PARSER);
             lexer.parseLast();
         }
+    }
+
+    /**
+     * The sink's WHOLE backing array as a String - past the write position too, which is where a cleared but
+     * unwiped secret survives.
+     */
+    private static String sinkContents(StringSink sink) throws Exception {
+        Field buffer = StringSink.class.getDeclaredField("buffer");
+        buffer.setAccessible(true);
+        return new String((char[]) buffer.get(sink));
     }
 
     private static String settingsJson(boolean enabled, boolean withDeviceEndpoint, String tokenEndpoint, String deviceEndpoint) {
