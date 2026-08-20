@@ -479,17 +479,17 @@ re-prompt. To eliminate it, serialise the *read-modify-write* of a refresh per i
   with short backoff up to a small acquire budget (~3s); if it still cannot be acquired,
   **proceed without it** (degrade to Layer 1) rather than fail a sign-in. A lock older than a staleness timeout (10 minutes)
   is treated as abandoned and stolen, so a crashed holder cannot wedge others. The window
-  must dominate the worst-case time a live holder can hold the lock. That worst case has two
-  parts: the refresh I/O under the lock — send + await + parse, plus a body drain on a parse
-  failure, each separately bounded by the HTTP timeout (capped at 120s), so up to ~4×120s =
-  ~480s — **plus the connection phase that precedes the send** — DNS resolution, the TCP
-  connect, and the TLS handshake — which is **not** bounded by the HTTP timeout (the OS bounds
-  the connect instead; a black-holed connect can run to the OS TCP-connect timeout, commonly
-  ~2 minutes). So size the window above ~4×HTTP-timeout **plus a generous connection-stall
-  allowance**, never just ~4×HTTP-timeout; the interactive wait is never held under the lock.
-  10 minutes clears ~480s with ample headroom for a typical connection stall; a client that
-  raises the HTTP timeout must raise this window in step. A client MUST NOT advertise a tighter
-  guarantee than this (an earlier draft claimed ~480s alone, omitting the connection phase).
+  must dominate the worst-case time a live holder can hold the lock. That worst case is the
+  refresh I/O under the lock — send + await + parse, plus a body drain on a parse failure, each
+  separately bounded by the HTTP timeout (capped at 120s), so up to ~4×120s = ~480s. **A client
+  MUST also bound the connection phase that precedes the send** — the TCP connect and the TLS
+  handshake — by the same HTTP timeout. Neither is bounded by it automatically: a client that
+  leaves the connect to the OS, or sizes the TLS handshake off a transport default, can hold
+  the lock far past the staleness window and have a peer steal it from under a live refresh,
+  at which point both replay the same rotating refresh token. Only DNS resolution is left to
+  the OS. So size the window above ~4×HTTP-timeout plus a DNS allowance; the interactive wait
+  is never held under the lock. 10 minutes clears ~480s with ample headroom; a client that
+  raises the HTTP timeout must raise this window in step.
 - **An empty/unstamped lock is reclaimable on a short grace, not the full staleness window.**
   The exclusive create and the stamp write are two operations on one open handle, so the file
   **does exist empty** between them. That window is small — no I/O sits between the two — but it

@@ -43,9 +43,9 @@ import io.questdb.client.std.Chars;
  * acquire that store's cross-process lock before such a refresh, which still counts as a quick silent
  * refresh. Note that "quick" bounds the interactive wait, not the network: the silent refresh is a
  * synchronous HTTP round-trip to the token endpoint, and its connection phase (DNS, TCP connect, TLS)
- * is bounded by the OS, not by the client timeout - so a black-holed token endpoint can stall a refresh
- * for the OS connect timeout (commonly ~2 minutes on Linux). A producer sizing flush backpressure
- * against this call should expect that worst case. An exception from {@link #getToken()} fails the
+ * is bounded by the client timeout as well for the bundled {@code OidcDeviceAuth}, leaving only DNS
+ * resolution to the OS. A provider that builds its own HTTP client should bound its connect and TLS
+ * handshake likewise, or a black-holed token endpoint stalls a flush for the OS connect timeout. An exception from {@link #getToken()} fails the
  * in-flight flush (HTTP) or the connection attempt (WebSocket).
  *
  * @see QuestDB#connect(CharSequence, HttpTokenProvider)

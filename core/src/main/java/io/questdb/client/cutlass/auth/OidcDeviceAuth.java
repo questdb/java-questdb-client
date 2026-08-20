@@ -94,8 +94,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * lifetime (up to 30 minutes), so a concurrent {@link #signIn()} or {@link #clearCache()} blocks
  * behind it - but {@link #getToken()} never waits behind an interactive sign-in: it fails fast with an
  * {@link OidcAuthException} rather than stall a request/flush path (a needed silent refresh still runs,
- * each HTTP round-trip phase bounded by {@link Builder#httpTimeoutMillis(int)} - though an unreachable
- * endpoint's connect is bounded by the OS, not by it - plus, with a coordinating {@link TokenStore}, a brief
+ * each HTTP round-trip phase bounded by {@link Builder#httpTimeoutMillis(int)}, and the TCP connect and TLS
+ * handshake bounded by it too - though DNS resolution is still the OS's to bound - plus, with a
+ * coordinating {@link TokenStore}, a brief
  * cross-process lock wait; see {@link #getToken()}). To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
@@ -125,6 +126,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int DEFAULT_POLL_INTERVAL_SECONDS = 5;
     // token cache TTL when the token response omits expires_in
     private static final int DEFAULT_TOKEN_TTL_SECONDS = 300;
+    // The config the DISCOVERY clients take. Discovery runs off DEFAULT_HTTP_TIMEOUT_MILLIS rather than a
+    // builder value, because it happens before there is an instance to carry one. See httpConfig().
+    private static final HttpClientConfiguration DISCOVERY_HTTP_CONFIG = httpConfig(DEFAULT_HTTP_TIMEOUT_MILLIS);
     private static final String ERROR_AUTHORIZATION_PENDING = "authorization_pending";
     private static final String ERROR_SLOW_DOWN = "slow_down";
     // getToken() polls for the instance lock in slices this small so it observes an interactive sign-in that
@@ -135,7 +139,6 @@ public class OidcDeviceAuth implements QuietCloseable {
     // device-code poll and token refresh
     private static final String GRANT_TYPE_DEVICE_CODE_ENCODED = urlEncode(GRANT_TYPE_DEVICE_CODE);
     private static final String GRANT_TYPE_REFRESH_TOKEN_ENCODED = urlEncode(GRANT_TYPE_REFRESH_TOKEN);
-    private static final HttpClientConfiguration HTTP_CONFIG = DefaultHttpClientConfiguration.INSTANCE;
     // a rate-limited identity provider answers 429; the token poll treats it as a transient backoff
     private static final String HTTP_STATUS_TOO_MANY_REQUESTS = "429";
     // Token responses carry JWTs (an id token with group claims can be several KB), and a single
@@ -146,10 +149,10 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
     // the I/O portion of a coordinated refresh, as a multiple of httpTimeoutMillis: the refresh under the lock
     // runs send + await + parse, plus a body drain on a parse failure, each separately bounded by
-    // httpTimeoutMillis. NOTE this multiple does NOT cover the connection phase that precedes the send - DNS
-    // resolution, the TCP connect, and the TLS handshake are NOT bounded by httpTimeoutMillis (the OS bounds the
-    // connect instead). build() requires the FileTokenStore staleness window to exceed this multiple as a floor;
-    // the default window adds ample headroom for a typical connection stall on top of it (see build())
+    // httpTimeoutMillis. The connection phase that precedes the send is bounded by httpTimeoutMillis too -
+    // httpConfig() derives the TCP connect timeout and the TLS handshake budget from it - so the only part of a
+    // hold this multiple does not account for is DNS resolution, which the OS bounds. build() requires the
+    // FileTokenStore staleness window to exceed this multiple as a floor (see build())
     private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 4;
     private static final Logger LOG = LoggerFactory.getLogger(OidcDeviceAuth.class);
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
@@ -161,7 +164,7 @@ public class OidcDeviceAuth implements QuietCloseable {
      * getToken() is called once per ILP flush and once per WebSocket (re)connect, so a producer retrying its
      * rows drove a sustained request flood at the identity provider (enough to trip its rate limits and
      * lengthen the very outage being retried) while each call blocked the producer for the round trip, up to
-     * the OS TCP-connect timeout against a black-holed endpoint.
+     * httpTimeoutMillis against a black-holed endpoint.
      * <p>
      * Deliberately short: this is a stampede guard, not a circuit breaker. A credential that comes back
      * within seconds is picked up on the next call, and any explicit {@link #signIn()} or
@@ -183,8 +186,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     // bounding it keeps the I/O portion of a refresh held under the FileTokenStore cross-process lock (send +
     // await + parse, plus a body drain on a parse failure - each separately bounded by this, so up to ~4x this)
     // a known, bounded multiple, so the store's staleness window can be sized to dominate it. The connection
-    // phase (DNS + TCP connect + TLS) is bounded by the OS, not by this, and the default staleness window
-    // leaves headroom for it (see Builder.build())
+    // phase is bounded by this too - httpConfig() derives the connect timeout and the TLS handshake budget
+    // from the same figure - leaving only DNS resolution to the OS (see Builder.build())
     private static final int MAX_HTTP_TIMEOUT_MILLIS = 120_000;
     // upper bound on the poll interval, both the initial value and the growth after a slow_down or 429, so
     // a hostile or buggy provider cannot stall the poll loop; matches the Python client
@@ -208,6 +211,8 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final String USER_AGENT = "questdb/java-client-oidc";
     private static final String WELL_KNOWN_OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration";
     private final String audienceEncoded;
+    // This instance's HTTP transport budgets, derived from httpTimeoutMillis. See httpConfig().
+    private final HttpClientConfiguration clientConfig;
     private final String clientIdEncoded;
     private final DeviceAuthorizationResponseParser deviceAuthParser = new DeviceAuthorizationResponseParser();
     private final Endpoint deviceAuthorizationEndpoint;
@@ -264,6 +269,10 @@ public class OidcDeviceAuth implements QuietCloseable {
         this.audienceEncoded = audience != null ? urlEncode(audience) : null;
         this.groupsInToken = builder.groupsInToken;
         this.httpTimeoutMillis = builder.httpTimeoutMillis;
+        // Derive the transport budgets from the SAME figure the rest of the class quotes, so the connection
+        // phase is bounded by it too rather than by the 600s HttpClientConfiguration default (TLS) and the
+        // OS (TCP connect). See httpConfig().
+        this.clientConfig = httpConfig(this.httpTimeoutMillis);
         this.prompt = builder.prompt;
         this.tlsConfig = tlsConfig;
         this.tokenStore = builder.tokenStore;
@@ -481,8 +490,8 @@ public class OidcDeviceAuth implements QuietCloseable {
      * finishes or times out, not the full device-code lifetime. That bound is the in-flight operation's own
      * worst case, which is NOT a single HTTP request timeout: a silent refresh under the lock runs a send, an
      * await and a body parse (each bounded by {@link Builder#httpTimeoutMillis(int)}), and its connection phase -
-     * DNS, TCP connect, TLS handshake - is bounded by the OS, not by that timeout, so a black-holed token
-     * endpoint can hold the lock, and this {@code close()}, for the OS connect timeout (commonly ~2 minutes on
+     * TCP connect, TLS handshake - is bounded by that timeout as well, leaving only DNS resolution to the
+     * OS, so a black-holed token endpoint can hold the lock, and this {@code close()}, for roughly that (on
      * Linux) rather than a single httpTimeoutMillis. The exception is a
      * {@link DeviceCodePrompt} that blocks in {@code promptUser} - for example the default
      * {@link DeviceCodePrompt#openBrowser()} prompt while it hands the verification URL to the OS browser,
@@ -550,11 +559,11 @@ public class OidcDeviceAuth implements QuietCloseable {
      * stall described next, not by a few seconds.
      * The send, response wait and body parse of that round-trip are each bounded by
      * {@link Builder#httpTimeoutMillis(int)} (30s by default); the connection phase that precedes them - DNS
-     * resolution, the TCP connect and the TLS handshake - is bounded by the OS, not by httpTimeoutMillis, so an
-     * unreachable (black-holed) token endpoint can stall this refresh for the OS TCP-connect timeout (commonly
-     * ~2 minutes on Linux) rather than 30s. That is the "quick silent refresh" the {@code HttpTokenProvider}
-     * contract permits on the flush path, not an unbounded interactive wait - but a producer sizing backpressure
-     * against this call should expect that OS-bounded connect stall, not a hard 30s cap.
+     * the TCP connect and the TLS handshake - is bounded by httpTimeoutMillis as well, since httpConfig()
+     * derives the connect timeout and the handshake budget from it. Only DNS resolution is left to the OS, so
+     * an unreachable (black-holed) token endpoint stalls this refresh for about the configured timeout rather
+     * than the OS TCP-connect timeout. That is the "quick silent refresh" the {@code HttpTokenProvider}
+     * contract permits on the flush path, not an unbounded interactive wait.
      *
      * @return a non-null, non-empty token
      * @throws OidcAuthException if no token has been obtained yet, if the cached token expired and could
@@ -838,8 +847,8 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private static void fetchJson(Endpoint endpoint, String path, ClientTlsConfiguration tlsConfig, JsonParser parser, String reachError, String parseError, String statusError) {
         HttpClient client = endpoint.isTls
-                ? HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig)
-                : HttpClientFactory.newPlainTextInstance(HTTP_CONFIG);
+                ? HttpClientFactory.newTlsInstance(DISCOVERY_HTTP_CONFIG, tlsConfig)
+                : HttpClientFactory.newPlainTextInstance(DISCOVERY_HTTP_CONFIG);
         // allocate the native lexer inside the try: new JsonLexer mallocs and can throw (native OOM), and
         // the client is already allocated, so a throw before the try is entered would skip the finally and
         // leak the client's native buffers
@@ -901,6 +910,38 @@ public class OidcDeviceAuth implements QuietCloseable {
             return c - 'A' + 10;
         }
         return -1;
+    }
+
+    /**
+     * The HTTP transport budgets for a client this class owns, all derived from one timeout.
+     * <p>
+     * DefaultHttpClientConfiguration answers 0 for the connect timeout and 600s for the request timeout, and
+     * HttpClient reads BOTH of those on the connection path: it leaves the TCP connect to the OS when the
+     * connect timeout is 0, and it sizes the TLS handshake as {@code connectTimeout > 0 ? connectTimeout :
+     * defaultTimeout}. Taking the defaults therefore gave the handshake alone a 600s budget -- the whole of
+     * FileTokenStore's DEFAULT_LOCK_STALE_MILLIS -- derived from nothing the caller set, so neither
+     * MAX_HTTP_TIMEOUT_MILLIS nor Builder.build()'s lockStaleMillis floor constrained it.
+     * <p>
+     * That matters beyond a slow request. A refresh runs inside the store's cross-process lock, whose file
+     * is stamped once at creation and never re-stamped, so a hold that outruns the staleness window is
+     * judged abandoned and stolen by a peer. Two holders then POST the same rotating refresh token, and an
+     * identity provider with reuse detection answers by revoking the whole family. Deriving both budgets
+     * from httpTimeoutMillis is what makes the "up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis"
+     * figure -- which the lock-stale floor, acquireForGetToken's wait cap and getToken()'s javadoc all
+     * quote -- actually true of the code.
+     */
+    private static HttpClientConfiguration httpConfig(final int timeoutMillis) {
+        return new DefaultHttpClientConfiguration() {
+            @Override
+            public int getConnectTimeout() {
+                return timeoutMillis;
+            }
+
+            @Override
+            public int getTimeout() {
+                return timeoutMillis;
+            }
+        };
     }
 
     private static boolean isDottedIpv4(String host) {
@@ -1512,12 +1553,12 @@ public class OidcDeviceAuth implements QuietCloseable {
     private HttpClient httpClient(boolean isTls) {
         if (isTls) {
             if (tlsClient == null) {
-                tlsClient = HttpClientFactory.newTlsInstance(HTTP_CONFIG, tlsConfig);
+                tlsClient = HttpClientFactory.newTlsInstance(clientConfig, tlsConfig);
             }
             return tlsClient;
         }
         if (plainClient == null) {
-            plainClient = HttpClientFactory.newPlainTextInstance(HTTP_CONFIG);
+            plainClient = HttpClientFactory.newPlainTextInstance(clientConfig);
         }
         return plainClient;
     }
@@ -2226,12 +2267,12 @@ public class OidcDeviceAuth implements QuietCloseable {
             // window must exceed the worst-case time a live refresh holds the lock, or a peer could steal a live
             // holder's lock mid-refresh and reopen the rotating-refresh-token race the lock prevents. Enforce the
             // bounded part of that worst case here, where both values are known: the refresh I/O under the lock is
-            // up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis. This is a FLOOR, not the whole story - the
-            // connection phase (DNS + TCP connect + TLS) that precedes the send is bounded by the OS, not by
-            // httpTimeoutMillis, so the staleness window must also clear a connection stall on top of this floor.
-            // The default 600s window leaves ~120s of headroom over the floor even at the 120s timeout cap, which
-            // covers a typical connection stall; a caller raising httpTimeoutMillis should raise lockStaleMillis
-            // to keep that headroom. A non-coordinating TokenStore is exempt - it takes no lock.
+            // up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis. httpConfig() bounds the connection phase
+            // that precedes the send by httpTimeoutMillis too (the TCP connect and the TLS handshake; DNS
+            // resolution remains the OS's), so this floor covers the hold rather than only part of it. The default
+            // 600s window leaves ample headroom over the floor even at the 120s timeout cap; a caller raising
+            // httpTimeoutMillis should raise lockStaleMillis to keep it. A non-coordinating TokenStore is exempt -
+            // it takes no lock.
             if (tokenStore instanceof FileTokenStore) {
                 long minStaleMillis = (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
                 long staleMillis = ((FileTokenStore) tokenStore).getLockStaleMillis();
