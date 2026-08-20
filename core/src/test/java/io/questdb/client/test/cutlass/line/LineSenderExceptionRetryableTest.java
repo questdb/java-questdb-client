@@ -99,4 +99,76 @@ public class LineSenderExceptionRetryableTest {
             }
         });
     }
+
+    @Test(timeout = 30_000)
+    public void testARetryableStatusFromTheSenderIsRetryable() throws Exception {
+        assertMemoryLeak(() -> {
+            // The other direction, and the one that carries the risk. assertFalse cannot tell a CLASSIFIED
+            // "permanent" from an UNCLASSIFIED exception, because the three constructors that carry no
+            // classification also report false - so the 401 test above passes just as happily against a
+            // sender that stopped classifying altogether. Only a true here proves the flag is computed and
+            // survives the throw.
+            //
+            // A 503 exhausts the retry budget and then throws with retryable=true. Chunked, because flush0
+            // asserts response.isChunked() on the error branch and the plain helper writes Content-Length.
+            final String errorBody = "{\"code\":\"unavailable\"}";
+            final String chunked503 = "HTTP/1.1 503 Service Unavailable\r\n"
+                    + "Content-Type: application/json\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(errorBody.length()) + "\r\n" + errorBody + "\r\n0\r\n\r\n";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) ->
+                    MockOidcServer.raw(chunked503))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(100)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the 503 to surface once the retry budget is spent");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("503"));
+                        Assert.assertTrue("a 503 is transient; a caller told to close or reset() on it would "
+                                        + "tear down a healthy sender and drop the buffered batch: "
+                                        + e.getMessage(),
+                                e.isRetryable());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testATransportFailureFromTheSenderIsRetryable() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sender's other retryable=true site: the give-up throw after the retry budget is spent on a
+            // transport error rather than a status. It reaches the caller through a different constructor
+            // call than the status path, so it needs its own assertion.
+            final int deadPort;
+            try (java.net.ServerSocket probe = new java.net.ServerSocket(0, 1,
+                    java.net.InetAddress.getLoopbackAddress())) {
+                deadPort = probe.getLocalPort();
+            }
+            try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                    .address("127.0.0.1:" + deadPort)
+                    .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                    .httpTimeoutMillis(1_000)
+                    .retryTimeoutMillis(100)
+                    .disableAutoFlush()
+                    .build()) {
+                sender.table("t").longColumn("v", 1L).atNow();
+                try {
+                    sender.flush();
+                    Assert.fail("expected the unreachable endpoint to surface");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("Connection Failed"));
+                    Assert.assertTrue("a transport failure is transient by definition: " + e.getMessage(),
+                            e.isRetryable());
+                }
+            }
+        });
+    }
 }
