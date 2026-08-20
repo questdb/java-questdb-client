@@ -139,6 +139,66 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
     }
 
     @Test
+    public void testDeliveringBetweenTwoGapWindowsGrantsAFreshSettleBudget() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The settle budget counts CONSECUTIVE capability-gap sweeps. Held per drain with no notion
+            // of progress, it instead spans every session: two gap windows with a DELIVERING session
+            // between them accumulate toward one threshold, so 16 sweeps that were never consecutive
+            // quarantine a slot the cluster is still draining - and nothing in production clears the
+            // .failed sentinel, so those replayable rows are abandoned for good. That is the rolling
+            // upgrade this budget exists to ride out, reaching the opposite verdict.
+            //
+            // Two windows of 9 (18 cumulative, past the threshold of 16), never more than 9 in a row,
+            // with a session that durably acks between them.
+            final int windowLength = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS - 7;
+            final int firstGapFrom = 2;
+            final int firstGapTo = firstGapFrom + windowLength - 1;          // 2..10
+            final int deliveringAttempt = firstGapTo + 1;                    // 11
+            final int secondGapFrom = deliveringAttempt + 1;                 // 12
+            final int secondGapTo = secondGapFrom + windowLength - 1;        // 20
+            assertTrue("the two windows must exceed the threshold that only consecutive sweeps may reach",
+                    2 * windowLength >= BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+            assertTrue("neither window may reach it on its own",
+                    windowLength < BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+
+            seedSlot(SEEDED_FRAMES);
+            // Connection 1 acks frame 0 then drops; connection 2 - the delivering session between the
+            // windows - acks frames 0 and 1, advancing the watermark, then drops too.
+            java.util.Map<Integer, Long> drops = new java.util.HashMap<>();
+            drops.put(1, 0L);
+            drops.put(2, 1L);
+            try (TestWebSocketServer server = new TestWebSocketServer(new GapScenarioHandler(drops), true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                ScriptedWireFactory factory = new ScriptedWireFactory(server.getPort(),
+                        n -> (n >= firstGapFrom && n <= firstGapTo)
+                                || (n >= secondGapFrom && n <= secondGapTo));
+                BackgroundDrainer drainer = newDrainer(factory);
+                CountingListener listener = new CountingListener();
+                drainer.setListener(listener);
+
+                runToCompletion(drainer);
+
+                assertEquals("delivering between the windows ends the episode, so neither window reaches "
+                                + "the threshold and the slot must still drain [attempts="
+                                + factory.attempts() + "]",
+                        BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                assertFalse("a slot the cluster is still draining must not be quarantined",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                assertEquals("no persistent-failure escalation may be reported", 0,
+                        listener.persistentFailures.get());
+                assertTrue("both gap windows must actually have been driven [attempts="
+                        + factory.attempts() + "]", factory.attempts() > secondGapTo);
+                // The observability callback fires per gap sweep and must show the counter restarting
+                // rather than running on to the threshold.
+                assertTrue("the second window must restart the count, not continue the first "
+                                + "[unavailableAttempts=" + listener.unavailableAttempts + "]",
+                        java.util.Collections.max(listener.unavailableAttempts) <= windowLength);
+            }
+        });
+    }
+
+    @Test
     public void testMidDrainPersistentCapabilityGapExhaustsBudgetThenQuarantines() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             seedSlot(SEEDED_FRAMES);
@@ -300,13 +360,22 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
      */
     private static final class GapScenarioHandler implements TestWebSocketServer.WebSocketServerHandler {
         private static final String TABLE = "trades";
-        private final boolean dropFirstConnection;
         private final List<TestWebSocketServer.ClientHandler> arrivalOrder = new ArrayList<>();
+        // connection index (1-based, in arrival order) -> the last per-connection seq it acks before
+        // closing the wire. A connection absent from the map acks everything it is sent.
+        private final java.util.Map<Integer, Long> dropAfterSeqByConnection;
         private final java.util.Map<TestWebSocketServer.ClientHandler, long[]> wireSeqByConn =
                 new java.util.IdentityHashMap<>();
 
         GapScenarioHandler(boolean dropFirstConnection) {
-            this.dropFirstConnection = dropFirstConnection;
+            this.dropAfterSeqByConnection = new java.util.HashMap<>();
+            if (dropFirstConnection) {
+                this.dropAfterSeqByConnection.put(1, 0L);
+            }
+        }
+
+        GapScenarioHandler(java.util.Map<Integer, Long> dropAfterSeqByConnection) {
+            this.dropAfterSeqByConnection = dropAfterSeqByConnection;
         }
 
         @Override
@@ -320,14 +389,15 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
             int connectionIndex = arrivalOrder.indexOf(client) + 1;
             long seq = counter[0]++;
             try {
-                if (dropFirstConnection && connectionIndex == 1) {
-                    if (seq == 0) {
+                Long dropAfterSeq = dropAfterSeqByConnection.get(connectionIndex);
+                if (dropAfterSeq != null) {
+                    if (seq <= dropAfterSeq) {
                         client.sendBinary(okFrame(seq, seq));
                         client.sendBinary(durableAckFrame(seq));
-                    } else if (seq == 1) {
+                    } else if (seq == dropAfterSeq + 1) {
                         client.close(); // mid-drain wire drop
                     }
-                    // seq > 1: late buffered frames from the condemned
+                    // beyond that: late buffered frames from the condemned
                     // connection; ignore.
                 } else {
                     client.sendBinary(okFrame(seq, seq));
@@ -374,10 +444,9 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
      */
     private static final class ScriptedWireFactory implements CursorWebSocketSendLoop.ReconnectFactory {
         private final AtomicInteger calls = new AtomicInteger();
+        private final java.util.function.IntPredicate isGapAttempt;
         private final int port;
         private final ThrowableSupplier throwSupplier;
-        private final int throwFrom;
-        private final int throwTo;
 
         ScriptedWireFactory(int port, int throwFrom, int throwTo) {
             this(port, throwFrom, throwTo,
@@ -385,9 +454,20 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
         }
 
         ScriptedWireFactory(int port, int throwFrom, int throwTo, ThrowableSupplier throwSupplier) {
+            this(port, n -> n >= throwFrom && n <= throwTo, throwSupplier);
+        }
+
+        // General form: an arbitrary set of gap attempts, so a scenario can script more than one
+        // contiguous window and put a delivering session between them.
+        ScriptedWireFactory(int port, java.util.function.IntPredicate isGapAttempt) {
+            this(port, isGapAttempt,
+                    () -> new QwpDurableAckMismatchException("localhost", port, "primary"));
+        }
+
+        ScriptedWireFactory(int port, java.util.function.IntPredicate isGapAttempt,
+                            ThrowableSupplier throwSupplier) {
             this.port = port;
-            this.throwFrom = throwFrom;
-            this.throwTo = throwTo;
+            this.isGapAttempt = isGapAttempt;
             this.throwSupplier = throwSupplier;
         }
 
@@ -398,7 +478,7 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
         @Override
         public WebSocketClient reconnect() throws Exception {
             int n = calls.incrementAndGet();
-            if (n >= throwFrom && n <= throwTo) {
+            if (isGapAttempt.test(n)) {
                 Throwable t = throwSupplier.get();
                 if (t instanceof RuntimeException) throw (RuntimeException) t;
                 if (t instanceof Exception) throw (Exception) t;

@@ -156,25 +156,37 @@ public final class BackgroundDrainer implements Runnable {
     private final long sfMaxTotalBytes;
     private final String slotPath;
     private final long syncIntervalNanos;
-    /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     /**
-     * Escalation counters for the two bounded ride-outs, held per DRAIN rather than per call.
+     * Escalation counters for the two bounded ride-outs, held per DRAIN rather than per call, plus the
+     * ack watermark that scopes them.
      * <p>
-     * They were locals of {@link #connectWithDurableAckRetry()}, which {@link #run()} re-enters after every
-     * mid-drain terminal - so each recycle refilled the budget it is supposed to spend. A cluster that
-     * flaps (connect accepted, drop, {@code 401}, recycle, repeat) looped forever with no ack progress: the
-     * escalation never arrived, the slot lock was never released, and one of {@code max_background_drainers}
-     * workers - four by default - stayed pinned, so four such slots starve every other orphan slot of a
-     * drainer. No data is lost, but none is delivered either, and no operator ever sees the quarantine.
+     * The counters were locals of {@link #connectWithDurableAckRetry()}, which {@link #run()} re-enters
+     * after every mid-drain terminal - so each recycle refilled the budget it is supposed to spend. A
+     * cluster that flaps (connect accepted, drop, {@code 401}, recycle, repeat) looped forever with no ack
+     * progress: the escalation never arrived, the slot lock was never released, and one of {@code
+     * max_background_drainers} workers - four by default - stayed pinned, so four such slots starve every
+     * other orphan slot of a drainer. No data is lost, but none is delivered either, and no operator ever
+     * sees the quarantine.
+     * <p>
+     * "No ack progress" is the actual condition, and {@code ackProgressWatermark} is what measures it.
+     * Spanning the whole drain instead over-counts in the opposite direction: a drain that connects,
+     * DELIVERS, then meets a later gap accumulates both runs toward one threshold, so 16 sweeps that were
+     * never consecutive quarantine a slot the cluster is still draining - abandoning replayable rows behind
+     * a {@code .failed} sentinel nothing in production clears. Both terminals are documented as CONSECUTIVE
+     * sweeps, so {@link #noteAckProgress(long)} ends the episode the moment the wire delivers anything: a
+     * durable ack past this watermark is positive proof the cluster accepted us, which is strictly stronger
+     * evidence than the role-reject and transport arms that already reset these. A flap that delivers
+     * nothing never advances the watermark and still escalates on schedule.
      * <p>
      * The wall-clock helpers beside them ({@code capabilityGapElapsedNanos}, {@code lastCapabilityGapNanos})
      * deliberately stay per-call: they measure an UNINTERRUPTED run, and a successful connect plus a drain
-     * is an interruption, so a fresh call should start their accounting over. These three measure the whole
-     * drain, which is the span a quarantine decision is about.
+     * is an interruption, so a fresh call should start their accounting over.
      */
+    private long ackProgressWatermark = Long.MIN_VALUE;
     private int capabilityGapAttempts;
     private int dynamicCredentialAuthAttempts;
     private long firstDynamicCredentialAuthFailureNanos;
+    /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
     /**
      * Engine constructed by {@link #run()}, captured for test observation
@@ -811,6 +823,31 @@ public final class BackgroundDrainer implements Runnable {
         }
     }
 
+    /**
+     * Ends any open escalation episode once the wire has durably acked something new. Both bounded
+     * ride-outs are documented as CONSECUTIVE sweeps, and a durable ack past the watermark is the
+     * cluster accepting this drainer - stronger evidence than a role reject or a transport error, both
+     * of which already reset these counters. Without it the two per-drain counters span every session of
+     * the drain, so a rolling upgrade that delivers between two gap windows accumulates both toward one
+     * threshold and quarantines a slot that was still draining.
+     * <p>
+     * Runs on the drainer thread only, from {@link #run()}'s poll loop, so the plain field reads and
+     * writes need no synchronisation. Deliberately NOT called from {@link #connectWithDurableAckRetry()}:
+     * a successful connect on its own delivers nothing, and treating it as progress would restore the
+     * per-call refill that let a flapping cluster recycle forever.
+     *
+     * @param acked the engine's current durable-ack watermark
+     */
+    private void noteAckProgress(long acked) {
+        if (acked <= ackProgressWatermark) {
+            return;
+        }
+        ackProgressWatermark = acked;
+        capabilityGapAttempts = 0;
+        dynamicCredentialAuthAttempts = 0;
+        firstDynamicCredentialAuthFailureNanos = 0L;
+    }
+
     @Override
     public void run() {
         runnerThread = Thread.currentThread();
@@ -961,6 +998,11 @@ public final class BackgroundDrainer implements Runnable {
                 outcome = DrainOutcome.SUCCESS;
                 return;
             }
+            // Seed the progress watermark from what a previous run already durably acked, so only acks
+            // THIS drain earns count as progress. Seeding from the -1 field default would make the first
+            // poll of a partially-drained slot read as progress and hand back a budget the initial connect
+            // had legitimately spent.
+            ackProgressWatermark = engine.ackedFsn();
             client = connectWithDurableAckRetry();
             if (client == null) {
                 // outcome already set (FAILED or STOPPED); markFailed sentinel
@@ -1029,6 +1071,7 @@ public final class BackgroundDrainer implements Runnable {
 
                 while (!stopRequestedOrInterrupted()) {
                     long acked = engine.ackedFsn();
+                    noteAckProgress(acked);
                     this.ackedFsn = acked;
                     if (acked >= target) {
                         outcome = DrainOutcome.SUCCESS;
