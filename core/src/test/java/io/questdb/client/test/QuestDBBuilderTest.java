@@ -127,6 +127,47 @@ public class QuestDBBuilderTest {
         }
     }
 
+    @Test(timeout = 30_000)
+    public void testEagerBuildAndBorrowQuerySurfaceAProviderFailure() throws Exception {
+        // The other half of the lazy_connect contract, and the half that must FAIL loudly: without
+        // lazy_connect the pools initialize eagerly, so a credential the provider cannot supply is a
+        // startup error the caller has to see rather than a sender that silently never authenticates.
+        // Driven against a LIVE server so the failure is unambiguously the credential and not connectivity.
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
+            server.setSendServerInfo(true);
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            HttpTokenProvider failing = () -> {
+                throw new IllegalStateException("not signed in yet");
+            };
+            String eagerCfg = "ws::addr=localhost:" + server.getPort() + ";"
+                    + "sender_pool_min=1;sender_pool_max=1;"
+                    + "query_pool_min=1;query_pool_max=1;auth_timeout_ms=2000;";
+            try {
+                QuestDB.connect(eagerCfg, failing).close();
+                Assert.fail("an eager build must surface a provider that cannot supply a credential");
+            } catch (RuntimeException e) {
+                assertCarriesProviderCause(e);
+            }
+
+            // And the deferred read path: query_pool_min=0 prewarms nothing, so the first borrowQuery() is
+            // where the pull happens. It must report the provider's failure rather than hand back a client
+            // that never authenticated.
+            String lazyQueryCfg = "ws::addr=localhost:" + server.getPort() + ";"
+                    + "sender_pool_min=0;sender_pool_max=1;"
+                    + "query_pool_min=0;query_pool_max=1;auth_timeout_ms=2000;";
+            try (QuestDB db = QuestDB.connect(lazyQueryCfg, failing)) {
+                try (Query ignored = db.borrowQuery()) {
+                    Assert.fail("borrowQuery() must surface a provider that cannot supply a credential");
+                } catch (RuntimeException e) {
+                    assertCarriesProviderCause(e);
+                }
+            }
+        }
+    }
+
     @Test
     public void testTokenProviderRejectsFixedConfigCredentialsBeforePoolCreation() {
         HttpTokenProvider provider = () -> "TOKEN";
@@ -356,6 +397,17 @@ public class QuestDBBuilderTest {
             Assert.assertNotNull(e.getMessage());
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedFragment));
         }
+    }
+
+    private static void assertCarriesProviderCause(Throwable thrown) {
+        // The provider's own message must survive to the caller: "not signed in yet" is actionable,
+        // a transport-shaped wrapper naming the endpoint is not.
+        for (Throwable t = thrown; t != null; t = t.getCause()) {
+            if (t.getMessage() != null && t.getMessage().contains("not signed in yet")) {
+                return;
+            }
+        }
+        Assert.fail("the provider's own failure must reach the caller, got: " + thrown);
     }
 
     private static void assertAuthorizationHeaders(
