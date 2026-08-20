@@ -3047,6 +3047,119 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testInterruptDuringTheRefreshDoesNotStartTheDeviceFlow() throws Exception {
+        assertMemoryLeak(() -> {
+            // signIn() guards the interrupt flag on entry, but everything after that guard is network work:
+            // the silent refresh is a round trip bounded by four times httpTimeoutMillis plus an OS connect
+            // stall. A cancellation landing inside it is the ORDINARY case rather than a narrow race, because
+            // a caller gives up precisely when a refresh is dragging - and proceeding then launches a browser
+            // and parks for the device-code lifetime on a thread whose owner already asked it to stop.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            CountDownLatch refreshReceived = new CountDownLatch(1);
+            CountDownLatch interruptSent = new CountDownLatch(1);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    // hold the refresh open until the test has interrupted the worker, then fail it so the
+                    // flow reaches the point where it would otherwise prompt
+                    refreshReceived.countDown();
+                    try {
+                        interruptSent.await(20, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return MockOidcServer.json(400, "{\"error\":\"invalid_grant\"}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", "ID-1", "REFRESH-1", 1));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn());
+                Assert.assertEquals(1, deviceCalls.get());
+                expireCachedToken(auth);
+
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                AtomicBoolean flagSurvived = new AtomicBoolean();
+                Thread worker = new Thread(() -> {
+                    try {
+                        auth.signIn();
+                        failure.compareAndSet(null, new AssertionError("signIn() must abandon a cancelled sign-in"));
+                    } catch (OidcAuthException expected) {
+                        if (!expected.getMessage().contains("interrupted")) {
+                            failure.compareAndSet(null, expected);
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    } finally {
+                        // read it, do not clear it: the caller's shutdown path is what waits on this flag
+                        flagSurvived.set(Thread.currentThread().isInterrupted());
+                    }
+                }, "cancelled-signin");
+                worker.start();
+
+                Assert.assertTrue("the refresh must reach the server",
+                        refreshReceived.await(20, TimeUnit.SECONDS));
+                worker.interrupt();
+                interruptSent.countDown();
+                worker.join(20_000);
+                Assert.assertFalse("signIn() did not return after the cancellation", worker.isAlive());
+
+                Assert.assertNull(String.valueOf(failure.get()), failure.get());
+                Assert.assertEquals("a cancelled sign-in must not open a browser or start a device grant",
+                        1, deviceCalls.get());
+                Assert.assertTrue("the interrupt is the caller's cancellation signal and must survive "
+                        + "signIn(), or their own shutdown bookkeeping reads as never-cancelled",
+                        flagSurvived.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testInterruptDuringThePollLoopAbandonsItAndKeepsTheFlag() throws Exception {
+        assertMemoryLeak(() -> {
+            // The other half: an interrupt that arrives once the poll loop is already running. Os.sleep
+            // catches InterruptedException, recomputes its deadline and keeps sleeping - and Thread.sleep
+            // clears the flag when it throws - so the loop both ignored the cancellation AND destroyed the
+            // evidence of it, then polled on to the device-code lifetime.
+            //
+            // The prompt runs on the sign-in thread, immediately before the poll loop, so interrupting from
+            // there lands the cancellation exactly where the loop must notice it.
+            AtomicInteger tokenPolls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 1800));
+                }
+                tokenPolls.incrementAndGet();
+                return MockOidcServer.json(400, "{\"error\":\"authorization_pending\"}");
+            };
+            DeviceCodePrompt cancellingPrompt = challenge -> Thread.currentThread().interrupt();
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, cancellingPrompt)) {
+                long startNanos = System.nanoTime();
+                try {
+                    auth.signIn();
+                    Assert.fail("the poll loop must abandon a cancelled sign-in");
+                } catch (OidcAuthException expected) {
+                    Assert.assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("interrupted"));
+                }
+                long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+
+                Assert.assertTrue("the interrupt must survive the poll loop", Thread.interrupted());
+                // the device code is good for 1800s; a loop that ignores the interrupt runs to the @Test
+                // timeout instead, so this ceiling is what separates the two
+                Assert.assertTrue("the poll loop ran on past the cancellation: " + elapsedMillis + "ms",
+                        elapsedMillis < 10_000);
+                Assert.assertTrue("the loop must not keep polling after the cancellation, saw "
+                        + tokenPolls.get() + " polls", tokenPolls.get() <= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRefreshWithoutIdTokenAdoptsRotatedRefreshToken() throws Exception {
         assertMemoryLeak(() -> {
             // A refresh may legally answer 2xx without an id_token (RFC 6749 6; OIDC Core 12.2), which a

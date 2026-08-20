@@ -688,6 +688,13 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (refreshToken != null && tryRefreshCoordinated()) {
                 return selectToken();
             }
+            // Re-check the flag, because the guard on entry only covers an interrupt the caller ARRIVED with.
+            // tryRefreshCoordinated() above is a network round trip - up to four times httpTimeoutMillis plus
+            // an OS connect stall - and a cancellation landing inside it is the common case, not a narrow
+            // race: it is precisely when a refresh is failing that a caller gives up. Proceeding would then
+            // launch a browser and park for the device-code lifetime on a thread whose owner has already
+            // asked it to stop.
+            throwIfInterrupted("the calling thread was interrupted before the interactive sign-in started");
             // flag the interactive phase so a concurrent getToken() fails fast (rather than waiting behind this
             // for the whole device-code lifetime); it still waits behind the cheap cache/refresh work above
             interactiveSignInInProgress = true;
@@ -1900,14 +1907,29 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     private void sleepBetweenPolls(long millis) {
-        // sleep in short slices so close() can abort an in-flight sign-in within ~POLL_SLEEP_SLICE_MILLIS
-        // instead of after a full (possibly slow_down-inflated) interval; Os.sleep ignores thread
-        // interrupts, so polling the closed flag is the only way to stay responsive to cancellation
+        // Sleep in short slices so close() can abort an in-flight sign-in within ~POLL_SLEEP_SLICE_MILLIS
+        // instead of after a full (possibly slow_down-inflated) interval.
+        //
+        // Thread.sleep, not Os.sleep: Os.sleep catches InterruptedException, recomputes its deadline and
+        // keeps sleeping, and Thread.sleep CLEARS the flag when it throws - so the caller's interrupt was
+        // not merely ignored here, it was destroyed. A caller who cancelled then returned from signIn() with
+        // Thread.interrupted() reading false, its own cancellation bookkeeping none the wiser, having waited
+        // out a poll loop that runs to the device-code lifetime. This class states the opposite invariant
+        // twice ("the flag is the caller's cancellation signal and must survive this call"), and getToken()
+        // and FileTokenStore.load()/save() honour it.
         long remaining = millis;
         while (remaining > 0) {
             throwIfClosed();
+            throwIfInterrupted("the calling thread was interrupted while waiting for authorization");
             long slice = Math.min(POLL_SLEEP_SLICE_MILLIS, remaining);
-            Os.sleep(slice);
+            try {
+                Thread.sleep(slice);
+            } catch (InterruptedException e) {
+                // Thread.sleep cleared the flag; put it back and let the caller see the cancellation both
+                // ways - as the exception below and as the flag their own shutdown path is waiting on.
+                Thread.currentThread().interrupt();
+                throwIfInterrupted("the calling thread was interrupted while waiting for authorization");
+            }
             remaining -= slice;
         }
     }
@@ -1966,6 +1988,22 @@ public class OidcDeviceAuth implements QuietCloseable {
     private void throwIfClosed() {
         if (closed) {
             throw new OidcAuthException("the OidcDeviceAuth instance is closed");
+        }
+    }
+
+    /**
+     * Abandons the current step when the calling thread carries an interrupt, LEAVING THE FLAG SET.
+     * <p>
+     * isInterrupted(), never interrupted(): the flag is the caller's cancellation signal and has to outlive
+     * this call, so the shutdown path that raised it - an ExecutorService.shutdownNow(), a Future.cancel,
+     * QWP's ConnectCancellation - still sees it. Clearing it here would leave the caller believing it was
+     * never cancelled, which is the failure this guard exists to stop rather than one more of its causes.
+     *
+     * @param message what the caller was doing when the cancellation was noticed
+     */
+    private void throwIfInterrupted(String message) {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new OidcAuthException(message);
         }
     }
 
