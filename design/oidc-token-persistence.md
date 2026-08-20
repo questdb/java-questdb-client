@@ -302,6 +302,16 @@ whole reason persistence is **opt-in**. Mitigations, mapped to PR #52's existing
   — exactly the CR/LF / non-ASCII rejection PR #52 applies to IdP responses
   (`OidcDeviceAuth.java:935-951`). A bad file degrades to an interactive sign-in; it never
   injects into a request or throws token bytes into a message.
+- **Untrusted CONTAINER = discard the whole directory.** The file checks above cover the
+  artefact; they say nothing about who could have put it there. On POSIX, assert the store
+  directory is not group/other-**writable** before adopting anything out of it (a merely
+  world-*readable* 0755 from a default umask is fine — no other user can create or replace an
+  entry, and the files are 0600). When it *was* writable, tighten it to 0700 and discard
+  **every** entry in it, not only the key being loaded. A client MUST do the directory-wide
+  version: tightening destroys the very evidence it reports, so whichever identity — or
+  whichever operation, load *or* save — touches the store first consumes the one observation,
+  and every entry left behind is one no later call can distrust. Each identity then re-signs
+  in. Best-effort: a delete that fails must degrade to a sign-in, never throw.
 - **Never log/echo secrets.** The store never logs token contents and never embeds file
   contents in an exception, upholding PR #52's "tokens never leak into logs or exceptions"
   rule. Only paths and `IOException` kinds appear in the one best-effort warning.

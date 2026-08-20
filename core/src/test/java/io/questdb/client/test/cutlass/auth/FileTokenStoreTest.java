@@ -1473,6 +1473,85 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testWorldWritableVerdictIsNotConsumedByWhicheverIdentityLoadsFirst() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // restrictToOwner reads the permissions, chmods to 0700, and returns the verdict it computed
+            // BEFORE the chmod - so the verdict is destroyed by the act of reporting it. One store directory
+            // holds one file per configuration, and identity A's load tightens the directory for everybody:
+            // by the time identity B loads, the directory is 0700, B's verdict is "trusted", and B adopts
+            // whatever <hashB>.json happens to be sitting there. A discarded its own entry and left B's.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey a = sampleKey();
+            TokenStoreKey b = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid profile", null, false);
+            Assert.assertNotEquals("the two identities must address different files", a.hash(), b.hash());
+
+            store.save(a, sampleToken("ACCESS-A", "REFRESH-A"));
+            store.save(b, sampleToken("ACCESS-B", "REFRESH-B"));
+
+            // the window: while this stands, any local user can replace either entry
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            byte[] planted = Files.readAllBytes(tokenFile(dir, b));
+            Files.write(tokenFile(dir, b),
+                    new String(planted, StandardCharsets.UTF_8)
+                            .replace("REFRESH-B", "REFRESH-PLANTED")
+                            .getBytes(StandardCharsets.UTF_8));
+
+            // A loads first and correctly refuses - and tightens the directory on the way through
+            Assert.assertNull("A must refuse an entry from a world-writable directory", store.load(a));
+            Assert.assertEquals("A's load tightens the directory for every later caller",
+                    PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(dir));
+
+            // B now loads over a directory that LOOKS owner-only, because A made it so
+            Assert.assertNull("B must not adopt an entry that was exposed in the same window, merely "
+                    + "because A's load already spent the directory's untrusted verdict", store.load(b));
+            Assert.assertFalse("and the exposed entry must be discarded, not left for the next load",
+                    Files.exists(tokenFile(dir, b)));
+
+            // the store stays usable for both identities over the tightened directory
+            store.save(a, sampleToken("ACCESS-A2", "REFRESH-A2"));
+            store.save(b, sampleToken("ACCESS-B2", "REFRESH-B2"));
+            Assert.assertEquals("REFRESH-A2", store.load(a).getRefreshToken());
+            Assert.assertEquals("REFRESH-B2", store.load(b).getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testWorldWritableVerdictSurvivesASaveTouchingTheDirectoryFirst() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The same verdict, spent by a WRITE path instead. save() and inLock() call ensureDirectory too
+            // and discarded its boolean outright, so a save arriving before any load tightened the directory
+            // and left every planted entry in it looking like it had always been protected.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey a = sampleKey();
+            TokenStoreKey b = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid profile", null, false);
+            store.save(b, sampleToken("ACCESS-B", "REFRESH-B"));
+
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            byte[] planted = Files.readAllBytes(tokenFile(dir, b));
+            Files.write(tokenFile(dir, b),
+                    new String(planted, StandardCharsets.UTF_8)
+                            .replace("REFRESH-B", "REFRESH-PLANTED")
+                            .getBytes(StandardCharsets.UTF_8));
+
+            // a save for an unrelated identity is the first thing to touch the directory
+            store.save(a, sampleToken("ACCESS-A", "REFRESH-A"));
+            Assert.assertEquals("the save tightens the directory, as it always did",
+                    PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(dir));
+
+            Assert.assertNull("an entry exposed before that save must not be adopted afterwards",
+                    store.load(b));
+        });
+    }
+
+    @Test
     public void testLoadTrustsAWorldREADABLEDirectory() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));

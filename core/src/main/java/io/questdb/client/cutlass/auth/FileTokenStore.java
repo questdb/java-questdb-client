@@ -393,7 +393,11 @@ public final class FileTokenStore implements TokenStore {
             // set when an interrupt arrives while we poll for the cross-process lock; see acquireLock
             boolean cancelled = false;
             try {
-                ensureDirectory();
+                if (!ensureDirectory()) {
+                    // As in save(). The action run under this lock is a refresh that re-reads the store, so
+                    // an entry exposed before this call must not survive to be adopted by it.
+                    discardUntrustedDirectoryContents();
+                }
                 lock = lockFile(key);
                 nonce = acquireLock(lock);
             } catch (InterruptedException e) {
@@ -485,17 +489,12 @@ public final class FileTokenStore implements TokenStore {
             if (!isDirectoryTrusted) {
                 // The directory was WRITABLE by other local users until the tightening a moment ago, so
                 // anything already in it may have been planted rather than written by us. Tightening protects
-                // what we write from here on and says nothing about what was there before. Discard the entry
-                // rather than merely skip it: leaving it would hand the very same file to the next load,
-                // which now sees an owner-only directory and would trust it.
-                warnUnprotectedStoreDirOnce("it was writable by other local users; the entry found in it was "
-                        + "discarded rather than trusted, and a fresh sign-in is required");
-                try {
-                    Files.deleteIfExists(tokenFile(key));
-                } catch (IOException ignore) {
-                    // best-effort: a delete failure must not turn an untrusted entry into a thrown load
-                }
-                sweepTempFiles(key.hash(), 0L);
+                // what we write from here on and says nothing about what was there before. Discard rather
+                // than merely skip: leaving a file behind hands it to the next load, which now sees an
+                // owner-only directory and would trust it. ALL of them, not just this key's - the verdict is
+                // spent by whoever observes it first, so the entries this call leaves are entries no later
+                // call can distrust.
+                discardUntrustedDirectoryContents();
                 return null;
             }
             Path file = tokenFile(key);
@@ -526,7 +525,14 @@ public final class FileTokenStore implements TokenStore {
         try {
             byte[] content = serialize(key, token);
             try {
-                ensureDirectory();
+                if (!ensureDirectory()) {
+                    // Same verdict load() acts on, and save() is just as often the first call to touch the
+                    // store - a process that signs in and persists before it ever loads. Discarding the
+                    // boolean here left every entry already in the directory looking, to every later load,
+                    // like it had always been protected. The fresh token below is written afterwards, into
+                    // the directory ensureDirectory has by now tightened, so persistence still works.
+                    discardUntrustedDirectoryContents();
+                }
                 sweepStaleTempFiles(key.hash());
                 Path target = tokenFile(key);
                 Path tmp = createTempFile(key.hash());
@@ -1070,6 +1076,48 @@ public final class FileTokenStore implements TokenStore {
             // non-POSIX filesystem (e.g. Windows): rely on the owner-only directory ACL instead
             warnNoPosixPermsOnce();
             return Files.createTempFile(directory, prefix, ".tmp");
+        }
+    }
+
+    /**
+     * Discards EVERY entry in the store directory, and warns once, after {@link #restrictToOwner(Path)} has
+     * reported it was writable by other local users.
+     * <p>
+     * Discarding only the caller's own {@code <hash>.json} is not enough, because the verdict is destroyed by
+     * the act of reporting it: restrictToOwner chmods the directory to 0700 as it returns, so whichever
+     * caller touches the store first consumes the one observation. Every later load - in this process or the
+     * next - then sees an owner-only directory and adopts whatever entry is sitting there, including one
+     * planted while the directory stood open. One store directory holds one file per configuration and is
+     * documented as belonging to the store alone, so once it has been writable by other local users nothing
+     * in it can be told apart from a plant: all of it goes, and each identity re-signs in.
+     * <p>
+     * Best-effort by design. This runs on the flush path through {@code OidcDeviceAuth.getToken()}, so a
+     * delete that fails must degrade to a refresh or an interactive sign-in rather than throw - and the
+     * caller that triggered it fails closed either way, whether or not the file goes.
+     */
+    private void discardUntrustedDirectoryContents() {
+        warnUnprotectedStoreDirOnce("it was writable by other local users; every entry found in it was "
+                + "discarded rather than trusted, and a fresh sign-in is required");
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path entry : stream) {
+                final String name = entry.getFileName().toString();
+                final boolean isEntry = name.endsWith(".json");
+                // A steal-captured lock (<hash>.lock.<uuid>.tmp) is a cross-process handover in flight, not
+                // an orphaned write temp - sweepTempFiles skips it for the same reason. The .lock files
+                // themselves stay too: they carry no token, and acquireLock already treats a hostile or
+                // stale one as stealable.
+                final boolean isWriteTemp = name.endsWith(".tmp") && !name.contains(".lock.");
+                if (!isEntry && !isWriteTemp) {
+                    continue;
+                }
+                try {
+                    Files.deleteIfExists(entry);
+                } catch (IOException ignore) {
+                    // best-effort; skip this entry, the caller still fails closed
+                }
+            }
+        } catch (IOException ignore) {
+            // best-effort; an unreadable directory must not turn a fail-closed load into a thrown one
         }
     }
 
