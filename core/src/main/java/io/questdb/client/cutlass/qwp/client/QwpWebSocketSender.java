@@ -269,8 +269,11 @@ public class QwpWebSocketSender implements Sender {
     private String currentTableName;
     // Cursor SF engine: the producer (user thread) writes encoded QWP frames
     // into the engine's mmap'd ring; the cursorSendLoop is the I/O thread
-    // that walks the ring and sends frames.
-    private CursorSendEngine cursorEngine;
+    // that walks the ring and sends frames. Volatile since the recycle
+    // started reassigning it (non-null -> null -> non-null on the producer
+    // thread): the monitoring accessors (getAckedFsn, awaitAckedFsn) read it
+    // from a monitor thread, same reasoning as symbolDictEpoch.
+    private volatile CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
     // True when the sender emits incremental (delta) symbol dictionaries: each
@@ -327,8 +330,11 @@ public class QwpWebSocketSender implements Sender {
     // recycle path) advance it past every FSN already handed out, so the
     // external sequence stays strictly monotone across the internal reset.
     // Rule everywhere it is applied: external = fsnEpochBase + raw: raw
-    // -1 (no-data) sentinels are never translated.
-    private long fsnEpochBase = 0;
+    // -1 (no-data) sentinels are never translated. Volatile because the
+    // recycle rolls it while a monitor thread may be inside getAckedFsn /
+    // awaitAckedFsn: a stale base paired with a fresh engine would report
+    // an FSN dip to -1 (same reasoning as symbolDictEpoch).
+    private volatile long fsnEpochBase = 0;
     private boolean hasDeferredMessages;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
@@ -452,8 +458,9 @@ public class QwpWebSocketSender implements Sender {
     // keep reporting the durable watermark instead of collapsing to -1 while
     // cursorEngine is transiently null mid-swap or permanently null after a
     // failed recycle -- all pre-swap data really is acked, so the watermark
-    // stays truthful.
-    private long lastRecycleDurableFsn = -1L;
+    // stays truthful. Volatile: those accessors are exactly the surface a
+    // monitoring thread reads mid-swap, same reasoning as symbolDictEpoch.
+    private volatile long lastRecycleDurableFsn = -1L;
     // Budget for recycleForDictReset's deferred-close await (see
     // RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS); non-final only so tests can
     // shrink it to drive the timeout branch.

@@ -699,6 +699,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
      * that knob gates the arming path this request feeds, so the request is
      * accepted and never acted on.
+     * <p>
+     * Call on the producing thread only: like every other {@code Sender}
+     * method, this mutates producer-side state and is not thread-safe.
      */
     default void resetSymbolDictionary() {
     }
