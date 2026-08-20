@@ -54,13 +54,11 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -273,7 +271,7 @@ public class FileTokenStoreTest {
             // under a lock it actually holds, and no atomic-capture temp file leaks.
             //
             // SCOPE NOTE: these four contenders do NOT race at the file-lock layer. inLock() takes the
-            // in-process PROCESS_LOCKS stripe for key.hash() before any lock-file logic, and that table is
+            // in-process PROCESS_LOCKS entry for key.hash() before any lock-file logic, and that map is
             // static, so four distinct FileTokenStore instances on one identity are serialized whatever the
             // file lock does - the first reclaims the abandoned lock, and each of the rest finds the path free
             // and creates its own. The genuinely concurrent capture race is
@@ -396,54 +394,99 @@ public class FileTokenStoreTest {
     public void testProcessLocksDoNotGrowWithTheIdentityCount() throws Exception {
         assertMemoryLeak(() -> {
             // TokenStoreKey is public and inLock() is public API, so a process mints as many identities as its
-            // caller needs - one per end user in a multi-tenant service. The ConcurrentHashMap<String,
-            // ReentrantLock> this replaced rooted a 64-char hash plus a lock for each of them, permanently:
-            // nothing removed an entry, and the comment claiming it was "bounded by identity count (a
-            // handful)" was a statement about the expected caller, not about the data structure.
+            // caller needs - one per end user in a multi-tenant service. An unpruned map roots a 64-char hash
+            // plus a lock for every identity EVER SEEN, for the life of the JVM. Bound it by the identities
+            // actually in flight instead: once the last caller on an identity leaves, its entry goes.
             Field field = FileTokenStore.class.getDeclaredField("PROCESS_LOCKS");
             field.setAccessible(true);
-            Object before = field.get(null);
-            Assert.assertTrue("the in-process locks must be a FIXED table, not a per-identity map: " + before,
-                    before instanceof ReentrantLock[]);
-            final int stripes = ((ReentrantLock[]) before).length;
+            java.util.Map<?, ?> locks = (java.util.Map<?, ?>) field.get(null);
 
             Path dir = storeDir();
             createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
             AtomicInteger ran = new AtomicInteger();
-            // far more identities than stripes, so a map-backed implementation would visibly outgrow the table
-            for (int i = 0; i < 500; i++) {
+            final int identities = 500;
+            for (int i = 0; i < identities; i++) {
                 TokenStoreKey key = new TokenStoreKey("client-" + i, "https://idp.example.com:443/token",
                         "https://idp.example.com:443/device", "openid", null, false);
                 Assert.assertTrue(store.inLock(key, () -> {
                     ran.incrementAndGet();
+                    // the entry has to EXIST while its critical section runs, or the lock is serializing
+                    // nothing; the retirement below is only interesting because of this
+                    Assert.assertFalse("the identity's lock must be held for the critical section",
+                            locks.isEmpty());
                     return true;
                 }));
             }
-            Assert.assertEquals("every identity must still have run its critical section", 500, ran.get());
+            Assert.assertEquals("every identity must still have run its critical section", identities, ran.get());
 
-            Object after = field.get(null);
-            Assert.assertSame("the stripe table must not be rebuilt", before, after);
-            Assert.assertEquals("the stripe table must not grow with the identity count",
-                    stripes, ((ReentrantLock[]) after).length);
-            // and it must be usable, not merely present: a fresh identity still serializes
+            // Nothing is in flight now, so nothing may be left behind. This is the assertion the old
+            // stripe-table version could not make: it asserted the table was the same ARRAY of the same
+            // LENGTH, which is true of any immutable array whether or not the code under test works.
+            Assert.assertEquals("no entry may outlive its last caller [left=" + locks + "]", 0, locks.size());
+            // and it must be usable, not merely empty: a fresh identity still serializes
             Assert.assertTrue(store.inLock(sampleKey(), () -> true));
+            Assert.assertEquals("the fresh identity must be retired too", 0, locks.size());
+        });
+    }
 
-            // The index must actually spread. Nothing about correctness rests on it - landing every identity
-            // on one stripe still serializes same-identity pairs, which is all the lock owes anyone - but it
-            // would quietly serialize every unrelated identity in the process behind one another's refresh
-            // round trips, so a broken mask (an & 0, a constant) is worth catching here rather than in
-            // production latency.
-            Method processLockFor = FileTokenStore.class.getDeclaredMethod("processLockFor", TokenStoreKey.class);
-            processLockFor.setAccessible(true);
-            Set<ReentrantLock> distinct = new HashSet<>();
-            for (int i = 0; i < 500; i++) {
-                distinct.add((ReentrantLock) processLockFor.invoke(null,
-                        new TokenStoreKey("client-" + i, "https://idp.example.com:443/token",
-                                "https://idp.example.com:443/device", "openid", null, false)));
+    @Test(timeout = 60_000)
+    public void testUnrelatedIdentitiesDoNotSerializeOnEachOther() throws Exception {
+        assertMemoryLeak(() -> {
+            // The in-process lock owes exactly one guarantee: two callers on the SAME identity must not run
+            // the read-refresh-write concurrently and double-POST a rotating refresh token. It owes unrelated
+            // identities nothing, and serializing them is not the free trade it looks - the lock is held
+            // across a whole token-endpoint round trip while the caller also holds its OidcDeviceAuth
+            // instance lock, and the acquire has no budget. One tenant's ILP flush blocking on another
+            // tenant's stalled refresh is a stall the flush path cannot see coming.
+            //
+            // MORE identities than a 64-entry stripe table has stripes, so the pigeonhole principle - not a
+            // probability - guarantees a collision under any fixed table of that size. Every identity must
+            // still be able to sit inside its critical section at once.
+            final int identities = 65;
+            Path dir = storeDir();
+            createStoreDir(dir);
+            FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
+
+            CyclicBarrier allInside = new CyclicBarrier(identities);
+            AtomicReference<Throwable> workerError = new AtomicReference<>();
+            AtomicInteger inside = new AtomicInteger();
+            List<Thread> workers = new ArrayList<>();
+            for (int i = 0; i < identities; i++) {
+                TokenStoreKey key = new TokenStoreKey("tenant-" + i, "https://idp.example.com:443/token",
+                        "https://idp.example.com:443/device", "openid", null, false);
+                Thread t = new Thread(() -> {
+                    try {
+                        Assert.assertTrue(store.inLock(key, () -> {
+                            try {
+                                inside.incrementAndGet();
+                                // Trips only once every identity is holding its own lock. Two identities
+                                // sharing one lock can never both get here, so a stripe table deadlocks the
+                                // barrier and the await below times out.
+                                allInside.await(30, TimeUnit.SECONDS);
+                                return true;
+                            } catch (Exception e) {
+                                throw new RuntimeException(e);
+                            }
+                        }));
+                    } catch (Throwable e) {
+                        workerError.compareAndSet(null, e);
+                        allInside.reset(); // unblock the peers so the test fails loudly, not by timing out
+                    }
+                }, "tenant-lock-" + i);
+                t.setDaemon(true);
+                workers.add(t);
+                t.start();
             }
-            Assert.assertTrue("500 identities must not all collide onto one stripe (got " + distinct.size()
-                    + " of " + stripes + ")", distinct.size() > stripes / 2);
+            for (Thread t : workers) {
+                joinOrFail(t, "tenant lock holder");
+            }
+            if (workerError.get() != null) {
+                throw new AssertionError("unrelated identities did not hold their locks concurrently; "
+                        + identities + " identities, " + inside.get() + " got inside", workerError.get());
+            }
+            Assert.assertEquals("every identity must have entered its critical section",
+                    identities, inside.get());
         });
     }
 
@@ -590,7 +633,7 @@ public class FileTokenStoreTest {
             Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
 
             // Two threads of the SAME JVM contend for the one abandoned lock. SCOPE NOTE: the mutual exclusion
-            // asserted below (overlaps==0, maxInside==1) is provided by the in-process PROCESS_LOCKS stripe,
+            // asserted below (overlaps==0, maxInside==1) is provided by the in-process PROCESS_LOCKS entry,
             // which inLock() takes for key.hash() BEFORE any file-lock logic - so it would hold
             // even if the file-lock steal were broken. What this test genuinely proves is that two same-process
             // contenders each steal the stale lock and run their critical section (ran==2), serialized, without

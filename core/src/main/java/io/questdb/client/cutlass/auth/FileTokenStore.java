@@ -59,6 +59,7 @@ import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -171,18 +172,27 @@ public final class FileTokenStore implements TokenStore {
     // file lock's lock-free degrade must not license an intra-process race, so this in-process lock is taken
     // first and is never subject to that degrade.
     //
-    // A fixed STRIPE TABLE, not a map keyed on the identity fingerprint. TokenStoreKey is public and inLock()
-    // is public API, so how many distinct identities a process mints is the caller's business - one per end
-    // user in a multi-tenant service is a perfectly ordinary shape - and the
-    // ConcurrentHashMap<String, ReentrantLock> this replaced rooted a 64-char hash plus a lock for every one
-    // of them, for the life of the JVM, with nothing ever removing an entry. Striping is the right trade
-    // rather than reference-counted removal, because the lock only has to serialize AT LEAST every
-    // same-identity pair: two unrelated identities that land on one stripe merely wait for each other, which
-    // costs one of them the refresh round trip a same-identity peer would have cost anyway, while
-    // UNDER-serializing double-POSTs a rotating refresh token. Over-serializing is cheap and safe,
-    // under-serializing is neither - so a fixed table buys the bound for free, and with no removal race to
-    // get wrong. Keep the length a power of two: processLockFor() masks rather than divides.
-    private static final ReentrantLock[] PROCESS_LOCKS = newProcessLockTable(64);
+    // Keyed on the identity fingerprint, with one entry per identity that currently has a holder or a
+    // waiter and nothing left behind once the last of them leaves. TokenStoreKey is public and inLock() is
+    // public API, so how many distinct identities a process mints is the caller's business - one per end
+    // user in a multi-tenant service is a perfectly ordinary shape - and an entry per identity EVER SEEN,
+    // which an unpruned map gives, roots a 64-char hash plus a lock for the life of the JVM. Retiring on
+    // the last release bounds the map by CONCURRENT identities instead, which is bounded by live threads.
+    //
+    // A fixed stripe table also bounds it, and was tried, but over-serializing is not the free trade it
+    // looks: this lock is held across a whole token-endpoint round trip while the caller also holds its
+    // OidcDeviceAuth instance lock, and the acquire has no budget. Two unrelated identities landing on one
+    // stripe therefore do not merely "wait for each other" - one tenant's ILP flush blocks on another
+    // tenant's stalled refresh for that holder's entire worst case, which getToken() sizes at four times
+    // httpTimeoutMillis plus an OS connect stall, and every other caller on the blocked instance fails
+    // meanwhile. That also made OidcDeviceAuth.getToken()'s "two instances sharing ONE IDENTITY" contract
+    // untrue. Per-identity entries serialize exactly the same-identity pairs the double-POST rule needs and
+    // nothing else, so the contract holds as written.
+    //
+    // compute()/computeIfPresent() apply their function atomically under the bin lock, so `users` needs no
+    // synchronization of its own and retirement has no race: an arriving thread cannot observe an entry
+    // that a departing one is removing.
+    private static final ConcurrentHashMap<String, ProcessLock> PROCESS_LOCKS = new ConcurrentHashMap<>();
     // Windows can fail the atomic token-file rename with a transient AccessDeniedException (a sharing violation)
     // when a concurrent reader in any process holds the target open; retry the rename this many times on a short
     // backoff before giving up, so a routine read/write overlap does not needlessly degrade persistence. Kept
@@ -347,20 +357,23 @@ public final class FileTokenStore implements TokenStore {
             Thread.currentThread().interrupt();
             return false;
         }
-        final ReentrantLock processLock = processLockFor(key);
+        // Retain before the acquire and release in the outermost finally, so every exit - the interrupted
+        // acquire below included - gives the claim back exactly once.
+        final ProcessLock processLock = retainProcessLock(key);
         // lockInterruptibly, never lock(): a peer thread on this identity holds this for a whole refresh round
         // trip, and an interrupt is the ONLY lever that reaches a caller stuck behind it. QWP's
         // ConnectCancellation.cancel() interrupts a thread inside a credential pull precisely so close() can
         // unstick it; an uninterruptible acquire here sleeps through that, outlives close()'s shutdown budget,
         // and leaves the native client, the cursor engine and the slot lock to a delegated teardown.
         try {
-            processLock.lockInterruptibly();
+            processLock.lock.lockInterruptibly();
         } catch (InterruptedException e) {
             // Interrupted WAITING for the process lock: a live cancellation, acted on by abandoning the
             // refresh. Not re-asserted - the signal has been consumed by doing what it asked. The caller
             // learns through the false return (OidcDeviceAuth turns it into a credential failure), while
             // leaving the flag set would break every later blocking call on this thread, including the
             // teardown the interrupt was sent to enable.
+            releaseProcessLock(key); // the acquire never happened, so give the claim straight back
             return false;
         }
         try {
@@ -438,7 +451,8 @@ public final class FileTokenStore implements TokenStore {
                 }
             }
         } finally {
-            processLock.unlock();
+            processLock.lock.unlock();
+            releaseProcessLock(key);
         }
     }
 
@@ -599,13 +613,6 @@ public final class FileTokenStore implements TokenStore {
         return System.currentTimeMillis() + " " + UUID.randomUUID();
     }
 
-    private static ReentrantLock[] newProcessLockTable(int stripes) {
-        final ReentrantLock[] locks = new ReentrantLock[stripes];
-        for (int i = 0; i < stripes; i++) {
-            locks[i] = new ReentrantLock();
-        }
-        return locks;
-    }
 
     private static boolean nullableEquals(String keyValue, StringSink fileValue) {
         boolean fileHasValue = fileValue.length() > 0;
@@ -749,13 +756,21 @@ public final class FileTokenStore implements TokenStore {
         putString(sink, value);
     }
 
-    private static ReentrantLock processLockFor(TokenStoreKey key) {
-        // key.hash() is a hex SHA-256, so its bits are already uniform and String.hashCode inherits that;
-        // spread anyway - the standard HashMap mix - so a table this small never rides on the low bits alone.
-        // Masking with length-1 is why the length must stay a power of two, and it handles a negative
-        // hashCode (including Integer.MIN_VALUE) without the Math.abs trap.
-        final int h = key.hash().hashCode();
-        return PROCESS_LOCKS[(h ^ (h >>> 16)) & (PROCESS_LOCKS.length - 1)];
+    // Drops this caller's claim on the identity's lock, retiring the entry when it was the last one, so the
+    // map never outgrows the identities actually in flight. Pairs with retainProcessLock in a finally.
+    private static void releaseProcessLock(TokenStoreKey key) {
+        PROCESS_LOCKS.computeIfPresent(key.hash(), (identity, held) -> --held.users == 0 ? null : held);
+    }
+
+    // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
+    // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
+    // it - which is what makes the retirement in releaseProcessLock safe.
+    private static ProcessLock retainProcessLock(TokenStoreKey key) {
+        return PROCESS_LOCKS.compute(key.hash(), (identity, existing) -> {
+            final ProcessLock held = existing != null ? existing : new ProcessLock();
+            held.users++;
+            return held;
+        });
     }
 
     private static byte[] readBounded(Path file) throws IOException {
@@ -1247,6 +1262,18 @@ public final class FileTokenStore implements TokenStore {
 
     private Path tokenFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".json");
+    }
+
+    /**
+     * One identity's in-process lock plus the number of callers currently holding or queued on it.
+     * <p>
+     * {@code users} is read and written only inside {@link ConcurrentHashMap#compute} /
+     * {@link ConcurrentHashMap#computeIfPresent} remapping functions, which run under the bin lock, so it
+     * needs no volatility or atomics of its own.
+     */
+    private static final class ProcessLock {
+        final ReentrantLock lock = new ReentrantLock();
+        int users;
     }
 
     private static final class TokenFileParser implements JsonParser {
