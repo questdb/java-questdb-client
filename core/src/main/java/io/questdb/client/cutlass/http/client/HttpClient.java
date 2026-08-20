@@ -934,8 +934,26 @@ public abstract class HttpClient implements QuietCloseable {
         public void await(int timeout) {
             int totalBytesReceived = 0;
             long unprocessedLo = responseParserBufLo;
+            // A positive timeout bounds the whole call, not each socket read - the same rule
+            // AbstractResponse.recv and AbstractChunkedResponse.recv apply to the BODY, and for the same
+            // reason. recvOrDie returns 0 whenever a read produced no application bytes (an incomplete TLS
+            // record that decrypts to nothing is the common case, and the IDP endpoints are required to be
+            // https), and a 0 leaves totalBytesReceived unmoved, so the loop neither advances the header
+            // parser nor fills its buffer: without one shared deadline it re-arms the full timeout forever
+            // and never reaches the "header is too large" escape either. That put no bound at all on
+            // OidcDeviceAuth's postForm/fetchJson, which read this head from an untrusted identity provider
+            // on the getToken() flush path. A non-positive timeout keeps the legacy "no bound" behaviour.
+            final boolean bounded = timeout > 0;
+            final long startNanos = bounded ? System.nanoTime() : 0L;
             while (isIncomplete()) {
-                final int len = recvOrDie(responseParserBufLo + totalBytesReceived, timeout);
+                int callTimeout = timeout;
+                if (bounded) {
+                    callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                    if (callTimeout <= 0) {
+                        throw new HttpClientException("timed out reading the response head");
+                    }
+                }
+                final int len = recvOrDie(responseParserBufLo + totalBytesReceived, callTimeout);
                 if (len > 0) {
                     totalBytesReceived += len;
                     unprocessedLo = parse(unprocessedLo, responseParserBufLo + totalBytesReceived, false, true);

@@ -119,6 +119,18 @@ public class MockOidcServer implements Closeable {
         return response;
     }
 
+    /**
+     * Dribbles the response HEAD - the status line and headers - one byte at a time and never terminates it,
+     * so the client never reaches a complete header block. The body-dribbling {@link #dribble()} above cannot
+     * reach this: a client only starts reading a body once the head has parsed, so the head read is a
+     * separate bound with a separate loop ({@code ResponseHeaders.await}, not {@code Response.recv}).
+     */
+    public static MockResponse dribbleHead() {
+        MockResponse response = new MockResponse(200, "", true);
+        response.dribbleHead = true;
+        return response;
+    }
+
     public static MockResponse stall() {
         MockResponse response = new MockResponse(200, "", true);
         response.stall = true;
@@ -318,6 +330,32 @@ public class MockOidcServer implements Closeable {
             }
             return;
         }
+        if (response.dribbleHead) {
+            // Dribble the response HEAD one byte at a time and never terminate it: no blank line ever
+            // arrives, so the header parser stays incomplete and ResponseHeaders.await keeps looping. Each
+            // read makes progress within its budget, so a client that re-armed a per-read timeout would run
+            // for (bytes x timeout) - long enough that the @Test timeout fires instead - while one bounding
+            // the WHOLE call aborts on its own deadline. Header bytes only, so nothing here can be mistaken
+            // for a body. Stop once the client aborts and closes the socket (the write throws).
+            // Well-formed throughout - a status line followed by endlessly repeated padding headers - so the
+            // client aborts on its deadline rather than on a parse error, which would prove nothing about
+            // the bound. The blank line that would end the head is never sent.
+            final StringBuilder head = new StringBuilder("HTTP/1.1 200 OK\r\n");
+            for (int i = 0; i < 400; i++) {
+                head.append("X-Pad-").append(i).append(": pad\r\n");
+            }
+            final byte[] headBytes = head.toString().getBytes(StandardCharsets.US_ASCII);
+            try {
+                for (byte headByte : headBytes) {
+                    out.write(headByte);
+                    out.flush();
+                    Thread.sleep(50);
+                }
+            } catch (IOException | InterruptedException ignore) {
+                // the client aborted on its whole-read deadline and closed the socket
+            }
+            return;
+        }
         if (response.dribble) {
             // send chunked headers, then dribble the chunk-size LINE one hex digit at a time (never the
             // terminating CRLF), so the client's single recv() keeps looping on the incomplete line while
@@ -419,6 +457,7 @@ public class MockOidcServer implements Closeable {
         final boolean chunked;
         final int status;
         boolean dribble;
+        boolean dribbleHead;
         boolean dropConnection;
         long oversizedBodyBytes;
         String rawResponse;
