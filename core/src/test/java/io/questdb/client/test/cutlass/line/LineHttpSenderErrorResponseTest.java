@@ -24,11 +24,15 @@
 
 package io.questdb.client.test.cutlass.line;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.questdb.client.Sender;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import org.junit.Assert;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -162,6 +166,50 @@ public class LineHttpSenderErrorResponseTest {
                     Assert.assertEquals("a committed batch must be sent exactly once; a drain failure after a "
                             + "2xx must not re-send it", 1, requests.get());
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDrainFailureAfterASuccessfulFlushReportsItsReason() throws Exception {
+        assertMemoryLeak(() -> {
+            // A 2xx IS the commit, so a body-drain abort after it changes no outcome - but it does drop the
+            // connection, because unconsumed bytes would mis-frame the next response. Against a server that
+            // dribbles every response that is one reconnect per flush, and the catch used to bind the
+            // exception and discard it, leaving the churn with nothing to explain it.
+            ch.qos.logback.classic.Logger senderLog =
+                    (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(
+                            "io.questdb.client.cutlass.line.http.AbstractLineHttpSender");
+            ListAppender<ILoggingEvent> appender = new ListAppender<>();
+            appender.start();
+            Level saved = senderLog.getLevel();
+            senderLog.setLevel(Level.ALL);
+            senderLog.addAppender(appender);
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.dribble(200))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(3_000)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush(); // the 2xx committed; only the drain aborts
+                }
+                String drainLine = null;
+                for (ILoggingEvent event : appender.list) {
+                    if (event.getFormattedMessage().contains("could not drain the response body")) {
+                        drainLine = event.getFormattedMessage();
+                        break;
+                    }
+                }
+                Assert.assertNotNull("a drain abort that drops the connection must say so; logged: "
+                        + appender.list, drainLine);
+                Assert.assertTrue("and it must carry WHY, not just that it happened: " + drainLine,
+                        drainLine.contains("reason=") && !drainLine.contains("reason=null"));
+            } finally {
+                senderLog.detachAppender(appender);
+                senderLog.setLevel(saved);
             }
         });
     }

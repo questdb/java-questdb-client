@@ -59,10 +59,13 @@ import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.TestOnly;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 
 public abstract class AbstractLineHttpSender implements Sender {
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractLineHttpSender.class);
     private static final String PATH = "/write?precision=n";
     private static final int RETRY_BACKOFF_MULTIPLIER = 2;
     private static final int RETRY_INITIAL_BACKOFF_MS = 10;
@@ -749,7 +752,16 @@ public abstract class AbstractLineHttpSender implements Sender {
                     try {
                         consumeChunkedResponse(response, actualTimeoutMillis); // if any
                     } catch (HttpClientException e) {
+                        // The flush already SUCCEEDED - a 2xx IS the commit - so this changes no outcome,
+                        // only the connection: unconsumed bytes would mis-frame the next response on it, so
+                        // it is dropped below and the next flush reconnects. That cost is otherwise
+                        // invisible - a server or intermediary that dribbles every response turns into one
+                        // reconnect per flush, and the only symptom is churn nothing explains. DEBUG, not
+                        // WARN: the handling is correct and a legitimately slow body is not a fault.
                         drained = false;
+                        LOG.debug("could not drain the response body after a successful flush; dropping the "
+                                        + "connection so the next response cannot be mis-framed [reason={}]",
+                                e.getMessage());
                     }
                     // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
                     if (!drained || keepAliveDisabled(response)) {
