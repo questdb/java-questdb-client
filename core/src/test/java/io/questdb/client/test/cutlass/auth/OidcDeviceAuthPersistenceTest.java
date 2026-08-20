@@ -109,6 +109,73 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCancelledStoreLockWaitDoesNotArmTheSharedRefreshBackOff() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                // an expired access token with a live refresh token: getToken() must want a silent refresh
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-1",
+                        System.currentTimeMillis() - 1_000, 300_000);
+                fake.cancelWaitInsteadOfRunning = true;
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        auth.getToken();
+                        Assert.fail("getToken must report the cancellation rather than a refresh failure");
+                    } catch (OidcAuthException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("interrupted"));
+                    }
+                    // refreshFailedAtMillis is INSTANCE state shared by every producer holding this
+                    // OidcDeviceAuth. Arming it here would fail all of them for
+                    // MIN_REFRESH_RETRY_INTERVAL_MILLIS over a credential that is fine and an identity
+                    // provider that was never contacted - the cancelled wait ran no refresh at all.
+                    Assert.assertEquals("a cancelled lock wait must not arm the shared refresh back-off",
+                            0L, readPrivateLong(auth, "refreshFailedAtMillis"));
+                    Assert.assertEquals("the token endpoint must not have been called", 0, token.get());
+                } finally {
+                    // the store set the flag on this thread by design; do not leak it into later tests
+                    Thread.interrupted();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCancelledStoreLockWaitDoesNotStartTheDeviceFlow() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-1", "REFRESH-1", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-1",
+                        System.currentTimeMillis() - 1_000, 300_000);
+                fake.cancelWaitInsteadOfRunning = true;
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        auth.signIn();
+                        Assert.fail("signIn must decline once a cancellation abandoned the store lock wait");
+                    } catch (OidcAuthException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("interrupted"));
+                    }
+                    // The device flow is the expensive wrong answer: it launches a browser and then polls
+                    // to the device-code lifetime on Os.sleep, which ignores interrupts - so a caller that
+                    // cancelled this thread cannot get it back, and shutdown does not complete. A plain
+                    // false from inLock reads as "the refresh failed", which is exactly what sends signIn()
+                    // here.
+                    Assert.assertEquals("a cancelled lock wait must not start the interactive device flow",
+                            0, device.get());
+                    Assert.assertEquals("and must not reach the token endpoint either", 0, token.get());
+                } finally {
+                    Thread.interrupted();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testBuildRejectsFileTokenStoreWithTooSmallStaleWindow() throws Exception {
         assertMemoryLeak(() -> {
             try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(200, "{}"))) {
@@ -1578,6 +1645,10 @@ public class OidcDeviceAuthPersistenceTest {
         final AtomicInteger loads = new AtomicInteger();
         final AtomicInteger locks = new AtomicInteger();
         final AtomicInteger saves = new AtomicInteger();
+        // models a CONFORMANT coordinating store whose lock wait a cancellation abandoned: per TokenStore's
+        // contract it returns false without running the action AND leaves the interrupt flag set, which is
+        // what lets OidcDeviceAuth tell that apart from a refresh that ran and failed
+        boolean cancelWaitInsteadOfRunning;
         // number of leading load() calls to fail before the first one is allowed to succeed; models a
         // transient store fault (an interrupted channel, a momentary IO error), as opposed to a store that
         // simply has nothing to return
@@ -1600,6 +1671,10 @@ public class OidcDeviceAuthPersistenceTest {
             locks.incrementAndGet();
             if (throwBeforeAction != null) {
                 throw throwBeforeAction;
+            }
+            if (cancelWaitInsteadOfRunning) {
+                Thread.currentThread().interrupt();
+                return false;
             }
             if (peerInstallsOnLock != null) {
                 // simulate a peer process refreshing and writing a fresh entry while we hold the lock

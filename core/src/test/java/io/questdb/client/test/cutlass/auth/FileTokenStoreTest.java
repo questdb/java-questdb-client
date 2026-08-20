@@ -1055,8 +1055,15 @@ public class FileTokenStoreTest {
             Assert.assertTrue("the interrupt must cut the poll short, took " + elapsed + "ms", elapsed < 5_000);
             Assert.assertFalse("the refresh must not start once the wait was cancelled", ran.get());
             Assert.assertEquals("an abandoned wait reports no refresh", Boolean.FALSE, result.get());
-            Assert.assertFalse("an interrupt that arrived during the wait is consumed by acting on it, so it "
-                    + "cannot go on to break the teardown it was sent to enable", flagLeftSet.get());
+            // The false above is not self-describing: a refresh that RAN and failed returns the same value.
+            // Only the restored flag separates them, and OidcDeviceAuth acts on the difference - a bare
+            // false sends signIn() into the interactive device flow (a browser, then a poll loop on Os.sleep
+            // that ignores interrupts) on a thread its owner just cancelled, and makes getToken() arm the
+            // instance-wide refresh back-off over a credential that is fine. This assertion used to require
+            // the opposite, on the reasoning that consuming the signal was "acting on it"; consuming it is
+            // what made the two cases indistinguishable.
+            Assert.assertTrue("inLock must leave the interrupt flag set when a cancellation abandoned its "
+                    + "wait, or the caller cannot tell that apart from a failed refresh", flagLeftSet.get());
             Assert.assertTrue("the peer's live lock must be left alone", Files.exists(lock));
         });
     }
@@ -1090,6 +1097,7 @@ public class FileTokenStoreTest {
 
             AtomicBoolean ran = new AtomicBoolean();
             AtomicReference<Boolean> result = new AtomicReference<>();
+            AtomicBoolean flagAfterReturn = new AtomicBoolean();
             AtomicReference<Throwable> waiterError = new AtomicReference<>();
             Thread waiter = new Thread(() -> {
                 try {
@@ -1097,6 +1105,10 @@ public class FileTokenStoreTest {
                         ran.set(true);
                         return true;
                     }));
+                    // sampled INSIDE the thread and immediately after the return, because that is the
+                    // instant OidcDeviceAuth inspects it to tell "the wait was cancelled" from "the
+                    // refresh ran and failed"
+                    flagAfterReturn.set(Thread.currentThread().isInterrupted());
                 } catch (Throwable t) {
                     // see the sibling test: a throw here must arrive as itself, not as a missing result
                     waiterError.compareAndSet(null, t);
@@ -1122,6 +1134,11 @@ public class FileTokenStoreTest {
                     elapsed < 5_000);
             Assert.assertFalse("the refresh must not start once the wait was cancelled", ran.get());
             Assert.assertEquals("an abandoned wait reports no refresh", Boolean.FALSE, result.get());
+            // Same contract as the file-lock sibling: false alone cannot be told from a failed refresh, and
+            // OidcDeviceAuth answers a failed refresh with the interactive device flow.
+            Assert.assertTrue("inLock must leave the interrupt flag set when a cancellation abandoned its "
+                    + "wait, or the caller cannot tell that apart from a failed refresh",
+                    flagAfterReturn.get());
 
             release.countDown();
             holder.join(10_000);

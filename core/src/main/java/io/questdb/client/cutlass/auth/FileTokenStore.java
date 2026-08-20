@@ -389,11 +389,20 @@ public final class FileTokenStore implements TokenStore {
             processLock.lock.lockInterruptibly();
         } catch (InterruptedException e) {
             // Interrupted WAITING for the process lock: a live cancellation, acted on by abandoning the
-            // refresh. Not re-asserted - the signal has been consumed by doing what it asked. The caller
-            // learns through the false return (OidcDeviceAuth turns it into a credential failure), while
-            // leaving the flag set would break every later blocking call on this thread, including the
-            // teardown the interrupt was sent to enable.
+            // refresh. RE-ASSERT the flag before returning. A bare `false` is indistinguishable from "the
+            // refresh ran and failed", which is the one thing the caller must not conclude here: signIn()
+            // reads it that way and starts the interactive device flow -- a browser launch and a poll loop
+            // that runs to the device-code lifetime on Os.sleep, which ignores interrupts -- on a thread
+            // whose owner has already asked it to stop, and getToken() reads it that way and arms the
+            // shared refresh back-off on a refresh that never happened, failing every other caller of this
+            // instance for the next five seconds. Restoring the flag is what lets signIn()'s
+            // throwIfInterrupted and getToken()'s post-refresh check tell the two apart. It is also what
+            // load() and save() already do; only this method consumed the signal.
+            //
+            // Safe to restore here: nothing below this point performs interruptible I/O -
+            // releaseProcessLock is a ConcurrentHashMap update, and no lock file was ever opened.
             releaseProcessLock(lockIdentity); // the acquire never happened, so give the claim straight back
+            Thread.currentThread().interrupt();
             return false;
         }
         try {
@@ -442,6 +451,14 @@ public final class FileTokenStore implements TokenStore {
                 // to stop - so never start it once an interrupt has been observed. isInterrupted() rather than
                 // interrupted() for the late arrival: we did not catch that one, so it is not ours to clear.
                 if (cancelled || Thread.currentThread().isInterrupted()) {
+                    if (cancelled) {
+                        // acquireLock's poll consumed the flag; put it back for the same reason the
+                        // process-lock wait above does, so the caller can tell a cancelled wait from a
+                        // failed refresh. The late-arrival case needs nothing - that flag is still set.
+                        // Nothing below performs interruptible I/O: cancelled implies acquireLock threw,
+                        // so nonce is null and the finally below skips releaseLock.
+                        Thread.currentThread().interrupt();
+                    }
                     return false;
                 }
                 return action.run();

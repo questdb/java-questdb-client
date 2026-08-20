@@ -621,6 +621,18 @@ public class OidcDeviceAuth implements QuietCloseable {
                     refreshFailedAtMillis = 0;
                     return selectToken();
                 }
+                // A coordinating TokenStore returns false WITHOUT running the refresh when an interrupt
+                // abandons its lock wait, and the contract requires it to leave the flag set so this call
+                // can tell that apart from a refresh that ran and failed. The difference matters twice
+                // over: refreshFailedAtMillis is INSTANCE state, so arming it here would make one
+                // cancelled caller fail every other producer sharing this OidcDeviceAuth for the next
+                // MIN_REFRESH_RETRY_INTERVAL_MILLIS - over a credential that is fine and an identity
+                // provider that is reachable - and the message below would send that operator to
+                // re-authenticate for the same reason. Report the cancellation instead, and leave the
+                // latch alone: nothing was attempted, so there is nothing to back off from.
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new OidcAuthException("the calling thread was interrupted while waiting for the token store lock, so no silent token refresh was attempted; retry on an uninterrupted thread");
+                }
                 refreshFailedAtMillis = System.currentTimeMillis();
             }
             if (cachedToken != null) {

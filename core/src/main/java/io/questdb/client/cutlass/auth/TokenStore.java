@@ -82,11 +82,20 @@ public interface TokenStore {
      * {@code action} unlocked, rather than lean on that fallback.
      * <p>
      * An implementation that waits for its lock must make that wait INTERRUPTIBLE and, on an interrupt,
-     * return {@code false} without running {@code action}. The wait can outlast the caller's own shutdown
-     * budget - QWP's connect cancellation interrupts a thread stuck in a credential pull precisely so
-     * {@code close()} can reclaim its native resources - and an uninterruptible wait defeats that, leaving
-     * the client, the cursor engine and the store-and-forward slot lock to a delegated teardown. The
-     * {@code false} return reads as "no refresh happened", which {@code OidcDeviceAuth} already handles.
+     * return {@code false} without running {@code action} AND leave the thread's interrupt flag SET. The
+     * wait can outlast the caller's own shutdown budget - QWP's connect cancellation interrupts a thread
+     * stuck in a credential pull precisely so {@code close()} can reclaim its native resources - and an
+     * uninterruptible wait defeats that, leaving the client, the cursor engine and the store-and-forward
+     * slot lock to a delegated teardown.
+     * <p>
+     * Restoring the flag is not optional politeness. {@code false} on its own is indistinguishable from
+     * "the refresh ran and failed", and {@code OidcDeviceAuth} must tell the two apart: it reads a plain
+     * {@code false} as a failed refresh and answers by starting the INTERACTIVE device flow - a browser
+     * launch and a poll loop that runs to the device-code lifetime, ignoring interrupts - on a thread whose
+     * owner has already cancelled it, and by arming the shared refresh back-off that then fails every other
+     * caller of the instance. An implementation that consumes the interrupt (as
+     * {@code InterruptedException} does) must re-assert it with {@code Thread.currentThread().interrupt()}
+     * before returning, once it is past any interruptible I/O of its own.
      *
      * @param key    the identity to lock
      * @param action the critical section; its boolean result is returned unchanged
