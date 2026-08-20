@@ -1438,6 +1438,49 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testLoadDiscardsOnlyTheStoresOwnFilesFromAWorldWritableDirectory() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // Discarding every ENTRY in an untrusted directory is right - the sibling test pins it. What the
+            // discard must not do is decide "entry" means "any .json", because the directory it is emptying
+            // is one the operator chose and may share. questdb.client.oidc.token.store.dir pointed at an
+            // existing config directory that happens to be group-writable is enough: one getToken() then
+            // deletes files the client never wrote.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            // Files a stranger owns, chosen to sit either side of the shape test: a plain name, a name that
+            // is hex but too short to be a fingerprint, a full-length hex name that is not a fingerprint of
+            // ANY key, and a foreign temp. (No uppercase-hex case: the store renders its digests lowercase,
+            // but on a case-insensitive filesystem such a name is the same file as the real entry, so the
+            // assertion would be about the filesystem rather than about the filter.)
+            Path plainJson = dir.resolve("my-important-settings.json");
+            Path shortHexJson = dir.resolve("abc123.json");
+            Path foreignTemp = dir.resolve("scratch-notes.tmp");
+            Files.write(plainJson, "{\"keep\":true}".getBytes(StandardCharsets.UTF_8));
+            Files.write(shortHexJson, "{\"keep\":true}".getBytes(StandardCharsets.UTF_8));
+            Files.write(foreignTemp, "keep".getBytes(StandardCharsets.UTF_8));
+
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+
+            Assert.assertNull("an entry from a directory other local users could write must not be adopted",
+                    store.load(key));
+            Assert.assertFalse("the store's own entry is still discarded - that half is unchanged",
+                    Files.exists(tokenFile(dir, key)));
+
+            Assert.assertTrue("a file the store never wrote must survive: " + plainJson.getFileName(),
+                    Files.exists(plainJson));
+            Assert.assertTrue("a short hex name is not a 64-char fingerprint: " + shortHexJson.getFileName(),
+                    Files.exists(shortHexJson));
+            Assert.assertTrue("a foreign .tmp is not a store write temp: " + foreignTemp.getFileName(),
+                    Files.exists(foreignTemp));
+        });
+    }
+
+    @Test
     public void testLoadRejectsAndDiscardsAnEntryFromAWorldWritableDirectory() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));

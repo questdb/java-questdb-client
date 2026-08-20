@@ -147,6 +147,10 @@ public final class FileTokenStore implements TokenStore {
     private static final long EMPTY_LOCK_STEAL_GRACE_MILLIS = 5_000L;
     private static final FileAttribute<Set<PosixFilePermission>> FILE_ATTRS =
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"));
+    // Length of the identity fingerprint every file this store writes is named after: TokenStoreKey.hash()
+    // is a SHA-256 rendered as lowercase hex, so 64 characters. Used to tell this store's own files apart
+    // from whatever else shares the directory - see discardUntrustedDirectoryContents().
+    private static final int HASH_NAME_LENGTH = 64;
     private static final char[] HEX = "0123456789abcdef".toCharArray();
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
@@ -592,6 +596,32 @@ public final class FileTokenStore implements TokenStore {
         } catch (IOException ignore) {
             // reclaimed by sweepStaleTempFiles later
         }
+    }
+
+    /**
+     * Whether {@code name} starts with the 64-character lowercase-hex identity fingerprint every file this
+     * store writes is named after.
+     * <p>
+     * This is the test for "we could have written this", used where a sweep has no single
+     * {@link TokenStoreKey} to scope itself by and must therefore recognise the store's files by shape
+     * rather than by an exact name. It is deliberately a prefix test: the entry is
+     * {@code <hash>.json} but a write temp is {@code <hash><random>.tmp}, so only the leading fingerprint
+     * is common to both.
+     * <p>
+     * Case matters. {@code TokenStoreKey} renders the digest through {@link #HEX}, which is lowercase, so
+     * an uppercase-hex name is not one of ours and is left alone.
+     */
+    private static boolean hasStoreHashPrefix(String name) {
+        if (name.length() < HASH_NAME_LENGTH) {
+            return false;
+        }
+        for (int i = 0; i < HASH_NAME_LENGTH; i++) {
+            final char c = name.charAt(i);
+            if ((c < '0' || c > '9') && (c < 'a' || c > 'f')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String newLockNonce() {
@@ -1101,7 +1131,20 @@ public final class FileTokenStore implements TokenStore {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
             for (Path entry : stream) {
                 final String name = entry.getFileName().toString();
-                final boolean isEntry = name.endsWith(".json");
+                // Only files THIS STORE could have written. Every one of them is named after a 64-hex
+                // identity fingerprint - tokenFile() builds "<hash>.json" and writeTemp() asks
+                // createTempFile() for "<hash><random>.tmp" - so a name without that prefix belongs to
+                // whatever else shares the directory. Without this test the filter below reads as "any
+                // .json file", and the operator who pointed questdb.client.oidc.token.store.dir at a
+                // directory holding their own config loses it on the first load(). The directory being
+                // group-writable is what brought us here; it is not a licence to delete files we did not
+                // write. sweepTempFiles() already scopes itself this way, by hash prefix.
+                if (!hasStoreHashPrefix(name)) {
+                    continue;
+                }
+                // The entry is exactly "<hash>.json"; anything longer that merely starts with a hash is
+                // not ours either. A write temp carries a random infix, so only its suffix is fixed.
+                final boolean isEntry = name.length() == HASH_NAME_LENGTH + 5 && name.endsWith(".json");
                 // A steal-captured lock (<hash>.lock.<uuid>.tmp) is a cross-process handover in flight, not
                 // an orphaned write temp - sweepTempFiles skips it for the same reason. The .lock files
                 // themselves stay too: they carry no token, and acquireLock already treats a hostile or
