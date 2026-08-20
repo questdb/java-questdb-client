@@ -49,6 +49,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -88,6 +89,10 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * attributes nor atomic moves.
  */
 public class FileTokenStoreTest {
+
+    private static final Set<PosixFilePermission> OWNER_ONLY_DIR_PERMS =
+            PosixFilePermissions.fromString("rwx------");
+
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
@@ -256,7 +261,7 @@ public class FileTokenStoreTest {
     public void testConcurrentStealContentionDegradesCleanly() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             TokenStoreKey key = sampleKey();
             // a lock abandoned by a crashed holder, backdated well past the staleness window
             Path lock = lockFile(dir, key);
@@ -348,7 +353,7 @@ public class FileTokenStoreTest {
             // separate io.questdb.client.test.* package with its own module-info, so package-private access
             // is structurally unavailable.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             TokenStoreKey key = sampleKey();
             Path lock = lockFile(dir, key);
             Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
@@ -403,7 +408,7 @@ public class FileTokenStoreTest {
             final int stripes = ((ReentrantLock[]) before).length;
 
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
             AtomicInteger ran = new AtomicInteger();
             // far more identities than stripes, so a map-backed implementation would visibly outgrow the table
@@ -489,7 +494,7 @@ public class FileTokenStoreTest {
             // The other half of the Windows sharing-violation arm: a denial that never clears must surface,
             // not be retried forever or swallowed. save() turns the throw into its best-effort degrade.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
             Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
 
@@ -532,7 +537,7 @@ public class FileTokenStoreTest {
             // containing directory, so taking it away denies the move exactly as the sharing violation does,
             // and restoring it mid-retry stands in for the Windows reader closing its handle.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
             Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
 
@@ -577,7 +582,7 @@ public class FileTokenStoreTest {
     public void testSameProcessContendersSerializeAndBothStealStaleLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             TokenStoreKey key = sampleKey();
             // a lock abandoned by a crashed holder, backdated well past the staleness window
             Path lock = lockFile(dir, key);
@@ -693,7 +698,7 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             Files.write(tokenFile(dir, key), "this is not json {{{".getBytes(StandardCharsets.UTF_8));
             Assert.assertNull(store.load(key));
         });
@@ -727,7 +732,7 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             Files.write(tokenFile(dir, key), new byte[0]);
             Assert.assertNull(store.load(key));
         });
@@ -737,7 +742,7 @@ public class FileTokenStoreTest {
     public void testEmptyLockStolenAfterGraceWithinStaleWindow() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // a holder that crashed between creating its lock and stamping it leaves an empty, unstamped lock.
             // It must be reclaimable on the short empty-lock grace, not held un-stealable until the full
             // staleness window elapses: here the staleness window is large (60s) but the empty lock is backdated
@@ -767,7 +772,7 @@ public class FileTokenStoreTest {
     public void testEmptyLockGraceIsNotShortenedByASmallStaleWindow() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // A staleness window far below the 5s empty-lock grace. The grace is the ONLY thing standing
             // between a peer caught between its exclusive create and its stamp and having its live lock
             // stolen, which is why the frozen cross-language contract says a client MUST NOT shorten it.
@@ -798,7 +803,7 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             // a pre-existing, world-accessible store directory (a permissive umask, a prior tool, or a hostile
             // local pre-create) must be tightened to owner-only before a token is written into it
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
 
             FileTokenStore store = new FileTokenStore(dir);
@@ -839,7 +844,7 @@ public class FileTokenStoreTest {
             // process re-prompts and re-persists in its own encoding, and the two never converge. That is
             // invisible in every other test, because they all round-trip through this client's own writer.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
             String withPort = "{\"v\":1,\"client_id\":\"questdb\","
@@ -899,7 +904,7 @@ public class FileTokenStoreTest {
             // shutdown budget, so a caller stuck here made close() time out and delegate the teardown of the
             // native client, the cursor engine and the store-and-forward slot lock.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir, 30_000, 600_000);
             TokenStoreKey key = sampleKey();
             Path lock = lockFile(dir, key);
@@ -958,7 +963,7 @@ public class FileTokenStoreTest {
             // interrupt can break. A peer thread holds it for a whole refresh round trip, so a caller behind
             // it was unreachable by the one lever QWP's ConnectCancellation has.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore holderStore = new FileTokenStore(dir, 30_000, 600_000);
             FileTokenStore waiterStore = new FileTokenStore(dir, 30_000, 600_000);
             TokenStoreKey key = sampleKey();
@@ -1031,7 +1036,7 @@ public class FileTokenStoreTest {
             // OidcDeviceAuthPersistenceTest.testGetTokenDegradesWhenStoreLockHeld; this pins the same bound
             // directly on the store, where such a call would live.
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir, 200, 600_000);
             TokenStoreKey key = sampleKey();
             // a live peer's stamped lock: neither the empty-lock grace nor the staleness steal applies, so the
@@ -1114,7 +1119,7 @@ public class FileTokenStoreTest {
     public void testInLockDegradesWhenHeldByFreshLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // small acquire budget, large staleness: a fresh foreign lock cannot be acquired or stolen
             FileTokenStore store = new FileTokenStore(dir, 200, 60_000);
             TokenStoreKey key = sampleKey();
@@ -1140,7 +1145,7 @@ public class FileTokenStoreTest {
     public void testInLockIsMutuallyExclusiveAcrossInstances() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             TokenStoreKey key = sampleKey();
             // two instances over one directory model two concurrent users of one identity; a generous acquire
             // budget makes a contender wait rather than degrade, and a large staleness window stops either from
@@ -1204,7 +1209,7 @@ public class FileTokenStoreTest {
     public void testInLockReleaseDoesNotDeleteAStolenLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // a tiny staleness window so our own in-progress hold is judged stale and a peer can steal it
             FileTokenStore store = new FileTokenStore(dir, 1000, 50);
             TokenStoreKey key = sampleKey();
@@ -1312,7 +1317,7 @@ public class FileTokenStoreTest {
     public void testInLockStealsStaleLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // staleness threshold 100ms; the pre-created lock is backdated well past it
             FileTokenStore store = new FileTokenStore(dir, 2000, 100);
             TokenStoreKey key = sampleKey();
@@ -1571,7 +1576,7 @@ public class FileTokenStoreTest {
     public void testOversizedStaleLockIsStolen() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // Stale window 60s, lock backdated only 10s: a STAMPED (readable) lock this fresh would NOT be
             // stolen (10s < 60s). So the steal below can only happen because the oversized lock reads as
             // unreadable/null via MAX_LOCK_FILE_BYTES and is stolen on the shorter empty-lock grace (5s < 10s).
@@ -1656,7 +1661,7 @@ public class FileTokenStoreTest {
     public void testSaveFailureLeavesNoTempFileAndThrows() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
             // make the atomic rename fail: the target path already exists as a NON-EMPTY directory, which a
@@ -1707,7 +1712,7 @@ public class FileTokenStoreTest {
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // a future schema version with an otherwise-matching fingerprint must be ignored, not served: the
             // version is the forward-compat guard the frozen cross-language contract rests on
             String v2 = "{\"v\":2,\"client_id\":\"questdb\","
@@ -1749,7 +1754,7 @@ public class FileTokenStoreTest {
     public void testStaleTempFilesAreSweptOnSave() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             // 1s staleness window so the test does not have to wait
             FileTokenStore store = new FileTokenStore(dir, 3_000, 1_000);
             TokenStoreKey key = sampleKey();
@@ -1828,7 +1833,7 @@ public class FileTokenStoreTest {
     public void testTruncatedJsonReturnsNull() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
-            Files.createDirectories(dir);
+            createStoreDir(dir);
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey key = sampleKey();
             // a crash mid-write on a filesystem without atomic rename, or a torn read, can leave a valid JSON
@@ -1890,6 +1895,34 @@ public class FileTokenStoreTest {
             Thread.sleep(5);
         }
         Assert.fail("the waiter never entered FileTokenStore." + method + " [state=" + t.getState() + ']');
+    }
+
+    /**
+     * Creates the store directory owner-only, the way {@code FileTokenStore} itself creates it - NOT the
+     * way the JVM's umask happens to.
+     * <p>
+     * A fixture that calls {@code Files.createDirectories(dir)} bare inherits the umask, so on a host with
+     * a group-writable one (002, the default on the Linux CI agents) the directory arrives {@code
+     * rwxrwxr-x}. {@code load()} then reads it as a directory another local user could have planted an
+     * entry in, discards the entry and returns null BEFORE it opens the file - which fails every test whose
+     * first assertion is that a valid entry loads, and, far worse, silently satisfies every test asserting
+     * that some malformed entry does NOT load. Those pass for the wrong reason: proved by feeding
+     * {@code testCorruptFileReturnsNull} a perfectly valid document, which fails the test at umask 022 and
+     * passes it at 002.
+     * <p>
+     * A test that wants a loose directory sets the permissions itself right after this call; that is an
+     * explicit statement rather than a property of whoever ran the build.
+     */
+    private static void createStoreDir(Path dir) throws Exception {
+        if (!FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+            Files.createDirectories(dir); // Windows: no POSIX bits to set, and load() trusts it either way
+            return;
+        }
+        Files.createDirectories(dir, PosixFilePermissions.asFileAttribute(OWNER_ONLY_DIR_PERMS));
+        // createDirectories applies the attribute only to directories it actually creates, so assert
+        // rather than assume: a fixture that silently reverted to the umask must not go unnoticed again.
+        Assert.assertEquals("the fixture must not leave the store directory at the mercy of the umask",
+                OWNER_ONLY_DIR_PERMS, Files.getPosixFilePermissions(dir));
     }
 
     private static void joinOrFail(Thread t, String what) throws InterruptedException {
