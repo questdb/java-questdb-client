@@ -25,7 +25,6 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
-import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
@@ -43,7 +42,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -57,8 +55,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * <p>
  * (a) proves the recycle's step 2 ({@code cursorSendLoop.close()}) correctly
  * joins an I/O thread that is itself mid-reconnect (not idle, not yet given
- * up), and that step 7's fresh {@code ensureConnected()} recovers once the
- * endpoint accepts connections again -- exercising
+ * up), and that step 7 no longer recovers the connection on the calling
+ * thread -- it defers to the I/O loop, so the swap returns promptly and the
+ * producer never observes the outage -- exercising
  * {@code CursorWebSocketSendLoop.close()}'s "handles both states" contract
  * under a real outage rather than a synthetic one.
  * <p>
@@ -78,16 +77,19 @@ public class SymbolDictRecycleOutageTest {
     /**
      * Kills the server out from under an armed, fully-drained sender, waits
      * for the pre-recycle I/O thread to actually enter its own reconnect
-     * loop (not just assumed via a fixed sleep), then triggers the recycle
-     * from a background thread -- because step 7's fresh
-     * {@code ensureConnected()} blocks the calling {@code table()} call (sync
-     * initial-connect mode) until the endpoint accepts again or
-     * {@code reconnect_max_duration_millis} elapses. The main thread revives
-     * a fresh server on the same port shortly after, well inside that
-     * budget, mirroring {@code ReconnectTest}'s down-then-up realism.
+     * loop (not just assumed via a fixed sleep) -- so the recycle's step 2
+     * ({@code cursorSendLoop.close()}) provably joins a MID-reconnect
+     * thread -- then triggers the recycle inline, on the calling thread.
+     * {@code reconnect_max_duration_millis} bounds only the sender's initial
+     * connect; under the store-and-forward contract step 7 no longer
+     * re-enters {@code connectWithRetry} on the producer thread, so the
+     * triggering {@code table()} call must return well within that budget
+     * even though the endpoint is still down when it fires. The main thread
+     * revives a fresh server on the same port after asserting the bound,
+     * mirroring {@code ReconnectTest}'s down-then-up realism.
      */
     @Test
-    public void testRecycleDuringOutageReconnectsAfresh() throws Exception {
+    public void testSyncModeRecycleDoesNotBlockProducerDuringOutage() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("outage-recycle").toString();
             AckAllHandler firstHandler = new AckAllHandler();
@@ -131,68 +133,31 @@ public class SymbolDictRecycleOutageTest {
                                     + "the triggering table() call",
                             ws.getTotalReconnectAttempts() > 0);
 
-                    // Trigger the recycle off-thread: step 7's fresh
-                    // ensureConnected() blocks the caller (sync initial-connect
-                    // mode) until the endpoint accepts again.
-                    AtomicReference<Throwable> triggerFailure = new AtomicReference<>();
-                    Thread trigger = new Thread(() -> {
-                        try {
-                            sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
-                        } catch (Throwable t) {
-                            triggerFailure.set(t);
-                        }
-                    }, "recycle-trigger");
-                    trigger.start();
+                    // The recycle must return promptly: reconnect_max_duration_millis
+                    // governs only the initial connect, and step 7 defers to the
+                    // I/O loop instead of re-entering connectWithRetry on the
+                    // producer thread.
+                    long startNanos = System.nanoTime();
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    Assert.assertFalse("recycle must disarm", ws.isResetArmed());
+                    Assert.assertEquals("recycle must complete despite the outage",
+                            1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue("the swap must not block the producer on the reconnect "
+                                    + "budget [elapsedMillis=" + elapsedMillis + ']',
+                            elapsedMillis < 3_000);
 
-                    try {
-                        // Resolve the outage shortly after -- well inside
-                        // reconnect_max_duration_millis=6000 -- on the SAME port.
-                        Thread.sleep(150);
-                        OutageRecycleHandler revivedHandler = new OutageRecycleHandler();
-                        try (TestWebSocketServer revived =
-                                     new TestWebSocketServer(revivedHandler, false, null, port)) {
-                            revived.start();
-                            Assert.assertTrue(revived.awaitStart(5, TimeUnit.SECONDS));
-
-                            trigger.join(10_000);
-                            Assert.assertFalse("recycle-trigger thread must have finished once the "
-                                            + "endpoint accepts again", trigger.isAlive());
-                            Assert.assertNull("triggering table() must not throw once the outage "
-                                            + "resolves within budget: " + triggerFailure.get(),
-                                    triggerFailure.get());
-
-                            Assert.assertFalse("recycle must disarm", ws.isResetArmed());
-                            Assert.assertEquals("recycle must complete despite the outage",
-                                    1, ws.getSymbolDictEpoch());
-                            // Deliberately >= 1, not == 1: the pre-recycle I/O thread is
-                            // banging on the refused port when the revive binds, and
-                            // nothing orders step 2's close+join against that bind, so a
-                            // stray handshake from the outgoing loop is legal here.
-                            Assert.assertTrue("revived server must observe a fresh handshake",
-                                    revived.handshakeCount() >= 1);
-
-                            // The "c" row was built (atNow()) inside the triggering
-                            // call but not yet flushed -- flush now and prove it
-                            // lands on the fresh connection.
-                            long fsn2 = sender.flushAndGetSequence();
-                            Assert.assertTrue("post-recycle row must land once reconnected",
-                                    sender.awaitAckedFsn(fsn2, 5_000));
-                            Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN",
-                                    fsn2 > fsn1);
-
-                            Assert.assertEquals("the fresh connection's first frame must carry a "
-                                            + "fresh (empty) dictionary, not a, b",
-                                    0, revivedHandler.firstFrameDeltaStart);
-                            Assert.assertEquals("post-recycle dictionary must hold only the new "
-                                            + "epoch's symbol, nothing lost or duplicated from "
-                                            + "before the outage",
-                                    Collections.singletonList("c"), revivedHandler.dict());
-                        }
-                    } finally {
-                        // Never leave the trigger thread running past this test:
-                        // a thread still inside the sender on an assert-failure
-                        // path muddies assertMemoryLeak's diagnostics.
-                        trigger.join(10_000);
+                    long fsn2 = sender.flushAndGetSequence();
+                    OutageRecycleHandler revivedHandler = new OutageRecycleHandler();
+                    try (TestWebSocketServer revived =
+                                 new TestWebSocketServer(revivedHandler, false, null, port)) {
+                        revived.start();
+                        Assert.assertTrue(revived.awaitStart(5, TimeUnit.SECONDS));
+                        Assert.assertTrue("the outage-window row must land once reconnected",
+                                sender.awaitAckedFsn(fsn2, 10_000));
+                        Assert.assertTrue(fsn2 > fsn1);
+                        Assert.assertEquals(0, revivedHandler.firstFrameDeltaStart);
+                        Assert.assertEquals(Collections.singletonList("c"), revivedHandler.dict());
                     }
                 }
             }
@@ -202,21 +167,21 @@ public class SymbolDictRecycleOutageTest {
     /**
      * Default configuration: no {@code reconnect_*} knob and no
      * {@code initial_connect_retry}, so the builder resolves
-     * {@code initialConnectMode} to OFF and step 7's {@code ensureConnected()}
-     * is a single-shot connect that fails outright while the endpoint refuses.
-     * Steps 1-6 have already committed by then, so latching {@code
-     * recycleFailure} here would brick the sender permanently over an ordinary
-     * transient outage -- the shipped default for every sender that crosses
-     * the threshold.
+     * {@code initialConnectMode} to OFF. Under the store-and-forward
+     * contract, step 7 no longer opens a connection on the calling thread
+     * at all -- it defers to the I/O loop, so the triggering {@code table()}
+     * call must return normally even while the endpoint refuses
+     * connections.
      * <p>
-     * Proves the step-7 failure reaches the caller WITHOUT latching, that the
-     * swap committed exactly one epoch, and that the very next send recovers
-     * through the existing {@code sendRow() -> ensureConnected()} path once
-     * the endpoint is back -- reconnecting only, never re-running a teardown
-     * step and never swapping a second time.
+     * Proves the swap commits exactly one epoch and disarms without the
+     * caller ever observing a transport failure, that the flush right after
+     * publishes into the fresh epoch's SF slot, and that once the endpoint
+     * returns on the same port the I/O loop's own reconnect replays every
+     * row sent during the outage with zero loss -- reconnecting only, never
+     * re-running a teardown step and never swapping a second time.
      */
     @Test
-    public void testDefaultConfigRecycleSurvivesFailedReconnect() throws Exception {
+    public void testDefaultConfigRecycleBuffersThroughOutage() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("default-config-outage").toString();
             AckAllHandler firstHandler = new AckAllHandler();
@@ -247,61 +212,52 @@ public class SymbolDictRecycleOutageTest {
                     // that is already down.
                     server.close();
 
-                    LineSenderException triggering = null;
-                    try {
-                        sender.table("t");
-                        Assert.fail("step 7's single-shot connect must throw while the endpoint "
-                                + "refuses connections");
-                    } catch (LineSenderException e) {
-                        triggering = e;
-                    }
-                    Assert.assertNotNull(triggering);
-
-                    Assert.assertEquals("the swap committed exactly one epoch before the connect "
-                                    + "failed", 1, ws.getSymbolDictEpoch());
+                    // The ring is drained, so the next table() fires the recycle
+                    // into a wire that is already down. The swap must complete AND
+                    // return normally -- the reconnect is the I/O loop's job, so
+                    // no transport failure may reach the producer. "c" registers
+                    // into the fresh dictionary after the swap's
+                    // resetSymbolDictStateForNewConnection but before the wire is
+                    // up, which keeps pinning the drained-guard: a deferred
+                    // connect that cleared the batch watermark would ship a row
+                    // pointing at an id the server never received.
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the swap must commit exactly one epoch",
+                            1, ws.getSymbolDictEpoch());
                     Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
-                    Assert.assertFalse("a committed swap disarms even when its reconnect fails",
-                            ws.isResetArmed());
+                    Assert.assertFalse("a committed swap disarms", ws.isResetArmed());
 
-                    // Endpoint back on the SAME port. The sender must not be
-                    // terminal: the next send reconnects on its own.
+                    // Producer keeps working against the dead endpoint: the
+                    // flush publishes into the fresh epoch's SF slot.
+                    long fsn2 = sender.flushAndGetSequence();
+                    Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN",
+                            fsn2 > fsn1);
+
+                    // Endpoint back on the SAME port: the I/O loop's own
+                    // reconnect must land the buffered rows -- zero loss.
                     OutageRecycleHandler revivedHandler = new OutageRecycleHandler();
                     try (TestWebSocketServer revived =
                                  new TestWebSocketServer(revivedHandler, false, null, port)) {
                         revived.start();
                         Assert.assertTrue(revived.awaitStart(5, TimeUnit.SECONDS));
 
-                        // "d" registers BEFORE the deferred connect -- symbol()
-                        // runs ahead of sendRow(), which is what finally
-                        // performs it -- so this first batch is the one that
-                        // proves the connect left the batch's symbol watermark
-                        // alone on its way through.
-                        sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
-                        long fsn2 = sender.flushAndGetSequence();
-                        Assert.assertTrue("a sender whose step-7 connect failed must still ingest "
-                                        + "once the endpoint returns",
-                                sender.awaitAckedFsn(fsn2, 5_000));
-                        Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN",
-                                fsn2 > fsn1);
-                        Assert.assertEquals("the recovery reconnects only -- it must not run a "
-                                        + "second swap", 1, ws.getSymbolDictEpoch());
+                        Assert.assertTrue("rows sent during the outage must replay once "
+                                        + "the endpoint returns",
+                                sender.awaitAckedFsn(fsn2, 10_000));
+                        Assert.assertEquals("the recovery reconnects only -- no second swap",
+                                1, ws.getSymbolDictEpoch());
                         Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
-
-                        Assert.assertEquals("the recovered connection's first frame must carry a "
+                        Assert.assertEquals("the fresh connection's first frame must carry a "
                                         + "fresh (empty) dictionary, not a, b",
                                 0, revivedHandler.firstFrameDeltaStart);
-                        Assert.assertEquals("the recovered stream must define every symbol its "
-                                        + "rows reference: a deferred connect that cleared the "
-                                        + "batch watermark would ship a row pointing at an id "
-                                        + "the server never received",
-                                Collections.singletonList("d"), revivedHandler.dict());
+                        Assert.assertEquals(Collections.singletonList("c"), revivedHandler.dict());
 
                         // And the epoch keeps extending normally from there.
                         sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();
                         long fsn3 = sender.flushAndGetSequence();
                         Assert.assertTrue(sender.awaitAckedFsn(fsn3, 5_000));
                         Assert.assertEquals("later batches must extend the same fresh dictionary",
-                                Arrays.asList("d", "e"), revivedHandler.dict());
+                                Arrays.asList("c", "e"), revivedHandler.dict());
                     }
                 }
             }
