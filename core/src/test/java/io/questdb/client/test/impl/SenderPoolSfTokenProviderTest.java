@@ -30,15 +30,15 @@ import io.questdb.client.Sender;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
-import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.file.Paths;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -76,16 +76,16 @@ public class SenderPoolSfTokenProviderTest {
 
     private String sfDir;
 
+    // one shared temp-directory mechanism instead of a per-class java.io.tmpdir path plus a hand-rolled
+    // recursive delete: the rule cleans up on failure and on an exception thrown out of a test too
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
+
     @Before
     public void setUp() {
-        sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-sf-pool-token-" + System.nanoTime()).toString();
+        sfDir = temp.getRoot().toPath().resolve("slot").toString();
     }
 
-    @After
-    public void tearDown() {
-        rmDir(sfDir);
-    }
 
     @Test
     public void testSfPooledSendersCarryTheProviderToken() throws Exception {
@@ -247,30 +247,6 @@ public class SenderPoolSfTokenProviderTest {
         return false;
     }
 
-    private static void rmDir(String dir) {
-        if (dir == null || !Files.exists(dir)) {
-            return;
-        }
-        long find = Files.findFirst(dir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        String child = dir + "/" + name;
-                        if (!Files.remove(child)) {
-                            rmDir(child);
-                        }
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(dir);
-    }
 
     private static final class CountingAckHandler implements TestWebSocketServer.WebSocketServerHandler {
         final AtomicInteger frames = new AtomicInteger();

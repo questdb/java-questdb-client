@@ -32,14 +32,14 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.SegmentRing;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.tools.TestUtils;
-import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.ServerSocket;
-import java.nio.file.Paths;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -80,45 +80,18 @@ public class EngineCloseSlotLockReleaseTest {
 
     private String sfDir;
 
+    // one shared temp-directory mechanism instead of a per-class java.io.tmpdir path plus a hand-rolled
+    // recursive delete: the rule cleans up on failure and on an exception thrown out of a test too
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
+
     @Before
     public void setUp() {
-        sfDir = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-engine-close-leak-" + System.nanoTime()).toString();
+        sfDir = temp.getRoot().toPath().resolve("slot").toString();
         assertEquals(0, Files.mkdir(sfDir, Files.DIR_MODE_DEFAULT));
     }
 
-    @After
-    public void tearDown() {
-        if (sfDir == null) return;
-        rmDirRecursive(sfDir);
-    }
 
-    private static void rmDirRecursive(String dir) {
-        if (!Files.exists(dir)) return;
-        long find = Files.findFirst(dir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        String child = dir + "/" + name;
-                        long probe = Files.findFirst(child);
-                        if (probe > 0) {
-                            Files.findClose(probe);
-                            rmDirRecursive(child);
-                        } else {
-                            Files.remove(child);
-                        }
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(dir);
-    }
 
     /**
      * A close driven by a caller that HOLDS the logical slot lock must not unlink it.

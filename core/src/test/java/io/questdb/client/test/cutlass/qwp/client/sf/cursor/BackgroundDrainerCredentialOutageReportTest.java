@@ -37,15 +37,15 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
-import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -101,17 +101,17 @@ public class BackgroundDrainerCredentialOutageReportTest {
 
     private String slotPath;
 
+    // one shared temp-directory mechanism instead of a per-class java.io.tmpdir path plus a hand-rolled
+    // recursive delete: the rule cleans up on failure and on an exception thrown out of a test too
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
+
     @Before
     public void setUp() {
-        slotPath = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-drainer-credential-" + System.nanoTime()).toString();
+        slotPath = temp.getRoot().toPath().resolve("slot").toString();
         assertEquals("mkdir slot dir", 0, Files.mkdir(slotPath, Files.DIR_MODE_DEFAULT));
     }
 
-    @After
-    public void tearDown() {
-        rmDirRec(slotPath);
-    }
 
     @Test
     public void testInitialConnectCredentialOutageIsNamedNotMislabelledUnreachable() throws Exception {
@@ -270,26 +270,6 @@ public class BackgroundDrainerCredentialOutageReportTest {
                 /* durableAckKeepaliveIntervalMillis */ 200L);
     }
 
-    private static void rmDirRec(String dir) {
-        if (dir == null || !Files.exists(dir)) return;
-        long find = Files.findFirst(dir);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        String child = dir + "/" + name;
-                        if (!Files.remove(child)) rmDirRec(child);
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(dir);
-    }
 
     private static void runToCompletion(BackgroundDrainer drainer) throws InterruptedException {
         Thread t = new Thread(drainer, "test-credential-outage-drainer");

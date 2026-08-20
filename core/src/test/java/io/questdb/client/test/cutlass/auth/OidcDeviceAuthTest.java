@@ -37,13 +37,14 @@ import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Os;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.std.str.StringSink;
+import io.questdb.client.test.tools.NoBrowserLaunch;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Assume;
+import org.junit.ClassRule;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -59,12 +60,13 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 public class OidcDeviceAuthTest {
 
-    static {
-        // The default device-code prompt opens a browser when one is available. Developer machines have
-        // one, so disable the launch process-wide for the whole test class; otherwise every flow that
-        // reaches the prompt (e.g. a fromQuestDB or builder test) would pop a real browser tab.
-        System.setProperty("questdb.client.oidc.open.browser", "false");
-    }
+    /**
+     * Every flow here that reaches the device-code prompt would otherwise pop a real browser tab on a
+     * developer machine. A class rule rather than a static initializer, so the override is undone
+     * afterwards instead of leaking into every later class in the surefire JVM.
+     */
+    @ClassRule
+    public static final NoBrowserLaunch NO_BROWSER = new NoBrowserLaunch();
 
     private static final String DEVICE_PATH = "/device";
     private static final JsonParser NOOP_JSON_PARSER = (code, tag, position) -> {
@@ -2326,44 +2328,36 @@ public class OidcDeviceAuthTest {
 
     @Test(timeout = 30_000)
     public void testIssuerPathScopingRejectsRawDotSegments() throws Exception {
-        // a RAW (unencoded) ".." or "." path segment carries no '%' or '\' (so endpointPathHasEncodedSeparator
-        // passes it) and no '?'/'#'/control (so Endpoint.parse accepts it), yet a lenient server normalizes
-        // .../realms/acme/../evil/token to a different realm - so the segment scan in isEndpointUnderIssuerPath
-        // must reject a bare '.'/'..' segment. Every OTHER traversal test feeds a percent-encoded or '#'/'?'
-        // form caught by an earlier gate; only these bare-dot cases exercise that dot-segment loop.
-        String issuer = "https://idp.example.com/realms/acme";
-        // control: a genuine sub-path endpoint stays accepted (proves the check is not rejecting everything)
-        Assert.assertTrue(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/token", issuer));
-        // a parent-traversal segment escapes the issuer path once the server normalizes it -> rejected
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/../evil/token", issuer));
-        // a single-dot segment and a mix are likewise normalized away and must not slip the scan
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/./../evil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/./acme/token", issuer));
+        assertMemoryLeak(() -> {
+            // A RAW (unencoded) ".." or "." segment carries no '%' or '\\' and no '?'/'#'/control, so it slips
+            // every earlier gate and reaches the dot-segment scan - the only cases that do. A lenient server
+            // normalizes .../realms/acme/../evil/device into a different realm, so the pin must reject it.
+            assertIssuerScopeAccepts("/realms/acme/device");
+            assertIssuerScopeRejects("/realms/acme/../evil/device");
+            assertIssuerScopeRejects("/realms/acme/./../evil/device");
+            assertIssuerScopeRejects("/realms/./acme/device");
+        });
     }
 
     @Test(timeout = 30_000)
     public void testIssuerPathScopingRejectsSplitEncodedAndBackslashSeparators() throws Exception {
-        // hardening: an encoded path separator can hide behind a SPLIT encoding (%2%66 -> %2f -> '/') or a
-        // double encoding (%252f), and a literal backslash is folded to '/' by decodePathSegments. Each lets an
-        // extra segment masquerade as being under the issuer path while a different raw path travels on the
-        // wire, so isEndpointUnderIssuerPath must reject them. Only the path is scoped; the origin matches here.
-        String issuer = "https://idp.example.com/realms/acme";
-        // a genuine sub-path endpoint stays accepted
-        Assert.assertTrue(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/protocol/token", issuer));
-        // split, double, and literal-backslash separators all resolve to a deeper /realms/acme/evil and are rejected
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%2%66evil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%252fevil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme\\evil/token", issuer));
-        // a percent-encoded backslash (%5c / %5C) is the encoded form of the literal '\' above; the scan
-        // rejects it at the encoded level too, before decodePathSegments would fold it to '/'
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5cevil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme%5Cevil/token", issuer));
-        // overlong-UTF-8 (%c0%ae, %e0%80%ae) and an IIS-style %u002e encode a '.'/'/' that a permissive server
-        // resolves but a byte-oriented percent decode leaves as high bytes or literal text; sitting past the
-        // issuer prefix they would slip the '..'/segment scan, so any '%' in an endpoint path is rejected
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%c0%ae%c0%ae/evil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%e0%80%ae%e0%80%ae/evil/token", issuer));
-        Assert.assertFalse(invokeIsEndpointUnderIssuerPath("https://idp.example.com/realms/acme/%u002e%u002e/evil/token", issuer));
+        assertMemoryLeak(() -> {
+            // An encoded path separator can hide behind a SPLIT encoding (%2%66 -> %2f -> '/'), a double
+            // encoding (%252f), or a backslash that decodePathSegments folds to '/'. Each lets an extra
+            // segment masquerade as being under the issuer path while a different raw path travels on the
+            // wire. Overlong UTF-8 (%c0%ae, %e0%80%ae) and an IIS-style %u002e encode a '.' that a permissive
+            // server resolves but a byte-oriented decode leaves as high bytes, so any '%' in an endpoint path
+            // is refused outright.
+            assertIssuerScopeAccepts("/realms/acme/protocol/device");
+            assertIssuerScopeRejects("/realms/acme%2%66evil/device");
+            assertIssuerScopeRejects("/realms/acme%252fevil/device");
+            assertIssuerScopeRejects("/realms/acme\\evil/device");
+            assertIssuerScopeRejects("/realms/acme%5cevil/device");
+            assertIssuerScopeRejects("/realms/acme%5Cevil/device");
+            assertIssuerScopeRejects("/realms/acme/%c0%ae%c0%ae/evil/device");
+            assertIssuerScopeRejects("/realms/acme/%e0%80%ae%e0%80%ae/evil/device");
+            assertIssuerScopeRejects("/realms/acme/%u002e%u002e/evil/device");
+        });
     }
 
     @Test(timeout = 30_000)
@@ -2395,35 +2389,32 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
-    public void testLoopbackHostClassifierAcceptsLoopbackForms() throws Exception {
-        // localhost (any case) and the whole 127.0.0.0/8 block are loopback: a plaintext /settings fetch to
-        // them never leaves the host, so settingsChannelIsPlaintext correctly skips the plaintext-channel
-        // pin. This is the pin's only exercised exemption, since MockOidcServer binds to loopback.
+    public void testPlaintextIdpEndpointIsAllowedOnlyForLoopbackHosts() {
+        // The rule the loopback classifier exists to serve: the identity provider endpoints must use https,
+        // because the device code and the refresh token travel over them - EXCEPT to a loopback host, where
+        // the request never leaves the machine. Driven through build(), which does no network I/O, rather
+        // than by reflecting on the private classifier: this asserts the outcome a user actually gets, and
+        // it survives that predicate being renamed, inlined or replaced.
+        //
+        // Both endpoints use the same host because build() also requires them to share an origin; that check
+        // is not what is under test here, it just has to be satisfied for the loopback rows to reach a verdict.
         String[] loopback = {
                 "localhost", "LOCALHOST", "LocalHost",
                 "127.0.0.1", "127.0.0.0", "127.1.2.3", "127.255.255.255", "127.0.0.255"
         };
-        for (String s : loopback) {
-            Assert.assertTrue("expected loopback: [" + s + "]", invokeIsLoopbackHost(s));
+        for (String host : loopback) {
+            try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                    .clientId("c")
+                    .deviceAuthorizationEndpoint("http://" + host + "/device")
+                    .tokenEndpoint("http://" + host + "/token")
+                    .build()) {
+                Assert.assertNotNull("plaintext to a loopback host must be allowed: [" + host + ']', auth);
+            }
         }
-        // The name is now accepted on the strength of what it RESOLVES to, not how it is spelt: RFC 6761
-        // says localhost must be loopback, but a host with no /etc/hosts entry leaves that to DNS, and this
-        // exemption is what lets a device code and a refresh token travel in cleartext. The assertions above
-        // therefore also pin that the resolution path still accepts the normal case - break it and every
-        // loopback form spelt as a name fails closed, which would be safe but would refuse a working local
-        // dev setup. The hostile half (localhost resolving OFF loopback) cannot be reached from a test
-        // without rewriting the host's resolver, so it is unasserted by design rather than by omission.
-        Assert.assertFalse("a name that does not resolve must fail closed",
-                invokeIsLoopbackHost("no-such-host.invalid"));
-    }
 
-    @Test(timeout = 30_000)
-    public void testLoopbackHostClassifierRejectsNonLoopbackAndSpoofing() throws Exception {
-        // every other host must classify as non-loopback so the plaintext-channel MITM pin FIRES over http -
-        // the firing path the loopback-bound test mock cannot reach end to end. A classifier that accepted
-        // any of these as loopback would silently disable the pin for a tampered /settings endpoint.
+        // Everything else must be refused over plaintext, so the MITM pin fires. A classifier that accepted
+        // any of these would silently send a device code and a refresh token across the network in the clear.
         String[] notLoopback = {
-                null, "",
                 "example.com", "questdb.example",
                 "127.evil.com",        // starts with "127." but is not a dotted-IPv4 literal
                 "localhost.evil.com",  // not an exact localhost match
@@ -2436,11 +2427,23 @@ public class OidcDeviceAuthTest {
                 "127..0.1",            // empty octet
                 "1270.0.0.1",          // does not start with "127."
                 "227.0.0.1",           // not the 127 block
-                "0.0.0.0", "10.0.0.1", "192.168.0.1", "::1"
+                "0.0.0.0", "10.0.0.1", "192.168.0.1",
+                // A name is accepted on the strength of what it RESOLVES to, not how it is spelt - RFC 6761
+                // says localhost must be loopback, but a host with no /etc/hosts entry leaves that to DNS.
+                // One that does not resolve must fail CLOSED, i.e. be treated as non-loopback. (The hostile
+                // half - localhost resolving off loopback - needs the host's resolver rewritten, so it is
+                // unasserted by design rather than by omission.)
+                "no-such-host.invalid"
         };
-        for (String s : notLoopback) {
-            Assert.assertFalse("expected non-loopback: [" + s + "]", invokeIsLoopbackHost(s));
+        for (String host : notLoopback) {
+            assertBuildFails("http://" + host + "/device", "http://" + host + "/token", "use an https url");
         }
+
+        // Two forms the classifier never sees, because the endpoint parser rejects them first. Asserted here
+        // so the list above is not silently assumed to cover them.
+        assertBuildFails("http:///device", "http:///token", "the host is empty");
+        assertBuildFails("http://[::1]:9000/device", "http://[::1]:9000/token",
+                "IPv6 literal hosts are not supported");
     }
 
     @Test(timeout = 30_000)
@@ -3646,6 +3649,49 @@ public class OidcDeviceAuthTest {
                 findHolderOf(instance, secret));
     }
 
+    /**
+     * Drives one issuer-path case through the PUBLIC path a user takes: a QuestDB {@code /settings} that
+     * advertises {@code devicePath} while the caller pins the issuer to {@code /realms/acme}. Asserts the
+     * outcome a caller sees - fromQuestDB throwing - rather than the return value of the private scan, so a
+     * rename or an inline of that scan leaves the coverage intact. The sibling scenario tests
+     * (testIssuerPathScopingRejectsEncodedSlash and friends) use the same shape; this exists so the encoding
+     * table can stay a table.
+     */
+    private static void assertIssuerScope(String devicePath, boolean accepted) throws Exception {
+        AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+        MockOidcServer.Handler handler = (method, path, body) -> {
+            MockOidcServer server = serverRef.get();
+            return MockOidcServer.json(200, "{\"config\":{"
+                    + "\"acl.oidc.enabled\":true,"
+                    + "\"acl.oidc.client.id\":\"questdb\","
+                    + "\"acl.oidc.token.endpoint\":\"" + server.httpUrl("/realms/acme/token") + "\","
+                    + "\"acl.oidc.device.authorization.endpoint\":\"" + server.httpUrl(devicePath) + "\""
+                    + "}}");
+        };
+        try (MockOidcServer server = new MockOidcServer(handler)) {
+            serverRef.set(server);
+            final String issuer = server.httpUrl("/realms/acme");
+            if (accepted) {
+                try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(issuer))) {
+                    Assert.assertNotNull("an endpoint genuinely under the issuer path must be accepted: "
+                            + devicePath, auth);
+                }
+            } else {
+                assertOidcFails(() -> OidcDeviceAuth.fromQuestDB(server.httpUrl(""), insecure().issuer(issuer)),
+                        "not under the pinned issuer",
+                        "an endpoint that escapes the issuer path must be rejected: " + devicePath);
+            }
+        }
+    }
+
+    private static void assertIssuerScopeAccepts(String devicePath) throws Exception {
+        assertIssuerScope(devicePath, true);
+    }
+
+    private static void assertIssuerScopeRejects(String devicePath) throws Exception {
+        assertIssuerScope(devicePath, false);
+    }
+
     private static void assertNoControlChars(String value) {
         for (int i = 0; i < value.length(); i++) {
             Assert.assertFalse("control char at index " + i + " in '" + value + "'", Character.isISOControl(value.charAt(i)));
@@ -3910,20 +3956,8 @@ public class OidcDeviceAuthTest {
         return null;
     }
 
-    private static boolean invokeIsEndpointUnderIssuerPath(String endpointUrl, String issuer) throws Exception {
-        Method m = OidcDeviceAuth.class.getDeclaredMethod("isEndpointUnderIssuerPath", String.class, String.class);
-        m.setAccessible(true);
-        return (boolean) m.invoke(null, endpointUrl, issuer);
-    }
-
     // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the
     // client is an open module, so reflection reaches it without widening production visibility for the test
-    private static boolean invokeIsLoopbackHost(String host) throws Exception {
-        Method m = OidcDeviceAuth.class.getDeclaredMethod("isLoopbackHost", String.class);
-        m.setAccessible(true);
-        return (boolean) m.invoke(null, host);
-    }
-
     private static boolean isInside(Thread t, String method) {
         for (StackTraceElement frame : t.getStackTrace()) {
             if (OidcDeviceAuth.class.getName().equals(frame.getClassName())

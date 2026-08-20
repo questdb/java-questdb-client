@@ -30,8 +30,10 @@ import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 import io.questdb.client.cutlass.auth.PersistedToken;
 import io.questdb.client.cutlass.auth.TokenStore;
 import io.questdb.client.cutlass.auth.TokenStoreKey;
+import io.questdb.client.test.tools.NoBrowserLaunch;
 import org.junit.Assert;
 import org.junit.Rule;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
@@ -47,9 +49,9 @@ public class OidcDeviceAuthPersistenceTest {
     private static final String DEVICE_PATH = "/device";
     private static final String TOKEN_PATH = "/token";
 
-    static {
-        System.setProperty("questdb.client.oidc.open.browser", "false");
-    }
+    // a restored sign-in here reaches the device-code prompt; see NoBrowserLaunch for why this is a rule
+    @ClassRule
+    public static final NoBrowserLaunch NO_BROWSER = new NoBrowserLaunch();
 
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();

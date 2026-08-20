@@ -39,6 +39,10 @@ import java.nio.charset.StandardCharsets;
 
 public class DirectUtf8SinkTest extends AbstractTest {
 
+    // DirectByteSink.implCreate allocates at least this much however small a capacity it is asked for, so a
+    // test that means to exercise growth has to write past it
+    private static final int MIN_ALLOCATED_CAPACITY = 32;
+
     @Test
     public void testAsAsciiCharSequence() {
         try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
@@ -126,7 +130,7 @@ public class DirectUtf8SinkTest extends AbstractTest {
         try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
             final byte[] src = "abcdefgh".getBytes(StandardCharsets.UTF_8);
 
-            // a partial range [2, 5) copies exactly "cde" and grows the sink past its initial capacity
+            // a partial range [2, 5) copies exactly "cde"
             sink.put(src, 2, 5);
             Assert.assertEquals(3, sink.size());
             TestUtils.assertEquals("cde".getBytes(StandardCharsets.UTF_8), sink);
@@ -143,6 +147,41 @@ public class DirectUtf8SinkTest extends AbstractTest {
             sink.put(src, 0, src.length);
             Assert.assertEquals(src.length, sink.size());
             TestUtils.assertEquals(src, sink);
+        }
+    }
+
+    @Test
+    public void testPutByteArrayRangeGrowsTheSink() {
+        // DirectByteSink's native create allocates a MINIMUM of 32 bytes however small a capacity it is
+        // asked for, so a handful of bytes into a new DirectUtf8Sink(4) never reallocates - the sibling test
+        // above used to claim it did. Cross the floor for real: a range longer than 32 bytes must reallocate
+        // mid-copy, and the whole payload must survive that move, contiguous and in order.
+        final byte[] src = new byte[MIN_ALLOCATED_CAPACITY * 4];
+        for (int i = 0; i < src.length; i++) {
+            src[i] = (byte) ('a' + (i % 26));
+        }
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            // seed a few bytes first, so the growing copy has existing content to preserve rather than
+            // starting from an empty sink
+            sink.put(src, 0, 3);
+            final int lo = 3;
+            final int hi = lo + MIN_ALLOCATED_CAPACITY + 17; // comfortably past the floor, and not a round number
+            sink.put(src, lo, hi);
+
+            Assert.assertTrue("preconditions: the payload must exceed the 32-byte floor",
+                    sink.size() > MIN_ALLOCATED_CAPACITY);
+            Assert.assertEquals(3 + (hi - lo), sink.size());
+            final byte[] expected = new byte[3 + (hi - lo)];
+            System.arraycopy(src, 0, expected, 0, 3);
+            System.arraycopy(src, lo, expected, 3, hi - lo);
+            TestUtils.assertEquals(expected, sink);
+
+            // and it keeps growing across repeated appends, not just the first reallocation
+            for (int i = 0; i < 8; i++) {
+                sink.put(src, 0, src.length);
+            }
+            Assert.assertEquals(3 + (hi - lo) + 8 * src.length, sink.size());
+            Assert.assertEquals((byte) src[0], sink.byteAt(3 + (hi - lo)));
         }
     }
 

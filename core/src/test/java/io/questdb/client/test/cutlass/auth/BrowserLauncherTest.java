@@ -30,6 +30,18 @@ import org.junit.Test;
 import java.lang.reflect.Method;
 import java.net.URI;
 
+/**
+ * Covers {@code BrowserLauncher}, the best-effort browser launch behind the default device-code prompt.
+ * <p>
+ * REFLECTION, deliberately: the class and all three methods are package-private, and the only public route
+ * to them is {@code DeviceCodePrompt.openBrowser().promptUser(...)}, whose whole contract is that it does
+ * nothing observable - it swallows every failure and, on a headless machine, never launches anything either
+ * way. There is no public path to assert on, so the choice is reflection or no coverage of the scheme
+ * allowlist at all. The one behaviour that IS observable from outside is what {@code open()} does with the
+ * kill-switch, and that is pinned without reflection by
+ * {@link DesktopFreeModulePathTest#testTheBrowserKillSwitchIsHonouredByOpenItself}, which runs it where
+ * {@code java.desktop} is absent.
+ */
 public class BrowserLauncherTest {
 
     @Test

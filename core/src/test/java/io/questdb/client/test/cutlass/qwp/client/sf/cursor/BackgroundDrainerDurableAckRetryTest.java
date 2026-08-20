@@ -43,7 +43,9 @@ import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -93,10 +95,14 @@ public class BackgroundDrainerDurableAckRetryTest {
 
     private String slotPath;
 
+    // one shared temp-directory mechanism instead of a per-class java.io.tmpdir path plus a hand-rolled
+    // recursive delete: the rule cleans up on failure and on an exception thrown out of a test too
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
+
     @Before
     public void setUp() {
-        slotPath = Paths.get(System.getProperty("java.io.tmpdir"),
-                "qdb-da-retry-" + System.nanoTime()).toString();
+        slotPath = temp.getRoot().toPath().resolve("slot").toString();
         assertEquals("mkdir slot dir", 0, Files.mkdir(slotPath, Files.DIR_MODE_DEFAULT));
     }
 
@@ -104,25 +110,9 @@ public class BackgroundDrainerDurableAckRetryTest {
     public void tearDown() {
         // Safety net for exits that bypass the assertMemoryLeak wrapper;
         // normally a no-op because the wrapper's finally already closed
-        // and cleared the stubs (close() is idempotent).
+        // and cleared the stubs (close() is idempotent). The slot directory
+        // itself is the TemporaryFolder rule's job.
         closeAllStubs();
-        if (slotPath == null) return;
-        long find = Files.findFirst(slotPath);
-        if (find > 0) {
-            try {
-                int rc = 1;
-                while (rc > 0) {
-                    String name = Files.utf8ToString(Files.findName(find));
-                    if (name != null && !".".equals(name) && !"..".equals(name)) {
-                        Files.remove(slotPath + "/" + name);
-                    }
-                    rc = Files.findNext(find);
-                }
-            } finally {
-                Files.findClose(find);
-            }
-        }
-        Files.remove(slotPath);
     }
 
     @Test(timeout = 60_000)
