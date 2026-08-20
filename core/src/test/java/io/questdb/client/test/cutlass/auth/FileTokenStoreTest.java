@@ -443,6 +443,43 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testOneConfigurationHoldsOneActiveLogin() throws Exception {
+        assertMemoryLeak(() -> {
+            // The store is keyed on a CONFIGURATION - client id, endpoints, scope, audience,
+            // groups-in-token mode - and no field of TokenStoreKey names a subject. Two people signing in
+            // through the same configuration therefore address the same file, and the later sign-in
+            // overwrites the earlier one: a store holds a single active login, which is the boundary the
+            // README and the FileTokenStore javadoc now state. Anyone reading "one file per identity" as
+            // "one file per person" would size a multi-user deployment on a guarantee that does not exist.
+            FileTokenStore store = new FileTokenStore(storeDir());
+            TokenStoreKey first = sampleKey();
+            TokenStoreKey second = sampleKey(); // a separate instance, identical configuration
+            Assert.assertEquals("identical configurations must address the same entry",
+                    first.hash(), second.hash());
+
+            store.save(first, sampleToken("ACCESS-ALICE", "REFRESH-ALICE"));
+            store.save(second, sampleToken("ACCESS-BOB", "REFRESH-BOB"));
+
+            PersistedToken loaded = store.load(first);
+            Assert.assertNotNull(loaded);
+            Assert.assertEquals("the later sign-in must own the entry", "ACCESS-BOB", loaded.getAccessToken());
+            Assert.assertEquals("REFRESH-BOB", loaded.getRefreshToken());
+            // and the first login is gone rather than merged or kept alongside
+            Assert.assertEquals("one configuration keeps one entry, not one per person",
+                    "ACCESS-BOB", store.load(second).getAccessToken());
+
+            // separating them is the caller's job, and a separate store directory is what does it
+            Path aliceDir = temp.getRoot().toPath().resolve("alice");
+            FileTokenStore aliceStore = FileTokenStore.at(aliceDir);
+            aliceStore.save(first, sampleToken("ACCESS-ALICE", "REFRESH-ALICE"));
+            Assert.assertEquals("a per-user store keeps a per-user login",
+                    "ACCESS-ALICE", aliceStore.load(first).getAccessToken());
+            Assert.assertEquals("and does not disturb the shared one",
+                    "ACCESS-BOB", store.load(first).getAccessToken());
+        });
+    }
+
+    @Test
     public void testReplaceTargetGivesUpAfterTheRetryBudget() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to deny the rename",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));

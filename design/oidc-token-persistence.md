@@ -176,9 +176,15 @@ Convenience: `FileTokenStore.atDefaultLocation()` and `FileTokenStore.at(Path di
 - **Location.** `${questdb.client.oidc.token.store.dir}` if set, else
   `${user.home}/.questdb/oidc-tokens/`. The `questdb.client.oidc.*` system-property
   namespace already exists (`questdb.client.oidc.open.browser`), so this matches.
-- **One file per identity**, named `<TokenStoreKey.hash()>.json`. A hashed name avoids
+- **One file per CONFIGURATION**, named `<TokenStoreKey.hash()>.json`. A hashed name avoids
   leaking the endpoint/client id/scope through directory listings, and lets several
-  identities coexist (multiple servers / users on one host).
+  configurations coexist (multiple servers or providers on one host). The key names a
+  configuration, not a subject — no field of it identifies the human who signed in — so two
+  people using the same configuration address the same file and the later sign-in overwrites
+  the earlier: **one store holds one active login**. A client MUST document that, and point a
+  caller who needs several concurrent logins at separate store directories rather than letting
+  them read the hashed name as a per-user partition. The default location is per OS user
+  already, so the case that bites is one OS user signing in as several people.
 - **Permissions.** Directory created `rwx------` (0700), file `rw-------` (0600), set
   *at creation* via `PosixFilePermissions.asFileAttribute(...)` so there is no
   world-readable window. On a non-POSIX FS (`setPosixFilePermissions`/attribute throws

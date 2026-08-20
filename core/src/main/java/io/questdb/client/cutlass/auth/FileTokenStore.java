@@ -63,16 +63,32 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * The default {@link TokenStore}: one plaintext JSON file per identity under a directory, with the
- * refresh token protected at rest by file permissions (0600 file, 0700 directory) rather than by
+ * The default {@link TokenStore}: one plaintext JSON file per OIDC configuration under a directory, with
+ * the refresh token protected at rest by file permissions (0600 file, 0700 directory) rather than by
  * encryption. This matches what {@code gcloud}, {@code aws} and {@code gh} do; for encryption at rest,
  * supply a {@link TokenStore} backed by an OS keychain or a secrets manager instead.
  * <p>
  * The default location is {@code ${user.home}/.questdb/oidc-tokens/}, overridable with the
  * {@code questdb.client.oidc.token.store.dir} system property. The file name is
- * {@code <TokenStoreKey.hash()>.json}, so several identities coexist and the name leaks neither the
+ * {@code <TokenStoreKey.hash()>.json}, so several configurations coexist and the name leaks neither the
  * endpoint nor the client id. The on-disk format (file name, JSON schema, write protocol, lock-file
  * protocol) is a deliberately language-neutral contract so other QuestDB clients can share the file.
+ * <p>
+ * <b>One store, one active login.</b> {@link TokenStoreKey} names a CONFIGURATION - client id, endpoints,
+ * scope, audience, groups-in-token mode - and no field of it names a subject, so two people signing in
+ * through the same configuration address the same file and the later sign-in overwrites the earlier one.
+ * Separate application users need separate stores ({@link #at(Path)} on a per-user directory, or a per-user
+ * {@code questdb.client.oidc.token.store.dir}), not a reliance on the key to tell them apart. The default
+ * location is per OS user already, so this only arises inside one OS user - a shared service account, or a
+ * process signing in on behalf of several people.
+ * <p>
+ * <b>Not authenticated.</b> The file carries no MAC or signature, so {@link #load} cannot distinguish a
+ * planted credential from its own: anyone able to WRITE the file can substitute a well-formed entry that
+ * this store will adopt and the caller will present. Permissions are the control, not the format. What load
+ * does reject is corruption and mix-ups - an oversized, malformed or unparseable file, an entry whose
+ * recorded identity fields do not match the key being loaded, an entry with no usable token, a token
+ * carrying control or non-ASCII characters - with the recorded expiry and lifetime clamped rather than
+ * trusted, and (on POSIX) an entry discarded outright when the directory is writable by other local users.
  * <p>
  * <b>Integrity (always).</b> {@link #save} writes a sibling temp file then atomically renames it over the
  * target, so a crash or an overlapping reader - in any process or language - sees the whole old or whole
