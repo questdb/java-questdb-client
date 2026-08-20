@@ -1016,6 +1016,49 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testTamperedBareJsonNullServedTokenIsRefusedNotServedAsBearerNull() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger device = new AtomicInteger();
+            AtomicInteger token = new AtomicInteger();
+            MockOidcServer.Handler handler = countingHandler(device, token, "ACCESS-FRESH", "REFRESH-FRESH", "ACCESS-2", "REFRESH-2");
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                Path dir = storeDir();
+                // Start from a file a conforming writer produced, so the fingerprint and the file name are
+                // exactly right, then replace the served token with a BARE JSON null - the one encoding
+                // design/oidc-token-persistence.md forbids, and the natural output of
+                // json.dumps({"access_token": None}) in a peer client sharing this store.
+                new FileTokenStore(dir).save(keyFor(server),
+                        new PersistedToken("ACCESS-PLANTED", null, "REFRESH-1",
+                                System.currentTimeMillis() + 300_000, 300_000));
+                Path file = dir.resolve(keyFor(server).hash() + ".json");
+                String conforming = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+                Assert.assertTrue("the writer must emit a present token as a QUOTED string, or this test is "
+                                + "not planting what it thinks: " + conforming,
+                        conforming.contains("\"access_token\":\"ACCESS-PLANTED\""));
+                Files.write(file, conforming
+                        .replace("\"access_token\":\"ACCESS-PLANTED\"", "\"access_token\":null")
+                        .getBytes(StandardCharsets.UTF_8));
+
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(new FileTokenStore(dir)).build()) {
+                    // JsonLexer reports a bare null and a quoted "null" identically, so the entry reaches
+                    // adopt() as the four characters "null" - non-blank, printable ASCII, and with a
+                    // fingerprint that matches, so nothing before adopt() turns it away. Served, it becomes
+                    // "Bearer null", which the server answers with 401; and because the persisted expiry is
+                    // still valid, getToken() would go on serving it rather than refreshing, so the producer
+                    // 401s with nothing naming the cause until the expiry lapses.
+                    String result = auth.signIn();
+                    Assert.assertEquals("ACCESS-FRESH", result);
+                    Assert.assertNotEquals("a bare JSON null must never be served as the credential",
+                            "null", result);
+                    Assert.assertNotEquals("null", auth.getToken());
+                    Assert.assertEquals("Bearer ACCESS-FRESH", auth.getAuthorizationHeaderValue());
+                }
+                Assert.assertTrue("a bare JSON null must fall back to the device flow", device.get() >= 1);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testTamperedBlankServedTokenRejectedOnLoad() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();

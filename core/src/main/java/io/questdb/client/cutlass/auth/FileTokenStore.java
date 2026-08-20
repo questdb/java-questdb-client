@@ -1405,10 +1405,19 @@ public final class FileTokenStore implements TokenStore {
         }
 
         private static void putValue(StringSink sink, CharSequence tag) {
-            // the writer omits a null/absent field entirely, so a value event means the field was present
+            // The writer omits a null/absent field entirely, so a value event means the field was present
             // with a real string: store it verbatim, including a value that is literally "null". A bare JSON
-            // null in a hand-edited or non-conforming file lands here as "null" too, which is harmless - a
-            // bogus token simply fails its fingerprint/char check and the entry falls back.
+            // null in a hand-edited or non-conforming file lands here as "null" too, because JsonLexer
+            // reports the two identically - which is exactly why the frozen format forbids a writer from
+            // emitting one (design/oidc-token-persistence.md).
+            //
+            // Faithfully round-tripping whatever is on disk is this parser's job; deciding whether a value is
+            // fit to be a credential is not. OidcDeviceAuth.adopt() makes that call, and refuses a served
+            // token of "null" along with the blank and control-character ones, so a non-conforming writer
+            // degrades to an interactive sign-in rather than to a "Bearer null" header the server answers
+            // with 401. Nothing here rejects it: the fingerprint covers client_id, the endpoints, scope,
+            // audience and groups_in_token - never the token - and "null" is four printable ASCII characters,
+            // so the char check passes it too.
             sink.clear();
             sink.put(tag);
         }

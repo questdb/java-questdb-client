@@ -1363,13 +1363,30 @@ public class OidcDeviceAuth implements QuietCloseable {
             lastPersistedRefreshToken = fileRefreshToken;
             return true;
         }
-        if (Chars.isBlank(servedToken) || !hasOnlyTokenChars(servedToken)) {
+        if (Chars.isBlank(servedToken) || !hasOnlyTokenChars(servedToken) || Chars.equals("null", servedToken)) {
             // PRESENT but unusable: whitespace-only (which passes hasOnlyTokenChars vacuously, space being
-            // 0x20, yet would be served as a blank "Bearer " header the server only answers with 401), or
-            // carrying a control or non-ASCII character. Unlike an absent token this is positive evidence
-            // that something else wrote this file, so reject the WHOLE entry - refresh token included.
-            // Adopting the refresh token of a file we know was tampered with would let an attacker who can
-            // write the store swap in their own, and this client would silently sign in as them.
+            // 0x20, yet would be served as a blank "Bearer " header the server only answers with 401),
+            // carrying a control or non-ASCII character, or the four characters "null". Unlike an absent
+            // token this is positive evidence that something else wrote this file, so reject the WHOLE entry
+            // - refresh token included. Adopting the refresh token of a file we know was tampered with would
+            // let an attacker who can write the store swap in their own, and this client would silently sign
+            // in as them.
+            //
+            // On "null" specifically: JsonLexer reports a bare JSON null and a quoted "null" identically, so
+            // design/oidc-token-persistence.md forbids a writer from emitting a bare null at all and requires
+            // an absent value to be OMITTED. A served token that reads as "null" is therefore either a writer
+            // violating that rule - json.dumps({"access_token": None}) is the natural way to get there from
+            // Python, and cross-language sharing is the whole point of freezing the format - or a token
+            // pathological enough to be indistinguishable from one. Neither may become "Bearer null": the
+            // server answers that with 401, and because the persisted expiry is honoured getToken() would go
+            // on serving it rather than refreshing, so the producer 401s with nothing naming the cause until
+            // the clamped expiry lapses. Refusing costs one interactive sign-in, and only to a caller whose
+            // real bearer token is four characters long.
+            //
+            // Checked HERE rather than in FileTokenStore because adopt() is the choke point every TokenStore
+            // goes through, including a caller's own implementation of the SPI. The refresh token needs no
+            // equivalent arm: it is url-encoded into a form body rather than spliced into a header, so a
+            // "null" there is simply rejected by the token endpoint and degrades to an interactive sign-in.
             return false;
         }
         accessToken = token.getAccessToken();
