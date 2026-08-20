@@ -158,17 +158,29 @@ public class HttpClientConstructorLeakTest {
 
     private static void assertConstructionFailureLeaksNothing(HttpClientConfiguration configuration) {
         HttpClient client = null;
+        // The "it threw" assertion CANNOT be an Assert.fail() inside the try: fail() throws AssertionError,
+        // which the catch below swallows, so an injection that stopped failing would report a green test
+        // having injected nothing - and all four tests share this helper, so all four would go green at once.
+        // The catch has to stay this broad, which is why the flag is needed rather than a narrower catch: the
+        // four injections share no supertype below Throwable. Epoll and Kqueue throw NetworkError, which
+        // extends Error, while the two failing allocations throw IllegalArgumentException out of
+        // Unsafe.malloc.
+        boolean threw = false;
         try {
             client = HttpClientFactory.newPlainTextInstance(configuration);
-            Assert.fail("expected the poller's initialisation failure to abort construction");
         } catch (Throwable expected) {
             // the point of the test is what assertMemoryLeak checks around it: the socket and the two native
             // buffers the base constructor took must not survive a throw from the subclass
+            threw = true;
         } finally {
             // defensive: if construction unexpectedly succeeded, do not leak it out of the test
             if (client != null) {
                 client.close();
             }
         }
+        Assert.assertTrue(
+                "construction succeeded, so this test's injected failure no longer fires and it proved nothing",
+                threw
+        );
     }
 }
