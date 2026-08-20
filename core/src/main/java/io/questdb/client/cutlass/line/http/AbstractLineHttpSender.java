@@ -470,11 +470,7 @@ public abstract class AbstractLineHttpSender implements Sender {
         // validateRowStarted() rejects EMPTY and TABLE_NAME_SET, so only ADDING_SYMBOLS and ADDING_COLUMNS
         // reach the terminator write
         validateRowStarted();
-        request.put('\n');
-        state = RequestState.EMPTY;
-        if (rowAdded()) {
-            flush();
-        }
+        terminateRow();
     }
 
     @Override
@@ -1036,6 +1032,25 @@ public abstract class AbstractLineHttpSender implements Sender {
      * (RFC 7230 obs-fold), and the request ships with no credential at all. cancelRow() cannot undo it either:
      * trimContentToLen only rewinds within the content section.
      */
+    /**
+     * Writes the row terminator and closes the row, WITHOUT re-checking that a row was started - the caller
+     * has already done it.
+     * <p>
+     * {@link #at(long, java.time.temporal.ChronoUnit)} and {@link #at(java.time.Instant)} must validate
+     * before they write the timestamp, not after: a rejected row would otherwise leave a stray timestamp in
+     * the request buffer for the next row to inherit. They used to follow that write with {@code atNow()},
+     * which validated the very same state a second time - nothing between the two calls can change it, since
+     * only {@code table()}, a column write and this method touch {@code state} - so every explicit-timestamp
+     * row paid for a second switch on the hot ingestion path. They call this instead.
+     */
+    protected void terminateRow() {
+        request.put('\n');
+        state = RequestState.EMPTY;
+        if (rowAdded()) {
+            flush();
+        }
+    }
+
     protected void validateRowStarted() {
         switch (state) {
             case EMPTY:
