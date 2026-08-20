@@ -404,6 +404,69 @@ public class OidcDeviceAuthPersistenceTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testGetTokenBackOffExpiresWhileAProducerKeepsCalling() throws Exception {
+        assertMemoryLeak(() -> {
+            // The companion of the throttle test above, and the half that cannot be checked by a tight
+            // loop: the back-off must EXPIRE on its own while the caller keeps calling. Arming the latch
+            // on a call the back-off itself skipped slides its window forward by one call every time, so
+            // it never elapses for any caller returning faster than the retry interval - and getToken()
+            // runs once per ILP flush, at a default auto-flush interval of one second. One transient
+            // identity-provider failure then wedges the sender for the life of the process.
+            //
+            // Drives real wall clock because that is the only thing that distinguishes the two shapes:
+            // both serve the same token, throttle to one round trip inside the window, and differ only in
+            // whether a later call is ever allowed through.
+            final long retryIntervalMillis = 5_000L; // OidcDeviceAuth.MIN_REFRESH_RETRY_INTERVAL_MILLIS
+            AtomicBoolean healthy = new AtomicBoolean();
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                tokenCalls.incrementAndGet();
+                if (!healthy.get()) {
+                    // a transient outage, not a revoked grant: tryRefresh reports failure and leaves the
+                    // cached refresh token intact, so the next attempt would succeed
+                    return MockOidcServer.json(503, "{\"error\":\"temporarily_unavailable\"}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-RECOVERED", null, "REFRESH-NEW", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-OK",
+                        System.currentTimeMillis() - 1, 300_000);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    try {
+                        auth.getToken();
+                        Assert.fail("the first call must attempt the refresh and surface its failure");
+                    } catch (OidcAuthException expected) {
+                    }
+                    Assert.assertEquals("the first call must have reached the token endpoint",
+                            1, tokenCalls.get());
+
+                    // the provider recovers, and the caller keeps polling well inside the window, exactly
+                    // as a flushing producer does
+                    healthy.set(true);
+                    String token = null;
+                    final long deadlineNanos = System.nanoTime() + 4 * retryIntervalMillis * 1_000_000L;
+                    while (token == null && System.nanoTime() - deadlineNanos < 0) {
+                        Thread.sleep(50);
+                        try {
+                            token = auth.getToken();
+                        } catch (OidcAuthException stillBackedOff) {
+                        }
+                    }
+                    Assert.assertEquals("the back-off must expire on its own; the identity provider "
+                                    + "recovered and getToken() never retried it",
+                            "ACCESS-RECOVERED", token);
+                    Assert.assertEquals("exactly one retry, once the window had elapsed",
+                            2, tokenCalls.get());
+                }
+            }
+        });
+    }
+
     @Test(timeout = 30_000)
     public void testSignInClearsTheRefreshBackOff() throws Exception {
         assertMemoryLeak(() -> {

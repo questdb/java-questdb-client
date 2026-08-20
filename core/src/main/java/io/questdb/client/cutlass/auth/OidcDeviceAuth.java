@@ -599,11 +599,19 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (refreshToken != null && Thread.currentThread().isInterrupted()) {
                 throw new OidcAuthException("the calling thread is interrupted, so no silent token refresh was attempted; retry on an uninterrupted thread");
             }
-            if (refreshToken != null && !isRefreshBackedOff() && tryRefreshCoordinated()) {
-                refreshFailedAtMillis = 0;
-                return selectToken();
-            }
-            if (refreshToken != null) {
+            // Arm the latch ONLY when a refresh was actually attempted and failed. Stamping it on a call
+            // that the back-off itself skipped slides the window forward by one call every time, so it
+            // never expires for a caller that returns faster than MIN_REFRESH_RETRY_INTERVAL_MILLIS - and
+            // getToken() runs once per ILP flush, at a default auto-flush interval of one second. One
+            // transient refresh failure then wedges the sender for the life of the process, long after the
+            // identity provider recovered, which is a circuit breaker rather than the stampede guard this
+            // is documented to be. maybeLoadFromStore() arms its sibling back-off inside the catch for the
+            // same reason: only a real attempt may re-arm.
+            if (refreshToken != null && !isRefreshBackedOff()) {
+                if (tryRefreshCoordinated()) {
+                    refreshFailedAtMillis = 0;
+                    return selectToken();
+                }
                 refreshFailedAtMillis = System.currentTimeMillis();
             }
             if (cachedToken != null) {
