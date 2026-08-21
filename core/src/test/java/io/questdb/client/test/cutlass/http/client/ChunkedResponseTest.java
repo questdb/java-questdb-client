@@ -259,6 +259,42 @@ public class ChunkedResponseTest {
         assertChunkSizeRejected("10000000000000001", "X", "positive overflow residue");
     }
 
+    @Test
+    public void testZeroPaddedChunkSizeIsStillAccepted() {
+        // The guard counts SIGNIFICANT hex digits, so a server that pads its size line is not mistaken for
+        // one overflowing it. A raw length check would reject this - it is 20 characters against a 15-digit
+        // bound - and would break framing against a perfectly conformant peer, which is a worse failure
+        // than the one the bound exists to prevent.
+        final long memSize = 128;
+        final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);
+        try {
+            final String wire = "00000000000000000001\r\nZ\r\n0\r\n\r\n";
+            final AbstractChunkedResponse rsp = new AbstractChunkedResponse(mem, mem + memSize, -1) {
+                boolean delivered;
+
+                @Override
+                protected int recvOrDie(long bufLo, long bufHi, int timeout) {
+                    if (delivered) {
+                        return 0;
+                    }
+                    delivered = true;
+                    for (int i = 0; i < wire.length(); i++) {
+                        Unsafe.getUnsafe().putByte(bufLo + i, (byte) wire.charAt(i));
+                    }
+                    return wire.length();
+                }
+            };
+            rsp.begin(mem, mem);
+            Fragment first = rsp.recv();
+            Assert.assertNotNull("a zero-padded size line must frame its chunk normally", first);
+            Assert.assertEquals('Z', (char) Unsafe.getUnsafe().getByte(first.lo()));
+            Assert.assertEquals(1, first.hi() - first.lo());
+            Assert.assertNull("and the terminator must still terminate", rsp.recv());
+        } finally {
+            Unsafe.free(mem, memSize, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private static void assertChunkSizeRejected(String sizeLine, String tail, String what) {
         final long memSize = 128;
         final long mem = Unsafe.malloc(memSize, MemoryTag.NATIVE_DEFAULT);

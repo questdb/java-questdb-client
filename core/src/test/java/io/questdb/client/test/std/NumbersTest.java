@@ -271,28 +271,29 @@ public class NumbersTest {
     }
 
     @Test
-    public void testParseHexLongRejectsOverflowRatherThanWrapping() {
-        // the boundary itself must be accepted...
+    public void testParseHexLongWrapsOnOverflowAndCallersBoundIt() {
+        // Two's-complement, like parseHexInt beside it and the server-side Numbers of the same name, whose
+        // Long256 decoding depends on the wrap. io.questdb.client.std is an exported package, so this is a
+        // shipped contract and not an internal detail.
         assertEquals(Long.MAX_VALUE, Numbers.parseHexLong("7fffffffffffffff"));
         assertEquals(0L, Numbers.parseHexLong("0"));
         assertEquals(0xacL, Numbers.parseHexLong("ac"));
-        // ...and leading zeros must not be mistaken for magnitude
+        // leading zeros carry no magnitude
         assertEquals(1L, Numbers.parseHexLong("000000000000000000001"));
         // range form
         assertEquals(0xf0L, Numbers.parseHexLong("xxF0yy", 2, 4));
 
-        // ...while everything past it is rejected rather than wrapped. The three residues matter
-        // separately: unchecked accumulation turned them into a negative value, a zero (which the HTTP
-        // chunk parser reads as the terminal chunk, truncating the body) and a short positive count.
-        assertHexLongRejected("8000000000000000");  // negative residue, and the smallest overflow
-        assertHexLongRejected("10000000000000000"); // zero residue
-        assertHexLongRejected("10000000000000001"); // positive residue
-        assertHexLongRejected("");
+        // The wrap itself, in the three shapes that break a length-prefixed format differently. Pinning the
+        // VALUES rather than a rejection is the point: a caller that parses a count it did not choose has
+        // to bound the digits before it gets here, because none of these is distinguishable afterwards -
+        // 10000000000000000 in particular is indistinguishable from a genuine 0.
+        assertEquals(Long.MIN_VALUE, Numbers.parseHexLong("8000000000000000")); // negative residue
+        assertEquals(0L, Numbers.parseHexLong("10000000000000000"));            // zero residue
+        assertEquals(1L, Numbers.parseHexLong("10000000000000001"));            // positive residue
+        assertEquals(-1L, Numbers.parseHexLong("ffffffffffffffff"));            // the full-width word
 
-        // The deliberate cost of the check: a full-width word with the high bit set used to read as -1 and
-        // is now rejected. Nothing in this library parsed one, and a caller wanting two's-complement
-        // wrap-around has to accumulate it itself.
-        assertHexLongRejected("ffffffffffffffff");
+        // an empty sequence is still an error rather than a zero
+        assertHexLongRejected("");
     }
 
     @Test

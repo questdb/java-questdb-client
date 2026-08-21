@@ -344,27 +344,26 @@ public final class Numbers {
     }
 
     /**
-     * Parses a hexadecimal sequence into a NON-NEGATIVE long, rejecting anything above
-     * {@link Long#MAX_VALUE} rather than wrapping.
+     * Parses a hexadecimal sequence into a long, reading a full-width 16-digit word as its
+     * TWO'S-COMPLEMENT value: {@code ffffffffffffffff} is {@code -1}, not an error. This matches
+     * {@link #parseHexInt(CharSequence, int, int)} beside it and the server-side {@code io.questdb.std.Numbers}
+     * of the same name, whose {@code Long256} decoding depends on the wrap.
      * <p>
-     * This used to accumulate {@code val << 4} unchecked, which silently discarded the high bits of any
-     * sequence long enough to overflow. That is indefensible wherever the digits are a COUNT chosen by a
-     * remote peer, and every residue is wrong in its own way: an HTTP chunk size of
-     * {@code 8000000000000000} wrapped negative and hung the framing state machine, one of
-     * {@code 10000000000000000} wrapped to zero and read as the terminal chunk (a truncated body reported
-     * as complete), and longer values wrapped to short positive counts that mis-framed everything after
-     * them.
-     * <p>
-     * The cost of the check is that a full-width 16-digit word with the high bit set -- {@code
-     * ffffffffffffffff}, previously read as {@code -1} -- is now rejected. Nothing in this library parsed
-     * one; a caller that wants two's-complement wrap-around must do its own accumulation.
+     * <b>Anything longer than 16 significant digits silently discards its high bits</b>, and a caller
+     * parsing a COUNT it did not choose must bound the digits itself rather than lean on this method to
+     * do it. Each overflow residue breaks a length-prefixed format its own way, and
+     * {@code AbstractChunkedResponse} is the worked example: an HTTP chunk size of
+     * {@code 8000000000000000} wraps negative and hangs a framing state machine, one of
+     * {@code 10000000000000000} wraps to zero and reads as the terminal chunk (a truncated body reported
+     * as complete), and longer values wrap to short positive counts that mis-frame everything after them.
+     * It guards by counting significant digits BEFORE calling here, which is the only form that works -
+     * the zero residue is indistinguishable from a genuine {@code 0} once parsed.
      *
      * @param sequence the characters to parse
      * @param lo       inclusive start
      * @param hi       exclusive end
-     * @return the parsed value, in {@code [0, Long.MAX_VALUE]}
-     * @throws NumericException if the sequence is empty, holds a non-hex character, or denotes a value
-     *                          above {@link Long#MAX_VALUE}
+     * @return the parsed value, wrapping on overflow
+     * @throws NumericException if the sequence is empty or holds a non-hex character
      */
     public static long parseHexLong(CharSequence sequence, int lo, int hi) throws NumericException {
         if (hi == 0) {
@@ -372,15 +371,12 @@ public final class Numbers {
         }
 
         long val = 0;
+        long r;
         for (int i = lo; i < hi; i++) {
-            int digit = hexToDecimal(sequence.charAt(i));
-            // Test BEFORE shifting: the shift is what loses the high bits, so afterwards there is nothing
-            // left to detect. val*16 + digit <= MAX_VALUE  <=>  val <= (MAX_VALUE - digit) >> 4, and both
-            // sides stay non-negative, so this cannot itself overflow.
-            if (val > (Long.MAX_VALUE - digit) >> 4) {
-                throw NumericException.instance().put("hex value exceeds Long.MAX_VALUE");
-            }
-            val = (val << 4) + digit;
+            int c = sequence.charAt(i);
+            long n = val << 4;
+            r = n + hexToDecimal(c);
+            val = r;
         }
         return val;
     }
