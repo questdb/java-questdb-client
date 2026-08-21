@@ -1520,6 +1520,58 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testARotatedRefreshWithNoServedKindIsNotPersistedAsAnUnadoptableEntry() throws Exception {
+        assertMemoryLeak(() -> {
+            // adopt() rejects a refresh token carried with NEITHER token kind, treating it as positive
+            // evidence of a foreign writer - an attacker who can write the store dropping in their own
+            // refresh token. That reasoning only holds while this client cannot produce the shape.
+            //
+            // It can. Under groupsInToken the served kind is the id token, so a stored entry carrying only
+            // an access token takes adopt()'s served-kind-absent branch, which nulls BOTH kinds and keeps
+            // the refresh token. A refresh that then rotates the refresh token but still returns no id
+            // token reaches adoptRotatedRefreshToken() -> persistIfRotated() with both null, and writing
+            // that snapshot leaves a file this client refuses for the life of the entry: every restart
+            // re-runs the device flow over a refresh token sitting on disk, which for a headless
+            // getToken() consumer is a hard failure.
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                // rotates the refresh token, still no id_token: the grant the branch above exists for
+                return MockOidcServer.json(200, tokenJson("ACCESS-NEW", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                long now = System.currentTimeMillis();
+                PersistedToken seeded = new PersistedToken("ACCESS-OLD", null, "REFRESH-1",
+                        now + 300_000, 300_000);
+                fake.stored = seeded;
+                fake.loadReturns = seeded;
+                try (OidcDeviceAuth auth = baseBuilder(server).groupsInToken(true).tokenStore(fake).build()) {
+                    try {
+                        // no id token anywhere: the seeded entry has none and the refresh does not produce
+                        // one, so this necessarily fails - the point is what it leaves on disk
+                        auth.getToken();
+                        Assert.fail("groupsInToken with no id token must not yield a served token");
+                    } catch (OidcAuthException expected) {
+                        // expected: selectToken() reports the missing served kind
+                    }
+                    Assert.assertEquals("the refresh must have run, or this test proves nothing about what "
+                            + "adoptRotatedRefreshToken() persists", 0, device.get());
+
+                    PersistedToken after = fake.stored;
+                    Assert.assertNotNull("the pre-existing entry must not be replaced by nothing", after);
+                    Assert.assertFalse("the client must never persist the one shape adopt() rejects as "
+                                    + "foreign: a refresh token with neither token kind",
+                            after.getAccessToken() == null && after.getIdToken() == null);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testARecoveredStoreReadDoesNotRevertACompletedSignIn() throws Exception {
         assertMemoryLeak(() -> {
             // maybeLoadFromStore() deliberately leaves its latch UNSET when a read THROWS, so a transient

@@ -1422,10 +1422,11 @@ public class OidcDeviceAuth implements QuietCloseable {
                 // the same reason the tampered-served-token branch below does.
                 //
                 // No grant this client stores can produce it. The device path reaches storeTokens only behind
-                // "accessToken.length() > 0 || idToken.length() > 0", the refresh path only behind a non-blank
-                // served kind, and persistIfRotated runs solely at the tail of storeTokens - so every entry we
-                // write carries at least one token kind. A file with a refresh token and nothing else came
-                // from somewhere else.
+                // "accessToken.length() > 0 || idToken.length() > 0", and the refresh path only behind a
+                // non-blank served kind. persistIfRotated() is also reached from adoptRotatedRefreshToken(),
+                // where both kinds CAN be null - the branch below nulls them - so it refuses to write that
+                // shape rather than leave this rejection resting on a callsite count. A file with a refresh
+                // token and nothing else came from somewhere else.
                 //
                 // Left adopted, it is the cheapest credential swap there is: an attacker who can WRITE the
                 // store directory - never needing to read our 0600 file - drops in a file whose fingerprint
@@ -1665,6 +1666,21 @@ public class OidcDeviceAuth implements QuietCloseable {
         // adoptRotatedRefreshToken() is covered by the same line, and before the rotation check below
         // because it is true whether or not this call writes anything.
         storeLoadAttempted = true;
+        // Never write an entry adopt() will refuse. It rejects a refresh token carried with NEITHER token
+        // kind as positive evidence of a foreign writer, and that reasoning is only sound while this client
+        // cannot produce the shape. It can: adopt()'s own served-kind-absent branch nulls BOTH kinds while
+        // keeping the refresh token, so a later refresh that rotates the refresh token but still returns no
+        // served kind reaches adoptRotatedRefreshToken() -> here with both null. Writing it would leave a
+        // file this client rejects for the life of the entry - a headless getToken() consumer re-running
+        // the device flow on every restart over a refresh token sitting on disk.
+        //
+        // Skipping the write leaves the previous entry in place, which is the better of the two: its
+        // refresh token is the one the provider just burned, so the next start spends one silent round
+        // trip and falls back to an interactive sign-in - the same end state, without a file that can
+        // never be read back.
+        if (accessToken == null && idToken == null) {
+            return;
+        }
         // persist on a new or rotated refresh token (the interactive sign-in, or a provider that rotates the
         // refresh token on every refresh); skip when it is unchanged, so the hot getToken() refresh path does
         // not rewrite the file every few minutes. The on-disk access token then goes stale, which costs only
