@@ -1520,6 +1520,53 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testARecoveredStoreReadDoesNotRevertACompletedSignIn() throws Exception {
+        assertMemoryLeak(() -> {
+            // maybeLoadFromStore() deliberately leaves its latch UNSET when a read THROWS, so a transient
+            // fault is retried rather than disabling persistence for the life of the instance. But it runs
+            // at the top of getToken(), AHEAD of the cache check, and adopt() assigns the served kind, the
+            // expiry and the ttl unconditionally - with no comparison against what is already in memory.
+            //
+            // So a store that is unavailable across signIn() and readable afterwards used to undo it: an
+            // unmounted home or a container started before its volume attaches fails the read AND the save
+            // (one root cause, both through ensureDirectory), the human authenticates, and then the next
+            // getToken() - one per ILP flush - re-reads and installs the PREVIOUS entry over the grant just
+            // obtained. The failed save is what makes it stick: nothing rewrote the entry to match memory.
+            AtomicInteger device = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    device.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-FRESH", null, "REFRESH-FRESH", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                long now = System.currentTimeMillis();
+                // a PREVIOUS login, still unexpired, so adopt() would take it and getToken() would serve it
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-STALE",
+                        now + 300_000, 300_000);
+                fake.failLoadTimes = 1;  // the read inside signIn()
+                fake.failSave = true;    // ...and the save that follows it, same root cause
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Assert.assertEquals("ACCESS-FRESH", auth.signIn());
+                    Assert.assertEquals("the device flow must have run", 1, device.get());
+                    Assert.assertTrue("the save must have been attempted and failed, or this test is not "
+                            + "reproducing the stuck-stale-entry case", fake.saves.get() > 0);
+
+                    // the store is readable again from here on (failLoadTimes is spent)
+                    Assert.assertEquals("a recovered store read must not install a previous login over the "
+                            + "grant signIn() just obtained", "ACCESS-FRESH", auth.getToken());
+                    Assert.assertEquals("ACCESS-FRESH", auth.getToken());
+                    Assert.assertEquals("once this instance holds its own tokens the store is no longer "
+                            + "authoritative for it and must not be re-read", 1, fake.loads.get());
+                }
+            }
+        });
+    }
+
+
+    @Test(timeout = 30_000)
     public void testSignInClearsTheStoreLoadBackOff() throws Exception {
         assertMemoryLeak(() -> {
             // The back-off must never strand a caller: signIn() is the explicit action a user takes to

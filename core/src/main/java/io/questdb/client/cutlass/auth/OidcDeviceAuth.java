@@ -1653,6 +1653,18 @@ public class OidcDeviceAuth implements QuietCloseable {
         if (tokenStore == null) {
             return;
         }
+        // This instance has now produced tokens of its own, so the on-disk entry is no longer authoritative
+        // for it and must never be read back over them. maybeLoadFromStore() deliberately leaves the latch
+        // UNSET when a read THROWS, so a transient fault is retried - but it runs at the top of getToken(),
+        // ahead of the cache check, and adopt() assigns the served kind, the expiry and the ttl
+        // unconditionally. Without this line: a store directory that is unavailable during signIn() (an
+        // unmounted home, a container started before its volume attaches) fails the read, the device flow
+        // completes, the save fails the same way and is swallowed, and then the directory recovers - so the
+        // next getToken(), one per ILP flush, re-reads and installs the PREVIOUS entry over the grant a
+        // human just authorized. Latched here rather than in storeTokens() so the refresh-only path through
+        // adoptRotatedRefreshToken() is covered by the same line, and before the rotation check below
+        // because it is true whether or not this call writes anything.
+        storeLoadAttempted = true;
         // persist on a new or rotated refresh token (the interactive sign-in, or a provider that rotates the
         // refresh token on every refresh); skip when it is unchanged, so the hot getToken() refresh path does
         // not rewrite the file every few minutes. The on-disk access token then goes stale, which costs only
