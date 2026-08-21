@@ -466,6 +466,53 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test(timeout = 60_000)
+    public void testAlternating401AndOutageStillReachesTheEscalation() throws Exception {
+        assertMemoryLeak(() -> {
+            // The two tests below prove an unrelated outage must not let the dwell be satisfied for free,
+            // and they restart the dwell anchor to get it. Taken alone that leaves the AND gate
+            // unsatisfiable: the anchor is rewound by the capability-gap, role-reject and transport arms,
+            // while the attempt counter is only ever reset by real ack progress. A cluster that alternates
+            // - reject, blip, reject, blip - therefore re-anchors before every rejection, elapsed is always
+            // ~0, the second disjunct is permanently true, and connectWithDurableAckRetry() never returns:
+            // the slot is never quarantined, no DATA_LOSS is reported, and one of max_background_drainers
+            // workers is pinned for the life of the process.
+            //
+            // The attempt cap is what closes it. It cannot be rewound by an unrelated state, so it bounds
+            // the episode however the rejections are spaced, while leaving the dwell to decide every case
+            // that is not pathological. Without it this test does not fail an assertion - it never returns
+            // and dies on the @Test timeout.
+            final AtomicInteger calls = new AtomicInteger();
+            CursorWebSocketSendLoop.ReconnectFactory alternating = new CursorWebSocketSendLoop.ReconnectFactory() {
+                @Override
+                public boolean hasDynamicCredential() {
+                    return true;
+                }
+
+                @Override
+                public WebSocketClient reconnect() {
+                    // strict alternation: no two rejections are ever consecutive, so the dwell anchor is
+                    // reset before each one and never accumulates
+                    if (calls.incrementAndGet() % 2 == 1) {
+                        throw new QwpAuthFailedException(401, "127.0.0.1", 9000);
+                    }
+                    throw new RuntimeException("cluster unreachable");
+                }
+            };
+            // A dwell far larger than anything this test can accumulate, so ONLY the cap can end it.
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    alternating, Long.MAX_VALUE, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+
+            assertNull("an alternating credential rejection must still reach the escalation",
+                    drainer.connectWithDurableAckRetry());
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertTrue("the cap must be the backstop, not the first line: the ordinary dwell path has to "
+                            + "get its full attempt threshold first",
+                    calls.get() >= BackgroundDrainer.DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS);
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testTransientOutageDoesNotCountTowardTheRotating401Dwell() throws Exception {
         assertMemoryLeak(() -> {
             // The dwell measures how long the REJECTION persisted, so an unrelated outage in the middle of a

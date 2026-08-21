@@ -114,6 +114,28 @@ public final class BackgroundDrainer implements Runnable {
      */
     public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
     /**
+     * Hard ceiling on rotating-credential {@code 401}/{@code 403} rejections within one no-ack-progress
+     * episode, whatever the dwell says.
+     * <p>
+     * The dwell is a wall clock anchored at the first rejection of the current run, and the
+     * capability-gap, role-reject and transport arms all rewind that anchor - deliberately, so an
+     * unrelated outage cannot satisfy the floor for free. The attempt threshold beside it is only ever
+     * reset by real ack progress. That asymmetry is what the gate needs in the ordinary case and what
+     * breaks it in the pathological one: a cluster that ALTERNATES - reject, blip, reject, blip - rewinds
+     * the anchor before every rejection, so the elapsed dwell is always ~0, the AND can never be
+     * satisfied, and the ride-out never ends. The drainer then sweeps forever with no ack progress: no
+     * {@code .failed} sentinel, no {@code DATA_LOSS} report, the slot lock held, and one worker of a
+     * fixed-size {@link BackgroundDrainerPool} pinned for the life of the process - the exact outcome
+     * {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} exists to prevent, reached by a different route.
+     * <p>
+     * An attempt cap is the right backstop precisely because nothing rewinds it: it shares the attempt
+     * counter's episode scope, so it bounds the ride-out however the rejections are spaced. It is set far
+     * above {@link #DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS} on purpose - the dwell decides every
+     * case that is not pathological, and this only ever fires when the dwell has been rendered
+     * unsatisfiable.
+     */
+    public static final int MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE = 256;
+    /**
      * Ceiling on the rotating-credential {@code 401}/{@code 403} wall-clock dwell, independent of the user
      * knob it is otherwise derived from.
      * <p>
@@ -479,9 +501,18 @@ public final class BackgroundDrainer implements Runnable {
                     // early - but the dwell is the CLAMPED one, so a saturated reconnect_max_duration_millis
                     // cannot make the second conjunct unsatisfiable and turn "ride it out" into "never
                     // escalate". See MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS.
+                    // The AND of the two thresholds, under a cap that nothing can rewind. The transient
+                    // arms below deliberately restart the dwell anchor, so an ALTERNATING cluster -
+                    // reject, blip, reject, blip - re-anchors before every rejection and leaves the
+                    // elapsed dwell permanently at ~0, making the AND unsatisfiable and the ride-out
+                    // endless. The attempt counter shares this episode's scope (only ack progress clears
+                    // it), so capping on it bounds the ride-out however the rejections are spaced while
+                    // leaving the dwell to decide every non-pathological case. See
+                    // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE.
                     retryDynamicCredentialAuth =
-                            dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
-                                    || dynamicCredentialAuthElapsedNanos < dynamicCredentialAuthDwellNanos;
+                            (dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
+                                    || dynamicCredentialAuthElapsedNanos < dynamicCredentialAuthDwellNanos)
+                                    && dynamicCredentialAuthAttempts < MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE;
                 }
                 if (retryDynamicCredentialAuth) {
                     lastErrorMessage = e.getMessage();
