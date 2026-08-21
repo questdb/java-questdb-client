@@ -58,15 +58,22 @@ public class LineHttpSenderErrorResponseTest {
     private static final char RLO = 0x202e;
 
     @Test(timeout = 30_000)
-    public void testMalformedResponseHeadOnFlushIsRetriedAsATransportError() throws Exception {
+    public void testMalformedResponseHeadOnFlushFailsOnceWithoutResending() throws Exception {
         assertMemoryLeak(() -> {
             // HttpHeaderParser rejects a response head it cannot parse - here a header block past its fixed
             // 4096-byte buffer, the shape an intermediary stacking Set-Cookie/CSP produces - by throwing
             // HttpException, a SIBLING of HttpClientException rather than a subclass. Uncaught it escaped
-            // flush0's retry arm and with it the retry, the address rotation and the client.disconnect()
-            // that keeps the next flush off a connection holding a half-read response, and left flush()
-            // throwing a raw HttpException instead of the LineSenderException its contract promises.
+            // flush0 entirely, taking with it the client.disconnect() that keeps the next flush off a
+            // connection holding a half-read response, and left flush() throwing a raw HttpException
+            // instead of the LineSenderException its contract promises.
+            //
+            // Caught, but NOT retried. The parser only ever runs on bytes that arrived, so the server
+            // answered: the batch is delivered, and the head is chosen by an intermediary, so the next
+            // attempt parses the same block and fails the same way. Routing it to the transport arm made a
+            // committed batch re-send until the retry budget ran out.
+            AtomicInteger requests = new AtomicInteger();
             try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
                 StringBuilder padding = new StringBuilder();
                 for (int i = 0; i < 5000; i++) {
                     padding.append('A');
@@ -78,18 +85,27 @@ public class LineHttpSenderErrorResponseTest {
                         .address("127.0.0.1:" + server.port())
                         .protocolVersion(Sender.PROTOCOL_VERSION_V1) // only the flush hits the mock
                         .httpTimeoutMillis(1_000)
-                        .retryTimeoutMillis(100)                     // exhaust the retry budget quickly
+                        .retryTimeoutMillis(5_000)                   // a budget a re-send would visibly spend
                         .disableAutoFlush()
                         .build()) {
                     sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
                     try {
                         sender.flush();
                         Assert.fail("an unparseable response head must fail the flush");
                     } catch (LineSenderException e) {
-                        // the documented type, reached through the retry arm; a raw HttpException here is
-                        // the regression
-                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("Connection Failed"));
+                        // the documented type, and a message that names what went wrong rather than
+                        // reporting a transport failure that did not happen
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("Malformed HTTP response head"));
+                        Assert.assertFalse("a head an intermediary will re-send identically is not retryable",
+                                e.isRetryable());
                     }
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    Assert.assertEquals("a batch the server already answered must be sent exactly once",
+                            1, requests.get());
+                    Assert.assertTrue("returned too slowly to have failed without retrying: "
+                            + elapsedMillis + "ms", elapsedMillis < 5_000);
                 }
             }
         });

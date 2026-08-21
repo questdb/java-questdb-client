@@ -790,18 +790,39 @@ public abstract class AbstractLineHttpSender implements Sender {
                     continue;
                 }
                 throwOnHttpErrorResponse(statusCode, response, false, actualTimeoutMillis);
-            } catch (HttpClientException | HttpException e) {
-                // this is a network error, we can retry.
+            } catch (HttpException e) {
+                // An unparseable response head: response.await() above hands it to HttpHeaderParser, which
+                // rejects a header block past its fixed 4096-byte buffer (an intermediary stacking
+                // Set-Cookie/CSP), a malformed Content-Length, or a status line that is not HTTP/1.x.
+                // HttpException is a SIBLING of HttpClientException, not a subclass, so it used to escape
+                // both arms - taking with it the client.disconnect() that keeps the next flush off a
+                // connection holding a half-read response, and leaving flush() throwing a raw
+                // HttpException rather than the LineSenderException its contract promises.
                 //
-                // HttpException too: response.await() above hands the response head to HttpHeaderParser,
-                // which rejects one it cannot parse - a header block past its fixed 4096-byte buffer (an
-                // intermediary stacking Set-Cookie/CSP), a malformed Content-Length, a status line that is
-                // not HTTP/1.x - by throwing HttpException. That is a SIBLING of HttpClientException, not a
-                // subclass, so it escaped this catch and with it the retry, the address rotation and the
-                // client.disconnect() that keeps the next flush off a connection holding a half-read
-                // response. It also left flush() throwing a raw HttpException rather than the
-                // LineSenderException its contract promises, past every caller's catch. An unparseable head
-                // is the response being unusable, which is exactly what this arm already handles.
+                // Handled here rather than in the retry arm below, because it is not a transport failure
+                // and must not be retried. HttpHeaderParser only runs on bytes that ARRIVED, so this is
+                // positive evidence the server answered - the same evidence the 2xx drain arm above treats
+                // as decisive - and the head is chosen by an intermediary, not by chance: the next attempt
+                // parses the same block and fails identically. Retrying spent the whole budget re-sending a
+                // batch the server had already taken (measured: 16 sends over ~11s per flush at the default
+                // budget, against 1 before HttpException reached the arm), which for a table without DEDUP
+                // keys is 15 extra copies of every row.
+                //
+                // Disconnect anyway: the half-read response would mis-frame the next one on this
+                // connection. lastFlushFailed suppresses the close-time re-flush for the same reason - the
+                // server already has these rows.
+                lastFlushFailed = true;
+                client.disconnect();
+                LineSenderException headEx = new LineSenderException("Could not flush buffer: http");
+                if (isTls) {
+                    headEx.put('s');
+                }
+                headEx.put("://");
+                headEx.put(currentHost()).put(':').put(currentPort()).put(this.path);
+                headEx.put(" Malformed HTTP response head").put(": ").put(e.getMessage());
+                throw headEx;
+            } catch (HttpClientException e) {
+                // this is a network error, we can retry.
                 lastFlushFailed = true;
                 client.disconnect(); // forces reconnect
                 long nowNanos = System.nanoTime();
