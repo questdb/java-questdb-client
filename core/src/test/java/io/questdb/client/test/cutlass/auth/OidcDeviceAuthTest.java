@@ -30,6 +30,9 @@ import io.questdb.client.cutlass.auth.DeviceCodePrompt;
 import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
 import io.questdb.client.cutlass.json.JsonException;
+import io.questdb.client.cutlass.http.client.Fragment;
+import io.questdb.client.cutlass.http.client.HttpClientException;
+import io.questdb.client.cutlass.http.client.Response;
 import io.questdb.client.cutlass.json.JsonLexer;
 import io.questdb.client.cutlass.json.JsonParser;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -45,6 +48,8 @@ import org.junit.ClassRule;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -1135,6 +1140,73 @@ public class OidcDeviceAuthTest {
                 } catch (OidcAuthException e) {
                     Assert.assertTrue(e.getMessage(), e.getMessage().contains("token endpoint"));
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testBodyReadAbortsOnItsElapsedDeadline() throws Exception {
+        assertMemoryLeak(() -> {
+            // parseBody bounds the WHOLE body read against an untrusted identity provider: a server that
+            // keeps delivering, slowly, for longer than httpTimeoutMillis must not hold the thread. The bound
+            // sits on a hot path - getToken() runs once per ILP flush - so losing it stalls ingestion rather
+            // than failing it.
+            //
+            // Two things can end that read and they are NOT interchangeable: the per-call recv bound
+            // ("timed out reading the chunked response body") and parseBody's own elapsed deadline. Only the
+            // second one catches a peer whose every individual read SUCCEEDS while the read as a whole runs
+            // past the budget, and nothing exercised it - a socket-level test races the two bounds and pins
+            // whichever wins on the day.
+            //
+            // Driving parseBody directly removes the race. The Response below hands back an EMPTY fragment
+            // immediately and forever: every recv succeeds, so the recv bound can never fire; totalBytes
+            // never grows, so the 4 MiB cap can never fire either; and the lexer is fed nothing, so it
+            // cannot throw. The elapsed deadline is the only exit, which is exactly the line under test.
+            Method parseBody = OidcDeviceAuth.class.getDeclaredMethod(
+                    "parseBody", Response.class, JsonLexer.class, JsonParser.class, int.class);
+            parseBody.setAccessible(true);
+
+            Fragment empty = new Fragment() {
+                @Override
+                public long hi() {
+                    return 0;
+                }
+
+                @Override
+                public long lo() {
+                    return 0;
+                }
+            };
+            AtomicInteger reads = new AtomicInteger();
+            Response alwaysReady = new Response() {
+                @Override
+                public Fragment recv() {
+                    return recv(0);
+                }
+
+                @Override
+                public Fragment recv(int timeout) {
+                    reads.incrementAndGet();
+                    return empty;
+                }
+            };
+
+            try (JsonLexer lexer = new JsonLexer(1024, 1024)) {
+                long startMillis = System.currentTimeMillis();
+                try {
+                    parseBody.invoke(null, alwaysReady, lexer, NOOP_JSON_PARSER, 200);
+                    Assert.fail("a body that never ends must abort on the elapsed deadline");
+                } catch (InvocationTargetException e) {
+                    Assert.assertTrue("expected the elapsed-deadline abort, got: " + e.getCause(),
+                            e.getCause() instanceof HttpClientException);
+                    Assert.assertEquals("timed out reading the identity provider response body",
+                            e.getCause().getMessage());
+                }
+                long elapsedMillis = System.currentTimeMillis() - startMillis;
+                Assert.assertTrue("the deadline must bound the read, not merely end it eventually: "
+                        + elapsedMillis + "ms", elapsedMillis < 10_000);
+                Assert.assertTrue("every read must have succeeded, or this pinned the recv bound instead",
+                        reads.get() > 0);
             }
         });
     }
