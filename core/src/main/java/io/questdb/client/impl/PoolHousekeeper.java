@@ -82,10 +82,22 @@ final class PoolHousekeeper {
                 // -- the very window this pool's per-slot ids and the drain_orphans(false) forced on
                 // recovery builds exist to eliminate.
                 //
-                // Interrupt and re-join. Every wait on that path is interruptible: acquireForGetToken polls
-                // a timed tryLock, and FileTokenStore's two lock waits abandon and re-assert the flag. The
-                // pull then throws, the step's caller swallows it (recovery is best-effort), and the loop
-                // reaches its stop check and releases the flock on its own.
+                // Interrupt and re-join. The waits this is aimed at are interruptible: acquireForGetToken
+                // polls a timed tryLock, and FileTokenStore's two lock waits abandon and re-assert the flag.
+                // The pull then throws, the step's caller swallows it (recovery is best-effort), and the
+                // loop reaches its stop check and releases the flock on its own.
+                //
+                // Not ALL of the pull is interruptible, and the join above is the only bound on the rest:
+                // the token POST's connect, send, await and parse phases run on the native HTTP client
+                // (raw fd + epoll/kqueue), which no interrupt breaks -- each is bounded by
+                // httpTimeoutMillis, and DNS resolution is not bounded at all. So a pull already inside its
+                // round trip outlives both joins, exactly as an in-flight connect to a black-holed host
+                // does. This escalation shortens the common case; it does not make the window impossible.
+                //
+                // The flag must not outlive the interrupt's target. Sender.close() and QwpQueryClient
+                // close() are interrupt-neutral precisely because this thread goes on to close delegates:
+                // a CARRIED flag makes CountDownLatch.await return instantly and would report a flock still
+                // held that was released fine.
                 thread.interrupt();
                 thread.join(STOP_TIMEOUT_MILLIS);
             }

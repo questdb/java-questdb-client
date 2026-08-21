@@ -1277,205 +1277,231 @@ public class QwpWebSocketSender implements Sender {
     public void close() {
         if (!closed) {
             closed = true;
-            Runnable hook = closeStartedHook;
-            closeStartedHook = null;
-            if (hook != null) {
-                try {
-                    hook.run();
-                } catch (Throwable t) {
-                    // A test witness must never prevent production resource cleanup.
-                    LOG.error("Error in close-started test hook: {}", String.valueOf(t));
-                }
-            }
-            boolean ioThreadStopped = true;
-            // Captures the first error from the flush/drain path AND any
-            // secondary errors from cleanup steps (added via addSuppressed).
-            // Silently swallowing any of these would hide latched terminal
-            // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
-            // SCHEMA_MISMATCH HALT) from users who only call close() and
-            // never call flush() afterwards.
-            Throwable terminalError = null;
-            // Snapshot the exact terminal error instance that a user-thread
-            // API call ALREADY caught (via flush()/at()) before close() ran.
-            // If flushPendingRows/drainOnClose below also rethrow the same
-            // instance, dropping it at the final rethrow avoids
-            // try-with-resources self-suppression: Throwable.addSuppressed
-            // raises IllegalArgumentException when primary == suppressed.
-            // Must stay this single read: the snapshot needs the identity of
-            // the error the user already owns, and only
-            // getSynchronouslySurfacedError() holds it. Deriving it from two
-            // separate latch reads races the I/O thread -- a terminal latched
-            // between the reads would be adopted as user-owned and silently
-            // dropped (see CloseOwnershipRaceTest).
-            Throwable alreadyOwnedByUser = cursorSendLoop != null
-                    ? cursorSendLoop.getSynchronouslySurfacedError() : null;
-
+            // Interrupt-neutral for the duration, the same shape QwpQueryClient.close() and
+            // FileTokenStore.load()/save() use. PoolHousekeeper.stop() and
+            // SenderPool.stopStartupRecoveryDriver() escalate to Thread.interrupt() when their join
+            // times out, and the thread they interrupt is the one that then runs senderPool.reapIdle()
+            // and the startup-recovery step's finally -- both of which close a delegate. A CARRIED flag
+            // is fatal to that close: CountDownLatch.await(t, u) tests Thread.interrupted() before it
+            // ever consults the latch, so CursorWebSocketSendLoop.close()'s shutdown await would throw
+            // having waited 0 ms, take the failed-stop path, and report the SF slot flock still held --
+            // the exact outcome the interrupt was added to prevent. Worse, that path re-asserts the
+            // flag, so every remaining delegate in the same reap sweep failed the same way.
+            //
+            // Clearing it here restores the intended meaning: the interrupt breaks the wait it was
+            // aimed at (a credential pull between steps), and the teardown that follows runs normally.
+            // An interrupt delivered DURING this close still lands on the await and still takes the
+            // failed-stop branch, which is correct -- that one really is 'we could not join'.
+            final boolean wasInterrupted = Thread.interrupted();
             try {
-                // Only drain when both the engine and the I/O loop are wired
-                // up — close() is also called from createForTesting() teardown
-                // and from connect() rollback paths where one or both may be null.
-                if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
-                    // 1) Flush user-thread state into the engine (encoded
-                    //    rows -> mmap'd / malloc'd ring). After this, the
-                    //    cursor engine's publishedFsn reflects the final
-                    //    target the I/O loop must drive ackedFsn up to.
-                    //    A pre-flight rejection means this batch cannot fit
-                    //    the current cap however it is split. It is
-                    //    RETAINED by design so it can go out once a
-                    //    larger-cap node is reached -- but on close there is
-                    //    no later flush, and letting the throw escape here
-                    //    skips sendCommitMessage, sealAndSwapBuffer and
-                    //    drainOnClose, abandoning every row an earlier
-                    //    successful flush already published. The message
-                    //    that path emits tells the caller to close the
-                    //    sender to discard the batch, so honour that:
-                    //    discard it, remember the error, and let the rest of
-                    //    close() run. rethrowTerminal below still surfaces it.
-                    try {
-                        flushPendingRows(deferCommit);
-                    } catch (BatchTooLargeForCapException e) {
-                        resetTableBuffersAfterFlush();
-                        terminalError = captureCloseError(terminalError, e);
-                    } catch (Throwable t) {
-                        // Same reasoning as the pre-flight rejection above, for the
-                        // failures a size check cannot see: sealAndSwapBuffer's
-                        // buffer-recycle timeout and appendBlocking's backpressure
-                        // deadline. Letting those escape to the outer catch skipped
-                        // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
-                        // flush that had already published deferred dictionary chunks
-                        // left their group open forever, and every row an EARLIER
-                        // successful flush published was abandoned unacked. The batch is
-                        // NOT discarded here (unlike the over-cap case, this failure is
-                        // not a verdict on the batch's contents), but the rest of close()
-                        // must still run. rethrowTerminal below surfaces it.
-                        terminalError = captureCloseError(terminalError, t);
-                    }
-                    if (!deferCommit && hasDeferredMessages) {
-                        sendCommitMessage();
-                    }
-                    if (activeBuffer != null && activeBuffer.hasData()) {
-                        sealAndSwapBuffer();
-                        if (!deferCommit) {
-                            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
-                        }
-                    }
-                    // 2) Safety-net rethrow: surface the latched terminal
-                    //    error only when no other channel has already
-                    //    delivered THIS terminal to the user. "Already
-                    //    delivered" means either the producer thread saw it
-                    //    synchronously via flush()/append() (checkUnsurfacedError
-                    //    is silent in that case) or the async dispatcher
-                    //    actually delivered the latched terminal to a
-                    //    user-installed custom handler
-                    //    (hasDeliveredTerminalToCustomHandler, checked here).
-                    //    The test is terminal-specific on purpose: an earlier
-                    //    routine RETRIABLE rejection delivered to the
-                    //    handler must NOT suppress a later genuine TERMINAL
-                    //    error (the "any error ever" flag did, silently
-                    //    losing it). It also stays false when the terminal
-                    //    reached only the default handler after a
-                    //    setErrorHandler(null) revert, or is still
-                    //    queued/abandoned behind a slow handler -- so a
-                    //    config-string-only caller, and a reverting caller,
-                    //    both still get the loud rethrow on shutdown.
-                    boolean terminalOwnedByCustomHandler = errorDispatcher != null
-                            && errorDispatcher.hasDeliveredTerminalToCustomHandler();
-                    if (!terminalOwnedByCustomHandler) {
-                        cursorSendLoop.checkUnsurfacedError();
-                    }
-                    // 3) Bounded drain: block until the server has ACK'd
-                    //    everything we just published, or until the
-                    //    configured timeout elapses. closeFlushTimeoutMillis
-                    //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit). Pass the same ownership flag the
-                    //    step-2 safety net used: when the custom handler
-                    //    already owns THIS terminal, the drain must stop on it
-                    //    without re-throwing (re-throwing would double-signal
-                    //    an error the user already handled). Otherwise the
-                    //    drain keeps the loud safety net and surfaces it.
-                    if (closeFlushTimeoutMillis > 0L) {
-                        drainOnClose(terminalOwnedByCustomHandler);
-                    }
-                }
-            } catch (Throwable t) {
-                terminalError = t;
-            }
-
-            // Shut down the I/O thread before closing the socket or buffers
-            // it may be using. Must run even if the flush above failed.
-            if (cursorSendLoop != null) {
-                try {
-                    cursorSendLoop.close();
-                } catch (Throwable e) {
-                    ioThreadStopped = false;
-                    LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
-                    terminalError = captureCloseError(terminalError, e);
+                close0();
+            } finally {
+                if (wasInterrupted) {
+                    Thread.currentThread().interrupt();
                 }
             }
-            // Drainer pool closes after the foreground I/O loop is wound
-            // down. Drainers share buildAndConnect's endpoint walk and
-            // hostTracker state with the foreground (never its observable
-            // connection state or event stream), but their
-            // connect gate is their own stop flag — NOT the foreground
-            // loop's liveness — so the pool's graceful-drain window below
-            // still lets in-flight drainers finish (including reconnects)
-            // even though cursorSendLoop is already stopped.
-            if (drainerPool != null) {
-                try {
-                    drainerPool.close();
-                } catch (Throwable e) {
-                    LOG.error("Error closing drainer pool: {}", String.valueOf(e));
-                    terminalError = captureCloseError(terminalError, e);
-                }
-            }
-
-            // Always free resources the I/O thread never touches:
-            // encoder and table buffers are user-thread-only.
-            try {
-                encoder.close();
-                ObjList<CharSequence> keys = tableBuffers.keys();
-                for (int i = 0, n = keys.size(); i < n; i++) {
-                    CharSequence key = keys.getQuick(i);
-                    if (key != null) {
-                        Misc.free(tableBuffers.get(key));
-                    }
-                }
-                tableBuffers.clear();
-            } catch (Throwable t) {
-                LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
-                terminalError = captureCloseError(terminalError, t);
-            }
-
-            if (!ioThreadStopped) {
-                // The worker may still touch every resource below. Hand the
-                // complete sender-owned tail to its exit path rather than
-                // permanently leaking everything except the engine. The
-                // callback is idempotence-gated by closeRemainingResources().
-                if (ownsCursorEngine && cursorEngine != null) {
-                    retainedEngine = cursorEngine;
-                }
-                Runnable closeCallback = () -> closeRemainingResources(null);
-                if (cursorSendLoop != null && cursorSendLoop.delegateClose(closeCallback)) {
-                    rethrowTerminal(terminalError);
-                    return;
-                }
-                // The worker exited between close() failing and delegation.
-                // Cleanup is safe here and its failures remain suppressed on
-                // the original close error.
-                terminalError = closeRemainingResources(terminalError);
-            } else {
-                terminalError = closeRemainingResources(terminalError);
-            }
-
-            // If close() ended up holding the same instance the user already
-            // caught earlier, suppress the rethrow. The user's catch block
-            // wraps close() (try-with-resources), and Throwable refuses
-            // self-suppression.
-            if (terminalError != null && terminalError == alreadyOwnedByUser) {
-                terminalError = null;
-            }
-            rethrowTerminal(terminalError);
         }
+    }
+
+    private void close0() {
+        Runnable hook = closeStartedHook;
+        closeStartedHook = null;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (Throwable t) {
+                // A test witness must never prevent production resource cleanup.
+                LOG.error("Error in close-started test hook: {}", String.valueOf(t));
+            }
+        }
+        boolean ioThreadStopped = true;
+        // Captures the first error from the flush/drain path AND any
+        // secondary errors from cleanup steps (added via addSuppressed).
+        // Silently swallowing any of these would hide latched terminal
+        // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
+        // SCHEMA_MISMATCH HALT) from users who only call close() and
+        // never call flush() afterwards.
+        Throwable terminalError = null;
+        // Snapshot the exact terminal error instance that a user-thread
+        // API call ALREADY caught (via flush()/at()) before close() ran.
+        // If flushPendingRows/drainOnClose below also rethrow the same
+        // instance, dropping it at the final rethrow avoids
+        // try-with-resources self-suppression: Throwable.addSuppressed
+        // raises IllegalArgumentException when primary == suppressed.
+        // Must stay this single read: the snapshot needs the identity of
+        // the error the user already owns, and only
+        // getSynchronouslySurfacedError() holds it. Deriving it from two
+        // separate latch reads races the I/O thread -- a terminal latched
+        // between the reads would be adopted as user-owned and silently
+        // dropped (see CloseOwnershipRaceTest).
+        Throwable alreadyOwnedByUser = cursorSendLoop != null
+                ? cursorSendLoop.getSynchronouslySurfacedError() : null;
+
+        try {
+            // Only drain when both the engine and the I/O loop are wired
+            // up — close() is also called from createForTesting() teardown
+            // and from connect() rollback paths where one or both may be null.
+            if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
+                // 1) Flush user-thread state into the engine (encoded
+                //    rows -> mmap'd / malloc'd ring). After this, the
+                //    cursor engine's publishedFsn reflects the final
+                //    target the I/O loop must drive ackedFsn up to.
+                //    A pre-flight rejection means this batch cannot fit
+                //    the current cap however it is split. It is
+                //    RETAINED by design so it can go out once a
+                //    larger-cap node is reached -- but on close there is
+                //    no later flush, and letting the throw escape here
+                //    skips sendCommitMessage, sealAndSwapBuffer and
+                //    drainOnClose, abandoning every row an earlier
+                //    successful flush already published. The message
+                //    that path emits tells the caller to close the
+                //    sender to discard the batch, so honour that:
+                //    discard it, remember the error, and let the rest of
+                //    close() run. rethrowTerminal below still surfaces it.
+                try {
+                    flushPendingRows(deferCommit);
+                } catch (BatchTooLargeForCapException e) {
+                    resetTableBuffersAfterFlush();
+                    terminalError = captureCloseError(terminalError, e);
+                } catch (Throwable t) {
+                    // Same reasoning as the pre-flight rejection above, for the
+                    // failures a size check cannot see: sealAndSwapBuffer's
+                    // buffer-recycle timeout and appendBlocking's backpressure
+                    // deadline. Letting those escape to the outer catch skipped
+                    // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
+                    // flush that had already published deferred dictionary chunks
+                    // left their group open forever, and every row an EARLIER
+                    // successful flush published was abandoned unacked. The batch is
+                    // NOT discarded here (unlike the over-cap case, this failure is
+                    // not a verdict on the batch's contents), but the rest of close()
+                    // must still run. rethrowTerminal below surfaces it.
+                    terminalError = captureCloseError(terminalError, t);
+                }
+                if (!deferCommit && hasDeferredMessages) {
+                    sendCommitMessage();
+                }
+                if (activeBuffer != null && activeBuffer.hasData()) {
+                    sealAndSwapBuffer();
+                    if (!deferCommit) {
+                        lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+                    }
+                }
+                // 2) Safety-net rethrow: surface the latched terminal
+                //    error only when no other channel has already
+                //    delivered THIS terminal to the user. "Already
+                //    delivered" means either the producer thread saw it
+                //    synchronously via flush()/append() (checkUnsurfacedError
+                //    is silent in that case) or the async dispatcher
+                //    actually delivered the latched terminal to a
+                //    user-installed custom handler
+                //    (hasDeliveredTerminalToCustomHandler, checked here).
+                //    The test is terminal-specific on purpose: an earlier
+                //    routine RETRIABLE rejection delivered to the
+                //    handler must NOT suppress a later genuine TERMINAL
+                //    error (the "any error ever" flag did, silently
+                //    losing it). It also stays false when the terminal
+                //    reached only the default handler after a
+                //    setErrorHandler(null) revert, or is still
+                //    queued/abandoned behind a slow handler -- so a
+                //    config-string-only caller, and a reverting caller,
+                //    both still get the loud rethrow on shutdown.
+                boolean terminalOwnedByCustomHandler = errorDispatcher != null
+                        && errorDispatcher.hasDeliveredTerminalToCustomHandler();
+                if (!terminalOwnedByCustomHandler) {
+                    cursorSendLoop.checkUnsurfacedError();
+                }
+                // 3) Bounded drain: block until the server has ACK'd
+                //    everything we just published, or until the
+                //    configured timeout elapses. closeFlushTimeoutMillis
+                //    <= 0 opts out (fast close, may lose memory-mode
+                //    data on JVM exit). Pass the same ownership flag the
+                //    step-2 safety net used: when the custom handler
+                //    already owns THIS terminal, the drain must stop on it
+                //    without re-throwing (re-throwing would double-signal
+                //    an error the user already handled). Otherwise the
+                //    drain keeps the loud safety net and surfaces it.
+                if (closeFlushTimeoutMillis > 0L) {
+                    drainOnClose(terminalOwnedByCustomHandler);
+                }
+            }
+        } catch (Throwable t) {
+            terminalError = t;
+        }
+
+        // Shut down the I/O thread before closing the socket or buffers
+        // it may be using. Must run even if the flush above failed.
+        if (cursorSendLoop != null) {
+            try {
+                cursorSendLoop.close();
+            } catch (Throwable e) {
+                ioThreadStopped = false;
+                LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
+                terminalError = captureCloseError(terminalError, e);
+            }
+        }
+        // Drainer pool closes after the foreground I/O loop is wound
+        // down. Drainers share buildAndConnect's endpoint walk and
+        // hostTracker state with the foreground (never its observable
+        // connection state or event stream), but their
+        // connect gate is their own stop flag — NOT the foreground
+        // loop's liveness — so the pool's graceful-drain window below
+        // still lets in-flight drainers finish (including reconnects)
+        // even though cursorSendLoop is already stopped.
+        if (drainerPool != null) {
+            try {
+                drainerPool.close();
+            } catch (Throwable e) {
+                LOG.error("Error closing drainer pool: {}", String.valueOf(e));
+                terminalError = captureCloseError(terminalError, e);
+            }
+        }
+
+        // Always free resources the I/O thread never touches:
+        // encoder and table buffers are user-thread-only.
+        try {
+            encoder.close();
+            ObjList<CharSequence> keys = tableBuffers.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence key = keys.getQuick(i);
+                if (key != null) {
+                    Misc.free(tableBuffers.get(key));
+                }
+            }
+            tableBuffers.clear();
+        } catch (Throwable t) {
+            LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
+            terminalError = captureCloseError(terminalError, t);
+        }
+
+        if (!ioThreadStopped) {
+            // The worker may still touch every resource below. Hand the
+            // complete sender-owned tail to its exit path rather than
+            // permanently leaking everything except the engine. The
+            // callback is idempotence-gated by closeRemainingResources().
+            if (ownsCursorEngine && cursorEngine != null) {
+                retainedEngine = cursorEngine;
+            }
+            Runnable closeCallback = () -> closeRemainingResources(null);
+            if (cursorSendLoop != null && cursorSendLoop.delegateClose(closeCallback)) {
+                rethrowTerminal(terminalError);
+                return;
+            }
+            // The worker exited between close() failing and delegation.
+            // Cleanup is safe here and its failures remain suppressed on
+            // the original close error.
+            terminalError = closeRemainingResources(terminalError);
+        } else {
+            terminalError = closeRemainingResources(terminalError);
+        }
+
+        // If close() ended up holding the same instance the user already
+        // caught earlier, suppress the rethrow. The user's catch block
+        // wraps close() (try-with-resources), and Throwable refuses
+        // self-suppression.
+        if (terminalError != null && terminalError == alreadyOwnedByUser) {
+            terminalError = null;
+        }
+        rethrowTerminal(terminalError);
     }
 
     @TestOnly
