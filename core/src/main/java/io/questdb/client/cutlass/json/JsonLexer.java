@@ -290,6 +290,27 @@ public class JsonLexer implements Mutable, Closeable {
         }
     }
 
+    /**
+     * Overwrites the decode buffers, so a secret this lexer parsed is no longer legible through them.
+     * <p>
+     * Every name and value the lexer emits is assembled in {@link #sink} first, and an escaped one is
+     * then resolved into {@link #unescapeSink}; a listener that copies the value out leaves the lexer's
+     * own copy behind. {@link #clear()} does not help - it rewinds the parse state and never touches
+     * either sink, and {@link StringSink#clear()} would only rewind the write position anyway, leaving
+     * a long secret legible in the tail past a shorter later write. {@link #close()} frees the native
+     * cache without zeroing it, and neither sink is reachable from outside this class.
+     * <p>
+     * Callers that parse credentials should wipe rather than clear between documents - {@code
+     * OidcDeviceAuth} parses the token endpoint's response with a long-lived lexer, so its access, id
+     * and refresh tokens would otherwise stay on the heap for the life of that instance. Like
+     * {@link StringSink#wipe()} this is best effort: it reaches this lexer's own storage, not a copy a
+     * listener has already taken.
+     */
+    public void wipe() {
+        sink.wipe();
+        unescapeSink.wipe();
+    }
+
     private static boolean isNotATerminator(char c) {
         return unquotedTerminators.excludes(c);
     }

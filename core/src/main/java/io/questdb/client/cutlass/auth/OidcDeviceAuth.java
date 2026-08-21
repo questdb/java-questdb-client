@@ -2185,6 +2185,13 @@ public class OidcDeviceAuth implements QuietCloseable {
         // write position, so a long secret followed by a short write stays legible in the tail. wipe()
         // overwrites the whole backing array instead.
         //
+        // jsonLexer is in that set too, and wiping the parsers alone missed it: the lexer ASSEMBLES every
+        // name and value in its own decode sinks before a listener ever sees one, so the parsers' copies
+        // are the second copy, not the first. It is a field reused for every token response, and neither
+        // JsonLexer.clear() (parse state only) nor close() (frees the native cache without zeroing it)
+        // touches those sinks, so the whole token stayed legible on the heap for the life of this
+        // instance - through clearCache(), which is exactly when a caller expects it gone.
+        //
         // What it cannot reach: any String already handed to a caller, and the HTTP client's native receive
         // buffers, where the raw token bytes also passed. Freeing those returns the pages to the allocator
         // without zeroing them. A caller who needs more than this should not be persisting tokens in this
@@ -2197,6 +2204,12 @@ public class OidcDeviceAuth implements QuietCloseable {
         responseStatus.wipe();
         deviceAuthParser.wipe();
         tokenParser.wipe();
+        if (jsonLexer != null) {
+            // null on a second close(): the first one wiped it and then freed the field. close() is
+            // documented idempotent, so the guard keeps it so - there is nothing left to wipe by then
+            // anyway, and the object is already unreachable.
+            jsonLexer.wipe();
+        }
     }
 
     private void warnPersistence(String operation, Throwable cause) {

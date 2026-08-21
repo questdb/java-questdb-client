@@ -1140,6 +1140,68 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testClearCacheWipesTheLexerDecodeBuffers() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sibling below covers close(), which cannot see this: close() runs the same sweep and THEN
+            // does jsonLexer = Misc.free(jsonLexer), so the field is null by the time the reflective walk
+            // looks and the lexer is garbage either way. clearCache() deliberately keeps the lexer alive -
+            // the instance stays usable for a later signIn() - so whatever it still holds stays reachable
+            // from this object.
+            //
+            // What it holds is the token itself. The lexer ASSEMBLES every name and value in its own decode
+            // sinks before a listener ever sees one, so TokenResponseParser's copy is the second copy, not
+            // the first; wiping the parsers left the originals untouched. JsonLexer.clear() resets parse
+            // state only, and StringSink.clear() would just rewind the write position anyway.
+            //
+            // So a caller who called clearCache() to sign this process out still had the access, id and
+            // refresh tokens legible on the heap - the exact retention StringSink.wipe() was added to close.
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"device_code\":\"DEVCODE-LEXER\","
+                            + "\"user_code\":\"USERCODE-LEXER\","
+                            + "\"verification_uri\":\"https://verify.example/device\","
+                            + "\"expires_in\":300,\"interval\":1}");
+                }
+                return MockOidcServer.json(200,
+                        tokenJson("ACCESS-LEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                OidcDeviceAuth auth = newAuth(server, false, noopPrompt());
+                try {
+                    Assert.assertEquals("ACCESS-LEXER-WIPE-ME", auth.signIn());
+                    // The decode buffers really carry a secret, or clearing them below proves nothing. The
+                    // sink is reused per value, so which one survives is whichever the parse ended on plus
+                    // whatever is still legible in the tail past it - the retention itself, so assert on the
+                    // set rather than on one field's position in the response.
+                    String before = lexerBuffers(auth);
+                    boolean holdsOne = false;
+                    for (String secret : new String[]{
+                            "ACCESS-LEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME"}) {
+                        holdsOne |= before.contains(secret);
+                    }
+                    Assert.assertTrue("the lexer must hold a parsed token before the wipe, otherwise this "
+                            + "test cannot fail: " + before, holdsOne);
+
+                    auth.clearCache();
+
+                    String buffers = lexerBuffers(auth);
+                    for (String secret : new String[]{
+                            "ACCESS-LEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME"}) {
+                        Assert.assertFalse("clearCache() left \"" + secret + "\" legible in the lexer's "
+                                + "decode buffers", buffers.contains(secret));
+                    }
+                    // and nothing else on the instance kept a copy either
+                    assertHoldsNowhere(auth, "ACCESS-LEXER-WIPE-ME");
+                    assertHoldsNowhere(auth, "REFRESH-LEXER-WIPE-ME");
+                } finally {
+                    auth.close();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testCloseWipesCredentialState() throws Exception {
         assertMemoryLeak(() -> {
             // close() disables every token operation, so nothing it holds can be needed again - yet the
@@ -4144,6 +4206,30 @@ public class OidcDeviceAuthTest {
     private static String jsonUnicodeEscape(int codePoint) {
         String hex = Integer.toHexString(codePoint);
         return ((char) 92) + "u" + "0000".substring(hex.length()) + hex;
+    }
+
+    /**
+     * The whole backing array of every {@link StringSink} the instance's {@code jsonLexer} owns, past the
+     * write position too - which is where a cleared but unwiped secret survives. Targets the lexer
+     * directly rather than going through findHolderOf, which reports only the FIRST holder it meets and
+     * would name the String field instead while the token was still cached.
+     */
+    private static String lexerBuffers(OidcDeviceAuth auth) throws Exception {
+        Object lexer = readField(auth, "jsonLexer");
+        Assert.assertNotNull("clearCache() must keep the lexer alive; close() is the one that frees it",
+                lexer);
+        StringSink out = new StringSink();
+        for (Field f : lexer.getClass().getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers())) {
+                continue;
+            }
+            f.setAccessible(true);
+            Object value = f.get(lexer);
+            if (value instanceof StringSink) {
+                out.put(f.getName()).put('=').put(sinkContents((StringSink) value)).put(' ');
+            }
+        }
+        return out.toString();
     }
 
     private static OidcDeviceAuth newAuth(MockOidcServer server, boolean groupsInToken, DeviceCodePrompt prompt) {
