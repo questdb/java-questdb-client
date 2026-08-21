@@ -48,7 +48,32 @@ public interface Utf16Sink extends CharSink<Utf16Sink> {
         // lone surrogate likewise - per-unit scanning would pass both through raw. Judging the whole code
         // point (via DisplaySafe, the shared classifier) escapes them, while a normal supplementary char
         // such as an emoji is neither control nor format and is emitted verbatim.
-        for (int i = 0, n = nonPrintable.length(); i < n; ) {
+        //
+        // Classify before copying, and when nothing needs escaping hand the whole sequence to
+        // put(CharSequence) instead of walking it a character at a time. The escaping loop below appends
+        // with put(char), so an implementation like StringSink pays a capacity check per CHARACTER, where
+        // its put(CharSequence) override pays one for the whole sequence and then copies in a tight loop.
+        // That matters because the biggest input here is a server-supplied error body on a failed ILP
+        // flush, which the client does not cap - and which is almost always entirely printable, so the
+        // scan finds nothing and the copy is the bulk one. Mixed input costs this extra scan and then
+        // takes the loop as before; that is the rare case, and it is the one where correctness, not
+        // speed, is the point. Mirrors OidcDeviceAuth.sanitizeForDisplay, which returns its input
+        // untouched on the same test.
+        final int n = nonPrintable.length();
+        int firstUnsafe = -1;
+        for (int i = 0; i < n; ) {
+            final int cp = Character.codePointAt(nonPrintable, i);
+            if (!DisplaySafe.isDisplaySafe(cp)) {
+                firstUnsafe = i;
+                break;
+            }
+            i += Character.charCount(cp);
+        }
+        if (firstUnsafe < 0) {
+            put(nonPrintable);
+            return;
+        }
+        for (int i = 0; i < n; ) {
             final int cp = Character.codePointAt(nonPrintable, i);
             final int count = Character.charCount(cp);
             if (DisplaySafe.isDisplaySafe(cp)) {

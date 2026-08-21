@@ -85,6 +85,22 @@ public class LineSenderExceptionTest {
     }
 
     @Test
+    public void testMessage_putAsPrintableAgreesOnBothPaths() {
+        // putAsPrintable now classifies before it copies: an all-printable sequence is handed to
+        // put(CharSequence) in one go, and only a sequence carrying something unsafe is walked and escaped
+        // character by character. Two paths mean they can drift, so pin that they agree - the same text,
+        // with and without one unsafe code point in it, must differ only by that code point's escape.
+        String printable = "Could not flush buffer: table 'trades' column 'price' rejected, line 42";
+        assertEquals(printable, new LineSenderException("").putAsPrintable(printable).getMessage());
+
+        // the escaping path over the same text, with a bidi override spliced into the middle
+        int at = printable.indexOf("column");
+        String tampered = printable.substring(0, at) + (char) 0x202e + printable.substring(at);
+        assertEquals(printable.substring(0, at) + "\\u202e" + printable.substring(at),
+                new LineSenderException("").putAsPrintable(tampered).getMessage());
+    }
+
+    @Test
     public void testMessage_withErrNo() {
         LineSenderException e = new LineSenderException("message").errno(10);
         String message = e.getMessage();
