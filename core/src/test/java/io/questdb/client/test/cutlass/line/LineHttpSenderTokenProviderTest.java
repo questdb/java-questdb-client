@@ -31,6 +31,7 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.http.AbstractLineHttpSender;
 import io.questdb.client.std.str.Utf8String;
 import io.questdb.client.test.cutlass.auth.MockOidcServer;
+import io.questdb.client.test.tools.HandOffCharSequence;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -349,7 +350,7 @@ public class LineHttpSenderTokenProviderTest {
                         .address("127.0.0.1:" + server.port())
                         .protocolVersion(Sender.PROTOCOL_VERSION_V1)
                         .disableAutoFlush()
-                        .httpTokenProvider(() -> new HandOffToken(clean, spliced))
+                        .httpTokenProvider(() -> new HandOffCharSequence(clean, spliced))
                         .build()) {
                     sender.table("t").longColumn("v", 1L).atNow();
                     sender.flush();
@@ -469,46 +470,4 @@ public class LineHttpSenderTokenProviderTest {
         }
     }
 
-    /**
-     * A provider buffer that hands off its content the moment a full scan of it completes: the first
-     * traversal reads {@code clean}, and every read after that reads {@code spliced}. That is the shape of a
-     * reused zero-allocation buffer refreshed by another thread the instant the validating scan finishes -
-     * the narrowest version of the window, and the one a reader that validates and then re-reads loses.
-     */
-    private static final class HandOffToken implements CharSequence {
-        private final String spliced;
-        private CharSequence current;
-        private boolean handedOff;
-
-        HandOffToken(String clean, String spliced) {
-            this.current = clean;
-            this.spliced = spliced;
-        }
-
-        @Override
-        public char charAt(int index) {
-            final char c = current.charAt(index);
-            if (!handedOff && index == current.length() - 1) {
-                handedOff = true;
-                current = spliced;
-            }
-            return c;
-        }
-
-        @Override
-        public int length() {
-            return current.length();
-        }
-
-        @Override
-        public CharSequence subSequence(int start, int end) {
-            return current.subSequence(start, end);
-        }
-
-        @Override
-        public String toString() {
-            // what a StringBuilder-backed buffer does: materialise whatever it currently holds
-            return current.toString();
-        }
-    }
 }

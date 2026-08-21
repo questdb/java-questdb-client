@@ -29,6 +29,7 @@ import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.HandOffCharSequence;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -59,6 +60,38 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * Each test runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class WebSocketTokenProviderTest {
+
+    @Test(timeout = 30_000)
+    public void testProviderBufferMutatedDuringTheHandshakeCannotSplice() throws Exception {
+        assertMemoryLeak(() -> {
+            // Sender.buildWebSocketAuthHeader's supplier applies the same snapshot-before-validate rule as
+            // the ILP sender and the query client, and was the one of the three with no test. Without the
+            // snapshot validateToken scans the provider's live sequence and the "Bearer " concatenation
+            // materialises it again, so a buffer that changes between those two reads ships the mutated
+            // bytes - CR/LF included - into the upgrade request.
+            final String clean = "GOODTOKEN";
+            final String spliced = "abc" + (char) 0x0d + (char) 0x0a + "X-Injected: pwned";
+            AtomicInteger pulls = new AtomicInteger();
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckHandler())) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .httpTokenProvider(() -> {
+                            pulls.incrementAndGet();
+                            return new HandOffCharSequence(clean, spliced);
+                        })
+                        .build()) {
+                    Assert.assertNotNull(sender);
+                    Assert.assertEquals("the upgrade must carry the bytes that were validated, not a value "
+                                    + "swapped in after the scan",
+                            "Bearer " + clean, server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+                    Assert.assertTrue("the provider must have been queried, or this test passes for the "
+                            + "wrong reason", pulls.get() >= 1);
+                }
+            }
+        });
+    }
 
     @Test
     public void testCredentialKindTaggedForTheOrphanDrainerTerminalPolicy() throws Exception {

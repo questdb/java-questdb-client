@@ -34,6 +34,7 @@ import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.test.cutlass.auth.MockOidcServer;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.HandOffCharSequence;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -79,6 +80,34 @@ public class QwpQueryClientTokenProviderTest {
         public void onError(byte status, String message) {
         }
     };
+
+    @Test
+    public void testProviderBufferMutatedDuringResolveCannotSplice() throws Exception {
+        assertMemoryLeak(() -> {
+            // resolveAuthorizationHeader snapshots the pulled value before validating it, so the bytes that
+            // are checked are the bytes that are sent. Without the snapshot validateToken scans the
+            // provider's live sequence and the "Bearer " concatenation then materialises it a second time -
+            // two reads of a buffer HttpTokenProvider explicitly invites a provider to reuse. A mutation
+            // landing between them passes the check and splices CR/LF into the upgrade header.
+            //
+            // The ILP sender's copy of this rule is pinned by
+            // LineHttpSenderTokenProviderTest.testTokenMutatedBetweenValidationAndTheHeaderCannotSplice;
+            // this is the same rule at the query client's callsite, which had no test.
+            final String clean = "GOODTOKEN";
+            final String spliced = "abc" + (char) 0x0d + (char) 0x0a + "X-Injected: pwned";
+            AtomicInteger pulls = new AtomicInteger();
+            try (QwpQueryClient c = QwpQueryClient.newPlainText("localhost", 9000)
+                    .withBearerTokenProvider(() -> {
+                        pulls.incrementAndGet();
+                        return new HandOffCharSequence(clean, spliced);
+                    })) {
+                Assert.assertEquals("the header must carry the bytes that were validated, not a value "
+                        + "swapped in after the scan", "Bearer " + clean, c.getAuthorizationHeaderForTest());
+                Assert.assertEquals("the provider must have been queried, or this test passes for the "
+                        + "wrong reason", 1, pulls.get());
+            }
+        });
+    }
 
     @Test
     public void testOidcProviderFailureIsWrappedAsLineSenderException() throws Exception {
