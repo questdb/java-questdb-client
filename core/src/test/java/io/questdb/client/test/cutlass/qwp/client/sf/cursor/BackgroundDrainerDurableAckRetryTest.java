@@ -542,6 +542,59 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test(timeout = 60_000)
+    public void testFlappingCapabilityGapEscalatesAcrossMidDrainRecycles() throws Exception {
+        assertMemoryLeak(() -> {
+            // The capability-gap half of the counters-as-fields fix, which nothing else pins. Every other
+            // capability-gap test drives ONE connectWithDurableAckRetry() call whose factory rejects
+            // continuously, so the settle budget is spent inside that single call and the field-vs-local
+            // distinction never shows. Reverting capabilityGapAttempts to a method local leaves all of
+            // them green.
+            //
+            // The shape that needs a field is a cluster that flaps: connect accepted, drain, mid-drain
+            // durable-ack terminal, run() re-enters connectWithDurableAckRetry(), repeat. One gap sweep
+            // per call refills a local budget on every recycle, so 16 consecutive sweeps never accumulate
+            // and the slot is never quarantined - the drainer sweeps forever holding the slot lock and one
+            // of max_background_drainers workers.
+            //
+            // Only the ATTEMPT counter can escalate here, which is what makes this discriminating: the
+            // wall-clock half (capabilityGapElapsedNanos, lastCapabilityGapNanos) is deliberately per-call,
+            // and with a single gap per call lastCapabilityGapNanos is still 0 when it is charged, so the
+            // episode clock stays at zero however many recycles run.
+            final AtomicInteger calls = new AtomicInteger();
+            CursorWebSocketSendLoop.ReconnectFactory flapping = new CursorWebSocketSendLoop.ReconnectFactory() {
+                @Override
+                public WebSocketClient reconnect() {
+                    // one capability gap, then let the connect through - the recycle-forever shape
+                    if (calls.incrementAndGet() % 2 == 1) {
+                        throw new QwpDurableAckMismatchException("h", 1234, "primary");
+                    }
+                    return stubClient();
+                }
+            };
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    flapping, Long.MAX_VALUE, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+
+            WebSocketClient out = null;
+            int recycles = 0;
+            for (; recycles < 40; recycles++) {
+                out = drainer.connectWithDurableAckRetry();
+                if (out == null) {
+                    break;
+                }
+                Os.sleep(2); // stand in for the drain between two mid-drain terminals
+            }
+
+            assertNull("a flapping capability gap must reach the escalation instead of recycling forever",
+                    out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertTrue("it must spend the whole settle budget, not escalate at the first recycle "
+                            + "[recycles=" + recycles + "]",
+                    recycles >= BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS - 1);
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testFlappingCredentialEscalatesAcrossMidDrainRecycles() throws Exception {
         assertMemoryLeak(() -> {
             // run() re-enters connectWithDurableAckRetry() after every mid-drain terminal. While the
