@@ -54,7 +54,9 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -997,6 +999,48 @@ public class FileTokenStoreTest {
                     "openid", "api://billing", true);
             Assert.assertEquals("5193f668130b28cd9430f5271011f1044b3b1c1e78bfc4f45d7688a3d9b1ceb0", groups.hash());
             Assert.assertNotEquals(withAudience.hash(), groups.hash());
+        });
+    }
+
+    @Test
+    public void testKeyIsUsableAsAMapKey() throws Exception {
+        assertMemoryLeak(() -> {
+            // TokenStore's contract says entries are keyed by TokenStoreKey, and its javadoc invites a
+            // custom store backed by a keychain or a vault. Without value equality that reads as an
+            // invitation to a Map that never hits: OidcDeviceAuth builds its key once per instance, so a
+            // Map-backed store looks correct until a second instance - or a restart - rebuilds an equal key,
+            // misses, and sends the user back through the device flow on every refresh. The bundled
+            // FileTokenStore is unaffected only because it keys by hash() for the file name.
+            TokenStoreKey a = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid groups", "api://billing", true);
+            TokenStoreKey sameIdentity = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid groups", "api://billing", true);
+            TokenStoreKey otherClient = new TokenStoreKey("other", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid groups", "api://billing", true);
+
+            Assert.assertEquals("two keys naming one identity must be equal", a, sameIdentity);
+            Assert.assertEquals("equal keys must share a hashCode", a.hashCode(), sameIdentity.hashCode());
+            Assert.assertNotEquals("a different client id is a different identity", a, otherClient);
+            Assert.assertNotEquals(a, null);
+            Assert.assertNotEquals(a, "not a key");
+
+            Map<TokenStoreKey, String> byKey = new HashMap<>();
+            byKey.put(a, "entry");
+            Assert.assertEquals("a rebuilt key must find the entry the original stored", "entry",
+                    byKey.get(sameIdentity));
+            Assert.assertNull("a different identity must not read another's entry", byKey.get(otherClient));
+            byKey.put(sameIdentity, "replaced");
+            Assert.assertEquals("an equal key must replace, not duplicate", 1, byKey.size());
+
+            // equality means "the same store entry", so it follows the constructor's null/empty audience
+            // normalisation rather than the raw arguments - the two below share one file, and now one
+            // Map slot too
+            TokenStoreKey emptyAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", "", false);
+            TokenStoreKey nullAud = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid", null, false);
+            Assert.assertEquals("keys addressing one entry must be equal", emptyAud, nullAud);
+            Assert.assertEquals(emptyAud.hashCode(), nullAud.hashCode());
         });
     }
 

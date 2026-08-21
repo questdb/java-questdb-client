@@ -35,6 +35,11 @@ package io.questdb.client.cutlass.auth;
  * <p>
  * Entries are keyed by {@link TokenStoreKey} (the non-secret identity: endpoints, client id, scope,
  * audience, groups-in-token mode), so a token minted for one identity is never returned for another.
+ * {@code TokenStoreKey} is a value type - it implements {@code equals}/{@code hashCode} over that
+ * identity - so an implementation may hold its entries in a {@code Map} keyed by it directly. A store
+ * that needs a stable name instead (a file, a keychain entry, a row id) should use
+ * {@link TokenStoreKey#hash()}, which is the same identity as an opaque hex string and is stable across
+ * processes and across QuestDB's client implementations in other languages.
  * Calls are made while {@code OidcDeviceAuth} holds its own instance lock, so an implementation does not
  * need to be thread-safe against concurrent calls from one {@code OidcDeviceAuth} instance; it does,
  * however, share its backing storage with other processes (and other language clients), so it must keep a

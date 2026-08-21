@@ -88,6 +88,30 @@ public final class TokenStoreKey {
         this.hash = computeHash(clientId, tokenEndpoint, deviceAuthorizationEndpoint, scope, this.audience, groupsInToken);
     }
 
+    /**
+     * Value equality over the identity this key names, so a {@link TokenStore} may hold its entries in a
+     * {@code Map} keyed by this type - which the {@link TokenStore} contract ("entries are keyed by
+     * {@link TokenStoreKey}") invites, and which identity equality would silently defeat: {@code
+     * OidcDeviceAuth} builds its key once per instance, so a Map-backed store appears to work until a
+     * second instance or a restart rebuilds an equal key and misses, sending the user back through the
+     * device flow on every refresh.
+     * <p>
+     * Compares {@link #hash()} rather than the fields one by one, so equality means exactly "the same
+     * store entry": the hash folds every identity field through the same null-vs-empty normalization the
+     * constructor applies, so two keys that address one entry are equal here even when their raw
+     * arguments differed in that respect.
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof TokenStoreKey)) {
+            return false;
+        }
+        return hash.equals(((TokenStoreKey) o).hash);
+    }
+
     public String getAudience() {
         return audience;
     }
@@ -114,6 +138,15 @@ public final class TokenStoreKey {
      */
     public String hash() {
         return hash;
+    }
+
+    /**
+     * Consistent with {@link #equals(Object)}: both derive from {@link #hash()}, which is a pure function
+     * of the identity fields.
+     */
+    @Override
+    public int hashCode() {
+        return hash.hashCode();
     }
 
     public boolean isGroupsInToken() {
