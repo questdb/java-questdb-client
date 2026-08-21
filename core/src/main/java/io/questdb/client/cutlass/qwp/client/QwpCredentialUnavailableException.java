@@ -42,10 +42,22 @@ import io.questdb.client.cutlass.line.LineSenderException;
  * fails fast, because a connectivity error is the caller's to see during initialization,
  * not after the drainer is running.
  * <p>
- * This is an internal marker that carries the provider's own exception: it exists so
- * the send loop can tell "the provider failed" apart from "the network failed". A
- * foreground connect unwraps it via {@link #providerFailure()} and rethrows the
- * provider's exception, so {@code build()} surfaces the provider's error directly.
+ * It exists so the send loop can tell "the provider failed" apart from "the network
+ * failed", and it carries the provider's own exception so a handler can surface that
+ * instead of this wrapper.
+ * <p>
+ * <b>Where a caller can meet it.</b> Not from the ordinary sender API: no path out of
+ * {@code build()}, {@code flush()} or any row call delivers this type. The foreground
+ * connects - SYNC in {@code CursorWebSocketSendLoop.connectWithRetry}, and the OFF-mode
+ * connect in {@code QwpWebSocketSender} - both catch it and rethrow
+ * {@link #providerFailure()}, so a token-provider failure reaches the caller as the
+ * provider's own exception; the running background drainer catches it and retries under
+ * the invariant above. It is public because both of those packages handle it, and
+ * because {@code QwpWebSocketSender.newReconnectFactory()} is public: a caller that
+ * drives {@code ReconnectFactory.reconnect()} itself runs the endpoint walk directly and
+ * so can receive this type unwrapped. Such a caller should treat it as the provider
+ * having failed rather than the cluster, and unwrap it with {@link #providerFailure()}
+ * the way the two foreground paths do.
  */
 public class QwpCredentialUnavailableException extends LineSenderException {
     private final RuntimeException providerFailure;
@@ -59,7 +71,8 @@ public class QwpCredentialUnavailableException extends LineSenderException {
 
     /**
      * The exception the token provider threw, for a caller that must surface the
-     * provider's own error instead of this marker.
+     * provider's own error rather than this wrapper. Never null: the wrapper is only
+     * ever constructed around a provider failure.
      */
     public RuntimeException providerFailure() {
         return providerFailure;
