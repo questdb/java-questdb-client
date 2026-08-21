@@ -33,6 +33,7 @@ import io.questdb.client.network.EpollFacadeImpl;
 import io.questdb.client.network.KqueueFacade;
 import io.questdb.client.network.KqueueFacadeImpl;
 import io.questdb.client.network.NetworkFacade;
+import io.questdb.client.network.SelectFacade;
 import io.questdb.client.std.Os;
 import org.junit.Assert;
 import org.junit.Assume;
@@ -142,16 +143,41 @@ public class HttpClientConstructorLeakTest {
     }
 
     @Test
+    public void testSelectFacadeFailureLeaksNothingIncludingTheFdSet() throws Exception {
+        Assume.assumeTrue("select/FDSet is the Windows poller", Os.type == Os.WINDOWS);
+        // The OTHER arm of the Windows guard, and the one the sibling above cannot reach: here FDSet is
+        // constructed successfully and the throw lands on the next statement, so the guard has to free the
+        // FDSet as well as everything the base constructor took. getSelectFacade() is a caller-supplied
+        // extension point evaluated inside the try for exactly this reason, and until now nothing drove it.
+        // Deterministic, with no arithmetic to rot.
+        assertMemoryLeak(() -> assertConstructionFailureLeaksNothing(new DefaultHttpClientConfiguration() {
+            @Override
+            public SelectFacade getSelectFacade() {
+                throw new IllegalStateException("injected select facade failure");
+            }
+        }));
+    }
+
+    @Test
     public void testSelectFdSetFailureLeaksNothing() throws Exception {
         Assume.assumeTrue("select/FDSet is the Windows poller", Os.type == Os.WINDOWS);
         // FDSet reaches no facade, so the injection is its size instead: the constructor computes
-        // ARRAY_OFFSET + 8 * capacity in int arithmetic, which a large capacity overflows negative, and
-        // allocateMemory rejects a negative size. An allocation that simply fails is exactly the shape a
-        // real one takes under memory pressure.
+        // ARRAY_OFFSET + 8 * capacity in INT arithmetic, and a capacity that overflows it negative makes
+        // allocateMemory reject the size. An allocation that simply fails is the shape a real one takes
+        // under memory pressure, and FDSet throwing rather than the statement after it is what exercises
+        // the guard's null-tolerant Misc.free(fdSet).
+        //
+        // The capacity has to overflow to a LARGE negative, not merely a negative. Integer.MAX_VALUE - the
+        // obvious choice, and what this used - makes 8 * capacity exactly -8, so the size works out to
+        // ARRAY_OFFSET - 8: negative only where ARRAY_OFFSET is 0 or 4. On Windows fd_set is
+        // { u_int fd_count; SOCKET fd_array[]; } with an 8-byte SOCKET, so arrayOffset() reports 8, the
+        // size lands on exactly 0, and allocateMemory(0) succeeds and hands back a null pointer instead of
+        // failing - construction completed and the test asserted nothing. 1 << 28 makes 8 * capacity
+        // overflow to exactly Integer.MIN_VALUE, so the size is negative whatever arrayOffset() reports.
         assertMemoryLeak(() -> assertConstructionFailureLeaksNothing(new DefaultHttpClientConfiguration() {
             @Override
             public int getWaitQueueCapacity() {
-                return Integer.MAX_VALUE;
+                return 1 << 28;
             }
         }));
     }
