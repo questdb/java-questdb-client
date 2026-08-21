@@ -2305,16 +2305,20 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getToken)}.
          * <br>
          * Over HTTP the provider is not called at build time: the first call happens when the first row is
-         * started, then once per flush. Over WebSocket the initial connection handshake runs during
-         * {@code build()} and queries the provider once for it, then again once per reconnect handshake - so a
-         * refreshed token is presented each time the link is (re)established; an already-established WebSocket
-         * is not re-authenticated mid-stream. The two transports differ in mechanism but both keep the producer
-         * alive across a sustained token outage: over HTTP a failed pull leaves the request token-pending and is
-         * retried on the next row; over WebSocket the token must be obtainable when {@code build()} runs (the
-         * initial handshake fails fast otherwise), after which a pull that keeps failing on later reconnects is
-         * retried indefinitely, with the buffered rows held in store-and-forward, until a token is available
-         * again. A token outage does not terminate a running WebSocket sender, just as a persistent transport
-         * reconnect failure does not (store-and-forward Invariant B).
+         * started, then once per flush. Over WebSocket it depends on whether the initial connect is eager.
+         * With an EAGER initial connect (the default, and any {@code initial_connect_retry} other than
+         * {@code async}) the handshake runs during {@code build()} and queries the provider once for it;
+         * under {@code lazy_connect=true} - or {@code initial_connect_retry=async} - the ingest side connects
+         * asynchronously, so {@code build()} pulls nothing and a provider failure surfaces through the error
+         * inbox rather than from {@code build()}. Either way the provider is queried again once per reconnect
+         * handshake, so a refreshed token is presented each time the link is (re)established; an
+         * already-established WebSocket is not re-authenticated mid-stream. The two transports differ in
+         * mechanism but both keep the producer alive across a sustained token outage: over HTTP a failed pull
+         * leaves the request token-pending and is retried on the next row; over WebSocket an EAGER initial
+         * handshake fails fast when no token can be obtained, after which a pull that keeps failing on later
+         * reconnects is retried indefinitely, with the buffered rows held in store-and-forward, until a token
+         * is available again. A token outage does not terminate a running WebSocket sender, just as a
+         * persistent transport reconnect failure does not (store-and-forward Invariant B).
          * <br>
          * Over HTTP the token is pulled once per request and written into the request buffer ahead of the
          * buffered rows, so a token refresh is picked up on the next new batch after a successful flush. A
@@ -2324,9 +2328,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * and rebuild the sender) so the next request pulls a fresh token.
          * <br>
          * A lazily-signing-in provider can therefore be wired before the interactive sign-in completes over HTTP,
-         * where the first pull is deferred to the first row; over WebSocket a token must already be obtainable
-         * when {@code build()} runs, since the initial handshake pulls it - otherwise that {@code build()} (or,
-         * over HTTP, the first row) fails. Running on the send/flush and reconnect paths, the provider must
+         * where the first pull is deferred to the first row, and over WebSocket under {@code lazy_connect=true}
+         * (or {@code initial_connect_retry=async}), where nothing is pulled at build time either. What does
+         * require a token up front is an EAGER WebSocket connect: its initial handshake pulls one during
+         * {@code build()}, so that {@code build()} (or, over HTTP, the first row) fails when none can be
+         * obtained. Running on the send/flush and reconnect paths, the provider must
          * return promptly and must not block on interactive input (see {@link HttpTokenProvider}). Supported
          * over HTTP and WebSocket transport, and mutually exclusive with {@link #httpToken(String)} and
          * {@link #httpUsernamePassword(String, String)}.
