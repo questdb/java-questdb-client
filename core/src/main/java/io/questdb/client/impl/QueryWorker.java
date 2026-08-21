@@ -206,6 +206,10 @@ public final class QueryWorker {
     }
 
     void shutdown() {
+        // Take the caller's cancellation out of the way for the whole teardown and hand it back at the
+        // end. Every join below would otherwise throw on arrival rather than on a real timeout; see the
+        // join site and QwpQueryClient.close() for what that costs.
+        boolean callerWasInterrupted = Thread.interrupted();
         shuttingDown = true;
         signalLock.lock();
         try {
@@ -236,9 +240,15 @@ public final class QueryWorker {
                 // the worker thread and the client's native socket/buffers.
             }
             try {
+                // Interrupt-neutral for the same reason QwpQueryClient.close() is: reapIdle() reaches
+                // here on the housekeeper thread, which PoolHousekeeper.stop() may have interrupted to
+                // break a credential pull. A carried flag makes this join throw instantly without ever
+                // checking whether the dispatch thread exited, so client.close() below would run
+                // alongside a still-live dispatch thread. Restored by the caller-flag handling in
+                // shutdown()'s outer finally.
                 thread.join(SHUTDOWN_JOIN_MILLIS);
             } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                callerWasInterrupted = true;
             }
         } finally {
             // close() must run even if cancel()/join() threw, otherwise the
@@ -248,6 +258,9 @@ public final class QueryWorker {
             try {
                 client.close();
             } catch (Throwable ignored) {
+            }
+            if (callerWasInterrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }

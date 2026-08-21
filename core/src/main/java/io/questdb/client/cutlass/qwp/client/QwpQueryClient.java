@@ -652,6 +652,26 @@ public class QwpQueryClient implements QuietCloseable {
         }
         connected = false;
         lastCloseTimedOut = false;
+        // Teardown must not be cancellable by a flag the CALLER merely arrived with. Thread.join(long)
+        // throws InterruptedException the instant the calling thread's flag is set, WITHOUT ever looking
+        // at whether the I/O thread has exited -- so a carried flag turns the join below into an
+        // immediate throw and takes the "could not join" return, skipping closePool() and
+        // webSocketClient.close(). Those are the only frees for sendScratch, the decoder and the
+        // batch-buffer pool, and there is no second attempt to preserve them for: closedFlag was CAS'd
+        // on entry, so every later close() returns at the guard above, and a pooled worker has already
+        // been removed from QueryClientPool.all by reapIdle() before shutdown() gets here, so the pool's
+        // own close() never sees it either. The leak is permanent and silent.
+        //
+        // This is not hypothetical: PoolHousekeeper.stop() interrupts the housekeeper thread to break a
+        // recovery build's credential pull, and that same thread runs queryPool.reapIdle() straight
+        // afterwards with the flag still set.
+        //
+        // Clear it for the duration and restore it in the finally -- the interrupt-neutral shape
+        // FileTokenStore.load()/save() already use, and bounded by shutdownJoinMs. The timeout branch
+        // below is unaffected: with the flag cleared the join really waits, so a genuinely stuck I/O
+        // thread still takes the leak-rather-than-SIGSEGV path, and an interrupt delivered DURING the
+        // wait still means "we could not join" and still returns.
+        final boolean wasInterrupted = Thread.interrupted();
         try {
             if (ioThread != null) {
                 ioThread.shutdown();
@@ -700,6 +720,11 @@ public class QwpQueryClient implements QuietCloseable {
             // (submitQuery copies its bytes into sendScratch), so it is safe to free
             // even when we otherwise leak the I/O thread and buffer pool.
             bindValues.close();
+            if (wasInterrupted) {
+                // Hand the caller's cancellation back exactly as it arrived. Restoring it here rather
+                // than earlier keeps it out of the joins above, which is the whole point.
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
