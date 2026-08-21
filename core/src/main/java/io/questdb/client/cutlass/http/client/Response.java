@@ -29,9 +29,27 @@ package io.questdb.client.cutlass.http.client;
  */
 public interface Response {
     /**
-     * Receives the next fragment of response data using the default timeout.
+     * Receives the next fragment of response data, bounded by this response's default timeout - the
+     * {@link io.questdb.client.HttpClientConfiguration#getTimeout()} of the client that produced it.
+     * <p>
+     * The bound {@link #recv(int)} describes applies here too, because the implementations in this library
+     * implement this method as {@code recv(defaultTimeout)}: it caps the WHOLE call rather than each socket
+     * read, so a server dribbling the body cannot keep one call running past it. Every configuration this
+     * library builds supplies a positive timeout - {@code request_timeout} is rejected below 1 on both the
+     * builder and the configuration-string paths - so the bound is live unless a caller supplies its own
+     * {@code HttpClientConfiguration} returning a non-positive value, which disables it.
+     * <p>
+     * Size that timeout against a SINGLE fragment read rather than the whole body: each call starts its own
+     * budget, so a large body spread over many calls is unaffected, and only one call that cannot complete
+     * within the timeout aborts.
+     * <p>
+     * Note the two methods delegate in OPPOSITE directions, which is what decides whether the bound exists
+     * at all. The {@link #recv(int)} default defers down to this method and discards its argument; the
+     * implementations here do the reverse. So an implementation overriding only this method is unbounded on
+     * both, while one extending {@code AbstractResponse} or {@code AbstractChunkedResponse} is bounded on
+     * both.
      *
-     * @return the received fragment
+     * @return the received fragment, or null once the body has been fully read
      */
     Fragment recv();
 
