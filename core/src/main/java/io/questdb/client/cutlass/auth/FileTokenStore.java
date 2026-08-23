@@ -1339,22 +1339,38 @@ public final class FileTokenStore implements TokenStore {
         }
         // We captured a live lock a peer recreated in the gap (or could not re-read what we captured): put it
         // back rather than steal it.
-        //
-        // Restore by hard-LINKING our capture back to the lock path, not by renaming it. Files.move without
-        // REPLACE_EXISTING looks atomic but is not: it stats the target, then renames, and rename(2) silently
-        // replaces. A third party that claims the freed path between those two steps therefore had its live
-        // lock destroyed by the very call whose comment promised to leave it intact. link(2) has no such gap -
-        // it fails outright when the target exists - and it preserves the peer's exact bytes, which matters
-        // because releaseLock verifies the stamp before deleting.
-        //
-        // A residual remains and is not closeable with a lock file: if a third party did claim the path, we
-        // drop our copy, so the recreating peer's lock file is gone while that peer still believes it holds
-        // the lock, and for that one refresh two holders can run concurrently. A filesystem offers no atomic
-        // "delete or rename only if the content is still X", so the capture-verify narrows the window to this
-        // multi-actor race - our steal, a peer recreating, AND a third party claiming the freed path, all
-        // overlapping - without eliminating it. Best-effort by design: it degrades to one extra refresh, a
-        // re-prompt on a rotating-refresh-token identity provider, never a torn or forged credential
-        // (Layer 1's atomic rename still holds).
+        restoreCapturedLock(lock, captured);
+    }
+
+    /**
+     * Puts a captured lock back at {@code lock} after the capture-verify decided it is NOT the abandoned lock
+     * we judged stale - a peer recreated it in the gap, or we could not re-read what we captured.
+     * <p>
+     * Restores by hard-LINKING the capture back to the lock path, not by renaming it. {@code Files.move}
+     * without {@code REPLACE_EXISTING} looks atomic but is not: it stats the target, then renames, and
+     * {@code rename(2)} silently replaces. A third party that claims the freed path between those two steps
+     * therefore had its live lock destroyed by the very call whose comment promised to leave it intact.
+     * {@code link(2)} has no such gap - it fails outright when the target exists - and it preserves the peer's
+     * exact bytes, which matters because {@link #releaseLock} verifies the stamp before deleting.
+     * <p>
+     * A residual remains and is not closeable with a lock file: if a third party did claim the path, we drop
+     * our copy, so the recreating peer's lock file is gone while that peer still believes it holds the lock,
+     * and for that one refresh two holders can run concurrently. A filesystem offers no atomic "delete or
+     * rename only if the content is still X", so the capture-verify narrows the window to this multi-actor
+     * race - our steal, a peer recreating, AND a third party claiming the freed path, all overlapping -
+     * without eliminating it. Best-effort by design: it degrades to one extra refresh, a re-prompt on a
+     * rotating-refresh-token identity provider, never a torn or forged credential (Layer 1's atomic rename
+     * still holds).
+     * <p>
+     * Split out of {@link #stealIfStale} so it can be driven directly. Reaching it through {@code stealIfStale}
+     * needs a peer to replace the lock file between the staleness read and the capture rename, which no test
+     * can force without a production seam - so the whole restore path, the part that keeps a stealer from
+     * destroying a peer's live lock, otherwise ran only in production.
+     *
+     * @param lock     the lock path to restore to
+     * @param captured the private capture name the steal renamed the lock to
+     */
+    private void restoreCapturedLock(Path lock, Path captured) {
         try {
             Files.createLink(lock, captured);
             deleteCapturedLock(captured);

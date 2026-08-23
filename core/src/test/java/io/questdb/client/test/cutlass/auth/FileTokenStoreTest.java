@@ -393,6 +393,76 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testRestoreCapturedLockPutsAPeersLockBackByteForByte() throws Exception {
+        assertMemoryLeak(() -> {
+            // The arm testConcurrentStealersLeaveExactlyOneWinner cannot reach. Its three observables - no
+            // stealer threw, the lock is gone, no capture temp survives - all hold under the bare
+            // deleteIfExists(lock) that stealIfStale's own comment says must never be used, because a bare
+            // delete also removes the lock and leaves no temp. What separates the two is what happens when the
+            // capture-verify says "this is NOT the lock we judged stale": the capture must go BACK, with the
+            // peer's exact bytes, because releaseLock verifies the stamp before deleting and a peer whose
+            // stamp we corrupted can no longer release its own lock.
+            //
+            // Driving stealIfStale itself cannot get here: confirmedStale is false only when a peer replaces
+            // the file between the staleness read and the ATOMIC_MOVE, an interleaving no test can force
+            // without a production seam. So drive the restore directly.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Path captured = dir.resolve(lock.getFileName().toString() + ".capture.tmp");
+
+            byte[] peerStamp = "peer-owner-nonce-9f3c".getBytes(StandardCharsets.UTF_8);
+            Files.write(captured, peerStamp);
+
+            Method restore = FileTokenStore.class.getDeclaredMethod(
+                    "restoreCapturedLock", Path.class, Path.class);
+            restore.setAccessible(true);
+            restore.invoke(new FileTokenStore(dir, 30_000, 60_000), lock, captured);
+
+            Assert.assertTrue("the peer's lock must be back at the lock path", Files.exists(lock));
+            Assert.assertArrayEquals("the peer's owner stamp must survive byte for byte, or releaseLock's "
+                            + "own-stamp check will refuse to let that peer release its own lock",
+                    peerStamp, Files.readAllBytes(lock));
+            Assert.assertFalse("the capture copy must not be left behind", Files.exists(captured));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
+    public void testRestoreCapturedLockLeavesAThirdPartysLockUntouched() throws Exception {
+        assertMemoryLeak(() -> {
+            // The reason the restore links rather than renames. Files.move without REPLACE_EXISTING stats the
+            // target and then renames, and rename(2) replaces silently - so a third party that claimed the
+            // freed path between those two steps would have its live lock destroyed by the very call whose
+            // comment promises to leave it intact. createLink fails outright instead. Here the third party has
+            // already claimed the path when the restore runs, which is the deterministic end of that race and
+            // needs no interleaving to reproduce.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Path captured = dir.resolve(lock.getFileName().toString() + ".capture.tmp");
+
+            byte[] thirdPartyStamp = "third-party-live-nonce".getBytes(StandardCharsets.UTF_8);
+            Files.write(lock, thirdPartyStamp);
+            Files.write(captured, "our-captured-copy".getBytes(StandardCharsets.UTF_8));
+
+            Method restore = FileTokenStore.class.getDeclaredMethod(
+                    "restoreCapturedLock", Path.class, Path.class);
+            restore.setAccessible(true);
+            restore.invoke(new FileTokenStore(dir, 30_000, 60_000), lock, captured);
+
+            Assert.assertArrayEquals("a third party's LIVE lock must survive the restore untouched - "
+                            + "overwriting it admits two holders at once",
+                    thirdPartyStamp, Files.readAllBytes(lock));
+            Assert.assertFalse("our capture copy must be dropped, not left to accumulate",
+                    Files.exists(captured));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
     public void testProcessLocksDoNotGrowWithTheIdentityCount() throws Exception {
         assertMemoryLeak(() -> {
             // TokenStoreKey is public and inLock() is public API, so a process mints as many identities as its
