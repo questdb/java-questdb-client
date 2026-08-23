@@ -95,6 +95,7 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         return dataAddr;
     }
 
+    @Override
     public Fragment recv(int timeout) {
         // A positive timeout bounds the whole call, not each socket read. This loop re-reads while a
         // chunk-size line (or the chunk-data-end CRLF) is incomplete, so without one shared deadline a server
