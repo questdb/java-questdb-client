@@ -199,6 +199,71 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
     }
 
     @Test
+    public void testConnectingWithoutDeliveringDoesNotGrantAFreshSettleBudget() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The negative twin of testDeliveringBetweenTwoGapWindowsGrantsAFreshSettleBudget, and the
+            // half that pins noteAckProgress()'s guard rather than its effect. A durable ack PAST the
+            // watermark ends the episode; merely reaching a node and drawing a session must not, because
+            // a session that delivers nothing is no evidence the cluster can drain this slot. run()'s
+            // poll loop calls noteAckProgress() on every 50ms tick, so weakening `acked <= watermark` to
+            // `acked < watermark` - or dropping the guard - refills all three escalation counters twenty
+            // times a second for as long as the drain is connected. The orphan drainer then sweeps
+            // forever with no ack progress: no .failed sentinel, no DATA_LOSS report, the slot lock held
+            // and one of max_background_drainers workers pinned for the life of the process.
+            //
+            // Same shape as the delivering twin - two windows of 9, neither reaching the threshold of 16
+            // alone, 18 cumulative - with the session between them acking nothing new.
+            final int windowLength = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS - 6;
+            final int firstGapFrom = 2;
+            final int firstGapTo = firstGapFrom + windowLength - 1;          // 2..11
+            final int silentAttempt = firstGapTo + 1;                        // 12
+            final int secondGapFrom = silentAttempt + 1;                     // 13
+            final int secondGapTo = secondGapFrom + windowLength - 1;        // 22
+            assertTrue("the two windows must exceed the threshold that only consecutive sweeps may reach",
+                    2 * windowLength >= BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+            assertTrue("neither window may reach it on its own",
+                    windowLength < BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS);
+
+            seedSlot(SEEDED_FRAMES);
+            // Connection 1 acks seq 0 then drops. Connection 2 - the session between the windows - takes
+            // the first frame and closes without acking anything (-1 puts the handler's drop at seq 0), so
+            // it connects, runs, and leaves the engine's durable-ack watermark exactly where it found it.
+            // That is the state the guard has to recognise.
+            java.util.Map<Integer, Long> drops = new java.util.HashMap<>();
+            drops.put(1, 0L);
+            drops.put(2, -1L);
+            try (TestWebSocketServer server = new TestWebSocketServer(new GapScenarioHandler(drops), true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                ScriptedWireFactory factory = new ScriptedWireFactory(server.getPort(),
+                        n -> (n >= firstGapFrom && n <= firstGapTo)
+                                || (n >= secondGapFrom && n <= secondGapTo));
+                BackgroundDrainer drainer = newDrainer(factory);
+                CountingListener listener = new CountingListener();
+                drainer.setListener(listener);
+
+                runToCompletion(drainer);
+
+                assertEquals("a session that delivered nothing must not refill the settle budget, so the "
+                                + "two windows accumulate and the slot is quarantined [attempts="
+                                + factory.attempts() + ", unavailableAttempts="
+                                + listener.unavailableAttempts + "]",
+                        BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+                assertTrue("the exhausted settle budget must drop the .failed sentinel",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                assertEquals("escalation must go through the settle budget, not the generic wire-error path",
+                        1, listener.persistentFailures.get());
+                assertEquals(BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS,
+                        listener.lastPersistentTotalAttempts.get());
+                // and the count must have run ON through the silent session rather than restarting at it
+                assertTrue("the second window must continue the first, not restart it [unavailableAttempts="
+                                + listener.unavailableAttempts + "]",
+                        java.util.Collections.max(listener.unavailableAttempts) > windowLength);
+            }
+        });
+    }
+
+    @Test
     public void testMidDrainPersistentCapabilityGapExhaustsBudgetThenQuarantines() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             seedSlot(SEEDED_FRAMES);
