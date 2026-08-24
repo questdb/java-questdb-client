@@ -405,6 +405,51 @@ public class SymbolDictRecycleTest {
         });
     }
 
+    /**
+     * A live symbol set larger than the threshold must not thrash the
+     * recycle: after a swap, re-arming requires the dictionary to reach
+     * max(threshold, 2 * size-at-swap). Review round 3, finding C1.
+     */
+    @Test
+    public void testLiveSetAboveThresholdDoesNotThrash() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                // threshold=4; the live set has 6 distinct symbols
+                try (Sender sender = Sender.fromConfig(cfg(server) + "symbol_dict_reset_threshold=4;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    String[] live = {"s0", "s1", "s2", "s3", "s4", "s5"};
+                    sendLiveSet(sender, live);              // registers 6 distinct -> arms
+                    sender.table("t");                       // barrier -> recycle #1
+                    Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
+                    // Refill from the SAME live pool three times over: 6 is above
+                    // the threshold but below the doubled floor (12) -> no re-arm.
+                    for (int pass = 0; pass < 3; pass++) {
+                        sendLiveSet(sender, live);
+                        sender.table("t");
+                    }
+                    Assert.assertEquals("a bounded live set must not re-trigger the recycle",
+                            1, ws.getSymbolDictResetsPerformed());
+                    // Genuine growth past the floor DOES re-arm: 12 fresh symbols.
+                    String[] grown = new String[12];
+                    for (int i = 0; i < 12; i++) {
+                        grown[i] = "g" + i;
+                    }
+                    sendLiveSet(sender, grown);
+                    sender.table("t");
+                    Assert.assertEquals(2, ws.getSymbolDictResetsPerformed());
+                }
+            }
+        });
+    }
+
+    private void sendLiveSet(Sender sender, String[] symbols) throws Exception {
+        for (String s : symbols) {
+            sender.table("t").symbol("s", s).longColumn("v", 1L).atNow();
+        }
+        long f = sender.flushAndGetSequence();
+        Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();

@@ -448,6 +448,15 @@ public class QwpWebSocketSender implements Sender {
     // Distinct-symbol count that triggers a recycle once resetEnabled is on
     // (connect-string key symbol_dict_reset_threshold).
     private int resetThresholdSymbols = DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS;
+    // Anti-thrash floor for the automatic reset (review r3, C1). 0 until the
+    // first swap; the effective re-arm bar is max(resetThresholdSymbols,
+    // resetFloorSymbols). Each swap raises it to twice the dictionary size
+    // at that swap, so a live symbol set larger than the threshold stops
+    // re-arming after at most ~log2(liveSet/threshold) swaps, while a
+    // genuinely unbounded-cardinality producer keeps recycling: the floor is
+    // capped at half the protocol cap so it can never double into the hard
+    // stop. Never lowered -- a shrunken working set simply stops arming.
+    private int resetFloorSymbols;
     // Wall-clock time (System.nanoTime()) at which resetArmed last flipped
     // false -> true. Recorded by armIfEligible so a later task's opportunistic
     // wait can measure how long the recycle has been armed against
@@ -2170,6 +2179,11 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public int getSymbolDictResetThreshold() {
         return resetThresholdSymbols;
+    }
+
+    @TestOnly
+    public int getResetFloorSymbolsForTesting() {
+        return resetFloorSymbols;
     }
 
     @TestOnly
@@ -4764,7 +4778,8 @@ public class QwpWebSocketSender implements Sender {
      */
     private void armIfEligible() {
         boolean shouldArm = resetEnabled
-                && (globalSymbolDictionary.size() >= resetThresholdSymbols || manualResetRequested);
+                && (globalSymbolDictionary.size() >= Math.max(resetThresholdSymbols, resetFloorSymbols)
+                        || manualResetRequested);
         if (shouldArm && !resetArmed) {
             armedSinceNanos = System.nanoTime();
             starvationWaitDoneThisArm = false;
@@ -5034,6 +5049,9 @@ public class QwpWebSocketSender implements Sender {
             lastCommitBoundaryFsn = -1L;
             symbolDictEpoch++;
             symbolDictResetsPerformed++;
+            // C1 anti-thrash floor: see resetFloorSymbols.
+            resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
+                    QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
             resetArmed = false;
             manualResetRequested = false;
             // step 6: rebuild the engine on the now-empty slot
