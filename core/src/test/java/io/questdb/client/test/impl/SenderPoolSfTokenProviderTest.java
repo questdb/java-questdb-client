@@ -130,7 +130,7 @@ public class SenderPoolSfTokenProviderTest {
     @Test(timeout = 60_000)
     public void testCloseBreaksARecoveryDelegateStuckInACredentialPull() throws Exception {
         // A recovery build pulls a credential before it connects, and that pull can block far longer than
-        // close()'s join: OidcDeviceAuth.getToken() documents a wait of up to four times httpTimeoutMillis
+        // close()'s join: OidcDeviceAuth.getToken() documents a wait of up to six times httpTimeoutMillis
         // behind a peer's refresh, and FileTokenStore's in-process lock wait has no budget at all, against a
         // PoolHousekeeper.STOP_TIMEOUT_MILLIS of 2s. The stop flag reaches the recovery loop only BETWEEN
         // steps, so it cannot reach a step parked inside the pull.

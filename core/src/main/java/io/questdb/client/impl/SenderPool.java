@@ -762,7 +762,7 @@ public final class SenderPool implements AutoCloseable {
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
      * (the transport exposes no application-level connect timeout to clamp it),
      * and unlike the credential pull that a token provider adds ahead of it - a
-     * wait of up to four times httpTimeoutMillis plus a token-store lock wait -
+     * wait of up to six times httpTimeoutMillis plus a token-store lock wait -
      * it blocks in a syscall that the stop path's interrupt cannot break.
      * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly

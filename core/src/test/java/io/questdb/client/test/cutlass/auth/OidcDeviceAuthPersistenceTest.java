@@ -180,22 +180,24 @@ public class OidcDeviceAuthPersistenceTest {
         assertMemoryLeak(() -> {
             try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(200, "{}"))) {
                 Path dir = storeDir();
-                // a lock-staleness window below LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE (4) x httpTimeoutMillis would let a
+                // a lock-staleness window below LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE (6) x httpTimeoutMillis would let a
                 // peer judge a live holder's lock stale and steal it mid-refresh, reopening the rotating-refresh-
-                // token race the lock prevents; build() must reject the combination rather than ship the race
+                // token race the lock prevents; build() must reject the combination rather than ship the race.
+                // The multiple counts the TCP connect and the TLS handshake as the two separate budgets
+                // HttpClient spends on them, on top of send, await, parse and the drain.
                 try {
                     baseBuilder(server)
                             .httpTimeoutMillis(30_000)
-                            .tokenStore(new FileTokenStore(dir, 3_000, 119_999))
+                            .tokenStore(new FileTokenStore(dir, 3_000, 179_999))
                             .build();
-                    Assert.fail("a lockStaleMillis below 4x httpTimeoutMillis must be rejected");
+                    Assert.fail("a lockStaleMillis below 6x httpTimeoutMillis must be rejected");
                 } catch (OidcAuthException expected) {
                     Assert.assertTrue(expected.getMessage(), expected.getMessage().contains("lockStaleMillis"));
                 }
-                // exactly 4x httpTimeoutMillis is the boundary and builds
+                // exactly 6x httpTimeoutMillis is the boundary and builds
                 try (OidcDeviceAuth ignored = baseBuilder(server)
                         .httpTimeoutMillis(30_000)
-                        .tokenStore(new FileTokenStore(dir, 3_000, 120_000))
+                        .tokenStore(new FileTokenStore(dir, 3_000, 180_000))
                         .build()) {
                     // building at the boundary succeeds
                 }

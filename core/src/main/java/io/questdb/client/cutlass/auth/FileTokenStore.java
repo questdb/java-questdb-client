@@ -187,7 +187,7 @@ public final class FileTokenStore implements TokenStore {
     // looks: this lock is held across a whole token-endpoint round trip while the caller also holds its
     // OidcDeviceAuth instance lock, and the acquire has no budget. Two unrelated identities landing on one
     // stripe therefore do not merely "wait for each other" - one tenant's ILP flush blocks on another
-    // tenant's stalled refresh for that holder's entire worst case, which getToken() sizes at four times
+    // tenant's stalled refresh for that holder's entire worst case, which getToken() sizes at six times
     // httpTimeoutMillis plus an OS connect stall, and every other caller on the blocked instance fails
     // meanwhile. That also made OidcDeviceAuth.getToken()'s "two instances sharing ONE IDENTITY" contract
     // untrue. Per-identity entries serialize exactly the same-identity pairs the double-POST rule needs and
@@ -244,7 +244,7 @@ public final class FileTokenStore implements TokenStore {
      *                                 120s timeout cap), but establishing the connection - DNS resolution, the
      *                                 TCP connect, and the TLS handshake - is NOT bounded by httpTimeoutMillis;
      *                                 the OS bounds it instead (a black-holed connect runs to the OS TCP-connect
-     *                                 timeout, commonly ~2 minutes). Size this window above ~4x httpTimeoutMillis
+     *                                 timeout, commonly ~3 minutes). Size this window above ~6x httpTimeoutMillis
      *                                 plus a generous connection-stall allowance, or a peer can judge a live but
      *                                 connection-stalled holder stale and steal its lock mid-refresh, reopening
      *                                 the cross-process refresh race this lock exists to prevent. The store

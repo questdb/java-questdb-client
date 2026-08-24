@@ -147,13 +147,18 @@ public class OidcDeviceAuth implements QuietCloseable {
     // tokens fail to parse with "String is too long".
     private static final int JSON_LEXER_CACHE_SIZE = 1024;
     private static final int JSON_LEXER_MAX_VALUE_BYTES = 1 << 20;
-    // the I/O portion of a coordinated refresh, as a multiple of httpTimeoutMillis: the refresh under the lock
-    // runs send + await + parse, plus a body drain on a parse failure, each separately bounded by
-    // httpTimeoutMillis. The connection phase that precedes the send is bounded by httpTimeoutMillis too -
-    // httpConfig() derives the TCP connect timeout and the TLS handshake budget from it - so the only part of a
-    // hold this multiple does not account for is DNS resolution, which the OS bounds. build() requires the
-    // FileTokenStore staleness window to exceed this multiple as a floor (see build())
-    private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 4;
+    // the I/O portion of a coordinated refresh, as a multiple of httpTimeoutMillis. The refresh under the
+    // lock runs, in order: TCP connect, the TLS handshake, send, await, parse, and a body drain on a parse
+    // failure. httpConfig() derives BOTH getConnectTimeout() and getTimeout() from httpTimeoutMillis, and
+    // HttpClient spends them separately - it grants the handshake a fresh budget anchored at its own start
+    // (see the tlsHandshakeStartNanos block), rather than continuing the connect's. So the connection phase
+    // alone is worth two of these, not one, and six is the count of independently bounded phases. It was 4,
+    // which enumerated only send/await/parse/drain and left connect and TLS out; the floor it feeds was then
+    // 480s at the 120s httpTimeoutMillis cap while a hold could reach 720s, so a peer could judge a live
+    // holder's lock stale and steal it mid-refresh - exactly the race the floor exists to prevent. The only
+    // part of a hold this still does not account for is DNS resolution, which the OS bounds. build() requires
+    // the FileTokenStore staleness window to exceed this multiple as a floor (see build())
+    private static final int LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 6;
     private static final Logger LOG = LoggerFactory.getLogger(OidcDeviceAuth.class);
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
@@ -544,10 +549,11 @@ public class OidcDeviceAuth implements QuietCloseable {
      * caller should retry once the sign-in completes. It does, however, wait briefly behind another thread's
      * quick cached read or silent refresh rather than fail every concurrent caller sharing this instance on
      * each token refresh - the {@code HttpTokenProvider} contract permits that bounded wait, capped here at
-     * FOUR times {@link Builder#httpTimeoutMillis(int)} (two minutes at the 30s default), which is the
-     * holder's own worst case: a silent refresh under the lock runs a send, an await and a body parse, each
-     * separately bounded by that timeout, so a peer waiting only one would fail every concurrent caller
-     * behind a refresh that was going to succeed. Size flush backpressure against the four-times figure, not
+     * SIX times {@link Builder#httpTimeoutMillis(int)} (three minutes at the 30s default), which is the
+     * holder's own worst case: a silent refresh under the lock runs a TCP connect, a TLS handshake, a send,
+     * an await and a body parse, each separately bounded by that timeout, so a peer waiting only one would
+     * fail every concurrent caller behind a refresh that was going to succeed. Size flush backpressure
+     * against the six-times figure, not
      * against {@code httpTimeoutMillis} itself. It still fails fast the moment an interactive sign-in or
      * {@link #close()} begins meanwhile. It is not, otherwise, instantaneous - when the cached
      * token has expired it makes one synchronous refresh round-trip to the token endpoint (and, with a
@@ -710,7 +716,7 @@ public class OidcDeviceAuth implements QuietCloseable {
                 return selectToken();
             }
             // Re-check the flag, because the guard on entry only covers an interrupt the caller ARRIVED with.
-            // tryRefreshCoordinated() above is a network round trip - up to four times httpTimeoutMillis plus
+            // tryRefreshCoordinated() above is a network round trip - up to six times httpTimeoutMillis plus
             // an OS connect stall - and a cancellation landing inside it is the common case, not a narrow
             // race: it is precisely when a refresh is failing that a caller gives up. Proceeding would then
             // launch a browser and park for the device-code lifetime on a thread whose owner has already
@@ -2320,12 +2326,13 @@ public class OidcDeviceAuth implements QuietCloseable {
             // window must exceed the worst-case time a live refresh holds the lock, or a peer could steal a live
             // holder's lock mid-refresh and reopen the rotating-refresh-token race the lock prevents. Enforce the
             // bounded part of that worst case here, where both values are known: the refresh I/O under the lock is
-            // up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis. httpConfig() bounds the connection phase
-            // that precedes the send by httpTimeoutMillis too (the TCP connect and the TLS handshake; DNS
-            // resolution remains the OS's), so this floor covers the hold rather than only part of it. The default
-            // 600s window leaves ample headroom over the floor even at the 120s timeout cap; a caller raising
-            // httpTimeoutMillis should raise lockStaleMillis to keep it. A non-coordinating TokenStore is exempt -
-            // it takes no lock.
+            // up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE x httpTimeoutMillis, which counts the TCP connect and the
+            // TLS handshake as the two separate budgets HttpClient actually spends on them (DNS resolution
+            // remains the OS's), so this floor covers the hold rather than only part of it. The default 600s
+            // window leaves ample headroom at the DEFAULT 30s timeout (180s), but NOT at the 120s cap, where a
+            // hold can reach 720s: a caller raising httpTimeoutMillis must raise lockStaleMillis to match, and
+            // this rejects the combination rather than shipping the race. A non-coordinating TokenStore is
+            // exempt - it takes no lock.
             if (tokenStore instanceof FileTokenStore) {
                 long minStaleMillis = (long) LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE * httpTimeoutMillis;
                 long staleMillis = ((FileTokenStore) tokenStore).getLockStaleMillis();

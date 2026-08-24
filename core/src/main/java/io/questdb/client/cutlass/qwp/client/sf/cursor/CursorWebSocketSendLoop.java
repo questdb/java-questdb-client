@@ -3769,7 +3769,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             }
             // A credential pull is caller code, so closeTraffic() cannot reach it, yet it can block far
             // longer than close()'s shutdown budget: OidcDeviceAuth.getToken() waits up to
-            // 4 x httpTimeoutMillis (120s by default) behind a peer's silent refresh, against a 30s
+            // 6 x httpTimeoutMillis (180s by default) behind a peer's silent refresh, against a 30s
             // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS. During an IdP outage the drainer sits inside a pull for
             // most of every retry cycle, so close() lands there routinely, not just in a narrow race. An
             // interrupt is the only lever that reaches a Java-level wait; OidcDeviceAuth converts it into a

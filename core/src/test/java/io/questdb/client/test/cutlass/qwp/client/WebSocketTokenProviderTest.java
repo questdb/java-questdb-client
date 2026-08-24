@@ -360,7 +360,7 @@ public class WebSocketTokenProviderTest {
             // The reconnect walk publishes the WebSocketClient it is about to block on so close() can break it
             // (ConnectCancellation), but the credential pull that now precedes the walk is caller code owning
             // no socket, so closeTraffic() cannot reach it. A pull can outlast close()'s 30s shutdown budget -
-            // OidcDeviceAuth.getToken() waits up to 4 x httpTimeoutMillis behind a peer's silent refresh - and
+            // OidcDeviceAuth.getToken() waits up to 6 x httpTimeoutMillis behind a peer's silent refresh - and
             // during an IdP outage the drainer sits inside a pull for most of every retry cycle, so close()
             // lands there routinely. Before the fix close() burned the whole budget and then threw
             // "cursor I/O thread did not stop", delegating teardown, on what is a clean shutdown.

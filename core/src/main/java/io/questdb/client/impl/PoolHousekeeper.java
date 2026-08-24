@@ -75,7 +75,7 @@ final class PoolHousekeeper {
                 // The stop flag only reaches the loop BETWEEN steps. A step blocked inside a recovery
                 // build is unreachable by it, and since recovery builds acquired a token provider the
                 // longest such block is a credential pull: OidcDeviceAuth.getToken() documents a wait of up
-                // to four times httpTimeoutMillis behind a peer's refresh, plus a token-store lock wait,
+                // to six times httpTimeoutMillis behind a peer's refresh, plus a token-store lock wait,
                 // which together dwarf this join. Returning anyway leaves the recoverer holding its
                 // store-and-forward slot flock after close() has returned, so an immediate reopen fails
                 // with "sf slot already in use" and the detached build's engine, mmaps and I/O thread leak

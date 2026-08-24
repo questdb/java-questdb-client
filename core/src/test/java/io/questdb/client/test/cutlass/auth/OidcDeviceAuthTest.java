@@ -3184,7 +3184,7 @@ public class OidcDeviceAuthTest {
     public void testInterruptDuringTheRefreshDoesNotStartTheDeviceFlow() throws Exception {
         assertMemoryLeak(() -> {
             // signIn() guards the interrupt flag on entry, but everything after that guard is network work:
-            // the silent refresh is a round trip bounded by four times httpTimeoutMillis plus an OS connect
+            // the silent refresh is a round trip bounded by six times httpTimeoutMillis plus an OS connect
             // stall. A cancellation landing inside it is the ORDINARY case rather than a narrow race, because
             // a caller gives up precisely when a refresh is dragging - and proceeding then launches a browser
             // and parks for the device-code lifetime on a thread whose owner already asked it to stop.
