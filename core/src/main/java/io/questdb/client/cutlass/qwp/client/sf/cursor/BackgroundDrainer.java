@@ -1090,14 +1090,18 @@ public final class BackgroundDrainer implements Runnable {
                         SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");
             }
 
-            // One iteration per wire session. Re-entered ONLY when a mid-drain
-            // reconnect sweep hit a durable-ack CAPABILITY gap: that is the
-            // exact rolling-upgrade condition the settle budget in
-            // connectWithDurableAckRetry() exists for, so it must not
-            // quarantine on the first sweep the way the initial-connect path
-            // never does. The engine stays alive across sessions (it holds the
-            // slot lock; only loop + client are recycled), and target remains
-            // valid -- the slot is orphaned, nothing appends to it.
+            // One iteration per wire session. Re-entered on either of the two
+            // RECOVERABLE mid-drain terminals the recycle branch below tests
+            // for -- a durable-ack CAPABILITY gap, or a 401/403 against a
+            // ROTATING credential. Both are conditions a later sweep can clear
+            // (a rolling upgrade settling; the next pulled token being
+            // accepted), so neither may quarantine on its first sweep the way
+            // the initial-connect path never does; connectWithDurableAckRetry()
+            // owns the bounded budget for each. Every other wire error still
+            // quarantines the slot without re-entering. The engine stays alive
+            // across sessions (it holds the slot lock; only loop + client are
+            // recycled), and target remains valid -- the slot is orphaned,
+            // nothing appends to it.
             drain:
             while (!stopRequested) {
                 loop = new CursorWebSocketSendLoop(
@@ -1117,8 +1121,8 @@ public final class BackgroundDrainer implements Runnable {
                 // loop retries rather than latching -- are dispatched into a null, and
                 // the outage is announced only by a throttled slf4j WARN, which is a
                 // NOP in an app with no binding configured. The foreground sender wires
-                // the same arm (QwpWebSocketSender.buildAndConnect /
-                // startCursorSendLoop); an orphan drainer rides out the same faults and
+                // the same arm (QwpWebSocketSender.ensureConnected, where it builds the
+                // loop); an orphan drainer rides out the same faults and
                 // must be just as observable, or a revoked token reads as a disk-sizing
                 // problem once SF fills. Null when no sink is installed, which
                 // setErrorDispatcher accepts and dispatchError treats as before.
