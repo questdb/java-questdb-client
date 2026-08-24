@@ -57,6 +57,15 @@ final class BrowserLauncher {
      * {@code questdb.client.oidc.open.browser} system property is set to {@code false}. May throw a
      * {@link LinkageError} when the {@code java.desktop} module is absent from the runtime; the caller
      * treats that as "no browser available".
+     * <p>
+     * Every OTHER failure of the desktop stack is swallowed, {@link Error}s included. Initialising the AWT
+     * toolkit raises {@link java.awt.AWTError} - a bare {@code Error}, not a {@code LinkageError} and not an
+     * {@code Exception} - when {@code assistive_technologies} in {@code $JAVA_HOME/conf/accessibility.properties}
+     * (or the matching system property) names a class the runtime cannot load, which is the stock configuration
+     * on several Linux distributions, and again when a set {@code DISPLAY} points at no X server. Catching only
+     * {@code Exception} let that escape {@code signIn()} on such a host - aborting a sign-in the human could
+     * have completed from the URL already printed, and as a type the caller's documented
+     * {@code catch (OidcAuthException)} does not handle.
      */
     static void open(String url) {
         if (!isBrowserOpenEnabled()) {
@@ -73,9 +82,15 @@ final class BrowserLauncher {
                     desktop.browse(uri);
                 }
             }
-        } catch (Exception ignore) {
-            // a headless display, a missing default browser or a security restriction must never
-            // break sign-in: the verification URL and code are already shown to the user
+        } catch (LinkageError e) {
+            // The java.desktop module is absent from this runtime. Rethrow rather than swallow: the
+            // degrade belongs to DeviceCodePrompt.openBrowser(), whose catch is what
+            // DesktopFreeModulePathTest and DesktopFreeKillSwitchMain pin.
+            throw e;
+        } catch (Throwable ignore) {
+            // A headless display, a missing default browser, a security restriction or a desktop stack
+            // that cannot initialise at all must never break sign-in: the verification URL and code are
+            // already shown to the user. Throwable, not Exception - see the javadoc on AWTError.
         }
     }
 
