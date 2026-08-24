@@ -497,16 +497,29 @@ public class QwpWebSocketSender implements Sender {
     // RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS); non-final only so tests can
     // shrink it to drive the timeout branch.
     private long recycleDeferredCloseMaxWaitMillis = RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS;
-    // Set (once) by recycleForDictReset's catch block when the recycle swap
-    // itself fails in steps 2-6 -- everything was acked before the swap tore
-    // the old engine down, so no data is at risk, but this sender can no
-    // longer make progress (no cursor engine, no I/O loop) and refuses further
-    // use. checkRecycleFailure() rethrows a fresh LineSenderException wrapping
-    // this cause on every later table()/flush-family call; close() still
-    // works normally. A step-7 (reconnect) failure deliberately does NOT set
-    // this: the swap has already committed there, so the sender is coherent
-    // and merely disconnected, and the next send retries the connect.
+    // Set (once) by completeRecycleRebuild when a rebuilt engine recovered
+    // UNACKED frames from the slot the outgoing close was supposed to have
+    // emptied -- the one failure that proves the fully-drained close contract
+    // was breached, so the producer's fresh dictionary and the slot's on-disk
+    // state have provably diverged and this sender refuses further use.
+    // checkRecycleFailure() rethrows a fresh LineSenderException wrapping this
+    // cause on every later table()/flush-family call; close() still works
+    // normally. Every other recycle failure is transient and resumable (see
+    // recycleResume), never latched here.
     private Throwable recycleFailure;
+    // Resumable recycle (review r3, C2): a transient failure mid-recycle no
+    // longer latches the sender terminal. CLOSE_LOOP = step 2 failed, the
+    // old loop is still dying and the old engine/dictionary are intact.
+    // REBUILD = the old engine is closed (possibly still releasing its slot
+    // flock); await/rebuild/commit are pending. resumeRecycleIfPending()
+    // advances the state from the table() barrier and ensureConnected().
+    private RecycleResume recycleResume = RecycleResume.NONE;
+    // The closed-but-not-yet-released outgoing engine a REBUILD resume still
+    // awaits; null once its deferred close completes.
+    private CursorSendEngine recyclePendingOutgoing;
+    // Raw last-published FSN of the outgoing epoch (step-1 snapshot),
+    // consumed by the commit when a REBUILD resume completes.
+    private long recyclePendingLastPublishedFsn = -1L;
     // Test seam: recycle step-7 fault injection. When set, runs (and is
     // expected to throw) inside ensureConnected()'s loop-construction try,
     // after cursorSendLoop is assigned but before start() -- exercising the
@@ -547,7 +560,10 @@ public class QwpWebSocketSender implements Sender {
     // Lifetime-monotonic in delta mode -- it is NOT reset on reconnect, because
     // the I/O thread re-registers the full dictionary via a catch-up frame before
     // replaying, so the producer's delta baseline stays valid across the wire
-    // boundary. Used only when deltaDictEnabled; ignored in full-dict mode.
+    // boundary. It drops back to -1 only where the LOOP ITSELF is replaced and
+    // its catch-up mirror dies with it: the recycle's swap commit, and the
+    // CLOSE_LOOP resume (see resumeRecycleIfPending). Used only when
+    // deltaDictEnabled; ignored in full-dict mode.
     private int sentMaxSymbolId = -1;
     // When true, auto-flush sends messages with FLAG_DEFER_COMMIT and only
     // explicit flush() triggers the server-side commit. Enables accumulating
@@ -2082,6 +2098,16 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * The installed engine-rebuild factory, so a test can wrap the real one
+     * (e.g. fault-inject the first rebuild and delegate afterwards) instead of
+     * replacing it outright. {@code null} for a {@code connect()}-built sender.
+     */
+    @TestOnly
+    public EngineRebuildFactory getEngineRebuildFactoryForTesting() {
+        return engineRebuildFactory;
+    }
+
+    /**
      * Snapshot of the typed payload for the latched terminal server-rejection error,
      * or {@code null} if the I/O loop has not latched a server-rejection terminal
      * (initial state, or only a wire-level failure has been latched). Read-only —
@@ -3148,7 +3174,9 @@ public class QwpWebSocketSender implements Sender {
     public QwpWebSocketSender table(CharSequence tableName) {
         checkNotClosed();
         checkRecycleFailure();
-        if (resetArmed) {
+        if (recycleResume != RecycleResume.NONE) {
+            resumeRecycleIfPending();
+        } else if (resetArmed) {
             maybeRecycleForDictReset();
         }
         // Fast path: if table name matches current, skip hashmap lookup
@@ -3854,13 +3882,18 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Terminal latch for a symbol-dictionary recycle swap that failed in steps
-     * 2-6 ({@link #recycleForDictReset()}). Everything was acked before the
-     * swap tore the old engine down, so no data is at risk -- but the swap
-     * itself left this sender without a cursor engine or I/O loop, so it
-     * refuses further use. A step-7 reconnect failure is NOT latched (the swap
-     * has committed by then and the sender is coherent, just disconnected --
-     * see {@link #recycleForDictReset()}). Checked by
+     * Terminal latch for the one symbol-dictionary recycle failure that is not
+     * resumable: a rebuilt engine that recovered UNACKED frames from the slot
+     * the outgoing engine's fully-drained close was supposed to have emptied
+     * (see {@link #completeRecycleRebuild}). That proves the everything-acked
+     * barrier the swap rests on was breached, so the producer's fresh
+     * dictionary and the slot's on-disk state have diverged and this sender
+     * refuses further use. Every OTHER recycle failure -- a wedged SF worker,
+     * an interrupted producer thread, a momentary rebuild fault, a
+     * post-cleanup fsync warning, a failed step-7 reconnect -- is transient:
+     * it throws to the triggering caller, leaves the counters un-bumped and
+     * the recycle pending ({@link #recycleResume}), and the next send
+     * finishes the swap. Checked by
      * {@link #table(CharSequence)}, the flush-family
      * entry points ({@link #flush()}, {@link #flushAndGetSequence()},
      * {@link #drain(long)}, {@link #awaitAckedFsn(long, long)}), and
@@ -4193,6 +4226,7 @@ public class QwpWebSocketSender implements Sender {
 
     private void ensureConnected() {
         checkNotClosed();
+        resumeRecycleIfPending();
         if (connected) {
             return;
         }
@@ -4802,10 +4836,10 @@ public class QwpWebSocketSender implements Sender {
      * shared flock-release retry driver for the close-ran-but-release-failed
      * case, mirroring {@link #isSlotLockReleased()}'s re-probe.
      * <p>
-     * Exhausting {@link #recycleDeferredCloseMaxWaitMillis} means the worker
-     * is genuinely dead (not stalled), so throw -- the recycle's catch then
-     * latches the sender terminal. Before throwing, hand the still-locked
-     * engine to {@link #retainedEngine} so a pool re-probe
+     * Exhausting {@link #recycleDeferredCloseMaxWaitMillis} throws; the
+     * recycle stays pending ({@link RecycleResume#REBUILD}) and the next send
+     * retries the await. Before throwing, hand the still-locked engine to
+     * {@link #retainedEngine} so a pool re-probe
      * ({@link #isSlotLockReleased()}) can still recover the slot's capacity
      * if the worker ever exits.
      */
@@ -4821,14 +4855,131 @@ public class QwpWebSocketSender implements Sender {
             if (System.nanoTime() >= deadlineNanos) {
                 retainedEngine = outgoing;
                 slotLockReleased = false;
-                throw new LineSenderException("symbol dictionary recycle could not reclaim its "
-                        + "slot: the outgoing engine's deferred close did not release the slot "
-                        + "lock within " + recycleDeferredCloseMaxWaitMillis
-                        + " ms (SF worker wedged)");
+                throw new LineSenderException("symbol dictionary recycle could not yet reclaim "
+                        + "its slot: the outgoing engine's deferred close did not release the "
+                        + "slot lock within " + recycleDeferredCloseMaxWaitMillis
+                        + " ms (SF worker stalled); the recycle stays pending and is retried "
+                        + "on the next send");
             }
             outgoing.ensureFlockReleaseRetryScheduled();
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
+    }
+
+    private static void closeQuietly(CursorSendEngine engine) {
+        try {
+            engine.close();
+        } catch (Throwable ignored) {
+            // best-effort; the retained files are the next rebuild's problem
+        }
+    }
+
+    /**
+     * The recycle's tail: await the outgoing engine's (possibly deferred)
+     * close, rebuild a fresh engine on the emptied slot, and only then
+     * commit the swap -- roll the FSN base, install the fresh dictionary,
+     * advance the counters, wire the engine, reconnect. Every phase before
+     * the commit is idempotent, so both {@link #recycleForDictReset()} and a
+     * REBUILD resume run this; a transient throw leaves
+     * {@code recycleResume == REBUILD} for the next attempt. Only a rebuild
+     * that recovered UNACKED frames -- a genuine breach of the barrier's
+     * everything-acked proof -- latches {@link #recycleFailure}.
+     */
+    private void completeRecycleRebuild(int dictSizeAtSwap, long startNanos) {
+        CursorSendEngine outgoing = recyclePendingOutgoing;
+        if (outgoing != null) {
+            awaitDeferredEngineClose(outgoing); // throws transient while wedged
+            recyclePendingOutgoing = null;
+            retainedEngine = null;
+        }
+        // step 5: rebuild the engine on the now-empty slot.
+        CursorSendEngine rebuilt = rebuildEngineOrAbandon(
+                "symbol dictionary recycle could not rebuild its engine; retried on the next send");
+        if (rebuilt.wasRecoveredFromDisk()) {
+            // The outgoing close's empties-the-slot contract can miss
+            // benignly: a transiently failed segment unlink retains the ack
+            // watermark, and the SF design is that the NEXT engine on the
+            // slot recovers those segments as fully acked and retries the
+            // unlink on its own close. Heal by doing exactly that. Only a
+            // recovery holding UNACKED frames is a genuine breach: latch.
+            if (rebuilt.publishedFsn() > rebuilt.ackedFsn()) {
+                LineSenderException breach = new LineSenderException(
+                        "symbol dictionary recycle rebuilt on a slot holding unacknowledged "
+                                + "frames: the outgoing engine's fully-drained close contract "
+                                + "was breached");
+                recycleFailure = breach;
+                recycleResume = RecycleResume.NONE;
+                closeQuietly(rebuilt);
+                LOG.error("symbol dictionary recycle failed; sender is now terminal "
+                        + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, breach);
+                throw breach;
+            }
+            closeQuietly(rebuilt); // fully drained: retries the segment unlink
+            rebuilt = rebuildEngineOrAbandon(
+                    "symbol dictionary recycle could not rebuild its engine after healing "
+                            + "leftover acked segments; retried on the next send");
+            if (rebuilt.wasRecoveredFromDisk()) {
+                closeQuietly(rebuilt);
+                throw new LineSenderException(
+                        "symbol dictionary recycle keeps recovering leftover acked segments "
+                                + "(slot cleanup not durable yet); retried on the next send");
+            }
+        }
+        // COMMIT (steps 4 + 6): pure producer-side state, and nothing below
+        // can throw. Step 4 rolls the external FSN base past every FSN the
+        // outgoing epoch handed out (the -1 no-publish case adds 0); it must
+        // run with cursorSendLoop == null, which step 2 guarantees and the
+        // step-7 reconnect below only undoes afterwards.
+        rollFsnEpochBase(recyclePendingLastPublishedFsn);
+        // Replace the dictionary, don't clear().
+        globalSymbolDictionary = new GlobalSymbolDictionary();
+        sentMaxSymbolId = -1;
+        currentBatchMaxSymbolId = -1;
+        lastCommitBoundaryFsn = -1L;
+        symbolDictEpoch++;
+        symbolDictResetsPerformed++;
+        resetArmed = false;
+        manualResetRequested = false;
+        // C1 anti-thrash floor: see resetFloorSymbols.
+        resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
+                QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
+        // Deliberately re-derived (not carried over): the healing half
+        // of the recycle contract -- a sender that degraded to full
+        // frames heals back into delta mode once the underlying fault
+        // clears; a persistent fault just degrades the fresh engine
+        // again on its first append (SymbolDictRecycleHealingTest).
+        deltaDictEnabled = rebuilt.isDeltaDictEnabled();
+        cursorEngine = rebuilt;
+        ownsCursorEngine = true;
+        cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
+        // The fresh engine holds the slot flock again; step 3's release
+        // flipped slotLockReleased true via the outgoing engine's
+        // listener, which no longer describes this sender's state.
+        slotLockReleased = false;
+        recycleResume = RecycleResume.NONE;
+        recyclePendingLastPublishedFsn = -1L;
+        // step 7: reconnect (the swap has already committed).
+        // hasInitialConnectRun forces ensureConnected's ASYNC branch here, so
+        // the deferred socket connect never parks the producer thread; the
+        // loop retries indefinitely on the I/O thread, and a failed setup
+        // here leaves a coherent, merely-disconnected sender that is retried
+        // by the next sendRow()'s ensureConnected().
+        try {
+            ensureConnected();
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable t) {
+            LOG.warn("symbol dictionary swap committed but starting its deferred reconnect "
+                            + "failed; sender stays disconnected on the fresh epoch and retries "
+                            + "the setup on the next send [epoch={}, dictSizeAtSwap={}]",
+                    symbolDictEpoch, dictSizeAtSwap, t);
+            if (t instanceof LineSenderException) {
+                throw (LineSenderException) t;
+            }
+            throw new LineSenderException(t).put("symbol dictionary recycle reconnect failed");
+        }
+        LOG.info("symbol dictionary recycled [epoch={}, dictSizeAtSwap={}, pauseMicros={}]",
+                symbolDictEpoch, dictSizeAtSwap, (System.nanoTime() - startNanos) / 1000L);
     }
 
     /**
@@ -4938,6 +5089,16 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    private CursorSendEngine rebuildEngineOrAbandon(String message) {
+        try {
+            return engineRebuildFactory.rebuild();
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new LineSenderException(t).put(message);
+        }
+    }
+
     /**
      * The symbol-dictionary recycle swap. Runs synchronously on the producer
      * thread from the {@link #table(CharSequence)} barrier, once
@@ -4984,36 +5145,33 @@ public class QwpWebSocketSender implements Sender {
      *       engine.</li>
      *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
      *       against the rolled {@link #fsnEpochBase} and defers the socket
-     *       connect itself to the I/O thread. Runs OUTSIDE the latching
-     *       try -- see below.</li>
+     *       connect itself to the I/O thread.</li>
      * </ol>
-     * The producer-visible swap (dictionary, counters, epoch) commits only
-     * once a fresh engine stands on the emptied slot: a throw in steps 2-6
-     * is caught before that point, leaves the counters un-bumped, latches
-     * {@link #recycleFailure}, and rethrows -- every frame that existed
-     * before this call was already proven acked, so no data is at risk, but
-     * the sender that made the throw observe a half-swapped engine/loop
-     * refuses further use from here on -- {@link #checkRecycleFailure()}
-     * enforces that at every later {@link #table(CharSequence)} and
-     * flush-family call. An {@link Error} (OOM/SOE/linkage) passes through
-     * this catch untouched, neither latched nor wrapped -- it is not a
-     * recycle verdict. (Step 1 is a pair of plain reads and runs before the
-     * latching try.)
+     * This method runs steps 1-3 and hands steps 4-7 to
+     * {@link #completeRecycleRebuild(int, long)}. The producer-visible swap
+     * (dictionary, counters, epoch) commits only once a fresh engine stands on
+     * the emptied slot, and a throw before that point no longer kills the
+     * sender: every frame that existed before this call was already proven
+     * acked, so nothing is at risk, and the recycle simply records how far it
+     * got ({@link #recycleResume}) and resumes from the next
+     * {@link #table(CharSequence)} or {@link #ensureConnected()} -- see
+     * {@link #resumeRecycleIfPending()}. An {@link Error} (OOM/SOE/linkage)
+     * passes through untouched, neither recorded nor wrapped -- it is not a
+     * recycle verdict.
      * <p>
      * Step 3 mirrors {@code close()}'s deferred-close discipline: when the
      * outgoing engine's close could not confirm SF-worker quiescence it
      * returns with the slot flock retained and {@code isCloseCompleted()}
-     * false, releasing both from the worker's exit path. Step 3 then awaits
+     * false, releasing both from the worker's exit path. The tail then awaits
      * that deferred release (bounded by
      * {@link #RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS}) before step 5 rebuilds
      * on the slot -- rebuilding against the retained flock would throw
-     * {@code SlotLockContentionException} and needlessly latch the sender
-     * terminal for what is usually a transient disk stall. Only exhausting
-     * the await budget (a genuinely dead worker) latches terminal.
+     * {@code SlotLockContentionException} for what is usually a transient disk
+     * stall.
      * <p>
-     * Step 7 is deliberately exempt from that latch. By then the swap has
-     * committed (step 6), so a failed step-7 setup (dispatcher construction,
-     * loop build/start -- environmental, since the socket connect itself is
+     * Step 7's failure mode is unchanged: by then the swap has committed
+     * (step 6), so a failed step-7 setup (dispatcher construction, loop
+     * build/start -- environmental, since the socket connect itself is
      * deferred to the I/O thread) leaves a fully coherent sender that is
      * merely disconnected: {@code connected == false}, loop and client already
      * closed and nulled by {@link #ensureConnected()}'s own catch, the fresh
@@ -5036,8 +5194,8 @@ public class QwpWebSocketSender implements Sender {
             // reporting this durable watermark while cursorEngine is null.
             lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
         }
+        // step 2: close the loop - joins the I/O thread, closes the client.
         try {
-            // step 2: close the loop - joins the I/O thread, closes the client.
             if (cursorSendLoop != null) {
                 cursorSendLoop.close();
                 // Read the sticky AFTER close(): close joins the I/O thread,
@@ -5048,91 +5206,112 @@ public class QwpWebSocketSender implements Sender {
                 cursorSendLoop = null;
             }
             client = null;
-            // step 3: fully-drained close of the engine - empties the slot
-            // and unlinks the parent-anchored logical slot lock. When the SF
-            // worker is wedged the close defers flock release to the worker's
-            // exit path; await it (bounded) before rebuilding on the slot.
-            CursorSendEngine outgoing = cursorEngine;
-            cursorEngine = null;
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable t) {
+            // close() set the loop's stop flag before throwing, so the loop
+            // is irreversibly dying but its I/O thread may still own the
+            // engine. Neither proceed with the swap nor claim connectivity;
+            // abandon, and let resumeRecycleIfPending() finish the close
+            // (a repeated close() converges once the I/O thread exits).
             connected = false;
-            outgoing.close();
-            awaitDeferredEngineClose(outgoing);
-            // step 4: roll the external FSN base (-1 no-publish case adds 0)
-            rollFsnEpochBase(lastPublishedFsn);
-            // step 5: rebuild the engine on the now-empty slot.
-            cursorEngine = engineRebuildFactory.rebuild();
-            ownsCursorEngine = true;
-            if (cursorEngine.wasRecoveredFromDisk()) {
-                // close(true) above emptied the slot, so a rebuild that found
-                // a persisted dictionary to recover from means the outgoing
-                // close's empties-the-slot contract was breached -- the fresh
-                // producer dictionary and the slot's on-disk state have
-                // diverged, so refuse to run on it.
-                throw new LineSenderException(
-                        "symbol dictionary recycle rebuilt on a non-empty slot: "
-                                + "the outgoing engine's fully-drained close did not empty it");
-            }
-            // step 6: producer-side swap COMMIT - replace, don't clear().
-            globalSymbolDictionary = new GlobalSymbolDictionary();
-            sentMaxSymbolId = -1;
-            currentBatchMaxSymbolId = -1;
-            lastCommitBoundaryFsn = -1L;
-            symbolDictEpoch++;
-            symbolDictResetsPerformed++;
-            resetArmed = false;
-            manualResetRequested = false;
-            // C1 anti-thrash floor: see resetFloorSymbols.
-            resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
-                    QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
-            // Deliberately re-derived (not carried over): the healing half
-            // of the recycle contract -- a sender that degraded to full
-            // frames heals back into delta mode once the underlying fault
-            // clears; a persistent fault just degrades the fresh engine
-            // again on its first append (SymbolDictRecycleHealingTest).
-            deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
-            cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
-            // The fresh engine holds the slot flock again; step 3's release
-            // flipped slotLockReleased true via the outgoing engine's
-            // listener, which no longer describes this sender's state.
-            slotLockReleased = false;
-        } catch (Error e) {
-            // OOM/SOE/linkage must reach the caller untouched (same
-            // convention as rethrowTerminal) and must not masquerade as a
-            // recycle verdict.
-            throw e;
-        } catch (Throwable t) {
-            // terminal latch - everything was acked before step 2,
-            // so no data is at risk; the sender refuses further use.
-            recycleFailure = t;
-            LOG.error("symbol dictionary recycle failed; sender is now terminal "
-                    + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, t);
-            if (t instanceof LineSenderException) {
-                throw (LineSenderException) t;
-            }
-            throw new LineSenderException(t).put("symbol dictionary recycle failed");
+            recycleResume = RecycleResume.CLOSE_LOOP;
+            LOG.warn("symbol dictionary recycle abandoned: closing the outgoing I/O loop "
+                    + "failed; the close is finished on the next send [epoch={}]",
+                    symbolDictEpoch, t);
+            rethrowRecycleAbandoned(t, "symbol dictionary recycle abandoned while closing "
+                    + "the outgoing I/O loop; retried on the next send");
         }
-        // step 7: reconnect (outside the latch; the swap has already
-        // committed). hasInitialConnectRun forces ensureConnected's ASYNC
-        // branch here, so the deferred socket connect never parks the
-        // producer thread; the loop retries indefinitely on the I/O thread,
-        // and a failed setup here leaves a coherent, merely-disconnected
-        // sender that is retried by the next sendRow()'s ensureConnected().
+        // step 3: fully-drained close of the engine - empties the slot and
+        // unlinks the parent-anchored logical slot lock. From here the old
+        // engine cannot come back, so record the REBUILD resume point BEFORE
+        // anything that can throw.
+        CursorSendEngine outgoing = cursorEngine;
+        cursorEngine = null;
+        connected = false;
+        recycleResume = RecycleResume.REBUILD;
+        recyclePendingOutgoing = outgoing;
+        recyclePendingLastPublishedFsn = lastPublishedFsn;
         try {
-            ensureConnected();
+            outgoing.close();
         } catch (Error e) {
             throw e;
         } catch (Throwable t) {
-            LOG.warn("symbol dictionary swap committed but starting its deferred reconnect "
-                            + "failed; sender stays disconnected on the fresh epoch and retries "
-                            + "the setup on the next send [epoch={}, dictSizeAtSwap={}]",
-                    symbolDictEpoch, dictSizeAtSwap, t);
-            if (t instanceof LineSenderException) {
-                throw (LineSenderException) t;
-            }
-            throw new LineSenderException(t).put("symbol dictionary recycle reconnect failed");
+            // A throw with the terminal cleanup nevertheless completed (the
+            // post-cleanup fsyncDir durability warning, C2(b)) is not a swap
+            // failure -- finishClose's finally released the slot regardless.
+            // awaitDeferredEngineClose() below tells the two apart: it
+            // returns immediately when isCloseCompleted(), parks while the
+            // deferred close is in flight, and throws only on a genuinely
+            // dead worker.
+            LOG.warn("outgoing engine close reported a failure during the symbol dictionary "
+                    + "recycle; deferring to the close-completion probe", t);
         }
-        LOG.info("symbol dictionary recycled [epoch={}, dictSizeAtSwap={}, pauseMicros={}]",
-                symbolDictEpoch, dictSizeAtSwap, (System.nanoTime() - startNanos) / 1000L);
+        completeRecycleRebuild(dictSizeAtSwap, startNanos);
+    }
+
+    /**
+     * Advances an abandoned recycle. CLOSE_LOOP finishes killing the old
+     * loop (no swap -- the old engine and dictionary are intact and the
+     * armed recycle re-fires from a later barrier, once the reconnect the
+     * next send drives has restored {@code connected}); it drops the
+     * producer's delta baseline with the dead loop's catch-up mirror, see
+     * below. REBUILD completes the await/rebuild/commit tail; because the
+     * commit swaps the dictionary, it refuses while producer state could
+     * carry old-dictionary symbol ids (staged rows or a row in progress) --
+     * the caller's row fails, rolls back, and the next table() resumes
+     * cleanly.
+     */
+    private void resumeRecycleIfPending() {
+        if (recycleResume == RecycleResume.NONE) {
+            return;
+        }
+        if (recycleResume == RecycleResume.CLOSE_LOOP) {
+            try {
+                cursorSendLoop.close(); // re-signals; converges once the I/O thread exits
+            } catch (Error e) {
+                throw e;
+            } catch (Throwable t) {
+                rethrowRecycleAbandoned(t, "the outgoing I/O loop is still stopping; "
+                        + "retried on the next send");
+            }
+            hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
+            cursorSendLoop = null;
+            client = null;
+            // The dead loop took its catch-up mirror with it, and the fresh
+            // loop ensureConnected() builds next seeds that mirror only from a
+            // RECOVERED persisted dictionary -- this engine is live, so the
+            // fresh loop starts at sentDictCount == 0. sentMaxSymbolId is the
+            // producer's model of the same number (it normally survives a
+            // reconnect precisely because the SAME loop re-registers from its
+            // mirror), so it has to drop with the mirror; otherwise the next
+            // frame's delta starts above the new loop's coverage and trips its
+            // torn-dictionary guard. Nothing is invalidated by the drop: the
+            // barrier proved the ring drained before step 2, and every publish
+            // path runs ensureConnected() -- hence this resume -- first, so no
+            // frame referencing those ids can be waiting to replay.
+            sentMaxSymbolId = -1;
+            recycleResume = RecycleResume.NONE;
+            return;
+        }
+        // REBUILD
+        if (pendingRowCount != 0
+                || (currentTableBuffer != null && currentTableBuffer.hasInProgressRow())) {
+            throw new LineSenderException(
+                    "a symbol dictionary recycle is completing; finish or cancel the "
+                            + "in-progress row and retry");
+        }
+        completeRecycleRebuild(globalSymbolDictionary.size(), System.nanoTime());
+    }
+
+    private void rethrowRecycleAbandoned(Throwable t, String message) {
+        if (t instanceof Error) {
+            throw (Error) t;
+        }
+        if (t instanceof LineSenderException) {
+            throw (LineSenderException) t;
+        }
+        throw new LineSenderException(t).put(message);
     }
 
     /**
@@ -5931,6 +6110,15 @@ public class QwpWebSocketSender implements Sender {
      */
     public interface EngineRebuildFactory {
         CursorSendEngine rebuild();
+    }
+
+    /**
+     * How far an abandoned symbol-dictionary recycle got, and therefore what
+     * {@link #resumeRecycleIfPending()} must still do. See
+     * {@link #recycleResume}.
+     */
+    private enum RecycleResume {
+        NONE, CLOSE_LOOP, REBUILD
     }
 
     private final class ReconnectSupplier implements CursorWebSocketSendLoop.ReconnectFactory {

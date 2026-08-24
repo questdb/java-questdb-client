@@ -355,51 +355,98 @@ public class SymbolDictRecycleTest {
     }
 
     /**
-     * A step-6 rebuild failure (the {@link QwpWebSocketSender.EngineRebuildFactory}
-     * itself throwing) must latch the sender terminal rather than leaving it in
-     * the torn-down state the swap's earlier steps produced. Uses
-     * {@code setEngineRebuildFactory} directly to inject the fault -- the real
-     * factory has no seam for a custom {@code FilesFacade} (it always goes
-     * through {@code LineSenderBuilder.constructEngineOnSlot} against the real
-     * filesystem), and this isolates the exception-path behaviour under test
-     * from any particular failure cause.
+     * A transient engine-rebuild failure must NOT latch the sender terminal:
+     * the recycle is abandoned before the swap commits and resumes on the
+     * next send. Replaces testFailedRebuildLatchesTerminal (review r3, C2(d):
+     * build() has a retry-and-quarantine loop for exactly these operational
+     * failures; killing a healthy sender on a provably empty slot mid-life
+     * was strictly worse than the build()-time behavior).
      */
     @Test
-    public void testFailedRebuildLatchesTerminal() throws Exception {
+    public void testFailedRebuildAbandonsAndRecovers() throws Exception {
         assertMemoryLeak(() -> {
             try (TestWebSocketServer server = ackingServer()) {
                 try (Sender sender = Sender.fromConfig(cfg(server))) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
-                    RuntimeException fault = new RuntimeException("injected engine rebuild fault");
+                    QwpWebSocketSender.EngineRebuildFactory real =
+                            ws.getEngineRebuildFactoryForTesting();
+                    AtomicInteger remainingFaults = new AtomicInteger(1);
                     ws.setEngineRebuildFactory(() -> {
-                        throw fault;
+                        if (remainingFaults.getAndDecrement() > 0) {
+                            throw new RuntimeException("injected engine rebuild fault");
+                        }
+                        return real.rebuild();
                     });
 
-                    // pendingRowCount == 0 -> resetSymbolDictionary() arms immediately.
                     sender.resetSymbolDictionary();
                     Assert.assertTrue(ws.isResetArmed());
-
-                    LineSenderException triggering = null;
                     try {
                         sender.table("t");
                         Assert.fail("expected the triggering table() call to throw");
-                    } catch (LineSenderException e) {
-                        triggering = e;
+                    } catch (LineSenderException expected) {
                     }
-                    Assert.assertNotNull(triggering);
-                    Assert.assertSame("the latched failure must be the exact rebuild fault",
-                            fault, triggering.getCause());
-
-                    // Every subsequent table()/flush-family call must rethrow --
-                    // never touch the torn-down (null cursorEngine/cursorSendLoop) state.
-                    assertRethrowsWithCause(fault, () -> sender.table("t"));
-                    assertRethrowsWithCause(fault, sender::flush);
-                    assertRethrowsWithCause(fault, sender::flushAndGetSequence);
-                    assertRethrowsWithCause(fault, () -> sender.drain(0));
-                    assertRethrowsWithCause(fault, () -> sender.awaitAckedFsn(0, 0));
-
-                    // close() must still work despite the latched terminal failure.
+                    // NOT latched, and the swap did NOT commit.
+                    Assert.assertEquals(0, ws.getSymbolDictEpoch());
+                    Assert.assertEquals(0, ws.getSymbolDictResetsPerformed());
+                    // The next call resumes the pending recycle with the real
+                    // factory and completes it.
+                    sender.table("t").symbol("s", "post").longColumn("v", 1L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    long f = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
                     sender.close();
+                }
+            }
+        });
+    }
+
+    /**
+     * A producer thread whose interrupt flag is already set makes step 2's
+     * loop close throw deterministically (CountDownLatch.await throws on
+     * entry). That must abandon the recycle non-terminally; once the flag is
+     * cleared the next call finishes the loop close and the sender recovers.
+     * Review r3, C2(c).
+     */
+    @Test
+    public void testInterruptedRecycleAbandonsAndRecovers() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long f1 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f1, 5_000));
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue(ws.isResetArmed());
+
+                    Thread.currentThread().interrupt();
+                    boolean threw = false;
+                    try {
+                        sender.table("t");
+                    } catch (LineSenderException expected) {
+                        threw = true;
+                    }
+                    // close() re-asserts the flag on the abandon path; clear it
+                    // for the recovery half of the test.
+                    boolean flagWasPreserved = Thread.interrupted();
+                    if (threw) {
+                        Assert.assertTrue("the failed-stop protocol re-asserts the flag",
+                                flagWasPreserved);
+                    }
+                    // Whether the close raced past the interrupt or abandoned,
+                    // the sender must never be terminal and must finish the
+                    // recycle on subsequent sends. A CLOSE_LOOP abandon leaves
+                    // the recycle armed but NOT yet run, and the barrier only
+                    // recycles at a drained instant with nothing staged -- so
+                    // flush the recovery row before the barrier that must swap.
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    long f2 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
+                    sender.table("t");
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                    long f3 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f3, 5_000));
                 }
             }
         });
@@ -479,17 +526,6 @@ public class SymbolDictRecycleTest {
         return names;
     }
 
-    private static void assertRethrowsWithCause(Throwable expectedCause, ThrowingRunnable action)
-            throws Exception {
-        try {
-            action.run();
-            Assert.fail("expected a latched LineSenderException to rethrow");
-        } catch (LineSenderException e) {
-            Assert.assertSame("a latched terminal sender must keep rethrowing the same cause",
-                    expectedCause, e.getCause());
-        }
-    }
-
     private static String cfg(TestWebSocketServer server) {
         return "ws::addr=localhost:" + server.getPort() + ";";
     }
@@ -515,11 +551,6 @@ public class SymbolDictRecycleTest {
         bb.put(name);
         bb.putLong(seqTxn);
         return bb.array();
-    }
-
-    @FunctionalInterface
-    private interface ThrowingRunnable {
-        void run() throws Exception;
     }
 
     /** ACKs every frame it receives; does not otherwise inspect the wire. */

@@ -273,6 +273,93 @@ public class SymbolDictRecycleDeferredCloseTest {
         });
     }
 
+    /**
+     * The await budget runs out while the worker is still wedged, but the
+     * wedge is transient after all. Exhausting the budget must NOT latch the
+     * sender terminal (review r3, C2): the recycle stays pending in its
+     * REBUILD resume state, and once the worker exits and the deferred close
+     * releases the flock, the next send finishes the await, rebuilds and
+     * commits the swap.
+     */
+    @Test(timeout = 60_000L)
+    public void testExhaustedDeferredCloseAwaitResumesOnNextSend() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-resume").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                CountDownLatch workerBlocked = new CountDownLatch(1);
+                CountDownLatch releaseWorker = new CountDownLatch(1);
+                AtomicBoolean wedgeFired = new AtomicBoolean();
+                AtomicReference<Throwable> auxErr = new AtomicReference<>();
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: batch must be acked before the recycle",
+                            sender.awaitAckedFsn(fsn1, 5_000));
+
+                    CursorSendEngine outgoing = ws.getCursorEngineForTesting();
+                    SegmentManager manager = outgoing.getManagerForTesting();
+                    try {
+                        manager.setBeforeTrimSyncHook(() -> {
+                            if (!wedgeFired.compareAndSet(false, true)) {
+                                return;
+                            }
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                    auxErr.compareAndSet(null, new AssertionError(
+                                            "timed out waiting for the test to release the worker"));
+                                }
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        Assert.assertTrue("worker never reached the wedge hook",
+                                workerBlocked.await(5, TimeUnit.SECONDS));
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        ws.setRecycleDeferredCloseMaxWaitMillisForTesting(100L);
+
+                        sender.resetSymbolDictionary();
+                        Assert.assertTrue(ws.isResetArmed());
+
+                        // With the worker wedged past the tiny await budget, the
+                        // triggering call must abandon -- not latch.
+                        try {
+                            sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                            Assert.fail("expected the exhausted deferred-close await to surface");
+                        } catch (LineSenderException expected) {
+                        }
+                        Assert.assertEquals("swap must not have committed", 0, ws.getSymbolDictEpoch());
+                        releaseWorker.countDown();
+                        // Wait for the worker to exit and release the flock, then the
+                        // next call resumes and completes the recycle.
+                        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!outgoing.isCloseCompleted() && System.nanoTime() < deadlineNanos) {
+                            Thread.sleep(10L);
+                        }
+                        Assert.assertTrue("deferred cleanup did not complete after the release",
+                                outgoing.isCloseCompleted());
+                        sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                        Assert.assertEquals(1, ws.getSymbolDictEpoch());
+
+                        long fsn2 = sender.flushAndGetSequence();
+                        Assert.assertTrue("post-resume batch must still get acked",
+                                sender.awaitAckedFsn(fsn2, 5_000));
+                    } finally {
+                        manager.setBeforeTrimSyncHook(null);
+                        releaseWorker.countDown();
+                    }
+                }
+                if (auxErr.get() != null) {
+                    throw new AssertionError("auxiliary thread failed", auxErr.get());
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();
