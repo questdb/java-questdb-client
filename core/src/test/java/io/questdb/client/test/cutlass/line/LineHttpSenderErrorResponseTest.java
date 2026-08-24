@@ -322,6 +322,14 @@ public class LineHttpSenderErrorResponseTest {
                         Assert.assertTrue("a definitive status must not spend the retry budget: "
                                 + elapsedMillis + "ms", elapsedMillis < 3_000);
                         Assert.assertEquals("a definitive status must not be retried", 1, requests.get());
+                        // The classification has to survive the wrapper too, not just the message. This is
+                        // the one throw site that builds its exception from the status alone, having failed
+                        // to read the body, so it re-passes `retryable` by hand - and a caller acting on
+                        // isRetryable() would re-flush forever into a 401 that keeps refusing. The `true`
+                        // direction is pinned by LineSenderExceptionRetryableTest, which is what makes this
+                        // assertFalse mean "classified permanent" rather than "not classified at all".
+                        Assert.assertFalse("a 401 must stay non-retryable through the unreadable-body wrapper",
+                                e.isRetryable());
                     }
                 }
             }

@@ -171,4 +171,49 @@ public class LineSenderExceptionRetryableTest {
             }
         });
     }
+
+    @Test(timeout = 30_000)
+    public void testAnUnreadableRetryableBodyStaysRetryable() throws Exception {
+        assertMemoryLeak(() -> {
+            // The wrapper path, and the direction that carries the risk on it. Every other test here reaches
+            // throwOnHttpErrorResponse0, which builds its exception beside the body it just read. When that
+            // read ABORTS - a dribbled body, a peer that vanished, a mangled chunk - the outer
+            // throwOnHttpErrorResponse catches it and builds a different exception from the status alone,
+            // re-passing `retryable` by hand. Nothing pinned that hand-off, so hardcoding it either way was
+            // green.
+            //
+            // A 503 whose body dribbles: flush0 retries on the status until retryTimeoutMillis is spent (the
+            // head arrives promptly each time, so those passes are fast), then reads the body to build the
+            // message and aborts on the whole-read bound. Told this was permanent, a caller following the
+            // documented advice closes or reset()s a healthy sender and drops the buffered batch over a fault
+            // that was going to clear.
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.dribble(503))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(100)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the 503 to surface once the retry budget is spent");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        // the wrapper's own shape, so a later refactor that routes this through the
+                        // body-reading path instead cannot satisfy the assertion below by accident
+                        Assert.assertTrue("expected the unreadable-body wrapper: " + msg,
+                                msg.contains("could not read the error response body"));
+                        Assert.assertTrue("the real status must survive the wrapper: " + msg,
+                                msg.contains("http-status=503"));
+                        Assert.assertTrue("a 503 is transient however unreadable its body: a caller told to "
+                                        + "close or reset() on it tears down a healthy sender and drops the "
+                                        + "buffered batch: " + msg,
+                                e.isRetryable());
+                    }
+                }
+            }
+        });
+    }
 }
