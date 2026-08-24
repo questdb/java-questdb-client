@@ -1360,10 +1360,14 @@ public class QwpWebSocketSender implements Sender {
                     ? cursorSendLoop.getSynchronouslySurfacedError() : null;
 
             try {
-                // Only drain when both the engine and the I/O loop are wired
-                // up — close() is also called from createForTesting() teardown
-                // and from connect() rollback paths where one or both may be null.
-                if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
+                // The flush/commit/seal trio needs only the engine: rows are
+                // encoded into the SF ring on the user thread. The loop-only
+                // members below (checkUnsurfacedError, drainOnClose) keep
+                // their own gate -- with no I/O loop nothing can advance
+                // acks, so draining would only stall for the full timeout.
+                // Also covers createForTesting() teardown and connect()
+                // rollback paths where the loop (or both) may be null.
+                if (connectionError.get() == null && cursorEngine != null) {
                     // 1) Flush user-thread state into the engine (encoded
                     //    rows -> mmap'd / malloc'd ring). After this, the
                     //    cursor engine's publishedFsn reflects the final
@@ -1429,7 +1433,7 @@ public class QwpWebSocketSender implements Sender {
                     //    both still get the loud rethrow on shutdown.
                     boolean terminalOwnedByCustomHandler = errorDispatcher != null
                             && errorDispatcher.hasDeliveredTerminalToCustomHandler();
-                    if (!terminalOwnedByCustomHandler) {
+                    if (cursorSendLoop != null && !terminalOwnedByCustomHandler) {
                         cursorSendLoop.checkUnsurfacedError();
                     }
                     // 3) Bounded drain: block until the server has ACK'd
@@ -1442,7 +1446,7 @@ public class QwpWebSocketSender implements Sender {
                     //    without re-throwing (re-throwing would double-signal
                     //    an error the user already handled). Otherwise the
                     //    drain keeps the loud safety net and surfaces it.
-                    if (closeFlushTimeoutMillis > 0L) {
+                    if (cursorSendLoop != null && closeFlushTimeoutMillis > 0L) {
                         drainOnClose(terminalOwnedByCustomHandler);
                     }
                 }
