@@ -2215,6 +2215,54 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testStealIfStaleRestoresALockAPeerRecreatedInTheCaptureGap() throws Exception {
+        assertMemoryLeak(() -> {
+            // The arm that ran only in production. stealIfStale judges a lock stale, captures it with an
+            // ATOMIC_MOVE, then re-reads the capture to confirm it took the stamp it judged rather than a
+            // LIVE lock a peer recreated in the gap between those two steps. Its own comment says a bare
+            // deleteIfExists(lock) "would admit two holders at once", yet replacing the whole
+            // capture/verify/restore with exactly that left the suite green: the two
+            // testRestoreCapturedLock* cases drive restoreCapturedLock DIRECTLY by reflection, so they
+            // pass unchanged when nothing calls it.
+            //
+            // Reaching the arm needs the peer to land inside that gap, which no amount of concurrency can
+            // force deterministically -- hence beforeCaptureHook, which runs there and nowhere else.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            byte[] peerLive = "peer-owner-stamp".getBytes(StandardCharsets.UTF_8);
+            Files.write(lock, "crashed-holder-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
+
+            FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeCaptureHook");
+            hookField.setAccessible(true);
+            // In the gap: the abandoned lock is replaced by a peer's freshly-created live one.
+            hookField.set(store, (Runnable) () -> {
+                try {
+                    Files.write(lock, peerLive);
+                    Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis()));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            Method stealIfStale = FileTokenStore.class.getDeclaredMethod("stealIfStale", Path.class);
+            stealIfStale.setAccessible(true);
+            stealIfStale.invoke(store, lock);
+
+            Assert.assertTrue("the peer's LIVE lock must survive the capture gap; removing it admits two "
+                    + "holders at once, which is the double-POST of one rotating refresh token that a "
+                    + "reuse-detecting provider answers by revoking the whole family", Files.exists(lock));
+            Assert.assertArrayEquals("the peer's lock must go back byte for byte, or releaseLock's "
+                            + "owner-stamp check refuses to delete it and the peer wedges every later acquire",
+                    peerLive, Files.readAllBytes(lock));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
     public void testSweepDoesNotDeleteStealCapturedLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();

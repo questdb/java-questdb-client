@@ -33,6 +33,7 @@ import io.questdb.client.std.NumericException;
 import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.std.str.StringSink;
 
+import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -209,6 +210,14 @@ public final class FileTokenStore implements TokenStore {
     private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
     private static final AtomicBoolean warnedTightenedStoreDir = new AtomicBoolean();
     private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
+    // Test seam, null in production: runs in the gap between judging a lock stale and capturing it with
+    // the ATOMIC_MOVE. That gap IS the interleaving stealIfStale's capture-verify defends -- a peer
+    // replacing the abandoned lock with a live one -- and nothing else can force it, so without this the
+    // whole capture/verify/restore could be collapsed back into the bare deleteIfExists its own comment
+    // forbids and no test would go red. Not final: the test installs it reflectively, as it already does
+    // to reach stealIfStale from the separate test module.
+    @TestOnly
+    private volatile Runnable beforeCaptureHook;
     private final Path directory;
     private final long lockAcquireBudgetMillis;
     // Namespaces this store's entries in PROCESS_LOCKS, so two stores over DIFFERENT directories never
@@ -1365,6 +1374,10 @@ public final class FileTokenStore implements TokenStore {
             // it is not a statement about the create-to-stamp gap, which is the same few microseconds however
             // the store is configured.
             return;
+        }
+        final Runnable hook = beforeCaptureHook;
+        if (hook != null) {
+            hook.run();
         }
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
         try {
