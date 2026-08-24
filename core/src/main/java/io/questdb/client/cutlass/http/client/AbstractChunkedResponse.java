@@ -275,14 +275,6 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
     }
 
     /**
-     * Receives data into the buffer or throws an exception.
-     *
-     * @param bufLo   the low address of the buffer
-     * @param bufHi   the high address of the buffer
-     * @param timeout the timeout in milliseconds
-     * @return the number of bytes received
-     */
-    /**
      * Whether a chunk-size line carries more significant hex digits than a long can hold.
      * <p>
      * Counts SIGNIFICANT digits, skipping leading zeros: {@code 0000000000000001} is sixteen characters
@@ -298,5 +290,13 @@ public abstract class AbstractChunkedResponse implements Response, Fragment {
         return n - i > MAX_CHUNK_SIZE_HEX_DIGITS;
     }
 
+    /**
+     * Receives data into the buffer or throws an exception.
+     *
+     * @param bufLo   the low address of the buffer
+     * @param bufHi   the high address of the buffer
+     * @param timeout the timeout in milliseconds
+     * @return the number of bytes received
+     */
     protected abstract int recvOrDie(long bufLo, long bufHi, int timeout);
 }
