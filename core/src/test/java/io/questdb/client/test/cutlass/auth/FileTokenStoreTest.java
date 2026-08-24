@@ -702,6 +702,60 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testReplaceTargetPreservesAnInterruptDeliveredDuringItsBackoff() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to deny the rename",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Assume.assumeFalse("a root process bypasses the directory permissions this denial relies on",
+                "root".equals(System.getProperty("user.name")));
+        assertMemoryLeak(() -> {
+            // replaceTarget's retry backoff is the one interruptible wait on the save path. save() parks and
+            // restores only the flag it saw on ENTRY, so an interrupt arriving mid-save has to survive this
+            // sleep on its own - and that interrupt is exactly what PoolHousekeeper.stop() delivers to break a
+            // recovery step. Os.sleep() swallowed it: it catches InterruptedException, sleeps on to its
+            // deadline and never re-asserts the flag, so the stop signal was destroyed and the caller's later
+            // isInterrupted() checks read false.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            Path tmp = Files.write(dir.resolve("payload.tmp"), "NEW".getBytes(StandardCharsets.UTF_8));
+            Path target = Files.write(dir.resolve("payload.json"), "OLD".getBytes(StandardCharsets.UTF_8));
+
+            Method replaceTarget = FileTokenStore.class.getDeclaredMethod("replaceTarget", Path.class, Path.class);
+            replaceTarget.setAccessible(true);
+            // Deny the rename the same way the sibling test does, and prove the denial bites on THIS host
+            // before resting on it: without a denial the first attempt succeeds, no backoff runs, and the
+            // assertion below would pass without exercising anything.
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"));
+            try {
+                try {
+                    Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    Assert.fail("the rename must be denied while the store directory is not writable");
+                } catch (AccessDeniedException expected) {
+                    // as intended - every attempt inside replaceTarget will now be denied, so it reaches its
+                    // backoff and stays there for the whole budget
+                }
+
+                // Set the flag BEFORE the call rather than racing a second thread into the 20ms window: the
+                // first backoff observes it either way, and this leaves nothing to time.
+                Thread.currentThread().interrupt();
+                try {
+                    replaceTarget.invoke(null, tmp, target);
+                    Assert.fail("a permanently denied rename must surface its AccessDeniedException");
+                } catch (InvocationTargetException e) {
+                    Assert.assertTrue("expected the denial to propagate, got " + e.getCause(),
+                            e.getCause() instanceof AccessDeniedException);
+                }
+                Assert.assertTrue("replaceTarget must hand back an interrupt delivered during its backoff, "
+                                + "or a stop signal aimed at the save path is lost",
+                        Thread.currentThread().isInterrupted());
+            } finally {
+                Thread.interrupted(); // do not leak the flag into the next test
+                // whatever happened above, leave the tree deletable
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"));
+            }
+        });
+    }
+
+    @Test
     public void testReplaceTargetRetriesADeniedRenameThenSucceeds() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to deny the rename",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));

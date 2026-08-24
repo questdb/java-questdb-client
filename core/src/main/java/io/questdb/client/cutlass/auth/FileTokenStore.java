@@ -30,7 +30,6 @@ import io.questdb.client.cutlass.json.JsonParser;
 import io.questdb.client.std.Chars;
 import io.questdb.client.std.Numbers;
 import io.questdb.client.std.NumericException;
-import io.questdb.client.std.Os;
 import io.questdb.client.std.str.DirectUtf8Sink;
 import io.questdb.client.std.str.StringSink;
 
@@ -939,7 +938,20 @@ public final class FileTokenStore implements TokenStore {
         AccessDeniedException lastDenied = null;
         for (int attempt = 0; attempt < REPLACE_MAX_ATTEMPTS; attempt++) {
             if (attempt > 0) {
-                Os.sleep(REPLACE_RETRY_SLEEP_MILLIS);
+                try {
+                    // Thread.sleep, not Os.sleep, for the reason acquireLock's poll gives: Os.sleep catches
+                    // InterruptedException and keeps sleeping to its deadline WITHOUT re-asserting the flag, so
+                    // a cancellation aimed at this backoff was destroyed outright. save() only parks and restores
+                    // the flag it saw on ENTRY, so an interrupt arriving mid-save -- which is exactly what
+                    // PoolHousekeeper.stop()'s escalation delivers to break a credential pull -- vanished here and
+                    // the stop signal was lost. Re-assert it and abandon the retry: persistence is best-effort,
+                    // and lastDenied is non-null on every pass that reaches this (attempt > 0 only follows an
+                    // AccessDeniedException), so the throw below reports the denial as it would have anyway.
+                    Thread.sleep(REPLACE_RETRY_SLEEP_MILLIS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
             try {
                 Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
