@@ -177,6 +177,21 @@ public class MockOidcServer implements Closeable {
         }
     }
 
+    /**
+     * How many TCP connections this server has accepted since it started.
+     * <p>
+     * The discriminator for "did the client drop the connection?", which no other observable exposes: a
+     * keep-alive reuse and a reconnect send the same bytes and produce the same request count, and this
+     * mock never sends {@code Connection: close}, so the client's own choice is the only thing that moves
+     * this number. {@code acceptLoop} records a socket before it starts the thread that answers on it, so
+     * a client that has read a response head is guaranteed to see that connection counted here.
+     *
+     * @return the number of accepted connections
+     */
+    public int connectionsAccepted() {
+        return connSockets.size();
+    }
+
     public String httpUrl(String path) {
         return "http://127.0.0.1:" + port() + path;
     }

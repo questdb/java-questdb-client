@@ -187,6 +187,56 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testDrainAbortAfterA2xxDropsTheConnection() throws Exception {
+        assertMemoryLeak(() -> {
+            // The other half of the drain-abort contract, and the half nothing pinned. Its sibling above
+            // covers ONE flush and proves the abort does not re-send it. This covers the flush AFTER it,
+            // which is the only place the `!drained` term of the disconnect can be observed at all.
+            //
+            // The abort leaves the response body unconsumed, so the socket still carries the first
+            // response's chunk-size digits. Without the disconnect the next flush writes onto it and its
+            // await() reads those digits instead of a status line: the header block never completes, so
+            // await() spends its whole bound and throws HttpClientException, which flush0 classifies as a
+            // transport error and RETRIES. Measured against this fixture: three sends for two flushes -
+            // one extra copy of a batch the server had already committed, which is the duplicate-row harm
+            // the surrounding arm exists to prevent, arriving by the one route it does not guard against.
+            //
+            // So the request count is what goes red, and it is asserted first. The connection count is
+            // NOT a discriminator here and is not claimed as one - it is 2 either way, because the failed
+            // second flush disconnects and reconnects on its own before retrying. It is asserted anyway,
+            // as the direct statement of the guard: one flush, one connection.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble();
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(1_000)                    // the whole-body-read bound each drain aborts on
+                        .retryTimeoutMillis(3_000)                   // a budget a re-send would visibly spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush();
+
+                    // The second flush is what needs a clean socket. Without the disconnect it lands on the
+                    // poisoned one and throws instead of succeeding.
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    sender.flush();
+
+                    Assert.assertEquals("two flushes, two sends: a drain abort leaves the body unconsumed, so "
+                                    + "a reused socket fails the next flush's header read and it retries - "
+                                    + "re-sending a batch the server had already committed",
+                            2, requests.get());
+                    Assert.assertEquals("and each flush went out on its own connection", 2,
+                            server.connectionsAccepted());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDrainFailureAfterASuccessfulFlushReportsItsReason() throws Exception {
         assertMemoryLeak(() -> {
             // A 2xx IS the commit, so a body-drain abort after it changes no outcome - but it does drop the
