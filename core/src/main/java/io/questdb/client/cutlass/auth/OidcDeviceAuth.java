@@ -163,27 +163,6 @@ public class OidcDeviceAuth implements QuietCloseable {
     // upper bound on the device code lifetime (the device authorization response's expires_in), so a
     // hostile or buggy provider cannot make the client poll for an absurd duration; matches the Python client
     private static final int MAX_DEVICE_CODE_TTL_SECONDS = 1800;
-    /**
-     * Floor on how often {@link #getToken()} will re-attempt a silent refresh after one failed. Without it a
-     * revoked refresh token, or an IdP outage, cost a full token-endpoint round trip on EVERY call - and
-     * getToken() is called once per ILP flush and once per WebSocket (re)connect, so a producer retrying its
-     * rows drove a sustained request flood at the identity provider (enough to trip its rate limits and
-     * lengthen the very outage being retried) while each call blocked the producer for the round trip, up to
-     * httpTimeoutMillis against a black-holed endpoint.
-     * <p>
-     * Deliberately short: this is a stampede guard, not a circuit breaker. A credential that comes back
-     * within seconds is picked up on the next call, and any explicit {@link #signIn()} or
-     * {@link #clearCache()} clears the latch outright.
-     */
-    private static final long MIN_REFRESH_RETRY_INTERVAL_MILLIS = 5_000L;
-    // First non-zero back-off between token store reads; it doubles per consecutive failure, up to
-    // MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS. Same floor as the refresh back-off above, and the same kind of
-    // stampede guard. The FIRST failure arms a ZERO-length back-off, so the very next call still re-reads the
-    // store: a one-shot fault - notably a carried interrupt flag, which makes the InterruptibleChannel under
-    // FileTokenStore throw on a thread that merely carries it - must recover on the next call rather than wait
-    // this out. Anything that survives that free retry needs an operator (a chmod, a remount), so waiting is
-    // no longer costing a recovery that was about to happen anyway.
-    private static final long MIN_STORE_LOAD_RETRY_INTERVAL_MILLIS = 5_000L;
     // upper bound on the token cache lifetime (the token response's expires_in), so an absurd or hostile
     // value cannot overflow the timing arithmetic or make the client trust a token for absurdly long
     private static final int MAX_EXPIRES_IN_SECONDS = 3600;
@@ -207,6 +186,27 @@ public class OidcDeviceAuth implements QuietCloseable {
     // that simply has nothing to return is unaffected: load() reports that by returning null rather than by
     // throwing, and that latches storeLoadAttempted outright.
     private static final long MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS = 60_000L;
+    /**
+     * Floor on how often {@link #getToken()} will re-attempt a silent refresh after one failed. Without it a
+     * revoked refresh token, or an IdP outage, cost a full token-endpoint round trip on EVERY call - and
+     * getToken() is called once per ILP flush and once per WebSocket (re)connect, so a producer retrying its
+     * rows drove a sustained request flood at the identity provider (enough to trip its rate limits and
+     * lengthen the very outage being retried) while each call blocked the producer for the round trip, up to
+     * httpTimeoutMillis against a black-holed endpoint.
+     * <p>
+     * Deliberately short: this is a stampede guard, not a circuit breaker. A credential that comes back
+     * within seconds is picked up on the next call, and any explicit {@link #signIn()} or
+     * {@link #clearCache()} clears the latch outright.
+     */
+    private static final long MIN_REFRESH_RETRY_INTERVAL_MILLIS = 5_000L;
+    // First non-zero back-off between token store reads; it doubles per consecutive failure, up to
+    // MAX_STORE_LOAD_RETRY_INTERVAL_MILLIS. Same floor as the refresh back-off above, and the same kind of
+    // stampede guard. The FIRST failure arms a ZERO-length back-off, so the very next call still re-reads the
+    // store: a one-shot fault - notably a carried interrupt flag, which makes the InterruptibleChannel under
+    // FileTokenStore throw on a thread that merely carries it - must recover on the next call rather than wait
+    // this out. Anything that survives that free retry needs an operator (a chmod, a remount), so waiting is
+    // no longer costing a recovery that was about to happen anyway.
+    private static final long MIN_STORE_LOAD_RETRY_INTERVAL_MILLIS = 5_000L;
     private static final int POLL_PENDING = 1;
     private static final long POLL_SLEEP_SLICE_MILLIS = 100;
     private static final int POLL_SLOW_DOWN = 2;
@@ -1160,6 +1160,29 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private static void requireSecureIdpEndpoint(Endpoint endpoint, String label, String url, boolean allowInsecureTransport) {
+        // https is always fine; plaintext http is allowed only to a loopback host, where the request never
+        // leaves the machine. allowInsecureTransport relaxes the QuestDB link but never the identity
+        // provider: the device code and refresh token must not cross the network in cleartext (matching
+        // the Python client)
+        if (endpoint.isTls || isLoopbackHost(endpoint.host)) {
+            return;
+        }
+        OidcAuthException ex = new OidcAuthException()
+                .put("the ").put(label).put(" uses insecure http, which would send the device code and ")
+                .put("refresh token across the network in cleartext; use an https url");
+        if (allowInsecureTransport) {
+            ex.put(" (allowInsecureTransport relaxes only the QuestDB connection, not the identity provider endpoints)");
+        }
+        throw ex.put(" [url=").put(url).put(']');
+    }
+    private static void requireSecureTransport(boolean isTls, String label, String url) {
+        if (!isTls) {
+            throw new OidcAuthException()
+                    .put("the ").put(label).put(" uses insecure http, which exposes the OIDC sign-in to network ")
+                    .put("attackers; use an https url, or call allowInsecureTransport(true) to override [url=").put(url).put(']');
+        }
+    }
     /**
      * Requires a well-formed 2xx status before a discovery body is trusted as configuration.
      * <p>
@@ -1211,30 +1234,7 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private static void requireSecureIdpEndpoint(Endpoint endpoint, String label, String url, boolean allowInsecureTransport) {
-        // https is always fine; plaintext http is allowed only to a loopback host, where the request never
-        // leaves the machine. allowInsecureTransport relaxes the QuestDB link but never the identity
-        // provider: the device code and refresh token must not cross the network in cleartext (matching
-        // the Python client)
-        if (endpoint.isTls || isLoopbackHost(endpoint.host)) {
-            return;
-        }
-        OidcAuthException ex = new OidcAuthException()
-                .put("the ").put(label).put(" uses insecure http, which would send the device code and ")
-                .put("refresh token across the network in cleartext; use an https url");
-        if (allowInsecureTransport) {
-            ex.put(" (allowInsecureTransport relaxes only the QuestDB connection, not the identity provider endpoints)");
-        }
-        throw ex.put(" [url=").put(url).put(']');
-    }
 
-    private static void requireSecureTransport(boolean isTls, String label, String url) {
-        if (!isTls) {
-            throw new OidcAuthException()
-                    .put("the ").put(label).put(" uses insecure http, which exposes the OIDC sign-in to network ")
-                    .put("attackers; use an https url, or call allowInsecureTransport(true) to override [url=").put(url).put(']');
-        }
-    }
 
     // package-private, not private: FileTokenStore needs the same treatment for the operator-supplied path
     // its IO errors embed, and a second copy of this walk in the same package would be the thing to avoid.
@@ -2207,6 +2207,15 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
+    private void warnPersistence(String operation, Throwable cause) {
+        // best-effort persistence: warn through SLF4J and carry on with the in-memory token. The store never
+        // puts token bytes in its messages, but an IO error can carry the operator-supplied store path, which
+        // could itself hold terminal-spoofing characters - sanitize the detail before printing, as every other
+        // untrusted display string is sanitized (sanitizeForDisplay is null-safe).
+        String detail = sanitizeForDisplay(cause.getMessage());
+        LOG.warn("OIDC token store {} failed; continuing without persistence{}",
+                operation, detail != null ? " [" + detail + ']' : "");
+    }
     private void wipeCredentialState() {
         // Best effort, and worth being precise about what that means.
         //
@@ -2246,15 +2255,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private void warnPersistence(String operation, Throwable cause) {
-        // best-effort persistence: warn through SLF4J and carry on with the in-memory token. The store never
-        // puts token bytes in its messages, but an IO error can carry the operator-supplied store path, which
-        // could itself hold terminal-spoofing characters - sanitize the detail before printing, as every other
-        // untrusted display string is sanitized (sanitizeForDisplay is null-safe).
-        String detail = sanitizeForDisplay(cause.getMessage());
-        LOG.warn("OIDC token store {} failed; continuing without persistence{}",
-                operation, detail != null ? " [" + detail + ']' : "");
-    }
 
     /**
      * Fluent builder for an {@link OidcDeviceAuth} configured against a known identity provider.

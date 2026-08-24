@@ -836,23 +836,6 @@ public final class FileTokenStore implements TokenStore {
         putString(sink, value);
     }
 
-    // Drops this caller's claim on the identity's lock, retiring the entry when it was the last one, so the
-    // map never outgrows the identities actually in flight. Pairs with retainProcessLock in a finally.
-    private static void releaseProcessLock(String identity) {
-        PROCESS_LOCKS.computeIfPresent(identity, (k, held) -> --held.users == 0 ? null : held);
-    }
-
-    // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
-    // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
-    // it - which is what makes the retirement in releaseProcessLock safe.
-    private static ProcessLock retainProcessLock(String identity) {
-        return PROCESS_LOCKS.compute(identity, (k, existing) -> {
-            final ProcessLock held = existing != null ? existing : new ProcessLock();
-            held.users++;
-            return held;
-        });
-    }
-
     private static byte[] readBounded(Path file) throws IOException {
         // read with a hard cap instead of Files.readAllBytes after a separate Files.size: the file is
         // attacker-writable, so a size-check-then-read races a concurrent grow - a file enlarged past the cap
@@ -881,7 +864,6 @@ public final class FileTokenStore implements TokenStore {
             return bytes;
         }
     }
-
     private static byte[] readLockHolder(Path lock) throws IOException {
         // read the lock's owner stamp with a hard cap rather than Files.readAllBytes: the <hash>.lock file
         // sits in the same attacker-writable directory as the token file, so an inflated lock would otherwise
@@ -909,7 +891,6 @@ public final class FileTokenStore implements TokenStore {
             return bytes;
         }
     }
-
     private static void releaseLock(Path lock, String nonce) {
         // release our own lock only: re-read it (bounded - see readLockHolder) and delete it solely when it
         // still carries our nonce. A hold that outran lockStaleMillis may have been judged stale and stolen
@@ -938,6 +919,15 @@ public final class FileTokenStore implements TokenStore {
                     + "it goes stale [error={}]", OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
         }
     }
+    // Drops this caller's claim on the identity's lock, retiring the entry when it was the last one, so the
+    // map never outgrows the identities actually in flight. Pairs with retainProcessLock in a finally.
+    private static void releaseProcessLock(String identity) {
+        PROCESS_LOCKS.computeIfPresent(identity, (k, held) -> --held.users == 0 ? null : held);
+    }
+
+
+
+
 
     private static void replaceTarget(Path tmp, Path target) throws IOException {
         // atomically rename tmp over target. On Windows a concurrent reader in any process holding target open
@@ -1014,6 +1004,16 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
+    // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
+    // it - which is what makes the retirement in releaseProcessLock safe.
+    private static ProcessLock retainProcessLock(String identity) {
+        return PROCESS_LOCKS.compute(identity, (k, existing) -> {
+            final ProcessLock held = existing != null ? existing : new ProcessLock();
+            held.users++;
+            return held;
+        });
+    }
     private static byte[] serialize(TokenStoreKey key, PersistedToken token) {
         // a null value (an absent audience, or a token kind the grant did not return) is omitted rather than
         // written as JSON null: the JsonLexer reports a bare null and a quoted "null" identically, so omitting
@@ -1263,6 +1263,52 @@ public final class FileTokenStore implements TokenStore {
         return lockNamespace + '\0' + key.hash();
     }
 
+    /**
+     * Puts a captured lock back at {@code lock} after the capture-verify decided it is NOT the abandoned lock
+     * we judged stale - a peer recreated it in the gap, or we could not re-read what we captured.
+     * <p>
+     * Restores by hard-LINKING the capture back to the lock path, not by renaming it. {@code Files.move}
+     * without {@code REPLACE_EXISTING} looks atomic but is not: it stats the target, then renames, and
+     * {@code rename(2)} silently replaces. A third party that claims the freed path between those two steps
+     * therefore had its live lock destroyed by the very call whose comment promised to leave it intact.
+     * {@code link(2)} has no such gap - it fails outright when the target exists - and it preserves the peer's
+     * exact bytes, which matters because {@link #releaseLock} verifies the stamp before deleting.
+     * <p>
+     * A residual remains and is not closeable with a lock file: if a third party did claim the path, we drop
+     * our copy, so the recreating peer's lock file is gone while that peer still believes it holds the lock,
+     * and for that one refresh two holders can run concurrently. A filesystem offers no atomic "delete or
+     * rename only if the content is still X", so the capture-verify narrows the window to this multi-actor
+     * race - our steal, a peer recreating, AND a third party claiming the freed path, all overlapping -
+     * without eliminating it. Best-effort by design: it degrades to one extra refresh, a re-prompt on a
+     * rotating-refresh-token identity provider, never a torn or forged credential (Layer 1's atomic rename
+     * still holds).
+     * <p>
+     * Split out of {@link #stealIfStale} so it can be driven directly. Reaching it through {@code stealIfStale}
+     * needs a peer to replace the lock file between the staleness read and the capture rename, which no test
+     * can force without a production seam - so the whole restore path, the part that keeps a stealer from
+     * destroying a peer's live lock, otherwise ran only in production.
+     *
+     * @param lock     the lock path to restore to
+     * @param captured the private capture name the steal renamed the lock to
+     */
+    private void restoreCapturedLock(Path lock, Path captured) {
+        try {
+            Files.createLink(lock, captured);
+            deleteCapturedLock(captured);
+        } catch (FileAlreadyExistsException e) {
+            // a third party owns the path now; leave their lock untouched and drop our copy
+            deleteCapturedLock(captured);
+        } catch (IOException | UnsupportedOperationException e) {
+            // the filesystem does not support hard links, or the link failed for another reason. Fall back to
+            // the plain move: it preserves the bytes but reopens the stat-then-rename window described above,
+            // which is still better than abandoning the peer's lock outright.
+            try {
+                Files.move(captured, lock);
+            } catch (IOException moveFailure) {
+                deleteCapturedLock(captured);
+            }
+        }
+    }
     private void stealIfStale(Path lock) {
         // Steal a lock abandoned by a crashed holder, but never remove a peer's freshly-created LIVE lock. A
         // bare deleteIfExists(lock) removes whatever sits at the path at that instant - including a fresh lock
@@ -1342,52 +1388,6 @@ public final class FileTokenStore implements TokenStore {
         restoreCapturedLock(lock, captured);
     }
 
-    /**
-     * Puts a captured lock back at {@code lock} after the capture-verify decided it is NOT the abandoned lock
-     * we judged stale - a peer recreated it in the gap, or we could not re-read what we captured.
-     * <p>
-     * Restores by hard-LINKING the capture back to the lock path, not by renaming it. {@code Files.move}
-     * without {@code REPLACE_EXISTING} looks atomic but is not: it stats the target, then renames, and
-     * {@code rename(2)} silently replaces. A third party that claims the freed path between those two steps
-     * therefore had its live lock destroyed by the very call whose comment promised to leave it intact.
-     * {@code link(2)} has no such gap - it fails outright when the target exists - and it preserves the peer's
-     * exact bytes, which matters because {@link #releaseLock} verifies the stamp before deleting.
-     * <p>
-     * A residual remains and is not closeable with a lock file: if a third party did claim the path, we drop
-     * our copy, so the recreating peer's lock file is gone while that peer still believes it holds the lock,
-     * and for that one refresh two holders can run concurrently. A filesystem offers no atomic "delete or
-     * rename only if the content is still X", so the capture-verify narrows the window to this multi-actor
-     * race - our steal, a peer recreating, AND a third party claiming the freed path, all overlapping -
-     * without eliminating it. Best-effort by design: it degrades to one extra refresh, a re-prompt on a
-     * rotating-refresh-token identity provider, never a torn or forged credential (Layer 1's atomic rename
-     * still holds).
-     * <p>
-     * Split out of {@link #stealIfStale} so it can be driven directly. Reaching it through {@code stealIfStale}
-     * needs a peer to replace the lock file between the staleness read and the capture rename, which no test
-     * can force without a production seam - so the whole restore path, the part that keeps a stealer from
-     * destroying a peer's live lock, otherwise ran only in production.
-     *
-     * @param lock     the lock path to restore to
-     * @param captured the private capture name the steal renamed the lock to
-     */
-    private void restoreCapturedLock(Path lock, Path captured) {
-        try {
-            Files.createLink(lock, captured);
-            deleteCapturedLock(captured);
-        } catch (FileAlreadyExistsException e) {
-            // a third party owns the path now; leave their lock untouched and drop our copy
-            deleteCapturedLock(captured);
-        } catch (IOException | UnsupportedOperationException e) {
-            // the filesystem does not support hard links, or the link failed for another reason. Fall back to
-            // the plain move: it preserves the bytes but reopens the stat-then-rename window described above,
-            // which is still better than abandoning the peer's lock outright.
-            try {
-                Files.move(captured, lock);
-            } catch (IOException moveFailure) {
-                deleteCapturedLock(captured);
-            }
-        }
-    }
 
     private void sweepStaleTempFiles(String hashPrefix) {
         // a crash between createTempFile and the atomic rename orphans a <hash>*.tmp holding a

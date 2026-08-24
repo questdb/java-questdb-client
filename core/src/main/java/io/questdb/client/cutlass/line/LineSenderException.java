@@ -73,24 +73,6 @@ public class LineSenderException extends RuntimeException {
         this.retryable = false;
     }
 
-    /**
-     * Whether the sender classified this failure as worth retrying - a 5xx, a 429, a transport error - as
-     * opposed to one that will keep failing, such as a 401 or a malformed request.
-     * <p>
-     * This is the flag the class documentation above tells a caller to act on: a transient error means call
-     * {@code flush()} again on the same sender, a permanent one means close it or {@code reset()}. It was
-     * accepted by the {@link #LineSenderException(CharSequence, boolean)} constructor and then discarded,
-     * so the sender computed the answer and no caller could read it.
-     * <p>
-     * {@code false} means "not classified as retryable", not "proven permanent": the constructors that carry
-     * no classification - a bare message, a wrapped cause - report {@code false}, which is the conservative
-     * direction for a caller that retries only on {@code true}.
-     *
-     * @return true when the sender classified this failure as retryable
-     */
-    public boolean isRetryable() {
-        return retryable;
-    }
 
     public LineSenderException appendIPv4(int ip) {
         Net.appendIP4(message, ip);
@@ -114,6 +96,24 @@ public class LineSenderException extends RuntimeException {
         return errNoRender + " " + message;
     }
 
+    /**
+     * Whether the sender classified this failure as worth retrying - a 5xx, a 429, a transport error - as
+     * opposed to one that will keep failing, such as a 401 or a malformed request.
+     * <p>
+     * This is the flag the class documentation above tells a caller to act on: a transient error means call
+     * {@code flush()} again on the same sender, a permanent one means close it or {@code reset()}. It was
+     * accepted by the {@link #LineSenderException(CharSequence, boolean)} constructor and then discarded,
+     * so the sender computed the answer and no caller could read it.
+     * <p>
+     * {@code false} means "not classified as retryable", not "proven permanent": the constructors that carry
+     * no classification - a bare message, a wrapped cause - report {@code false}, which is the conservative
+     * direction for a caller that retries only on {@code true}.
+     *
+     * @return true when the sender classified this failure as retryable
+     */
+    public boolean isRetryable() {
+        return retryable;
+    }
     public LineSenderException put(char ch) {
         message.put(ch);
         return this;
