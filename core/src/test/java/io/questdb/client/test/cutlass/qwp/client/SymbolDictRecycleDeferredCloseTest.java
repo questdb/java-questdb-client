@@ -52,9 +52,12 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * returns with the slot flock retained and its release deferred to the
  * worker's exit path. The recycle must await that release before rebuilding on
  * the slot -- rebuilding against the retained flock throws
- * {@code SlotLockContentionException} and would latch the sender permanently
- * terminal for what is usually a transient disk stall. Only exhausting the
- * await budget (a genuinely dead worker) may latch terminal.
+ * {@code SlotLockContentionException} and would fail the recycle for what is
+ * usually a transient disk stall. Exhausting the await budget does not latch
+ * the sender terminal either (review r3, C2): it throws to the triggering
+ * caller and leaves the recycle pending in its {@code RecycleResume.REBUILD}
+ * state, so each later send retries the await, and one of them finishes the
+ * swap once the worker finally exits. Nothing on this path is terminal.
  * <p>
  * The wedge: {@code SegmentManager}'s trim-sync hook runs unconditionally once
  * per service pass, so parking the worker there leaves it un-joinable exactly
@@ -117,13 +120,22 @@ public class SymbolDictRecycleDeferredCloseTest {
                         sender.resetSymbolDictionary();
                         Assert.assertTrue(ws.isResetArmed());
 
+                        // Positive witness that the await really parked (M15).
+                        // A sleep could not tell "the await is parked" from
+                        // "the close completed inline and the test skipped the
+                        // code under test"; this fires from inside the await's
+                        // own deferred-close branch.
+                        CountDownLatch parked = new CountDownLatch(1);
+                        ws.setDeferredCloseParkWitnessForTesting(parked::countDown);
+
                         // Un-wedges the worker while the recycle is parked in its
                         // deferred-close await. The pre-release assert can never
                         // race: the flock release needs the worker's exit, which
                         // needs this very countDown.
                         releaser = new Thread(() -> {
                             try {
-                                Thread.sleep(1_500L);
+                                Assert.assertTrue("the await must actually park",
+                                        parked.await(10, TimeUnit.SECONDS));
                                 Assert.assertFalse(
                                         "deferred close cannot complete while the worker is wedged",
                                         outgoing.isCloseCompleted());
@@ -175,15 +187,17 @@ public class SymbolDictRecycleDeferredCloseTest {
     }
 
     /**
-     * A permanent wedge: the await budget (shrunk via the test seam) runs out
-     * with the flock still held -- a genuinely dead worker. The recycle must
-     * latch terminal BEFORE committing any of the swap (epoch stays 0), and
-     * the still-locked engine must stay reachable through
-     * {@code isSlotLockReleased()}'s re-probe so the slot's capacity is
-     * recoverable if the worker ever exits.
+     * A wedge that outlives the await budget (shrunk via the test seam): every
+     * send while the worker is stuck runs the await afresh and throws again,
+     * and none of them may commit any part of the swap (epoch stays 0). The
+     * repeated throw is NOT a latch, which the tail proves: once the worker
+     * exits, the still-locked engine's late release becomes visible through
+     * {@code isSlotLockReleased()}'s retained-engine re-probe -- so the slot's
+     * capacity is recoverable -- and the very next send resumes the pending
+     * recycle and completes it. A latched sender could do neither.
      */
     @Test(timeout = 60_000L)
-    public void testRecycleLatchesTerminalWhenDeferredCloseNeverReleases() throws Exception {
+    public void testExhaustedDeferredCloseAwaitKeepsThrowingWhileWedged() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-deferred-timeout").toString();
             try (TestWebSocketServer server = ackingServer()) {
@@ -228,8 +242,8 @@ public class SymbolDictRecycleDeferredCloseTest {
 
                         try {
                             sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
-                            Assert.fail("expected the recycle to latch terminal once the "
-                                    + "deferred-close await budget ran out");
+                            Assert.fail("expected the exhausted deferred-close await to throw "
+                                    + "while the worker stays wedged");
                         } catch (LineSenderException e) {
                             TestUtils.assertContains(e.getMessage(),
                                     "deferred close did not release the slot lock");
@@ -237,13 +251,16 @@ public class SymbolDictRecycleDeferredCloseTest {
 
                         // The await runs at step 3, before the step-5 swap: no
                         // epoch may have committed, and every later entry point
-                        // must rethrow the latched failure.
+                        // re-runs the await and throws the same transient
+                        // verdict for as long as the worker stays wedged.
                         Assert.assertEquals("the swap must not have committed",
                                 0, ws.getSymbolDictEpoch());
                         try {
                             sender.table("t");
-                            Assert.fail("expected a latched terminal sender to rethrow");
-                        } catch (LineSenderException expected) {
+                            Assert.fail("expected the retried await to throw again");
+                        } catch (LineSenderException e) {
+                            TestUtils.assertContains(e.getMessage(),
+                                    "deferred close did not release the slot lock");
                         }
                         Assert.assertFalse("the slot flock is still held by the wedged engine",
                                 ws.isSlotLockReleased());
@@ -261,6 +278,17 @@ public class SymbolDictRecycleDeferredCloseTest {
                                 outgoing.isCloseCompleted());
                         Assert.assertTrue("sender must expose the late flock release",
                                 ws.isSlotLockReleased());
+
+                        // The proof that none of the throws above latched: the
+                        // next send resumes the pending recycle and commits it.
+                        sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                        Assert.assertEquals("the pending recycle must complete once the wedge "
+                                + "clears", 1, ws.getSymbolDictEpoch());
+                        long fsn2 = sender.flushAndGetSequence();
+                        Assert.assertTrue("post-resume batch must still get acked",
+                                sender.awaitAckedFsn(fsn2, 5_000));
+                        Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
+                                + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']', fsn2 > fsn1);
                     } finally {
                         manager.setBeforeTrimSyncHook(null);
                         releaseWorker.countDown();

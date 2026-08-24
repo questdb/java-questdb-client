@@ -3310,9 +3310,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * {@code slotPath}'s logical lock. {@link #build} itself does not call this --
          * its own lock spans the connect loop too, see the comment at its call site --
          * this entry point is for callers that only need a freshly (re)built engine on
-         * an already-owned slot, such as a symbol-dictionary epoch rebuild. Discards the
-         * quarantined verdict: a recycle rebuild latches terminal on connect failure
-         * rather than quarantining, so it has no connect-loop retry guard to seed.
+         * an already-owned slot, such as a symbol-dictionary epoch rebuild. Recovery
+         * verdicts still quarantine here exactly as they do under {@link #build} --
+         * that happens inside {@link #constructEngineOnSlotLocked}. Only the
+         * quarantined FLAG is discarded: it exists to seed {@code build}'s connect-loop
+         * retry guard, and a recycle rebuild has no such loop. A rebuild that fails
+         * outright does not latch the sender terminal either; the recycle abandons and
+         * retries on the next send.
          */
         static CursorSendEngine constructEngineOnSlot(
                 String sfDir, String senderId, String slotPath,

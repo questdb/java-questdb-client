@@ -276,6 +276,10 @@ public class QwpWebSocketSender implements Sender {
     private volatile CursorSendEngine cursorEngine;
     private CursorWebSocketSendLoop cursorSendLoop;
     private boolean deferCommit;
+    // Test seam: runs once when awaitDeferredEngineClose() actually begins
+    // parking (positive witness that the await engaged rather than
+    // completing inline -- see SymbolDictRecycleDeferredCloseTest).
+    private Runnable deferredCloseParkWitness;
     // True when the sender emits incremental (delta) symbol dictionaries: each
     // message carries only symbol ids not yet sent on the wire, rather than the
     // full dictionary from id 0. Enabled in memory-mode (a reconnect replays from
@@ -2951,6 +2955,17 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Installs the positive witness {@link #awaitDeferredEngineClose} runs
+     * once it actually begins parking, so a test can prove the await engaged
+     * instead of completing inline -- see
+     * {@code SymbolDictRecycleDeferredCloseTest}.
+     */
+    @TestOnly
+    public void setDeferredCloseParkWitnessForTesting(Runnable witness) {
+        this.deferredCloseParkWitness = witness;
+    }
+
     public void setEngineRebuildFactory(EngineRebuildFactory factory) {
         this.engineRebuildFactory = factory;
     }
@@ -4850,6 +4865,10 @@ public class QwpWebSocketSender implements Sender {
         LOG.warn("symbol dictionary recycle waiting for a deferred engine close: the SF worker "
                 + "did not quiesce, so the slot lock is still held [maxWaitMillis={}]",
                 recycleDeferredCloseMaxWaitMillis);
+        Runnable witness = deferredCloseParkWitness;
+        if (witness != null) {
+            witness.run();
+        }
         long deadlineNanos = System.nanoTime() + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         while (!outgoing.isCloseCompleted()) {
             if (System.nanoTime() >= deadlineNanos) {
@@ -4903,22 +4922,19 @@ public class QwpWebSocketSender implements Sender {
             // unlink on its own close. Heal by doing exactly that. Only a
             // recovery holding UNACKED frames is a genuine breach: latch.
             if (rebuilt.publishedFsn() > rebuilt.ackedFsn()) {
-                LineSenderException breach = new LineSenderException(
-                        "symbol dictionary recycle rebuilt on a slot holding unacknowledged "
-                                + "frames: the outgoing engine's fully-drained close contract "
-                                + "was breached");
-                recycleFailure = breach;
-                recycleResume = RecycleResume.NONE;
-                closeQuietly(rebuilt);
-                LOG.error("symbol dictionary recycle failed; sender is now terminal "
-                        + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, breach);
-                throw breach;
+                throw latchRecycleBreach(rebuilt, dictSizeAtSwap);
             }
             closeQuietly(rebuilt); // fully drained: retries the segment unlink
             rebuilt = rebuildEngineOrAbandon(
                     "symbol dictionary recycle could not rebuild its engine after healing "
                             + "leftover acked segments; retried on the next send");
             if (rebuilt.wasRecoveredFromDisk()) {
+                // Re-check: a breach the first pass could not see (the heal's
+                // close reshaped what recovery finds) must latch here too,
+                // otherwise it loops forever behind a resumable "acked" message.
+                if (rebuilt.publishedFsn() > rebuilt.ackedFsn()) {
+                    throw latchRecycleBreach(rebuilt, dictSizeAtSwap);
+                }
                 closeQuietly(rebuilt);
                 throw new LineSenderException(
                         "symbol dictionary recycle keeps recovering leftover acked segments "
@@ -4997,6 +5013,28 @@ public class QwpWebSocketSender implements Sender {
     private boolean isRingDrained() {
         long published = cursorEngine.publishedFsn();
         return published < 0 || cursorEngine.ackedFsn() >= published;
+    }
+
+    /**
+     * The recycle's one non-resumable verdict: a rebuild recovered UNACKED
+     * frames from the slot the outgoing engine's fully-drained close was
+     * supposed to have emptied, so the producer's fresh dictionary and the
+     * slot's on-disk state have genuinely diverged. Latches
+     * {@link #recycleFailure}, disposes the rebuilt engine, and always throws
+     * -- the declared return type only lets callers write
+     * {@code throw latchRecycleBreach(...)}.
+     */
+    private RuntimeException latchRecycleBreach(CursorSendEngine rebuilt, int dictSizeAtSwap) {
+        LineSenderException breach = new LineSenderException(
+                "symbol dictionary recycle rebuilt on a slot holding unacknowledged "
+                        + "frames: the outgoing engine's fully-drained close contract "
+                        + "was breached");
+        recycleFailure = breach;
+        recycleResume = RecycleResume.NONE;
+        closeQuietly(rebuilt);
+        LOG.error("symbol dictionary recycle failed; sender is now terminal "
+                + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, breach);
+        throw breach;
     }
 
     /**
@@ -5219,7 +5257,7 @@ public class QwpWebSocketSender implements Sender {
             LOG.warn("symbol dictionary recycle abandoned: closing the outgoing I/O loop "
                     + "failed; the close is finished on the next send [epoch={}]",
                     symbolDictEpoch, t);
-            rethrowRecycleAbandoned(t, "symbol dictionary recycle abandoned while closing "
+            throw rethrowRecycleAbandoned(t, "symbol dictionary recycle abandoned while closing "
                     + "the outgoing I/O loop; retried on the next send");
         }
         // step 3: fully-drained close of the engine - empties the slot and
@@ -5272,7 +5310,7 @@ public class QwpWebSocketSender implements Sender {
             } catch (Error e) {
                 throw e;
             } catch (Throwable t) {
-                rethrowRecycleAbandoned(t, "the outgoing I/O loop is still stopping; "
+                throw rethrowRecycleAbandoned(t, "the outgoing I/O loop is still stopping; "
                         + "retried on the next send");
             }
             hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
@@ -5304,7 +5342,12 @@ public class QwpWebSocketSender implements Sender {
         completeRecycleRebuild(globalSymbolDictionary.size(), System.nanoTime());
     }
 
-    private void rethrowRecycleAbandoned(Throwable t, String message) {
+    /**
+     * Always throws; the declared return type exists purely so every caller
+     * can write {@code throw rethrowRecycleAbandoned(...)} and make an
+     * accidental fall-through past an abandoned recycle unrepresentable.
+     */
+    private RuntimeException rethrowRecycleAbandoned(Throwable t, String message) {
         if (t instanceof Error) {
             throw (Error) t;
         }
