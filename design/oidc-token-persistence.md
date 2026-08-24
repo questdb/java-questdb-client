@@ -312,6 +312,25 @@ whole reason persistence is **opt-in**. Mitigations, mapped to PR #52's existing
   whichever operation, load *or* save — touches the store first consumes the one observation,
   and every entry left behind is one no later call can distrust. Each identity then re-signs
   in. Best-effort: a delete that fails must degrade to a sign-in, never throw.
+- **The distrust must outlive the chmod: an `.untrusted` sentinel.** The directory-wide discard
+  closes the *sequential* case (whoever touches the store first sweeps everything, so a later
+  call finds nothing to distrust). It does **not** by itself close the *concurrent* one:
+  tightening the permissions and sweeping the entries are two steps, and a second caller —
+  another thread, or another process — that reads the permissions in the window between them
+  sees an owner-only directory with the planted entries still in it, computes "trusted", and
+  adopts a plant. To close that window a client MUST make the distrust survive the chmod with an
+  on-disk marker. Before tightening the permissions, drop a sentinel file named `.untrusted`
+  (0600, empty, no secret) in the store directory; treat the directory as untrusted whenever
+  that sentinel is present, **whatever the permission bits say**; and remove it only after a
+  **complete** directory-wide sweep — leave it in place if the directory could not be listed or
+  any delete failed, so the next caller re-sweeps before anything trusts it. The sentinel's name
+  has no `<hex>` store prefix, so the directory sweep never mistakes it for an entry to delete;
+  a client sweeping the directory MUST likewise leave it alone. The Python client MUST mirror
+  this: same name, dropped before the chmod, cleared only after a clean sweep. Residual: an
+  attacker who both planted an entry *and* actively deletes the sentinel in the sub-syscall
+  window between the drop and the chmod can still race a concurrent trust — a far narrower window
+  than the tighten-to-sweep gap this closes, and Layer 1's atomic replacement still guarantees no
+  torn or forged credential.
 - **Never log/echo secrets.** The store never logs token contents and never embeds file
   contents in an exception, upholding PR #52's "tokens never leak into logs or exceptions"
   rule. Only paths and `IOException` kinds appear in the one best-effort warning.

@@ -1842,6 +1842,115 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testAnUntrustedSentinelKeepsAnOwnerOnlyDirectoryDistrusted() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The invariant the concurrent fix rests on, pinned directly: while the .untrusted sentinel is
+            // present, the directory is distrusted whatever its permission bits say. It reconstructs, without
+            // threads, the state a second caller observes mid-race - a peer detected the world-writable
+            // directory, dropped the sentinel and chmodded to 0700, but has not yet swept - an owner-only
+            // directory that still holds a valid-looking entry AND the sentinel. A loader that trusts on the
+            // bits alone adopts the entry; it must not.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("baseline: an entry in an owner-only directory is trusted", store.load(key));
+            Assert.assertEquals("baseline: the directory is owner-only", OWNER_ONLY_DIR_PERMS,
+                    Files.getPosixFilePermissions(dir));
+
+            // mark untrusted while leaving the permissions owner-only: the "tightened but not yet swept" state
+            Path sentinel = dir.resolve(".untrusted");
+            Files.write(sentinel, new byte[0]);
+
+            Assert.assertNull("a marked directory must be distrusted even while it looks owner-only",
+                    store.load(key));
+            Assert.assertFalse("the entry under a marked directory must be discarded",
+                    Files.exists(tokenFile(dir, key)));
+            Assert.assertFalse("a complete sweep must clear the sentinel", Files.exists(sentinel));
+
+            // recovery: with the sentinel gone the store trusts the owner-only directory again
+            store.save(key, sampleToken("ACCESS-2", "REFRESH-2"));
+            PersistedToken reloaded = store.load(key);
+            Assert.assertNotNull(reloaded);
+            Assert.assertEquals("REFRESH-2", reloaded.getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testConcurrentLoadDistrustsTheDirectoryTightenedButNotYetSwept() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The concurrent case the sibling sequential verdict tests cannot reach. restrictToOwner tightens
+            // the directory to 0700 and returns the verdict in one breath, but the planted entries are not
+            // swept until discardUntrustedDirectoryContents runs afterwards. A SECOND caller - another thread
+            // or process - that reads the permissions in the gap between the chmod and the sweep sees an
+            // owner-only directory with the plant still in it and, on the permission bits alone, would trust
+            // it. The .untrusted sentinel dropped before the chmod is what it must distrust through instead.
+            //
+            // beforeUntrustedDiscardHook drops us into exactly that gap: it fires after the tighten-and-mark,
+            // before the sweep. From inside it a fresh store (no hook) loads the OTHER identity over the
+            // tightened directory - the second caller - and must refuse the plant. No real concurrency can
+            // force a peer into this sub-syscall gap deterministically, which is why the seam exists (as
+            // beforeCaptureHook does for stealIfStale).
+            Path dir = storeDir();
+            FileTokenStore first = new FileTokenStore(dir);
+            FileTokenStore second = new FileTokenStore(dir);
+            TokenStoreKey a = sampleKey();
+            TokenStoreKey b = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid profile", null, false);
+            Assert.assertNotEquals("the two identities must address different files", a.hash(), b.hash());
+
+            first.save(a, sampleToken("ACCESS-A", "REFRESH-A"));
+            first.save(b, sampleToken("ACCESS-B", "REFRESH-B"));
+
+            // the window: while this stands, any local user can replace either entry
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            byte[] planted = Files.readAllBytes(tokenFile(dir, b));
+            Files.write(tokenFile(dir, b),
+                    new String(planted, StandardCharsets.UTF_8)
+                            .replace("REFRESH-B", "REFRESH-PLANTED")
+                            .getBytes(StandardCharsets.UTF_8));
+
+            AtomicReference<PersistedToken> secondSaw = new AtomicReference<>();
+            AtomicReference<Set<PosixFilePermission>> permsInGap = new AtomicReference<>();
+            AtomicBoolean plantPresentInGap = new AtomicBoolean();
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeUntrustedDiscardHook");
+            hookField.setAccessible(true);
+            hookField.set(first, (Runnable) () -> {
+                try {
+                    permsInGap.set(Files.getPosixFilePermissions(dir));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+                plantPresentInGap.set(Files.exists(tokenFile(dir, b)));
+                secondSaw.set(second.load(b));
+            });
+
+            // A refuses its own identity AND, through the hook, drives the concurrent B into the gap
+            Assert.assertNull("A must refuse an entry from a world-writable directory", first.load(a));
+
+            Assert.assertEquals("the directory was already tightened to 0700 when B observed it",
+                    OWNER_ONLY_DIR_PERMS, permsInGap.get());
+            Assert.assertTrue("the plant was still present when B observed it - the sweep had not run yet",
+                    plantPresentInGap.get());
+            Assert.assertNull("B must NOT adopt the plant it saw over the tightened directory: the .untrusted "
+                    + "sentinel dropped before the chmod carries the distrust the chmod would otherwise erase",
+                    secondSaw.get());
+            Assert.assertFalse("the plant must be discarded, not left for the next load",
+                    Files.exists(tokenFile(dir, b)));
+
+            // the store recovers over the tightened directory: the sentinel is gone and both identities work
+            first.save(a, sampleToken("ACCESS-A2", "REFRESH-A2"));
+            first.save(b, sampleToken("ACCESS-B2", "REFRESH-B2"));
+            Assert.assertEquals("REFRESH-A2", first.load(a).getRefreshToken());
+            Assert.assertEquals("REFRESH-B2", first.load(b).getRefreshToken());
+        });
+    }
+
+    @Test
     public void testLoadThrowsRatherThanReportsEmptyWhenTheDirectoryIsUnusable() throws Exception {
         assertMemoryLeak(() -> {
             // Same fixture as testInLockDegradesWhenDirectoryUnusable: a regular file standing where the

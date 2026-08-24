@@ -204,6 +204,17 @@ public final class FileTokenStore implements TokenStore {
     private static final int REPLACE_MAX_ATTEMPTS = 5;
     private static final long REPLACE_RETRY_SLEEP_MILLIS = 20L;
     private static final int SCHEMA_VERSION = 1;
+    // Name of the "this directory is untrusted" sentinel, dropped into the store directory the instant
+    // restrictToOwner finds it writable by other local users - BEFORE it tightens the permissions to 0700.
+    // The chmod that publishes owner-only to every other process also erases the evidence the directory was
+    // ever exposed, so a concurrent caller reading the permissions in the window between that chmod and the
+    // discard sweep would see an owner-only directory, judge it trusted, and adopt an entry a local attacker
+    // planted while it stood open. The sentinel outlives the chmod: discardUntrustedDirectoryContents removes
+    // it only after it has swept every untrusted entry, and every trust check treats its presence as
+    // untrusted whatever the permission bits say. Its name has no 64-hex store prefix, so the sweep never
+    // mistakes it for an entry to delete, and it carries no secret. Part of the frozen cross-language
+    // contract (design/oidc-token-persistence.md), so the Python client marks and clears the same name.
+    private static final String UNTRUSTED_SENTINEL_NAME = ".untrusted";
     // set once if the platform cannot enforce owner-only POSIX permissions on the token files (e.g. Windows),
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
     // (compareAndSet, so a race between two threads still prints a single warning)
@@ -218,6 +229,14 @@ public final class FileTokenStore implements TokenStore {
     // to reach stealIfStale from the separate test module.
     @TestOnly
     private volatile Runnable beforeCaptureHook;
+    // Test seam, null in production: runs at the top of discardUntrustedDirectoryContents, in the window
+    // AFTER restrictToOwner has tightened the directory to 0700 and dropped the untrusted sentinel but
+    // BEFORE the sweep clears it. That window is the one a concurrent caller must still distrust through,
+    // and no amount of real concurrency forces a peer into it deterministically - so the test drops a
+    // second, hookless store's load() into it from here to prove it refuses a plant over the tightened
+    // directory. Installed reflectively, like beforeCaptureHook.
+    @TestOnly
+    private volatile Runnable beforeUntrustedDiscardHook;
     private final Path directory;
     private final long lockAcquireBudgetMillis;
     // Namespaces this store's entries in PROCESS_LOCKS, so two stores over DIFFERENT directories never
@@ -975,56 +994,6 @@ public final class FileTokenStore implements TokenStore {
         throw lastDenied;
     }
 
-    /**
-     * Re-asserts owner-only permissions on the store directory. The at-rest protection of the plaintext token
-     * files is exactly these permissions, so a pre-existing directory another tool or a permissive umask left
-     * loose is tightened rather than trusted as it stands. ensureDirectory runs this on every save and every
-     * inLock, so it chmods only on detected drift - the common case costs one stat and no write syscall.
-     * <p>
-     * NOT best-effort on the failure that matters. An {@code IOException} here means the directory is not ours
-     * to chmod, which is precisely the state in which the documented {@code 0700} protection does not hold and
-     * another local user can create, replace or delete entries in it. Swallowing it left every caller believing
-     * the protection applied. Callers degrade on the throw, each in the way that suits it: {@code save} refuses
-     * to write a plaintext refresh token into a directory it cannot protect, {@code inLock} runs lock-free.
-     * On a non-POSIX filesystem (Windows) the check is unavailable rather than failed, so it falls back to the
-     * inherited ACL as before (owner-only hardening there, via AclFileAttributeView, is a separate follow-up).
-     *
-     * @param directory the store directory, which must already exist
-     * @return {@code true} when the directory's content may be trusted, {@code false} when it was writable
-     *         by group or other, so another local user could have planted an entry before this call
-     *         tightened it
-     * @throws IOException if the directory exists but its permissions cannot be read or set
-     */
-    private static boolean restrictToOwner(Path directory) throws IOException {
-        try {
-            final Set<PosixFilePermission> perms = Files.getPosixFilePermissions(directory);
-            // Writable by group or other is the state that decides TRUST, and it is narrower than "not
-            // owner-only": only write permission on a directory lets another local user create or replace an
-            // entry in it, which is what load() would then adopt. The 0755 a default umask produces exposes
-            // no token - the files themselves are 0600 - and everything in it was still put there by us, so
-            // it is tightened for defence in depth but its content stays trusted.
-            final boolean wasOtherWritable = perms.contains(PosixFilePermission.GROUP_WRITE)
-                    || perms.contains(PosixFilePermission.OTHERS_WRITE);
-            if (!DIR_PERMS.equals(perms)) {
-                // Tightening is load-bearing - it IS the at-rest protection of the plaintext token files, so
-                // it stays unconditional - but it changes a directory the operator chose and may share with
-                // something else, so it must not be silent. Once per JVM, and never naming the path.
-                if (warnedTightenedStoreDir.compareAndSet(false, true)) {
-                    LOG.warn("the OIDC token store directory was not owner-only and has been tightened to "
-                            + "0700; it holds plaintext refresh tokens, so it must not be shared with "
-                            + "anything else. Point questdb.client.oidc.token.store.dir at a directory of "
-                            + "its own if another tool needs access to that path.");
-                }
-                Files.setPosixFilePermissions(directory, DIR_PERMS);
-            }
-            return !wasOtherWritable;
-        } catch (UnsupportedOperationException e) {
-            // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
-            warnNoPosixPermsOnce();
-            return true;
-        }
-    }
-
     // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
     // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
     // it - which is what makes the retirement in releaseProcessLock safe.
@@ -1164,6 +1133,19 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    private void clearUntrusted() {
+        // Remove the untrusted sentinel once discardUntrustedDirectoryContents has swept every untrusted
+        // entry, so a later caller may trust the owner-only directory again. Called ONLY after a complete
+        // sweep: while any untrusted entry might remain, the sentinel must stay so the next caller re-sweeps
+        // rather than trusting a directory that still holds a plant. Best-effort - a failure here just leaves
+        // the directory marked untrusted, so the next caller sweeps again; it never fails a sign-in.
+        try {
+            Files.deleteIfExists(untrustedSentinel());
+        } catch (IOException ignore) {
+            // best-effort; the sentinel stays and the next caller re-sweeps
+        }
+    }
+
     private Path createTempFile(String prefix) throws IOException {
         try {
             return Files.createTempFile(directory, prefix, ".tmp", FILE_ATTRS);
@@ -1175,35 +1157,53 @@ public final class FileTokenStore implements TokenStore {
     }
 
     /**
-     * Discards EVERY entry in the store directory, and warns once, after {@link #restrictToOwner(Path)} has
-     * reported it was writable by other local users.
+     * Discards EVERY entry in the store directory, warns once, and lifts the untrusted sentinel on a clean
+     * sweep - run after {@link #restrictToOwner()} has reported the directory was writable by other local
+     * users, or has found the sentinel still standing from an earlier such report.
      * <p>
      * Discarding only the caller's own {@code <hash>.json} is not enough, because the verdict is destroyed by
      * the act of reporting it: restrictToOwner chmods the directory to 0700 as it returns, so whichever
-     * caller touches the store first consumes the one observation. Every later load - in this process or the
-     * next - then sees an owner-only directory and adopts whatever entry is sitting there, including one
-     * planted while the directory stood open. One store directory holds one file per configuration and is
-     * documented as belonging to the store alone, so once it has been writable by other local users nothing
-     * in it can be told apart from a plant: all of it goes, and each identity re-signs in.
+     * caller touches the store first consumes the one permission-based observation. Every later load - in
+     * this process or the next - would then see an owner-only directory and adopt whatever entry is sitting
+     * there, including one planted while the directory stood open. Two defences combine: this method discards
+     * ALL entries, not just the key being loaded (one store directory holds one file per configuration and is
+     * documented as the store's alone, so once other local users could write it nothing in it can be told
+     * apart from a plant); and restrictToOwner drops the {@code .untrusted} sentinel before the chmod so the
+     * verdict survives it, which this method clears only after a COMPLETE sweep. A concurrent caller reading
+     * the tightened permissions before that clear still finds the sentinel and distrusts - the gap the
+     * directory-wide sweep alone leaves open. Each identity then re-signs in.
      * <p>
      * Best-effort by design. This runs on the flush path through {@code OidcDeviceAuth.getToken()}, so a
      * delete that fails must degrade to a refresh or an interactive sign-in rather than throw - and the
-     * caller that triggered it fails closed either way, whether or not the file goes.
+     * caller that triggered it fails closed either way, whether or not the file goes. A failed or partial
+     * sweep leaves the sentinel in place, so the next caller re-sweeps before anything trusts the directory.
      */
     private void discardUntrustedDirectoryContents() {
         warnUnprotectedStoreDirOnce("it was writable by other local users; every entry found in it was "
                 + "discarded rather than trusted, and a fresh sign-in is required");
+        final Runnable hook = beforeUntrustedDiscardHook;
+        if (hook != null) {
+            // test seam: fires with the directory already tightened to 0700 and marked untrusted, but
+            // before the sweep below - the exact window a concurrent caller must still distrust through
+            hook.run();
+        }
+        // Track a COMPLETE sweep. The untrusted sentinel is lifted only when every untrusted entry is gone;
+        // if the directory could not be listed or any delete failed, an entry may remain, so the sentinel
+        // stays and the next caller re-sweeps before anything trusts the now owner-only directory.
+        boolean sweptClean = true;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
             for (Path entry : stream) {
                 final String name = entry.getFileName().toString();
                 // Only files THIS STORE could have written. Every one of them is named after a 64-hex
                 // identity fingerprint - tokenFile() builds "<hash>.json" and writeTemp() asks
                 // createTempFile() for "<hash><random>.tmp" - so a name without that prefix belongs to
-                // whatever else shares the directory. Without this test the filter below reads as "any
-                // .json file", and the operator who pointed questdb.client.oidc.token.store.dir at a
-                // directory holding their own config loses it on the first load(). The directory being
-                // group-writable is what brought us here; it is not a licence to delete files we did not
-                // write. sweepTempFiles() already scopes itself this way, by hash prefix.
+                // whatever else shares the directory (the untrusted sentinel included, whose name has no such
+                // prefix, so it is never swept as an entry - clearUntrusted removes it below). Without this
+                // test the filter below reads as "any .json file", and the operator who pointed
+                // questdb.client.oidc.token.store.dir at a directory holding their own config loses it on the
+                // first load(). The directory being group-writable is what brought us here; it is not a
+                // licence to delete files we did not write. sweepTempFiles() already scopes itself this way,
+                // by hash prefix.
                 if (!hasStoreHashPrefix(name)) {
                     continue;
                 }
@@ -1221,18 +1221,28 @@ public final class FileTokenStore implements TokenStore {
                 try {
                     Files.deleteIfExists(entry);
                 } catch (IOException ignore) {
-                    // best-effort; skip this entry, the caller still fails closed
+                    // best-effort; skip this entry, the caller still fails closed. Leave the directory marked
+                    // untrusted (below) so a later call retries the delete before anything adopts what is left.
+                    sweptClean = false;
                 }
             }
         } catch (IOException ignore) {
-            // best-effort; an unreadable directory must not turn a fail-closed load into a thrown one
+            // best-effort; an unreadable directory must not turn a fail-closed load into a thrown one. The
+            // sweep is incomplete, so the sentinel stays and the next caller re-sweeps.
+            sweptClean = false;
+        }
+        if (sweptClean) {
+            // Every untrusted entry is gone, so lift the distrust: a later caller may trust the owner-only
+            // directory again. Until this point the sentinel is the only thing keeping a concurrent caller
+            // from adopting an entry over a directory restrictToOwner's chmod already made look owner-only.
+            clearUntrusted();
         }
     }
 
     /**
      * Creates the store directory owner-only when absent, and asserts it is owner-only either way.
      *
-     * @return {@code true} when the directory's content may be trusted - see {@link #restrictToOwner(Path)}
+     * @return {@code true} when the directory's content may be trusted - see {@link #restrictToOwner()}
      * @throws IOException if the directory cannot be created, or exists and cannot be made owner-only
      */
     private boolean ensureDirectory() throws IOException {
@@ -1251,7 +1261,7 @@ public final class FileTokenStore implements TokenStore {
         // createDirectories" is not evidence the directory is ours. That window is exactly the hostile
         // local pre-create this method exists to defeat. Re-asserting here also covers ordinary drift on a
         // pre-existing directory (another tool, a permissive umask), which is what the old branch handled.
-        return restrictToOwner(directory);
+        return restrictToOwner();
     }
 
     private boolean isOlderThan(Path lock, long thresholdMillis) {
@@ -1265,6 +1275,23 @@ public final class FileTokenStore implements TokenStore {
 
     private Path lockFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".lock");
+    }
+
+    private void markUntrusted() {
+        // Drop the untrusted sentinel. Reached only from restrictToOwner's POSIX path (getPosixFilePermissions
+        // has already succeeded), so FILE_ATTRS is supported here. Already-present - a concurrent caller, or a
+        // previous run - is success. Any other failure is swallowed rather than propagated: the caller that
+        // triggered it still returns untrusted and sweeps (restrictToOwner sees wasOtherWritable), so a failed
+        // mark only degrades a CONCURRENT caller back to the pre-sentinel race, and it must never flip the
+        // verdict (a RuntimeException escaping to restrictToOwner's UnsupportedOperationException catch would
+        // return "trusted") nor fail a sign-in.
+        try {
+            writeNewFile(untrustedSentinel(), new byte[0], FILE_ATTRS);
+        } catch (FileAlreadyExistsException e) {
+            // already marked untrusted; nothing to do
+        } catch (IOException | RuntimeException ignore) {
+            // best-effort; see the method contract above
+        }
     }
 
     /**
@@ -1330,6 +1357,76 @@ public final class FileTokenStore implements TokenStore {
             }
         }
     }
+
+    /**
+     * Re-asserts owner-only permissions on the store directory. The at-rest protection of the plaintext token
+     * files is exactly these permissions, so a pre-existing directory another tool or a permissive umask left
+     * loose is tightened rather than trusted as it stands. ensureDirectory runs this on every save and every
+     * inLock, so it chmods only on detected drift - the common case costs one stat and no write syscall.
+     * <p>
+     * NOT best-effort on the failure that matters. An {@code IOException} here means the directory is not ours
+     * to chmod, which is precisely the state in which the documented {@code 0700} protection does not hold and
+     * another local user can create, replace or delete entries in it. Swallowing it left every caller believing
+     * the protection applied. Callers degrade on the throw, each in the way that suits it: {@code save} refuses
+     * to write a plaintext refresh token into a directory it cannot protect, {@code inLock} runs lock-free.
+     * On a non-POSIX filesystem (Windows) the check is unavailable rather than failed, so it falls back to the
+     * inherited ACL as before (owner-only hardening there, via AclFileAttributeView, is a separate follow-up).
+     *
+     * @return {@code true} when the directory's content may be trusted, {@code false} when it was writable
+     *         by group or other (so another local user could have planted an entry before this call tightened
+     *         it), or when an un-swept {@code .untrusted} sentinel shows an earlier such tightening has not yet
+     *         finished discarding
+     * @throws IOException if the directory exists but its permissions cannot be read or set
+     */
+    private boolean restrictToOwner() throws IOException {
+        try {
+            final Set<PosixFilePermission> perms = Files.getPosixFilePermissions(directory);
+            // Writable by group or other is the state that decides TRUST, and it is narrower than "not
+            // owner-only": only write permission on a directory lets another local user create or replace an
+            // entry in it, which is what load() would then adopt. The 0755 a default umask produces exposes
+            // no token - the files themselves are 0600 - and everything in it was still put there by us, so
+            // it is tightened for defence in depth but its content stays trusted.
+            final boolean wasOtherWritable = perms.contains(PosixFilePermission.GROUP_WRITE)
+                    || perms.contains(PosixFilePermission.OTHERS_WRITE);
+            if (wasOtherWritable) {
+                // Drop the untrusted sentinel BEFORE the chmod below. The chmod publishes owner-only to every
+                // other process the instant it lands, but the entries planted while the directory stood open
+                // are not swept until discardUntrustedDirectoryContents runs after we return - so a concurrent
+                // caller reading the permissions in that gap would otherwise compute wasOtherWritable == false
+                // and adopt a plant. The sentinel carries this "untrusted" verdict across the chmod that would
+                // otherwise erase it. Best-effort: if the mark fails we still return untrusted for THIS caller
+                // (wasOtherWritable is true below), so only a concurrent caller degrades to the pre-sentinel
+                // race. Residual: an attacker who both planted an entry and actively deletes the sentinel in
+                // the sub-syscall window between this mark and the chmod can still race a concurrent trust - a
+                // far narrower window than the chmod-to-sweep gap this closes, and Layer 1's atomic replace
+                // still bars a torn or forged credential.
+                markUntrusted();
+            }
+            if (!DIR_PERMS.equals(perms)) {
+                // Tightening is load-bearing - it IS the at-rest protection of the plaintext token files, so
+                // it stays unconditional - but it changes a directory the operator chose and may share with
+                // something else, so it must not be silent. Once per JVM, and never naming the path.
+                if (warnedTightenedStoreDir.compareAndSet(false, true)) {
+                    LOG.warn("the OIDC token store directory was not owner-only and has been tightened to "
+                            + "0700; it holds plaintext refresh tokens, so it must not be shared with "
+                            + "anything else. Point questdb.client.oidc.token.store.dir at a directory of "
+                            + "its own if another tool needs access to that path.");
+                }
+                Files.setPosixFilePermissions(directory, DIR_PERMS);
+            }
+            // Trusted only when the directory was never other-writable AND no un-swept untrusted sentinel
+            // remains - the one just dropped above, one a concurrent caller is mid-sweep on, or one a previous
+            // run tightened but left behind after an incomplete sweep. Files.exists is what carries the verdict
+            // across the chmod above; it reports false when it cannot stat, which only fails open in the case
+            // wasOtherWritable already covers.
+            return !wasOtherWritable && !Files.exists(untrustedSentinel());
+        } catch (UnsupportedOperationException e) {
+            // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
+            warnNoPosixPermsOnce();
+            return true;
+        }
+    }
+
     private void stealIfStale(Path lock) {
         // Steal a lock abandoned by a crashed holder, but never remove a peer's freshly-created LIVE lock. A
         // bare deleteIfExists(lock) removes whatever sits at the path at that instant - including a fresh lock
@@ -1455,6 +1552,10 @@ public final class FileTokenStore implements TokenStore {
 
     private Path tokenFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".json");
+    }
+
+    private Path untrustedSentinel() {
+        return directory.resolve(UNTRUSTED_SENTINEL_NAME);
     }
 
     /**
