@@ -518,7 +518,7 @@ public class QwpWebSocketSender implements Sender {
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
     private volatile long symbolDictEpoch;
     // Incremented once per completed symbol-dictionary recycle swap, beside
-    // symbolDictEpoch (recycleForDictReset step 5). The two move together
+    // symbolDictEpoch (recycleForDictReset step 6). The two move together
     // today -- the only way symbolDictEpoch advances is through a committed
     // recycle swap -- but they count different things (dictionary generation
     // vs. completed swaps) and are incremented independently in case a
@@ -2234,11 +2234,12 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Number of symbol-dictionary recycles this sender has completed. Advances
-     * by one at step 5 of {@link #recycleForDictReset()}, the instant the swap
-     * commits to the new epoch -- before the engine rebuild (step 6) or the
-     * reconnect (step 7), so a later step-6 rebuild failure that latches
-     * {@link #recycleFailure}, and a step-7 reconnect failure that does not,
-     * both still leave this incremented. Unlike the per-send-loop
+     * by one at step 6 of {@link #recycleForDictReset()}, the instant the swap
+     * commits to the new epoch -- after the engine rebuild (step 5) has
+     * already succeeded, so a step-5 rebuild failure that latches
+     * {@link #recycleFailure} leaves this counter un-bumped, while a later
+     * step-7 reconnect failure (which cannot latch: the swap already
+     * committed by then) still leaves this incremented. Unlike the per-send-loop
      * {@code getTotal*} counters, it is scoped to the sender's whole lifetime
      * and never resets. volatile: a
      * concurrent read sees the latest write the producer thread completed,
@@ -2254,10 +2255,11 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Number of symbol-dictionary recycle swaps this sender has completed.
-     * Incremented alongside {@link #getSymbolDictEpoch()} at step 5 of
-     * {@link #recycleForDictReset()} -- before the engine rebuild (step 6) or
-     * the reconnect (step 7), so, like the epoch counter, a later
-     * rebuild/reconnect failure still leaves this incremented, latched or not.
+     * Incremented alongside {@link #getSymbolDictEpoch()} at step 6 of
+     * {@link #recycleForDictReset()} -- after the engine rebuild (step 5) has
+     * already succeeded, so, like the epoch counter, a step-5 rebuild failure
+     * leaves this un-bumped while a step-7 reconnect failure still leaves it
+     * incremented (the swap has already committed by then).
      * Also like the epoch counter, it is scoped to the sender's whole lifetime
      * and never resets. The two counts move together today -- the
      * only way the epoch advances is through a completed recycle swap -- but
@@ -4907,7 +4909,7 @@ public class QwpWebSocketSender implements Sender {
      * {@code QwpWebSocketSender.connect(...)} overload leaves it null --
      * only {@code Sender.build()} installs one -- and the recycle feature is
      * default-on, so a connect()-built sender must simply stay unarmed rather
-     * than NPE at step 6 and latch terminal), or a cursor engine this sender
+     * than NPE at step 5 and latch terminal), or a cursor engine this sender
      * does not own ({@code setCursorEngine(engine, false)}'s contract: the
      * caller retains ownership, so closing it out from under them at step 3
      * would be a use-after-free from the caller's point of view).
@@ -4987,7 +4989,7 @@ public class QwpWebSocketSender implements Sender {
      * </ol>
      * The producer-visible swap (dictionary, counters, epoch) commits only
      * once a fresh engine stands on the emptied slot: a throw in steps 2-6
-     * is caught before that point leaves the counters un-bumped, latches
+     * is caught before that point, leaves the counters un-bumped, latches
      * {@link #recycleFailure}, and rethrows -- every frame that existed
      * before this call was already proven acked, so no data is at risk, but
      * the sender that made the throw observe a half-swapped engine/loop
@@ -5030,6 +5032,8 @@ public class QwpWebSocketSender implements Sender {
         final int dictSizeAtSwap = globalSymbolDictionary.size();
         final long startNanos = System.nanoTime();
         if (lastPublishedFsn >= 0) {
+            // Written before teardown: the monitoring accessors keep
+            // reporting this durable watermark while cursorEngine is null.
             lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
         }
         try {
@@ -5107,10 +5111,12 @@ public class QwpWebSocketSender implements Sender {
             }
             throw new LineSenderException(t).put("symbol dictionary recycle failed");
         }
-        // step 7: reconnect -- unchanged from head (outside the latch; the
-        // loop retries indefinitely on the I/O thread; a failed setup here
-        // leaves a coherent, merely-disconnected sender and is retried by
-        // the next sendRow()'s ensureConnected()).
+        // step 7: reconnect (outside the latch; the swap has already
+        // committed). hasInitialConnectRun forces ensureConnected's ASYNC
+        // branch here, so the deferred socket connect never parks the
+        // producer thread; the loop retries indefinitely on the I/O thread,
+        // and a failed setup here leaves a coherent, merely-disconnected
+        // sender that is retried by the next sendRow()'s ensureConnected().
         try {
             ensureConnected();
         } catch (Error e) {
