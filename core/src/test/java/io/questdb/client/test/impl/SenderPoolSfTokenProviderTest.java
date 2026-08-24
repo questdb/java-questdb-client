@@ -206,6 +206,93 @@ public class SenderPoolSfTokenProviderTest {
         });
     }
 
+    @Test(timeout = 60_000)
+    public void testCloseBreaksARecoveryDelegateStuckInACredentialPullWhenTheCallerIsInterrupted() throws Exception {
+        // The sibling above drives close() from a CLEAN thread. This one arrives with the caller's
+        // interrupt flag already set, which is the ordinary shape of a close() from a task cancelled by
+        // ExecutorService.shutdownNow(), or from a finally on a thread the application cancelled.
+        //
+        // Thread.join(millis) consults the CALLING thread's flag before it ever looks at whether the
+        // target is alive, so a carried flag made PoolHousekeeper.stop()'s first join throw at 0 ms and
+        // skip the interrupt escalation entirely -- and stop()'s catch re-asserted the flag on its way
+        // out, so SenderPool.stopStartupRecoveryDriver()'s escalation was then GUARANTEED to skip too.
+        // One carried flag disabled both, and close() returned with the recoverer still parked in the
+        // credential pull, holding its slot flock. Reverting either site to a bare
+        // "catch (InterruptedException e) { Thread.currentThread().interrupt(); }" turns this red.
+        TestUtils.assertMemoryLeak(() -> {
+            // Phase 1 -- strand unacked frames on disk, so phase 2 has recovery work to do.
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + silent.getPort() + ";sf_dir=" + sfDir + ";"
+                        + "sender_pool_min=1;sender_pool_max=1;"
+                        + "query_pool_min=0;query_pool_max=1;"
+                        + "close_flush_timeout_millis=500;";
+                try (QuestDB db = QuestDB.connect(cfg, () -> "PHASE1-TOKEN")) {
+                    try (Sender s = db.borrowSender()) {
+                        for (int i = 0; i < 3; i++) {
+                            s.table("recover").longColumn("v", i).atNow();
+                            s.flush();
+                        }
+                    }
+                }
+            }
+            Assert.assertTrue("unacked data must persist on disk for recovery to have work",
+                    hasSegmentFile(sfDir + "/default-0"));
+
+            // Phase 2 -- the same provider park as the sibling.
+            CountDownLatch pullEntered = new CountDownLatch(1);
+            AtomicBoolean pullInterrupted = new AtomicBoolean();
+            HttpTokenProvider blockingProvider = () -> {
+                pullEntered.countDown();
+                try {
+                    Thread.sleep(TimeUnit.MINUTES.toMillis(5));
+                } catch (InterruptedException e) {
+                    pullInterrupted.set(true);
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("credential pull cancelled");
+                }
+                return "NEVER-ARRIVES";
+            };
+
+            CountingAckHandler handler = new CountingAckHandler();
+            try (TestWebSocketServer ack = new TestWebSocketServer(handler)) {
+                ack.start();
+                Assert.assertTrue(ack.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + ack.getPort() + ";sf_dir=" + sfDir + ";"
+                        + "sender_pool_min=0;sender_pool_max=1;"
+                        + "query_pool_min=0;query_pool_max=1;";
+
+                QuestDB db = QuestDB.connect(cfg, blockingProvider);
+                Assert.assertTrue("the recovery delegate must reach the credential pull",
+                        pullEntered.await(20, TimeUnit.SECONDS));
+
+                // Arrive at close() already cancelled -- the whole point of this test.
+                Thread.currentThread().interrupt();
+                long elapsedMillis;
+                boolean flagSurvivedClose;
+                try {
+                    long startNanos = System.nanoTime();
+                    db.close();
+                    elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                } finally {
+                    // Read AND clear in a finally, so a failure below cannot leak a set flag into the
+                    // next test in this class.
+                    flagSurvivedClose = Thread.interrupted();
+                }
+
+                Assert.assertTrue("a carried interrupt must not disable the escalation: close() must still "
+                                + "break a recovery delegate parked in a credential pull, or it returns "
+                                + "while that delegate still holds the slot flock",
+                        pullInterrupted.get());
+                Assert.assertTrue("close() must hand the caller's cancellation back rather than consume it",
+                        flagSurvivedClose);
+                Assert.assertTrue("close() must not wait out the parked pull; took " + elapsedMillis + "ms",
+                        elapsedMillis < 30_000);
+            }
+        });
+    }
+
     @Test
     public void testSfStartupRecoveryDelegateCarriesTheProviderToken() throws Exception {
         // The forRecovery leg of buildManagedSlotSender. A recovery delegate replays

@@ -69,6 +69,16 @@ final class PoolHousekeeper {
         synchronized (signalLock) {
             signalLock.notifyAll();
         }
+        // Clear the caller's cancellation for the duration and hand it back at the end -- the shape
+        // QueryWorker.shutdown() and QwpQueryClient.close() already use. Thread.join(millis) consults the
+        // CALLING thread's interrupt flag before it ever looks at whether the target is alive, so a caller
+        // that arrives interrupted -- a close() from a task cancelled by shutdownNow(), or from a finally on
+        // a thread the application cancelled -- made the first join throw at 0 ms and skip the escalation
+        // below entirely. That is the one case the escalation is most needed in: it exists because the
+        // target may be parked in a credential pull only an interrupt can break, and skipping it returns
+        // from close() with the recoverer still holding its store-and-forward slot flock. The flag is
+        // restored before returning, so the caller's own cancellation bookkeeping still sees it.
+        boolean callerWasInterrupted = Thread.interrupted();
         try {
             thread.join(STOP_TIMEOUT_MILLIS);
             if (thread.isAlive()) {
@@ -102,7 +112,11 @@ final class PoolHousekeeper {
                 thread.join(STOP_TIMEOUT_MILLIS);
             }
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            callerWasInterrupted = true;
+        } finally {
+            if (callerWasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 

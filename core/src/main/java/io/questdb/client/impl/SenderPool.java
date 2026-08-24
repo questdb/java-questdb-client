@@ -1708,6 +1708,12 @@ public final class SenderPool implements AutoCloseable {
             if (beforeStartupRecoveryJoinHook != null) {
                 beforeStartupRecoveryJoinHook.run();
             }
+            // Interrupt-neutral for the same reason PoolHousekeeper.stop() is, and it matters twice over
+            // here: stop() runs FIRST from QuestDBImpl.close() and re-asserts the caller's flag on its way
+            // out, so without this the join below is GUARANTEED to throw at 0 ms and skip the escalation
+            // whenever the caller arrived interrupted. One carried flag would otherwise disable both
+            // escalations, leaving the recoverer holding its slot flock after close() returns.
+            boolean callerWasInterrupted = Thread.interrupted();
             try {
                 startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
                 if (startupRecoveryThread.isAlive()) {
@@ -1720,10 +1726,13 @@ public final class SenderPool implements AutoCloseable {
                     startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
                 }
             } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                callerWasInterrupted = true;
             }
             if (afterStartupRecoveryJoinHook != null) {
                 afterStartupRecoveryJoinHook.run();
+            }
+            if (callerWasInterrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
