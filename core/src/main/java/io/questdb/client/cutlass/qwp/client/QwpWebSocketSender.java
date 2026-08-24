@@ -458,9 +458,9 @@ public class QwpWebSocketSender implements Sender {
     // stop. Never lowered -- a shrunken working set simply stops arming.
     private int resetFloorSymbols;
     // Wall-clock time (System.nanoTime()) at which resetArmed last flipped
-    // false -> true. Recorded by armIfEligible so a later task's opportunistic
-    // wait can measure how long the recycle has been armed against
-    // resetMaxWaitMillis.
+    // false -> true. Recorded by armIfEligible so maybeBlockForStarvedReset's
+    // opportunistic wait can measure how long the recycle has been armed
+    // against resetMaxWaitMillis.
     private long armedSinceNanos;
     // Set by resetSymbolDictionary() (the public advisory API) and never
     // cleared by armIfEligible itself -- once a caller asks for a fresh epoch,
@@ -473,7 +473,7 @@ public class QwpWebSocketSender implements Sender {
     // resetSymbolDictionary() when no flush is in flight), never on the
     // per-symbol registration path.
     private boolean resetArmed;
-    // Cleared on the false -> true armed transition; a later task's
+    // Cleared on the false -> true armed transition; maybeBlockForStarvedReset's
     // opportunistic-wait step sets it once it has waited out its window for
     // THIS arm cycle, so a subsequent forced-wait check does not re-wait.
     private boolean starvationWaitDoneThisArm;
@@ -4917,8 +4917,8 @@ public class QwpWebSocketSender implements Sender {
      * pre-connected here), a flush in flight ({@code pendingRowCount != 0}),
      * or a row under construction. Otherwise proceeds to the ring-drained
      * check: if the backlog is empty, recycle immediately; if not, defer to
-     * the (later-task) starvation-wait policy instead of blocking the caller
-     * indefinitely here.
+     * {@link #maybeBlockForStarvedReset()}'s starvation-wait policy instead
+     * of blocking the caller indefinitely here.
      */
     private void maybeRecycleForDictReset() {
         if (engineRebuildFactory == null || !ownsCursorEngine) {
@@ -4944,67 +4944,85 @@ public class QwpWebSocketSender implements Sender {
      * <ol>
      *   <li>Snapshot the outgoing epoch's last published (raw) FSN.</li>
      *   <li>Close and null the cursor I/O loop -- joins the I/O thread and
-     *       closes the WebSocket client.</li>
-     *   <li>Fully-drained close of the outgoing cursor engine. Everything was
-     *       proven acked by the barrier, so {@code close()} (== {@code close(true)})
-     *       takes the reclaim branch: it empties the slot AND unlinks the
+     *       closes the WebSocket client. {@code hasLoopEverConnected} is read
+     *       only AFTER {@code close()} returns: the join makes even an
+     *       ASYNC-initial sender's connect (observed only by the I/O thread,
+     *       never by {@code ensureConnected}'s {@code client != null} branch)
+     *       final by then.</li>
+     *   <li>Clear {@code connected} -- the sender must not claim connectivity
+     *       once its engine is coming down -- then fully-drained close of the
+     *       outgoing cursor engine. Everything was proven acked by the
+     *       barrier, so {@code close()} (== {@code close(true)}) takes the
+     *       reclaim branch: it empties the slot AND unlinks the
      *       parent-anchored logical slot lock (see {@code CursorSendEngine.close}'s
      *       javadoc) -- this sender holds no other lock on the slot at this
-     *       point, so releasing it here is safe.</li>
+     *       point, so releasing it here is safe. Awaits the (possibly
+     *       deferred) release -- see below.</li>
      *   <li>Roll {@link #fsnEpochBase} past every FSN the outgoing epoch ever
      *       handed out. Must run with {@code cursorSendLoop == null} (step 2
      *       already guarantees this -- see {@link #rollFsnEpochBase}'s
      *       precondition).</li>
-     *   <li>Producer-side state swap: a fresh {@link GlobalSymbolDictionary}
+     *   <li>Rebuild the cursor engine on the now-empty slot via
+     *       {@link #engineRebuildFactory}, the identical construct path
+     *       {@code Sender.build()} uses. A rebuild that recovers a persisted
+     *       dictionary from disk means the outgoing close's empties-the-slot
+     *       contract was breached, so the recycle refuses to run on it.</li>
+     *   <li>Producer-side swap COMMIT -- only now that a fresh engine stands
+     *       on the emptied slot: a fresh {@link GlobalSymbolDictionary}
      *       (replaced, not cleared -- nothing else retains the old instance),
      *       both symbol-id watermarks reset, {@code lastCommitBoundaryFsn}
      *       reset (it held a raw old-epoch FSN that does not survive the
      *       roll), the epoch counter and the completed-swap counter both
-     *       advanced, and the arming flags consumed.</li>
-     *   <li>Rebuild the cursor engine on the now-empty slot via
-     *       {@link #engineRebuildFactory}, the identical construct path
-     *       {@code Sender.build()} uses. {@code deltaDictEnabled} is re-derived
-     *       from the fresh engine and its slot-lock-release listener rewired,
-     *       mirroring (not calling) {@link #setCursorEngine} -- that method's
-     *       guards refuse a second engine.</li>
+     *       advanced, the arming flags consumed, the C1 anti-thrash floor
+     *       raised, {@code deltaDictEnabled} re-derived from the fresh
+     *       engine (the healing half of the recycle contract -- see
+     *       {@link #disableDeltaDict}), and the fresh engine's
+     *       slot-lock-release listener rewired, mirroring (not calling)
+     *       {@link #setCursorEngine} -- that method's guards refuse a second
+     *       engine.</li>
      *   <li>Reconnect: {@link #ensureConnected()} builds a fresh I/O loop
      *       against the rolled {@link #fsnEpochBase} and defers the socket
      *       connect itself to the I/O thread. Runs OUTSIDE the latching
      *       try -- see below.</li>
      * </ol>
-     * A throw in steps 2-6 is caught, latches {@link #recycleFailure},
-     * and rethrows: every frame that existed before this call was already
-     * proven acked, so no data is at risk, but the sender that made the throw
-     * observe a half-swapped engine/loop refuses further use from here on --
-     * {@link #checkRecycleFailure()} enforces that at every later
-     * {@link #table(CharSequence)} and flush-family call. (Step 1 is a pair
-     * of plain reads and runs before the latching try.)
+     * The producer-visible swap (dictionary, counters, epoch) commits only
+     * once a fresh engine stands on the emptied slot: a throw in steps 2-6
+     * is caught before that point leaves the counters un-bumped, latches
+     * {@link #recycleFailure}, and rethrows -- every frame that existed
+     * before this call was already proven acked, so no data is at risk, but
+     * the sender that made the throw observe a half-swapped engine/loop
+     * refuses further use from here on -- {@link #checkRecycleFailure()}
+     * enforces that at every later {@link #table(CharSequence)} and
+     * flush-family call. An {@link Error} (OOM/SOE/linkage) passes through
+     * this catch untouched, neither latched nor wrapped -- it is not a
+     * recycle verdict. (Step 1 is a pair of plain reads and runs before the
+     * latching try.)
      * <p>
      * Step 3 mirrors {@code close()}'s deferred-close discipline: when the
      * outgoing engine's close could not confirm SF-worker quiescence it
      * returns with the slot flock retained and {@code isCloseCompleted()}
      * false, releasing both from the worker's exit path. Step 3 then awaits
      * that deferred release (bounded by
-     * {@link #RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS}) before step 6 rebuilds
+     * {@link #RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS}) before step 5 rebuilds
      * on the slot -- rebuilding against the retained flock would throw
      * {@code SlotLockContentionException} and needlessly latch the sender
      * terminal for what is usually a transient disk stall. Only exhausting
      * the await budget (a genuinely dead worker) latches terminal.
      * <p>
      * Step 7 is deliberately exempt from that latch. By then the swap has
-     * committed, so a failed step-7 setup (dispatcher construction, loop
-     * build/start -- environmental, since the socket connect itself is
+     * committed (step 6), so a failed step-7 setup (dispatcher construction,
+     * loop build/start -- environmental, since the socket connect itself is
      * deferred to the I/O thread) leaves a fully coherent sender that is
      * merely disconnected: {@code connected == false}, loop and client already
      * closed and nulled by {@link #ensureConnected()}'s own catch, the fresh
-     * engine attached, and the step-5 counters ({@link #symbolDictEpoch},
+     * engine attached, and the step-6 counters ({@link #symbolDictEpoch},
      * {@link #symbolDictResetsPerformed}) correctly left incremented because
      * the swap really did happen. It rethrows loudly to the triggering caller
      * but the sender stays usable, and the ordinary
      * {@code sendRow() -> ensureConnected()} path retries the deferred setup
      * -- and only that -- on the next send. Nothing can fire a second swap
      * meanwhile: the fresh dictionary is below threshold,
-     * {@code manualResetRequested} was consumed at step 5, and
+     * {@code manualResetRequested} was consumed at step 6, and
      * {@link #maybeRecycleForDictReset()} requires {@code connected}.
      */
     private void recycleForDictReset() {
@@ -5012,49 +5030,32 @@ public class QwpWebSocketSender implements Sender {
         final int dictSizeAtSwap = globalSymbolDictionary.size();
         final long startNanos = System.nanoTime();
         if (lastPublishedFsn >= 0) {
-            // The barrier proved every published frame acked, so this is the
-            // durable watermark the monitoring accessors keep reporting while
-            // cursorEngine is null (mid-swap, or for good after a failed swap).
             lastRecycleDurableFsn = fsnEpochBase + lastPublishedFsn;
         }
         try {
             // step 2: close the loop - joins the I/O thread, closes the client.
-            // Capture the outgoing loop's own ever-connected state into the
-            // sender-lifetime sticky OR BEFORE closing it: this is the only
-            // place an ASYNC-initial sender's connect (which happens only on
-            // the I/O thread, never observed by ensureConnected's client !=
-            // null branch) reaches hasLoopEverConnected.
             if (cursorSendLoop != null) {
-                hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
                 cursorSendLoop.close();
+                // Read the sticky AFTER close(): close joins the I/O thread,
+                // so a connect that landed mid-window is final here. This is
+                // the only place an ASYNC-initial sender's connect (observed
+                // only by the I/O thread) reaches hasLoopEverConnected.
+                hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
                 cursorSendLoop = null;
             }
             client = null;
-            // step 3: fully-drained close of the engine - empties the slot.
-            // Holds NO logical slot lock here: close(true) unlinks the logical
-            // lock file (CursorSendEngine close javadoc). When the SF worker
-            // is wedged in a syscall the close defers flock release to the
-            // worker's exit path -- await it (bounded) rather than let step 6
-            // throw SlotLockContentionException on the retained flock.
+            // step 3: fully-drained close of the engine - empties the slot
+            // and unlinks the parent-anchored logical slot lock. When the SF
+            // worker is wedged the close defers flock release to the worker's
+            // exit path; await it (bounded) before rebuilding on the slot.
             CursorSendEngine outgoing = cursorEngine;
-            outgoing.close();
             cursorEngine = null;
+            connected = false;
+            outgoing.close();
             awaitDeferredEngineClose(outgoing);
             // step 4: roll the external FSN base (-1 no-publish case adds 0)
             rollFsnEpochBase(lastPublishedFsn);
-            // step 5: producer state swap - replace, don't clear()
-            globalSymbolDictionary = new GlobalSymbolDictionary();
-            sentMaxSymbolId = -1;
-            currentBatchMaxSymbolId = -1;
-            lastCommitBoundaryFsn = -1L;
-            symbolDictEpoch++;
-            symbolDictResetsPerformed++;
-            // C1 anti-thrash floor: see resetFloorSymbols.
-            resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
-                    QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
-            resetArmed = false;
-            manualResetRequested = false;
-            // step 6: rebuild the engine on the now-empty slot
+            // step 5: rebuild the engine on the now-empty slot.
             cursorEngine = engineRebuildFactory.rebuild();
             ownsCursorEngine = true;
             if (cursorEngine.wasRecoveredFromDisk()) {
@@ -5067,12 +5068,34 @@ public class QwpWebSocketSender implements Sender {
                         "symbol dictionary recycle rebuilt on a non-empty slot: "
                                 + "the outgoing engine's fully-drained close did not empty it");
             }
+            // step 6: producer-side swap COMMIT - replace, don't clear().
+            globalSymbolDictionary = new GlobalSymbolDictionary();
+            sentMaxSymbolId = -1;
+            currentBatchMaxSymbolId = -1;
+            lastCommitBoundaryFsn = -1L;
+            symbolDictEpoch++;
+            symbolDictResetsPerformed++;
+            resetArmed = false;
+            manualResetRequested = false;
+            // C1 anti-thrash floor: see resetFloorSymbols.
+            resetFloorSymbols = Math.min(dictSizeAtSwap * 2,
+                    QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2);
+            // Deliberately re-derived (not carried over): the healing half
+            // of the recycle contract -- a sender that degraded to full
+            // frames heals back into delta mode once the underlying fault
+            // clears; a persistent fault just degrades the fresh engine
+            // again on its first append (SymbolDictRecycleHealingTest).
             deltaDictEnabled = cursorEngine.isDeltaDictEnabled();
             cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
             // The fresh engine holds the slot flock again; step 3's release
             // flipped slotLockReleased true via the outgoing engine's
             // listener, which no longer describes this sender's state.
             slotLockReleased = false;
+        } catch (Error e) {
+            // OOM/SOE/linkage must reach the caller untouched (same
+            // convention as rethrowTerminal) and must not masquerade as a
+            // recycle verdict.
+            throw e;
         } catch (Throwable t) {
             // terminal latch - everything was acked before step 2,
             // so no data is at risk; the sender refuses further use.
@@ -5084,24 +5107,14 @@ public class QwpWebSocketSender implements Sender {
             }
             throw new LineSenderException(t).put("symbol dictionary recycle failed");
         }
-        // step 7: reconnect - rebuilds the loop with the rolled base, deferring
-        // the socket connect to the I/O thread (hasInitialConnectRun forces
-        // ensureConnected's ASYNC branch, and hasLoopEverConnected -- if this
-        // sender ever reached the server -- seeds the fresh loop's own
-        // hasEverConnected so Invariant B's classification survives the
-        // rebuild): the loop retries indefinitely with
-        // backoff while the producer keeps buffering into the fresh slot, so a
-        // transient outage in this window never surfaces to the producer and
-        // never imposes a reconnect budget on it (the store-and-forward
-        // contract). OUTSIDE the latching try on purpose: the swap has already
-        // committed, so the residual failures here (dispatcher construction,
-        // loop build/start -- environmental, not transport) leave a coherent
-        // fresh-epoch sender that is merely disconnected. They throw loudly
-        // but do NOT latch; the next sendRow() retries the deferred setup --
-        // and ONLY that -- through ensureConnected.
-        connected = false;
+        // step 7: reconnect -- unchanged from head (outside the latch; the
+        // loop retries indefinitely on the I/O thread; a failed setup here
+        // leaves a coherent, merely-disconnected sender and is retried by
+        // the next sendRow()'s ensureConnected()).
         try {
             ensureConnected();
+        } catch (Error e) {
+            throw e;
         } catch (Throwable t) {
             LOG.warn("symbol dictionary swap committed but starting its deferred reconnect "
                             + "failed; sender stays disconnected on the fresh epoch and retries "
@@ -5176,8 +5189,10 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Stops emitting delta dictionaries for the rest of this sender's life, after the
-     * per-slot {@code .symbol-dict} has proved unwritable.
+     * Stops emitting delta dictionaries for the rest of this epoch, after the
+     * per-slot {@code .symbol-dict} has proved unwritable -- a symbol-dictionary
+     * recycle re-derives {@code deltaDictEnabled} from the fresh engine (the
+     * healing contract; see {@link #recycleForDictReset()}).
      * <p>
      * The side-file can stop accepting appends mid-run -- a full disk or an exhausted
      * quota, where SF's own segments stay writable because they are pre-allocated mmap
@@ -5200,8 +5215,9 @@ public class QwpWebSocketSender implements Sender {
         }
         deltaDictEnabled = false;
         LOG.warn("symbol dictionary persistence failed; this sender has switched to full "
-                + "self-sufficient frames for the rest of its life (bandwidth cost only -- "
-                + "no data is at risk, and recovery replays such frames without a side file)",
+                + "self-sufficient frames for the rest of this epoch (bandwidth cost only -- "
+                + "no data is at risk, and recovery replays such frames without a side file; "
+                + "a symbol dictionary recycle re-derives delta mode from the fresh engine)",
                 cause);
     }
 

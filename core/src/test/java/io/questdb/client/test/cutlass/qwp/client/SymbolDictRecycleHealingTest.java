@@ -99,7 +99,12 @@ public class SymbolDictRecycleHealingTest {
                     sender.table("t").symbol("s", "d").longColumn("v", 3L).atNow();
                     long fsn2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn2, 5_000));
-                    Assert.assertTrue("armed again: c, d cross threshold=2 in the new epoch",
+                    // The C1 anti-thrash floor (resetFloorSymbols = 2x the first swap's
+                    // dictSizeAtSwap = 4) keeps c,d (2 symbols, == threshold but < floor)
+                    // from re-arming on their own; a manual request bypasses the floor by
+                    // design, so drive the second recycle through resetSymbolDictionary().
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue("manual reset request bypasses the C1 floor",
                             ws.isResetArmed());
 
                     // Ring drained again -> second recycle: epoch 2.
