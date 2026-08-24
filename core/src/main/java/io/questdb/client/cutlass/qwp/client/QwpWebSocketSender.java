@@ -2239,9 +2239,11 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Whether this sender is still in delta-encoded mode. Flips to {@code false}
-     * permanently once {@link #disableDeltaDict} fires (a persisted-dictionary
-     * write failure, including a recognised mmap access fault) -- every later
-     * flush then ships full self-sufficient frames instead.
+     * for the rest of this epoch once {@link #disableDeltaDict} fires (a
+     * persisted-dictionary write failure, including a recognised mmap access
+     * fault) -- every later flush this epoch then ships full self-sufficient
+     * frames instead. A symbol-dictionary recycle re-derives this from the
+     * fresh engine.
      */
     @TestOnly
     public boolean isDeltaDictEnabledForTest() {
@@ -2274,10 +2276,11 @@ public class QwpWebSocketSender implements Sender {
      * Number of symbol-dictionary recycles this sender has completed. Advances
      * by one at step 6 of {@link #recycleForDictReset()}, the instant the swap
      * commits to the new epoch -- after the engine rebuild (step 5) has
-     * already succeeded, so a step-5 rebuild failure that latches
-     * {@link #recycleFailure} leaves this counter un-bumped, while a later
-     * step-7 reconnect failure (which cannot latch: the swap already
-     * committed by then) still leaves this incremented. Unlike the per-send-loop
+     * already succeeded, so a step-5 rebuild failure -- which abandons the
+     * recycle to be resumed by a later send -- leaves this counter
+     * un-bumped, while a later step-7 reconnect failure (which cannot
+     * latch: the swap already committed by then) still leaves this
+     * incremented. Unlike the per-send-loop
      * {@code getTotal*} counters, it is scoped to the sender's whole lifetime
      * and never resets. volatile: a
      * concurrent read sees the latest write the producer thread completed,
@@ -2821,7 +2824,10 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * A permanent no-op while {@code symbol_dict_reset} is off: arming gates
      * on that knob, so a sender configured with the recycle disabled never
-     * acts on the request, however many times it is made.
+     * acts on the request, however many times it is made. The request is
+     * likewise a permanent no-op on senders that cannot recycle -- ones
+     * without an engine rebuild factory (every {@code connect()}-built
+     * sender) or running on an engine they do not own -- which never arm.
      */
     @Override
     public void resetSymbolDictionary() {
@@ -6026,7 +6032,9 @@ public class QwpWebSocketSender implements Sender {
             // Surface any I/O thread error first — appendBlocking itself only
             // throws on PAYLOAD_TOO_LARGE / backpressure deadline, but the
             // I/O loop can have failed independently.
-            cursorSendLoop.checkError();
+            if (cursorSendLoop != null) {
+                cursorSendLoop.checkError();
+            }
             throw new LineSenderException("cursor SF append failed", t);
         }
     }
