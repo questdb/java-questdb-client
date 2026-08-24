@@ -498,6 +498,12 @@ public class QwpWebSocketSender implements Sender {
     // this: the swap has already committed there, so the sender is coherent
     // and merely disconnected, and the next send retries the connect.
     private Throwable recycleFailure;
+    // Test seam: recycle step-7 fault injection. When set, runs (and is
+    // expected to throw) inside ensureConnected()'s loop-construction try,
+    // after cursorSendLoop is assigned but before start() -- exercising the
+    // catch that closes and nulls the fresh loop, i.e. the failed-reconnect
+    // state the C4/C5 regression tests pin.
+    private Runnable loopStartFault;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits. volatile: this is public API (see
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
@@ -2933,6 +2939,11 @@ public class QwpWebSocketSender implements Sender {
     }
 
     @TestOnly
+    public void setLoopStartFaultForTesting(Runnable fault) {
+        this.loopStartFault = fault;
+    }
+
+    @TestOnly
     public void setRecycleDeferredCloseMaxWaitMillisForTesting(long millis) {
         this.recycleDeferredCloseMaxWaitMillis = millis;
     }
@@ -4267,6 +4278,9 @@ public class QwpWebSocketSender implements Sender {
             // reached the server in a prior loop instance.
             if (hasLoopEverConnected) {
                 cursorSendLoop.markEverConnected();
+            }
+            if (loopStartFault != null) {
+                loopStartFault.run();
             }
             cursorSendLoop.start();
         } catch (Throwable t) {
