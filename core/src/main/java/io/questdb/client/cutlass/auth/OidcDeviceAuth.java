@@ -2283,6 +2283,15 @@ public class OidcDeviceAuth implements QuietCloseable {
          * the device authorization and token endpoints always require {@code https} unless they are
          * loopback, so the device code and refresh token never cross the network in cleartext (matching
          * the Python client). Defaults to {@code false}.
+         * <p>
+         * It bounds the SCHEME, not the trust anchor. {@code tlsConfig} is what decides whether the client
+         * validates the identity provider's certificate, and one instance carries a single one, so passing
+         * {@link ClientTlsConfiguration#INSECURE_NO_VALIDATION} to reach a self-signed QuestDB also turns
+         * validation off on the device-authorization and token requests - the legs that carry the device code
+         * and the refresh token. Point {@code tlsConfig} at a trust store instead when an identity provider
+         * is in play.
+         *
+         * @see #tlsConfig(ClientTlsConfiguration)
          */
         public Builder allowInsecureTransport(boolean allowInsecureTransport) {
             this.allowInsecureTransport = allowInsecureTransport;
@@ -2415,6 +2424,22 @@ public class OidcDeviceAuth implements QuietCloseable {
             return this;
         }
 
+        /**
+         * Sets the TLS configuration for every {@code https} request this instance makes: the QuestDB
+         * {@code /settings} discovery request, any identity provider discovery document, and the
+         * device-authorization and token requests of the sign-in itself. Defaults to full validation.
+         * <p>
+         * One configuration covers all of them, so it is also what decides whether the client validates the
+         * IDENTITY PROVIDER's certificate. {@link ClientTlsConfiguration#INSECURE_NO_VALIDATION}, reached for
+         * to talk to a QuestDB server presenting a self-signed certificate, therefore also stops the client
+         * authenticating the token endpoint - which carries the refresh token - leaving that leg encrypted
+         * but open to an on-path attacker. {@link #allowInsecureTransport(boolean)} is the knob scoped to the
+         * QuestDB link alone, and it only relaxes the scheme; there is no per-leg trust anchor. Prefer a
+         * trust store over disabling validation whenever an identity provider is involved.
+         *
+         * @param tlsConfig the TLS configuration, or {@code null} for full validation
+         * @return this instance for method chaining
+         */
         public Builder tlsConfig(ClientTlsConfiguration tlsConfig) {
             this.tlsConfig = tlsConfig;
             return this;
@@ -2455,6 +2480,15 @@ public class OidcDeviceAuth implements QuietCloseable {
          * request). It does <b>not</b> relax the identity provider endpoints, which always require
          * {@code https} unless they are loopback, so the device code and refresh token are never sent in
          * cleartext. Enable only for local development on a trusted network. Defaults to {@code false}.
+         * <p>
+         * It bounds the SCHEME, not the trust anchor. {@code tlsConfig} is what decides whether the client
+         * validates the identity provider's certificate, and one instance carries a single one, so passing
+         * {@link ClientTlsConfiguration#INSECURE_NO_VALIDATION} to reach a self-signed QuestDB also turns
+         * validation off on the device-authorization and token requests - the legs that carry the device code
+         * and the refresh token. Point {@code tlsConfig} at a trust store instead when an identity provider
+         * is in play.
+         *
+         * @see #tlsConfig(ClientTlsConfiguration)
          */
         public DiscoveryOptions allowInsecureTransport(boolean allowInsecureTransport) {
             this.allowInsecureTransport = allowInsecureTransport;
@@ -2493,6 +2527,11 @@ public class OidcDeviceAuth implements QuietCloseable {
         /**
          * Sets the TLS configuration used for the {@code /settings} discovery request, any identity
          * provider discovery document, and the later sign-in requests. Defaults to full validation.
+         * <p>
+         * One configuration covers all of them, so it is also what decides whether the client validates the
+         * IDENTITY PROVIDER's certificate - see {@link Builder#tlsConfig(ClientTlsConfiguration)} for what
+         * {@link ClientTlsConfiguration#INSECURE_NO_VALIDATION} costs on the leg that carries the refresh
+         * token.
          */
         public DiscoveryOptions tlsConfig(ClientTlsConfiguration tlsConfig) {
             this.tlsConfig = tlsConfig;
