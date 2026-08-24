@@ -48,9 +48,12 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntPredicate;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -106,6 +109,100 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
         assertEquals("mkdir slot dir", 0, Files.mkdir(slotPath, Files.DIR_MODE_DEFAULT));
     }
 
+
+    @Test
+    public void testDeliveringBetweenTwoRotating401WindowsGrantsAFreshRideOut() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // noteAckProgress() clears dynamicCredentialAuthAttempts when the wire durably acks something
+            // past the watermark, and nothing failed when that line was deleted. Held per drain with no
+            // notion of progress, the counter instead spans every session: two rejection windows with a
+            // DELIVERING session between them accumulate toward one threshold, so rejections that were
+            // never consecutive quarantine a slot the cluster is still draining - and nothing in
+            // production clears the .failed sentinel, so those replayable rows are abandoned for good.
+            //
+            // Two windows of 5 calls each. Each window spends its first call inside the send loop's own
+            // reconnect (latched as authTerminal, deliberately not counted), leaving 4 counted per window
+            // - under the threshold of 6 alone, over it cumulatively.
+            //
+            // The quarantine gate is an AND of the attempt threshold and a wall-clock dwell floor, so the
+            // dwell is set to 1ms here: it is satisfied within one backoff either way, which leaves the
+            // ATTEMPT count as the only thing deciding the verdict. Its twin below does the reverse.
+            final long dwellMillis = 1L;
+            seedSlot(SEEDED_FRAMES);
+            Map<Integer, Long> drops = new HashMap<>();
+            drops.put(1, 0L); // connection 1 acks one frame, then drops -> into window 1
+            drops.put(2, 1L); // connection 2 is the delivering session -> advances, then drops into window 2
+            try (TestWebSocketServer server = new TestWebSocketServer(new ScriptedAckHandler(drops, -1, 0L), true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                ScriptedWireFactory factory = new ScriptedWireFactory(server.getPort(),
+                        n -> (n >= 2 && n <= 6) || (n >= 8 && n <= 12), /* dynamicCredential */ true);
+                BackgroundDrainer drainer = newDrainer(factory, dwellMillis);
+                List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+                drainer.setErrorSink(captured::add);
+
+                runToCompletion(drainer);
+
+                assertEquals("delivering between the windows ends the episode, so neither window reaches "
+                                + "the attempt threshold and the slot must still drain [attempts="
+                                + factory.attempts() + "]",
+                        BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                assertFalse("a slot the cluster is still draining must not be quarantined",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                assertTrue("a credential the next token healed must report no data loss: " + captured,
+                        captured.isEmpty());
+                assertTrue("both rejection windows must actually have been driven [attempts="
+                        + factory.attempts() + "]", factory.attempts() > 12);
+            }
+        });
+    }
+
+    @Test
+    public void testDeliveringBetweenTwoRotating401WindowsRestartsTheDwellAnchor() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The twin of the test above, for the OTHER line noteAckProgress() clears:
+            // firstDynamicCredentialAuthFailureNanos, the anchor the wall-clock dwell is measured from.
+            // The quarantine gate is an AND, so each line needs its own discriminator - dropping the
+            // attempts reset leaves the dwell short and the OR still satisfied, and dropping the anchor
+            // reset leaves the attempt count low. This one keeps the attempt count legitimate and makes
+            // only the anchor decide.
+            //
+            // The dwell is 300ms here (reconnect_max_duration_millis, under the clamp). The delivering
+            // session sleeps 800ms before it acks, so a STALE anchor measures ~800ms+ and a restarted one
+            // measures only the second window's own backoff - a margin no scheduling jitter closes.
+            final long dwellMillis = 300L;
+            seedSlot(SEEDED_FRAMES);
+            Map<Integer, Long> drops = new HashMap<>();
+            drops.put(1, 0L);
+            drops.put(2, 1L);
+            // connection 2 - the delivering session - sleeps before acking, putting real wall clock
+            // between the first rejection and the second window.
+            try (TestWebSocketServer server = new TestWebSocketServer(new ScriptedAckHandler(drops, 2, 800L), true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                // Window 2 is long enough to reach the attempt threshold on its own, so the attempt
+                // conjunct is satisfied either way and only the dwell conjunct decides the verdict.
+                ScriptedWireFactory factory = new ScriptedWireFactory(server.getPort(),
+                        n -> (n >= 2 && n <= 6) || (n >= 8 && n <= 14), /* dynamicCredential */ true);
+                BackgroundDrainer drainer = newDrainer(factory, dwellMillis);
+                List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+                drainer.setErrorSink(captured::add);
+
+                runToCompletion(drainer);
+
+                assertEquals("ack progress must restart the dwell anchor, so the second window is measured "
+                                + "from its own first rejection and cannot satisfy the dwell floor "
+                                + "[attempts=" + factory.attempts() + "]",
+                        BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                assertFalse("a slot the cluster is still draining must not be quarantined",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                assertTrue("a credential the next token healed must report no data loss: " + captured,
+                        captured.isEmpty());
+                assertTrue("both rejection windows must actually have been driven [attempts="
+                        + factory.attempts() + "]", factory.attempts() > 14);
+            }
+        });
+    }
 
     @Test
     public void testMidDrainConstantCredential401QuarantinesImmediately() throws Exception {
@@ -202,12 +299,16 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
     }
 
     private BackgroundDrainer newDrainer(ScriptedWireFactory factory) {
+        return newDrainer(factory, RECONNECT_MAX_DURATION_MILLIS);
+    }
+
+    private BackgroundDrainer newDrainer(ScriptedWireFactory factory, long reconnectMaxDurationMillis) {
         return new BackgroundDrainer(
                 slotPath,
                 SEGMENT_SIZE_BYTES,
                 SF_MAX_TOTAL_BYTES,
                 factory,
-                RECONNECT_MAX_DURATION_MILLIS,
+                reconnectMaxDurationMillis,
                 FAST_BACKOFF_MILLIS,
                 FAST_BACKOFF_MAX_MILLIS,
                 /* requestDurableAck */ true,
@@ -313,6 +414,96 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
     }
 
     /**
+     * Per-connection scripted acks over a real wire. Connection indexes present in
+     * {@code dropAfterSeqByConnection} (1-based, arrival order) durably ack up to that per-connection
+     * seq and then close the socket - a deterministic mid-drain wire drop; every other connection acks
+     * whatever it is sent. One connection may additionally sleep before its first ack, which is how
+     * {@link #testDeliveringBetweenTwoRotating401WindowsRestartsTheDwellAnchor()} puts real wall clock
+     * between the two rejection windows without leaning on backoff timing.
+     * <p>
+     * Mirrors {@code BackgroundDrainerMidDrainCapabilityGapTest.GapScenarioHandler}; kept local because
+     * that one is private to its own class and the two scripts differ in the delay.
+     */
+    private static final class ScriptedAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private static final String TABLE = "trades";
+        private final List<TestWebSocketServer.ClientHandler> arrivalOrder = new ArrayList<>();
+        private final int delayConnectionIndex;
+        private final long delayMillis;
+        private final Map<Integer, Long> dropAfterSeqByConnection;
+        private final Map<TestWebSocketServer.ClientHandler, long[]> wireSeqByConn =
+                new java.util.IdentityHashMap<>();
+        private boolean delayed;
+
+        ScriptedAckHandler(Map<Integer, Long> dropAfterSeqByConnection, int delayConnectionIndex, long delayMillis) {
+            this.dropAfterSeqByConnection = dropAfterSeqByConnection;
+            this.delayConnectionIndex = delayConnectionIndex;
+            this.delayMillis = delayMillis;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            long[] counter = wireSeqByConn.get(client);
+            if (counter == null) {
+                counter = new long[1];
+                wireSeqByConn.put(client, counter);
+                arrivalOrder.add(client);
+            }
+            int connectionIndex = arrivalOrder.indexOf(client) + 1;
+            long seq = counter[0]++;
+            if (connectionIndex == delayConnectionIndex && !delayed) {
+                delayed = true;
+                try {
+                    Thread.sleep(delayMillis);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            try {
+                Long dropAfterSeq = dropAfterSeqByConnection.get(connectionIndex);
+                if (dropAfterSeq != null) {
+                    if (seq <= dropAfterSeq) {
+                        client.sendBinary(okFrame(seq, seq));
+                        client.sendBinary(durableAckFrame(seq));
+                    } else if (seq == dropAfterSeq + 1) {
+                        client.close(); // mid-drain wire drop
+                    }
+                    // beyond that: late buffered frames from the condemned connection; ignore.
+                } else {
+                    client.sendBinary(okFrame(seq, seq));
+                    client.sendBinary(durableAckFrame(seq));
+                }
+            } catch (IOException ignored) {
+                // Best-effort ack: the connection died under us. The client replays on its next one.
+            }
+        }
+
+        private static byte[] durableAckFrame(long seqTxn) {
+            byte[] name = TABLE.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer bb = ByteBuffer.allocate(1 + 2 + 2 + name.length + 8)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            bb.put((byte) 0x02); // STATUS_DURABLE_ACK
+            bb.putShort((short) 1); // tableCount
+            bb.putShort((short) name.length);
+            bb.put(name);
+            bb.putLong(seqTxn);
+            return bb.array();
+        }
+
+        private static byte[] okFrame(long wireSeq, long seqTxn) {
+            byte[] name = TABLE.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer bb = ByteBuffer.allocate(1 + 8 + 2 + 2 + name.length + 8)
+                    .order(ByteOrder.LITTLE_ENDIAN);
+            bb.put((byte) 0x00); // STATUS_OK
+            bb.putLong(wireSeq);
+            bb.putShort((short) 1); // tableCount
+            bb.putShort((short) name.length);
+            bb.put(name);
+            bb.putLong(seqTxn);
+            return bb.array();
+        }
+    }
+
+    /**
      * Per-call-index scripted factory over a real wire. Call indexes inside
      * {@code [throwFrom, throwTo]} (1-based, inclusive) throw a
      * {@link QwpAuthFailedException} (401); every other call returns a live
@@ -324,13 +515,15 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
         private final AtomicInteger calls = new AtomicInteger();
         private final boolean dynamicCredential;
         private final int port;
-        private final int throwFrom;
-        private final int throwTo;
+        private final IntPredicate rejectWhen;
 
         ScriptedWireFactory(int port, int throwFrom, int throwTo, boolean dynamicCredential) {
+            this(port, n -> n >= throwFrom && n <= throwTo, dynamicCredential);
+        }
+
+        ScriptedWireFactory(int port, IntPredicate rejectWhen, boolean dynamicCredential) {
             this.port = port;
-            this.throwFrom = throwFrom;
-            this.throwTo = throwTo;
+            this.rejectWhen = rejectWhen;
             this.dynamicCredential = dynamicCredential;
         }
 
@@ -346,7 +539,7 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
         @Override
         public WebSocketClient reconnect() throws Exception {
             int n = calls.incrementAndGet();
-            if (n >= throwFrom && n <= throwTo) {
+            if (rejectWhen.test(n)) {
                 throw new QwpAuthFailedException(401, "localhost", port);
             }
             WebSocketClient c = WebSocketClientFactory.newPlainTextInstance();
