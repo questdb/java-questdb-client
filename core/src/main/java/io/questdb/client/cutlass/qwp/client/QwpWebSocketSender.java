@@ -361,8 +361,9 @@ public class QwpWebSocketSender implements Sender {
     // does not reset CursorWebSocketSendLoop's own hasEverConnected back to
     // false -- which would wrongly re-arm its startup-terminal
     // classification (endpointPolicyFailureIsTerminal()) and misclassify
-    // wasEverConnected() for the whole post-recycle outage window.
-    private boolean hasLoopEverConnected;
+    // wasEverConnected() for the whole post-recycle outage window. Volatile:
+    // wasEverConnected() is consulted from the error-dispatcher daemon.
+    private volatile boolean hasLoopEverConnected;
     // FSN of the last commit-bearing (non-FLAG_DEFER_COMMIT) frame this session
     // published, or -1 when none. Frames above it are deferred and uncommitted:
     // the server withholds their acks by design (their rows are rolled back on
@@ -1985,9 +1986,11 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Highest FSN that has been server-acknowledged. Rejections never advance
      * the watermark. Returns {@code -1} only while nothing has ever been
-     * published in this sender's lifetime. After a symbol-dictionary recycle
-     * the accessor keeps reporting the last pre-swap durable watermark until
-     * the fresh epoch publishes -- it never collapses back to {@code -1}.
+     * published in this sender's lifetime. On a live sender the value never
+     * collapses back to {@code -1}: after a symbol-dictionary recycle the
+     * accessor keeps reporting the last pre-swap durable watermark until the
+     * fresh epoch publishes. (After {@code close()} the reading is
+     * unspecified.)
      * <p>
      * Snapshot accessor — for a bounded wait, use
      * {@link #awaitAckedFsn(long, long)}.
