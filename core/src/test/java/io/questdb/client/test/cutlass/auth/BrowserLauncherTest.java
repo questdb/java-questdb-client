@@ -111,7 +111,7 @@ public class BrowserLauncherTest {
     }
 
     // BrowserLauncher is a package-private helper; the client is an open module, so reflection reaches its
-    // static methods without widening production visibility for the test (mirrors invokeIsLoopbackHost).
+    // static methods without widening production visibility for the test.
     private static boolean invokeIsBrowserOpenEnabled() throws Exception {
         Method m = Class.forName("io.questdb.client.cutlass.auth.BrowserLauncher").getDeclaredMethod("isBrowserOpenEnabled");
         m.setAccessible(true);

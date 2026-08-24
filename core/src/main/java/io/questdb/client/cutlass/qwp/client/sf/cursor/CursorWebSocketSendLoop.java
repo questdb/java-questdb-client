@@ -3774,7 +3774,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // most of every retry cycle, so close() lands there routinely, not just in a narrow race. An
             // interrupt is the only lever that reaches a Java-level wait; OidcDeviceAuth converts it into a
             // provider failure, which the reconnect loop treats as a transient outage and then observes the
-            // abort. Fires ONLY while a pull is in flight, so a sender with no token provider is untouched.
+            // abort. Fires while the connect walk is inside its credential-pull window, which the walk enters
+            // whenever it carries a cancellation -- including with no token provider configured, since it
+            // publishes the marker before it looks at the supplier. That costs nothing: close() sets
+            // running=false before cancel(), so every path a late interrupt can reach is already winding down,
+            // and the I/O thread's exit is native frees plus a latch countdown, none of it interruptible.
             // It does NOT cover a provider stalled in an OS-level TCP connect, which ignores interrupts --
             // close() still loud-fails on its budget there, as it did before.
             Thread t = credentialPullThread;

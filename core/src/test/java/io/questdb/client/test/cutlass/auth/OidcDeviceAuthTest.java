@@ -4260,8 +4260,8 @@ public class OidcDeviceAuthTest {
         return null;
     }
 
-    // isLoopbackHost is a private static security classifier (it gates the plaintext-channel MITM pin); the
-    // client is an open module, so reflection reaches it without widening production visibility for the test
+    // Whether a thread is currently executing the named OidcDeviceAuth method, read off its stack. Used to
+    // wait for a peer to be parked inside a specific phase rather than sleeping and hoping.
     private static boolean isInside(Thread t, String method) {
         for (StackTraceElement frame : t.getStackTrace()) {
             if (OidcDeviceAuth.class.getName().equals(frame.getClassName())
