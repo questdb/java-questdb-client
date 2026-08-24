@@ -80,7 +80,7 @@ public class SymbolDictRecycleArmingTest {
 
     /**
      * Decision 5: arming ignores {@code deltaDictEnabled} -- threshold-based
-     * arming must still fire once the sender has degraded to full self-sufficient
+     * evaluation must still run once the sender has degraded to full self-sufficient
      * frames. Reaching a custom low {@code symbol_dict_reset_threshold} on a
      * sender that also carries the fault-injecting {@code FilesFacade} needs
      * {@code QwpWebSocketSender}'s widest {@code connect(List<Endpoint>, ...)}
@@ -90,6 +90,14 @@ public class SymbolDictRecycleArmingTest {
      * {@code sender.resetThresholdSymbols} directly and also accepts the
      * hand-built {@code CursorSendEngine}, so both requirements are reachable
      * together.
+     * <p>
+     * This {@code connect(...)} overload installs no {@link
+     * io.questdb.client.cutlass.qwp.client.QwpWebSocketSender.EngineRebuildFactory
+     * EngineRebuildFactory} (only {@code Sender.build()} does), so per review
+     * r3 M3 crossing the threshold must never actually arm -- {@code
+     * armIfEligible()} folds the capability check in ahead of the threshold
+     * comparison. Decision 5 is instead pinned negatively here: full-dict
+     * degradation does not change that verdict either way.
      */
     @Test
     public void testArmsInFullDictMode() throws Exception {
@@ -160,11 +168,14 @@ public class SymbolDictRecycleArmingTest {
                             sender.isResetArmed());
 
                     // No manual resetSymbolDictionary() call anywhere in this test: crossing
-                    // the threshold alone must arm the recycle, even while degraded.
+                    // the threshold, even while degraded, still must not arm -- this
+                    // connect(...) overload installs no engineRebuildFactory (review r3,
+                    // M3), and that capability check now runs ahead of the threshold
+                    // comparison in armIfEligible().
                     sender.table("m").symbol("s", "c").longColumn("v", 3L).atNow();
                     sender.flush();
-                    Assert.assertTrue("threshold-based arming must fire even in full-dict mode "
-                                    + "(Decision 5: arming ignores deltaDictEnabled)",
+                    Assert.assertFalse("a sender with no rebuild factory must never arm, even once "
+                                    + "the threshold is crossed in full-dict mode (review r3, M3)",
                             sender.isResetArmed());
                 } finally {
                     sender.close();

@@ -4812,12 +4812,26 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Re-evaluates whether the symbol-dictionary recycle should be armed:
-     * {@code resetEnabled} is on AND either the global dictionary has reached
-     * {@code resetThresholdSymbols} distinct entries or a caller requested a
-     * reset via {@link #resetSymbolDictionary()}. Deliberately ignores
-     * {@code deltaDictEnabled} -- a producer degraded to full self-sufficient
-     * frames still benefits from bounding its dictionary size, and a manual
-     * request is honoured regardless of mode.
+     * {@code resetEnabled} is on, the sender can actually rebuild ({@link
+     * #engineRebuildFactory} is set and {@link #ownsCursorEngine}), AND
+     * either the global dictionary has reached the effective bar
+     * {@code max(resetThresholdSymbols, resetFloorSymbols)} distinct entries
+     * or a caller requested a reset via {@link #resetSymbolDictionary()}.
+     * Deliberately ignores {@code deltaDictEnabled} -- a producer degraded to
+     * full self-sufficient frames still benefits from bounding its dictionary
+     * size, and a manual request is honoured regardless of mode.
+     * <p>
+     * A sender that cannot rebuild -- no {@link #engineRebuildFactory} (every
+     * public {@code QwpWebSocketSender.connect(...)} overload leaves it null
+     * -- only {@code Sender.build()} installs one), or a cursor engine this
+     * sender does not own ({@code setCursorEngine(engine, false)}'s contract:
+     * the caller retains ownership, so closing it out from under them would
+     * be a use-after-free from the caller's point of view) -- must never arm.
+     * Since the recycle feature is default-on and {@code
+     * resetSymbolDictionary()} is a public advisory API, arming a sender with
+     * no way to ever act on the request would leave {@code isResetArmed()}
+     * reading true forever alongside a permanently-0 resets counter,
+     * misleading monitoring.
      * <p>
      * Called from two safe points only: the tail of
      * {@link #resetTableBuffersAfterFlush()} (no row in progress, this flush's
@@ -4829,6 +4843,8 @@ public class QwpWebSocketSender implements Sender {
      */
     private void armIfEligible() {
         boolean shouldArm = resetEnabled
+                && engineRebuildFactory != null
+                && ownsCursorEngine
                 && (globalSymbolDictionary.size() >= Math.max(resetThresholdSymbols, resetFloorSymbols)
                         || manualResetRequested);
         if (shouldArm && !resetArmed) {
@@ -5091,20 +5107,12 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Evaluates whether the barrier in {@link #table(CharSequence)} may run
      * the symbol-dictionary recycle right now. Only ever called with
-     * {@link #resetArmed} true.
+     * {@link #resetArmed} true -- {@link #armIfEligible()} already refused to
+     * arm a sender that cannot rebuild, so this method only has to weigh
+     * producer-side state.
      * <p>
-     * Refuses before any teardown when the rebuild itself is impossible or
-     * unsafe: no {@link #engineRebuildFactory} (every public
-     * {@code QwpWebSocketSender.connect(...)} overload leaves it null --
-     * only {@code Sender.build()} installs one -- and the recycle feature is
-     * default-on, so a connect()-built sender must simply stay unarmed rather
-     * than NPE at step 5 and latch terminal), or a cursor engine this sender
-     * does not own ({@code setCursorEngine(engine, false)}'s contract: the
-     * caller retains ownership, so closing it out from under them at step 3
-     * would be a use-after-free from the caller's point of view).
-     * <p>
-     * Also refuses when there is producer-side state the swap cannot safely
-     * tear down: no connection yet (a V4 sender that has never sent is never
+     * Refuses when there is producer-side state the swap cannot safely tear
+     * down: no connection yet (a V4 sender that has never sent is never
      * pre-connected here), a flush in flight ({@code pendingRowCount != 0}),
      * or a row under construction. Otherwise proceeds to the ring-drained
      * check: if the backlog is empty, recycle immediately; if not, defer to
@@ -5112,9 +5120,6 @@ public class QwpWebSocketSender implements Sender {
      * of blocking the caller indefinitely here.
      */
     private void maybeRecycleForDictReset() {
-        if (engineRebuildFactory == null || !ownsCursorEngine) {
-            return;
-        }
         if (!connected
                 || pendingRowCount != 0
                 || (currentTableBuffer != null && currentTableBuffer.hasInProgressRow())) {

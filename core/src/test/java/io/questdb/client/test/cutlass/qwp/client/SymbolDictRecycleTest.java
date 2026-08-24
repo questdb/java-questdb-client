@@ -126,13 +126,16 @@ public class SymbolDictRecycleTest {
 
     /**
      * {@code engineRebuildFactory} is only installed by {@code Sender.build()}
-     * ({@code Sender.java:1752}) -- every public {@code QwpWebSocketSender.connect(...)}
+     * ({@code Sender.java:1760}) -- every public {@code QwpWebSocketSender.connect(...)}
      * overload leaves it null. Since the recycle feature is default-on and
      * {@code resetSymbolDictionary()} is a public advisory API, a connect()-built
-     * sender can become "armed" with no way to ever act on it.
-     * {@code maybeRecycleForDictReset()} must refuse before any teardown in that
-     * case, not attempt step 6 and NPE into a latched terminal state -- covers
-     * both ways a sender can arm: the manual request and threshold crossing.
+     * sender could previously become "armed" with no way to ever act on it --
+     * {@code isResetArmed()} reading true forever alongside a permanently-0
+     * resets counter misled monitoring (review r3, M3). {@code armIfEligible()}
+     * now folds the same capability check ({@code engineRebuildFactory != null
+     * && ownsCursorEngine}) into the arming decision itself, so a sender that
+     * cannot rebuild never arms in the first place -- covers both ways a
+     * sender can otherwise arm: the manual request and threshold crossing.
      */
     @Test
     public void testConnectBuiltSenderNeverRecyclesWithoutFactory() throws Exception {
@@ -143,7 +146,8 @@ public class SymbolDictRecycleTest {
                 // Manual reset request on the simplest connect() overload.
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", port)) {
                     sender.resetSymbolDictionary();
-                    Assert.assertTrue("a manual request arms immediately (no row/flush in flight)",
+                    Assert.assertFalse("a sender with no rebuild factory must never arm, not even "
+                                    + "for a manual request (review r3, M3)",
                             sender.isResetArmed());
 
                     // Drained instant (nothing published yet, no row in progress): with a
@@ -155,7 +159,7 @@ public class SymbolDictRecycleTest {
                             sender.awaitAckedFsn(fsn, 5_000));
                     Assert.assertEquals("no factory -> the recycle can never actually run",
                             0, sender.getSymbolDictEpoch());
-                    Assert.assertTrue("stays armed forever -- nothing ever consumes the request",
+                    Assert.assertFalse("still never armed -- nothing changed that would flip it",
                             sender.isResetArmed());
                 }
 
@@ -195,7 +199,9 @@ public class SymbolDictRecycleTest {
                     sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
                     long fsn1 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(fsn1, 5_000));
-                    Assert.assertTrue("threshold=2 crossed by a, b", sender.isResetArmed());
+                    Assert.assertFalse("a sender with no rebuild factory must never arm: "
+                            + "isResetArmed()==true with a permanently-0 resets counter "
+                            + "misleads monitoring", sender.isResetArmed());
 
                     // Drained instant again: must not recycle, must not throw.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
@@ -204,7 +210,8 @@ public class SymbolDictRecycleTest {
                             sender.awaitAckedFsn(fsn2, 5_000));
                     Assert.assertEquals("no factory -> the recycle can never actually run",
                             0, sender.getSymbolDictEpoch());
-                    Assert.assertTrue("stays armed -- nothing ever consumes the threshold arming",
+                    Assert.assertFalse("still never armed -- crossing the threshold again changes "
+                                    + "nothing",
                             sender.isResetArmed());
                 } finally {
                     sender.close();
