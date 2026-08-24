@@ -1294,11 +1294,33 @@ public final class BackgroundDrainer implements Runnable {
                 // Safe on the failed-stop path above too: a still-live I/O thread's
                 // later offer() is rejected by the closed dispatcher rather than
                 // resurrecting its delivery thread.
+                //
+                // Interrupt-neutral for this ONE call, then restored. Everything above
+                // deliberately runs with the flag set -- stopRequestedOrInterrupted() leaves
+                // it so loop.close()'s latch await throws rather than blocking on a wedged
+                // I/O thread -- but SenderErrorDispatcher.close() drains by joining its
+                // delivery thread against a refreshed deadline, and its catch re-asserts the
+                // flag before looping. Arriving with the flag set makes Thread.join(millis)
+                // throw on arrival on every pass, so the loop BUSY-SPINS for as long as the
+                // delivery thread stays alive, capped at the 100ms drain deadline.
+                //
+                // It still drains correctly -- join() returns normally the moment the thread
+                // is no longer alive, so neither the wait's duration nor which errors get
+                // delivered changes. What changes is the cost: measured at 15k-53k join
+                // attempts, one core pinned for that window, per closing drainer, and
+                // max_background_drainers is 4 by default. Same clear-and-restore the sibling
+                // teardowns use (QueryWorker.shutdown, QwpQueryClient.close,
+                // QwpWebSocketSender.close).
+                final boolean wasInterrupted = Thread.interrupted();
                 try {
                     loopErrorDispatcher.close();
                 } catch (Throwable e) {
                     LOG.warn("drainer slot {}: error dispatcher close failed ({})",
                             slotPath, e.getMessage());
+                } finally {
+                    if (wasInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             }
             if (client != null && ioThreadStopped) {
