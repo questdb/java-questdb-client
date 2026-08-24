@@ -86,6 +86,47 @@ public class LineHttpSenderTokenProviderTest {
     }
 
     @Test(timeout = 30_000)
+    public void testAtNowWithoutTableDoesNotCorruptTheAuthorizationHeader() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sibling below covers at(); atNow() shares the same guard (validateRowStarted) but its own,
+            // separately deletable, call site. With a provider, newRequest() leaves the request at the header
+            // stage (withContent() deferred until the first row stamps the Authorization header). If atNow()
+            // skipped the guard, its terminator '\n' would land in the HTTP HEADER block on a line of its own,
+            // folding the following "Authorization: Bearer ..." into it (RFC 7230 obs-fold) so the flush ships
+            // with NO credential - strictly worse than at()'s stray body byte. Covered over V1 and V2 (V3
+            // inherits V2's).
+            int[] versions = {Sender.PROTOCOL_VERSION_V1, Sender.PROTOCOL_VERSION_V2};
+            for (int i = 0; i < versions.length; i++) {
+                try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.json(204, ""))) {
+                    try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                            .address("127.0.0.1:" + server.port())
+                            .protocolVersion(versions[i])
+                            .disableAutoFlush()
+                            .httpTokenProvider(() -> "TOKEN")
+                            .build()) {
+                        try {
+                            sender.atNow();
+                            Assert.fail("expected atNow() with no table name to be rejected");
+                        } catch (LineSenderException e) {
+                            Assert.assertTrue(e.getMessage(), e.getMessage().contains("no table name was provided"));
+                        }
+                        // the documented recovery, and the sender must still be usable afterwards
+                        sender.cancelRow();
+                        sender.table("t").longColumn("v", 1L).atNow();
+                        sender.flush();
+                    }
+                    List<String> auth = server.requestAuthHeaders();
+                    Assert.assertEquals("exactly one flush must reach the server", 1, auth.size());
+                    // null here means the rejected atNow() spliced a terminator ahead of the header, so the
+                    // mock's parser never saw a line whose field name is "Authorization"
+                    Assert.assertEquals("the token must reach the wire as its own header",
+                            "Bearer TOKEN", auth.get(0));
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testAtWithoutTableDoesNotCorruptTheAuthorizationHeader() throws Exception {
         assertMemoryLeak(() -> {
             // Regression: at() used to write the leading space and the timestamp BEFORE atNow() validated the

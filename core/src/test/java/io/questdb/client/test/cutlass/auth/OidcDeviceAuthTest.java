@@ -1235,8 +1235,14 @@ public class OidcDeviceAuthTest {
                             + "\"verification_uri\":\"https://verify.example/device\","
                             + "\"expires_in\":300,\"interval\":1}");
                 }
+                // The access token carries a JSON \\u002D escape (which decodes to the '-' already in the
+                // string), so the lexer resolves it through unescapeSink rather than returning the sink
+                // verbatim - the SECOND decode buffer JsonLexer.wipe() clears. A plain-concatenated token
+                // carries no escape, skips unescape(), and leaves unescapeSink empty, so its wipe is never
+                // exercised and dropping it goes unnoticed. The decoded value is byte-identical to the other
+                // WIPE-ME secrets, so signIn()'s return and every assertion below are unchanged.
                 return MockOidcServer.json(200,
-                        tokenJson("ACCESS-LEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME", 3600));
+                        tokenJson("ACCESS\\u002DLEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME", 3600));
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt());

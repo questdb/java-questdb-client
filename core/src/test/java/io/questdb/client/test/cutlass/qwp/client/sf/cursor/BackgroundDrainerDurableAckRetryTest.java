@@ -267,6 +267,37 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test(timeout = 60_000)
+    public void testTerminalUpgradeWithDynamicCredentialStillQuarantinesImmediately() throws Exception {
+        assertMemoryLeak(() -> {
+            // A non-421 upgrade reject is terminal whatever the credential's nature: waiting cannot change a
+            // 5xx handshake refusal, so the drainer must quarantine on the first attempt exactly as it does
+            // without a dynamic credential (testTerminalUpgradeMarksFailedImmediately). The rotating-credential
+            // ride-out is gated on `e instanceof QwpAuthFailedException`, NOT on hasDynamicCredential() alone -
+            // WebSocketUpgradeException shares the same catch arm. Dropping that conjunct would route this
+            // upgrade reject into the ride-out and retry a genuine terminal up to
+            // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE (256) times before escalating, spending the
+            // settle budget on data the handshake will never accept.
+            ScriptedFactory factory = ScriptedFactory
+                    .alwaysFailing(() -> new WebSocketUpgradeException(500, null, "server error during upgrade"))
+                    .withDynamicCredential();
+            BackgroundDrainer drainer = newDrainer(factory);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals("a non-421 upgrade reject is terminal whatever the credential kind - the ride-out is "
+                            + "keyed on QwpAuthFailedException, not on hasDynamicCredential() alone",
+                    1, factory.attempts());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+            assertEquals(SenderError.Category.DATA_LOSS, captured.get(0).getCategory());
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testFixedCredentialAuthRejectionStillQuarantinesImmediately() throws Exception {
         assertMemoryLeak(() -> {
             // A 401 against a CONSTANT credential is a permanent misconfiguration: re-presenting the same
@@ -582,6 +613,47 @@ public class BackgroundDrainerDurableAckRetryTest {
             // quarantines exactly there; restarting it means the sixth rejection must be followed by a fresh
             // dwell of uninterrupted 401s first.
             assertTrue("a capability gap must not have satisfied the dwell [attempts="
+                            + factory.attempts() + "]",
+                    factory.attempts() > 7);
+            assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testRoleRejectDoesNotCountTowardTheRotating401Dwell() throws Exception {
+        assertMemoryLeak(() -> {
+            // The third sibling of the dwell-anchor reset, alongside the transient-outage and capability-gap
+            // cases above. The dwell measures how long the REJECTION persisted, so a role reject - an
+            // all-replica failover window in the middle of a 401 run - is not part of it. Anchored at the
+            // first 401 and never restarted, a 401, then a role-reject window outlasting the dwell, then a
+            // sixth rejection would satisfy both thresholds at once and quarantine a slot on a credential
+            // rejected for seconds - abandoning replayable rows behind a .failed sentinel nothing in
+            // production clears.
+            final long dwellMillis = 100L;
+            AtomicInteger scripted = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+                if (scripted.incrementAndGet() == 6) {
+                    // an all-replica failover window, longer than the whole dwell
+                    Os.sleep(dwellMillis * 3);
+                    return new QwpIngressRoleRejectedException(
+                            QwpIngressRoleRejectedException.ROLE_REPLICA, "127.0.0.1", 9000);
+                }
+                return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+            }).withDynamicCredential();
+            BackgroundDrainer drainer = newDrainerWithBudgets(
+                    factory, dwellMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+            List<SenderError> captured = Collections.synchronizedList(new ArrayList<SenderError>());
+            drainer.setErrorSink(captured::add);
+
+            assertNull(drainer.connectWithDurableAckRetry());
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+
+            // five 401s, the role-reject window, then the sixth 401 - attempt seven overall. Charging the
+            // window to the dwell quarantines exactly there; restarting it means the sixth rejection must be
+            // followed by a fresh dwell of uninterrupted 401s first. The configured dwell is far below
+            // MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS, so the clamp is inert and the dwell is unambiguously
+            // what ends the ride-out.
+            assertTrue("the role-reject window must not have satisfied the dwell [attempts="
                             + factory.attempts() + "]",
                     factory.attempts() > 7);
             assertEquals("exactly one abandonment report: " + captured, 1, captured.size());
@@ -1100,6 +1172,50 @@ public class BackgroundDrainerDurableAckRetryTest {
     }
 
     @Test(timeout = 60_000)
+    public void testRotatingCredentialRejectionResetsCapabilityGapEpisode() throws Exception {
+        assertMemoryLeak(() -> {
+            // The reverse direction of testRoleRejectResetsCapabilityGapEpisode /
+            // testTransportErrorResetsCapabilityGapEpisode: a rotating-401 that is ridden out proves nothing
+            // about a node's batch cap, so it restarts the capability-gap settle budget exactly as those
+            // transient states do. 15 gap errors, one 401 (ridden out with a dynamic credential), then gaps
+            // again -- the second episode gets the full 16 attempts, it does not inherit the first episode's
+            // 15.
+            int cap = BackgroundDrainer.DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS;
+            CountingListener listener = new CountingListener();
+            AtomicInteger sweeps = new AtomicInteger();
+            ScriptedFactory factory = ScriptedFactory.alwaysFailing(() -> {
+                if (sweeps.incrementAndGet() == cap) { // 16th sweep: a rotating-401 between the gap runs
+                    return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+                }
+                return new QwpDurableAckMismatchException("h", 1234, "primary");
+            }).withDynamicCredential();
+            BackgroundDrainer drainer = newDrainer(factory);
+            drainer.setListener(listener);
+            WebSocketClient out = drainer.connectWithDurableAckRetry();
+            assertNull(out);
+            assertEquals(BackgroundDrainer.DrainOutcome.FAILED, drainer.outcome());
+            assertEquals(1, listener.persistentFailures.get());
+            assertEquals("second episode must get the full budget after the reset",
+                    cap, listener.lastPersistentTotalAttempts.get());
+            // 15 gap + 1 rotating-401 + 16 gap = 32 sweeps total.
+            assertEquals(2 * cap, factory.attempts());
+            // The DA stream carries both episodes' per-episode numbering (1..15, then 1..15 -- the second
+            // episode's 16th attempt fires persistent-failure instead). A ridden-out 401 fires no
+            // observability callback, so unlike the role-reject reset nothing lands on the primary stream.
+            List<Integer> expectedDaStream = new ArrayList<>();
+            for (int episode = 0; episode < 2; episode++) {
+                for (int i = 1; i <= cap - 1; i++) {
+                    expectedDaStream.add(i);
+                }
+            }
+            assertEquals(expectedDaStream, listener.unavailableAttempts);
+            assertTrue("a ridden-out 401 fires no primary-unavailable callback",
+                    listener.primaryUnavailableAttempts.isEmpty());
+            assertTrue(Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
+    }
+
+    @Test(timeout = 60_000)
     public void testRoleRejectAndCapabilityGapLandOnSeparateStreams() throws Exception {
         assertMemoryLeak(() -> {
             // M10 discriminator: gap -> role reject -> gap -> success. The
@@ -1298,6 +1414,59 @@ public class BackgroundDrainerDurableAckRetryTest {
         // reject that restarted the episode lands on the primary stream.
         assertEquals(Arrays.asList(1, 2, 1, 2), listener.unavailableAttempts);
         assertEquals(Collections.singletonList(1), listener.primaryUnavailableAttempts);
+    }
+
+    @Test(timeout = 60_000)
+    public void testRotatingCredentialRejectionGrantsFreshWallClockToNextGapEpisode() {
+        // Companion to testRotatingCredentialRejectionResetsCapabilityGapEpisode, which pins the
+        // ATTEMPT-counter half of the reset but runs under a 60s budget where the wall-clock half is
+        // unobservable: a mutant that resets only capabilityGapAttempts (leaving capabilityGapElapsedNanos /
+        // lastCapabilityGapNanos ticking) passes it. This pins the WALL-CLOCK half of the ride-out arm's
+        // reset - the twin of testRoleRejectGrantsFreshWallClockToNextGapEpisode: gap sweeps burn most of the
+        // budget, a ridden-out 401 proves nothing about the node's batch cap, and the next gap episode must
+        // start from a zero wall clock -- under the counter-only mutant the stale elapsed (plus the
+        // still-anchored lastCapabilityGapNanos charging straight across the 401 window) exhausts the budget
+        // and quarantines a cluster that was about to settle.
+        long budgetMillis = 800L;
+        CountingListener listener = new CountingListener();
+        AtomicInteger sweeps = new AtomicInteger();
+        ScriptedFactory factory = ScriptedFactory.failingTimes(5, () -> {
+            switch (sweeps.incrementAndGet()) {
+                case 2:
+                    // Burn ~600ms of the 800ms budget inside the first gap episode.
+                    sleepQuietly(600);
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+                case 3:
+                    // A rotating-401 ridden out: the settle budget must restart in full.
+                    return new QwpAuthFailedException(401, "127.0.0.1", 9000);
+                case 5:
+                    // Second episode burns ~350ms -- well inside a fresh 800ms budget, but 600 + 350 > 800
+                    // under the mutant's carried-over wall clock.
+                    sleepQuietly(350);
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+                default:
+                    return new QwpDurableAckMismatchException("h", 1234, "primary");
+            }
+        }).withDynamicCredential();
+        BackgroundDrainer drainer = newDrainerWithBudgets(
+                factory, budgetMillis, FAST_BACKOFF_MILLIS, FAST_BACKOFF_MAX_MILLIS);
+        drainer.setListener(listener);
+        WebSocketClient out = drainer.connectWithDurableAckRetry();
+        assertSame("a ridden-out 401 restarts the episode wall clock -- the second gap episode must get the "
+                        + "full settle budget, not the first episode's leftovers",
+                factory.successSentinel(), out);
+        // gap, gap(+600ms), 401(ridden out), gap, gap(+350ms), success = 6 sweeps.
+        assertEquals(6, factory.attempts());
+        assertEquals(BackgroundDrainer.DrainOutcome.PENDING, drainer.outcome());
+        assertEquals("a settling cluster must never see a persistent-failure escalation",
+                0, listener.persistentFailures.get());
+        assertFalse("no .failed sentinel: both gap episodes stayed inside their budgets",
+                Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        // DA stream: gaps 1,2 then the fresh episode's 1,2. A ridden-out 401 fires no observability callback,
+        // so nothing lands on the primary stream (unlike the role-reject twin).
+        assertEquals(Arrays.asList(1, 2, 1, 2), listener.unavailableAttempts);
+        assertTrue("a ridden-out 401 fires no primary-unavailable callback",
+                listener.primaryUnavailableAttempts.isEmpty());
     }
 
     @Test(timeout = 60_000)

@@ -56,6 +56,50 @@ public class LineHttpSenderInterfaceTest {
     }
 
     @Test
+    public void testRejectedAtNowWritesNothing() {
+        // atNow() validates the row state before writing its terminator, the same guard at() carries in a
+        // separately deletable method. All four at() overloads are covered below; the one bare atNow() call
+        // in this suite runs in ADDING_COLUMNS, so the rejected states reach it only here. Both are exercised
+        // - no table name, and a table with no symbols or columns - over V1 and V2 (V3 inherits V2's).
+        for (int version = 1; version <= 2; version++) {
+            String config = "http::addr=127.0.0.1:1;auto_flush=off;protocol_version=" + version + ';';
+            String where = "[version=" + version + ']';
+
+            try (Sender sender = Sender.fromConfig(config)) {
+                try {
+                    sender.atNow();
+                    Assert.fail("atNow() with no table name must be rejected " + where);
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(), e.getMessage().contains("no table name was provided"));
+                }
+                Assert.assertEquals("a rejected atNow() must not write a terminator " + where,
+                        0, sender.bufferView().size());
+            }
+
+            try (Sender sender = Sender.fromConfig(config)) {
+                sender.table("t");
+                int afterTableName = sender.bufferView().size();
+                Assert.assertTrue("preconditions: table() writes " + where, afterTableName > 0);
+                try {
+                    sender.atNow();
+                    Assert.fail("atNow() with no symbols or columns must be rejected " + where);
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage(),
+                            e.getMessage().contains("no symbols or columns were provided"));
+                }
+                Assert.assertEquals("a rejected atNow() must not write a terminator " + where,
+                        afterTableName, sender.bufferView().size());
+
+                // and the half-built row is still intact: finishing it properly must work
+                sender.longColumn("v", 1L);
+                sender.atNow();
+                Assert.assertTrue("the row must still complete after the rejection " + where,
+                        sender.bufferView().size() > afterTableName);
+            }
+        }
+    }
+
+    @Test
     public void testRejectedExplicitTimestampWritesNothing() {
         // at(timestamp) validates BEFORE it writes, and that ordering is the whole reason it does not simply
         // delegate to atNow(): a row rejected after the timestamp went into the buffer would leave those bytes

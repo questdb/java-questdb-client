@@ -112,6 +112,57 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testMalformedResponseHeadSuppressesTheReflushOnClose() throws Exception {
+        assertMemoryLeak(() -> {
+            // The HttpException arm sets lastFlushFailed = true so close()'s auto-flush cannot re-send the
+            // batch: the parser only runs on bytes that arrived, so the server already received these rows,
+            // and a close-time re-send would duplicate every one of them on a table without DEDUP keys. The
+            // sibling above disables auto-flush and asserts inside the try, so close()'s suppression gate is
+            // never reached there; this leaves auto-flush ON (the default) so close() calls flush0(true), and
+            // asserts the batch is not sent a second time.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                StringBuilder padding = new StringBuilder();
+                for (int i = 0; i < 5000; i++) {
+                    padding.append('A');
+                }
+                return MockOidcServer.raw("HTTP/1.1 204 No Content\r\n"
+                        + "X-Pad: " + padding + "\r\n\r\n");
+            })) {
+                Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // only the flush hits the mock
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(5_000)
+                        // auto-flush left ON (the default): close() runs flush0(true), so its gate is exercised
+                        .build();
+                try {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("an unparseable response head must fail the flush");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("Malformed HTTP response head"));
+                    }
+                    Assert.assertEquals("the failed flush sent the batch once", 1, requests.get());
+                } finally {
+                    // close() auto-flushes; lastFlushFailed must suppress it. Should a regression drop that
+                    // flag, the re-send hits the same malformed head and close() itself throws - either way
+                    // the counter has already reached 2, which the assertion below turns into a clear failure.
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignore) {
+                        // a re-send that fails still reached the server and incremented the counter
+                    }
+                }
+                Assert.assertEquals("close() must not re-send a batch the server already answered",
+                        1, requests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testProtocolDetectionErrorBodyControlAndBidiAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
             // when the caller does not pin a protocol version, build() probes the server for one; a
