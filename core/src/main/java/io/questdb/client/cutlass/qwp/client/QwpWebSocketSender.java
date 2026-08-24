@@ -1984,21 +1984,26 @@ public class QwpWebSocketSender implements Sender {
 
     /**
      * Highest FSN that has been server-acknowledged. Rejections never advance
-     * the watermark. {@code -1} if
-     * the I/O loop has not yet started or no batch has been published.
+     * the watermark. Returns {@code -1} only while nothing has ever been
+     * published in this sender's lifetime. After a symbol-dictionary recycle
+     * the accessor keeps reporting the last pre-swap durable watermark until
+     * the fresh epoch publishes -- it never collapses back to {@code -1}.
      * <p>
      * Snapshot accessor — for a bounded wait, use
      * {@link #awaitAckedFsn(long, long)}.
      */
     @Override
     public long getAckedFsn() {
-        // Snapshot: the recycle transitions cursorEngine non-null -> null ->
-        // non-null on the producer thread, so read the field once. While it
-        // is null (mid-swap, or for good after a failed swap) report the last
-        // watermark a recycle barrier proved durable instead of collapsing
-        // to -1 -- all pre-swap data really is acked.
+        // Read fsnEpochBase FIRST, then cursorEngine: the recycle writes
+        // engine=null -> base+=L+1 -> engine=fresh, so a reader that saw the
+        // NEW base is ordered after the null write and can only observe null
+        // or the fresh engine -- never (new base, stale engine), which would
+        // fabricate an FSN above anything ever published. Sender is
+        // documented single-threaded; this ordering just keeps best-effort
+        // monitor reads truthful rather than promising thread safety.
+        long base = fsnEpochBase;
         CursorSendEngine engine = cursorEngine;
-        return engine != null ? fsnEpochBase + engine.ackedFsn() : lastRecycleDurableFsn;
+        return engine != null ? base + engine.ackedFsn() : lastRecycleDurableFsn;
     }
 
     /**
@@ -3291,15 +3296,19 @@ public class QwpWebSocketSender implements Sender {
     /**
      * True iff this sender has at least once installed a live (connected
      * + upgraded) WebSocket. Sticky — once true, stays true even after a
-     * subsequent disconnect. Lets a {@link SenderErrorHandler}
-     * disambiguate a "never reached the server" terminal failure (likely
-     * a config typo or firewall block) from a "lost connection after we
-     * were up" failure (likely transient). Returns {@code false} if no
-     * I/O loop is running.
+     * subsequent disconnect, including through a symbol-dict recycle's
+     * loop-null window (mid-swap, or after a failed reconnect setup).
+     * Lets a {@link SenderErrorHandler} disambiguate a "never reached the
+     * server" terminal failure (likely a config typo or firewall block)
+     * from a "lost connection after we were up" failure (likely
+     * transient). Returns {@code false} only if no loop has ever
+     * connected in this sender's lifetime.
      */
     public boolean wasEverConnected() {
+        // Sticky by contract: fall back to the sender-lifetime flag while no
+        // loop is installed (mid-recycle, or after a failed reconnect setup).
         CursorWebSocketSendLoop l = cursorSendLoop;
-        return l != null && l.hasEverConnected();
+        return hasLoopEverConnected || (l != null && l.hasEverConnected());
     }
 
     private static Throwable captureCloseError(Throwable terminalError, Throwable t) {

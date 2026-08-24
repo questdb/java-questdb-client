@@ -611,8 +611,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
     /**
      * Highest frame sequence number (FSN) the server has acknowledged.
-     * Returns {@code -1} when no batch has been published yet, and on transports that
-     * do not track FSNs (HTTP, TCP, UDP).
+     * Returns {@code -1} only while nothing has ever been published in this
+     * sender's lifetime. After a symbol-dictionary recycle the accessor keeps
+     * reporting the last pre-swap durable watermark until the fresh epoch
+     * publishes -- it never collapses back to {@code -1}.
      * <br>
      * Snapshot accessor: for a bounded blocking wait, use
      * {@link #awaitAckedFsn(long, long)}.

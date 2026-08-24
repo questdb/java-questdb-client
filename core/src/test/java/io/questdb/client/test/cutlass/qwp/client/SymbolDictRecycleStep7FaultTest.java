@@ -84,6 +84,8 @@ public class SymbolDictRecycleStep7FaultTest {
                     }
                     // The swap committed; the sender must NOT be terminal.
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue("wasEverConnected() is documented sticky and must survive "
+                            + "the recycle's loop-null window", ws.wasEverConnected());
                     ws.setLoopStartFaultForTesting(null);
                     // Next send retries the deferred setup and data flows again.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
