@@ -34,6 +34,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -92,6 +95,64 @@ public class SymbolDictRecycleStep7FaultTest {
         });
     }
 
+    /**
+     * Pins the conditional in resetSymbolDictStateForNewConnection(): ids a
+     * row registered before the deferred reconnect completes must still ship
+     * in the next delta. Review round 3, finding C4 (empirically untested:
+     * suite was green with the guard reverted).
+     */
+    @Test
+    public void testPostFailedReconnectDeltaCoversStagedSymbolIds() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.newFolder("step7-c4").getAbsolutePath();
+            CapturingAckHandler handler = new CapturingAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                try (Sender sender = Sender.fromConfig(cfg(server, sfDir))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long f1 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f1, 5_000));
+
+                    ws.setLoopStartFaultForTesting(() -> {
+                        throw new RuntimeException("injected step-7 fault");
+                    });
+                    try {
+                        sender.table("t");
+                        Assert.fail("expected the step-7 failure to surface");
+                    } catch (LineSenderException ignore) {
+                    }
+                    // Everything before this point belongs to the old epoch's
+                    // dictionary; the swap already committed (steps 1-6), only
+                    // the reconnect (step 7) failed, so no new frame reached
+                    // the wire during the failed table() call above.
+                    int firstPostRecycle = handler.framesSnapshot().size();
+                    ws.setLoopStartFaultForTesting(null);
+
+                    // This row registers "c" in the FRESH dictionary during
+                    // symbol(); its sendRow() then completes the deferred
+                    // reconnect, which runs resetSymbolDictStateForNewConnection
+                    // with the row in progress -- the C4 window.
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    long f2 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
+
+                    // Replay every captured frame's delta sections; a delta that
+                    // omits "c" while rows reference it throws DictionaryGapException.
+                    List<String> dict = new ArrayList<>();
+                    List<byte[]> frames = handler.framesSnapshot();
+                    for (int i = firstPostRecycle; i < frames.size(); i++) {
+                        QwpWireTestUtils.accumulateDeltaDictionary(frames.get(i), dict);
+                    }
+                    Assert.assertTrue("the post-recycle delta must carry the staged id for 'c'",
+                            dict.contains("c"));
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();
@@ -121,6 +182,39 @@ public class SymbolDictRecycleStep7FaultTest {
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * ACKs every frame it receives and records each binary payload before
+     * acking, so the test can replay the wire's delta-dictionary sections
+     * after the fact. Tracks the current client like {@code
+     * OutageRecycleHandler} (SymbolDictRecycleOutageTest) and resets its
+     * sequence counter on a new connection -- otherwise a post-recycle
+     * reconnect's fresh {@code nextSeq=0} clamps against the prior
+     * connection's already-higher acked sequence and spams a benign WARN.
+     */
+    private static class CapturingAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final List<byte[]> frames = Collections.synchronizedList(new ArrayList<byte[]>());
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private TestWebSocketServer.ClientHandler currentClient;
+
+        List<byte[]> framesSnapshot() {
+            return new ArrayList<>(frames);
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                currentClient = client;
+                nextSeq.set(0);
+            }
+            frames.add(data);
             try {
                 client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
             } catch (IOException e) {
