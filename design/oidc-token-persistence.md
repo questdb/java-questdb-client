@@ -1,11 +1,12 @@
 # OIDC device-flow token persistence
 
 Status: **implemented** in PR #52 (`OidcDeviceAuth`, RFC 8628 device flow) on branch
-`ia_oidc_device_flow` — both the `TokenStore` SPI and the default `FileTokenStore` (Layer 1
-atomic replace and Layer 2 lock-file critical section) shipped together. This document remains
-the frozen cross-language on-disk contract (file name, JSON schema, atomic-write and lock-file
-protocols) that other clients (e.g. Python) mirror; the design discussion below is retained as
-the rationale of record. Code line references are indicative and may drift from the current source.
+`ia_oidc_device_flow` — both the `TokenStore` SPI and the default `FileTokenStore` (directory
+recovery coordination, Layer 1 atomic replace and Layer 2 refresh critical section) shipped
+together. This document remains the frozen cross-language on-disk contract (file name, JSON
+schema, atomic-write and lock-file protocols) that other clients (e.g. Python) mirror; the design
+discussion below is retained as the rationale of record. Code line references are indicative and
+may drift from the current source.
 
 ## Problem
 
@@ -344,6 +345,12 @@ whole reason persistence is **opt-in**. Mitigations, mapped to PR #52's existing
   window between the drop and the chmod can still race a concurrent trust — a far narrower window
   than the tighten-to-sweep gap this closes, and Layer 1's atomic replacement still guarantees no
   torn or forged credential.
+- **The recovery sweep and token operations are one directory-locked transaction.** The sentinel
+  prevents a peer from trusting before the sweep, but by itself allows two sweepers to act on the
+  same old verdict: one can complete recovery and save while the other is paused, after which the
+  paused sweep deletes the fresh file. Every load, save, and trust recovery therefore follows the
+  required `.store.lock` protocol specified below. The lock is held through the sweep and the
+  bounded read/write, so a successful save cannot be invalidated by an earlier distrust verdict.
 - **Never log/echo secrets.** The store never logs token contents and never embeds file
   contents in an exception, upholding PR #52's "tokens never leak into logs or exceptions"
   rule. Only paths and `IOException` kinds appear in the one best-effort warning.
@@ -393,6 +400,9 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
 
 - **Directory:** `${questdb.client.oidc.token.store.dir}` if set, else
   `${user.home}/.questdb/oidc-tokens/`. Created `rwx------` (0700).
+- **Directory recovery lock:** `.store.lock` in that directory, created 0600 with
+  `O_CREAT|O_EXCL` and carrying the same bounded owner-stamp protocol as the per-identity lock
+  below. Every conforming client MUST honor it; see *Directory recovery coordination*.
 - **File name:** `<hex>.json`, where `<hex>` is the lowercase hex SHA-256 of the
   UTF-8 **canonical identity string**, NUL-separated so no field can be confused with a
   separator:
@@ -473,7 +483,42 @@ serving — but it defeats *sharing*, leaving each client to re-prompt).
 
 ## Cross-process and cross-language coordination (Q2)
 
-Two layers; the first is mandatory, the second handles the one case the first cannot.
+Directory recovery coordination plus two data layers; recovery and Layer 1 are mandatory, while
+Layer 2 handles the rotating-refresh-token case Layer 1 cannot.
+
+**Directory recovery coordination (always; cross-language-safe).** The `.untrusted` sentinel
+carries a distrust verdict across the chmod, but it does not serialize the directory-wide sweep
+with token writes. Without serialization, two callers can both observe the sentinel: A tightens
+and pauses before its sweep; B sweeps, clears the sentinel, saves another identity, and returns;
+then A resumes with its stale verdict and deletes B's completed file. The save reported success,
+but a headless restart finds no refresh token and requires a human sign-in.
+
+Every client therefore MUST treat the following as one required directory-wide critical section:
+
+1. Ensure the directory exists, without tightening a pre-existing directory yet.
+2. Acquire `.store.lock` with `O_CREAT|O_EXCL`, 0600 permissions, the owner stamp, bounded 4 KiB
+   read, 5-second empty-lock grace, configured staleness window, capture-then-verify steal, and
+   owner-verified release specified for `<hex>.lock` below.
+3. While holding the lock, run the permission/trust check. If the directory was group/other
+   writable, mark `.untrusted` before tightening it and retain that untrusted verdict for this
+   critical section.
+4. Re-read `.store.lock` after the tighten and require the exact owner stamp. The lock was created
+   while the directory may still have been writable, so another local user could have removed or
+   replaced it before the chmod. On absence, unreadable content, or mismatch, reassert `.untrusted`
+   now that the directory is owner-only and abort/retry without loading, sweeping, or writing.
+5. If the directory is untrusted, complete the directory-wide sweep before doing anything else.
+   A recovering `load` returns no entry for that call; a `save` writes its fresh entry only after
+   the sweep. Keep `.store.lock` held through the bounded read or the complete temp-write/flush/
+   rename, then release it.
+
+Acquisition is **required**, unlike the per-identity refresh lock: timeout or I/O failure fails the
+store operation rather than running it uncoordinated. The caller already treats load failures as
+transient and save as best-effort; silent loss after a successful save is not an acceptable
+degrade. The directory lock is short-lived and is never held across token-endpoint I/O. An
+`inLock` implementation may acquire and release it to prepare the directory before acquiring
+`<hex>.lock`; the refresh action then briefly takes `.store.lock` inside `<hex>.lock` for its load
+and save. No path may hold `.store.lock` while waiting for `<hex>.lock`, so this order has no
+cross-process cycle. The Python client MUST use the same name and protocol.
 
 **Layer 1 — atomic replacement (always; cross-language-safe).** The write protocol above
 makes every update all-or-nothing, so any mix of processes and languages sharing one file
@@ -619,7 +664,9 @@ Resolved (shipped in PR #52):
 
 - `FileTokenStore`: round-trip save/load; perms are 0600/0700 (skip on non-POSIX);
   ATOMIC_MOVE leaves no `.tmp`; corrupt/oversized/garbage file -> `load` returns null, no
-  throw; fingerprint mismatch -> null; a token with CR/LF/non-ASCII -> rejected on load.
+  throw; fingerprint mismatch -> null; a token with CR/LF/non-ASCII -> rejected on load;
+  deterministically pause one caller between tightening and its distrust sweep, prove a
+  concurrent load/save waits on `.store.lock`, and prove a save that returns survives the sweep.
 - `OidcDeviceAuth` against a fake `TokenStore` + the existing `MockOidcServer`:
   - sign in -> a second *new* instance with the same store skips the device flow and only
     hits the token endpoint (silent refresh) — assert the device-auth endpoint is never
@@ -644,5 +691,6 @@ Resolved (shipped in PR #52):
 Notes carried from the discussion (not open):
 - Python persistence does not exist yet and will be built **after** the Java client, using
   this as the base — hence the frozen contract. The single most important thing Python
-  must copy verbatim is the **lock-file** coordination (not an OS advisory lock), since
+  must copy verbatim is both **lock-file** protocols (not OS advisory locks): `.store.lock`
+  for directory recovery/read/write ordering and `<hex>.lock` for refresh ordering, since
   Java `FileLock` (`fcntl`) and Python `flock` do not interoperate.

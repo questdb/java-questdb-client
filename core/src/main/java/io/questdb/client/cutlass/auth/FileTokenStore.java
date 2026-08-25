@@ -97,7 +97,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>
  * <b>Integrity (always).</b> {@link #save} writes a sibling temp file then atomically renames it over the
  * target, so a crash or an overlapping reader - in any process or language - sees the whole old or whole
- * new file, never a torn credential.
+ * new file, never a torn credential. A required directory-wide {@code .store.lock} serialises trust recovery,
+ * its full-directory discard, and token reads/writes, so an earlier discard cannot delete a different
+ * identity's completed save. It is held only for bounded filesystem work, never for an IdP request.
  * <p>
  * <b>Rotating refresh tokens (Layer 2).</b> {@link #inLock} serialises the read-refresh-write of a token
  * refresh across processes with an {@code O_CREAT|O_EXCL} lock file ({@code <hash>.lock}) - not an OS
@@ -140,8 +142,12 @@ public final class FileTokenStore implements TokenStore {
     private static final long DEFAULT_LOCK_STALE_MILLIS = 600_000L;
     private static final FileAttribute<Set<PosixFilePermission>> DIR_ATTRS =
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));
+    // Cross-process lock covering directory trust recovery and token-file operations. Unlike the per-identity
+    // refresh lock, this lock is REQUIRED: running a save without it could let a concurrent directory-wide
+    // untrusted-content sweep delete the file after save() has returned successfully.
+    private static final String DIRECTORY_LOCK_FILE_NAME = ".store.lock";
     // the same owner-only directory permissions as DIR_ATTRS, in the form setPosixFilePermissions wants, so
-    // ensureDirectory can re-assert them on a directory that already exists with looser permissions
+    // restrictToOwner can re-assert them on a directory that already exists with looser permissions
     private static final Set<PosixFilePermission> DIR_PERMS = PosixFilePermissions.fromString("rwx------");
     // steal an empty/unstamped lock once it has existed at least this long. A validly held lock always
     // carries an owner stamp (acquireLock stamps it immediately after the exclusive create); an empty lock is
@@ -175,19 +181,19 @@ public final class FileTokenStore implements TokenStore {
     // attacker-writable directory as the token file, and a real owner stamp (millis + UUID) is a few dozen
     // bytes, so anything past this cap is corrupt or hostile and is not read into memory
     private static final int MAX_LOCK_FILE_BYTES = 1 << 12;
-    // Serializes same-identity critical sections WITHIN this JVM. Two OidcDeviceAuth instances for one
-    // identity in a single process (e.g. an ILP Sender and a QwpQueryClient) have separate instance locks, so
-    // only this shared lock stops them running the read-refresh-write concurrently and double-POSTing the same
-    // parent refresh token - which a reuse-detecting IdP revokes the whole token family for. The cross-process
-    // file lock's lock-free degrade must not license an intra-process race, so this in-process lock is taken
-    // first and is never subject to that degrade.
+    // Serializes both same-identity refresh critical sections and same-directory token-file operations WITHIN
+    // this JVM. Two OidcDeviceAuth instances for one identity in a single process (e.g. an ILP Sender and a
+    // QwpQueryClient) have separate instance locks, so only the identity entry stops them running the
+    // read-refresh-write concurrently and double-POSTing the same parent refresh token - which a
+    // reuse-detecting IdP revokes the whole token family for. The directory entry stops a distrust sweep for
+    // one identity from deleting a different identity's concurrent save. Neither in-process lock degrades.
     //
-    // Keyed on the identity fingerprint, with one entry per identity that currently has a holder or a
-    // waiter and nothing left behind once the last of them leaves. TokenStoreKey is public and inLock() is
-    // public API, so how many distinct identities a process mints is the caller's business - one per end
-    // user in a multi-tenant service is a perfectly ordinary shape - and an entry per identity EVER SEEN,
-    // which an unpruned map gives, roots a 64-char hash plus a lock for the life of the JVM. Retiring on
-    // the last release bounds the map by CONCURRENT identities instead, which is bounded by live threads.
+    // Identity entries are keyed on directory + fingerprint; directory entries use the normalized directory
+    // alone. Each exists only while it has a holder or waiter and nothing is left behind once the last one
+    // leaves. TokenStoreKey is public and inLock() is public API, so how many distinct identities a process
+    // mints is the caller's business - one per end user in a multi-tenant service is a perfectly ordinary
+    // shape - and an entry per identity EVER SEEN, which an unpruned map gives, roots a 64-char hash plus a
+    // lock for the life of the JVM. Retiring on the last release bounds the map by concurrent operations.
     //
     // A fixed stripe table also bounds it, and was tried, but over-serializing is not the free trade it
     // looks: this lock is held across a whole token-endpoint round trip while the caller also holds its
@@ -238,10 +244,9 @@ public final class FileTokenStore implements TokenStore {
     private volatile Runnable beforeCaptureHook;
     // Test seam, null in production: runs at the top of discardUntrustedDirectoryContents, in the window
     // AFTER restrictToOwner has tightened the directory to 0700 and dropped the untrusted sentinel but
-    // BEFORE the sweep clears it. That window is the one a concurrent caller must still distrust through,
-    // and no amount of real concurrency forces a peer into it deterministically - so the test drops a
-    // second, hookless store's load() into it from here to prove it refuses a plant over the tightened
-    // directory. Installed reflectively, like beforeCaptureHook.
+    // BEFORE the sweep clears it. The directory recovery lock is held while this fires, so a concurrent load
+    // or save must wait until the sweep has completed rather than act on a stale distrust verdict. Installed
+    // reflectively, like beforeCaptureHook.
     @TestOnly
     private volatile Runnable beforeUntrustedDiscardHook;
     private final Path directory;
@@ -456,13 +461,13 @@ public final class FileTokenStore implements TokenStore {
             // set when an interrupt arrives while we poll for the cross-process lock; see acquireLock
             boolean cancelled = false;
             try {
-                if (!ensureDirectory()) {
-                    // As in save(). The action run under this lock is a refresh that re-reads the store, so
-                    // an entry exposed before this call must not survive to be adopted by it.
-                    discardUntrustedDirectoryContents();
-                }
+                // Prepare/recover the directory under the required directory-wide lock, then release it
+                // BEFORE acquiring the per-identity refresh lock. The action below commonly calls load() and
+                // save(), which briefly reacquire the directory lock while the identity lock is held; never
+                // holding the two file locks while acquiring each other keeps the cross-process order acyclic.
+                withDirectoryLock(isDirectoryTrusted -> null);
                 lock = lockFile(key);
-                nonce = acquireLock(lock);
+                nonce = acquireLock(lock, false);
             } catch (InterruptedException e) {
                 // Arrived DURING the poll, so it is a live cancellation rather than carried state. Consumed
                 // for the same reason as the process-lock wait above.
@@ -515,8 +520,8 @@ public final class FileTokenStore implements TokenStore {
                         // warning, same degrade: peers run unserialized until the lock goes stale.
                         // sanitized: an IO error message embeds the operator-supplied store path, which is
                         // the one untrusted string these warnings put in front of a terminal
-                        LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free "
-                                + "refresh until it goes stale [error={}]",
+                        LOG.warn("could not release the OIDC token store lock; peer operations may be delayed "
+                                + "until it goes stale [error={}]",
                                 OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
                     } finally {
                         if (wasInterruptedInSection) {
@@ -550,14 +555,34 @@ public final class FileTokenStore implements TokenStore {
             // well as the artefact: a store directory another local user can write is one whose contents
             // were never ours to trust. Fail closed - a null return is the documented outcome for any
             // unusable entry and degrades to a refresh or an interactive sign-in.
-            final boolean isDirectoryTrusted;
             try {
-                isDirectoryTrusted = ensureDirectory();
+                return withDirectoryLock(isDirectoryTrusted -> {
+                    if (!isDirectoryTrusted) {
+                        // The directory was WRITABLE by other local users before the recovery lock tightened
+                        // it, so this caller must not adopt anything from that exposure even though the sweep
+                        // has now completed. A later call may trust freshly written entries after the sentinel
+                        // is gone.
+                        return null;
+                    }
+                    Path file = tokenFile(key);
+                    byte[] bytes;
+                    try {
+                        bytes = readBounded(file);
+                    } catch (NoSuchFileException e) {
+                        return null;
+                    } catch (IOException e) {
+                        throw new OidcAuthException(e).put("could not read the OIDC token store file");
+                    }
+                    if (bytes == null) {
+                        return null;
+                    }
+                    return parseAndVerify(key, bytes);
+                });
             } catch (IOException e) {
                 // THROW, do not return null. load()'s contract makes the two mean opposite things: null is
                 // the definitive "there is nothing here", which latches storeLoadAttempted and ends the
                 // reads for the life of the OidcDeviceAuth, while a throw reads as a transient fault and is
-                // retried under the store-load back-off. What ensureDirectory() reports here is squarely
+                // retried under the store-load back-off. What directory preparation reports here is squarely
                 // transient - Files.createDirectories failing because a home directory is not mounted yet,
                 // EIO/ESTALE on an NFS home, a momentarily read-only or full filesystem - so answering null
                 // told every later call that a store holding a perfectly good refresh token was empty. The
@@ -568,30 +593,6 @@ public final class FileTokenStore implements TokenStore {
                 warnUnprotectedStoreDirOnce("it could not be restricted to owner-only access");
                 throw new OidcAuthException(e).put("could not prepare the OIDC token store directory");
             }
-            if (!isDirectoryTrusted) {
-                // The directory was WRITABLE by other local users until the tightening a moment ago, so
-                // anything already in it may have been planted rather than written by us. Tightening protects
-                // what we write from here on and says nothing about what was there before. Discard rather
-                // than merely skip: leaving a file behind hands it to the next load, which now sees an
-                // owner-only directory and would trust it. ALL of them, not just this key's - the verdict is
-                // spent by whoever observes it first, so the entries this call leaves are entries no later
-                // call can distrust.
-                discardUntrustedDirectoryContents();
-                return null;
-            }
-            Path file = tokenFile(key);
-            byte[] bytes;
-            try {
-                bytes = readBounded(file);
-            } catch (NoSuchFileException e) {
-                return null;
-            } catch (IOException e) {
-                throw new OidcAuthException(e).put("could not read the OIDC token store file");
-            }
-            if (bytes == null) {
-                return null;
-            }
-            return parseAndVerify(key, bytes);
         } finally {
             if (wasInterrupted) {
                 Thread.currentThread().interrupt();
@@ -607,32 +608,30 @@ public final class FileTokenStore implements TokenStore {
         try {
             byte[] content = serialize(key, token);
             try {
-                if (!ensureDirectory()) {
-                    // Same verdict load() acts on, and save() is just as often the first call to touch the
-                    // store - a process that signs in and persists before it ever loads. Discarding the
-                    // boolean here left every entry already in the directory looking, to every later load,
-                    // like it had always been protected. The fresh token below is written afterwards, into
-                    // the directory ensureDirectory has by now tightened, so persistence still works.
-                    discardUntrustedDirectoryContents();
-                }
-                sweepStaleTempFiles(key.hash());
-                Path target = tokenFile(key);
-                Path tmp = createTempFile(key.hash());
-                boolean moved = false;
-                try {
-                    writeAndFlush(tmp, content);
-                    replaceTarget(tmp, target);
-                    moved = true;
-                } finally {
-                    if (!moved) {
-                        try {
-                            Files.deleteIfExists(tmp);
-                        } catch (IOException ignore) {
-                            // best-effort: never let the cleanup failure replace the write/rename failure
-                            // that is unwinding; sweepStaleTempFiles reclaims the orphan on a later save
+                withDirectoryLock(isDirectoryTrusted -> {
+                    // withDirectoryLock has already discarded every untrusted entry when this verdict is
+                    // false. Write the fresh token only afterwards, while the same directory-wide lock is
+                    // still held, so a peer cannot arrive with the old verdict and sweep this completed save.
+                    sweepStaleTempFiles(key.hash());
+                    Path target = tokenFile(key);
+                    Path tmp = createTempFile(key.hash());
+                    boolean moved = false;
+                    try {
+                        writeAndFlush(tmp, content);
+                        replaceTarget(tmp, target);
+                        moved = true;
+                    } finally {
+                        if (!moved) {
+                            try {
+                                Files.deleteIfExists(tmp);
+                            } catch (IOException ignore) {
+                                // best-effort: never let the cleanup failure replace the write/rename failure
+                                // that is unwinding; sweepStaleTempFiles reclaims the orphan on a later save
+                            }
                         }
                     }
-                }
+                    return null;
+                });
             } catch (IOException e) {
                 throw new OidcAuthException(e).put("could not persist the OIDC token to the token store");
             }
@@ -925,6 +924,12 @@ public final class FileTokenStore implements TokenStore {
             return bytes;
         }
     }
+
+    private static boolean isLockOwner(Path lock, String nonce) throws IOException {
+        final byte[] content = readLockHolder(lock);
+        return content != null && nonce.equals(new String(content, StandardCharsets.UTF_8));
+    }
+
     private static void releaseLock(Path lock, String nonce) {
         // release our own lock only: re-read it (bounded - see readLockHolder) and delete it solely when it
         // still carries our nonce. A hold that outran lockStaleMillis may have been judged stale and stolen
@@ -934,8 +939,7 @@ public final class FileTokenStore implements TokenStore {
         // one syscall gap rather than the whole hold, so a misconfigured staleness window degrades to at most
         // the documented double-refresh rather than corrupting a peer's lock state.
         try {
-            byte[] content = readLockHolder(lock);
-            if (content != null && nonce.equals(new String(content, StandardCharsets.UTF_8))) {
+            if (isLockOwner(lock, nonce)) {
                 Files.deleteIfExists(lock);
             }
             // otherwise a peer now owns this lock file, or it is unreadable/oversized; leave it for that owner
@@ -949,11 +953,11 @@ public final class FileTokenStore implements TokenStore {
             // exists to prevent. That is worth a line an operator can find, rather than surfacing later as
             // unexplained repeated sign-ins.
             // sanitized: see the sibling warning in inLock - the message embeds the store path
-            LOG.warn("could not release the OIDC token store lock; peers degrade to lock-free refresh until "
-                    + "it goes stale [error={}]", OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
+            LOG.warn("could not release the OIDC token store lock; peer operations may be delayed until it "
+                    + "goes stale [error={}]", OidcDeviceAuth.sanitizeForDisplay(e.getMessage()));
         }
     }
-    // Drops this caller's claim on the identity's lock, retiring the entry when it was the last one, so the
+    // Drops this caller's claim on the operation's lock, retiring the entry when it was the last one, so the
     // map never outgrows the identities actually in flight. Pairs with retainProcessLock in a finally.
     private static void releaseProcessLock(String identity) {
         PROCESS_LOCKS.computeIfPresent(identity, (k, held) -> --held.users == 0 ? null : held);
@@ -1001,9 +1005,9 @@ public final class FileTokenStore implements TokenStore {
         throw lastDenied;
     }
 
-    // Claims the lock for this identity, creating the entry if this caller is the first to arrive. Registers
-    // the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is queued on
-    // it - which is what makes the retirement in releaseProcessLock safe.
+    // Claims the lock for this operation identity, creating the entry if this caller is the first to arrive.
+    // Registers the claim BEFORE the acquire, so an entry cannot be retired out from under a thread that is
+    // queued on it - which is what makes the retirement in releaseProcessLock safe.
     private static ProcessLock retainProcessLock(String identity) {
         return PROCESS_LOCKS.compute(identity, (k, existing) -> {
             final ProcessLock held = existing != null ? existing : new ProcessLock();
@@ -1080,6 +1084,88 @@ public final class FileTokenStore implements TokenStore {
                 + "can write, or supply a TokenStore backed by an OS keychain.", reason);
     }
 
+    /**
+     * Runs one short token-store filesystem operation under the directory-wide in-process and cross-process
+     * locks. This lock covers the trust check, a required directory-wide distrust sweep, and the operation
+     * itself as one unit. In particular, no caller may retain a pre-lock "untrusted" verdict and sweep after a
+     * peer has already completed recovery and saved a fresh token.
+     * <p>
+     * The lock file has to be created before {@link #restrictToOwner()} changes a pre-existing directory:
+     * otherwise two processes can both consume the old permission verdict before either has a common lock.
+     * Because another local user can still remove or replace that lock while the directory is writable, the
+     * owner nonce is re-read after the chmod. A lost lock aborts the operation; when the directory was
+     * untrusted, the sentinel is reasserted after the chmod so the eventual owner must sweep before trusting.
+     */
+    private <T> T withDirectoryLock(DirectoryAction<T> action) throws IOException {
+        createDirectory();
+
+        // Directory identities are normalized paths without NUL; per-identity keys append NUL + a 64-hex
+        // fingerprint, so the two domains cannot collide in PROCESS_LOCKS.
+        final String lockIdentity = lockNamespace;
+        final ProcessLock processLock = retainProcessLock(lockIdentity);
+        try {
+            processLock.lock.lockInterruptibly();
+        } catch (InterruptedException e) {
+            releaseProcessLock(lockIdentity);
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while waiting for the OIDC token store directory lock", e);
+        }
+        try {
+            final Path lock = directoryLockFile();
+            String nonce = null;
+            try {
+                try {
+                    nonce = acquireLock(lock, true);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while waiting for the OIDC token store directory lock", e);
+                }
+
+                final boolean isDirectoryTrusted = restrictToOwner();
+                final boolean isOwner;
+                try {
+                    isOwner = isLockOwner(lock, nonce);
+                } catch (IOException e) {
+                    // The directory may have been writable when the lock was created, so another local user
+                    // could remove it before the chmod. An absent or unreadable stamp is loss of ownership,
+                    // never successful acquisition.
+                    if (!isDirectoryTrusted) {
+                        markUntrusted();
+                    }
+                    throw new IOException("lost ownership of the OIDC token store directory lock", e);
+                }
+                if (!isOwner) {
+                    if (!isDirectoryTrusted) {
+                        // restrictToOwner has already tightened the directory, so this mark cannot now be
+                        // removed by the other local user who could write it before the chmod.
+                        markUntrusted();
+                    }
+                    throw new IOException("lost ownership of the OIDC token store directory lock");
+                }
+
+                if (!isDirectoryTrusted) {
+                    discardUntrustedDirectoryContents();
+                }
+                return action.run(isDirectoryTrusted);
+            } finally {
+                if (nonce != null) {
+                    // A live interrupt during the action must not strand the lock until its staleness window.
+                    final boolean wasInterrupted = Thread.interrupted();
+                    try {
+                        releaseLock(lock, nonce);
+                    } finally {
+                        if (wasInterrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+            }
+        } finally {
+            processLock.lock.unlock();
+            releaseProcessLock(lockIdentity);
+        }
+    }
+
     private static void writeAndFlush(Path file, byte[] content) throws IOException {
         // write the payload and force it to disk before the rename, so a crash between the write and the
         // atomic rename cannot leave the target pointing at unflushed (zero/partial) bytes - the temp file
@@ -1104,10 +1190,12 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
-    private String acquireLock(Path lock) throws InterruptedException {
+    private String acquireLock(Path lock, boolean isRequired) throws IOException, InterruptedException {
         // returns the unique owner nonce stamped into the lock on success, or null if it could not be acquired
-        // within the budget. releaseLock uses the nonce to verify ownership before deleting, so a hold that
-        // outran lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
+        // within the budget when isRequired is false. A required directory lock throws instead: proceeding
+        // without it would let an untrusted-directory sweep delete another identity's completed save.
+        // releaseLock uses the nonce to verify ownership before deleting, so a hold that outran
+        // lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
         final String nonce = newLockNonce();
         // nanoTime, not currentTimeMillis: this is an elapsed budget, and the wall clock is adjustable. An
         // NTP step or an operator setting the date back stretches a millis-based deadline by the size of the
@@ -1130,7 +1218,10 @@ public final class FileTokenStore implements TokenStore {
                 // several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin.
                 stealIfStale(lock);
                 if (System.nanoTime() - deadlineNanos >= 0) {
-                    return null; // give up and run without the lock rather than stall a sign-in
+                    if (isRequired) {
+                        throw new IOException("timed out acquiring the OIDC token store directory lock");
+                    }
+                    return null; // give up and run without the refresh lock rather than stall a sign-in
                 }
                 // Thread.sleep, not Os.sleep: Os.sleep catches InterruptedException and keeps sleeping to its
                 // deadline WITHOUT re-asserting the flag, so a cancellation aimed at this poll was swallowed
@@ -1150,7 +1241,11 @@ public final class FileTokenStore implements TokenStore {
                 //
                 // A lock we genuinely did leave half-created is EMPTY, and stealIfStale already reclaims an
                 // empty lock on the short EMPTY_LOCK_STEAL_GRACE_MILLIS grace, so leaving it behind costs at
-                // most that grace. Degrade to a lock-free refresh instead.
+                // most that grace. A refresh lock degrades to a lock-free refresh; a required directory lock
+                // propagates the failure because running a sweep or write without it is unsafe.
+                if (isRequired) {
+                    throw e;
+                }
                 // sanitized: see the sibling warning in inLock - the message embeds the store path
                 LOG.warn("could not acquire the OIDC token store lock; running this refresh without "
                         + "cross-process coordination [error={}]",
@@ -1291,12 +1386,13 @@ public final class FileTokenStore implements TokenStore {
     }
 
     /**
-     * Creates the store directory owner-only when absent, and asserts it is owner-only either way.
+     * Creates the store directory owner-only when absent. A pre-existing directory is deliberately left as-is
+     * until the caller owns {@code .store.lock}; {@link #restrictToOwner()} both changes its permissions and
+     * emits the trust verdict whose directory-wide sweep must be serialized with every token write.
      *
-     * @return {@code true} when the directory's content may be trusted - see {@link #restrictToOwner()}
-     * @throws IOException if the directory cannot be created, or exists and cannot be made owner-only
+     * @throws IOException if the directory cannot be created
      */
-    private boolean ensureDirectory() throws IOException {
+    private void createDirectory() throws IOException {
         if (!Files.isDirectory(directory)) {
             try {
                 Files.createDirectories(directory, DIR_ATTRS);
@@ -1305,14 +1401,10 @@ public final class FileTokenStore implements TokenStore {
                 Files.createDirectories(directory);
             }
         }
-        // Verify UNCONDITIONALLY, including immediately after our own create, rather than only on the
-        // pre-existing branch. createDirectories is a no-op when the directory already exists, and it applies
-        // DIR_ATTRS only to directories it actually creates - so a peer that won the race between the
-        // isDirectory check above and the call keeps whatever permissions IT chose, and "we called
-        // createDirectories" is not evidence the directory is ours. That window is exactly the hostile
-        // local pre-create this method exists to defeat. Re-asserting here also covers ordinary drift on a
-        // pre-existing directory (another tool, a permissive umask), which is what the old branch handled.
-        return restrictToOwner();
+    }
+
+    private Path directoryLockFile() {
+        return directory.resolve(DIRECTORY_LOCK_FILE_NAME);
     }
 
     private boolean isOlderThan(Path lock, long thresholdMillis) {
@@ -1446,8 +1538,9 @@ public final class FileTokenStore implements TokenStore {
     /**
      * Re-asserts owner-only permissions on the store directory. The at-rest protection of the plaintext token
      * files is exactly these permissions, so a pre-existing directory another tool or a permissive umask left
-     * loose is tightened rather than trusted as it stands. ensureDirectory runs this on every save and every
-     * inLock, so it chmods only on detected drift - the common case costs one stat and no write syscall.
+     * loose is tightened rather than trusted as it stands. withDirectoryLock runs this on every load, save and
+     * inLock preparation, so it chmods only on detected drift - the common case costs one stat and no write
+     * syscall.
      * <p>
      * NOT best-effort on the failure that matters. An {@code IOException} here means the directory is not ours
      * to chmod, which is precisely the state in which the documented {@code 0700} protection does not hold and
@@ -1662,8 +1755,13 @@ public final class FileTokenStore implements TokenStore {
         return directory.resolve(UNTRUSTED_SENTINEL_NAME);
     }
 
+    @FunctionalInterface
+    private interface DirectoryAction<T> {
+        T run(boolean isDirectoryTrusted) throws IOException;
+    }
+
     /**
-     * One identity's in-process lock plus the number of callers currently holding or queued on it.
+     * One operation identity's in-process lock plus the number of callers currently holding or queued on it.
      * <p>
      * {@code users} is read and written only inside {@link ConcurrentHashMap#compute} /
      * {@link ConcurrentHashMap#computeIfPresent} remapping functions, which run under the bin lock, so it

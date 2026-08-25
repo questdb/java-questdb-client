@@ -79,7 +79,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *     permissions instead (testReplaceTargetRetriesADeniedRenameThenSucceeds and its give-up sibling). Those
  *     two skip when the process is root, which bypasses the permission bits they rely on;</li>
  *     <li>the {@code UnsupportedOperationException} fallbacks around {@code FILE_ATTRS}/{@code DIR_ATTRS}
- *     ({@code createTempFile}, {@code createLockFile}, {@code ensureDirectory}, {@code restrictToOwner}) are
+ *     ({@code createTempFile}, {@code createLockFile}, {@code createDirectory}, {@code restrictToOwner}) are
  *     NOT exercised. They fire only where the filesystem cannot carry POSIX permissions, which a POSIX host
  *     cannot produce without a synthetic {@code FileSystemProvider}; the suite has no such fixture and none
  *     of these tests reach them;</li>
@@ -1424,8 +1424,8 @@ public class FileTokenStoreTest {
     @Test
     public void testInLockDegradesWhenDirectoryUnusable() throws Exception {
         assertMemoryLeak(() -> {
-            // a regular file standing where the store directory's parent must be makes ensureDirectory throw
-            // IOException; inLock must still run the action lock-free rather than fail a sign-in
+            // a regular file standing where the store directory's parent must be makes directory preparation
+            // throw IOException; inLock must still run the action lock-free rather than fail a sign-in
             Path blocker = temp.getRoot().toPath().resolve("blocker");
             Files.write(blocker, new byte[]{1});
             FileTokenStore store = new FileTokenStore(blocker.resolve("oidc-tokens"));
@@ -1850,9 +1850,9 @@ public class FileTokenStoreTest {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         assertMemoryLeak(() -> {
-            // The same verdict, spent by a WRITE path instead. save() and inLock() call ensureDirectory too
-            // and discarded its boolean outright, so a save arriving before any load tightened the directory
-            // and left every planted entry in it looking like it had always been protected.
+            // Exercise the same distrust verdict through a WRITE path. A save arriving before any load must
+            // tighten and sweep the directory before publishing its own token; otherwise planted entries can
+            // look as though they had always been protected.
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
             TokenStoreKey a = sampleKey();
@@ -1915,22 +1915,22 @@ public class FileTokenStoreTest {
     }
 
     @Test
-    public void testConcurrentLoadDistrustsTheDirectoryTightenedButNotYetSwept() throws Exception {
+    public void testConcurrentLoadWaitsForTheUntrustedDirectorySweep() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         assertMemoryLeak(() -> {
             // The concurrent case the sibling sequential verdict tests cannot reach. restrictToOwner tightens
             // the directory to 0700 and returns the verdict in one breath, but the planted entries are not
             // swept until discardUntrustedDirectoryContents runs afterwards. A SECOND caller - another thread
-            // or process - that reads the permissions in the gap between the chmod and the sweep sees an
-            // owner-only directory with the plant still in it and, on the permission bits alone, would trust
-            // it. The .untrusted sentinel dropped before the chmod is what it must distrust through instead.
+            // or process - must wait on the directory recovery lock until that sweep is complete. Otherwise a
+            // loader can adopt a plant in the chmod-to-sweep gap, and a saver can write a fresh entry which the
+            // first caller's later directory-wide sweep silently deletes.
             //
             // beforeUntrustedDiscardHook drops us into exactly that gap: it fires after the tighten-and-mark,
-            // before the sweep. From inside it a fresh store (no hook) loads the OTHER identity over the
-            // tightened directory - the second caller - and must refuse the plant. No real concurrency can
-            // force a peer into this sub-syscall gap deterministically, which is why the seam exists (as
-            // beforeCaptureHook does for stealIfStale).
+            // before the sweep and while the directory lock is held. From inside it a fresh store (no hook)
+            // starts loading the OTHER identity and must block until the first caller has swept. No real
+            // concurrency can force a peer into this sub-syscall gap deterministically, which is why the seam
+            // exists (as beforeCaptureHook does for stealIfStale).
             Path dir = storeDir();
             FileTokenStore first = new FileTokenStore(dir);
             FileTokenStore second = new FileTokenStore(dir);
@@ -1951,8 +1951,11 @@ public class FileTokenStoreTest {
                             .getBytes(StandardCharsets.UTF_8));
 
             AtomicReference<PersistedToken> secondSaw = new AtomicReference<>();
+            AtomicReference<Throwable> secondFailure = new AtomicReference<>();
             AtomicReference<Set<PosixFilePermission>> permsInGap = new AtomicReference<>();
             AtomicBoolean plantPresentInGap = new AtomicBoolean();
+            AtomicBoolean secondReturned = new AtomicBoolean();
+            AtomicReference<Thread> secondThread = new AtomicReference<>();
             Field hookField = FileTokenStore.class.getDeclaredField("beforeUntrustedDiscardHook");
             hookField.setAccessible(true);
             hookField.set(first, (Runnable) () -> {
@@ -1962,19 +1965,42 @@ public class FileTokenStoreTest {
                     throw new RuntimeException(e);
                 }
                 plantPresentInGap.set(Files.exists(tokenFile(dir, b)));
-                secondSaw.set(second.load(b));
+                Assert.assertTrue("the cross-process directory lock must cover the whole chmod-to-sweep gap",
+                        Files.isRegularFile(dir.resolve(".store.lock"), LinkOption.NOFOLLOW_LINKS));
+                Thread loader = new Thread(() -> {
+                    try {
+                        secondSaw.set(second.load(b));
+                        secondReturned.set(true);
+                    } catch (Throwable t) {
+                        secondFailure.compareAndSet(null, t);
+                    }
+                }, "concurrent-untrusted-loader");
+                loader.setDaemon(true);
+                secondThread.set(loader);
+                loader.start();
+                try {
+                    awaitWaitingInside(loader, "withDirectoryLock");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+                Assert.assertFalse("the second load must not return while the first caller still owns the "
+                        + "directory recovery lock", secondReturned.get());
             });
 
-            // A refuses its own identity AND, through the hook, drives the concurrent B into the gap
+            // A refuses its own identity AND, through the hook, parks the concurrent B at the gap
             Assert.assertNull("A must refuse an entry from a world-writable directory", first.load(a));
+            joinOrFail(secondThread.get(), "the concurrent loader");
 
             Assert.assertEquals("the directory was already tightened to 0700 when B observed it",
                     OWNER_ONLY_DIR_PERMS, permsInGap.get());
             Assert.assertTrue("the plant was still present when B observed it - the sweep had not run yet",
                     plantPresentInGap.get());
-            Assert.assertNull("B must NOT adopt the plant it saw over the tightened directory: the .untrusted "
-                    + "sentinel dropped before the chmod carries the distrust the chmod would otherwise erase",
-                    secondSaw.get());
+            Assert.assertNull("the concurrent load failed instead of waiting for the sweep: " + secondFailure.get(),
+                    secondFailure.get());
+            Assert.assertTrue("the concurrent load must finish after the sweep releases the directory lock",
+                    secondReturned.get());
+            Assert.assertNull("B must not adopt the plant after it is allowed through", secondSaw.get());
             Assert.assertFalse("the plant must be discarded, not left for the next load",
                     Files.exists(tokenFile(dir, b)));
 
@@ -1983,6 +2009,69 @@ public class FileTokenStoreTest {
             first.save(b, sampleToken("ACCESS-B2", "REFRESH-B2"));
             Assert.assertEquals("REFRESH-A2", first.load(a).getRefreshToken());
             Assert.assertEquals("REFRESH-B2", first.load(b).getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testConcurrentSaveWaitsForTheUntrustedDirectorySweepAndSurvives() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // Regression for the lost-persistence interleaving: A detects a world-writable directory, marks
+            // and tightens it, then pauses before its directory-wide sweep. B saves another identity and
+            // returns. Without one lock covering BOTH the sweep and the write, A resumes and deletes B's
+            // completed file; a headless process then cannot resume after restart and needs a human sign-in.
+            Path dir = storeDir();
+            FileTokenStore first = new FileTokenStore(dir);
+            FileTokenStore second = new FileTokenStore(dir);
+            TokenStoreKey a = sampleKey();
+            TokenStoreKey b = new TokenStoreKey("questdb", "https://idp.example.com:443/token",
+                    "https://idp.example.com:443/device", "openid profile", null, false);
+            Assert.assertNotEquals("the two identities must address different files", a.hash(), b.hash());
+
+            first.save(a, sampleToken("ACCESS-A", "REFRESH-A"));
+            first.save(b, sampleToken("ACCESS-B", "REFRESH-B"));
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+
+            AtomicBoolean saveReturned = new AtomicBoolean();
+            AtomicReference<Throwable> saveFailure = new AtomicReference<>();
+            AtomicReference<Thread> saveThread = new AtomicReference<>();
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeUntrustedDiscardHook");
+            hookField.setAccessible(true);
+            hookField.set(first, (Runnable) () -> {
+                Assert.assertTrue("the cross-process directory lock must remain held through the sweep",
+                        Files.isRegularFile(dir.resolve(".store.lock"), LinkOption.NOFOLLOW_LINKS));
+                Thread saver = new Thread(() -> {
+                    try {
+                        second.save(b, sampleToken("ACCESS-B2", "REFRESH-B2"));
+                        saveReturned.set(true);
+                    } catch (Throwable t) {
+                        saveFailure.compareAndSet(null, t);
+                    }
+                }, "concurrent-untrusted-saver");
+                saver.setDaemon(true);
+                saveThread.set(saver);
+                saver.start();
+                try {
+                    awaitWaitingInside(saver, "withDirectoryLock");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+                Assert.assertFalse("save must not report success while an earlier distrust sweep can still "
+                        + "delete its file", saveReturned.get());
+            });
+
+            Assert.assertNull("A must refuse an entry from a world-writable directory", first.load(a));
+            joinOrFail(saveThread.get(), "the concurrent saver");
+
+            Assert.assertNull("the concurrent save failed instead of waiting for recovery: " + saveFailure.get(),
+                    saveFailure.get());
+            Assert.assertTrue("the save must complete once the directory sweep releases the lock",
+                    saveReturned.get());
+            PersistedToken reloaded = new FileTokenStore(dir).load(b);
+            Assert.assertNotNull("a save that returned successfully must survive the earlier sweep", reloaded);
+            Assert.assertEquals("REFRESH-B2", reloaded.getRefreshToken());
         });
     }
 
@@ -2032,7 +2121,7 @@ public class FileTokenStoreTest {
             // FileAlreadyExistsException alone cannot do - and displace the squatter.
             //
             // beforeUntrustedDiscardHook drops us into the chmod-to-sweep gap, the same seam and the same
-            // window as testConcurrentLoadDistrustsTheDirectoryTightenedButNotYetSwept, and asserts what a
+            // window as testConcurrentLoadWaitsForTheUntrustedDirectorySweep, and asserts what a
             // peer arriving there would find at the name.
             Path dir = storeDir();
             FileTokenStore store = new FileTokenStore(dir);
@@ -2141,7 +2230,7 @@ public class FileTokenStoreTest {
     public void testLoadThrowsRatherThanReportsEmptyWhenTheDirectoryIsUnusable() throws Exception {
         assertMemoryLeak(() -> {
             // Same fixture as testInLockDegradesWhenDirectoryUnusable: a regular file standing where the
-            // store directory's parent must be makes ensureDirectory throw IOException. That fault is
+            // store directory's parent must be makes directory preparation throw IOException. That fault is
             // TRANSIENT in the field - a home directory not mounted yet, EIO/ESTALE on an NFS home, a
             // momentarily read-only or full filesystem.
             Path blocker = temp.getRoot().toPath().resolve("blocker");
@@ -2390,6 +2479,35 @@ public class FileTokenStoreTest {
                     Files.getPosixFilePermissions(tokenFile(dir, key)));
             Assert.assertEquals(PosixFilePermissions.fromString("rwx------"),
                     Files.getPosixFilePermissions(dir));
+        });
+    }
+
+    @Test
+    public void testSaveDoesNotDegradeWhenTheDirectoryLockIsHeld() throws Exception {
+        assertMemoryLeak(() -> {
+            // The per-identity refresh lock deliberately degrades after its acquire budget, but applying that
+            // policy to .store.lock reopens the lost-save race: a writer can return while a peer still holds an
+            // old distrust verdict and later sweeps its file. Directory coordination must fail the best-effort
+            // persistence call instead of making a false success claim.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            Path directoryLock = dir.resolve(".store.lock");
+            byte[] peerStamp = "live-directory-owner".getBytes(StandardCharsets.UTF_8);
+            Files.write(directoryLock, peerStamp);
+            FileTokenStore store = new FileTokenStore(dir, 200, 60_000);
+            TokenStoreKey key = sampleKey();
+
+            try {
+                store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+                Assert.fail("save must not run without the required directory lock");
+            } catch (OidcAuthException expected) {
+                // wrapped as the same best-effort persistence failure OidcDeviceAuth already handles
+            }
+
+            Assert.assertFalse("a timed-out save must not write a token outside the directory lock",
+                    Files.exists(tokenFile(dir, key)));
+            Assert.assertArrayEquals("the live peer's directory lock must be left untouched",
+                    peerStamp, Files.readAllBytes(directoryLock));
         });
     }
 
@@ -2679,6 +2797,28 @@ public class FileTokenStoreTest {
             Thread.sleep(5);
         }
         Assert.fail("the waiter never entered FileTokenStore." + method + " [state=" + t.getState() + ']');
+    }
+
+    private static void awaitWaitingInside(Thread t, String method) throws InterruptedException {
+        // Stronger than awaitInside: prove the helper has reached the named store operation AND is parked
+        // there, which distinguishes real directory-lock exclusion from a thread that was merely scheduled.
+        final long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            boolean isInside = false;
+            for (StackTraceElement frame : t.getStackTrace()) {
+                if (FileTokenStore.class.getName().equals(frame.getClassName())
+                        && method.equals(frame.getMethodName())) {
+                    isInside = true;
+                    break;
+                }
+            }
+            final Thread.State state = t.getState();
+            if (isInside && (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING)) {
+                return;
+            }
+            Thread.sleep(5);
+        }
+        Assert.fail("the waiter never blocked inside FileTokenStore." + method + " [state=" + t.getState() + ']');
     }
 
     /**
