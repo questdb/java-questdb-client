@@ -87,10 +87,13 @@ import java.util.concurrent.locks.ReentrantLock;
  * <b>Not authenticated.</b> The file carries no MAC or signature, so {@link #load} cannot distinguish a
  * planted credential from its own: anyone able to WRITE the file can substitute a well-formed entry that
  * this store will adopt and the caller will present. Permissions are the control, not the format. What load
- * does reject is corruption and mix-ups - an oversized, malformed or unparseable file, an entry whose
- * recorded identity fields do not match the key being loaded, an entry with no usable token, a token
- * carrying control or non-ASCII characters - with the recorded expiry and lifetime clamped rather than
- * trusted, and (on POSIX) an entry discarded outright when the directory is writable by other local users.
+ * itself rejects is corruption and mix-ups - an oversized, malformed or unparseable file, an entry whose
+ * recorded identity fields do not match the key being loaded, and (on POSIX) an entry discarded outright
+ * when the directory is writable by other local users. The token-shape checks that guard what actually gets
+ * served - rejecting an entry with no usable token or a token carrying control/non-ASCII characters, and
+ * clamping the recorded expiry and lifetime rather than trusting them - do not run here; they live one level
+ * up in {@code OidcDeviceAuth.adopt()}, the choke point every {@link TokenStore} (including a caller's own
+ * SPI implementation) passes through.
  * <p>
  * <b>Integrity (always).</b> {@link #save} writes a sibling temp file then atomically renames it over the
  * target, so a crash or an overlapping reader - in any process or language - sees the whole old or whole
@@ -123,14 +126,16 @@ public final class FileTokenStore implements TokenStore {
     private static final long DEFAULT_LOCK_ACQUIRE_BUDGET_MILLIS = 3_000L;
     // treat a lock older than this as abandoned by a crashed holder and steal it. Must stay comfortably
     // above the longest a live holder can hold it (one refresh under the lock) so a live holder is never
-    // stolen from. That refresh runs send + await + parse, plus a body drain on a parse failure, each
-    // separately bounded by the client's HTTP timeout (so up to ~4x it; OidcDeviceAuth caps that timeout at
-    // 120s, hence ~480s), PLUS the connection phase (DNS + TCP connect + TLS handshake), which the HTTP
-    // timeout does NOT bound and which the OS bounds instead (a black-holed connect is ~tcp-connect-timeout,
-    // commonly ~2 minutes on Linux). This 10-minute window leaves ample headroom above ~480s + a typical
-    // connection stall; a pathological DNS/connection hang longer than that headroom can still let a peer
-    // steal a live holder's lock mid-refresh, degrading to a concurrent refresh of the same parent refresh
-    // token: a redundant refresh on most IdPs, but on a reuse-detecting one (e.g. Auth0 default) a possible
+    // stolen from. That hold runs, in order, the TCP connect, the TLS handshake, send, await, parse, and a
+    // body drain on a parse failure - six phases, each separately bounded by the client's HTTP timeout,
+    // because OidcDeviceAuth.httpConfig() derives BOTH the connect timeout and the request timeout from
+    // httpTimeoutMillis and HttpClient spends them separately (so up to LOCK_HOLD_HTTP_TIMEOUT_MULTIPLE = 6x
+    // it; OidcDeviceAuth caps that timeout at 120s, hence up to ~720s). Only DNS resolution is left to the OS.
+    // At the 30s default httpTimeoutMillis the worst case is ~180s, so this 10-minute window leaves ample
+    // headroom; build() enforces a 6x floor, so a caller who raises httpTimeoutMillis toward the cap must
+    // raise this window to match. A pathological DNS hang beyond the headroom can still let a peer steal a
+    // live holder's lock mid-refresh, degrading to a concurrent refresh of the same parent refresh token: a
+    // redundant refresh on most IdPs, but on a reuse-detecting one (e.g. Auth0 default) a possible
     // token-family revocation and re-prompt / headless hard-failure (see the class javadoc residual note)
     private static final long DEFAULT_LOCK_STALE_MILLIS = 600_000L;
     private static final FileAttribute<Set<PosixFilePermission>> DIR_ATTRS =
@@ -266,20 +271,20 @@ public final class FileTokenStore implements TokenStore {
      *                                 and at most 30_000 (30s): {@code getToken()} can wait it out on the
      *                                 latency-sensitive flush path, so it is kept short
      * @param lockStaleMillis          a lock older than this is treated as abandoned by a crashed holder and
-     *                                 stolen. It MUST exceed the longest a live holder can hold the lock, which
-     *                                 is the under-lock refresh PLUS the connection phase that precedes it: the
-     *                                 refresh runs send + await + parse plus a body drain, each bounded by the
-     *                                 {@code OidcDeviceAuth} httpTimeoutMillis (so up to ~4x it, ~480s at the
-     *                                 120s timeout cap), but establishing the connection - DNS resolution, the
-     *                                 TCP connect, and the TLS handshake - is NOT bounded by httpTimeoutMillis;
-     *                                 the OS bounds it instead (a black-holed connect runs to the OS TCP-connect
-     *                                 timeout, commonly ~3 minutes). Size this window above ~6x httpTimeoutMillis
-     *                                 plus a generous connection-stall allowance, or a peer can judge a live but
-     *                                 connection-stalled holder stale and steal its lock mid-refresh, reopening
-     *                                 the cross-process refresh race this lock exists to prevent. The store
-     *                                 cannot see the client's timeout, so sizing this correctly is the caller's
-     *                                 responsibility; the default is 600_000 (~480s worst-case refresh plus
-     *                                 ample headroom for a typical connection stall).
+     *                                 stolen. It MUST exceed the longest a live holder can hold the lock: the
+     *                                 under-lock refresh runs the TCP connect, the TLS handshake, send, await,
+     *                                 parse, and a body drain on a parse failure - six phases, each bounded by
+     *                                 the {@code OidcDeviceAuth} httpTimeoutMillis, because httpConfig() derives
+     *                                 BOTH the connect timeout and the request timeout from it and HttpClient
+     *                                 spends them separately (so up to ~6x it, ~720s at the 120s timeout cap).
+     *                                 Only DNS resolution is left to the OS. Size this window above 6x
+     *                                 httpTimeoutMillis plus a small DNS allowance, or a peer can judge a live
+     *                                 holder stale and steal its lock mid-refresh, reopening the cross-process
+     *                                 refresh race this lock exists to prevent. The store cannot see the
+     *                                 client's timeout, so sizing this correctly is the caller's responsibility;
+     *                                 the default is 600_000, ample for the 30s default httpTimeoutMillis (~180s
+     *                                 worst case) - and {@code build()} enforces the 6x floor so a raised
+     *                                 httpTimeoutMillis forces a matching lockStaleMillis.
      */
     public FileTokenStore(Path directory, long lockAcquireBudgetMillis, long lockStaleMillis) {
         if (directory == null) {
