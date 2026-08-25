@@ -175,8 +175,8 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
             Map<Integer, Long> drops = new HashMap<>();
             drops.put(1, 0L);
             drops.put(2, 1L);
-            // connection 2 - the delivering session - sleeps before acking, putting real wall clock
-            // between the first rejection and the second window.
+            // connection 2 - the delivering session - acks its progress and then lingers before it drops,
+            // putting real wall clock between the two rejection windows (see ScriptedAckHandler).
             try (TestWebSocketServer server = new TestWebSocketServer(new ScriptedAckHandler(drops, 2, 800L), true)) {
                 server.start();
                 assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
@@ -417,9 +417,10 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
      * Per-connection scripted acks over a real wire. Connection indexes present in
      * {@code dropAfterSeqByConnection} (1-based, arrival order) durably ack up to that per-connection
      * seq and then close the socket - a deterministic mid-drain wire drop; every other connection acks
-     * whatever it is sent. One connection may additionally sleep before its first ack, which is how
-     * {@link #testDeliveringBetweenTwoRotating401WindowsRestartsTheDwellAnchor()} puts real wall clock
-     * between the two rejection windows without leaning on backoff timing.
+     * whatever it is sent. One connection may additionally linger after durably acking its progress and
+     * before it drops, which is how {@link #testDeliveringBetweenTwoRotating401WindowsRestartsTheDwellAnchor()}
+     * puts real wall clock between the two rejection windows without leaning on backoff timing - and without
+     * racing the drainer's ack-progress poll, which a sleep before the ack did.
      * <p>
      * Mirrors {@code BackgroundDrainerMidDrainCapabilityGapTest.GapScenarioHandler}; kept local because
      * that one is private to its own class and the two scripts differ in the delay.
@@ -450,14 +451,6 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
             }
             int connectionIndex = arrivalOrder.indexOf(client) + 1;
             long seq = counter[0]++;
-            if (connectionIndex == delayConnectionIndex && !delayed) {
-                delayed = true;
-                try {
-                    Thread.sleep(delayMillis);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
             try {
                 Long dropAfterSeq = dropAfterSeqByConnection.get(connectionIndex);
                 if (dropAfterSeq != null) {
@@ -465,6 +458,21 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
                         client.sendBinary(okFrame(seq, seq));
                         client.sendBinary(durableAckFrame(seq));
                     } else if (seq == dropAfterSeq + 1) {
+                        // The wall-clock gap between the two rejection windows goes HERE - AFTER this
+                        // connection durably acked its progress (the seq <= dropAfterSeq branch above) and
+                        // BEFORE it drops the wire. Sleeping before the ack instead raced the drop: on a
+                        // loaded runner the client had not committed the durable ack - so the drainer's poll
+                        // never observed the watermark advance and noteAckProgress never reset the counter or
+                        // anchor - by the time the drop recycled it into the second window, and a healthy slot
+                        // quarantined. Lingering after the ack lets the poll observe the advance first.
+                        if (connectionIndex == delayConnectionIndex && !delayed) {
+                            delayed = true;
+                            try {
+                                Thread.sleep(delayMillis);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        }
                         client.close(); // mid-drain wire drop
                     }
                     // beyond that: late buffered frames from the condemned connection; ignore.
