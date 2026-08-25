@@ -809,27 +809,30 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static void discoverFromIdp(String issuer, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport, WellKnownDiscoveryParser parser) {
         // the issuer is pinned out of band (the caller guarantees it is non-null), so the server cannot choose
         // where discovery - and the credential POSTs it resolves - are aimed
-        String expectedIssuer = issuer;
-        while (expectedIssuer.length() > 1 && expectedIssuer.charAt(expectedIssuer.length() - 1) == '/') {
-            expectedIssuer = expectedIssuer.substring(0, expectedIssuer.length() - 1);
+        // A trailing slash remains part of the issuer identifier and must survive the exact comparison below.
+        // Remove it only from the base used to construct the well-known request URL, as required by OIDC
+        // Discovery section 4.1.
+        String discoveryBase = issuer;
+        while (discoveryBase.length() > 1 && discoveryBase.charAt(discoveryBase.length() - 1) == '/') {
+            discoveryBase = discoveryBase.substring(0, discoveryBase.length() - 1);
         }
-        String url = expectedIssuer + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
+        String url = discoveryBase + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
         Endpoint endpoint = Endpoint.parse(url);
         requireSecureIdpEndpoint(endpoint, "OIDC issuer", url, allowInsecureTransport);
         fetchJson(endpoint, endpoint.path, tlsConfig, parser,
                 "could not reach the identity provider to discover OIDC settings",
                 "could not parse the identity provider discovery document",
                 "the identity provider did not return an OIDC discovery document");
-        // OpenID Connect Discovery requires code-point-for-code-point equality with the issuer prefix used
-        // for this request: it is an identifier comparison, not an origin comparison. Do not case-fold the
-        // host, normalize Unicode, remove a default port, or otherwise turn a wrong-tenant document into a
-        // match. Validate before fromQuestDB copies either discovered endpoint out of the parser.
+        // OpenID Connect Discovery requires code-point-for-code-point equality with the pinned issuer whose
+        // configuration this request retrieves: it is an identifier comparison, not an origin comparison. Do
+        // not case-fold the host, normalize Unicode, remove a default port, or otherwise turn a wrong-tenant
+        // document into a match. Validate before fromQuestDB copies either discovered endpoint out of the parser.
         if (parser.issuer.length() == 0) {
             throw new OidcAuthException()
                     .put("the identity provider discovery document does not contain the required issuer; ")
                     .put("refusing to use its endpoints");
         }
-        if (!Chars.equals(expectedIssuer, parser.issuer)) {
+        if (!Chars.equals(issuer, parser.issuer)) {
             // Do not echo parser.issuer: it came from an untrusted response and may contain display-control
             // characters. The caller already knows which issuer it pinned.
             throw new OidcAuthException()

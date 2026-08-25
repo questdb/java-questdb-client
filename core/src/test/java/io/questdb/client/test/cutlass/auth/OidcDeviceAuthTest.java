@@ -1611,6 +1611,16 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryAcceptsPathIssuerWithTrailingSlash() throws Exception {
+        assertMemoryLeak(() -> assertFromQuestDbDiscoveryAcceptsTrailingSlashIssuer("/realms/acme/"));
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryAcceptsRootIssuerWithTrailingSlash() throws Exception {
+        assertMemoryLeak(() -> assertFromQuestDbDiscoveryAcceptsTrailingSlashIssuer("/"));
+    }
+
+    @Test(timeout = 30_000)
     public void testFromQuestDbDiscoveryDocMissingDeviceEndpointRejected() throws Exception {
         assertMemoryLeak(() -> {
             // discovery runs against the pinned issuer, but the discovery document does not advertise a
@@ -4078,6 +4088,43 @@ public class OidcDeviceAuthTest {
             Assert.fail("expected build to fail for device=" + deviceEndpoint + " token=" + tokenEndpoint);
         } catch (OidcAuthException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
+        }
+    }
+
+    private static void assertFromQuestDbDiscoveryAcceptsTrailingSlashIssuer(String issuerPath) throws Exception {
+        final String endpointPrefix = issuerPath.substring(0, issuerPath.length() - 1);
+        final String discoveryPath = endpointPrefix + WELL_KNOWN_PATH;
+        final String devicePath = endpointPrefix + DEVICE_PATH;
+        final String tokenPath = endpointPrefix + TOKEN_PATH;
+        AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+        MockOidcServer.Handler handler = (method, path, body) -> {
+            MockOidcServer server = serverRef.get();
+            if (SETTINGS_PATH.equals(path)) {
+                return MockOidcServer.json(200, settingsJson(true, false, server.httpUrl(tokenPath), null));
+            }
+            if (discoveryPath.equals(path)) {
+                return MockOidcServer.json(200, wellKnownJson(
+                        server.httpUrl(devicePath),
+                        server.httpUrl(tokenPath),
+                        server.httpUrl(issuerPath)
+                ));
+            }
+            if (devicePath.equals(path)) {
+                return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+            }
+            if (tokenPath.equals(path)) {
+                return MockOidcServer.json(200, tokenJson("ACCESS-TRAILING-SLASH", "ID-TRAILING-SLASH", null, 3600));
+            }
+            return MockOidcServer.json(404, "{}");
+        };
+        try (MockOidcServer server = new MockOidcServer(handler)) {
+            serverRef.set(server);
+            try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+                    server.httpUrl(""),
+                    insecure().issuer(server.httpUrl(issuerPath))
+            )) {
+                Assert.assertEquals("ID-TRAILING-SLASH", auth.signIn());
+            }
         }
     }
 
