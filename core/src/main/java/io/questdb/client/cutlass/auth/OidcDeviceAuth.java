@@ -357,7 +357,8 @@ public class OidcDeviceAuth implements QuietCloseable {
         String resolvedIssuer = issuer != null && !issuer.isEmpty() ? issuer : null;
         // capture each endpoint's provenance before discovery may fill a missing one: only an endpoint the
         // untrusted /settings response advertised is origin-pinned to the issuer below. An endpoint discovered
-        // from the provider's own .well-known is authoritative for wherever the pinned issuer hosts it.
+        // from the provider's own .well-known is authoritative for wherever the pinned issuer hosts it, after
+        // the document's returned issuer has exactly matched the issuer used for the discovery request.
         final boolean tokenEndpointFromSettings = tokenEndpoint != null;
         final boolean deviceEndpointFromSettings = deviceAuthorizationEndpoint != null;
 
@@ -808,13 +809,33 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static void discoverFromIdp(String issuer, ClientTlsConfiguration tlsConfig, boolean allowInsecureTransport, WellKnownDiscoveryParser parser) {
         // the issuer is pinned out of band (the caller guarantees it is non-null), so the server cannot choose
         // where discovery - and the credential POSTs it resolves - are aimed
-        String url = wellKnownUrl(issuer);
+        String expectedIssuer = issuer;
+        while (expectedIssuer.length() > 1 && expectedIssuer.charAt(expectedIssuer.length() - 1) == '/') {
+            expectedIssuer = expectedIssuer.substring(0, expectedIssuer.length() - 1);
+        }
+        String url = expectedIssuer + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
         Endpoint endpoint = Endpoint.parse(url);
         requireSecureIdpEndpoint(endpoint, "OIDC issuer", url, allowInsecureTransport);
         fetchJson(endpoint, endpoint.path, tlsConfig, parser,
                 "could not reach the identity provider to discover OIDC settings",
                 "could not parse the identity provider discovery document",
                 "the identity provider did not return an OIDC discovery document");
+        // OpenID Connect Discovery requires code-point-for-code-point equality with the issuer prefix used
+        // for this request: it is an identifier comparison, not an origin comparison. Do not case-fold the
+        // host, normalize Unicode, remove a default port, or otherwise turn a wrong-tenant document into a
+        // match. Validate before fromQuestDB copies either discovered endpoint out of the parser.
+        if (parser.issuer.length() == 0) {
+            throw new OidcAuthException()
+                    .put("the identity provider discovery document does not contain the required issuer; ")
+                    .put("refusing to use its endpoints");
+        }
+        if (!Chars.equals(expectedIssuer, parser.issuer)) {
+            // Do not echo parser.issuer: it came from an untrusted response and may contain display-control
+            // characters. The caller already knows which issuer it pinned.
+            throw new OidcAuthException()
+                    .put("the identity provider discovery document issuer does not exactly match the pinned issuer; ")
+                    .put("refusing to use its endpoints");
+        }
     }
 
     private static void discoverSettings(Endpoint server, ClientTlsConfiguration tlsConfig, SettingsDiscoveryParser parser) {
@@ -1336,14 +1357,6 @@ public class OidcDeviceAuth implements QuietCloseable {
                     .put("the identity provider returned an ").put(tokenName)
                     .put(" containing a disallowed control or non-ASCII character; refusing to use it as a credential");
         }
-    }
-
-    private static String wellKnownUrl(String issuer) {
-        String trimmed = issuer;
-        while (trimmed.length() > 1 && trimmed.charAt(trimmed.length() - 1) == '/') {
-            trimmed = trimmed.substring(0, trimmed.length() - 1);
-        }
-        return trimmed + WELL_KNOWN_OPENID_CONFIGURATION_PATH;
     }
 
     private void acquireForGetToken() {
@@ -3057,9 +3070,11 @@ public class OidcDeviceAuth implements QuietCloseable {
 
     private static final class WellKnownDiscoveryParser implements JsonParser {
         private static final int FIELD_DEVICE_AUTHORIZATION_ENDPOINT = 1;
+        private static final int FIELD_ISSUER = 2;
         private static final int FIELD_NONE = 0;
-        private static final int FIELD_TOKEN_ENDPOINT = 2;
+        private static final int FIELD_TOKEN_ENDPOINT = 3;
         final StringSink deviceAuthorizationEndpoint = new StringSink();
+        final StringSink issuer = new StringSink();
         final StringSink tokenEndpoint = new StringSink();
         // objects nested inside a JSON array are never trusted: an array-wrapped document must not surface its
         // element object's fields at the top-level depth. arrayDepth gates every name/value read on being 0.
@@ -3088,6 +3103,8 @@ public class OidcDeviceAuth implements QuietCloseable {
                     if (arrayDepth == 0 && depth == 1) {
                         if (Chars.equals("device_authorization_endpoint", tag)) {
                             field = FIELD_DEVICE_AUTHORIZATION_ENDPOINT;
+                        } else if (Chars.equals("issuer", tag)) {
+                            field = FIELD_ISSUER;
                         } else if (Chars.equals("token_endpoint", tag)) {
                             field = FIELD_TOKEN_ENDPOINT;
                         } else {
@@ -3100,6 +3117,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                         switch (field) {
                             case FIELD_DEVICE_AUTHORIZATION_ENDPOINT:
                                 putNonNull(deviceAuthorizationEndpoint, tag);
+                                break;
+                            case FIELD_ISSUER:
+                                putNonNull(issuer, tag);
                                 break;
                             case FIELD_TOKEN_ENDPOINT:
                                 putNonNull(tokenEndpoint, tag);

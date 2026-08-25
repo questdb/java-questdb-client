@@ -1639,6 +1639,79 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryRejectsMismatchedIssuer() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(
+                            true,
+                            false,
+                            server.httpUrl("/realms/acme/token"),
+                            null
+                    ));
+                }
+                if (("/realms/acme" + WELL_KNOWN_PATH).equals(path)) {
+                    // Every endpoint passes the existing origin/path checks. Only the returned issuer reveals
+                    // that this is metadata for a different tenant on the same authorization server.
+                    return MockOidcServer.json(200, wellKnownJson(
+                            server.httpUrl("/realms/acme/device"),
+                            server.httpUrl("/realms/acme/token"),
+                            server.httpUrl("/realms/other")
+                    ));
+                }
+                return MockOidcServer.json(500, "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                assertOidcFails(
+                        () -> OidcDeviceAuth.fromQuestDB(
+                                server.httpUrl(""),
+                                insecure().issuer(server.httpUrl("/realms/acme"))
+                        ),
+                        "issuer does not exactly match the pinned issuer"
+                );
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFromQuestDbDiscoveryRejectsMissingIssuer() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                MockOidcServer server = serverRef.get();
+                if (SETTINGS_PATH.equals(path)) {
+                    return MockOidcServer.json(200, settingsJson(
+                            true,
+                            false,
+                            server.httpUrl(TOKEN_PATH),
+                            null
+                    ));
+                }
+                if (WELL_KNOWN_PATH.equals(path)) {
+                    return MockOidcServer.json(200, "{"
+                            + "\"token_endpoint\":\"" + server.httpUrl(TOKEN_PATH) + "\","
+                            + "\"device_authorization_endpoint\":\"" + server.httpUrl(DEVICE_PATH) + "\""
+                            + "}");
+                }
+                return MockOidcServer.json(500, "{}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                serverRef.set(server);
+                assertOidcFails(
+                        () -> OidcDeviceAuth.fromQuestDB(
+                                server.httpUrl(""),
+                                insecure().issuer(server.httpUrl(""))
+                        ),
+                        "does not contain the required issuer"
+                );
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testFromQuestDbDiscoveryRunsFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicReference<MockOidcServer> serverRef = new AtomicReference<>();
