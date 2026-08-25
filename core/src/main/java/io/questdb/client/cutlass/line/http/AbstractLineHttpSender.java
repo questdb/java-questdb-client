@@ -338,8 +338,15 @@ public abstract class AbstractLineHttpSender implements Sender {
                         } else {
                             lastErrorSink.clear();
                         }
-                        // the construct-time probe retries on any read abort (caught below), so its own
-                        // configured request timeout is the right bound here
+                        // This error-body read is bounded at request_timeout. The construct-time probe does
+                        // catch a read abort in the retry loop below, but it does NOT absorb it into extra
+                        // retries: retry_timeout (maxRetriesNanos, 10s default) is smaller than a single
+                        // attempt's bound (request_timeout, 30s default). The probe's no-arg reads -
+                        // response.await() above and the recv() inside parser.parse() - each bound the WHOLE
+                        // call on elapsed time at request_timeout, so after the first attempt aborts nowNanos
+                        // has already passed the retry deadline (armed at first-failure nowNanos +
+                        // maxRetriesNanos). The probe therefore runs at most two attempts (initial + one retry)
+                        // before build() throws "Failed to detect server line protocol version".
                         chunkedResponseToSink(response, lastErrorSink, clientConfiguration.getTimeout());
                     } catch (HttpClientException e) {
                         if (lastErrorSink == null) {
