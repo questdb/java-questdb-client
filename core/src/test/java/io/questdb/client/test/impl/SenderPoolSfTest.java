@@ -1536,6 +1536,12 @@ public class SenderPoolSfTest {
                     releaseWorker.countDown();
                     manager.setAfterRingCleanupHook(null);
                     manager.setBeforeInstallSyncHook(null);
+                    // The 50 ms timeout above is only for forcing the slot-
+                    // retirement path under test. Restore a normal teardown
+                    // budget before closing the recovered sender: otherwise a
+                    // slow CI runner can defer that sender's final mmap cleanup
+                    // past assertMemoryLeak() and bleed it into the next test.
+                    manager.setWorkerJoinTimeoutMillis(TimeUnit.SECONDS.toMillis(60));
                     pool.close();
                     manager.close();
                 }
