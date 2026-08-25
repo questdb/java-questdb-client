@@ -146,6 +146,16 @@ public final class FileTokenStore implements TokenStore {
     // refresh lock, this lock is REQUIRED: running a save without it could let a concurrent directory-wide
     // untrusted-content sweep delete the file after save() has returned successfully.
     private static final String DIRECTORY_LOCK_FILE_NAME = ".store.lock";
+    // Once the directory is owner-only and has no pending distrust sweep, the directory lock protects only
+    // bounded atomic filesystem work, never the IdP round-trip covered by lockStaleMillis. Give that trusted
+    // state a short renewable lease so a process killed during writeAndFlush cannot strand every load/save for
+    // the refresh lock's 10-minute default. A live holder refreshes the mtime well inside this window; a dead
+    // one stops refreshing and is reclaimable within the default 3-second acquire budget. An untrusted or
+    // indeterminate directory retains the conservative configured staleness window: a paused sweep must never
+    // resume after a peer has displaced its lock and delete that peer's completed save.
+    private static final long DIRECTORY_LOCK_EMPTY_STEAL_GRACE_MILLIS = 2_000L;
+    private static final long DIRECTORY_LOCK_HEARTBEAT_MILLIS = 500L;
+    private static final long DIRECTORY_LOCK_STALE_MILLIS = 2_000L;
     // the same owner-only directory permissions as DIR_ATTRS, in the form setPosixFilePermissions wants, so
     // restrictToOwner can re-assert them on a directory that already exists with looser permissions
     private static final Set<PosixFilePermission> DIR_PERMS = PosixFilePermissions.fromString("rwx------");
@@ -275,8 +285,10 @@ public final class FileTokenStore implements TokenStore {
      *                                 to a lock-free refresh rather than stalling a sign-in. Must be positive
      *                                 and at most 30_000 (30s): {@code getToken()} can wait it out on the
      *                                 latency-sensitive flush path, so it is kept short
-     * @param lockStaleMillis          a lock older than this is treated as abandoned by a crashed holder and
-     *                                 stolen. It MUST exceed the longest a live holder can hold the lock: the
+     * @param lockStaleMillis          an identity lock older than this is treated as abandoned by a crashed
+     *                                 holder and stolen; it is also the conservative directory-lock window
+     *                                 while a distrust recovery is pending. It MUST exceed the longest a live
+     *                                 identity-lock holder can hold the lock: the
      *                                 under-lock refresh runs the TCP connect, the TLS handshake, send, await,
      *                                 parse, and a body drain on a parse failure - six phases, each bounded by
      *                                 the {@code OidcDeviceAuth} httpTimeoutMillis, because httpConfig() derives
@@ -652,8 +664,9 @@ public final class FileTokenStore implements TokenStore {
         // Exclusively create the lock (O_CREAT|O_EXCL via CREATE_NEW), then write the owner nonce into that same
         // open channel before closing it. The file exists empty only for the tiny window between the create and
         // the stamp; a GC/safepoint pause (or a cross-machine clock skew) CAN land in that window, so what keeps
-        // our freshly-created lock from being stolen as empty-and-stale is EMPTY_LOCK_STEAL_GRACE_MILLIS sitting
-        // well above it, not the absence of the window. FileAlreadyExists means a peer already holds it.
+        // our freshly-created lock from being stolen as empty-and-stale is the applicable grace (5 seconds for
+        // an identity lock; 2 seconds for a trusted directory lock) sitting well above it, not the absence of
+        // the window. FileAlreadyExists means a peer already holds it.
         // releaseLock and stealIfStale verify this nonce before deleting. Keep the owner-only perms (and the
         // non-POSIX fallback) to match the store's other files.
         final byte[] bytes = nonce.getBytes(StandardCharsets.UTF_8);
@@ -1112,6 +1125,7 @@ public final class FileTokenStore implements TokenStore {
         }
         try {
             final Path lock = directoryLockFile();
+            DirectoryLockHeartbeat heartbeat = null;
             String nonce = null;
             try {
                 try {
@@ -1143,11 +1157,19 @@ public final class FileTokenStore implements TokenStore {
                     throw new IOException("lost ownership of the OIDC token store directory lock");
                 }
 
+                // The required lock can cover a flush or a distrust sweep. Renew its timestamp while either
+                // runs. A trusted-directory waiter uses the short lease; one that still sees pending recovery
+                // retains the conservative configured window so a paused sweep cannot be displaced.
+                heartbeat = new DirectoryLockHeartbeat(lock, nonce);
+
                 if (!isDirectoryTrusted) {
                     discardUntrustedDirectoryContents();
                 }
                 return action.run(isDirectoryTrusted);
             } finally {
+                if (heartbeat != null) {
+                    heartbeat.close();
+                }
                 if (nonce != null) {
                     // A live interrupt during the action must not strand the lock until its staleness window.
                     final boolean wasInterrupted = Thread.interrupted();
@@ -1194,8 +1216,8 @@ public final class FileTokenStore implements TokenStore {
         // returns the unique owner nonce stamped into the lock on success, or null if it could not be acquired
         // within the budget when isRequired is false. A required directory lock throws instead: proceeding
         // without it would let an untrusted-directory sweep delete another identity's completed save.
-        // releaseLock uses the nonce to verify ownership before deleting, so a hold that outran
-        // lockStaleMillis (and was stolen by a peer) never deletes the peer's lock on release
+        // releaseLock uses the nonce to verify ownership before deleting, so a hold that outran its staleness
+        // window (and was stolen by a peer) never deletes the peer's lock on release
         final String nonce = newLockNonce();
         // nanoTime, not currentTimeMillis: this is an elapsed budget, and the wall clock is adjustable. An
         // NTP step or an operator setting the date back stretches a millis-based deadline by the size of the
@@ -1206,9 +1228,9 @@ public final class FileTokenStore implements TokenStore {
         final long deadlineNanos = System.nanoTime() + lockAcquireBudgetMillis * 1_000_000L;
         while (true) {
             try {
-                // exclusive-create then stamp on the same open channel: the empty-file window between the two is
-                // tiny and covered by EMPTY_LOCK_STEAL_GRACE_MILLIS, so a GC/safepoint pause mid-acquisition
-                // cannot get our freshly-created lock stolen as empty-and-stale
+                // exclusive-create then stamp on the same open channel: the empty-file window between the two
+                // is tiny and covered by the applicable empty-lock grace, so a GC/safepoint pause
+                // mid-acquisition cannot get our freshly-created lock stolen as empty-and-stale
                 createLockFile(lock, nonce);
                 return nonce;
             } catch (FileAlreadyExistsException e) {
@@ -1216,7 +1238,15 @@ public final class FileTokenStore implements TokenStore {
                 // so a stealer never removes a peer's freshly-created live lock (see stealIfStale). Then fall
                 // through to the bounded wait below rather than retry immediately: a steal contest between
                 // several acquirers (or a misconfigured tiny lockStaleMillis) must not hot-spin.
-                stealIfStale(lock);
+                if (isRequired && canUseShortDirectoryLockLease()) {
+                    stealIfStale(
+                            lock,
+                            DIRECTORY_LOCK_STALE_MILLIS,
+                            DIRECTORY_LOCK_EMPTY_STEAL_GRACE_MILLIS
+                    );
+                } else {
+                    stealIfStale(lock);
+                }
                 if (System.nanoTime() - deadlineNanos >= 0) {
                     if (isRequired) {
                         throw new IOException("timed out acquiring the OIDC token store directory lock");
@@ -1240,8 +1270,8 @@ public final class FileTokenStore implements TokenStore {
                 // reuse-detecting identity provider answers by revoking the whole token family.
                 //
                 // A lock we genuinely did leave half-created is EMPTY, and stealIfStale already reclaims an
-                // empty lock on the short EMPTY_LOCK_STEAL_GRACE_MILLIS grace, so leaving it behind costs at
-                // most that grace. A refresh lock degrades to a lock-free refresh; a required directory lock
+                // empty lock on its dedicated grace, so leaving it behind costs at most that grace once it is
+                // safe to reclaim. A refresh lock degrades to a lock-free refresh; a required directory lock
                 // propagates the failure because running a sweep or write without it is unsafe.
                 if (isRequired) {
                     throw e;
@@ -1405,15 +1435,6 @@ public final class FileTokenStore implements TokenStore {
 
     private Path directoryLockFile() {
         return directory.resolve(DIRECTORY_LOCK_FILE_NAME);
-    }
-
-    private boolean isOlderThan(Path lock, long thresholdMillis) {
-        try {
-            FileTime modified = Files.getLastModifiedTime(lock);
-            return System.currentTimeMillis() - modified.toMillis() > thresholdMillis;
-        } catch (IOException e) {
-            return false; // cannot determine the age; do not steal
-        }
     }
 
     private Path lockFile(TokenStoreKey key) {
@@ -1614,7 +1635,35 @@ public final class FileTokenStore implements TokenStore {
         }
     }
 
+    private boolean canUseShortDirectoryLockLease() {
+        // Read permissions BEFORE the sentinel. Recovery publishes the sentinel before tightening the
+        // directory, and clears it only after a complete sweep. That order means we cannot combine a stale
+        // "no sentinel" observation with the owner-only permissions recovery publishes later and mistake an
+        // in-progress sweep for a trusted directory.
+        try {
+            try {
+                final Set<PosixFilePermission> perms = Files.getPosixFilePermissions(directory);
+                if (perms.contains(PosixFilePermission.GROUP_WRITE)
+                        || perms.contains(PosixFilePermission.OTHERS_WRITE)) {
+                    return false;
+                }
+            } catch (UnsupportedOperationException e) {
+                // On a non-POSIX filesystem restrictToOwner cannot derive an untrusted verdict from mode bits.
+                // A sentinel still blocks the short lease below if another implementation left one behind.
+            }
+            return Files.notExists(untrustedSentinel(), LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException | SecurityException e) {
+            // Uncertainty is the fail-closed direction: retain the long configured window rather than risk
+            // admitting a peer while a distrust sweep can still resume.
+            return false;
+        }
+    }
+
     private void stealIfStale(Path lock) {
+        stealIfStale(lock, lockStaleMillis, EMPTY_LOCK_STEAL_GRACE_MILLIS);
+    }
+
+    private void stealIfStale(Path lock, long staleMillis, long emptyLockStealGraceMillis) {
         // Steal a lock abandoned by a crashed holder, but never remove a peer's freshly-created LIVE lock. A
         // bare deleteIfExists(lock) removes whatever sits at the path at that instant - including a fresh lock
         // a peer created in the gap since we judged the old one stale - and would admit two holders at once.
@@ -1630,14 +1679,21 @@ public final class FileTokenStore implements TokenStore {
         } catch (IOException e) {
             return; // gone or unreadable; nothing to steal here - the create attempt or a peer settles it
         }
-        // read the stamp first, then check age: if a peer replaces the lock with a fresh one in between, the
-        // age check reads the fresh mtime and returns false, so we never proceed against a live lock.
-        if (before != null) {
-            // a stamped lock is a (claimed) live holder: steal only once it outlives the full staleness window
-            if (!isOlderThan(lock, lockStaleMillis)) {
-                return;
-            }
-        } else if (!isOlderThan(lock, EMPTY_LOCK_STEAL_GRACE_MILLIS)) {
+        // Read the stamp first, then the mtime: if a peer replaces the lock in between, the fresh mtime keeps
+        // us from proceeding. Preserve the exact mtime for the capture verification too. The directory-lock
+        // heartbeat changes metadata rather than the owner stamp, so comparing only the stamp after capture
+        // could discard a live lock that renewed between this age check and the atomic move.
+        final FileTime beforeModified;
+        try {
+            beforeModified = Files.getLastModifiedTime(lock);
+        } catch (IOException e) {
+            return; // cannot determine the age; do not steal
+        }
+        final long staleThresholdMillis = before != null ? staleMillis : emptyLockStealGraceMillis;
+        if (System.currentTimeMillis() - beforeModified.toMillis() <= staleThresholdMillis) {
+            return;
+        }
+        if (before == null) {
             // an empty/unreadable lock is almost never a validly-held lock: acquireLock creates the lock and
             // stamps the owner nonce onto the same open channel (createLockFile via CREATE_NEW), so a live lock
             // carries its stamp within the tiny create->stamp window. An empty lock therefore means either a
@@ -1650,14 +1706,12 @@ public final class FileTokenStore implements TokenStore {
             // atomic rename holds - it degrades to at most a concurrent refresh, the best-effort residual
             // inLock already accepts.)
             //
-            // The grace is used verbatim, never clamped down to a smaller lockStaleMillis. It is the one thing
-            // standing between a peer caught mid-stamp and having its live lock stolen, so the frozen
-            // cross-language contract (design/oidc-token-persistence.md) states that a client MUST NOT shorten
-            // it - and a store built with a staleness window under 5s would otherwise do exactly that,
-            // silently. A short window is a legitimate way to say "steal an abandoned STAMPED lock quickly";
-            // it is not a statement about the create-to-stamp gap, which is the same few microseconds however
-            // the store is configured.
-            return;
+            // The per-identity grace is used verbatim, never clamped down to a smaller lockStaleMillis. It is
+            // the one thing standing between a refresh peer caught mid-stamp and having its live lock stolen,
+            // so the frozen cross-language contract states that clients MUST NOT shorten it. The required
+            // directory lock uses its own shorter grace: withDirectoryLock verifies the owner stamp again after
+            // tightening the directory, so a paused creator whose empty file was reclaimed aborts before doing
+            // any trust recovery or token I/O. That extra ownership check makes prompt crash recovery safe there.
         }
         final Runnable hook = beforeCaptureHook;
         if (hook != null) {
@@ -1672,20 +1726,25 @@ public final class FileTokenStore implements TokenStore {
             return;
         }
         byte[] after = null;
+        FileTime afterModified = null;
         boolean afterReadOk = false;
         try {
             after = readLockHolder(captured);
+            afterModified = Files.getLastModifiedTime(captured);
             afterReadOk = true;
         } catch (IOException ignore) {
-            // captured but cannot re-read; treated as a non-match below, so we restore rather than steal
+            // captured but cannot re-read its stamp or mtime; treated as a non-match below, so we restore
         }
-        // Confirm we captured the same stamp we judged stale (or the same empty/oversized junk), not a live
-        // lock a peer recreated in the gap. afterReadOk is load-bearing and separate from "after == null":
-        // readLockHolder returns null for a legitimately empty or oversized lock but THROWS on an IO error,
-        // and folding those together let a failed re-read of an empty lock read as confirmedStale - so the
-        // steal completed on the strength of an IO error rather than on evidence the lock was unchanged,
-        // the exact opposite of what the catch above says it does.
+        // Confirm we captured the same stamp AND mtime we judged stale (or the same empty/oversized junk), not
+        // a peer's replacement or a live directory lock renewed in the gap. afterReadOk is load-bearing and
+        // separate from "after == null": readLockHolder returns null for a legitimately empty or oversized
+        // lock but THROWS on an IO error, and folding those together would complete a steal on the strength of
+        // an IO error rather than on evidence the lock was unchanged.
         final boolean confirmedStale = afterReadOk
+                // The heartbeat and age calculation both operate at millisecond precision. Compare at that
+                // same precision so a filesystem that normalizes sub-millisecond metadata during the atomic
+                // rename does not make every genuinely abandoned lock look renewed.
+                && beforeModified.toMillis() == afterModified.toMillis()
                 && (before == null ? after == null : Arrays.equals(before, after));
         if (confirmedStale) {
             // genuinely the abandoned lock: drop it, so the next createLockFile can claim a fresh one
@@ -1758,6 +1817,70 @@ public final class FileTokenStore implements TokenStore {
     @FunctionalInterface
     private interface DirectoryAction<T> {
         T run(boolean isDirectoryTrusted) throws IOException;
+    }
+
+    private static final class DirectoryLockHeartbeat implements AutoCloseable {
+        private final Path lock;
+        private final String nonce;
+        private final Thread thread;
+        private volatile boolean closed;
+
+        private DirectoryLockHeartbeat(Path lock, String nonce) {
+            this.lock = lock;
+            this.nonce = nonce;
+            this.thread = new Thread(this::run, "questdb-oidc-store-lock-heartbeat");
+            this.thread.setDaemon(true);
+            this.thread.start();
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            thread.interrupt();
+            boolean interrupted = false;
+            try {
+                // Bound teardown too: a filesystem call stuck in the heartbeat must not turn a completed token
+                // operation into an unbounded close. The daemon checks closed again before renewing.
+                thread.join(DIRECTORY_LOCK_HEARTBEAT_MILLIS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private void run() {
+            while (!closed) {
+                try {
+                    Thread.sleep(DIRECTORY_LOCK_HEARTBEAT_MILLIS);
+                } catch (InterruptedException e) {
+                    if (closed) {
+                        return;
+                    }
+                }
+                if (closed) {
+                    return;
+                }
+                try {
+                    // Do not renew a lock another process stole or replaced. The ownership check and timestamp
+                    // update retain the same one-syscall residual as releaseLock's checked delete: a replacement
+                    // in that tiny gap can receive one harmless extra lease interval, never altered contents.
+                    if (!isLockOwner(lock, nonce)) {
+                        return;
+                    }
+                    if (closed) {
+                        return;
+                    }
+                    Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis()));
+                } catch (IOException | RuntimeException e) {
+                    // Losing the ability to renew falls back to the lease: peers may reclaim after the stale
+                    // interval rather than wait forever. The foreground operation still verifies ownership
+                    // before entering this heartbeat and releaseLock never deletes a replacement.
+                    return;
+                }
+            }
+        }
     }
 
     /**

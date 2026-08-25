@@ -972,6 +972,42 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testDirectoryLockHeartbeatKeepsALiveRecoveryLockFresh() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to drive directory recovery",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            createStoreDir(dir);
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            FileTokenStore store = new FileTokenStore(dir);
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeUntrustedDiscardHook");
+            hookField.setAccessible(true);
+            hookField.set(store, (Runnable) () -> {
+                Path lock = dir.resolve(".store.lock");
+                try {
+                    long firstModified = Files.getLastModifiedTime(lock).toMillis();
+                    long deadline = System.nanoTime() + 2_000_000_000L;
+                    while (System.nanoTime() - deadline < 0
+                            && Files.getLastModifiedTime(lock).toMillis() <= firstModified) {
+                        Thread.sleep(25L);
+                    }
+                    Assert.assertTrue("a live directory lock must renew its lease while recovery is paused",
+                            Files.getLastModifiedTime(lock).toMillis() > firstModified);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            });
+
+            store.save(sampleKey(), sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertFalse("the directory lock must still be released after the heartbeat",
+                    Files.exists(dir.resolve(".store.lock")));
+        });
+    }
+
+    @Test
     public void testEmptyAudienceNormalizesToNull() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -990,6 +1026,28 @@ public class FileTokenStoreTest {
             PersistedToken loaded = store.load(emptyAud);
             Assert.assertNotNull("an empty-audience key must load the entry it just saved", loaded);
             Assert.assertEquals("ACCESS-1", loaded.getAccessToken());
+        });
+    }
+
+    @Test
+    public void testEmptyDirectoryLockAbandonedByACrashedWriterIsReclaimed() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            // The narrower crash window: the process died after CREATE_NEW but before its nonce write. The
+            // required directory lock cannot use the refresh lock's 5s empty-file grace because its default
+            // acquisition budget is only 3s; unlike inLock, it cannot safely degrade after that budget.
+            Path directoryLock = dir.resolve(".store.lock");
+            Files.createFile(directoryLock);
+
+            PersistedToken loaded = new FileTokenStore(dir).load(key);
+            Assert.assertNotNull(loaded);
+            Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+            Assert.assertFalse("the empty abandoned directory lock must be stolen and released",
+                    Files.exists(directoryLock));
         });
     }
 
@@ -1717,6 +1775,28 @@ public class FileTokenStoreTest {
         assertMemoryLeak(() -> {
             FileTokenStore store = new FileTokenStore(storeDir());
             Assert.assertNull(store.load(sampleKey()));
+        });
+    }
+
+    @Test
+    public void testLoadStealsAStampedDirectoryLockAbandonedByACrashedWriter() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            // The lock is fresh and stamped, exactly as a process killed after createLockFile() leaves it.
+            // The default load must outwait the directory lease and reclaim it inside its 3s acquire budget,
+            // rather than applying the refresh lock's 10-minute stale window and throwing.
+            Path directoryLock = dir.resolve(".store.lock");
+            Files.write(directoryLock, "dead-directory-owner".getBytes(StandardCharsets.UTF_8));
+
+            PersistedToken loaded = new FileTokenStore(dir).load(key);
+            Assert.assertNotNull(loaded);
+            Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+            Assert.assertFalse("the abandoned directory lock must be stolen and released",
+                    Files.exists(directoryLock));
         });
     }
 
@@ -2512,6 +2592,37 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testSaveDoesNotUseTheShortDirectoryLeaseWhileARecoveryIsPending() throws Exception {
+        assertMemoryLeak(() -> {
+            // A short lease is safe only after every distrust sweep is complete. If an old sweeper were
+            // displaced and later resumed, it could delete a new holder's completed save. Keep the configured
+            // 60s stale window while the sentinel stands even though this fake lock is older than the trusted
+            // directory lease (2s).
+            Path dir = storeDir();
+            createStoreDir(dir);
+            Files.createFile(dir.resolve(".untrusted"));
+            Path directoryLock = dir.resolve(".store.lock");
+            byte[] peerStamp = "recovering-directory-owner".getBytes(StandardCharsets.UTF_8);
+            Files.write(directoryLock, peerStamp);
+            Files.setLastModifiedTime(directoryLock, FileTime.fromMillis(System.currentTimeMillis() - 3_000));
+            FileTokenStore store = new FileTokenStore(dir, 200, 60_000);
+            TokenStoreKey key = sampleKey();
+
+            try {
+                store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+                Assert.fail("save must not displace a pending directory recovery");
+            } catch (OidcAuthException expected) {
+                // The required lock fails closed until the recovery holder releases it or reaches 60s stale.
+            }
+
+            Assert.assertFalse("a timed-out save must not write while recovery is pending",
+                    Files.exists(tokenFile(dir, key)));
+            Assert.assertArrayEquals("the recovering peer's directory lock must be left untouched",
+                    peerStamp, Files.readAllBytes(directoryLock));
+        });
+    }
+
+    @Test
     public void testSaveFailureLeavesNoTempFileAndThrows() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -2672,6 +2783,43 @@ public class FileTokenStoreTest {
             Assert.assertArrayEquals("the peer's lock must go back byte for byte, or releaseLock's "
                             + "owner-stamp check refuses to delete it and the peer wedges every later acquire",
                     peerLive, Files.readAllBytes(lock));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
+    public void testStealIfStaleRestoresALockRenewedInTheCaptureGap() throws Exception {
+        assertMemoryLeak(() -> {
+            // A directory-lock heartbeat preserves the owner stamp and changes only the mtime. Simulate a
+            // renewal after the age check but before capture: comparing only owner bytes would misclassify the
+            // captured live lock as unchanged and delete it, admitting a second holder.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            byte[] owner = "live-owner-stamp".getBytes(StandardCharsets.UTF_8);
+            Files.write(lock, owner);
+            Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis() - 600_000));
+
+            FileTokenStore store = new FileTokenStore(dir, 30_000, 60_000);
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeCaptureHook");
+            hookField.setAccessible(true);
+            hookField.set(store, (Runnable) () -> {
+                try {
+                    Files.setLastModifiedTime(lock, FileTime.fromMillis(System.currentTimeMillis()));
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            Method stealIfStale = FileTokenStore.class.getDeclaredMethod("stealIfStale", Path.class);
+            stealIfStale.setAccessible(true);
+            stealIfStale.invoke(store, lock);
+
+            Assert.assertTrue("a renewed live lock must be restored after capture", Files.exists(lock));
+            Assert.assertArrayEquals("renewal must not alter the owner stamp", owner, Files.readAllBytes(lock));
+            Assert.assertTrue("the restored lock must retain the renewal timestamp",
+                    System.currentTimeMillis() - Files.getLastModifiedTime(lock).toMillis() < 5_000);
             assertNoCaptureTempFiles(dir, key);
         });
     }

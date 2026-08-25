@@ -497,8 +497,15 @@ Every client therefore MUST treat the following as one required directory-wide c
 
 1. Ensure the directory exists, without tightening a pre-existing directory yet.
 2. Acquire `.store.lock` with `O_CREAT|O_EXCL`, 0600 permissions, the owner stamp, bounded 4 KiB
-   read, 5-second empty-lock grace, configured staleness window, capture-then-verify steal, and
-   owner-verified release specified for `<hex>.lock` below.
+   read, capture-then-verify steal, and owner-verified release specified for `<hex>.lock` below.
+   Once the directory is owner-only and has no `.untrusted` marker, this required lock has a separate
+   short lease because it then protects bounded filesystem work rather than an identity-provider
+   request: a stamped holder renews its mtime every 500 ms and is stale after 2 seconds without a
+   renewal. An empty lock is likewise reclaimable after 2 seconds. The post-chmod owner-stamp check in
+   step 4 makes reclaiming a creator paused before its stamp safe: it wakes without ownership and
+   aborts before loading, sweeping, or writing. A directory that is writable by another user, still
+   marked `.untrusted`, or cannot be inspected retains the configured staleness window. This prevents
+   a paused old sweep from resuming after displacement and deleting a new holder's completed save.
 3. While holding the lock, run the permission/trust check. If the directory was group/other
    writable, mark `.untrusted` before tightening it and retain that untrusted verdict for this
    critical section.
@@ -514,7 +521,9 @@ Every client therefore MUST treat the following as one required directory-wide c
 Acquisition is **required**, unlike the per-identity refresh lock: timeout or I/O failure fails the
 store operation rather than running it uncoordinated. The caller already treats load failures as
 transient and save as best-effort; silent loss after a successful save is not an acceptable
-degrade. The directory lock is short-lived and is never held across token-endpoint I/O. An
+degrade. A process crash stops the lease heartbeat, so the default 3-second acquisition budget can
+reclaim the lock instead of inheriting the refresh lock's 10-minute stale window. The directory
+lock is short-lived and is never held across token-endpoint I/O. An
 `inLock` implementation may acquire and release it to prepare the directory before acquiring
 `<hex>.lock`; the refresh action then briefly takes `.store.lock` inside `<hex>.lock` for its load
 and save. No path may hold `.store.lock` while waiting for `<hex>.lock`, so this order has no
