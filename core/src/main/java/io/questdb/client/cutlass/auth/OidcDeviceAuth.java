@@ -1521,19 +1521,22 @@ public class OidcDeviceAuth implements QuietCloseable {
     }
 
     /**
-     * Adopts a rotated {@code refresh_token} from a refresh response that did NOT carry the served token
-     * kind, so the rotation is not lost with the rest of the response.
+     * Adopts a rotated {@code refresh_token} from a clean-2xx refresh response this client cannot otherwise
+     * use, so the rotation is not lost with the rest of the response.
      * <p>
-     * A refresh response may legally omit the served kind - RFC 6749 6 makes {@code id_token} optional, and
-     * OIDC Core 12.2 says the refresh response is the token response "except that it might not contain an
-     * id_token" - which is exactly the shape a {@code groupsInToken} client meets against a provider that
-     * only mints an id token at authorization time. That response is still a clean 2xx, and the
-     * {@code refresh_token} in it is authoritative: a rotating provider has already invalidated the one we
-     * presented. Keeping the old token would replay a spent credential on every later refresh, which a
-     * reuse-detecting provider answers by revoking the whole token family - so the caller loses the
-     * credential entirely rather than merely failing to refresh it once.
+     * Two shapes reach here, and what they have in common is the only thing that matters: the provider
+     * accepted the refresh token we presented and answered 2xx with no OAuth error. The served kind may be
+     * ABSENT - RFC 6749 6 makes {@code id_token} optional, and OIDC Core 12.2 says the refresh response is
+     * the token response "except that it might not contain an id_token", which is exactly the shape a
+     * {@code groupsInToken} client meets against a provider that only mints an id token at authorization
+     * time. Or it may be PRESENT and unusable, rejected by {@code validateTokenChars} for a control or
+     * non-ASCII character. Either way the {@code refresh_token} in that body is authoritative: a rotating
+     * provider has already invalidated the one we presented. Keeping the old token would replay a spent
+     * credential on every later refresh, which a reuse-detecting provider answers by revoking the whole
+     * token family - so the caller loses the credential entirely rather than merely failing to refresh it
+     * once, and with a {@link TokenStore} that revocation reaches every process sharing the identity.
      * <p>
-     * Only the refresh token is taken. The served kind did not arrive, so the cached tokens and the expiry
+     * Only the refresh token is taken. No usable served token arrived, so the cached tokens and the expiry
      * stay as they were: the entry reads as expired, {@code tryRefresh()} still reports failure, and the
      * caller falls back to the interactive flow exactly as before - now holding a refresh token that is
      * still live, so the NEXT refresh can succeed on its own.
@@ -2148,6 +2151,16 @@ public class OidcDeviceAuth implements QuietCloseable {
                 // rather than let the rejection propagate out of getToken()/signIn() past the runDeviceFlow()
                 // fallback the caller expects. validateTokenChars runs before any state mutation, so the cached
                 // token and refresh token are left intact for that fallback.
+                //
+                // Intact is exactly what the refresh token must NOT be left. This is still a clean 2xx, so a
+                // rotating provider has already invalidated the one we presented and the refresh_token in
+                // this body is the live one - the same reasoning adoptRotatedRefreshToken() states for the
+                // sibling branch below, which reaches it because the served kind was ABSENT rather than
+                // unusable. Dropping the rotation here leaves getToken() replaying a spent credential on
+                // every later refresh, and a reuse-detecting provider answers a replay by revoking the whole
+                // family - so the caller loses the credential outright instead of failing this one refresh,
+                // and with a TokenStore that revocation reaches every process sharing the identity.
+                adoptRotatedRefreshToken();
                 return false;
             }
             return true;

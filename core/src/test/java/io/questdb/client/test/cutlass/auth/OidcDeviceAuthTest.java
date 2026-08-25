@@ -53,6 +53,9 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -3116,6 +3119,68 @@ public class OidcDeviceAuthTest {
     }
 
     @Test(timeout = 30_000)
+    public void testRefreshedTokenWithControlCharStillAdoptsTheRotatedRefreshToken() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sibling test above pins the FALLBACK when a refresh returns an unusable served token. This
+            // one pins what happens to the refresh_token that arrived beside it.
+            //
+            // The rejection does not undo the exchange: the provider accepted the token we presented and
+            // answered a clean 2xx, so a rotating provider has already burned it and the refresh_token in
+            // that body is the live one. That is the rule adoptRotatedRefreshToken() states, and it applied
+            // only to the branch where the served kind was ABSENT - the branch where it arrives and is
+            // rejected returned first and dropped the rotation with the rest of the response.
+            //
+            // signIn() hides the loss, because its device-flow fallback overwrites the refresh token before
+            // anything can replay it. getToken() is where it bites: it never prompts, so the spent token
+            // stays cached and goes back on the wire, and a reuse-detecting provider answers a replay by
+            // revoking the whole family - the credential lost outright rather than one refresh failed.
+            AtomicInteger deviceCalls = new AtomicInteger();
+            AtomicInteger deviceCodeGrants = new AtomicInteger();
+            List<String> presented = Collections.synchronizedList(new ArrayList<>());
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    deviceCalls.incrementAndGet();
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                if (body.contains("grant_type=refresh_token")) {
+                    presented.add(body.contains("refresh_token=REFRESH-1") ? "REFRESH-1"
+                            : body.contains("refresh_token=REFRESH-2") ? "REFRESH-2" : "OTHER:" + body);
+                    // clean 2xx: the exchange happened. The served token carries an escaped CR, so
+                    // validateTokenChars rejects it - but REFRESH-2 is live and REFRESH-1 is now spent.
+                    return MockOidcServer.json(200, tokenJson("ACCESS\\r2", null, "REFRESH-2", 3600));
+                }
+                deviceCodeGrants.getAndIncrement();
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 1));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn());
+
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    expireCachedToken(auth);
+                    clearRefreshBackOff(auth);
+                    try {
+                        auth.getToken();
+                        Assert.fail("an unusable served token must not be served");
+                    } catch (OidcAuthException expected) {
+                        // getToken() never prompts, so it reports the failure and leaves the caller to
+                        // signIn(); what matters is the credential it holds when it does
+                    }
+                }
+
+                Assert.assertEquals("both attempts must reach the token endpoint", 2, presented.size());
+                Assert.assertEquals("the first refresh presents the token we started with",
+                        "REFRESH-1", presented.get(0));
+                Assert.assertEquals("the second refresh must present the ROTATED token: the provider burned "
+                                + "REFRESH-1 answering the first, so replaying it is what a reuse-detecting "
+                                + "provider revokes the whole family over",
+                        "REFRESH-2", presented.get(1));
+                Assert.assertEquals("no interactive flow may run on the getToken() path", 1, deviceCalls.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testRefreshKeepsExistingRefreshTokenWhenOmitted() throws Exception {
         assertMemoryLeak(() -> {
             // a refresh response that omits refresh_token (RFC 6749 permits this) must not drop the existing
@@ -4202,6 +4267,14 @@ public class OidcDeviceAuthTest {
     // this reflection would be the third in the package. There is no non-reflective route - expires_in is
     // clamped to a default when non-positive, and the smallest usable value still leaves a live window that
     // would have to be slept out.
+    // Disarms the 5s stampede latch a failed silent refresh arms, so a test can drive two refresh attempts
+    // back to back without sleeping through MIN_REFRESH_RETRY_INTERVAL_MILLIS.
+    static void clearRefreshBackOff(OidcDeviceAuth auth) throws Exception {
+        Field f = OidcDeviceAuth.class.getDeclaredField("refreshFailedAtMillis");
+        f.setAccessible(true);
+        f.setLong(auth, 0L);
+    }
+
     static void expireCachedToken(OidcDeviceAuth auth) throws Exception {
         Field f = OidcDeviceAuth.class.getDeclaredField("expiresAtMillis");
         f.setAccessible(true);
