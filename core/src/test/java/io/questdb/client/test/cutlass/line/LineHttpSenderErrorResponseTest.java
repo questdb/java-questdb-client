@@ -238,6 +238,65 @@ public class LineHttpSenderErrorResponseTest {
     }
 
     @Test(timeout = 30_000)
+    public void testDribbledResponseHeadFailsTheFlushWithinTheRetryBudget() throws Exception {
+        assertMemoryLeak(() -> {
+            // The response HEAD read is bounded on elapsed time the same way the body read is, and the two
+            // sibling tests above cover only the body. The head bound is the one existing non-OIDC senders
+            // are most exposed to, because it precedes every response, including the 204 QuestDB's own
+            // /write answers with.
+            //
+            // What separates it from the body cases: at the point await() aborts, NO STATUS HAS BEEN READ.
+            // So unlike the 2xx drain arm - which knows the server committed and reports success - and
+            // unlike the error arm - which has a verdict to surface - this abort carries no information
+            // about whether the batch landed. flush0 classifies it as a transport failure and retries,
+            // which is the only thing it can do, and the pre-existing ILP-over-HTTP at-least-once window
+            // is what that retry spends. Against a table without DEDUP keys, a peer that dribbles a head
+            // past the budget can therefore duplicate rows.
+            //
+            // This pins the two properties that keep that bounded and diagnosable: the flush TERMINATES on
+            // the retry budget instead of running on with the dribble, and it reports a transport timeout
+            // rather than something the operator cannot act on. Base could not reach it at all - await()
+            // re-armed its timeout on every socket read, so a head making progress never aborted.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribbleHead();
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(500)                      // the whole-head-read bound
+                        .retryTimeoutMillis(2_000)                   // and the budget the retries spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    try {
+                        sender.flush();
+                        Assert.fail("a head that never completes must fail the flush");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue("the operator must be told this was a transport timeout, not "
+                                        + "handed a bare parse error: " + e.getMessage(),
+                                e.getMessage().contains("timed out"));
+                        Assert.assertTrue("a head-read abort carries no status, so it stays retryable - "
+                                        + "unlike a malformed head, which is a verdict",
+                                e.isRetryable());
+                    }
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // The mock dribbles for ~10s. A per-read re-arm would not abort until then, and the
+                    // 30s @Test timeout would fire instead of this ceiling.
+                    Assert.assertTrue("the head bound must fire, not run on with the dribble: "
+                            + elapsedMillis + "ms", elapsedMillis < 15_000);
+                    Assert.assertTrue("the flush must retry within its budget rather than give up on the "
+                                    + "first abort, and must stop when the budget is spent: "
+                                    + requests.get() + " sends",
+                            requests.get() >= 1 && requests.get() < 20);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testDrainAbortAfterA2xxDropsTheConnection() throws Exception {
         assertMemoryLeak(() -> {
             // The other half of the drain-abort contract, and the half nothing pinned. Its sibling above

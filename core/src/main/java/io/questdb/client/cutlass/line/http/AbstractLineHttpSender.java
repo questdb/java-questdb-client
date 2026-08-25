@@ -731,6 +731,20 @@ public abstract class AbstractLineHttpSender implements Sender {
                     throw new HttpClientException("Request timed out");
                 }
 
+                // Bounded on ELAPSED time, not per socket read - see HttpClient.ResponseHeaders.await(int).
+                // That makes a head which dribbles but keeps making progress abort here, where base ran on
+                // with it, and this is the third body-read-shaped change on this path that an existing
+                // non-OIDC sender can observe (the other two are consumeChunkedResponse below and
+                // throwOnHttpErrorResponse).
+                //
+                // It differs from both in what it can conclude: NO STATUS HAS BEEN READ yet, so unlike the
+                // 2xx drain - which knows the server committed and reports success - and unlike the error
+                // arm - which has a verdict to surface - this abort says nothing about whether the batch
+                // landed. It falls to the HttpClientException arm and retries, which is the only available
+                // answer, and the retry spends the pre-existing ILP-over-HTTP at-least-once window: against
+                // a table without DEDUP keys a peer that dribbles a head past the budget duplicates rows.
+                // Reaching it needs an intermediary; QuestDB's own /write answers 204 with a small head.
+                // Pinned by LineHttpSenderErrorResponseTest#testDribbledResponseHeadFailsTheFlushWithinTheRetryBudget.
                 response.await(remainingMillis);
                 DirectUtf8Sequence statusCode = response.getStatusCode();
                 if (isSuccessResponse(statusCode)) {
