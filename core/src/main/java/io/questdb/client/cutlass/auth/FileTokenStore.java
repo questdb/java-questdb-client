@@ -220,6 +220,7 @@ public final class FileTokenStore implements TokenStore {
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
     // (compareAndSet, so a race between two threads still prints a single warning)
     private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
+    private static final AtomicBoolean warnedStuckUntrustedSentinel = new AtomicBoolean();
     private static final AtomicBoolean warnedTightenedStoreDir = new AtomicBoolean();
     private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
     // Test seam, null in production: runs in the gap between judging a lock stale and capturing it with
@@ -1041,6 +1042,26 @@ public final class FileTokenStore implements TokenStore {
                 + "Back the store with an OS keychain for at-rest encryption.");
     }
 
+    private static void warnStuckUntrustedSentinelOnce(String reason) {
+        // The untrusted sentinel is meant to be transient: a caller marks the directory, sweeps it, and
+        // clears the mark. When either the sweep or the clear keeps failing, the mark stands and
+        // restrictToOwner distrusts the directory on every later call - so load() returns null over an entry
+        // save() has just written, and token persistence is silently and permanently off for this directory.
+        // Nothing self-heals it, because the sweep skips the sentinel by design and markUntrusted only runs
+        // while the directory is still other-writable.
+        //
+        // Once per JVM, ASCII-only and without the path, for the same reasons as warnUnprotectedStoreDirOnce
+        // beside it: the condition is a property of the directory every identity in this process shares,
+        // load() sits on the flush path, and an operator-supplied path can carry terminal-spoofing bytes.
+        if (!warnedStuckUntrustedSentinel.compareAndSet(false, true)) {
+            return;
+        }
+        LOG.warn("the OIDC token store directory is marked untrusted and the mark cannot be lifted, so no "
+                + "token will be persisted or read there until it is: {}. Remove the '.untrusted' entry and "
+                + "anything left beside it in questdb.client.oidc.token.store.dir, or point that setting at "
+                + "a fresh directory only this user can write.", reason);
+    }
+
     private static void warnUnprotectedStoreDirOnce(String reason) {
         // once per JVM, like warnNoPosixPermsOnce: the condition is a property of the directory, which every
         // identity in this process shares, and load() sits on the flush path via OidcDeviceAuth.getToken().
@@ -1140,10 +1161,22 @@ public final class FileTokenStore implements TokenStore {
         // sweep: while any untrusted entry might remain, the sentinel must stay so the next caller re-sweeps
         // rather than trusting a directory that still holds a plant. Best-effort - a failure here just leaves
         // the directory marked untrusted, so the next caller sweeps again; it never fails a sign-in.
+        //
+        // "The next caller re-sweeps" assumes the failure is TRANSIENT. When it is not, this method is the
+        // only thing that can ever lift the distrust - the sweep skips the sentinel by design (no hash
+        // prefix), and markUntrusted only runs while the directory is still other-writable - so a sentinel
+        // that cannot be deleted latches the directory untrusted for good: every later load returns null
+        // over an entry save() just wrote, and persistence is silently dead until someone removes the file
+        // by hand. A non-empty directory squatting the name reaches that state with one mkdir, and it
+        // survives the chmod that ends the attacker's write access.
+        //
+        // So: report it. The distrust itself stays - it is the fail-closed direction and it is cheap to be
+        // wrong about - but an operator gets a line naming the condition and the fix instead of persistence
+        // that merely stops working.
         try {
             Files.deleteIfExists(untrustedSentinel());
-        } catch (IOException ignore) {
-            // best-effort; the sentinel stays and the next caller re-sweeps
+        } catch (IOException e) {
+            warnStuckUntrustedSentinelOnce("the sentinel file itself could not be removed");
         }
     }
 
@@ -1237,6 +1270,13 @@ public final class FileTokenStore implements TokenStore {
             // directory again. Until this point the sentinel is the only thing keeping a concurrent caller
             // from adopting an entry over a directory restrictToOwner's chmod already made look owner-only.
             clearUntrusted();
+        } else {
+            // The sweep is what lifts the distrust, so a sweep that keeps failing latches it: the sentinel
+            // stays, every later load returns null over an entry save() just wrote, and persistence is dead
+            // for this directory until someone intervenes. One undeletable entry is enough - an entry owned
+            // by another UID under a sticky-bit parent, or a persistent EPERM/EIO/ESTALE. Retrying is right;
+            // doing it forever in silence is not.
+            warnStuckUntrustedSentinelOnce("the directory could not be swept completely");
         }
     }
 

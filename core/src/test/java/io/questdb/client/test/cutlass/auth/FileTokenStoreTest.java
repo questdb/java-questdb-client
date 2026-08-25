@@ -2031,6 +2031,78 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testAnUnliftableUntrustedMarkNamesItselfRatherThanKillingPersistenceInSilence() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The sentinel is meant to be transient: mark, sweep, clear. Its retention on a failed sweep is
+            // deliberate and fail-closed ("the next caller re-sweeps"), but that reasoning assumes the
+            // failure goes away. When it does not, nothing else can lift the mark - the sweep skips the
+            // sentinel by design and markUntrusted only runs while the directory is still other-writable -
+            // so restrictToOwner distrusts on every later call. load() then returns null over an entry
+            // save() has just written, for good, and the only thing that ever said so was a warning about
+            // the directory not being owner-only, which is a different condition with a different fix.
+            //
+            // A non-empty directory squatting the sentinel's name reaches that state with one mkdir and
+            // survives the chmod that ends the attacker's write access: deleteIfExists cannot remove it, so
+            // the clear fails on every pass.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+            Assert.assertNotNull("baseline: the store works before the name is squatted", store.load(key));
+
+            Path sentinel = dir.resolve(".untrusted");
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            Files.createDirectory(sentinel);
+            Files.write(sentinel.resolve("occupant"), new byte[]{1});
+
+            Field latch = FileTokenStore.class.getDeclaredField("warnedStuckUntrustedSentinel");
+            latch.setAccessible(true);
+            ((AtomicBoolean) latch.get(null)).set(false);
+
+            ch.qos.logback.classic.Logger storeLogger = (ch.qos.logback.classic.Logger)
+                    org.slf4j.LoggerFactory.getLogger(FileTokenStore.class);
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                    new ch.qos.logback.core.read.ListAppender<>();
+            appender.start();
+            ch.qos.logback.classic.Level savedLevel = storeLogger.getLevel();
+            storeLogger.setLevel(ch.qos.logback.classic.Level.ALL);
+            storeLogger.addAppender(appender);
+            try {
+                // three full rounds: the mark cannot be lifted, so every one of them refuses
+                for (int i = 0; i < 3; i++) {
+                    store.save(key, sampleToken("ACCESS-" + i, "REFRESH-" + i));
+                    Assert.assertNull("a mark that cannot be lifted keeps the directory distrusted",
+                            store.load(key));
+                }
+            } finally {
+                storeLogger.detachAppender(appender);
+                storeLogger.setLevel(savedLevel);
+                appender.stop();
+            }
+
+            Assert.assertTrue("the squatter must still be standing - that is what makes the state permanent",
+                    Files.isDirectory(sentinel, LinkOption.NOFOLLOW_LINKS));
+
+            int stuck = 0;
+            for (ch.qos.logback.classic.spi.ILoggingEvent e : appender.list) {
+                String msg = e.getFormattedMessage();
+                if (msg.contains("marked untrusted and the mark cannot be lifted")
+                        && msg.contains("no token will be persisted or read")
+                        && msg.contains(".untrusted")) {
+                    stuck++;
+                }
+            }
+            Assert.assertEquals("a permanently latched store must say so, naming the entry to remove: "
+                            + "persistence that merely stops working leaves an operator with a headless "
+                            + "producer that re-prompts every restart and nothing to act on. Warned "
+                            + "exactly once per JVM, like its siblings, because load() is on the flush path",
+                    1, stuck);
+        });
+    }
+
+    @Test
     public void testLoadThrowsRatherThanReportsEmptyWhenTheDirectoryIsUnusable() throws Exception {
         assertMemoryLeak(() -> {
             // Same fixture as testInLockDegradesWhenDirectoryUnusable: a regular file standing where the
