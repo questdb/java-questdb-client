@@ -61,7 +61,7 @@ public class OidcAuthException extends RuntimeException {
         OidcAuthException e = new OidcAuthException();
         // Sanitize the IdP error code once and reuse the result for both the message and the field.
         // getOauthError() is public, so it must not hand a logging caller the raw provider string: JsonLexer
-        // now decodes JSON escapes, so an "error" such as access_denied[2J would otherwise deliver a
+        // now decodes JSON escapes, so an "error" such as access_deniedESC[2J would otherwise deliver a
         // real ESC (ANSI/CR-LF/bidi injection) straight out of getOauthError().
         e.oauthError = sanitize(error);
         e.put("the identity provider returned an error [error=");
