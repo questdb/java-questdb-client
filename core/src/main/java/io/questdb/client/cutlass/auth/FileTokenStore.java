@@ -1622,7 +1622,17 @@ public final class FileTokenStore implements TokenStore {
                     continue;
                 }
                 try {
-                    if (now - Files.getLastModifiedTime(tmp).toMillis() >= minAgeMillis) {
+                    // minAgeMillis <= 0 is clear()'s "at ANY age" sweep and must not consult the clock at
+                    // all. Going through the comparison made it conditional on one: a temp whose recorded
+                    // mtime is AHEAD of now - a network home whose server clock leads the client's, or a
+                    // wall-clock step back from an NTP correction, a snapshot restore, a container starting
+                    // before time sync - yields a negative left-hand side, which is not >= 0, so the sweep
+                    // skipped it. save()'s sweep skips it too, for the same reason against a larger
+                    // threshold, so nothing in this class would ever reclaim it: clear() would report
+                    // success while a temp holding the full serialized entry - access, id and refresh
+                    // tokens in plaintext - stayed on disk after the caller asked to forget the credential.
+                    if (minAgeMillis <= 0
+                            || now - Files.getLastModifiedTime(tmp).toMillis() >= minAgeMillis) {
                         Files.deleteIfExists(tmp);
                     }
                 } catch (IOException ignore) {

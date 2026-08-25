@@ -925,6 +925,41 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testClearRemovesAnOrphanedWriteTempStampedInTheFuture() throws Exception {
+        assertMemoryLeak(() -> {
+            // The sibling test's orphan is stamped in the past, which every clock agrees on. clear() passes
+            // minAgeMillis 0 to mean "at ANY age", but that went through the same "now - mtime >= minAge"
+            // comparison save()'s staleness-bounded sweep uses - and an mtime AHEAD of now makes the left
+            // side negative, which is not >= 0. So the one sweep that is supposed to ignore the clock was
+            // the one the clock could veto, and save()'s sweep skips the same file against a larger
+            // threshold, leaving nothing in the class that would ever reclaim it.
+            //
+            // A future mtime needs no attacker: a network home whose server clock leads the client's (which
+            // this class documents as in scope), or a wall-clock step back from an NTP correction, a VM
+            // snapshot restore, or a container started before its time sync.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            Path orphan = dir.resolve(key.hash() + "9999.tmp");
+            Files.write(orphan, "{\"refresh_token\":\"REFRESH-1\"}".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(orphan,
+                    FileTime.fromMillis(System.currentTimeMillis() + 3_600_000L));
+            Assert.assertTrue("the fixture must be stamped in the future - that is the whole point",
+                    Files.getLastModifiedTime(orphan).toMillis() > System.currentTimeMillis());
+
+            store.clear(key);
+
+            Assert.assertFalse("clear must remove the token file", Files.exists(tokenFile(dir, key)));
+            Assert.assertFalse("clear() is an explicit 'forget this credential', so its sweep must not be "
+                            + "conditional on a clock: a temp stamped in the future holds the same plaintext "
+                            + "refresh token, and no later sweep in this class reclaims it either",
+                    Files.exists(orphan));
+        });
+    }
+
+    @Test
     public void testCorruptFileReturnsNull() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
