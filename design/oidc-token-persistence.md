@@ -326,7 +326,20 @@ whole reason persistence is **opt-in**. Mitigations, mapped to PR #52's existing
   any delete failed, so the next caller re-sweeps before anything trusts it. The sentinel's name
   has no `<hex>` store prefix, so the directory sweep never mistakes it for an entry to delete;
   a client sweeping the directory MUST likewise leave it alone. The Python client MUST mirror
-  this: same name, dropped before the chmod, cleared only after a clean sweep. Residual: an
+  this: same name, dropped before the chmod, cleared only after a clean sweep.
+
+  **The presence test MUST NOT follow symlinks, and MUST treat "cannot tell" as present.** The
+  party this sentinel defends against is the one who can write this directory, so both defaults
+  fail the wrong way. A link-following test reports a *dangling* symlink planted at the sentinel's
+  name as absent, which disables the sentinel outright — no race to win — and an exclusive-create
+  mark cannot displace it, because `O_CREAT|O_EXCL` answers `EEXIST` for a symlink exactly as it
+  does for a peer's mark. A test that reads "absent or unreadable" as absent trusts an
+  indeterminate stat for the same reason. Use a no-follow test that is positive evidence of
+  absence — Java `Files.notExists(p, NOFOLLOW_LINKS)`, Python `os.path.lexists(p)` (negated) —
+  so a symlink, a directory or a failed stat all leave the directory untrusted. Only a **regular
+  file** (no-follow) counts as a mark a client may later clear; a client that finds any other
+  shape at the name MUST displace it and mark again rather than read it as a peer's mark, since
+  a shape its clear cannot delete would latch the directory untrusted forever. Residual: an
   attacker who both planted an entry *and* actively deletes the sentinel in the sub-syscall
   window between the drop and the chmod can still race a concurrent trust — a far narrower window
   than the tighten-to-sweep gap this closes, and Layer 1's atomic replacement still guarantees no

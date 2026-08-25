@@ -46,6 +46,7 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
@@ -1947,6 +1948,85 @@ public class FileTokenStoreTest {
             first.save(b, sampleToken("ACCESS-B2", "REFRESH-B2"));
             Assert.assertEquals("REFRESH-A2", first.load(a).getRefreshToken());
             Assert.assertEquals("REFRESH-B2", first.load(b).getRefreshToken());
+        });
+    }
+
+    @Test
+    public void testADanglingSymlinkAtTheSentinelNameKeepsTheDirectoryDistrusted() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The sibling test plants the sentinel as a REGULAR FILE, which is the only shape this store
+            // writes - and so the only shape it ever proved the distrust through. The party the sentinel
+            // defends against is the one who can write this directory, and they choose the shape. A DANGLING
+            // symlink at the name reports absent to any link-following test, so a verdict built on
+            // Files.exists reads "no sentinel" and trusts the directory on its permission bits alone - the
+            // mechanism disabled outright, with no race to win and nothing in any log. The exclusive-create
+            // mark cannot displace it either: O_CREAT|O_EXCL answers EEXIST for a symlink exactly as it does
+            // for a peer's mark, so markUntrusted reads the squatter as "already marked" and returns happy.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-PLANT"));
+            Assert.assertNotNull("baseline: an entry in an owner-only directory is trusted", store.load(key));
+
+            Path sentinel = dir.resolve(".untrusted");
+            Files.createSymbolicLink(sentinel, dir.resolve("no-such-target"));
+            Assert.assertTrue("the fixture must be a symlink", Files.isSymbolicLink(sentinel));
+            Assert.assertFalse("the fixture must DANGLE - that is what a link-following test misreads",
+                    Files.exists(sentinel));
+
+            Assert.assertNull("a symlink standing at the sentinel's name must distrust the directory just as "
+                            + "a regular file does; a link-following presence test hands an attacker who can "
+                            + "write this directory a way to switch the sentinel off",
+                    store.load(key));
+            Assert.assertFalse("the entry under a distrusted directory must be discarded",
+                    Files.exists(tokenFile(dir, key)));
+        });
+    }
+
+    @Test
+    public void testMarkUntrustedDisplacesASymlinkSquattingTheSentinelName() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            // The other half. Distrusting THROUGH a squatter (the sibling test) keeps THIS caller safe, but
+            // the sentinel's job is to carry the verdict to a CONCURRENT one across the chmod. That peer
+            // reads the name itself, so the name has to end up holding a mark rather than the attacker's
+            // symlink. markUntrusted must therefore tell a peer's mark from a squatter - which the
+            // FileAlreadyExistsException alone cannot do - and displace the squatter.
+            //
+            // beforeUntrustedDiscardHook drops us into the chmod-to-sweep gap, the same seam and the same
+            // window as testConcurrentLoadDistrustsTheDirectoryTightenedButNotYetSwept, and asserts what a
+            // peer arriving there would find at the name.
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            Path sentinel = dir.resolve(".untrusted");
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
+            Files.createSymbolicLink(sentinel, dir.resolve("no-such-target"));
+
+            AtomicBoolean regularFileInGap = new AtomicBoolean();
+            AtomicBoolean stillASymlinkInGap = new AtomicBoolean();
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeUntrustedDiscardHook");
+            hookField.setAccessible(true);
+            hookField.set(store, (Runnable) () -> {
+                regularFileInGap.set(Files.isRegularFile(sentinel, LinkOption.NOFOLLOW_LINKS));
+                stillASymlinkInGap.set(Files.isSymbolicLink(sentinel));
+            });
+
+            Assert.assertNull("the world-writable directory must be distrusted", store.load(key));
+
+            Assert.assertFalse("markUntrusted must not leave the attacker's symlink standing at the name: a "
+                            + "peer reading it in this gap follows it, finds nothing, and trusts the plant",
+                    stillASymlinkInGap.get());
+            Assert.assertTrue("the sentinel name must hold a real mark - a regular file - once markUntrusted "
+                            + "has run, so a concurrent caller in the chmod-to-sweep gap distrusts",
+                    regularFileInGap.get());
+            Assert.assertFalse("a complete sweep must still clear the mark it wrote",
+                    Files.exists(sentinel, LinkOption.NOFOLLOW_LINKS));
         });
     }
 

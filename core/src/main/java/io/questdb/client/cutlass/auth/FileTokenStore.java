@@ -46,6 +46,7 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -1277,6 +1278,23 @@ public final class FileTokenStore implements TokenStore {
         return directory.resolve(key.hash() + ".lock");
     }
 
+    /**
+     * Whether the untrusted sentinel's name currently carries a mark this class could have written and can
+     * later clear - a regular file, following no symlink.
+     * <p>
+     * Only a regular file qualifies. {@link #clearUntrusted()} removes the mark with a plain delete after a
+     * complete sweep, so any shape that delete cannot remove would stand at the name forever and latch the
+     * directory untrusted; and a symlink at the name is not a mark at all, since a dangling one reports
+     * absent to a link-following test. Both are squatters rather than a peer's mark, which is what
+     * {@link #markUntrusted()} uses this to decide.
+     *
+     * @return {@code true} when the name holds a regular file, {@code false} for a symlink, a directory,
+     *         an absent name, or a stat this process cannot make
+     */
+    private boolean isUsableSentinel() {
+        return Files.isRegularFile(untrustedSentinel(), LinkOption.NOFOLLOW_LINKS);
+    }
+
     private void markUntrusted() {
         // Drop the untrusted sentinel. Reached only from restrictToOwner's POSIX path (getPosixFilePermissions
         // has already succeeded), so FILE_ATTRS is supported here. Already-present - a concurrent caller, or a
@@ -1285,10 +1303,27 @@ public final class FileTokenStore implements TokenStore {
         // mark only degrades a CONCURRENT caller back to the pre-sentinel race, and it must never flip the
         // verdict (a RuntimeException escaping to restrictToOwner's UnsupportedOperationException catch would
         // return "trusted") nor fail a sign-in.
+        final Path sentinel = untrustedSentinel();
         try {
-            writeNewFile(untrustedSentinel(), new byte[0], FILE_ATTRS);
+            writeNewFile(sentinel, new byte[0], FILE_ATTRS);
         } catch (FileAlreadyExistsException e) {
-            // already marked untrusted; nothing to do
+            // A peer's mark, or a squatter. CREATE_NEW is O_CREAT|O_EXCL, which reports EEXIST for a symlink
+            // (dangling or not) and for a directory just as it does for a peer's regular file, so this
+            // exception alone does not say the name carries a usable mark. Only a regular file is one:
+            // clearUntrusted deletes exactly that after a complete sweep, so a shape it cannot remove would
+            // otherwise stand at this name forever, and every later mark would land here and report success.
+            // Displace the squatter and mark again. Nothing but this class writes this name, so there is no
+            // peer state to lose; a plain symlink is unlinked by delete, and a directory only yields when
+            // empty, which is the fail-closed direction (restrictToOwner keeps distrusting it either way).
+            if (!isUsableSentinel()) {
+                try {
+                    Files.deleteIfExists(sentinel);
+                    writeNewFile(sentinel, new byte[0], FILE_ATTRS);
+                } catch (IOException | RuntimeException ignore) {
+                    // best-effort; the squatter stands, and restrictToOwner's NOFOLLOW test still distrusts
+                    // through it, so the directory fails closed rather than open
+                }
+            }
         } catch (IOException | RuntimeException ignore) {
             // best-effort; see the method contract above
         }
@@ -1416,10 +1451,19 @@ public final class FileTokenStore implements TokenStore {
             }
             // Trusted only when the directory was never other-writable AND no un-swept untrusted sentinel
             // remains - the one just dropped above, one a concurrent caller is mid-sweep on, or one a previous
-            // run tightened but left behind after an incomplete sweep. Files.exists is what carries the verdict
-            // across the chmod above; it reports false when it cannot stat, which only fails open in the case
-            // wasOtherWritable already covers.
-            return !wasOtherWritable && !Files.exists(untrustedSentinel());
+            // run tightened but left behind after an incomplete sweep. This test is what carries the verdict
+            // across the chmod above.
+            //
+            // NOFOLLOW_LINKS, and notExists rather than !exists, because both defaults fail OPEN and the
+            // attacker this sentinel defends against is the one who can write this directory. A bare
+            // Files.exists follows symlinks, so a dangling link planted at the sentinel's name reports
+            // "absent" and the directory reads as trusted - the sentinel silently disabled, with no race to
+            // win, for as long as the link stands (markUntrusted's exclusive create cannot replace it
+            // either; see the squatter branch there). And !exists is true both for "absent" and for "cannot
+            // tell", so an unreadable stat also trusted. notExists(NOFOLLOW_LINKS) is positive evidence of
+            // absence: a link, a directory or an indeterminate stat all leave the directory distrusted,
+            // which costs at most one extra sweep and a re-sign-in.
+            return !wasOtherWritable && Files.notExists(untrustedSentinel(), LinkOption.NOFOLLOW_LINKS);
         } catch (UnsupportedOperationException e) {
             // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
             warnNoPosixPermsOnce();
