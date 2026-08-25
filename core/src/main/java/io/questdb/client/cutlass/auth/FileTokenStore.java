@@ -1176,7 +1176,12 @@ public final class FileTokenStore implements TokenStore {
         try {
             Files.deleteIfExists(untrustedSentinel());
         } catch (IOException e) {
-            warnStuckUntrustedSentinelOnce("the sentinel file itself could not be removed");
+            // The exception KIND, not its message: a message can carry the path, and an operator-supplied
+            // path can carry terminal-spoofing bytes, which is why every warning in this class omits it.
+            // The kind is the part that tells them what to look for - DirectoryNotEmptyException means
+            // something is squatting the name, AccessDeniedException means the permissions are.
+            warnStuckUntrustedSentinelOnce("the '.untrusted' entry itself could not be removed ("
+                    + e.getClass().getSimpleName() + ")");
         }
     }
 
