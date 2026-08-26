@@ -50,6 +50,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -134,6 +135,63 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
                 // attempts 1 and 2 (calls 3, 4) fire the observability callback.
                 assertEquals(Arrays.asList(1, 2), listener.unavailableAttempts);
                 assertEquals(0, listener.persistentFailures.get());
+            }
+        });
+    }
+
+    @Test
+    public void testFinalAckObservedAfterRecoverableTerminalStopsWithoutAnotherAttempt() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            seedSlot(SEEDED_FRAMES);
+            CountDownLatch releaseFinalAck = new CountDownLatch(1);
+            FinalAckThenCloseHandler handler = new FinalAckThenCloseHandler(
+                    releaseFinalAck, SEEDED_FRAMES - 1L);
+            try (TestWebSocketServer server = new TestWebSocketServer(handler, true)) {
+                server.start();
+                assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                // Attempt 1 sends every orphan frame. The server holds its ACKs until the drainer has read
+                // the old watermark, then durably ACKs the target and closes. Attempt 2 is the loop's
+                // recoverable capability-gap terminal. The post-terminal re-read must see the completed
+                // drain and return; attempting connection 3 would spend a fresh settle budget and can
+                // quarantine rows the server has already accepted.
+                ScriptedWireFactory factory = new ScriptedWireFactory(
+                        server.getPort(), 2, Integer.MAX_VALUE);
+                BackgroundDrainer drainer = newDrainer(factory);
+                CountDownLatch staleAckPolled = new CountDownLatch(1);
+                drainer.setAfterAckPollHookForTesting(loop -> {
+                    staleAckPolled.countDown();
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (loop.getTerminalError() == null && System.nanoTime() < deadline) {
+                        Thread.yield();
+                    }
+                    if (loop.getTerminalError() == null) {
+                        throw new AssertionError("recoverable terminal was not published after the final ACK");
+                    }
+                });
+
+                Thread runner = new Thread(drainer, "test-post-terminal-ack-drainer");
+                runner.setDaemon(true);
+                runner.start();
+                try {
+                    assertTrue("drainer did not capture the pre-ACK watermark",
+                            staleAckPolled.await(5, TimeUnit.SECONDS));
+                    releaseFinalAck.countDown();
+                    runner.join(10_000L);
+                } finally {
+                    releaseFinalAck.countDown();
+                    if (runner.isAlive()) {
+                        drainer.requestStop();
+                        runner.join(5_000L);
+                    }
+                }
+
+                assertFalse("drainer did not finish after observing the final ACK", runner.isAlive());
+                assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
+                assertFalse("a fully acknowledged orphan slot must not be quarantined",
+                        Files.exists(slotPath + "/" + OrphanScanner.FAILED_SENTINEL_NAME));
+                assertEquals("the final ACK must stop the drainer before it starts another connect sweep",
+                        2, factory.attempts());
             }
         });
     }
@@ -497,6 +555,41 @@ public class BackgroundDrainerMidDrainCapabilityGapTest {
             bb.put(name);
             bb.putLong(seqTxn);
             return bb.array();
+        }
+    }
+
+    /**
+     * Gates the first ACK until the drainer has captured its old watermark, then delegates normal ACK
+     * framing to {@link GapScenarioHandler} and closes immediately after the target. Keeping this wrapper
+     * separate leaves the shared gap fixture's timing unchanged for its existing dwell tests.
+     */
+    private static final class FinalAckThenCloseHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final GapScenarioHandler delegate = new GapScenarioHandler(false);
+        private final CountDownLatch firstAckGate;
+        private final long targetSequence;
+        private long sequence;
+
+        private FinalAckThenCloseHandler(CountDownLatch firstAckGate, long targetSequence) {
+            this.firstAckGate = firstAckGate;
+            this.targetSequence = targetSequence;
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (sequence == 0) {
+                try {
+                    if (!firstAckGate.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("timed out waiting to release the final ACK scenario");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while waiting to release the final ACK scenario", e);
+                }
+            }
+            delegate.onBinaryMessage(client, data);
+            if (sequence++ == targetSequence) {
+                client.close();
+            }
         }
     }
 

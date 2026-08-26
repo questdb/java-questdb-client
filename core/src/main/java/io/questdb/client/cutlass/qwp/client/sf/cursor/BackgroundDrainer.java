@@ -41,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 /**
  * Empties one orphan slot, then exits. Owned by
@@ -216,6 +217,8 @@ public final class BackgroundDrainer implements Runnable {
      * reference an already-closed engine once the drain ends.
      */
     private volatile CursorSendEngine engineForTesting;
+    @TestOnly
+    private Consumer<CursorWebSocketSendLoop> afterAckPollHookForTesting;
     // Sink for this drainer's SenderError reports. Two feeds: the dataLoss fired
     // when it permanently abandons a slot behind a .failed sentinel, and the
     // non-TERMINAL reports of the drain loop itself -- an unobtainable credential
@@ -819,6 +822,16 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * Installs a test-only hook after the drain loop reads {@code ackedFsn} but before it checks the loop's
+     * terminal latch. This makes the late-ack ordering deterministic without changing either production
+     * thread's publication order.
+     */
+    @TestOnly
+    public void setAfterAckPollHookForTesting(Consumer<CursorWebSocketSendLoop> hook) {
+        afterAckPollHookForTesting = hook;
+    }
+
+    /**
      * Periodic SF checkpoint interval this drainer inherited from the
      * adopting sender at construction time.
      */
@@ -1150,6 +1163,10 @@ public final class BackgroundDrainer implements Runnable {
                         LOG.info("drainer fully drained slot {} (target={}, acked={})",
                                 slotPath, target, acked);
                         return;
+                    }
+                    Consumer<CursorWebSocketSendLoop> afterAckPollHook = afterAckPollHookForTesting;
+                    if (afterAckPollHook != null) {
+                        afterAckPollHook.accept(loop);
                     }
                     try {
                         loop.checkError();
