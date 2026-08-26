@@ -241,6 +241,7 @@ public final class FileTokenStore implements TokenStore {
     // so the at-rest protection falls back to the directory's inherited ACL; warns the user exactly once
     // (compareAndSet, so a race between two threads still prints a single warning)
     private static final AtomicBoolean warnedNoPosixPerms = new AtomicBoolean();
+    private static final AtomicBoolean warnedStoreDirIoFailure = new AtomicBoolean();
     private static final AtomicBoolean warnedStuckUntrustedSentinel = new AtomicBoolean();
     private static final AtomicBoolean warnedTightenedStoreDir = new AtomicBoolean();
     private static final AtomicBoolean warnedUnprotectedStoreDir = new AtomicBoolean();
@@ -602,7 +603,7 @@ public final class FileTokenStore implements TokenStore {
                 // consumer this persistence exists to serve, that is a hard failure with no recovery short
                 // of a restart. The sibling arm below already throws for readBounded's IOException, and
                 // save() lets this very exception propagate; only this path disagreed.
-                warnUnprotectedStoreDirOnce("it could not be restricted to owner-only access");
+                warnStoreDirIoFailureOnce(e);
                 throw new OidcAuthException(e).put("could not prepare the OIDC token store directory");
             }
         } finally {
@@ -1082,6 +1083,18 @@ public final class FileTokenStore implements TokenStore {
                 + "token will be persisted or read there until it is: {}. Remove the '.untrusted' entry and "
                 + "anything left beside it in questdb.client.oidc.token.store.dir, or point that setting at "
                 + "a fresh directory only this user can write.", reason);
+    }
+
+    private static void warnStoreDirIoFailureOnce(IOException cause) {
+        // This is an operational I/O fault, not evidence that the directory permissions are unsafe. Keep its
+        // once-per-JVM budget separate from warnUnprotectedStoreDirOnce: a transient mount or filesystem failure
+        // must not suppress the later warning that explains why exposed token contents were discarded.
+        if (!warnedStoreDirIoFailure.compareAndSet(false, true)) {
+            return;
+        }
+        LOG.warn("could not prepare the OIDC token store directory; persisted credentials are temporarily "
+                        + "unavailable and the load will be retried [error={}]",
+                OidcDeviceAuth.sanitizeForDisplay(cause.getMessage()));
     }
 
     private static void warnUnprotectedStoreDirOnce(String reason) {

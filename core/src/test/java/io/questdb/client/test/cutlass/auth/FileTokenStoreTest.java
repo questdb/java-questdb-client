@@ -2335,6 +2335,79 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testTransientLoadFailureDoesNotSuppressUntrustedDirectoryWarning() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to expose the store directory",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Field ioLatchField = FileTokenStore.class.getDeclaredField("warnedStoreDirIoFailure");
+            ioLatchField.setAccessible(true);
+            AtomicBoolean ioLatch = (AtomicBoolean) ioLatchField.get(null);
+            Field securityLatchField = FileTokenStore.class.getDeclaredField("warnedUnprotectedStoreDir");
+            securityLatchField.setAccessible(true);
+            AtomicBoolean securityLatch = (AtomicBoolean) securityLatchField.get(null);
+            boolean ioLatchWasSet = ioLatch.getAndSet(false);
+            boolean securityLatchWasSet = securityLatch.getAndSet(false);
+
+            ch.qos.logback.classic.Logger storeLogger = (ch.qos.logback.classic.Logger)
+                    org.slf4j.LoggerFactory.getLogger(FileTokenStore.class);
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                    new ch.qos.logback.core.read.ListAppender<>();
+            appender.start();
+            ch.qos.logback.classic.Level savedLevel = storeLogger.getLevel();
+            storeLogger.setLevel(ch.qos.logback.classic.Level.ALL);
+            storeLogger.addAppender(appender);
+            try {
+                Path blocker = temp.getRoot().toPath().resolve("warning-blocker");
+                Files.write(blocker, new byte[]{1});
+                FileTokenStore unavailableStore = new FileTokenStore(blocker.resolve("oidc-tokens"));
+                try {
+                    unavailableStore.load(sampleKey());
+                    Assert.fail("the transient directory failure must still propagate");
+                } catch (OidcAuthException expected) {
+                    Assert.assertTrue(expected.getMessage(),
+                            expected.getMessage().contains("could not prepare the OIDC token store directory"));
+                }
+
+                Path exposedDir = temp.newFolder("exposed-store").toPath();
+                FileTokenStore exposedStore = new FileTokenStore(exposedDir);
+                TokenStoreKey key = sampleKey();
+                exposedStore.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+                Files.setPosixFilePermissions(exposedDir, PosixFilePermissions.fromString("rwxrwxrwx"));
+                Assert.assertNull("contents found after other-user write access must be discarded",
+                        exposedStore.load(key));
+            } finally {
+                storeLogger.detachAppender(appender);
+                storeLogger.setLevel(savedLevel);
+                appender.stop();
+                ioLatch.set(ioLatchWasSet);
+                securityLatch.set(securityLatchWasSet);
+            }
+
+            int ioWarnings = 0;
+            int securityWarnings = 0;
+            for (ch.qos.logback.classic.spi.ILoggingEvent event : appender.list) {
+                String message = event.getFormattedMessage();
+                if (message.contains("could not prepare the OIDC token store directory")) {
+                    ioWarnings++;
+                    Assert.assertTrue("the transient warning must carry the filesystem cause: " + message,
+                            message.contains("warning-blocker"));
+                    Assert.assertFalse("a filesystem fault must not be misreported as a permissions finding: "
+                                    + message,
+                            message.contains("not owner-only"));
+                }
+                if (message.contains("the OIDC token store directory is not owner-only")) {
+                    securityWarnings++;
+                    Assert.assertTrue("the security warning must explain the discarded credentials: " + message,
+                            message.contains("every entry found in it was discarded"));
+                }
+            }
+            Assert.assertEquals("the transient I/O condition has its own one-shot warning", 1, ioWarnings);
+            Assert.assertEquals("the transient warning must not consume the security warning's latch",
+                    1, securityWarnings);
+        });
+    }
+
+    @Test
     public void testLoadTrustsAWorldREADABLEDirectory() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
