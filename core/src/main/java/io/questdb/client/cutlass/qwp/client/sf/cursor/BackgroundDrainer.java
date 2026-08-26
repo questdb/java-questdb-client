@@ -1153,6 +1153,20 @@ public final class BackgroundDrainer implements Runnable {
                             throw (Error) t.getCause();
                         }
                         if (loop.capabilityGapTerminal() != null || loop.authTerminal() != null) {
+                            // The I/O thread publishes a durable ack before it latches a later terminal.
+                            // That publication can land after the poll at the top of this iteration but
+                            // before checkError() observes the terminal. Re-read here so recycling the wire
+                            // cannot carry a spent escalation budget across progress we actually made.
+                            long ackedAfterTerminal = engine.ackedFsn();
+                            noteAckProgress(ackedAfterTerminal);
+                            this.ackedFsn = ackedAfterTerminal;
+                            if (ackedAfterTerminal >= target) {
+                                outcome = DrainOutcome.SUCCESS;
+                                LOG.info("drainer fully drained slot {} before recoverable terminal "
+                                                + "(target={}, acked={})",
+                                        slotPath, target, ackedAfterTerminal);
+                                return;
+                            }
                             // Mid-drain RECOVERABLE terminal: recycle the wire, NOT
                             // the slot. connectWithDurableAckRetry() owns the matching
                             // bounded budget and drops the sentinel itself if the
