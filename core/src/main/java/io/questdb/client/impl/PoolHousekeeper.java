@@ -24,6 +24,8 @@
 
 package io.questdb.client.impl;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * Daemon thread that periodically asks both pools to reap idle / over-age
  * slots. Owned by {@link QuestDBImpl}; one instance per {@code QuestDB}
@@ -77,10 +79,12 @@ final class PoolHousekeeper {
         // below entirely. That is the one case the escalation is most needed in: it exists because the
         // target may be parked in a credential pull only an interrupt can break, and skipping it returns
         // from close() with the recoverer still holding its store-and-forward slot flock. The flag is
-        // restored before returning, so the caller's own cancellation bookkeeping still sees it.
+        // restored before returning, so the caller's own cancellation bookkeeping still sees it. A fresh
+        // interrupt during either join is handled the same way: remember it, finish the shutdown protocol,
+        // then restore it.
         boolean callerWasInterrupted = Thread.interrupted();
         try {
-            thread.join(STOP_TIMEOUT_MILLIS);
+            callerWasInterrupted |= joinIgnoringCallerInterrupts(thread, STOP_TIMEOUT_MILLIS);
             if (thread.isAlive()) {
                 // The stop flag only reaches the loop BETWEEN steps. A step blocked inside a recovery
                 // build is unreachable by it, and since recovery builds acquired a token provider the
@@ -109,15 +113,38 @@ final class PoolHousekeeper {
                 // a CARRIED flag makes CountDownLatch.await return instantly and would report a flock still
                 // held that was released fine.
                 thread.interrupt();
-                thread.join(STOP_TIMEOUT_MILLIS);
+                callerWasInterrupted |= joinIgnoringCallerInterrupts(thread, STOP_TIMEOUT_MILLIS);
             }
-        } catch (InterruptedException e) {
-            callerWasInterrupted = true;
         } finally {
             if (callerWasInterrupted) {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /**
+     * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
+     * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
+     * remainder of the original budget before handing the information back to {@link #stop()}.
+     */
+    private static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
+        final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        final long deadlineNanos = System.nanoTime() + timeoutNanos;
+        boolean callerWasInterrupted = false;
+        while (target.isAlive()) {
+            final long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L) {
+                break;
+            }
+            final long waitMillis = TimeUnit.NANOSECONDS.toMillis(remainingNanos);
+            final int waitNanos = (int) (remainingNanos - TimeUnit.MILLISECONDS.toNanos(waitMillis));
+            try {
+                target.join(waitMillis, waitNanos);
+            } catch (InterruptedException e) {
+                callerWasInterrupted = true;
+            }
+        }
+        return callerWasInterrupted;
     }
 
     private void runLoop() {
