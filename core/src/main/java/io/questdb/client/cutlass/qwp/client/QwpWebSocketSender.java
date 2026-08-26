@@ -3915,37 +3915,51 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
-        while (cursorEngine.ackedFsn() < target) {
-            // Stop on a latched terminal (acks will never reach target);
-            // surface it only when no other channel already delivered it.
-            if (errorOwnedByCustomHandler) {
-                if (cursorSendLoop.getTerminalError() != null) {
-                    return;
+        boolean restoreInterrupt = Thread.interrupted();
+        try {
+            while (cursorEngine.ackedFsn() < target) {
+                // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
+                // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
+                // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
+                // next paced wait, remember it, and restore the flag once when the drain exits.
+                if (Thread.interrupted()) {
+                    restoreInterrupt = true;
                 }
-            } else {
-                cursorSendLoop.checkError();
+                // Stop on a latched terminal (acks will never reach target);
+                // surface it only when no other channel already delivered it.
+                if (errorOwnedByCustomHandler) {
+                    if (cursorSendLoop.getTerminalError() != null) {
+                        return;
+                    }
+                } else {
+                    cursorSendLoop.checkError();
+                }
+                if (System.nanoTime() >= deadlineNanos) {
+                    long acked = cursorEngine.ackedFsn();
+                    // Name the outage the I/O thread is riding out, when there is one. A
+                    // foreground sender now retries endpoint-policy rejections indefinitely,
+                    // so a revoked token reaches the operator HERE, and blaming timeout
+                    // tuning for what is actually an auth failure would misdirect them.
+                    CursorWebSocketSendLoop loop = cursorSendLoop;
+                    Throwable outage = loop == null ? null : loop.lastReconnectError();
+                    LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
+                            closeFlushTimeoutMillis, target, acked,
+                            outage == null ? "" : "; wire is not draining: " + outage.getMessage());
+                    throw new LineSenderException("close() drain timed out after ")
+                            .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
+                            .put(target).put(", ackedFsn=").put(acked)
+                            .put("] - server did not acknowledge ")
+                            .put(target - acked)
+                            .put(outage == null
+                                    ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
+                                    : " pending batches; the wire is not draining: " + outage.getMessage());
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
             }
-            if (System.nanoTime() >= deadlineNanos) {
-                long acked = cursorEngine.ackedFsn();
-                // Name the outage the I/O thread is riding out, when there is one. A
-                // foreground sender now retries endpoint-policy rejections indefinitely,
-                // so a revoked token reaches the operator HERE, and blaming timeout
-                // tuning for what is actually an auth failure would misdirect them.
-                CursorWebSocketSendLoop loop = cursorSendLoop;
-                Throwable outage = loop == null ? null : loop.lastReconnectError();
-                LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
-                        closeFlushTimeoutMillis, target, acked,
-                        outage == null ? "" : "; wire is not draining: " + outage.getMessage());
-                throw new LineSenderException("close() drain timed out after ")
-                        .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
-                        .put(target).put(", ackedFsn=").put(acked)
-                        .put("] - server did not acknowledge ")
-                        .put(target - acked)
-                        .put(outage == null
-                                ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
-                                : " pending batches; the wire is not draining: " + outage.getMessage());
+        } finally {
+            if (restoreInterrupt) {
+                Thread.currentThread().interrupt();
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
     }
 

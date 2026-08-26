@@ -62,6 +62,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -1995,6 +1996,44 @@ public class OidcDeviceAuthTest {
                             Thread.currentThread().isInterrupted());
                 } finally {
                     Thread.interrupted(); // clear so the flag does not leak into later tests sharing this fork
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testGetTokenSucceedsWhenInterruptedAfterContendedFastPath() throws Exception {
+        assertMemoryLeak(() -> {
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-1", null, "REFRESH-1", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt())) {
+                Assert.assertEquals("ACCESS-1", auth.signIn());
+
+                // Force the first untimed CAS to miss, modelling contention that ends before the timed arm.
+                // AQS checks the carried interrupt before that arm attempts its own CAS, so pre-fix getToken()
+                // threw at 0ms despite the lock now being free and ACCESS-1 still being valid.
+                MissOnceReentrantLock testLock = new MissOnceReentrantLock();
+                Field lockField = OidcDeviceAuth.class.getDeclaredField("lock");
+                lockField.setAccessible(true);
+                lockField.set(auth, testLock);
+
+                Thread.currentThread().interrupt();
+                try {
+                    Assert.assertEquals("a valid cached token must survive ended contention", "ACCESS-1",
+                            auth.getToken());
+                    Assert.assertTrue("getToken() must preserve the caller's interrupt",
+                            Thread.currentThread().isInterrupted());
+                    Assert.assertEquals("the contended timed arm must have been reached", 1,
+                            testLock.timedTryLockCalls);
+                    Assert.assertEquals("the catch must make one final untimed acquire", 2,
+                            testLock.untimedTryLockCalls);
+                } finally {
+                    Thread.interrupted();
                 }
             }
         });
@@ -4501,6 +4540,23 @@ public class OidcDeviceAuthTest {
             }
         }
         return out.toString();
+    }
+
+    private static final class MissOnceReentrantLock extends ReentrantLock {
+        private int timedTryLockCalls;
+        private int untimedTryLockCalls;
+
+        @Override
+        public boolean tryLock() {
+            untimedTryLockCalls++;
+            return untimedTryLockCalls > 1 && super.tryLock();
+        }
+
+        @Override
+        public boolean tryLock(long timeout, TimeUnit unit) throws InterruptedException {
+            timedTryLockCalls++;
+            return super.tryLock(timeout, unit);
+        }
     }
 
     private static OidcDeviceAuth newAuth(MockOidcServer server, boolean groupsInToken, DeviceCodePrompt prompt) {

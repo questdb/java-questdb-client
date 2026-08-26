@@ -1434,6 +1434,14 @@ public class OidcDeviceAuth implements QuietCloseable {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                // tryAcquireNanos checks interruption before it attempts the CAS, including when the lock was
+                // released between the fast-path miss above and this timed acquire. Give that now-free lock one
+                // untimed attempt, which (like the fast path) ignores the carried flag and lets getToken() reach
+                // its cache check. Only report an interrupted WAIT when the lock is genuinely still held.
+                if (lock.tryLock()) {
+                    publishLockHolder();
+                    return;
+                }
                 throw new OidcAuthException("interrupted while waiting to acquire the OIDC token");
             }
         }
