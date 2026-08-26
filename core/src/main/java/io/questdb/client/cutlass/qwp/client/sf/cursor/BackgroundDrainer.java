@@ -1084,7 +1084,19 @@ public final class BackgroundDrainer implements Runnable {
                 loopErrorDispatcher = new SenderErrorDispatcher(
                         err -> {
                             if (err.getAppliedPolicy() != SenderError.Policy.TERMINAL) {
-                                sink.onError(err);
+                                // This sink belongs to the live sender, while err's FSNs belong to the orphan
+                                // engine being drained. Strip that foreign correlation span before forwarding;
+                                // otherwise an operator can join it to unrelated live rows with the same FSNs.
+                                sink.onError(new SenderError(
+                                        err.getCategory(),
+                                        err.getAppliedPolicy(),
+                                        err.getServerStatusByte(),
+                                        err.getServerMessage(),
+                                        err.getMessageSequence(),
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        err.getTableName(),
+                                        err.getDetectedAtNanos()));
                             }
                         },
                         SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");

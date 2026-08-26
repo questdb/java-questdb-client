@@ -218,6 +218,10 @@ public class BackgroundDrainerCredentialOutageReportTest {
                 assertTrue("the provider's own failure must be carried through: "
                         + credentialError.getServerMessage(),
                         credentialError.getServerMessage().contains(PROVIDER_FAILURE_MESSAGE));
+                assertEquals("orphan-engine FSNs must not be exposed through the live sender's handler",
+                        SenderError.NO_MESSAGE_SEQUENCE, credentialError.getFromFsn());
+                assertEquals("orphan-engine FSNs must not be exposed through the live sender's handler",
+                        SenderError.NO_MESSAGE_SEQUENCE, credentialError.getToFsn());
 
                 for (SenderError e : captured) {
                     assertFalse("a drain that recovered must report no data loss: " + captured,
