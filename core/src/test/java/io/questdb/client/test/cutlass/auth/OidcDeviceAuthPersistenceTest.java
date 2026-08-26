@@ -40,8 +40,11 @@ import org.junit.rules.TemporaryFolder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -170,6 +173,186 @@ public class OidcDeviceAuthPersistenceTest {
                     Assert.assertEquals("and must not reach the token endpoint either", 0, token.get());
                 } finally {
                     Thread.interrupted();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseInterruptsRefreshWaitingBehindPeerInstance() throws Exception {
+        assertMemoryLeak(() -> {
+            CountDownLatch peerRefreshInFlight = new CountDownLatch(1);
+            CountDownLatch releasePeerRefresh = new CountDownLatch(1);
+            CountDownLatch closeStarted = new CountDownLatch(1);
+            AtomicInteger refreshPosts = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(500, "{\"error\":\"unexpected_device_flow\"}");
+                }
+                int refreshNumber = refreshPosts.incrementAndGet();
+                if (refreshNumber == 1) {
+                    peerRefreshInFlight.countDown();
+                    try {
+                        if (!releasePeerRefresh.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the test did not release the peer refresh");
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("the mock peer refresh was interrupted", e);
+                    }
+                    // Leave the persisted entry stale. Without close() interrupting the waiting instance, that
+                    // instance acquires the shared process lock next and starts a fresh token POST after closed.
+                    return MockOidcServer.json(500, "{\"error\":\"temporarily_unavailable\"}");
+                }
+                return MockOidcServer.json(200, tokenJson("ACCESS-UNEXPECTED", null, "REFRESH-2", 3600));
+            };
+
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                Path dir = storeDir();
+                new FileTokenStore(dir).save(keyFor(server), new PersistedToken(
+                        "ACCESS-STALE", null, "REFRESH-1", System.currentTimeMillis() - 1_000, 300_000));
+                AtomicReference<Throwable> peerFailure = new AtomicReference<>();
+                AtomicReference<Throwable> waitingFailure = new AtomicReference<>();
+                try (OidcDeviceAuth peer = baseBuilder(server).tokenStore(new FileTokenStore(dir)).build();
+                     OidcDeviceAuth closing = baseBuilder(server).tokenStore(new FileTokenStore(dir)).build()) {
+                    Thread peerRefresh = new Thread(() -> {
+                        try {
+                            peer.getToken();
+                        } catch (Throwable e) {
+                            peerFailure.set(e);
+                        }
+                    }, "oidc-peer-refresh");
+                    Thread waitingRefresh = new Thread(() -> {
+                        try {
+                            closing.getToken();
+                        } catch (Throwable e) {
+                            waitingFailure.set(e);
+                        }
+                    }, "oidc-waiting-refresh");
+                    // Prevent an unfixed close() from pinning the test thread for the full mock/HTTP timeout.
+                    // The fixed close returns before this fallback fires, while the peer still owns the lock.
+                    Thread fallbackRelease = new Thread(() -> {
+                        try {
+                            closeStarted.await();
+                            Thread.sleep(2_000);
+                            releasePeerRefresh.countDown();
+                        } catch (InterruptedException ignore) {
+                            // The fixed path releases the peer itself and stops this fallback promptly.
+                        }
+                    }, "oidc-close-test-fallback");
+                    peerRefresh.setDaemon(true);
+                    waitingRefresh.setDaemon(true);
+                    fallbackRelease.setDaemon(true);
+                    peerRefresh.start();
+                    fallbackRelease.start();
+
+                    long closeElapsedMillis;
+                    try {
+                        Assert.assertTrue("the peer refresh did not reach the token endpoint",
+                                peerRefreshInFlight.await(10, TimeUnit.SECONDS));
+                        waitingRefresh.start();
+                        // The peer is now inside the token POST while holding FileTokenStore's JVM-wide
+                        // per-directory/per-identity process lock. Wait until the second instance queues on it.
+                        long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (waitingRefresh.isAlive()
+                                && waitingRefresh.getState() != Thread.State.WAITING
+                                && System.nanoTime() - waitDeadline < 0) {
+                            Thread.sleep(10);
+                        }
+                        Assert.assertEquals("the second instance did not queue on the shared process lock",
+                                Thread.State.WAITING, waitingRefresh.getState());
+
+                        closeStarted.countDown();
+                        long closeStartNanos = System.nanoTime();
+                        closing.close();
+                        closeElapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStartNanos);
+                        waitingRefresh.join(5_000);
+                    } finally {
+                        releasePeerRefresh.countDown();
+                        fallbackRelease.interrupt();
+                        waitingRefresh.interrupt();
+                        peerRefresh.join(10_000);
+                        waitingRefresh.join(10_000);
+                        fallbackRelease.join(10_000);
+                    }
+
+                    Assert.assertTrue("close() waited " + closeElapsedMillis
+                                    + "ms for another instance's refresh instead of interrupting its own waiter",
+                            closeElapsedMillis < 1_000);
+                    Assert.assertFalse("the interrupted refresh thread did not unwind", waitingRefresh.isAlive());
+                    Assert.assertTrue("the waiting refresh must report cancellation",
+                            waitingFailure.get() instanceof OidcAuthException);
+                    Assert.assertTrue(waitingFailure.get().getMessage(),
+                            waitingFailure.get().getMessage().contains("interrupted"));
+                    Assert.assertTrue("the peer refresh must fail on the mock 500 response",
+                            peerFailure.get() instanceof OidcAuthException);
+                    Assert.assertEquals("a closing instance must not start another token POST", 1, refreshPosts.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testClosePreventsRefreshPostAfterStoreReturnsLate() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger tokenPosts = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(500, "{\"error\":\"unexpected_device_flow\"}");
+                }
+                tokenPosts.incrementAndGet();
+                return MockOidcServer.json(200, tokenJson("ACCESS-UNEXPECTED", null, "REFRESH-2", 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-1",
+                        System.currentTimeMillis() - 1_000, 300_000);
+                fake.inLockEntered = new CountDownLatch(1);
+                fake.releaseInLock = new CountDownLatch(1);
+                AtomicReference<Throwable> refreshFailure = new AtomicReference<>();
+                CountDownLatch closeStarted = new CountDownLatch(1);
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    Thread refresh = new Thread(() -> {
+                        try {
+                            auth.getToken();
+                        } catch (Throwable e) {
+                            refreshFailure.set(e);
+                        }
+                    }, "oidc-late-store-refresh");
+                    // This deliberately models a TokenStore implementation that finishes its wait despite an
+                    // interrupt. close() must still acquire the instance lock before freeing resources, so let
+                    // the store return shortly after close begins and verify the refresh checks closed before I/O.
+                    Thread delayedRelease = new Thread(() -> {
+                        try {
+                            closeStarted.await();
+                            Thread.sleep(200);
+                            fake.releaseInLock.countDown();
+                        } catch (InterruptedException ignore) {
+                            // Test cleanup releases the latch directly.
+                        }
+                    }, "oidc-late-store-release");
+                    refresh.setDaemon(true);
+                    delayedRelease.setDaemon(true);
+                    refresh.start();
+                    delayedRelease.start();
+                    try {
+                        Assert.assertTrue("the refresh did not enter the delayed store section",
+                                fake.inLockEntered.await(10, TimeUnit.SECONDS));
+                        closeStarted.countDown();
+                        auth.close();
+                    } finally {
+                        fake.releaseInLock.countDown();
+                        delayedRelease.interrupt();
+                        refresh.join(10_000);
+                        delayedRelease.join(10_000);
+                    }
+                    Assert.assertFalse("the delayed refresh thread did not unwind", refresh.isAlive());
+                    Assert.assertTrue("the delayed refresh must observe close",
+                            refreshFailure.get() instanceof OidcAuthException);
+                    Assert.assertTrue(refreshFailure.get().getMessage(),
+                            refreshFailure.get().getMessage().contains("closed"));
+                    Assert.assertEquals("a refresh resuming after close must not issue a token POST",
+                            0, tokenPosts.get());
                 }
             }
         });
@@ -1755,8 +1938,10 @@ public class OidcDeviceAuthPersistenceTest {
         // simply has nothing to return
         int failLoadTimes;
         boolean failSave;
+        CountDownLatch inLockEntered;
         PersistedToken loadReturns;
         PersistedToken peerInstallsOnLock;
+        CountDownLatch releaseInLock;
         PersistedToken stored;
         RuntimeException throwAfterAction;
         RuntimeException throwBeforeAction;
@@ -1776,6 +1961,22 @@ public class OidcDeviceAuthPersistenceTest {
             if (cancelWaitInsteadOfRunning) {
                 Thread.currentThread().interrupt();
                 return false;
+            }
+            if (inLockEntered != null) {
+                inLockEntered.countDown();
+                boolean interrupted = false;
+                while (true) {
+                    try {
+                        releaseInLock.await();
+                        break;
+                    } catch (InterruptedException e) {
+                        // Model a store whose own wait is not cancelled, while preserving the caller's signal.
+                        interrupted = true;
+                    }
+                }
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
             if (peerInstallsOnLock != null) {
                 // simulate a peer process refreshing and writing a fresh entry while we hold the lock
