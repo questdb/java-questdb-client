@@ -232,10 +232,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     // interactive flow, getToken() uses tryLock so the flush path never stalls behind a sign-in
     private final ReentrantLock lock = new ReentrantLock();
     private final Object tokenStoreWaiterGuard = new Object();
-    // The thread currently entering or waiting in TokenStore.inLock(). Deliberately narrower than the instance
-    // lock hold: close() may interrupt this wait, but must not leave an interrupt on a thread doing ordinary
-    // store I/O or about to return a cached token. The action clears the marker as soon as inLock() acquires its
-    // lock, and the surrounding finally covers stores that return or throw without entering the action.
+    // The thread currently entering or waiting in TokenStore.inLock(), or running TokenStore.clear(), whose SPI
+    // does not expose the lock-acquired boundary. Deliberately narrower than the instance lock hold: close() may
+    // interrupt a coordinating store operation, but must not leave an interrupt on a thread doing an ordinary
+    // load/save or about to return a cached token. The refresh action clears the marker as soon as inLock()
+    // acquires its lock; clear keeps it for the whole best-effort call so close cannot miss its internal wait.
     private Thread tokenStoreWaiterThread;
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
@@ -484,10 +485,21 @@ public class OidcDeviceAuth implements QuietCloseable {
             tokenTtlMillis = 0;
             refreshFailedAtMillis = 0;
             if (tokenStore != null) {
+                // FileTokenStore.clear() coordinates with a peer refresh through the same interruptible
+                // per-identity lock as tryRefreshCoordinated(). Publish this caller too, otherwise close()
+                // sees no waiter and blocks on this instance lock for the peer's whole refresh. TokenStore's
+                // clear SPI has no callback at the exact lock-acquired boundary, so keep the marker for the
+                // whole best-effort clear; a close racing ordinary clear I/O is cancellation of this operation,
+                // not an interrupt leaked into an unrelated cached-token return.
+                publishTokenStoreWaiter();
                 try {
-                    tokenStore.clear(storeKey);
-                } catch (RuntimeException e) {
-                    warnPersistence("clear", e);
+                    try {
+                        tokenStore.clear(storeKey);
+                    } catch (RuntimeException e) {
+                        warnPersistence("clear", e);
+                    }
+                } finally {
+                    clearTokenStoreWaiter();
                 }
             }
             // do not reload the entry we just removed on the next signIn()/getToken()
@@ -501,10 +513,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      * Frees the network connections and native buffers this instance holds. If a {@link #signIn()}
      * sign-in is in flight on another thread, signals it to stop so it fails with an
      * {@link OidcAuthException} instead of polling until the device code expires. The signal is observed
-     * between polls (within ~100ms while waiting out a poll interval). Only while an operation is waiting for a
-     * peer instance's shared token-store lock is its thread interrupted, abandoning that wait immediately; an
-     * HTTP request already in flight is not cancelled at the transport, so {@code close()} acquires the lock -
-     * and returns - only once that request finishes or times out, not the full device-code lifetime. That bound is
+     * between polls (within ~100ms while waiting out a poll interval). Only while an operation is in a
+     * coordinating token-store call is its thread interrupted: a refresh publishes only its wait for a peer
+     * instance's shared lock, while a clear publishes its whole best-effort call because the store SPI does not
+     * expose that wait separately. An HTTP request already in flight is not cancelled at the transport, so
+     * {@code close()} acquires the lock - and returns - only once that request finishes or times out, not the full
+     * device-code lifetime. That bound is
      * the in-flight operation's own worst case, which is NOT a single HTTP request timeout: a silent refresh
      * under the lock runs a send, an await and a body parse (each bounded by
      * {@link Builder#httpTimeoutMillis(int)}), and its connection phase -
@@ -519,11 +533,12 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     @Override
     public void close() {
-        // Flag cancellation before taking the lock, then interrupt only a thread published at the
-        // TokenStore.inLock() acquisition boundary. Publishing the whole instance-lock holder would also
-        // interrupt ordinary store reads and cached-token returns, leaking close()'s cancellation signal into
-        // unrelated caller work after a successful getToken(). The lock acquire must still succeed before
-        // native resources are freed, so other in-flight work is waited out as before.
+        // Flag cancellation before taking the lock, then interrupt only a thread published for a coordinating
+        // store-lock operation. Refresh publishes the exact TokenStore.inLock() acquisition boundary; clear()
+        // covers its whole SPI call because that boundary is not exposed. Publishing every instance-lock holder
+        // would also interrupt ordinary store reads and cached-token returns, leaking close()'s cancellation
+        // signal into unrelated caller work after a successful getToken(). The lock acquire must still succeed
+        // before native resources are freed, so other in-flight work is waited out as before.
         closed = true;
         synchronized (tokenStoreWaiterGuard) {
             Thread waiter = tokenStoreWaiterThread;

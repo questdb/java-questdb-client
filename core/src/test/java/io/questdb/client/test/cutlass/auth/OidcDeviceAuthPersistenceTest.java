@@ -299,6 +299,114 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCloseInterruptsClearCacheWaitingBehindPeerInstance() throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore holderStore = new FileTokenStore(dir);
+            FileTokenStore clearingStore = new FileTokenStore(dir);
+            TokenStoreKey key = new TokenStoreKey(
+                    "questdb",
+                    "http://127.0.0.1:1/token",
+                    "http://127.0.0.1:1/device",
+                    "openid",
+                    null,
+                    false);
+            holderStore.save(key, new PersistedToken(
+                    "ACCESS-STALE", null, "REFRESH-SECRET",
+                    System.currentTimeMillis() - 1_000, 300_000));
+
+            CountDownLatch holderEntered = new CountDownLatch(1);
+            CountDownLatch releaseHolder = new CountDownLatch(1);
+            CountDownLatch closeStarted = new CountDownLatch(1);
+            AtomicBoolean clearInterruptedAtReturn = new AtomicBoolean();
+            AtomicReference<Throwable> holderFailure = new AtomicReference<>();
+            AtomicReference<Throwable> clearFailure = new AtomicReference<>();
+
+            try (OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                    .clientId("questdb")
+                    .deviceAuthorizationEndpoint("http://127.0.0.1:1/device")
+                    .tokenEndpoint("http://127.0.0.1:1/token")
+                    .tokenStore(clearingStore)
+                    .build()) {
+                Thread holder = new Thread(() -> {
+                    try {
+                        holderStore.inLock(key, () -> {
+                            holderEntered.countDown();
+                            try {
+                                if (!releaseHolder.await(10, TimeUnit.SECONDS)) {
+                                    throw new AssertionError("the test did not release the token-store holder");
+                                }
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError("the token-store holder was interrupted", e);
+                            }
+                            return true;
+                        });
+                    } catch (Throwable e) {
+                        holderFailure.set(e);
+                    }
+                }, "oidc-clear-peer-holder");
+                Thread clearer = new Thread(() -> {
+                    try {
+                        auth.clearCache();
+                    } catch (Throwable e) {
+                        clearFailure.set(e);
+                    } finally {
+                        clearInterruptedAtReturn.set(Thread.currentThread().isInterrupted());
+                    }
+                }, "oidc-clear-waiter");
+                // Prevent an unfixed close() from pinning the test thread until the holder's 10-second fallback.
+                Thread fallbackRelease = new Thread(() -> {
+                    try {
+                        closeStarted.await();
+                        Thread.sleep(2_000L);
+                        releaseHolder.countDown();
+                    } catch (InterruptedException ignore) {
+                        // The fixed path releases the holder itself and stops this fallback promptly.
+                    }
+                }, "oidc-clear-close-fallback");
+                holder.setDaemon(true);
+                clearer.setDaemon(true);
+                fallbackRelease.setDaemon(true);
+                holder.start();
+                fallbackRelease.start();
+
+                long closeElapsedMillis;
+                try {
+                    Assert.assertTrue("the peer did not enter the token-store critical section",
+                            holderEntered.await(10, TimeUnit.SECONDS));
+                    clearer.start();
+                    awaitProcessLockWait(clearer);
+
+                    closeStarted.countDown();
+                    long closeStartNanos = System.nanoTime();
+                    auth.close();
+                    closeElapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStartNanos);
+                    clearer.join(5_000L);
+                } finally {
+                    releaseHolder.countDown();
+                    fallbackRelease.interrupt();
+                    clearer.interrupt();
+                    holder.join(10_000L);
+                    clearer.join(10_000L);
+                    fallbackRelease.join(10_000L);
+                }
+
+                Assert.assertTrue("close() waited " + closeElapsedMillis
+                                + "ms for a peer token-store operation instead of interrupting clearCache()",
+                        closeElapsedMillis < 1_000L);
+                Assert.assertFalse("the interrupted clearCache() thread did not unwind", clearer.isAlive());
+                Assert.assertNull("the peer token-store holder failed", holderFailure.get());
+                Assert.assertNull("clearCache() failed", clearFailure.get());
+                Assert.assertTrue("clearCache() must preserve close()'s cancellation signal",
+                        clearInterruptedAtReturn.get());
+                Assert.assertFalse("clearCache() must still erase the persisted credential when interrupted",
+                        Files.exists(dir.resolve(key.hash() + ".json")));
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testCloseInterruptsRefreshWaitingBehindPeerInstance() throws Exception {
         assertMemoryLeak(() -> {
             CountDownLatch peerRefreshInFlight = new CountDownLatch(1);
@@ -2038,6 +2146,28 @@ public class OidcDeviceAuthPersistenceTest {
                 }
             }
         });
+    }
+
+    private static void awaitProcessLockWait(Thread thread) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() - deadlineNanos < 0) {
+            boolean inFileStoreLock = false;
+            boolean inInterruptibleAcquire = false;
+            for (StackTraceElement frame : thread.getStackTrace()) {
+                if (FileTokenStore.class.getName().equals(frame.getClassName())
+                        && "inLock".equals(frame.getMethodName())) {
+                    inFileStoreLock = true;
+                }
+                if ("lockInterruptibly".equals(frame.getMethodName())) {
+                    inInterruptibleAcquire = true;
+                }
+            }
+            if (thread.getState() == Thread.State.WAITING && inFileStoreLock && inInterruptibleAcquire) {
+                return;
+            }
+            Thread.sleep(5L);
+        }
+        Assert.fail("clearCache() never reached FileTokenStore's interruptible process-lock wait");
     }
 
     private static OidcDeviceAuth.Builder baseBuilder(MockOidcServer server) {

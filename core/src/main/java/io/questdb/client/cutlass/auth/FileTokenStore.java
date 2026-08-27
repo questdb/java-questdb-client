@@ -391,13 +391,15 @@ public final class FileTokenStore implements TokenStore {
                 sweepTempFiles(key.hash(), 0L);
                 return true;
             };
-            if (!inLock(key, delete)) {
-                // inLock declined to RUN the action - a live cancellation, or it could not coordinate at all.
-                // It returns false only when the action never ran (this action always returns true), so this
-                // cannot double-delete. Run it uncoordinated rather than return with the credential still on
-                // disk: the cross-process lock only orders us against a peer's in-flight refresh, and losing
-                // that ordering costs at worst a peer re-persisting later, which this method already documents
-                // as best-effort. Leaving the secret behind is not a trade this call may make.
+            if (wasInterrupted || !inLock(key, delete)) {
+                // Run without coordination if inLock declined to RUN the action - a live cancellation, or it
+                // could not coordinate at all. Do the same for a carried interrupt consumed above, before inLock
+                // could mistake it for a live cancellation, so a close() interrupt delivered just before this
+                // call cannot be hidden for the duration of a peer refresh. This action always returns true, so
+                // the fallback cannot double-delete. The cross-process lock only orders us against a peer's
+                // in-flight refresh, and losing that ordering costs at worst a peer re-persisting later, which
+                // this method already documents as best-effort. Leaving the secret behind is not a trade this
+                // call may make.
                 delete.run();
             }
         } finally {
