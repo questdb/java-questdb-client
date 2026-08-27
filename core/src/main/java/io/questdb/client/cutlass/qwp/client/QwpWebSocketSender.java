@@ -5156,7 +5156,7 @@ public class QwpWebSocketSender implements Sender {
 
     private CursorSendEngine rebuildEngineOrAbandon(String message) {
         try {
-            return engineRebuildFactory.rebuild();
+            return engineRebuildFactory.rebuild(userErrorHandler());
         } catch (Error e) {
             throw e;
         } catch (Throwable t) {
@@ -5429,6 +5429,11 @@ public class QwpWebSocketSender implements Sender {
         sealAndSwapBuffer();
         hasDeferredMessages = false;
         lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+    }
+
+    private SenderErrorHandler userErrorHandler() {
+        SenderErrorHandler h = errorHandler;
+        return h == DefaultSenderErrorHandler.INSTANCE ? null : h;
     }
 
     /**
@@ -6182,6 +6187,15 @@ public class QwpWebSocketSender implements Sender {
      */
     public interface EngineRebuildFactory {
         CursorSendEngine rebuild();
+
+        /**
+         * Rebuild with the sender's current user-supplied error handler ({@code null}
+         * when only the default handler is installed), so a quarantine during the
+         * rebuild reaches a handler installed after {@code build()}.
+         */
+        default CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+            return rebuild();
+        }
     }
 
     /**

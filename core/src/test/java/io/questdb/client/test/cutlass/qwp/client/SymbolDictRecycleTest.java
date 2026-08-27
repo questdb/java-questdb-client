@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
@@ -49,8 +50,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.HEADER_SIZE;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
@@ -402,6 +405,47 @@ public class SymbolDictRecycleTest {
                     long f = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
                     sender.close();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRebuildFactoryReceivesTheLiveErrorHandler() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    SenderErrorHandler installedAfterBuild = error -> { };
+                    ws.setErrorHandler(installedAfterBuild);
+
+                    QwpWebSocketSender.EngineRebuildFactory real = ws.getEngineRebuildFactoryForTesting();
+                    AtomicReference<SenderErrorHandler> handlerSeen = new AtomicReference<>();
+                    AtomicBoolean handlerlessOverloadCalled = new AtomicBoolean();
+                    ws.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
+                        @Override
+                        public CursorSendEngine rebuild() {
+                            handlerlessOverloadCalled.set(true);
+                            return real.rebuild();
+                        }
+
+                        @Override
+                        public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+                            handlerSeen.set(liveHandler);
+                            return real.rebuild(liveHandler);
+                        }
+                    });
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    sender.resetSymbolDictionary();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the recycle must have committed", 1, ws.getSymbolDictEpoch());
+
+                    Assert.assertSame("a rebuild-time quarantine must reach the handler installed after build()",
+                            installedAfterBuild, handlerSeen.get());
+                    Assert.assertFalse("the sender must call the handler-aware overload",
+                            handlerlessOverloadCalled.get());
                 }
             }
         });

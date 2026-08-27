@@ -1761,11 +1761,24 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 // dispatcher daemon, drainer pool, microbatch buffers and
                 // WebSocketClient inside the abandoned `connected`.
                 connected.setTransactional(transactional);
-                connected.setEngineRebuildFactory(() -> LineSenderBuilder.constructEngineOnSlot(
-                        sfDir, senderId, slotPath,
-                        actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
-                        actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
-                        errorHandler));
+                final String rebuildSfDir = sfDir;
+                final String rebuildSenderId = senderId;
+                final SenderErrorHandler buildTimeHandler = errorHandler;
+                connected.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
+                    @Override
+                    public CursorSendEngine rebuild() {
+                        return rebuild(buildTimeHandler);
+                    }
+
+                    @Override
+                    public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+                        return LineSenderBuilder.constructEngineOnSlot(
+                                rebuildSfDir, rebuildSenderId, slotPath,
+                                actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
+                                actualSfAppendDeadlineNanos, actualSfSyncIntervalNanos,
+                                liveHandler);
+                    }
+                });
                 try {
                     // Install the drainer listener BEFORE startOrphanDrainers
                     // below: drainers must see the listener at submit time so
