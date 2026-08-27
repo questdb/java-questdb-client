@@ -53,6 +53,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -408,6 +409,78 @@ public class SymbolDictRecycleTest {
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     long f = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
+                }
+            }
+        });
+    }
+
+    /**
+     * A monitor thread that read the epoch base BEFORE a recycle and reads the
+     * engine AFTER it -- the torn pair the accessor clamps -- must still see the
+     * pre-recycle durable watermark, never the fresh engine's -1.
+     */
+    @Test
+    public void testGetAckedFsnTornReadAcrossRecycleKeepsDurableWatermark() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server) + "symbol_dict_reset_threshold=2;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long f2 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
+                    Assert.assertTrue("threshold=2 crossed", ws.isResetArmed());
+                    long before = ws.getAckedFsn();
+                    Assert.assertEquals("two acked frames on the external scale", f2, before);
+                    Assert.assertEquals(1L, before);
+
+                    CountDownLatch baseRead = new CountDownLatch(1);
+                    CountDownLatch swapped = new CountDownLatch(1);
+                    AtomicBoolean fired = new AtomicBoolean();
+                    AtomicReference<Throwable> monitorError = new AtomicReference<>();
+                    ws.setAckedFsnReadWitnessForTesting(() -> {
+                        if (!fired.compareAndSet(false, true)) {
+                            return;
+                        }
+                        baseRead.countDown();
+                        try {
+                            if (!swapped.await(10, TimeUnit.SECONDS)) {
+                                throw new AssertionError("the recycle never released the monitor");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException(e);
+                        }
+                    });
+                    AtomicLong observed = new AtomicLong(Long.MIN_VALUE);
+                    Thread monitor = new Thread(() -> {
+                        try {
+                            observed.set(ws.getAckedFsn());
+                        } catch (Throwable t) {
+                            monitorError.set(t);
+                        }
+                    }, "acked-fsn-monitor");
+                    monitor.start();
+                    try {
+                        Assert.assertTrue("monitor never reached the witness",
+                                baseRead.await(5, TimeUnit.SECONDS));
+                        ws.setAckedFsnReadWitnessForTesting(null);
+                        // The recycle runs synchronously inside this call: the
+                        // base rolls past f2 and a fresh engine (ackedFsn == -1)
+                        // is installed while the monitor still holds the OLD base.
+                        sender.table("t");
+                        Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    } finally {
+                        swapped.countDown();
+                        monitor.join(10_000);
+                    }
+                    if (monitorError.get() != null) {
+                        throw new AssertionError("monitor failed", monitorError.get());
+                    }
+                    Assert.assertEquals("a torn (old base, fresh engine) read must clamp to the "
+                            + "durable watermark", before, observed.get());
+                    Assert.assertEquals("the producer-thread read after the swap", before, ws.getAckedFsn());
                 }
             }
         });

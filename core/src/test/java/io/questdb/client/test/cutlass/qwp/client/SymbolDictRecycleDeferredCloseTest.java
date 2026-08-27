@@ -126,7 +126,16 @@ public class SymbolDictRecycleDeferredCloseTest {
                         // code under test"; this fires from inside the await's
                         // own deferred-close branch.
                         CountDownLatch parked = new CountDownLatch(1);
-                        ws.setDeferredCloseParkWitnessForTesting(parked::countDown);
+                        AtomicLong ackedWhileEngineNull = new AtomicLong(Long.MIN_VALUE);
+                        AtomicBoolean awaitWhileEngineNull = new AtomicBoolean();
+                        ws.setDeferredCloseParkWitnessForTesting(() -> {
+                            // Runs on the producer thread inside step 3's await:
+                            // cursorEngine is null here, so both accessors must
+                            // answer from the durable watermark the barrier proved.
+                            ackedWhileEngineNull.set(ws.getAckedFsn());
+                            awaitWhileEngineNull.set(ws.awaitAckedFsn(fsn1, 0));
+                            parked.countDown();
+                        });
 
                         // Un-wedges the worker while the recycle is parked in its
                         // deferred-close await. The pre-release assert can never
@@ -162,6 +171,10 @@ public class SymbolDictRecycleDeferredCloseTest {
                                 outgoing.isCloseCompleted());
                         Assert.assertNotSame("the recycle must run on a rebuilt engine",
                                 outgoing, ws.getCursorEngineForTesting());
+                        Assert.assertEquals("mid-swap (engine null) getAckedFsn must report the "
+                                + "pre-swap durable watermark", fsn1, ackedWhileEngineNull.get());
+                        Assert.assertTrue("mid-swap (engine null) awaitAckedFsn at the durable "
+                                + "watermark must answer true", awaitWhileEngineNull.get());
 
                         sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
                         long fsn2 = sender.flushAndGetSequence();

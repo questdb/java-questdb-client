@@ -280,6 +280,7 @@ public class QwpWebSocketSender implements Sender {
     // parking (positive witness that the await engaged rather than
     // completing inline -- see SymbolDictRecycleDeferredCloseTest).
     private Runnable deferredCloseParkWitness;
+    private volatile Runnable ackedFsnReadWitness;
     // True when the sender emits incremental (delta) symbol dictionaries: each
     // message carries only symbol ids not yet sent on the wire, rather than the
     // full dictionary from id 0. Enabled in memory-mode (a reconnect replays from
@@ -2009,6 +2010,10 @@ public class QwpWebSocketSender implements Sender {
         // documented single-threaded; this keeps best-effort monitor reads
         // truthful rather than promising thread safety.
         long base = fsnEpochBase;
+        Runnable witness = ackedFsnReadWitness;
+        if (witness != null) {
+            witness.run();
+        }
         CursorSendEngine engine = cursorEngine;
         return engine != null ? Math.max(lastRecycleDurableFsn, base + engine.ackedFsn()) : lastRecycleDurableFsn;
     }
@@ -2986,6 +2991,16 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public void setDeferredCloseParkWitnessForTesting(Runnable witness) {
         this.deferredCloseParkWitness = witness;
+    }
+
+    /**
+     * Installs a witness {@link #getAckedFsn()} runs between its two volatile
+     * reads (epoch base first, engine second), so a test can hold a monitor
+     * thread on the torn (old base, fresh engine) pair across a real recycle.
+     */
+    @TestOnly
+    public void setAckedFsnReadWitnessForTesting(Runnable witness) {
+        this.ackedFsnReadWitness = witness;
     }
 
     public void setEngineRebuildFactory(EngineRebuildFactory factory) {
