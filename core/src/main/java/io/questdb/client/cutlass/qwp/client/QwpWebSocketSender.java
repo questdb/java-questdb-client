@@ -4226,6 +4226,8 @@ public class QwpWebSocketSender implements Sender {
             }
             if (System.nanoTime() >= deadlineNanos) {
                 long acked = cursorEngine.ackedFsn();
+                long externalTarget = fsnEpochBase + target;
+                long externalAcked = fsnEpochBase + acked;
                 // Name the outage the I/O thread is riding out, when there is one. A
                 // foreground sender now retries endpoint-policy rejections indefinitely,
                 // so a revoked token reaches the operator HERE, and blaming timeout
@@ -4233,11 +4235,11 @@ public class QwpWebSocketSender implements Sender {
                 CursorWebSocketSendLoop loop = cursorSendLoop;
                 Throwable outage = loop == null ? null : loop.lastReconnectError();
                 LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
-                        closeFlushTimeoutMillis, target, acked,
+                        closeFlushTimeoutMillis, externalTarget, externalAcked,
                         outage == null ? "" : "; wire is not draining: " + outage.getMessage());
                 throw new LineSenderException("close() drain timed out after ")
                         .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
-                        .put(target).put(", ackedFsn=").put(acked)
+                        .put(externalTarget).put(", ackedFsn=").put(externalAcked)
                         .put("] - server did not acknowledge ")
                         .put(target - acked)
                         .put(outage == null

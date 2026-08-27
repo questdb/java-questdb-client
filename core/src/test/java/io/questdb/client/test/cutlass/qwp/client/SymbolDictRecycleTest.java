@@ -486,6 +486,48 @@ public class SymbolDictRecycleTest {
         });
     }
 
+    /**
+     * The close-drain timeout names FSNs on the same external scale
+     * {@code flushAndGetSequence()} hands out, so an operator can feed the
+     * printed target straight back into {@code awaitAckedFsn()} after a recycle.
+     */
+    @Test
+    public void testCloseDrainTimeoutReportsExternalFsnsAfterRecycle() throws Exception {
+        assertMemoryLeak(() -> {
+            SwitchableAckHandler handler = new SwitchableAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String config = cfg(server) + "symbol_dict_reset_threshold=2;close_flush_timeout_millis=200;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long f1 = sender.flushAndGetSequence();
+                    Assert.assertTrue(sender.awaitAckedFsn(f1, 5_000));
+                    Assert.assertTrue("threshold=2 crossed", ws.isResetArmed());
+
+                    // Nothing published on the fresh epoch is ever acked.
+                    handler.acking = false;
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycles here
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    long f2 = sender.flushAndGetSequence();
+                    Assert.assertEquals("the fresh epoch continues the external scale", f1 + 1, f2);
+                    try {
+                        sender.close();
+                        Assert.fail("expected the close drain to time out");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue("drain message must name the external target and acked "
+                                + "watermark [expected targetFsn=" + f2 + ", ackedFsn=" + (f2 - 1)
+                                + "; msg=" + msg + ']',
+                                msg.contains("[targetFsn=" + f2 + ", ackedFsn=" + (f2 - 1) + "]"));
+                    }
+                }
+            }
+        });
+    }
+
     @Test
     public void testRebuildFactoryReceivesTheLiveErrorHandler() throws Exception {
         assertMemoryLeak(() -> {
@@ -850,6 +892,24 @@ public class SymbolDictRecycleTest {
 
         @Override
         public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /** Acks every frame while {@link #acking} is set; withholds every ack afterwards. */
+    private static class SwitchableAckHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        volatile boolean acking = true;
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (!acking) {
+                return;
+            }
             try {
                 client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
             } catch (IOException e) {

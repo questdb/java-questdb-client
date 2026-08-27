@@ -1808,7 +1808,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                     long elapsedMs = (System.nanoTime() - outageStartNanos) / 1_000_000L;
                     LOG.info("cursor I/O loop {} succeeded after {}ms, {} attempts; "
                                     + "replaying from FSN {}",
-                            phase, elapsedMs, attempts, fsnAtZero);
+                            phase, elapsedMs, attempts, externalFsnBase + fsnAtZero);
                     return;
                 }
                 // A null factory result is an unsuccessful connect state, not a cap-gap
@@ -4033,7 +4033,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             // no ack progress escalates to a poisoned-frame terminal instead
             // of reconnect-looping forever.
             LOG.warn("server rejected wire seq {} (category={}, policy={}, status=0x{}) -- recycling connection, will replay from fsn {}",
-                    wireSeq, category, policy, Integer.toHexString(status & 0xFF), engine.ackedFsn() + 1L);
+                    wireSeq, category, policy, Integer.toHexString(status & 0xFF), externalFsnBase + engine.ackedFsn() + 1L);
             dispatchError(err);
             LineSenderException recycleCause = new LineSenderException(
                     "server NACK (" + category + ", " + policy + "): "
