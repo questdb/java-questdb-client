@@ -54,7 +54,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * SF-backed. This suite pins that: every scenario {@code SymbolDictRecycleTest}
  * proves for a disk-backed sender must hold identically for a {@code Sender.fromConfig}
  * sender built with no {@code sf_dir} at all. No production change is expected to
- * make these pass; a failure here means Task 5's swap accidentally gated something
+ * make these pass; a failure here means the swap accidentally gated something
  * on store-and-forward being present.
  */
 public class SymbolDictRecycleMemoryModeTest {
@@ -117,11 +117,13 @@ public class SymbolDictRecycleMemoryModeTest {
     /**
      * Strengthens {@link #testRecycleAtEmptyBacklog} into a content oracle: every
      * row before and after the recycle carries a distinct symbol value, and this
-     * asserts the server observed the FULL, exact, gap-free, duplicate-free
-     * sequence across both connections -- not just a spot check of the boundary
-     * frame. Proves the epoch swap loses (and doesn't duplicate) nothing that was
-     * ever acked, in memory mode exactly as {@code testPostRecycleSlotContents}
-     * proves the persisted-dictionary shape in SF mode.
+     * asserts the server observed the full, gap-free, duplicate-free
+     * symbol-registration sequence across both connections; every row carries a
+     * distinct symbol, so that sequence mirrors the rows frame for frame -- not
+     * just a spot check of the boundary frame. Proves the epoch swap loses (and
+     * doesn't duplicate) nothing that was ever acked, in memory mode exactly as
+     * {@code testPostRecycleSlotContents} proves the persisted-dictionary shape
+     * in SF mode.
      */
     @Test
     public void testRecycleLosesNothingAcked() throws Exception {

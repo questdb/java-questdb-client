@@ -79,7 +79,7 @@ public class SymbolDictRecycleArmingTest {
     }
 
     /**
-     * Decision 5: arming ignores {@code deltaDictEnabled} -- threshold-based
+     * Arming ignores {@code deltaDictEnabled} -- threshold-based
      * evaluation must still run once the sender has degraded to full self-sufficient
      * frames. Reaching a custom low {@code symbol_dict_reset_threshold} on a
      * sender that also carries the fault-injecting {@code FilesFacade} needs
@@ -96,7 +96,7 @@ public class SymbolDictRecycleArmingTest {
      * EngineRebuildFactory} (only {@code Sender.build()} does), so
      * crossing the threshold must never actually arm -- {@code
      * armIfEligible()} folds the capability check in ahead of the threshold
-     * comparison. Decision 5 is instead pinned negatively here: full-dict
+     * comparison. That rule is instead pinned negatively here: full-dict
      * degradation does not change that verdict either way.
      */
     @Test

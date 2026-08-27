@@ -331,7 +331,7 @@ public class QwpWebSocketSender implements Sender {
     // watermark, and every FSN the I/O loop surfaces through the progress
     // and error dispatchers). Stays 0 until a later symbol-dict recycle
     // rebuilds the cursor engine and restarts its internal FSNs at 0 --
-    // rollFsnEpochBaseForTest (and its production counterpart in the
+    // rollFsnEpochBaseForTesting (and its production counterpart in the
     // recycle path) advance it past every FSN already handed out, so the
     // external sequence stays strictly monotone across the internal reset.
     // Rule everywhere it is applied: external = fsnEpochBase + raw: raw
@@ -2274,7 +2274,7 @@ public class QwpWebSocketSender implements Sender {
 
     /** Current value of {@link #fsnEpochBase}. */
     @TestOnly
-    public long getFsnEpochBaseForTest() {
+    public long getFsnEpochBaseForTesting() {
         return fsnEpochBase;
     }
 
@@ -2319,7 +2319,7 @@ public class QwpWebSocketSender implements Sender {
      * {@link #createForTesting}), never on an already-connected sender.
      */
     @TestOnly
-    public void rollFsnEpochBaseForTest(long lastPublishedFsn) {
+    public void rollFsnEpochBaseForTesting(long lastPublishedFsn) {
         rollFsnEpochBase(lastPublishedFsn);
     }
 

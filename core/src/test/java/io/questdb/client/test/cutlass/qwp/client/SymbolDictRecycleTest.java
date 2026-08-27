@@ -710,13 +710,12 @@ public class SymbolDictRecycleTest {
                     // close() re-asserts the flag on the abandon path; clear it
                     // for the recovery half of the test.
                     boolean flagWasPreserved = Thread.interrupted();
-                    if (threw) {
-                        Assert.assertTrue("the failed-stop protocol re-asserts the flag",
-                                flagWasPreserved);
-                    }
-                    // Whether the close raced past the interrupt or abandoned,
-                    // the sender must never be terminal and must finish the
-                    // recycle on subsequent sends. A CLOSE_LOOP abandon leaves
+                    Assert.assertTrue("an interrupted producer must abandon the recycle at the "
+                            + "loop close", threw);
+                    Assert.assertTrue("the failed-stop protocol re-asserts the flag",
+                            flagWasPreserved);
+                    // The abandon must never be terminal, and the sender must
+                    // finish the recycle on subsequent sends. A CLOSE_LOOP abandon leaves
                     // the recycle armed but NOT yet run, and the barrier only
                     // recycles at a drained instant with nothing staged -- so
                     // flush the recovery row before the barrier that must swap.

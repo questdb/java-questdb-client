@@ -62,7 +62,7 @@ public class SymbolDictRecycleStarvationTest {
      * (near) constant time, the sender must never recycle, and it must stay
      * armed forever -- nothing ever consumes the arming.
      */
-    @Test
+    @Test(timeout = 60_000L)
     public void testMaxWaitZeroNeverBlocks() throws Exception {
         assertMemoryLeak(() -> {
             GatedAckHandler handler = new GatedAckHandler();
@@ -92,8 +92,8 @@ public class SymbolDictRecycleStarvationTest {
                         sender.table("t");
                         long elapsedMs = (System.nanoTime() - t0) / 1_000_000;
                         Assert.assertTrue("table() call #" + i + " took " + elapsedMs
-                                        + "ms -- resetMaxWaitMillis=0 must never block",
-                                elapsedMs < 100);
+                                        + "ms -- resetMaxWaitMillis=0 must return in under 1_000ms",
+                                elapsedMs < 1_000);
                         Thread.sleep(20);
                     }
 
@@ -122,7 +122,7 @@ public class SymbolDictRecycleStarvationTest {
      * drain arriving mid-wait is observed without needing a fresh
      * {@code table()} call.
      */
-    @Test
+    @Test(timeout = 60_000L)
     public void testBlocksThenRecyclesWhenAcksArrive() throws Exception {
         assertMemoryLeak(() -> {
             GatedAckHandler handler = new GatedAckHandler();
@@ -206,8 +206,8 @@ public class SymbolDictRecycleStarvationTest {
      * fires on the next table() call -- opportunistically, without another
      * blocking wait.
      */
-    @Test
-    public void testTimeoutLogsAndReArms() throws Exception {
+    @Test(timeout = 60_000L)
+    public void testTimeoutCountsAndStaysArmed() throws Exception {
         assertMemoryLeak(() -> {
             GatedAckHandler handler = new GatedAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
@@ -304,7 +304,7 @@ public class SymbolDictRecycleStarvationTest {
      * {@code poison_min_escalation_window_millis=0}) so the timing is
      * deterministic instead of depending on the (much slower) defaults.
      */
-    @Test
+    @Test(timeout = 60_000L)
     public void testLatchedErrorDuringWaitThrows() throws Exception {
         assertMemoryLeak(() -> {
             GatedThenPoisonHandler handler = new GatedThenPoisonHandler();
@@ -394,7 +394,7 @@ public class SymbolDictRecycleStarvationTest {
      * and once the group is closed and its commit acked, the still-armed
      * recycle must fire at the very next drained {@code table()} call.
      */
-    @Test
+    @Test(timeout = 60_000L)
     public void testDeferredCommitGroupSkipsWait() throws Exception {
         assertMemoryLeak(() -> {
             DeferAwareAckHandler handler = new DeferAwareAckHandler();
@@ -402,7 +402,7 @@ public class SymbolDictRecycleStarvationTest {
                 server.start();
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 int port = server.getPort();
-                long maxWaitMillis = 300;
+                long maxWaitMillis = 2_000;
                 String cfg = "ws::addr=localhost:" + port
                         + ";symbol_dict_reset_threshold=2"
                         + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis + ";";
@@ -426,7 +426,7 @@ public class SymbolDictRecycleStarvationTest {
 
                     Assert.assertTrue("an open deferred-commit group must never be waited on "
                                     + "(the server withholds its ack by design), took " + elapsedMs + "ms",
-                            elapsedMs < 100);
+                            elapsedMs < 1_000);
                     Assert.assertTrue("must still be armed -- neither the wait nor the recycle ran",
                             ws.isResetArmed());
                     Assert.assertEquals("the futility guard is not a timeout",

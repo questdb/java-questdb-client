@@ -53,7 +53,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * user-visible FSN surface must stay strictly monotone across that boundary
  * by translating {@code external = fsnEpochBase + raw} (negative sentinels
  * pass untranslated). The recycle machinery itself lands in a later task --
- * these tests exercise the translation seam ({@code rollFsnEpochBaseForTest})
+ * these tests exercise the translation seam ({@code rollFsnEpochBaseForTesting})
  * directly.
  * <p>
  * Every test that rolls the base does so on a sender BEFORE its first connect
@@ -121,7 +121,7 @@ public class SymbolDictRecycleFsnContinuityTest {
 
                 QwpWebSocketSender sender2 = createRolledSender(server, fsn1);
                 try {
-                    long newBase = sender2.getFsnEpochBaseForTest();
+                    long newBase = sender2.getFsnEpochBaseForTesting();
                     Assert.assertEquals(fsn1 + 1, newBase);
 
                     sender2.table("t").longColumn("v", 2L).atNow();
@@ -165,7 +165,7 @@ public class SymbolDictRecycleFsnContinuityTest {
                 // published FSN is exactly what the recycle swap does in production.
                 QwpWebSocketSender sender2 = createRolledSender(server, lastPublishedFsn);
                 try {
-                    long newBase = sender2.getFsnEpochBaseForTest();
+                    long newBase = sender2.getFsnEpochBaseForTesting();
                     Assert.assertEquals(lastPublishedFsn + 1, newBase);
 
                     Assert.assertEquals("before any new ack, getAckedFsn must read the synthetic "
@@ -243,7 +243,7 @@ public class SymbolDictRecycleFsnContinuityTest {
 
                 AtomicReference<SenderError> asyncError = new AtomicReference<>();
                 QwpWebSocketSender sender = createRolledSender(server, 41L);
-                long base = sender.getFsnEpochBaseForTest();
+                long base = sender.getFsnEpochBaseForTesting();
                 sender.setErrorHandler(e -> asyncError.compareAndSet(null, e));
                 try {
                     sender.table("foo").longColumn("v", 1L).atNow();
@@ -386,7 +386,7 @@ public class SymbolDictRecycleFsnContinuityTest {
 
     /**
      * An unconnected memory-mode sender with a freshly-attached (never published-to)
-     * {@link CursorSendEngine}, its {@link QwpWebSocketSender#getFsnEpochBaseForTest()}
+     * {@link CursorSendEngine}, its {@link QwpWebSocketSender#getFsnEpochBaseForTesting()}
      * rolled by {@code rollAmount} before the first connect. Models the sender a symbol-dict
      * recycle swap hands off to: a fresh raw engine paired with an already-advanced epoch
      * base, so the loop this sender builds on first use gets that base baked into its
@@ -398,7 +398,7 @@ public class SymbolDictRecycleFsnContinuityTest {
                 null, 4L * 1024 * 1024, 128L * 1024 * 1024,
                 CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
         sender.setCursorEngine(engine, true);
-        sender.rollFsnEpochBaseForTest(rollAmount);
+        sender.rollFsnEpochBaseForTesting(rollAmount);
         return sender;
     }
 

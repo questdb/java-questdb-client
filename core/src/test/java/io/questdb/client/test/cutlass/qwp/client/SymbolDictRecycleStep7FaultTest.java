@@ -98,8 +98,8 @@ public class SymbolDictRecycleStep7FaultTest {
     /**
      * Pins the conditional in resetSymbolDictStateForNewConnection(): ids a
      * row registered before the deferred reconnect completes must still ship
-     * in the next delta. Empirically untested: suite was green with the
-     * guard reverted.
+     * in the next delta. Red-proofed: reverting the guard to an
+     * unconditional clear fails this test.
      */
     @Test
     public void testPostFailedReconnectDeltaCoversStagedSymbolIds() throws Exception {

@@ -52,28 +52,28 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * Crash-window recovery for {@code QwpWebSocketSender.recycleForDictReset()}
- * (Task 5's 8-step symbol-dictionary recycle swap, quoted here for reference):
+ * (its seven steps, quoted here for reference):
  * <pre>
  * 1. lastPublishedFsn = cursorEngine.publishedFsn()
  * 2. close cursorSendLoop (I/O thread + client)
  * 3. cursorEngine.close() -- FULLY DRAINED (the barrier only fires the swap once
  *    isRingDrained() is true), so this unlinks every *.sfa, the ack watermark,
- *    the persisted dictionary and the logical slot lock, leaving the slot empty.
- * 4. rollFsnEpochBase(lastPublishedFsn)
- * 5. producer state swap: fresh GlobalSymbolDictionary, sentMaxSymbolId=-1,
- *    symbolDictEpoch++, resetArmed=false
- * 6. cursorEngine = engineRebuildFactory.rebuild() -- a brand-new CursorSendEngine
+ *    the persisted dictionary and the logical slot lock, leaving the slot empty;
+ *    a deferred close is awaited before step 4
+ * 4. cursorEngine = engineRebuildFactory.rebuild() -- a brand-new CursorSendEngine
  *    on the now-empty slot (fresh .lock/.ack-watermark/.symbol-dict/segments)
+ * 5. rollFsnEpochBase(lastPublishedFsn)
+ * 6. producer state swap: fresh GlobalSymbolDictionary, sentMaxSymbolId=-1,
+ *    symbolDictEpoch++, resetArmed=false
  * 7. reconnect (ensureConnected())
- * 8. (catch) recycleFailure latch on any throw
  * </pre>
  * This suite pins what a restarted sender recovers if the process dies at each
- * of four points around that sequence, per the phase-11 brief:
+ * of four points around that sequence:
  * <ul>
  *     <li>(a) {@link #testCrashBeforeRecycleStartsRecoversAckedResidueOnly()} --
  *     before step 2. The pre-recycle epoch's slot holds fully-acked residue.</li>
  *     <li>(b) {@link #testCrashBetweenEngineCloseAndRebuildRecoversAsFreshStart()}
- *     -- between steps 3 and 6. The slot is empty.</li>
+ *     -- between steps 3 and 4. The slot is empty.</li>
  *     <li>(c) {@link #testCrashAfterRebuildBeforeFirstFlushRecoversAsRecoveredButEmpty()}
  *     -- after step 7, before the new epoch's first flush. The slot holds a
  *     freshly-rebuilt engine's own state files, but no data.</li>
@@ -86,7 +86,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * <h2>Why these are simulated, not paused mid-sequence</h2>
  * {@code recycleForDictReset()} runs synchronously inside one {@code table()}
  * call with no external hook between its steps, so a test cannot literally
- * suspend a live sender between step 3 and step 6. And unlike
+ * suspend a live sender between step 3 and step 4. And unlike
  * {@code CursorSendEngineCrashConsistencyTest}'s bare {@code CursorSendEngine} +
  * fault-injecting {@code FilesFacade}, a {@code Sender} built through the public
  * API (as production always does) has no seam for a custom {@code FilesFacade}
@@ -107,7 +107,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *     close(boolean)} classifies {@code publishedFsn() < 0} as fully drained
  *     exactly like the everything-acked case (that check lives there, not in
  *     {@code finishClose}, which only receives the resulting flag), so this
- *     close unlinks every SF state file step 6 just created -- everything but
+ *     close unlinks every SF state file step 4 just created -- everything but
  *     the reusable {@code .lock}/{@code .lock.pid} pair, which no close in this
  *     suite ever removes -- leaving the slot in the same empty state that step
  *     3 alone (on the OLD engine) would have left between tearing down and
@@ -135,12 +135,12 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *
  * <h2>(b) and (c) are NOT the same recoverable state</h2>
  * Both look empty of data and both replay nothing, but they are not
- * byte-identical on disk, and a restarted engine can tell them apart. Arm (b)'s
+ * byte-identical on disk, and a restarted engine can tell them apart. (b)'s
  * directory holds nothing this engine ever created -- no manifest, no segment.
  * (The crashed sender's own fully-drained close already removed {@code
  * sf-manifest.bin} along with the last segment, so recovery finds NO {@code
  * .sfa} files and NO manifest, and falls straight through to {@code
- * Recovery.empty()}.) Arm (c)'s directory holds the fresh rebuild's own
+ * Recovery.empty()}.) (c)'s directory holds the fresh rebuild's own
  * {@code sf-manifest.bin} (boundaries collapsed at 0) and its zero-frame
  * {@code sf-initial.sfa} / {@code sf-...0000.sfa} pair. {@code
  * SegmentRing.recover()}'s manifest branch (the {@code chain.size() == 0}
@@ -178,7 +178,7 @@ public class SymbolDictRecycleCrashWindowsTest {
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
     /**
-     * Arm (a): before step 2. The pre-recycle epoch has flushed a fully-acked
+     * (a): before step 2. The pre-recycle epoch has flushed a fully-acked
      * batch but the barrier that starts {@code recycleForDictReset()} has not
      * fired yet -- the crash lands with an intact, acked epoch-0 slot on disk.
      * Recovery must find that residue, recognize it as already acked (nothing
@@ -247,7 +247,7 @@ public class SymbolDictRecycleCrashWindowsTest {
     }
 
     /**
-     * Arm (b): between steps 3 and 6. See the class javadoc for how this is
+     * (b): between steps 3 and 4. See the class javadoc for how this is
      * constructed (drive a real recycle to completion, then close before any
      * flush touches the rebuilt engine -- the "never published" fully-drained
      * branch empties it exactly like step 3 alone would have).
@@ -277,12 +277,12 @@ public class SymbolDictRecycleCrashWindowsTest {
                     // close() below: the fresh engine has published nothing, so
                     // close(boolean)'s "never published" check (CursorSendEngine's
                     // publishedFsn() < 0 branch) classifies it fully-drained too --
-                    // finishClose unlinks every SF state file step 6 just created
+                    // finishClose unlinks every SF state file step 4 just created
                     // (everything but .lock/.lock.pid), leaving the slot as empty
                     // as it was right after step 3 alone emptied the OLD engine.
                 }
             }
-            Assert.assertEquals("a crash between steps 3 and 6 leaves the slot dir "
+            Assert.assertEquals("a crash between steps 3 and 4 leaves the slot dir "
                             + "holding only the reusable lock pair -- this is the "
                             + "disk image this arm exists to pin",
                     Arrays.asList(".lock", ".lock.pid"), listDir(slot));
@@ -319,7 +319,7 @@ public class SymbolDictRecycleCrashWindowsTest {
     }
 
     /**
-     * Arm (c): after step 7, pre-first-flush. See the class javadoc for how
+     * (c): after step 7, pre-first-flush. See the class javadoc for how
      * this is constructed (snapshot the freshly-rebuilt slot before closing,
      * close for real so nothing leaks, then restore the snapshot on top of the
      * vacated directory) and for why this recovers differently from arm (b)
@@ -399,7 +399,7 @@ public class SymbolDictRecycleCrashWindowsTest {
     }
 
     /**
-     * Arm (d): an ordinary mid-operation crash, but one epoch into the
+     * (d): an ordinary mid-operation crash, but one epoch into the
      * post-recycle steady state (epoch g+1), to prove the recycle's epoch
      * bookkeeping does not corrupt normal backlog recovery. Uses the same
      * close-fast-with-an-unacking-server idiom as {@code RecoveryReplayTest},
