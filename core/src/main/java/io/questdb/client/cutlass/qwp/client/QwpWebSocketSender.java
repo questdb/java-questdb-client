@@ -2380,7 +2380,13 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Total binary frames whose ACKs have been received and applied.
+     * Total binary frames whose ACKs have been received and applied, since
+     * the last symbol-dictionary recycle.
+     * <p>
+     * Reads the live cursor I/O loop, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalAcks() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2412,8 +2418,14 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Cumulative number of times {@code appendBlocking} hit a full engine
      * ring and parked waiting for the segment manager or the wire to free
-     * space. One increment per blocking call, not per spin. Returns 0
-     * when the cursor engine has not been allocated yet.
+     * space, since the last symbol-dictionary recycle. One increment per
+     * blocking call, not per spin. Returns 0 when the cursor engine has not
+     * been allocated yet.
+     * <p>
+     * Reads the live cursor engine, which a symbol-dictionary recycle
+     * rebuilds, so the count restarts at 0 on every recycle: a monitor
+     * differencing it across one sees a negative delta. Correlate with the
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalBackpressureStalls() {
         CursorSendEngine e = cursorEngine;
@@ -3004,7 +3016,17 @@ public class QwpWebSocketSender implements Sender {
         this.ackedFsnReadWitness = witness;
     }
 
+    /**
+     * Installs the factory a symbol-dictionary recycle uses to rebuild its
+     * cursor engine on the emptied slot ({@code Sender.build()} installs the
+     * builder's). {@code null} disarms the recycle: {@link #armIfEligible()}
+     * never arms a sender that cannot rebuild. May be called before or after
+     * connect; takes effect at the next recycle.
+     *
+     * @throws LineSenderException if the sender is closed
+     */
     public void setEngineRebuildFactory(EngineRebuildFactory factory) {
+        checkNotClosed();
         this.engineRebuildFactory = factory;
     }
 
@@ -5396,18 +5418,20 @@ public class QwpWebSocketSender implements Sender {
             hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
             cursorSendLoop = null;
             client = null;
-            // The dead loop took its catch-up mirror with it, and the fresh
-            // loop ensureConnected() builds next seeds that mirror only from a
-            // RECOVERED persisted dictionary -- this engine is live, so the
-            // fresh loop starts at sentDictCount == 0. sentMaxSymbolId is the
-            // producer's model of the same number (it normally survives a
-            // reconnect precisely because the SAME loop re-registers from its
-            // mirror), so it has to drop with the mirror; otherwise the next
-            // frame's delta starts above the new loop's coverage and trips its
-            // torn-dictionary guard. Nothing is invalidated by the drop: the
-            // barrier proved the ring drained before step 2, and every publish
-            // path runs ensureConnected() -- hence this resume -- first, so no
-            // frame referencing those ids can be waiting to replay.
+            // The dead loop took its catch-up mirror with it. The fresh loop
+            // ensureConnected() builds next seeds its mirror only from the
+            // engine's construction-time recovered dictionary (recoveredSize():
+            // 0 for an engine built on an empty slot, N for one that recovered
+            // a slot at Sender.build()), never from what the dead loop had
+            // already shipped. sentMaxSymbolId is the producer's model of the
+            // loop's coverage (it normally survives a reconnect precisely
+            // because the SAME loop re-registers from its mirror), so it has to
+            // drop with the mirror; a recovered engine's N-entry prefix is
+            // re-shipped once and discarded as already known. Nothing is
+            // invalidated by the drop: the barrier proved the ring drained
+            // before step 2, and every publish path runs ensureConnected() --
+            // hence this resume -- first, so no frame referencing those ids can
+            // be waiting to replay.
             sentMaxSymbolId = -1;
             recycleResume = RecycleResume.NONE;
             return;

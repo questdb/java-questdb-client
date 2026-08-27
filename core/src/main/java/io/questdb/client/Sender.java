@@ -3448,10 +3448,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // caller must be able to act on, and LOG.error alone cannot carry it: this client
             // ships slf4j-api with no binding, so an embedding app with no provider gets a NOP
             // logger and the loss is announced nowhere. Deliver it programmatically too, so an
-            // errorHandler can alert / page / record it. Dispatched synchronously here because
-            // the async SenderErrorDispatcher belongs to the connected sender, which does not
-            // exist yet at build time. A throwing handler must not turn a contained outage back
-            // into a failed build, so swallow anything it raises.
+            // errorHandler can alert / page / record it. Dispatched synchronously here: at
+            // build time the async SenderErrorDispatcher does not exist yet, and at a recycle
+            // rebuild a data-loss notice must not be dropped under its inbox pressure. A
+            // throwing handler must not turn a contained outage back into a failed build, so
+            // swallow anything it raises.
             if (errorHandler != null) {
                 try {
                     errorHandler.onError(SenderError.dataLoss(

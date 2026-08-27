@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
@@ -528,6 +529,42 @@ public class SymbolDictRecycleTest {
         });
     }
 
+    /**
+     * A recycle tears the wire connection down and reconnects deliberately.
+     * The fresh loop's success is classified against the sender-lifetime
+     * flags, so it reports RECONNECTED (same endpoint), and no DISCONNECTED
+     * precedes it -- a recycle is not an outage.
+     */
+    @Test
+    public void testRecycleReportsReconnectedWithoutDisconnected() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(cfg(server) + "symbol_dict_reset_threshold=2;")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    List<SenderConnectionEvent.Kind> kinds = Collections.synchronizedList(new ArrayList<>());
+                    ws.setConnectionListener(event -> kinds.add(event.getKind()));
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertTrue(ws.isResetArmed());
+
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycles here
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    awaitKind(kinds, SenderConnectionEvent.Kind.RECONNECTED);
+
+                    Assert.assertEquals("exactly one RECONNECTED for the recycle's reconnect [kinds=" + kinds + ']',
+                            1, Collections.frequency(kinds, SenderConnectionEvent.Kind.RECONNECTED));
+                    Assert.assertFalse("a recycle is not an outage: no DISCONNECTED [kinds=" + kinds + ']',
+                            kinds.contains(SenderConnectionEvent.Kind.DISCONNECTED));
+                    Assert.assertFalse("same endpoint: never FAILED_OVER [kinds=" + kinds + ']',
+                            kinds.contains(SenderConnectionEvent.Kind.FAILED_OVER));
+                }
+            }
+        });
+    }
+
     @Test
     public void testRebuildFactoryReceivesTheLiveErrorHandler() throws Exception {
         assertMemoryLeak(() -> {
@@ -740,6 +777,17 @@ public class SymbolDictRecycleTest {
         }
         long f = sender.flushAndGetSequence();
         Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
+    }
+
+    private static void awaitKind(List<SenderConnectionEvent.Kind> kinds, SenderConnectionEvent.Kind kind)
+            throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!kinds.contains(kind)) {
+            if (System.nanoTime() >= deadlineNanos) {
+                throw new AssertionError("listener never saw " + kind + " [seen=" + kinds + ']');
+            }
+            Thread.sleep(20L);
+        }
     }
 
     private static TestWebSocketServer ackingServer() throws Exception {
