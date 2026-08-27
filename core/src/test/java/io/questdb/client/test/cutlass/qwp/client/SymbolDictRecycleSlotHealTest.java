@@ -95,7 +95,7 @@ public class SymbolDictRecycleSlotHealTest {
     public final TemporaryFolder temporaryFolder = TemporaryFolder.builder().assureDeletion().build();
 
     /**
-     * Review r3, C2(a): a benign fully-drained close verdict (segment unlink
+     * A benign fully-drained close verdict (segment unlink
      * transiently failed; watermark retained by design) must not brick the
      * recycle. The rebuild recovers fully-acked leftovers; the sender heals by
      * closing the recovered engine (which retries the unlink) and rebuilding
@@ -313,7 +313,7 @@ public class SymbolDictRecycleSlotHealTest {
     }
 
     /**
-     * Review r3: the terminal latch's one surviving case. A rebuild that
+     * The terminal latch's one surviving case. A rebuild that
      * recovers UNACKED frames proves the fully-drained-close contract was
      * breached -- the fresh producer dictionary and the slot's state have
      * genuinely diverged, so the sender must refuse further use ({@code close()}

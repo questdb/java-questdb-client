@@ -55,9 +55,8 @@ public class SymbolDictRecycleStep7FaultTest {
     /**
      * Pins that a step-7 (reconnect) failure does NOT latch the sender
      * terminal: the swap has committed, the sender is coherent and merely
-     * disconnected, and the next send retries the deferred setup. Review
-     * round 3, finding C5 (the test the PR body credited was deleted by
-     * commit 6793928a).
+     * disconnected, and the next send retries the deferred setup. The test
+     * the PR body credited was deleted by commit 6793928a.
      */
     @Test
     public void testStep7FailureDoesNotLatchAndRecovers() throws Exception {
@@ -100,8 +99,8 @@ public class SymbolDictRecycleStep7FaultTest {
     /**
      * Pins the conditional in resetSymbolDictStateForNewConnection(): ids a
      * row registered before the deferred reconnect completes must still ship
-     * in the next delta. Review round 3, finding C4 (empirically untested:
-     * suite was green with the guard reverted).
+     * in the next delta. Empirically untested: suite was green with the
+     * guard reverted.
      */
     @Test
     public void testPostFailedReconnectDeltaCoversStagedSymbolIds() throws Exception {
@@ -136,7 +135,7 @@ public class SymbolDictRecycleStep7FaultTest {
                     // This row registers "c" in the FRESH dictionary during
                     // symbol(); its sendRow() then completes the deferred
                     // reconnect, which runs resetSymbolDictStateForNewConnection
-                    // with the row in progress -- the C4 window.
+                    // with the row in progress -- this race window.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     long f2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));

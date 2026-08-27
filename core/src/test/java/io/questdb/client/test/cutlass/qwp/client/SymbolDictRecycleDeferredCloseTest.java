@@ -54,7 +54,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * the slot -- rebuilding against the retained flock throws
  * {@code SlotLockContentionException} and would fail the recycle for what is
  * usually a transient disk stall. Exhausting the await budget does not latch
- * the sender terminal either (review r3, C2): it throws to the triggering
+ * the sender terminal either: it throws to the triggering
  * caller and leaves the recycle pending in its {@code RecycleResume.REBUILD}
  * state, so each later send retries the await, and one of them finishes the
  * swap once the worker finally exits. Nothing on this path is terminal.
@@ -120,7 +120,7 @@ public class SymbolDictRecycleDeferredCloseTest {
                         sender.resetSymbolDictionary();
                         Assert.assertTrue(ws.isResetArmed());
 
-                        // Positive witness that the await really parked (M15).
+                        // Positive witness that the await really parked.
                         // A sleep could not tell "the await is parked" from
                         // "the close completed inline and the test skipped the
                         // code under test"; this fires from inside the await's
@@ -339,7 +339,7 @@ public class SymbolDictRecycleDeferredCloseTest {
     /**
      * The await budget runs out while the worker is still wedged, but the
      * wedge is transient after all. Exhausting the budget must NOT latch the
-     * sender terminal (review r3, C2): the recycle stays pending in its
+     * sender terminal: the recycle stays pending in its
      * REBUILD resume state, and once the worker exits and the deferred close
      * releases the flock, the next send finishes the await, rebuilds and
      * commits the swap.

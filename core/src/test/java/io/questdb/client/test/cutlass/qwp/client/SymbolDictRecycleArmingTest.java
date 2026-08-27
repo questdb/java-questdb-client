@@ -93,8 +93,8 @@ public class SymbolDictRecycleArmingTest {
      * <p>
      * This {@code connect(...)} overload installs no {@link
      * io.questdb.client.cutlass.qwp.client.QwpWebSocketSender.EngineRebuildFactory
-     * EngineRebuildFactory} (only {@code Sender.build()} does), so per review
-     * r3 M3 crossing the threshold must never actually arm -- {@code
+     * EngineRebuildFactory} (only {@code Sender.build()} does), so
+     * crossing the threshold must never actually arm -- {@code
      * armIfEligible()} folds the capability check in ahead of the threshold
      * comparison. Decision 5 is instead pinned negatively here: full-dict
      * degradation does not change that verdict either way.
@@ -169,13 +169,13 @@ public class SymbolDictRecycleArmingTest {
 
                     // No manual resetSymbolDictionary() call anywhere in this test: crossing
                     // the threshold, even while degraded, still must not arm -- this
-                    // connect(...) overload installs no engineRebuildFactory (review r3,
-                    // M3), and that capability check now runs ahead of the threshold
+                    // connect(...) overload installs no engineRebuildFactory,
+                    // and that capability check now runs ahead of the threshold
                     // comparison in armIfEligible().
                     sender.table("m").symbol("s", "c").longColumn("v", 3L).atNow();
                     sender.flush();
                     Assert.assertFalse("a sender with no rebuild factory must never arm, even once "
-                                    + "the threshold is crossed in full-dict mode (review r3, M3)",
+                                    + "the threshold is crossed in full-dict mode",
                             sender.isResetArmed());
                 } finally {
                     sender.close();

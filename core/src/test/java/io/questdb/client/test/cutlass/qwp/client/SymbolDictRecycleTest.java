@@ -134,7 +134,7 @@ public class SymbolDictRecycleTest {
      * {@code resetSymbolDictionary()} is a public advisory API, a connect()-built
      * sender could previously become "armed" with no way to ever act on it --
      * {@code isResetArmed()} reading true forever alongside a permanently-0
-     * resets counter misled monitoring (review r3, M3). {@code armIfEligible()}
+     * resets counter misled monitoring. {@code armIfEligible()}
      * now folds the same capability check ({@code engineRebuildFactory != null
      * && ownsCursorEngine}) into the arming decision itself, so a sender that
      * cannot rebuild never arms in the first place -- covers both ways a
@@ -150,7 +150,7 @@ public class SymbolDictRecycleTest {
                 try (QwpWebSocketSender sender = QwpWebSocketSender.connect("localhost", port)) {
                     sender.resetSymbolDictionary();
                     Assert.assertFalse("a sender with no rebuild factory must never arm, not even "
-                                    + "for a manual request (review r3, M3)",
+                                    + "for a manual request",
                             sender.isResetArmed());
 
                     // Drained instant (nothing published yet, no row in progress): with a
@@ -367,8 +367,8 @@ public class SymbolDictRecycleTest {
     /**
      * A transient engine-rebuild failure must NOT latch the sender terminal:
      * the recycle is abandoned before the swap commits and resumes on the
-     * next send. Replaces testFailedRebuildLatchesTerminal (review r3, C2(d):
-     * build() has a retry-and-quarantine loop for exactly these operational
+     * next send. Replaces testFailedRebuildLatchesTerminal (build() has a
+     * retry-and-quarantine loop for exactly these operational
      * failures; killing a healthy sender on a provably empty slot mid-life
      * was strictly worse than the build()-time behavior).
      */
@@ -404,7 +404,6 @@ public class SymbolDictRecycleTest {
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     long f = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f, 5_000));
-                    sender.close();
                 }
             }
         });
@@ -456,7 +455,6 @@ public class SymbolDictRecycleTest {
      * loop close throw deterministically (CountDownLatch.await throws on
      * entry). That must abandon the recycle non-terminally; once the flag is
      * cleared the next call finishes the loop close and the sender recovers.
-     * Review r3, C2(c).
      */
     @Test
     public void testInterruptedRecycleAbandonsAndRecovers() throws Exception {
@@ -506,7 +504,7 @@ public class SymbolDictRecycleTest {
     /**
      * A live symbol set larger than the threshold must not thrash the
      * recycle: after a swap, re-arming requires the dictionary to reach
-     * max(threshold, 2 * size-at-swap). Review round 3, finding C1.
+     * max(threshold, 2 * size-at-swap).
      */
     @Test
     public void testLiveSetAboveThresholdDoesNotThrash() throws Exception {
