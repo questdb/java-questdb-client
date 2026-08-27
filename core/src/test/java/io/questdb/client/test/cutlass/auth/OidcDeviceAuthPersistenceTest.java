@@ -45,6 +45,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -288,6 +289,81 @@ public class OidcDeviceAuthPersistenceTest {
                             peerFailure.get() instanceof OidcAuthException);
                     Assert.assertEquals("a closing instance must not start another token POST", 1, refreshPosts.get());
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testCloseDoesNotInterruptSuccessfulTokenStoreLoad() throws Exception {
+        assertMemoryLeak(() -> {
+            CountDownLatch loadEntered = new CountDownLatch(1);
+            AtomicBoolean releaseLoad = new AtomicBoolean();
+            AtomicReference<String> returnedToken = new AtomicReference<>();
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            AtomicBoolean interruptedAfterReturn = new AtomicBoolean();
+            PersistedToken valid = new PersistedToken(
+                    "ACCESS-VALID", null, null, System.currentTimeMillis() + 300_000, 300_000);
+            TokenStore store = new TokenStore() {
+                @Override
+                public void clear(TokenStoreKey key) {
+                }
+
+                @Override
+                public PersistedToken load(TokenStoreKey key) {
+                    loadEntered.countDown();
+                    while (!releaseLoad.get()) {
+                        LockSupport.park();
+                    }
+                    return valid;
+                }
+
+                @Override
+                public void save(TokenStoreKey key, PersistedToken token) {
+                }
+            };
+
+            try (MockOidcServer server = new MockOidcServer(
+                    (method, path, body) -> MockOidcServer.json(500, "{\"error\":\"unexpected_request\"}"))) {
+                OidcDeviceAuth auth = baseBuilder(server).tokenStore(store).build();
+                Thread tokenThread = new Thread(() -> {
+                    try {
+                        returnedToken.set(auth.getToken());
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    } finally {
+                        interruptedAfterReturn.set(Thread.currentThread().isInterrupted());
+                    }
+                }, "oidc-successful-store-load");
+                Thread closeThread = new Thread(auth::close, "oidc-close-during-store-load");
+                tokenThread.setDaemon(true);
+                closeThread.setDaemon(true);
+                tokenThread.start();
+                try {
+                    Assert.assertTrue("getToken() did not enter the token store load",
+                            loadEntered.await(10, TimeUnit.SECONDS));
+                    closeThread.start();
+                    // Give close() time to publish closed and wait for the instance lock. Before the fix it
+                    // interrupts the instance-lock holder here, causing park() to return with the flag set.
+                    Thread.sleep(200);
+                    releaseLoad.set(true);
+                    LockSupport.unpark(tokenThread);
+                    tokenThread.join(10_000);
+                    closeThread.join(10_000);
+                } finally {
+                    releaseLoad.set(true);
+                    LockSupport.unpark(tokenThread);
+                    tokenThread.interrupt();
+                    tokenThread.join(10_000);
+                    closeThread.join(10_000);
+                    auth.close();
+                }
+
+                Assert.assertFalse("getToken() thread did not finish", tokenThread.isAlive());
+                Assert.assertFalse("close() thread did not finish", closeThread.isAlive());
+                Assert.assertNull("getToken() failed", failure.get());
+                Assert.assertEquals("ACCESS-VALID", returnedToken.get());
+                Assert.assertFalse("close() left an interrupt on a successful getToken() caller",
+                        interruptedAfterReturn.get());
             }
         });
     }

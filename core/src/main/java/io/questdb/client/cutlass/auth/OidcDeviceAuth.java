@@ -100,9 +100,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * cross-process lock wait; see {@link #getToken()}). To abort a waiting sign-in, call
  * {@link #close()} from another thread; it signals the flow to stop, which then fails with an
  * {@link OidcAuthException} rather than polling until the device code expires. Cancellation is seen
- * between polls (within ~100ms while waiting out an interval); the holder thread is interrupted to abandon
- * an interruptible token-store lock wait, but a poll already in flight is not cancelled at the transport, so
- * the abort - and {@link #close()} - can take up to one HTTP request timeout (see
+ * between polls (within ~100ms while waiting out an interval); a token-store lock waiter is interrupted to
+ * abandon that interruptible wait, but a poll already in flight is not cancelled at the transport, so the
+ * abort - and {@link #close()} - can take up to one HTTP request timeout (see
  * {@link Builder#httpTimeoutMillis(int)}), still far short of the device-code lifetime (a
  * {@link DeviceCodePrompt} that blocks in {@code promptUser}, such as the default browser launch, can
  * extend that wait by however long it runs).
@@ -228,15 +228,12 @@ public class OidcDeviceAuth implements QuietCloseable {
     // serializes signIn()/getToken()/clearCache()/close(); signIn() holds it for the whole
     // interactive flow, getToken() uses tryLock so the flush path never stalls behind a sign-in
     private final ReentrantLock lock = new ReentrantLock();
-    private final Object lockHolderGuard = new Object();
-    // The thread currently holding lock for a token operation. Published immediately after acquisition and
-    // cleared before release, so close() can interrupt an operation that is itself waiting interruptibly on a
-    // shared FileTokenStore process lock. lockHolderGuard pairs publishLockHolder()'s publish-then-closed check
-    // with close()'s closed-write-then-holder-read: either the operation observes close and stops, or close
-    // observes the holder and supplies the interrupt that makes FileTokenStore.inLock() unwind. Reading and
-    // interrupting under the same guard used to clear the holder prevents a stale interrupt after the operation
-    // has returned to unrelated caller code.
-    private Thread lockHolderThread;
+    private final Object tokenStoreWaiterGuard = new Object();
+    // The thread currently entering or waiting in TokenStore.inLock(). Deliberately narrower than the instance
+    // lock hold: close() may interrupt this wait, but must not leave an interrupt on a thread doing ordinary
+    // store I/O or about to return a cached token. The action clears the marker as soon as inLock() acquires its
+    // lock, and the surrounding finally covers stores that return or throw without entering the action.
+    private Thread tokenStoreWaiterThread;
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
     private final String scopeEncoded;
@@ -475,7 +472,6 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     public void clearCache() {
         lock.lock();
-        publishLockHolder();
         try {
             throwIfClosed();
             // the same sweep close() runs: nulling the served token is not enough on its own, since the raw
@@ -494,7 +490,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             // do not reload the entry we just removed on the next signIn()/getToken()
             storeLoadAttempted = true;
         } finally {
-            unlockInstance();
+            lock.unlock();
         }
     }
 
@@ -502,10 +498,10 @@ public class OidcDeviceAuth implements QuietCloseable {
      * Frees the network connections and native buffers this instance holds. If a {@link #signIn()}
      * sign-in is in flight on another thread, signals it to stop so it fails with an
      * {@link OidcAuthException} instead of polling until the device code expires. The signal is observed
-     * between polls (within ~100ms while waiting out a poll interval). The operation's thread is interrupted
-     * so an interruptible wait for a peer instance's shared token-store lock is abandoned immediately; an HTTP
-     * request already in flight is not cancelled at the transport, so {@code close()} acquires the lock - and
-     * returns - only once that request finishes or times out, not the full device-code lifetime. That bound is
+     * between polls (within ~100ms while waiting out a poll interval). Only while an operation is waiting for a
+     * peer instance's shared token-store lock is its thread interrupted, abandoning that wait immediately; an
+     * HTTP request already in flight is not cancelled at the transport, so {@code close()} acquires the lock -
+     * and returns - only once that request finishes or times out, not the full device-code lifetime. That bound is
      * the in-flight operation's own worst case, which is NOT a single HTTP request timeout: a silent refresh
      * under the lock runs a send, an await and a body parse (each bounded by
      * {@link Builder#httpTimeoutMillis(int)}), and its connection phase -
@@ -520,17 +516,16 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     @Override
     public void close() {
-        // Flag cancellation before taking the lock, then interrupt its published holder. The cross-thread
-        // handshake pairs with publishLockHolder(): a token operation that published before this write is
-        // interrupted, while one that publishes after it observes closed before starting more work. In
-        // particular, the interrupt releases an operation queued in FileTokenStore.inLock() behind another
-        // OidcDeviceAuth instance's refresh. The lock acquire must still succeed before native resources are
-        // freed, so an in-flight HTTP request that does not react to interruption is waited out as before.
+        // Flag cancellation before taking the lock, then interrupt only a thread published at the
+        // TokenStore.inLock() acquisition boundary. Publishing the whole instance-lock holder would also
+        // interrupt ordinary store reads and cached-token returns, leaking close()'s cancellation signal into
+        // unrelated caller work after a successful getToken(). The lock acquire must still succeed before
+        // native resources are freed, so other in-flight work is waited out as before.
         closed = true;
-        synchronized (lockHolderGuard) {
-            Thread holder = lockHolderThread;
-            if (holder != null && holder != Thread.currentThread()) {
-                holder.interrupt();
+        synchronized (tokenStoreWaiterGuard) {
+            Thread waiter = tokenStoreWaiterThread;
+            if (waiter != null && waiter != Thread.currentThread()) {
+                waiter.interrupt();
             }
         }
         lock.lock();
@@ -668,7 +663,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             throw new OidcAuthException("no token has been obtained yet; call signIn() to sign in before using getToken()");
         } finally {
-            unlockInstance();
+            lock.unlock();
         }
     }
 
@@ -685,7 +680,6 @@ public class OidcDeviceAuth implements QuietCloseable {
      */
     public String signIn() {
         lock.lock();
-        publishLockHolder();
         try {
             throwIfClosed();
             // signIn() is an explicit user action, and it is about to spend a whole interactive device flow -
@@ -755,7 +749,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             return selectToken();
         } finally {
-            unlockInstance();
+            lock.unlock();
         }
     }
 
@@ -1393,7 +1387,6 @@ public class OidcDeviceAuth implements QuietCloseable {
         // managed thread, where interrupt is the standard cancellation signal, is the common case. An
         // uncontended acquire cannot be behind an interactive sign-in (which holds the lock), so it is correct.
         if (lock.tryLock()) {
-            publishLockHolder();
             return;
         }
         // Contended - a peer holds the lock. Never wait behind an interactive signIn(): it holds the lock for
@@ -1429,7 +1422,6 @@ public class OidcDeviceAuth implements QuietCloseable {
             }
             try {
                 if (lock.tryLock(Math.min(remainingNanos, GET_TOKEN_LOCK_POLL_SLICE_MILLIS * 1_000_000L), TimeUnit.NANOSECONDS)) {
-                    publishLockHolder();
                     return;
                 }
             } catch (InterruptedException e) {
@@ -1439,7 +1431,6 @@ public class OidcDeviceAuth implements QuietCloseable {
                 // untimed attempt, which (like the fast path) ignores the carried flag and lets getToken() reach
                 // its cache check. Only report an interrupted WAIT when the lock is genuinely still held.
                 if (lock.tryLock()) {
-                    publishLockHolder();
                     return;
                 }
                 throw new OidcAuthException("interrupted while waiting to acquire the OIDC token");
@@ -2228,23 +2219,21 @@ public class OidcDeviceAuth implements QuietCloseable {
         return false;
     }
 
-    private void publishLockHolder() {
-        synchronized (lockHolderGuard) {
-            lockHolderThread = Thread.currentThread();
+    private void clearTokenStoreWaiter() {
+        synchronized (tokenStoreWaiterGuard) {
+            if (tokenStoreWaiterThread == Thread.currentThread()) {
+                tokenStoreWaiterThread = null;
+            }
         }
     }
 
-    private void unlockInstance() {
-        // Clear while still owning the lock. Clearing after unlock could overwrite a new holder's publication.
-        // Keep the publication across a reentrant call (for example a prompt callback invoking clearCache()).
-        if (lock.getHoldCount() == 1) {
-            synchronized (lockHolderGuard) {
-                if (lockHolderThread == Thread.currentThread()) {
-                    lockHolderThread = null;
-                }
-            }
+    private void publishTokenStoreWaiter() {
+        synchronized (tokenStoreWaiterGuard) {
+            // Pair publish-then-closed with close()'s closed-then-read handshake. If close won the race, do not
+            // enter a potentially blocking store call; if this publication won, close sees and interrupts it.
+            throwIfClosed();
+            tokenStoreWaiterThread = Thread.currentThread();
         }
-        lock.unlock();
     }
 
     private boolean tryRefreshCoordinated() {
@@ -2270,14 +2259,27 @@ public class OidcDeviceAuth implements QuietCloseable {
         final boolean[] actionEntered = new boolean[1];
         final boolean[] actionCompleted = new boolean[1];
         final boolean[] actionResult = new boolean[1];
+        publishTokenStoreWaiter();
         try {
-            return tokenStore.inLock(storeKey, () -> {
-                actionEntered[0] = true;
-                boolean refreshed = refreshUnderLock();
-                actionResult[0] = refreshed;
-                actionCompleted[0] = true;
-                return refreshed;
-            });
+            try {
+                return tokenStore.inLock(storeKey, () -> {
+                    actionEntered[0] = true;
+                    // inLock() acquired (or deliberately declined to acquire) its coordination lock. Clear the
+                    // interrupt target before doing store I/O or returning a cached peer token, then re-check
+                    // close so an interrupt delivered just before this hand-off cannot accompany a successful
+                    // return.
+                    clearTokenStoreWaiter();
+                    throwIfClosed();
+                    boolean refreshed = refreshUnderLock();
+                    actionResult[0] = refreshed;
+                    actionCompleted[0] = true;
+                    return refreshed;
+                });
+            } finally {
+                // Covers an interrupted/declined wait and a store that throws or returns without invoking action.
+                // This inner finally runs before the catch below degrades to an uncoordinated refresh.
+                clearTokenStoreWaiter();
+            }
         } catch (RuntimeException e) {
             if (actionCompleted[0]) {
                 warnPersistence("lock release", e);
