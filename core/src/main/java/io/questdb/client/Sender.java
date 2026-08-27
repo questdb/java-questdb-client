@@ -1929,7 +1929,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
          * bounded live set larger than the threshold recycles once and settles
          * instead of recycling on every refill. Must be greater than
-         * {@code 0} and no larger than {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}.
+         * {@code 0} and no larger than half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}
+         * (the re-arm floor's own cap): arming happens at a flush tail and the swap at the
+         * next drained {@code table(...)} call, so a threshold nearer the protocol cap would
+         * hit the cap error before any recycle could run.
          * <p>
          * Default {@code 100_000}. WebSocket transport only.
          */
@@ -1937,9 +1940,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
                 throw new LineSenderException("symbol_dict_reset_threshold is only supported for WebSocket transport");
             }
-            if (threshold <= 0 || threshold > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE) {
+            if (threshold <= 0 || threshold > QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2) {
                 throw new LineSenderException("symbol_dict_reset_threshold must be > 0 and <= ")
-                        .put(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE).put(": ").put(threshold);
+                        .put(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2).put(": ").put(threshold);
             }
             this.symbolDictResetThreshold = threshold;
             return this;
@@ -1968,6 +1971,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (maxWaitMillis < 0) {
                 throw new LineSenderException("symbol_dict_reset_max_wait_millis must be >= 0: ").put(maxWaitMillis);
+            }
+            if (maxWaitMillis > Long.MAX_VALUE / 1_000_000L) {
+                throw new LineSenderException("symbol_dict_reset_max_wait_millis is out of range: ").put(maxWaitMillis);
             }
             this.symbolDictResetMaxWaitMillis = maxWaitMillis;
             return this;

@@ -317,11 +317,14 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                 () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold=0;"));
         assertThrows("symbol_dict_reset_threshold must be > 0",
                 () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold=-5;"));
-        assertThrows("symbol_dict_reset_threshold must be > 0 and <= " + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+        assertThrows("symbol_dict_reset_threshold must be > 0 and <= " + (QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2),
                 () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold="
-                        + (QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE + 1) + ";"));
+                        + (QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2 + 1) + ";"));
         assertThrows("symbol_dict_reset_max_wait_millis must be >= 0: -1",
                 () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_max_wait_millis=-1;"));
+        assertThrows("symbol_dict_reset_max_wait_millis is out of range",
+                () -> Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_max_wait_millis="
+                        + (Long.MAX_VALUE / 1_000_000L + 1) + ";"));
     }
 
     @Test
@@ -373,21 +376,21 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
     }
 
     /**
-     * The accepted upper edge: exactly {@code MAX_SYMBOL_DICTIONARY_SIZE}
-     * (2M) must pass validation -- a {@code >} -> {@code >=} regression at
-     * the bound would reject it. Both the connect-string and the fluent
-     * setter paths.
+     * The accepted upper edge: exactly half of {@code MAX_SYMBOL_DICTIONARY_SIZE}
+     * (1M, the re-arm floor's own cap) must pass validation -- a {@code >} ->
+     * {@code >=} regression at the bound would reject it. Both the
+     * connect-string and the fluent setter paths.
      */
     @Test
-    public void testSymbolDictResetThresholdAcceptsHardCapBoundary() {
-        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+    public void testSymbolDictResetThresholdAcceptsHalfCapBoundary() {
+        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2,
                 Sender.builder("ws::addr=" + LOCALHOST + ";symbol_dict_reset_threshold="
-                                + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE + ";")
+                                + QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2 + ";")
                         .wsConfigSnapshotForTest()
                         .get("symbol_dict_reset_threshold"));
-        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE,
+        Assert.assertEquals(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2,
                 Sender.builder(Sender.Transport.WEBSOCKET)
-                        .symbolDictResetThreshold(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE)
+                        .symbolDictResetThreshold(QwpConstants.MAX_SYMBOL_DICTIONARY_SIZE / 2)
                         .wsConfigSnapshotForTest()
                         .get("symbol_dict_reset_threshold"));
     }
