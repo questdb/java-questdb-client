@@ -2290,7 +2290,7 @@ public class QwpWebSocketSender implements Sender {
      * {@code getTotal*} counters, it is scoped to the sender's whole lifetime
      * and never resets. volatile: a
      * concurrent read sees the latest write the producer thread completed,
-     * but there is no atomicity across the three symbol-dictionary-recycle
+     * but there is no atomicity across the two symbol-dictionary-recycle
      * counters -- a reader on another thread can observe this one already
      * advanced while {@link #getSymbolDictResetStarvationTimeouts()} still
      * reflects an older value; there is no atomicity across the counters.
