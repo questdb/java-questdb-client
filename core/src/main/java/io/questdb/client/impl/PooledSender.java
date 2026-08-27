@@ -336,6 +336,11 @@ public final class PooledSender implements Sender {
     }
 
     @Override
+    public void resetSymbolDictionary() {
+        slot.live(generation).resetSymbolDictionary();
+    }
+
+    @Override
     public Sender shortColumn(CharSequence name, short value) {
         slot.live(generation).shortColumn(name, value);
         return this;

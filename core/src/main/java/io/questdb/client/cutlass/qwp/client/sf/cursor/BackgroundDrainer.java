@@ -789,7 +789,8 @@ public final class BackgroundDrainer implements Runnable {
                         maxHeadFrameRejections,
                         poisonMinEscalationWindowMillis,
                         catchUpCapGapMinEscalationWindowMillis,
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN,
+                        0L);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {

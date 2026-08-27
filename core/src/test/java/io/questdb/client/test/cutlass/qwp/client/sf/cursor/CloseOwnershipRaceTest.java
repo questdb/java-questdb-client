@@ -76,7 +76,8 @@ public class CloseOwnershipRaceTest {
                         CursorWebSocketSendLoop.DEFAULT_MAX_HEAD_FRAME_REJECTIONS,
                         0,
                         0,
-                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                        CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN,
+                        0L);
                 loop.start();
                 // Race close()'s exact ownership snapshot against the latch
                 // transition, stopping once the latch has landed. Nothing in
