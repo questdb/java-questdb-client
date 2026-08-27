@@ -48,7 +48,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
- * FSN epoch-base continuity across a symbol-dict recycle. Task 5's engine
+ * FSN epoch-base continuity across a symbol-dict recycle. The recycle's engine
  * rebuild restarts the internal cursor engine's raw FSNs at 0; every
  * user-visible FSN surface must stay strictly monotone across that boundary
  * by translating {@code external = fsnEpochBase + raw} (negative sentinels
