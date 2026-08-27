@@ -2219,6 +2219,10 @@ public class QwpWebSocketSender implements Sender {
         return resetThresholdSymbols;
     }
 
+    /**
+     * The current re-arm floor: 0 before the first swap, then
+     * {@code min(2 x dictSizeAtSwap, MAX_SYMBOL_DICTIONARY_SIZE / 2)}.
+     */
     @TestOnly
     public int getResetFloorSymbolsForTesting() {
         return resetFloorSymbols;

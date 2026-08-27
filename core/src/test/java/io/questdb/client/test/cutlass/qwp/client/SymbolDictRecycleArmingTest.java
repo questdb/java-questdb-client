@@ -100,7 +100,7 @@ public class SymbolDictRecycleArmingTest {
      * degradation does not change that verdict either way.
      */
     @Test
-    public void testArmsInFullDictMode() throws Exception {
+    public void testDoesNotArmWithoutRebuildFactory() throws Exception {
         assertMemoryLeak(() -> {
             String sfDir = temporaryFolder.getRoot().toPath().resolve("arm-full-dict-sf").toString();
             String slot = Paths.get(sfDir, "default").toString();
@@ -226,6 +226,53 @@ public class SymbolDictRecycleArmingTest {
                             ws.isResetArmed());
                     sender.flush();
                     Assert.assertTrue(ws.isResetArmed());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testReArmFloorDoublesPerSwapAndBlocksOrganicReArm() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("floor-sf").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String config = cfg(server) + "sf_dir=" + sfDir + ";symbol_dict_reset_threshold=2;";
+                try (Sender sender = Sender.fromConfig(config)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertEquals("no swap yet: floor is 0", 0, ws.getResetFloorSymbolsForTesting());
+
+                    // epoch 0: two symbols == threshold -> arms
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertTrue(ws.isResetArmed());
+
+                    // swap #1 runs inside this table() with dictSizeAtSwap == 2
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("floor = 2 x size-at-swap", 4, ws.getResetFloorSymbolsForTesting());
+
+                    // epoch 1: c,d,e,f == floor -> arms again
+                    sender.table("t").symbol("s", "d").longColumn("v", 2L).atNow();
+                    sender.table("t").symbol("s", "e").longColumn("v", 2L).atNow();
+                    sender.table("t").symbol("s", "f").longColumn("v", 2L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertTrue("size 4 >= max(threshold 2, floor 4) must arm", ws.isResetArmed());
+
+                    // swap #2 with dictSizeAtSwap == 4
+                    sender.table("t").symbol("s", "g").longColumn("v", 3L).atNow();
+                    Assert.assertEquals(2, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("floor doubles again", 8, ws.getResetFloorSymbolsForTesting());
+
+                    // epoch 2: four symbols is above the threshold but below the floor
+                    sender.table("t").symbol("s", "h").longColumn("v", 4L).atNow();
+                    sender.table("t").symbol("s", "i").longColumn("v", 4L).atNow();
+                    sender.table("t").symbol("s", "j").longColumn("v", 4L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                    Assert.assertFalse("size 4 < floor 8 must not re-arm organically", ws.isResetArmed());
+
+                    sender.resetSymbolDictionary();
+                    Assert.assertTrue("the advisory request bypasses the floor", ws.isResetArmed());
                 }
             }
         });
