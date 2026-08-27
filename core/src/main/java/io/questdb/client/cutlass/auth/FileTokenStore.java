@@ -1277,10 +1277,20 @@ public final class FileTokenStore implements TokenStore {
                 // refresh - the budget can be tens of seconds, far past a QWP close()'s shutdown window.
                 Thread.sleep(LOCK_POLL_SLICE_MILLIS);
             } catch (IOException e) {
-                // Do NOT delete the lock here. That used to be justified by "the exclusive create succeeded
-                // and only the nonce write failed, so the file is ours" - true for one of the failures this
-                // arm catches, but not the others. From the second loop iteration onward a PEER's live lock
-                // occupies the path, and plenty of "cannot create" failures are not
+                // Windows reports CREATE_NEW against a DIRECTORY at this name as AccessDeniedException rather
+                // than FileAlreadyExistsException, so the squatter recovery above is otherwise unreachable on
+                // that platform. Recover only a shape this class cannot have written. The helper captures the
+                // name atomically and restores it if a peer replaced the squatter with a regular lock between
+                // this shape check and the capture; a successful displacement leaves the canonical name free,
+                // so retry the exclusive create.
+                if (!Files.isRegularFile(lock, LinkOption.NOFOLLOW_LINKS) && displaceLockSquatter(lock)) {
+                    continue;
+                }
+
+                // Do NOT delete any remaining lock here. That used to be justified by "the exclusive create
+                // succeeded and only the nonce write failed, so the file is ours" - true for one of the
+                // failures this arm catches, but not the others. From the second loop iteration onward a
+                // PEER's live lock occupies the path, and plenty of "cannot create" failures are not
                 // FileAlreadyExistsException: fd exhaustion (EMFILE/ENFILE), EACCES, EROFS, ENOSPC and a
                 // Windows sharing violation all arrive as a plain IOException. deleteIfExists cannot tell
                 // the two cases apart, and removing a peer's live lock admits a second holder - the
@@ -1471,22 +1481,26 @@ public final class FileTokenStore implements TokenStore {
      * behind for {@code sweepStaleTempFiles}, but the lock NAME is free either way, which is what unwedges the
      * store. Silent, like every other steal on this path - the condition is self-healing once the name is
      * reclaimed, and an operator has nothing to act on.
+     *
+     * @return {@code true} when this call captured a non-regular squatter and freed the canonical lock name;
+     *         {@code false} when capture failed or the captured name was a peer's regular lock and was restored
      */
-    private void displaceLockSquatter(Path lock) {
+    private boolean displaceLockSquatter(Path lock) {
         final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
         try {
             Files.move(lock, captured, StandardCopyOption.ATOMIC_MOVE);
         } catch (IOException e) {
             // already gone, a peer captured it first, or the filesystem cannot rename atomically; the next
             // acquire poll re-tests the shape rather than risk a non-atomic removal
-            return;
+            return false;
         }
         if (Files.isRegularFile(captured, LinkOption.NOFOLLOW_LINKS)) {
             // a peer replaced the squatter with a real lock between the shape test and the rename; restore it
             restoreCapturedLock(lock, captured);
-            return;
+            return false;
         }
         deleteCapturedLock(captured);
+        return true;
     }
 
     private Path lockFile(TokenStoreKey key) {
