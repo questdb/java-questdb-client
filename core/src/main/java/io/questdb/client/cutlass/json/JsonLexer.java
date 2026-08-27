@@ -96,6 +96,9 @@ public class JsonLexer implements Mutable, Closeable {
     @Override
     public void close() {
         if (cacheCapacity > 0 && cache != 0) {
+            // The stash may contain raw credential bytes from a value split across parse() calls. Do not hand
+            // those bytes back to the native allocator, where they remain readable until the block is reused.
+            Vect.memset(cache, cacheCapacity, 0);
             Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
             cache = 0;
         }
@@ -295,10 +298,10 @@ public class JsonLexer implements Mutable, Closeable {
      * <p>
      * Every name and value the lexer emits is assembled in {@link #sink} first, and an escaped one is
      * then resolved into {@link #unescapeSink}; a listener that copies the value out leaves the lexer's
-     * own copy behind. {@link #clear()} does not help - it rewinds the parse state and never touches
-     * either sink, and {@link StringSink#clear()} would only rewind the write position anyway, leaving
-     * a long secret legible in the tail past a shorter later write. {@link #close()} frees the native
-     * cache without zeroing it, and neither sink is reachable from outside this class.
+     * own copy behind. When a value spans parse calls, its raw bytes are also assembled in the native
+     * {@link #cache}. {@link #clear()} does not help - it rewinds the parse state and never touches these
+     * buffers, and {@link StringSink#clear()} would only rewind the write position anyway, leaving a long
+     * secret legible in the tail past a shorter later write. None is reachable from outside this class.
      * <p>
      * Callers that parse credentials should wipe rather than clear between documents - {@code
      * OidcDeviceAuth} parses the token endpoint's response with a long-lived lexer, so its access, id
@@ -309,6 +312,11 @@ public class JsonLexer implements Mutable, Closeable {
     public void wipe() {
         sink.wipe();
         unescapeSink.wipe();
+        if (cacheCapacity > 0 && cache != 0) {
+            // Wipe the whole allocation, not cacheSize: a completed value resets cacheSize to zero, and a
+            // shorter later split value can leave the tail of an earlier credential beyond the current size.
+            Vect.memset(cache, cacheCapacity, 0);
+        }
     }
 
     private static boolean isNotATerminator(char c) {
@@ -357,6 +365,10 @@ public class JsonLexer implements Mutable, Closeable {
         long ptr = Unsafe.malloc(n, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         if (cacheCapacity > 0) {
             Vect.memcpy(ptr, cache, cacheSize);
+            // Growth replaces the allocation before a credential owner has an opportunity to call wipe().
+            // Zero the old block before returning it to the allocator so a copied split token is not retained
+            // in freed native memory.
+            Vect.memset(cache, cacheCapacity, 0);
             Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         }
         cacheCapacity = n;

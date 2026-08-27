@@ -1225,12 +1225,15 @@ public class OidcDeviceAuthTest {
             // from this object.
             //
             // What it holds is the token itself. The lexer ASSEMBLES every name and value in its own decode
-            // sinks before a listener ever sees one, so TokenResponseParser's copy is the second copy, not
-            // the first; wiping the parsers left the originals untouched. JsonLexer.clear() resets parse
-            // state only, and StringSink.clear() would just rewind the write position anyway.
+            // sinks before a listener ever sees one, and stashes split values in a native cache, so
+            // TokenResponseParser's copy is not the only copy. Wiping the parsers left the originals
+            // untouched. JsonLexer.clear() resets parse state only, and StringSink.clear() would just rewind
+            // the write position anyway.
             //
             // So a caller who called clearCache() to sign this process out still had the access, id and
-            // refresh tokens legible on the heap - the exact retention StringSink.wipe() was added to close.
+            // refresh tokens legible on the heap or in native memory - the exact retention wipe() exists to
+            // close.
+            String refreshToken = "REFRESH-LEXER-WIPE-ME-" + TestUtils.repeat("r", 3_000);
             MockOidcServer.Handler handler = (method, path, body) -> {
                 if (DEVICE_PATH.equals(path)) {
                     return MockOidcServer.json(200, "{"
@@ -1243,10 +1246,13 @@ public class OidcDeviceAuthTest {
                 // string), so the lexer resolves it through unescapeSink rather than returning the sink
                 // verbatim - the SECOND decode buffer JsonLexer.wipe() clears. A plain-concatenated token
                 // carries no escape, skips unescape(), and leaves unescapeSink empty, so its wipe is never
-                // exercised and dropping it goes unnoticed. The decoded value is byte-identical to the other
-                // WIPE-ME secrets, so signIn()'s return and every assertion below are unchanged.
-                return MockOidcServer.json(200,
-                        tokenJson("ACCESS\\u002DLEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME", 3600));
+                // exercised and dropping it goes unnoticed. The decoded access-token value keeps the same
+                // WIPE-ME marker, while the long refresh token below independently exercises the native stash.
+                // Force the long refresh token across 64-byte HTTP chunks. JsonLexer copies the fragment
+                // prefix into its native split-value cache, then resets cacheSize to zero after emitting the
+                // completed value without erasing the allocation.
+                return MockOidcServer.chunkedJson(200,
+                        tokenJson("ACCESS\\u002DLEXER-WIPE-ME", "ID-LEXER-WIPE-ME", refreshToken, 3600));
             };
             try (MockOidcServer server = new MockOidcServer(handler)) {
                 OidcDeviceAuth auth = newAuth(server, false, noopPrompt());
@@ -1264,6 +1270,10 @@ public class OidcDeviceAuthTest {
                     }
                     Assert.assertTrue("the lexer must hold a parsed token before the wipe, otherwise this "
                             + "test cannot fail: " + before, holdsOne);
+                    String nativeBefore = lexerNativeCache(auth);
+                    Assert.assertTrue("the chunk-split refresh token must be legible in the lexer's native "
+                                    + "stash before the wipe",
+                            nativeBefore.contains("REFRESH-LEXER-WIPE-ME"));
 
                     auth.clearCache();
 
@@ -1272,6 +1282,14 @@ public class OidcDeviceAuthTest {
                             "ACCESS-LEXER-WIPE-ME", "ID-LEXER-WIPE-ME", "REFRESH-LEXER-WIPE-ME"}) {
                         Assert.assertFalse("clearCache() left \"" + secret + "\" legible in the lexer's "
                                 + "decode buffers", buffers.contains(secret));
+                    }
+                    String nativeAfter = lexerNativeCache(auth);
+                    Assert.assertFalse("clearCache() left the split refresh token legible in the lexer's "
+                                    + "native stash",
+                            nativeAfter.contains("REFRESH-LEXER-WIPE-ME"));
+                    for (int i = 0, n = nativeAfter.length(); i < n; i++) {
+                        Assert.assertEquals("JsonLexer.wipe() must zero the whole native stash allocation",
+                                0, nativeAfter.charAt(i));
                     }
                     // and nothing else on the instance kept a copy either
                     assertHoldsNowhere(auth, "ACCESS-LEXER-WIPE-ME");
@@ -4538,6 +4556,27 @@ public class OidcDeviceAuthTest {
             if (value instanceof StringSink) {
                 out.put(f.getName()).put('=').put(sinkContents((StringSink) value)).put(' ');
             }
+        }
+        return out.toString();
+    }
+
+    /**
+     * The whole native split-value cache owned by the instance's {@link JsonLexer}, including the tail beyond
+     * its logical cacheSize. A completed split value resets cacheSize to zero, so inspecting only the logical
+     * range would miss precisely the retained credential this helper is meant to expose.
+     */
+    private static String lexerNativeCache(OidcDeviceAuth auth) throws Exception {
+        Object lexer = readField(auth, "jsonLexer");
+        Assert.assertNotNull("clearCache() must keep the lexer alive; close() is the one that frees it", lexer);
+        Field cacheField = JsonLexer.class.getDeclaredField("cache");
+        Field capacityField = JsonLexer.class.getDeclaredField("cacheCapacity");
+        cacheField.setAccessible(true);
+        capacityField.setAccessible(true);
+        long cache = cacheField.getLong(lexer);
+        int capacity = capacityField.getInt(lexer);
+        StringSink out = new StringSink(capacity);
+        for (int i = 0; i < capacity; i++) {
+            out.put((char) (Unsafe.getUnsafe().getByte(cache + i) & 0xff));
         }
         return out.toString();
     }

@@ -93,14 +93,13 @@ public interface TokenStore {
      * uninterruptible wait defeats that, leaving the client, the cursor engine and the store-and-forward
      * slot lock to a delegated teardown.
      * <p>
-     * Restoring the flag is not optional politeness. {@code false} on its own is indistinguishable from
-     * "the refresh ran and failed", and {@code OidcDeviceAuth} must tell the two apart: it reads a plain
-     * {@code false} as a failed refresh and answers by starting the INTERACTIVE device flow - a browser
-     * launch and a poll loop that runs to the device-code lifetime, ignoring interrupts - on a thread whose
-     * owner has already cancelled it, and by arming the shared refresh back-off that then fails every other
-     * caller of the instance. An implementation that consumes the interrupt (as
-     * {@code InterruptedException} does) must re-assert it with {@code Thread.currentThread().interrupt()}
-     * before returning, once it is past any interruptible I/O of its own.
+     * Restoring the flag is not optional politeness. {@code OidcDeviceAuth} distinguishes "the refresh ran
+     * and failed" from "the wait was abandoned" by recording whether {@code action} was entered, because an
+     * interrupt may independently arrive while a real refresh is running. It still needs the preserved flag
+     * to report why a no-action return occurred and, more importantly, the caller owns that cancellation
+     * signal. An implementation that consumes the interrupt (as {@code InterruptedException} does) must
+     * re-assert it with {@code Thread.currentThread().interrupt()} before returning, once it is past any
+     * interruptible I/O of its own.
      *
      * @param key    the identity to lock
      * @param action the critical section; its boolean result is returned unchanged

@@ -213,6 +213,9 @@ public class OidcDeviceAuth implements QuietCloseable {
     private static final int POLL_SLOW_DOWN = 2;
     private static final int POLL_SUCCESS = 0;
     private static final int POLL_TRANSIENT_ERROR = 3;
+    private static final int REFRESH_FAILED = 0;
+    private static final int REFRESH_NOT_ATTEMPTED = 2;
+    private static final int REFRESH_SUCCEEDED = 1;
     private static final int SLOW_DOWN_INCREMENT_SECONDS = 5;
     private static final String USER_AGENT = "questdb/java-client-oidc";
     private static final String WELL_KNOWN_OPENID_CONFIGURATION_PATH = "/.well-known/openid-configuration";
@@ -640,22 +643,28 @@ public class OidcDeviceAuth implements QuietCloseable {
             // is documented to be. maybeLoadFromStore() arms its sibling back-off inside the catch for the
             // same reason: only a real attempt may re-arm.
             if (refreshToken != null && !isRefreshBackedOff()) {
-                if (tryRefreshCoordinated()) {
+                final int refreshResult = tryRefreshCoordinated();
+                if (refreshResult == REFRESH_SUCCEEDED) {
                     refreshFailedAtMillis = 0;
                     return selectToken();
                 }
-                // A coordinating TokenStore returns false WITHOUT running the refresh when an interrupt
-                // abandons its lock wait, and the contract requires it to leave the flag set so this call
-                // can tell that apart from a refresh that ran and failed. The difference matters twice
-                // over: refreshFailedAtMillis is INSTANCE state, so arming it here would make one
-                // cancelled caller fail every other producer sharing this OidcDeviceAuth for the next
-                // MIN_REFRESH_RETRY_INTERVAL_MILLIS - over a credential that is fine and an identity
-                // provider that is reachable - and the message below would send that operator to
-                // re-authenticate for the same reason. Report the cancellation instead, and leave the
-                // latch alone: nothing was attempted, so there is nothing to back off from.
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new OidcAuthException("the calling thread was interrupted while waiting for the token store lock, so no silent token refresh was attempted; retry on an uninterrupted thread");
+                // Whether the action ran is the only sound discriminator here. The interrupt flag is not:
+                // Future.cancel(true), PoolHousekeeper.stop(), or any application cancellation can set it
+                // WHILE a refresh that really reached the IdP is failing. Reading that case as an abandoned
+                // store wait produced a false "no attempt" diagnostic and skipped the stampede latch; with no
+                // store configured it even named a lock that did not exist. The action-entry marker inside
+                // tryRefreshCoordinated() tells the two outcomes apart without consuming the caller's flag.
+                if (refreshResult == REFRESH_NOT_ATTEMPTED) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new OidcAuthException("the calling thread was interrupted while waiting for the token store lock, so no silent token refresh was attempted; retry on an uninterrupted thread");
+                    }
+                    // A conforming store only declines without running action on an interrupt and preserves
+                    // that flag. Keep the no-attempt outcome accurate even for a custom store that violates
+                    // the flag half of the contract, and do not arm a back-off for work that never happened.
+                    throw new OidcAuthException("the token store returned without running the silent token refresh; retry shortly");
                 }
+                // REFRESH_FAILED means the endpoint was actually attempted, so arm the stampede guard even
+                // when an unrelated cancellation set this thread's interrupt flag during that round trip.
                 refreshFailedAtMillis = System.currentTimeMillis();
             }
             if (cachedToken != null) {
@@ -729,7 +738,7 @@ public class OidcDeviceAuth implements QuietCloseable {
             // falls through to the interactive flow when the refresh fails, and it is exactly the call a user
             // makes to recover from the failure getToken() is backing off from.
             refreshFailedAtMillis = 0;
-            if (refreshToken != null && tryRefreshCoordinated()) {
+            if (refreshToken != null && tryRefreshCoordinated() == REFRESH_SUCCEEDED) {
                 return selectToken();
             }
             // Re-check the flag, because the guard on entry only covers an interrupt the caller ARRIVED with.
@@ -2236,9 +2245,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         }
     }
 
-    private boolean tryRefreshCoordinated() {
+    private int tryRefreshCoordinated() {
         if (tokenStore == null) {
-            return tryRefresh();
+            return tryRefresh() ? REFRESH_SUCCEEDED : REFRESH_FAILED;
         }
         // Serialise the read-refresh-write across processes (and adopt a peer's just-rotated refresh token)
         // through the store's per-identity lock; a store that does not coordinate just runs the refresh.
@@ -2261,8 +2270,9 @@ public class OidcDeviceAuth implements QuietCloseable {
         final boolean[] actionResult = new boolean[1];
         publishTokenStoreWaiter();
         try {
+            final boolean storeResult;
             try {
-                return tokenStore.inLock(storeKey, () -> {
+                storeResult = tokenStore.inLock(storeKey, () -> {
                     actionEntered[0] = true;
                     // inLock() acquired (or deliberately declined to acquire) its coordination lock. Clear the
                     // interrupt target before doing store I/O or returning a cached peer token, then re-check
@@ -2280,16 +2290,23 @@ public class OidcDeviceAuth implements QuietCloseable {
                 // This inner finally runs before the catch below degrades to an uncoordinated refresh.
                 clearTokenStoreWaiter();
             }
+            // inLock() can return false either because action ran and the refresh failed, or because an
+            // interrupt abandoned its wait before action. Do not infer which from the thread flag: the flag
+            // may have arrived during a refresh that did run. The callback entry is the exact discriminator.
+            if (!actionEntered[0]) {
+                return REFRESH_NOT_ATTEMPTED;
+            }
+            return storeResult ? REFRESH_SUCCEEDED : REFRESH_FAILED;
         } catch (RuntimeException e) {
             if (actionCompleted[0]) {
                 warnPersistence("lock release", e);
-                return actionResult[0];
+                return actionResult[0] ? REFRESH_SUCCEEDED : REFRESH_FAILED;
             }
             if (actionEntered[0]) {
                 throw e;
             }
             warnPersistence("lock", e);
-            return tryRefresh();
+            return tryRefresh() ? REFRESH_SUCCEEDED : REFRESH_FAILED;
         }
     }
 

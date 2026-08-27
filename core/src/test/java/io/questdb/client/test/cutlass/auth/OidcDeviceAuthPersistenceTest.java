@@ -147,6 +147,125 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testFailedRefreshWithLateInterruptArmsBackOffWhenStoreActionRan() throws Exception {
+        assertMemoryLeak(() -> {
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(500, "{\"error\":\"unexpected_device_flow\"}");
+                }
+                tokenCalls.incrementAndGet();
+                return MockOidcServer.json(400, "{\"error\":\"invalid_grant\"}");
+            };
+            try (MockOidcServer server = new MockOidcServer(handler)) {
+                FakeTokenStore fake = new FakeTokenStore();
+                fake.loadReturns = new PersistedToken("ACCESS-STALE", null, "REFRESH-REVOKED",
+                        System.currentTimeMillis() - 1_000, 300_000);
+                // Model cancellation arriving after action.run(): the refresh really reached the IdP and
+                // failed, but the caller carries an interrupt by the time getToken() classifies the result.
+                fake.interruptAfterAction = true;
+                try (OidcDeviceAuth auth = baseBuilder(server).tokenStore(fake).build()) {
+                    final String message;
+                    try {
+                        auth.getToken();
+                        Assert.fail("the revoked refresh token must fail");
+                        return;
+                    } catch (OidcAuthException e) {
+                        message = e.getMessage();
+                    }
+
+                    Assert.assertTrue("the store must have run the refresh action", fake.actionRuns.get() > 0);
+                    Assert.assertEquals("the failed refresh must reach the token endpoint once", 1, tokenCalls.get());
+                    Assert.assertFalse("a refresh that ran must not be reported as an abandoned store wait: "
+                                    + message,
+                            message.contains("no silent token refresh was attempted")
+                                    || message.contains("token store lock"));
+                    Assert.assertTrue("the actual failed attempt must arm the shared stampede guard",
+                            readPrivateLong(auth, "refreshFailedAtMillis") > 0);
+                    Assert.assertTrue("the caller's cancellation signal must survive",
+                            Thread.currentThread().isInterrupted());
+                } finally {
+                    Thread.interrupted();
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testFailedRefreshWithLateInterruptArmsBackOffWithoutTokenStore() throws Exception {
+        assertMemoryLeak(() -> {
+            CountDownLatch refreshEntered = new CountDownLatch(1);
+            CountDownLatch releaseRefresh = new CountDownLatch(1);
+            AtomicInteger tokenCalls = new AtomicInteger();
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthJson());
+                }
+                if (tokenCalls.incrementAndGet() == 1) {
+                    return MockOidcServer.json(200,
+                            tokenJson("ACCESS-INITIAL", null, "REFRESH-REVOKED", 3600));
+                }
+                refreshEntered.countDown();
+                try {
+                    if (!releaseRefresh.await(10, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the test did not release the failed refresh response");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("the mock token endpoint was interrupted", e);
+                }
+                return MockOidcServer.json(400, "{\"error\":\"invalid_grant\"}");
+            };
+
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = baseBuilder(server).build()) {
+                Assert.assertEquals("ACCESS-INITIAL", auth.signIn());
+                OidcDeviceAuthTest.expireCachedToken(auth);
+
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                AtomicBoolean callerInterruptSurvived = new AtomicBoolean();
+                Thread caller = new Thread(() -> {
+                    try {
+                        auth.getToken();
+                    } catch (Throwable e) {
+                        failure.set(e);
+                    } finally {
+                        callerInterruptSurvived.set(Thread.currentThread().isInterrupted());
+                        Thread.interrupted();
+                    }
+                }, "oidc-interrupted-failed-refresh");
+                caller.setDaemon(true);
+                caller.start();
+                try {
+                    Assert.assertTrue("the refresh did not reach the token endpoint",
+                            refreshEntered.await(10, TimeUnit.SECONDS));
+                    caller.interrupt();
+                    releaseRefresh.countDown();
+                    caller.join(10_000);
+                } finally {
+                    releaseRefresh.countDown();
+                    caller.interrupt();
+                    caller.join(10_000);
+                }
+
+                Assert.assertFalse("the interrupted getToken() caller did not finish", caller.isAlive());
+                Assert.assertTrue("the revoked refresh must surface as an OIDC failure",
+                        failure.get() instanceof OidcAuthException);
+                String message = failure.get().getMessage();
+                Assert.assertFalse("a no-store refresh cannot have been abandoned behind a store lock: "
+                                + message,
+                        message.contains("no silent token refresh was attempted")
+                                || message.contains("token store lock"));
+                Assert.assertEquals("one device grant and one failed refresh must reach the token endpoint",
+                        2, tokenCalls.get());
+                Assert.assertTrue("the actual failed attempt must arm the shared stampede guard",
+                        readPrivateLong(auth, "refreshFailedAtMillis") > 0);
+                Assert.assertTrue("the caller's cancellation signal must survive", callerInterruptSurvived.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testCancelledStoreLockWaitDoesNotStartTheDeviceFlow() throws Exception {
         assertMemoryLeak(() -> {
             AtomicInteger device = new AtomicInteger();
@@ -2005,15 +2124,18 @@ public class OidcDeviceAuthPersistenceTest {
         final AtomicInteger loads = new AtomicInteger();
         final AtomicInteger locks = new AtomicInteger();
         final AtomicInteger saves = new AtomicInteger();
+        final AtomicInteger actionRuns = new AtomicInteger();
         // models a CONFORMANT coordinating store whose lock wait a cancellation abandoned: per TokenStore's
         // contract it returns false without running the action AND leaves the interrupt flag set, which is
-        // what lets OidcDeviceAuth tell that apart from a refresh that ran and failed
+        // preserved as the caller's cancellation signal; OidcDeviceAuth uses action entry to distinguish this
+        // from a refresh that ran and failed
         boolean cancelWaitInsteadOfRunning;
         // number of leading load() calls to fail before the first one is allowed to succeed; models a
         // transient store fault (an interrupted channel, a momentary IO error), as opposed to a store that
         // simply has nothing to return
         int failLoadTimes;
         boolean failSave;
+        boolean interruptAfterAction;
         CountDownLatch inLockEntered;
         PersistedToken loadReturns;
         PersistedToken peerInstallsOnLock;
@@ -2059,7 +2181,11 @@ public class OidcDeviceAuthPersistenceTest {
                 stored = peerInstallsOnLock;
                 peerInstallsOnLock = null;
             }
+            actionRuns.incrementAndGet();
             boolean result = action.run();
+            if (interruptAfterAction) {
+                Thread.currentThread().interrupt();
+            }
             if (throwAfterAction != null) {
                 // a bookkeeping failure on the way out - releasing the lock, closing a handle - AFTER the
                 // critical section already completed
