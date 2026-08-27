@@ -1453,6 +1453,40 @@ public final class FileTokenStore implements TokenStore {
         return directory.resolve(DIRECTORY_LOCK_FILE_NAME);
     }
 
+    /**
+     * Removes a shape occupying a lock name that this class cannot have written - a directory, or a symlink
+     * (dangling or not). Only a regular file is a lock: {@link #createLockFile} produces nothing else, and
+     * {@link #releaseLock} and the steal path both reclaim nothing else, so a squatter left standing wedges
+     * every later acquire on that name for good.
+     * <p>
+     * Capture-then-decide rather than a bare delete, for the reason {@link #stealIfStale} captures: a peer
+     * that creates a genuine lock in the gap between the shape test and the removal would otherwise have it
+     * deleted out from under it, admitting two holders. The rename is atomic, so among racing callers exactly
+     * one captures the name; whatever it captured is then inspected, and a regular file - a peer's real lock,
+     * created in that gap - is put back untouched rather than stolen.
+     * <p>
+     * Best-effort throughout: a squatter that resists removal (a non-empty directory) leaves a capture temp
+     * behind for {@code sweepStaleTempFiles}, but the lock NAME is free either way, which is what unwedges the
+     * store. Silent, like every other steal on this path - the condition is self-healing once the name is
+     * reclaimed, and an operator has nothing to act on.
+     */
+    private void displaceLockSquatter(Path lock) {
+        final Path captured = lock.resolveSibling(lock.getFileName().toString() + '.' + UUID.randomUUID() + ".tmp");
+        try {
+            Files.move(lock, captured, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            // already gone, a peer captured it first, or the filesystem cannot rename atomically; the next
+            // acquire poll re-tests the shape rather than risk a non-atomic removal
+            return;
+        }
+        if (Files.isRegularFile(captured, LinkOption.NOFOLLOW_LINKS)) {
+            // a peer replaced the squatter with a real lock between the shape test and the rename; restore it
+            restoreCapturedLock(lock, captured);
+            return;
+        }
+        deleteCapturedLock(captured);
+    }
+
     private Path lockFile(TokenStoreKey key) {
         return directory.resolve(key.hash() + ".lock");
     }
@@ -1654,9 +1688,24 @@ public final class FileTokenStore implements TokenStore {
             // which costs at most one extra sweep and a re-sign-in.
             return !wasOtherWritable && Files.notExists(untrustedSentinel(), LinkOption.NOFOLLOW_LINKS);
         } catch (UnsupportedOperationException e) {
-            // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL
+            // non-POSIX FS (e.g. Windows): cannot enforce owner-only perms; keep the inherited ACL.
+            //
+            // The permission half of the verdict is unavailable here, but the SENTINEL half is not, and it is
+            // the half that carries a peer's verdict across a filesystem this client cannot read mode bits on.
+            // The sentinel is deliberately permission-INDEPENDENT - design/oidc-token-persistence.md requires
+            // honouring it "whatever the permission bits say", precisely so a client on one platform can act on
+            // a distrust another platform's client published into the shared directory the frozen on-disk
+            // contract exists to allow. Returning a bare true ignored it: a directory a POSIX peer marked
+            // untrusted and had not finished sweeping (its sweep latches whenever a single entry resists
+            // deletion - see discardUntrustedDirectoryContents) read as trusted here, so this client adopted
+            // entries out of it and presented their tokens, and never swept or cleared the mark either.
+            // canUseShortDirectoryLockLease already evaluates the sentinel on this same catch, for the same
+            // reason it gives there.
+            //
+            // NOFOLLOW_LINKS and notExists for the reason the POSIX return above spells out: both defaults fail
+            // OPEN, and a link, a directory or an indeterminate stat must all leave the directory distrusted.
             warnNoPosixPermsOnce();
-            return true;
+            return Files.notExists(untrustedSentinel(), LinkOption.NOFOLLOW_LINKS);
         }
     }
 
@@ -1698,27 +1747,73 @@ public final class FileTokenStore implements TokenStore {
         // we judged stale. If a peer had already replaced it with a live lock we grabbed that instead, so we
         // put it back rather than steal it. This mirrors releaseLock's own-stamp check and shrinks the
         // residual race from the whole age-check->delete gap to the gap between the two renames.
-        final byte[] before;
+        //
+        // A name this class could not have written is a SQUATTER, not a lock, and no amount of waiting turns
+        // it into one: createLockFile only ever produces a regular file. Displace it at once, exactly as
+        // markUntrusted displaces a squatted sentinel name and for the reason it gives there - "Nothing but
+        // this class writes this name, so there is no peer state to lose".
+        //
+        // It has to be a shape test rather than the stamp read below, because neither the age check nor the
+        // stamp read can settle these. createLockFile's O_CREAT|O_EXCL reports EEXIST for a directory and for
+        // a symlink just as it does for a peer's lock, so acquireLock polled its whole budget and threw, and
+        // threw again on every later call - permanently, since no sweep reclaims this name either
+        // (discardUntrustedDirectoryContents skips it for want of a hash prefix, and sweepTempFiles globs
+        // <hash>*.tmp). For the required directory lock that means persistence is silently dead: every
+        // load()/save() fails, OidcDeviceAuth degrades to "continuing without persistence", and every process
+        // start re-runs the interactive device flow. Ageing them instead would merely delay it by a staleness
+        // window, and a dangling symlink would never age at all - NOFOLLOW stats the link, and the link is as
+        // young as the ln -s that planted it.
+        //
+        // This is also what this file already claims, where discardUntrustedDirectoryContents deliberately
+        // leaves .lock names in place: "acquireLock already treats a hostile or stale one as stealable".
+        if (!Files.isRegularFile(lock, LinkOption.NOFOLLOW_LINKS)) {
+            displaceLockSquatter(lock);
+            return;
+        }
+        // THREE states, not two. readLockHolder hands back the stamp bytes, hands back null for a
+        // legitimately empty or oversized lock, and THROWS when a regular file that IS shaped like a lock
+        // cannot be opened for reading - its mode denies this uid. That throw used to return outright, on the
+        // reasoning that "the create attempt or a peer settles it"; nothing settles it, for the same reason
+        // the shapes above are not settled. It needs no attacker either: a run under a different uid (a
+        // sudo -E start, a re-mapped container uid) killed while holding the lock leaves a 0600 file this uid
+        // cannot read.
+        //
+        // Unlike a squatter this one is genuinely ambiguous - it may be another uid's LIVE lock - so it is not
+        // displaced. Carry "the stamp could not be read" as its own state and let the age check and the
+        // capture-verify below settle it, exactly as they settle an empty one. It is aged on the FULL
+        // staleness window, never the short empty-lock grace: that grace exists for a creator paused inside
+        // createLockFile's own create->stamp window, a state this protocol can genuinely be in for a moment,
+        // and an unreadable file is not.
+        byte[] before = null;
+        boolean beforeStampReadable = false;
         try {
             before = readLockHolder(lock);
+            beforeStampReadable = true;
         } catch (IOException e) {
-            return; // gone or unreadable; nothing to steal here - the create attempt or a peer settles it
+            // leave beforeStampReadable false; the age check and the capture-verify below still apply
         }
         // Read the stamp first, then the mtime: if a peer replaces the lock in between, the fresh mtime keeps
         // us from proceeding. Preserve the exact mtime for the capture verification too. The directory-lock
         // heartbeat changes metadata rather than the owner stamp, so comparing only the stamp after capture
         // could discard a live lock that renewed between this age check and the atomic move.
+        //
+        // NOFOLLOW_LINKS: stat the NAME, not whatever it points at. A dangling symlink squatting the lock name
+        // has no target to stat, so the link-following default threw here and returned - the second route into
+        // the same permanent wedge. It also keeps the before/after mtimes describing one object across the
+        // capture, since the rename moves the link itself rather than its target.
         final FileTime beforeModified;
         try {
-            beforeModified = Files.getLastModifiedTime(lock);
+            beforeModified = Files.getLastModifiedTime(lock, LinkOption.NOFOLLOW_LINKS);
         } catch (IOException e) {
-            return; // cannot determine the age; do not steal
+            return; // the name is gone, or the directory is unreadable; nothing to age or steal
         }
-        final long staleThresholdMillis = before != null ? staleMillis : emptyLockStealGraceMillis;
+        final long staleThresholdMillis = beforeStampReadable && before == null
+                ? emptyLockStealGraceMillis
+                : staleMillis;
         if (System.currentTimeMillis() - beforeModified.toMillis() <= staleThresholdMillis) {
             return;
         }
-        if (before == null) {
+        if (beforeStampReadable && before == null) {
             // an empty/unreadable lock is almost never a validly-held lock: acquireLock creates the lock and
             // stamps the owner nonce onto the same open channel (createLockFile via CREATE_NEW), so a live lock
             // carries its stamp within the tiny create->stamp window. An empty lock therefore means either a
@@ -1750,27 +1845,40 @@ public final class FileTokenStore implements TokenStore {
             // leave the lock for the staleness path. Either way we have not removed a peer's live lock.
             return;
         }
+        // Read the stamp and the mtime in SEPARATE try blocks. Folding them into one (as this did) meant a
+        // stamp read that throws skipped the mtime read with it, leaving afterModified null - harmless while
+        // an unreadable stamp returned before ever reaching the capture, but with that state now carried here
+        // it would make every such capture unconfirmable and restore the very shape we are reclaiming.
         byte[] after = null;
-        FileTime afterModified = null;
-        boolean afterReadOk = false;
+        boolean afterStampReadable = false;
         try {
             after = readLockHolder(captured);
-            afterModified = Files.getLastModifiedTime(captured);
-            afterReadOk = true;
+            afterStampReadable = true;
         } catch (IOException ignore) {
-            // captured but cannot re-read its stamp or mtime; treated as a non-match below, so we restore
+            // still unreadable after the capture; matched against beforeStampReadable below
         }
-        // Confirm we captured the same stamp AND mtime we judged stale (or the same empty/oversized junk), not
-        // a peer's replacement or a live directory lock renewed in the gap. afterReadOk is load-bearing and
-        // separate from "after == null": readLockHolder returns null for a legitimately empty or oversized
-        // lock but THROWS on an IO error, and folding those together would complete a steal on the strength of
-        // an IO error rather than on evidence the lock was unchanged.
-        final boolean confirmedStale = afterReadOk
+        FileTime afterModified = null;
+        try {
+            afterModified = Files.getLastModifiedTime(captured, LinkOption.NOFOLLOW_LINKS);
+        } catch (IOException ignore) {
+            // captured but cannot re-stat it; treated as a non-match below, so we restore
+        }
+        // Confirm we captured the same stamp AND mtime we judged stale (or the same empty/oversized junk, or
+        // the same unreadable shape), not a peer's replacement or a live directory lock renewed in the gap.
+        //
+        // Readability is part of that identity, which is why beforeStampReadable is compared rather than
+        // folded into "before == null": readLockHolder returns null for a legitimately empty or oversized lock
+        // but THROWS on an IO error, and treating those alike would complete a steal on the strength of an IO
+        // error rather than on evidence the name was unchanged. It cuts both ways here - a name that could not
+        // be read before the capture but yields a stamp after it is not what we judged stale, so we restore.
+        final boolean confirmedStale = afterModified != null
+                && beforeStampReadable == afterStampReadable
                 // The heartbeat and age calculation both operate at millisecond precision. Compare at that
                 // same precision so a filesystem that normalizes sub-millisecond metadata during the atomic
                 // rename does not make every genuinely abandoned lock look renewed.
                 && beforeModified.toMillis() == afterModified.toMillis()
-                && (before == null ? after == null : Arrays.equals(before, after));
+                && (!beforeStampReadable
+                        || (before == null ? after == null : Arrays.equals(before, after)));
         if (confirmedStale) {
             // genuinely the abandoned lock: drop it, so the next createLockFile can claim a fresh one
             deleteCapturedLock(captured);

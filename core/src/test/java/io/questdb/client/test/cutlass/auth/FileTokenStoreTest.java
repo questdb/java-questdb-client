@@ -3008,6 +3008,77 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testADirectorySquattingTheDirectoryLockNameIsDisplaced() throws Exception {
+        assertSquattedDirectoryLockIsReclaimed("a directory", Files::createDirectory);
+    }
+
+    @Test
+    public void testADanglingSymlinkSquattingTheDirectoryLockNameIsDisplaced() throws Exception {
+        Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertSquattedDirectoryLockIsReclaimed("a dangling symlink",
+                lock -> Files.createSymbolicLink(lock, lock.resolveSibling("no-such-target")));
+    }
+
+    @Test
+    public void testAnUnreadableStaleLockIsStolenRatherThanWedgingPersistence() throws Exception {
+        Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Assume.assumeFalse("root reads every file, so an unreadable lock cannot be modelled here",
+                "root".equals(System.getProperty("user.name")));
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            FileTokenStore store = new FileTokenStore(dir);
+            TokenStoreKey key = sampleKey();
+            store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            // The shape a run under a DIFFERENT uid leaves when it is killed holding the lock: correctly
+            // shaped and correctly named, but with a mode that denies this uid the stamp read. No attacker
+            // needed - a sudo -E start or a re-mapped container uid produces it. Unlike a squatter it is
+            // genuinely ambiguous (it may be a live holder's), so it is aged rather than displaced on sight;
+            // backdate it well past both staleness windows.
+            Path directoryLock = dir.resolve(".store.lock");
+            // Backdate BEFORE the chmod: setLastModifiedTime opens the file, so it cannot touch a mode-000 one
+            // even when we own it.
+            Files.write(directoryLock, "another-uids-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setLastModifiedTime(directoryLock, FileTime.fromMillis(System.currentTimeMillis() - 3_600_000L));
+            Files.setPosixFilePermissions(directoryLock, PosixFilePermissions.fromString("---------"));
+
+            PersistedToken loaded = new FileTokenStore(dir).load(key);
+            Assert.assertNotNull("an abandoned unreadable directory lock must not wedge persistence", loaded);
+            Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+            Assert.assertFalse("the stale unreadable lock must be stolen and released",
+                    Files.exists(directoryLock, LinkOption.NOFOLLOW_LINKS));
+        });
+    }
+
+    @Test
+    public void testAnUnreadableFreshLockIsNotStolen() throws Exception {
+        Assume.assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Assume.assumeFalse("root reads every file, so an unreadable lock cannot be modelled here",
+                "root".equals(System.getProperty("user.name")));
+        assertMemoryLeak(() -> {
+            // The safety property the ageing buys, and the reason an unreadable lock is not displaced the way
+            // a directory or a symlink is: another uid's LIVE lock is equally unreadable to us, and only its
+            // age tells it apart from the abandoned one above. Stealing it would admit two holders and
+            // double-POST one rotating refresh token.
+            Path dir = storeDir();
+            createStoreDir(dir);
+            TokenStoreKey key = sampleKey();
+            Path lock = lockFile(dir, key);
+            Files.write(lock, "live-owner-stamp".getBytes(StandardCharsets.UTF_8));
+            Files.setPosixFilePermissions(lock, PosixFilePermissions.fromString("---------"));
+
+            FileTokenStore store = new FileTokenStore(dir, 3_000, 60_000);
+            Method stealIfStale = FileTokenStore.class.getDeclaredMethod("stealIfStale", Path.class);
+            stealIfStale.setAccessible(true);
+            stealIfStale.invoke(store, lock);
+
+            Assert.assertTrue("a fresh unreadable lock may be a live holder's and must not be stolen",
+                    Files.exists(lock, LinkOption.NOFOLLOW_LINKS));
+            assertNoCaptureTempFiles(dir, key);
+        });
+    }
+
+    @Test
     public void testSweepDoesNotDeleteStealCapturedLock() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -3125,6 +3196,46 @@ public class FileTokenStoreTest {
                 Assert.fail("a steal must not leak a capture temp file: " + p.getFileName());
             }
         }
+    }
+
+    /**
+     * A shape this store never writes, sitting on the required {@code .store.lock} name, must be displaced on
+     * sight rather than waited out. {@code CREATE_NEW} reports EEXIST for a directory and for a symlink
+     * exactly as it does for a peer's live lock, so acquireLock spends its whole budget and throws - and
+     * throws again on every later call, since nothing reclaims that name (it carries no hash prefix, so the
+     * untrusted sweep skips it, and it is not a {@code *.tmp}). Persistence then dies silently: load() and
+     * save() both fail, OidcDeviceAuth degrades to "continuing without persistence", and every process start
+     * re-runs the interactive device flow - a hard failure for the headless consumer this feature exists for.
+     */
+    private void assertSquattedDirectoryLockIsReclaimed(String shape, LockPlanter planter) throws Exception {
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            TokenStoreKey key = sampleKey();
+            new FileTokenStore(dir).save(key, sampleToken("ACCESS-1", "REFRESH-1"));
+
+            Path directoryLock = dir.resolve(".store.lock");
+            planter.plant(directoryLock);
+            Assert.assertFalse("the fixture must leave a NON-regular shape at the lock name [" + shape + ']',
+                    Files.isRegularFile(directoryLock, LinkOption.NOFOLLOW_LINKS));
+
+            // On the FIRST call, not after a staleness window: a squatter is not a lock and no wait turns it
+            // into one. A dangling symlink would never age out at all, since NOFOLLOW stats the link and the
+            // link is exactly as young as the planting above.
+            PersistedToken loaded = new FileTokenStore(dir).load(key);
+            Assert.assertNotNull("persistence must survive " + shape + " squatting the directory lock", loaded);
+            Assert.assertEquals("REFRESH-1", loaded.getRefreshToken());
+            Assert.assertFalse("the squatter must be gone from the lock name [" + shape + ']',
+                    Files.exists(directoryLock, LinkOption.NOFOLLOW_LINKS));
+
+            // and the store is fully usable afterwards, not merely readable once
+            new FileTokenStore(dir).save(key, sampleToken("ACCESS-2", "REFRESH-2"));
+            Assert.assertEquals("REFRESH-2", new FileTokenStore(dir).load(key).getRefreshToken());
+        });
+    }
+
+    @FunctionalInterface
+    private interface LockPlanter {
+        void plant(Path lock) throws IOException;
     }
 
     private static void awaitInside(Thread t, String method) throws InterruptedException {
