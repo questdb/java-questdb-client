@@ -253,6 +253,11 @@ public final class FileTokenStore implements TokenStore {
     // to reach stealIfStale from the separate test module.
     @TestOnly
     private volatile Runnable beforeCaptureHook;
+    // Test seam, null in production: runs after restrictToOwner has read a loose directory's permissions but
+    // before its chmod. A test removes the directory here so the real setPosixFilePermissions call fails,
+    // pinning that the success warning and its once-per-JVM latch happen only after a completed syscall.
+    @TestOnly
+    private volatile Runnable beforeDirectoryTightenHook;
     // Test seam, null in production: runs at the top of discardUntrustedDirectoryContents, in the window
     // AFTER restrictToOwner has tightened the directory to 0700 and dropped the untrusted sentinel but
     // BEFORE the sweep clears it. The directory recovery lock is held while this fires, so a concurrent load
@@ -1612,17 +1617,26 @@ public final class FileTokenStore implements TokenStore {
                 // still bars a torn or forged credential.
                 markUntrusted();
             }
-            if (!DIR_PERMS.equals(perms)) {
+            // Any group/other bit is looser than owner-only and must be removed. Test containment rather than
+            // exact equality: 0500, 0600 and other owner-only subsets are already at least as strict as 0700;
+            // assigning DIR_PERMS to them would silently WIDEN access by adding missing owner permissions.
+            if (!DIR_PERMS.containsAll(perms)) {
                 // Tightening is load-bearing - it IS the at-rest protection of the plaintext token files, so
                 // it stays unconditional - but it changes a directory the operator chose and may share with
-                // something else, so it must not be silent. Once per JVM, and never naming the path.
+                // something else, so it must not be silent. Announce only AFTER chmod succeeds: consuming the
+                // once-per-JVM latch first would claim a change that did not happen and suppress the warning
+                // for the next directory that is genuinely tightened. Never name the path.
+                final Runnable hook = beforeDirectoryTightenHook;
+                if (hook != null) {
+                    hook.run();
+                }
+                Files.setPosixFilePermissions(directory, DIR_PERMS);
                 if (warnedTightenedStoreDir.compareAndSet(false, true)) {
                     LOG.warn("the OIDC token store directory was not owner-only and has been tightened to "
                             + "0700; it holds plaintext refresh tokens, so it must not be shared with "
                             + "anything else. Point questdb.client.oidc.token.store.dir at a directory of "
                             + "its own if another tool needs access to that path.");
                 }
-                Files.setPosixFilePermissions(directory, DIR_PERMS);
             }
             // Trusted only when the directory was never other-writable AND no un-swept untrusted sentinel
             // remains - the one just dropped above, one a concurrent caller is mid-sweep on, or one a previous

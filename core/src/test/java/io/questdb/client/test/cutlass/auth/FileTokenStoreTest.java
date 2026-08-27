@@ -47,6 +47,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
@@ -2408,6 +2409,106 @@ public class FileTokenStoreTest {
     }
 
     @Test
+    public void testOwnerOnlyPermissionSubsetsAreNotWidenedTo0700() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to inspect and preserve strict directory modes",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            FileTokenStore store = new FileTokenStore(dir);
+            Method restrictToOwner = FileTokenStore.class.getDeclaredMethod("restrictToOwner");
+            restrictToOwner.setAccessible(true);
+            try {
+                for (String mode : new String[]{"r-x------", "rw-------"}) {
+                    Set<PosixFilePermission> expected = PosixFilePermissions.fromString(mode);
+                    Files.setPosixFilePermissions(dir, expected);
+                    restrictToOwner.invoke(store);
+                    Assert.assertEquals("an already-owner-only " + mode
+                                    + " directory must not gain missing owner permissions",
+                            expected, Files.getPosixFilePermissions(dir));
+                }
+            } finally {
+                // Leave the temporary-folder rule enough access to delete the directory tree.
+                Files.setPosixFilePermissions(dir, OWNER_ONLY_DIR_PERMS);
+            }
+        });
+    }
+
+    @Test
+    public void testTightenWarningIsLatchedOnlyAfterChmodSucceeds() throws Exception {
+        Assume.assumeTrue("POSIX permissions are needed to force and observe the chmod",
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        assertMemoryLeak(() -> {
+            Field latchField = FileTokenStore.class.getDeclaredField("warnedTightenedStoreDir");
+            latchField.setAccessible(true);
+            AtomicBoolean latch = (AtomicBoolean) latchField.get(null);
+            boolean latchWasSet = latch.getAndSet(false);
+
+            Path dir = storeDir();
+            Files.createDirectories(dir);
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
+            FileTokenStore store = new FileTokenStore(dir);
+            Method restrictToOwner = FileTokenStore.class.getDeclaredMethod("restrictToOwner");
+            restrictToOwner.setAccessible(true);
+            Field hookField = FileTokenStore.class.getDeclaredField("beforeDirectoryTightenHook");
+            hookField.setAccessible(true);
+
+            ch.qos.logback.classic.Logger storeLogger = (ch.qos.logback.classic.Logger)
+                    org.slf4j.LoggerFactory.getLogger(FileTokenStore.class);
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                    new ch.qos.logback.core.read.ListAppender<>();
+            appender.start();
+            ch.qos.logback.classic.Level savedLevel = storeLogger.getLevel();
+            storeLogger.setLevel(ch.qos.logback.classic.Level.ALL);
+            storeLogger.addAppender(appender);
+            try {
+                // Remove the empty directory after restrictToOwner has statted it but before the real chmod.
+                // setPosixFilePermissions then throws NoSuchFileException, deterministically exercising the
+                // syscall-failure ordering without a synthetic FileSystemProvider.
+                hookField.set(store, (Runnable) () -> {
+                    try {
+                        Files.delete(dir);
+                    } catch (IOException e) {
+                        throw new AssertionError("could not remove the directory before chmod", e);
+                    }
+                });
+                try {
+                    restrictToOwner.invoke(store);
+                    Assert.fail("chmod on the removed directory must fail");
+                } catch (InvocationTargetException e) {
+                    Assert.assertTrue("the real chmod failure must propagate, got: " + e.getCause(),
+                            e.getCause() instanceof NoSuchFileException);
+                }
+                Assert.assertFalse("a failed chmod must not consume the one-time success-warning latch",
+                        latch.get());
+                Assert.assertEquals("a failed chmod must not announce a completed tighten",
+                        0, countTightenWarnings(appender));
+
+                hookField.set(store, null);
+                Files.createDirectories(dir);
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
+                restrictToOwner.invoke(store);
+
+                Assert.assertEquals("the later directory must genuinely be tightened",
+                        OWNER_ONLY_DIR_PERMS, Files.getPosixFilePermissions(dir));
+                Assert.assertTrue("a successful chmod must consume the warning latch", latch.get());
+                Assert.assertEquals("the successful tighten after a failure must still be announced once",
+                        1, countTightenWarnings(appender));
+            } finally {
+                hookField.set(store, null);
+                storeLogger.detachAppender(appender);
+                storeLogger.setLevel(savedLevel);
+                appender.stop();
+                latch.set(latchWasSet);
+                if (!Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) {
+                    Files.createDirectories(dir);
+                }
+                Files.setPosixFilePermissions(dir, OWNER_ONLY_DIR_PERMS);
+            }
+        });
+    }
+
+    @Test
     public void testLoadTrustsAWorldREADABLEDirectory() throws Exception {
         Assume.assumeTrue("POSIX permissions are needed to loosen the store directory",
                 FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
@@ -2983,6 +3084,19 @@ public class FileTokenStoreTest {
             Files.write(tokenFile(dir, key), tampered.getBytes(StandardCharsets.UTF_8));
             Assert.assertNull("a version that truncates to 1 as an int must be rejected", store.load(key));
         });
+    }
+
+    private static int countTightenWarnings(
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender
+    ) {
+        int warnings = 0;
+        for (ch.qos.logback.classic.spi.ILoggingEvent event : appender.list) {
+            if (event.getFormattedMessage().contains(
+                    "the OIDC token store directory was not owner-only and has been tightened to 0700")) {
+                warnings++;
+            }
+        }
+        return warnings;
     }
 
     private static TokenStoreKey sampleKey() {
