@@ -1350,6 +1350,11 @@ public final class CursorSendEngine implements QuietCloseable {
     }
 
     @TestOnly
+    public Runnable getSlotLockReleaseListenerForTesting() {
+        return slotLockReleaseListener;
+    }
+
+    @TestOnly
     public long getSyncIntervalNanosForTesting() {
         return syncIntervalNanos;
     }

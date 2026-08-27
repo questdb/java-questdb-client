@@ -417,7 +417,8 @@ public class QwpWebSocketSender implements Sender {
     // Engine whose close() could not complete during sender close() — its
     // cleanup is pending on a worker/I/O-thread exit path. isSlotLockReleased()
     // re-probes it so a late flock release becomes visible to the owning pool.
-    // Only ever set inside close(); null for a sender that closed cleanly.
+    // Set by close() and by a recycle whose deferred-close await ran out; null
+    // while no engine is retained.
     private volatile CursorSendEngine retainedEngine;
     private int pendingRowCount;
     private SenderProgressDispatcher progressDispatcher;
@@ -1575,8 +1576,9 @@ public class QwpWebSocketSender implements Sender {
      * Not a one-shot snapshot: when close() left engine cleanup pending on a
      * manager-worker quiescence or I/O-thread exit path, this re-probes the
      * retained engine and latches true the moment that cleanup completes — pools re-probe retired
-     * slots through this getter to recover their capacity. Monotonic:
-     * false→true only, never back. Cheap (volatile reads on every common
+     * slots through this getter to recover their capacity. Reset to false by a
+     * recycle that rebuilds the engine (the fresh engine holds the flock
+     * again); otherwise latches false→true. Cheap (volatile reads on every common
      * path) so pools may call it under their capacity lock; only the rare
      * orphaned-retry state below does more.
      * <p>
@@ -4923,12 +4925,19 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
-    private static void closeQuietly(CursorSendEngine engine) {
+    private void closeRecoveredEngine(CursorSendEngine recovered) {
+        recyclePendingOutgoing = recovered;
         try {
-            engine.close();
-        } catch (Throwable ignored) {
-            // best-effort; the retained files are the next rebuild's problem
+            recovered.close();
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable t) {
+            LOG.warn("recovered engine close reported a failure during the symbol dictionary "
+                    + "recycle; deferring to the close-completion probe", t);
         }
+        awaitDeferredEngineClose(recovered);
+        recyclePendingOutgoing = null;
+        retainedEngine = null;
     }
 
     /**
@@ -4962,7 +4971,7 @@ public class QwpWebSocketSender implements Sender {
             if (rebuilt.publishedFsn() > rebuilt.ackedFsn()) {
                 throw latchRecycleBreach(rebuilt, dictSizeAtSwap);
             }
-            closeQuietly(rebuilt); // fully drained: retries the segment unlink
+            closeRecoveredEngine(rebuilt); // fully drained: retries the segment unlink
             rebuilt = rebuildEngineOrAbandon(
                     "symbol dictionary recycle could not rebuild its engine after healing "
                             + "leftover acked segments; retried on the next send");
@@ -4973,7 +4982,7 @@ public class QwpWebSocketSender implements Sender {
                 if (rebuilt.publishedFsn() > rebuilt.ackedFsn()) {
                     throw latchRecycleBreach(rebuilt, dictSizeAtSwap);
                 }
-                closeQuietly(rebuilt);
+                closeRecoveredEngine(rebuilt);
                 throw new LineSenderException(
                         "symbol dictionary recycle keeps recovering leftover acked segments "
                                 + "(slot cleanup not durable yet); retried on the next send");
@@ -5006,9 +5015,9 @@ public class QwpWebSocketSender implements Sender {
         cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
-        // The fresh engine holds the slot flock again; step 3's release
-        // flipped slotLockReleased true via the outgoing engine's
-        // listener, which no longer describes this sender's state.
+        // The fresh engine holds the slot flock again; a stale true (an
+        // isSlotLockReleased() re-probe of the outgoing engine while the
+        // recycle stayed pending) no longer describes this sender's state.
         slotLockReleased = false;
         recycleResume = RecycleResume.NONE;
         recyclePendingLastPublishedFsn = -1L;
@@ -5069,7 +5078,17 @@ public class QwpWebSocketSender implements Sender {
                         + "was breached");
         recycleFailure = breach;
         recycleResume = RecycleResume.NONE;
-        closeQuietly(rebuilt);
+        try {
+            rebuilt.close();
+        } catch (Error e) {
+            throw e;
+        } catch (Throwable ignored) {
+            // terminal either way; the retained-engine probe below covers a deferred close
+        }
+        if (!rebuilt.isCloseCompleted()) {
+            retainedEngine = rebuilt;
+            slotLockReleased = false;
+        }
         LOG.error("symbol dictionary recycle failed; sender is now terminal "
                 + "[epoch={}, dictSizeAtSwap={}]", symbolDictEpoch, dictSizeAtSwap, breach);
         throw breach;
@@ -5298,6 +5317,7 @@ public class QwpWebSocketSender implements Sender {
         recyclePendingOutgoing = outgoing;
         recyclePendingLastPublishedFsn = lastPublishedFsn;
         try {
+            outgoing.setSlotLockReleaseListener(null);
             outgoing.close();
         } catch (Error e) {
             throw e;

@@ -47,9 +47,11 @@ import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
@@ -148,6 +150,164 @@ public class SymbolDictRecycleSlotHealTest {
                     Assert.assertTrue("post-recycle FSN must exceed pre-recycle FSN "
                             + "[fsn1=" + fsn1 + ", fsn2=" + fsn2 + ']', fsn2 > fsn1);
                 }
+            }
+        });
+    }
+
+    /**
+     * The heal closes the engine that recovered the leftovers. When that engine's
+     * SF worker is wedged, its close returns with the slot flock retained, exactly
+     * like the outgoing engine's close in step 3 -- and must be awaited the same
+     * way, or rebuild #2 collides with the retained flock.
+     */
+    @Test(timeout = 60_000L)
+    public void testHealRidesOutADeferredCloseOfTheRecoveredEngine() throws Exception {
+        assertMemoryLeak(() -> {
+            String doctoredSlot = temporaryFolder.getRoot().toPath().resolve("doctored-deferred").toString();
+            prepareFullyAckedLeftoverSlot(doctoredSlot);
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("heal-deferred-sf").toString();
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicReference<Throwable> auxErr = new AtomicReference<>();
+            Thread releaser = null;
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig(config(server, sfDir))) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                    AtomicInteger rebuilds = new AtomicInteger();
+                    ws.setEngineRebuildFactory(() -> {
+                        CursorSendEngine engine = new CursorSendEngine(doctoredSlot, SEGMENT_BYTES);
+                        if (rebuilds.incrementAndGet() == 1) {
+                            // Wedge the RECOVERED engine's worker so the heal's close defers.
+                            SegmentManager manager = engine.getManagerForTesting();
+                            manager.setBeforeTrimSyncHook(() -> {
+                                workerBlocked.countDown();
+                                try {
+                                    if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                        auxErr.compareAndSet(null, new AssertionError("worker never released"));
+                                    }
+                                } catch (Throwable t) {
+                                    auxErr.compareAndSet(null, t);
+                                }
+                            });
+                            manager.wakeWorker();
+                            try {
+                                Assert.assertTrue("worker never reached the wedge hook",
+                                        workerBlocked.await(5, TimeUnit.SECONDS));
+                            } catch (InterruptedException e) {
+                                throw new RuntimeException(e);
+                            }
+                            manager.setWorkerJoinTimeoutMillis(50L);
+                        }
+                        return engine;
+                    });
+
+                    CountDownLatch parked = new CountDownLatch(1);
+                    ws.setDeferredCloseParkWitnessForTesting(parked::countDown);
+                    releaser = new Thread(() -> {
+                        try {
+                            Assert.assertTrue("the heal's close must park in the deferred-close await",
+                                    parked.await(10, TimeUnit.SECONDS));
+                        } catch (Throwable t) {
+                            auxErr.compareAndSet(null, t);
+                        } finally {
+                            releaseWorker.countDown();
+                        }
+                    }, "heal-deferred-close-releaser");
+                    releaser.start();
+
+                    sender.resetSymbolDictionary();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+
+                    Assert.assertEquals("heal must close the recovered engine and rebuild again", 2, rebuilds.get());
+                    Assert.assertEquals("the recycle must have committed", 1, ws.getSymbolDictEpoch());
+                    Assert.assertFalse(ws.getCursorEngineForTesting().wasRecoveredFromDisk());
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                } finally {
+                    releaseWorker.countDown();
+                    if (releaser != null) {
+                        releaser.join(10_000);
+                    }
+                }
+            }
+            if (auxErr.get() != null) {
+                throw new AssertionError(auxErr.get());
+            }
+        });
+    }
+
+    /**
+     * When the recovered engine's deferred close outlives the await budget, the
+     * recycle must retain that engine exactly like an outgoing engine: close()
+     * must not report the slot flock released while the wedged worker still
+     * holds it, and the re-probe must latch once the worker exits.
+     */
+    @Test(timeout = 60_000L)
+    public void testHealDeferredCloseExhaustionRetainsTheRecoveredEngine() throws Exception {
+        assertMemoryLeak(() -> {
+            String doctoredSlot = temporaryFolder.getRoot().toPath().resolve("doctored-retained").toString();
+            prepareFullyAckedLeftoverSlot(doctoredSlot);
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("heal-retained-sf").toString();
+            CountDownLatch workerBlocked = new CountDownLatch(1);
+            CountDownLatch releaseWorker = new CountDownLatch(1);
+            AtomicReference<Throwable> auxErr = new AtomicReference<>();
+            try (TestWebSocketServer server = ackingServer()) {
+                QwpWebSocketSender ws = (QwpWebSocketSender) Sender.fromConfig(config(server, sfDir));
+                try {
+                    ws.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(ws.awaitAckedFsn(ws.flushAndGetSequence(), 5_000));
+
+                    ws.setEngineRebuildFactory(() -> {
+                        CursorSendEngine engine = new CursorSendEngine(doctoredSlot, SEGMENT_BYTES);
+                        SegmentManager manager = engine.getManagerForTesting();
+                        manager.setBeforeTrimSyncHook(() -> {
+                            workerBlocked.countDown();
+                            try {
+                                if (!releaseWorker.await(30, TimeUnit.SECONDS)) {
+                                    auxErr.compareAndSet(null, new AssertionError("worker never released"));
+                                }
+                            } catch (Throwable t) {
+                                auxErr.compareAndSet(null, t);
+                            }
+                        });
+                        manager.wakeWorker();
+                        try {
+                            Assert.assertTrue("worker never reached the wedge hook",
+                                    workerBlocked.await(5, TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        }
+                        manager.setWorkerJoinTimeoutMillis(50L);
+                        return engine;
+                    });
+                    ws.setRecycleDeferredCloseMaxWaitMillisForTesting(150L);
+
+                    ws.resetSymbolDictionary();
+                    try {
+                        ws.table("t");
+                        Assert.fail("the exhausted await must throw a resumable failure");
+                    } catch (LineSenderException expected) {
+                        Assert.assertTrue(expected.getMessage(),
+                                expected.getMessage().contains("could not yet reclaim its slot"));
+                    }
+                    Assert.assertEquals("the swap must not have committed", 0, ws.getSymbolDictEpoch());
+                } finally {
+                    ws.close();
+                }
+                Assert.assertFalse("close() must not report the flock released while the recovered "
+                        + "engine's wedged worker still holds it", ws.isSlotLockReleased());
+
+                releaseWorker.countDown();
+                long deadline = System.currentTimeMillis() + 10_000;
+                while (!ws.isSlotLockReleased() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(10);
+                }
+                Assert.assertTrue("the re-probe must latch once the worker exits", ws.isSlotLockReleased());
+            }
+            if (auxErr.get() != null) {
+                throw new AssertionError(auxErr.get());
             }
         });
     }

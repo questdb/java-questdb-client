@@ -302,6 +302,41 @@ public class SymbolDictRecycleDeferredCloseTest {
     }
 
     /**
+     * The outgoing engine's slot-lock listener is the sender's own
+     * onSlotLockReleased. Left attached, a release that completes after step 6
+     * (a preempted retry thread between closeCompleted = true and listener.run())
+     * would mark the REBUILT engine's flock released. Step 3 detaches it.
+     */
+    @Test(timeout = 60_000L)
+    public void testRecycleDetachesTheOutgoingEngineListener() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("recycle-detach-listener").toString();
+            try (TestWebSocketServer server = ackingServer()) {
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                    CursorSendEngine outgoing = ws.getCursorEngineForTesting();
+                    Assert.assertNotNull("the live engine carries the sender's listener",
+                            outgoing.getSlotLockReleaseListenerForTesting());
+
+                    sender.resetSymbolDictionary();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+
+                    Assert.assertNull("step 3 must detach the outgoing engine's listener",
+                            outgoing.getSlotLockReleaseListenerForTesting());
+                    Assert.assertNotNull("the rebuilt engine carries the listener instead",
+                            ws.getCursorEngineForTesting().getSlotLockReleaseListenerForTesting());
+                    Assert.assertFalse("the rebuilt engine holds the flock", ws.isSlotLockReleased());
+                }
+            }
+        });
+    }
+
+    /**
      * The await budget runs out while the worker is still wedged, but the
      * wedge is transient after all. Exhausting the budget must NOT latch the
      * sender terminal (review r3, C2): the recycle stays pending in its
