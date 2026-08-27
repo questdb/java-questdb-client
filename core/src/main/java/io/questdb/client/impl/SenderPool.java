@@ -760,10 +760,12 @@ public final class SenderPool implements AutoCloseable {
      * minutes-long block a {@code reconnect_*}-tuned config used to cause (M1).
      * One residual window remains and is NOT closed here: a single in-flight
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
-     * (the transport exposes no application-level connect timeout to clamp it),
-     * and unlike the credential pull that a token provider adds ahead of it - a
-     * wait of up to six times httpTimeoutMillis plus a token-store lock wait -
-     * it blocks in a syscall that the stop path's interrupt cannot break.
+     * (the transport exposes no application-level connect timeout to clamp it)
+     * and the stop path's interrupt cannot break that syscall. Only a deferred,
+     * PoolHousekeeper-driven pool can carry a token provider: QuestDBImpl is the
+     * sole caller of that constructor and passes {@code deferStartupRecovery=true}.
+     * Its potentially much longer credential pull is therefore interrupted by
+     * {@link PoolHousekeeper#stop()}, never by this pool's private-driver stop.
      * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly
      * after {@code close()} returns. No data is lost (the slot stays durable on
@@ -1708,31 +1710,33 @@ public final class SenderPool implements AutoCloseable {
             if (beforeStartupRecoveryJoinHook != null) {
                 beforeStartupRecoveryJoinHook.run();
             }
-            // Interrupt-neutral for the same reason PoolHousekeeper.stop() is, and it matters twice over
-            // here: stop() runs FIRST from QuestDBImpl.close() and re-asserts the caller's flag on its way
-            // out, so without this the join below is GUARANTEED to throw at 0 ms and skip the escalation
-            // whenever the caller arrived interrupted. One carried flag would otherwise disable both
-            // escalations, leaving the recoverer holding its slot flock after close() returns.
+            // A private startup-recovery driver and a token provider are mutually exclusive by construction:
+            // QuestDBImpl passes deferStartupRecovery=true on the only path that supplies a provider. This
+            // escalation therefore does NOT break credential pulls (PoolHousekeeper.stop() owns that live
+            // protection). It is still a last resort for an unexpected interruptible overrun in a direct
+            // driver's build, drain, or teardown after the closed signal and normal unpark failed to stop it.
+            //
+            // Keep the whole two-join protocol interrupt-neutral. A carried caller flag, or an interrupt
+            // delivered DURING the first join, must be remembered without jumping past the target interrupt
+            // and second join; restore it only once the shutdown protocol has completed.
             boolean callerWasInterrupted = Thread.interrupted();
             try {
-                startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                        startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
                 if (startupRecoveryThread.isAlive()) {
-                    // Same escalation, and for the same reason, as PoolHousekeeper.stop(): the closed flag
-                    // reaches the driver only between steps, so a step blocked inside a recovery build's
-                    // credential pull outlives this join and returns while still holding the slot flock.
-                    // The pull's waits are interruptible, so an interrupt unwinds it and lets the driver
-                    // release the flock before close() returns.
+                    // The closed flag reaches the driver only between operations. Interrupt an overrun and
+                    // spend a second bounded join giving its finally/close path time to release the slot flock.
                     startupRecoveryThread.interrupt();
-                    startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                    callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                            startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
                 }
-            } catch (InterruptedException e) {
-                callerWasInterrupted = true;
-            }
-            if (afterStartupRecoveryJoinHook != null) {
-                afterStartupRecoveryJoinHook.run();
-            }
-            if (callerWasInterrupted) {
-                Thread.currentThread().interrupt();
+                if (afterStartupRecoveryJoinHook != null) {
+                    afterStartupRecoveryJoinHook.run();
+                }
+            } finally {
+                if (callerWasInterrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }

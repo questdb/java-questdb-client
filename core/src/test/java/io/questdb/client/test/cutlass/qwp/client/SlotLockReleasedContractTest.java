@@ -117,10 +117,11 @@ public class SlotLockReleasedContractTest {
      * Interrupt-neutrality: a CARRIED interrupt flag must not turn a healthy {@code close()} into a
      * failed stop.
      * <p>
-     * {@code PoolHousekeeper.stop()} and {@code SenderPool.stopStartupRecoveryDriver()} escalate to
-     * {@code Thread.interrupt()} when their join times out, and the thread they interrupt is the same one
-     * that then runs {@code senderPool.reapIdle()} and the startup-recovery step's {@code finally} --
-     * both of which close a delegate. That makes a carried flag ordinary on this path rather than exotic.
+     * {@code PoolHousekeeper.stop()} interrupts a housekeeper blocked in a pooled credential pull.
+     * {@code SenderPool.stopStartupRecoveryDriver()} has no token provider by construction, but can likewise
+     * interrupt an unexpected overrun in its direct recovery driver. Those threads then run
+     * {@code senderPool.reapIdle()} or a startup-recovery step's {@code finally}, both of which close a
+     * delegate. That makes a carried flag ordinary on this path rather than exotic.
      * <p>
      * It is also fatal if unhandled: {@code CountDownLatch.await(t, u)} tests {@code Thread.interrupted()}
      * before it ever consults the latch, so the shutdown await returns instantly, {@code close()} takes the

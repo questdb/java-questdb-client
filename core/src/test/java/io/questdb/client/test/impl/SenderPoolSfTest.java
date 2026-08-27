@@ -3393,6 +3393,92 @@ public class SenderPoolSfTest {
         }
     }
 
+    @Test(timeout = 30_000)
+    public void testDirectRecoveryCloseStillEscalatesWhenCallerIsInterruptedDuringFirstJoin() throws Exception {
+        createCandidateSlot("default-0");
+        CountDownLatch afterJoin = new CountDownLatch(1);
+        CountDownLatch beforeJoin = new CountDownLatch(1);
+        CountDownLatch closeReturned = new CountDownLatch(1);
+        CountDownLatch releaseWait = new CountDownLatch(1);
+        CountDownLatch targetInterrupted = new CountDownLatch(1);
+        CountDownLatch waitEntered = new CountDownLatch(1);
+        AtomicBoolean callerInterruptRestored = new AtomicBoolean();
+        AtomicBoolean driverAliveAfterJoin = new AtomicBoolean();
+        AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+        IntFunction<Sender> senderFactory = idx -> {
+            throw new LineSenderException("injected recovery failure");
+        };
+        Runnable recoveryWaiter = () -> {
+            waitEntered.countDown();
+            try {
+                releaseWait.await();
+            } catch (InterruptedException e) {
+                targetInterrupted.countDown();
+                Thread.currentThread().interrupt();
+            }
+        };
+
+        SenderPool pool = newPoolWithRecoveryControls(
+                "ws::addr=localhost:1;sf_dir=" + sfDir + ";",
+                0, 1, 0, senderFactory, null, recoveryWaiter, null);
+        Thread recoveryThread = pool.getStartupRecoveryThreadForTesting();
+        pool.setStartupRecoveryJoinHooksForTesting(
+                beforeJoin::countDown,
+                () -> {
+                    driverAliveAfterJoin.set(recoveryThread.isAlive());
+                    afterJoin.countDown();
+                });
+        Thread closeThread = new Thread(() -> {
+            try {
+                pool.close();
+                callerInterruptRestored.set(Thread.currentThread().isInterrupted());
+            } catch (Throwable t) {
+                closeFailure.set(t);
+            } finally {
+                closeReturned.countDown();
+            }
+        }, "test-interrupted-direct-pool-close");
+        try {
+            Assert.assertTrue("the failed recovery must enter its retry wait",
+                    waitEntered.await(10, TimeUnit.SECONDS));
+            closeThread.start();
+            Assert.assertTrue("close must reach the direct-driver join",
+                    beforeJoin.await(10, TimeUnit.SECONDS));
+
+            // Do not merely arrive with a carried flag: wait until close is actually inside the first timed
+            // join, then interrupt it. The old single try/catch jumped straight past target.interrupt() and
+            // the second join in precisely this interleaving.
+            long stateDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (closeThread.getState() != Thread.State.TIMED_WAITING
+                    && System.nanoTime() < stateDeadline) {
+                Thread.yield();
+            }
+            Assert.assertEquals("close never entered the first timed join",
+                    Thread.State.TIMED_WAITING, closeThread.getState());
+            closeThread.interrupt();
+
+            Assert.assertTrue("close must finish after escalating to the recovery driver",
+                    closeReturned.await(10, TimeUnit.SECONDS));
+            Assert.assertTrue("the interrupted first join must not skip the target interrupt",
+                    targetInterrupted.await(1, TimeUnit.SECONDS));
+            Assert.assertTrue("close must complete its second join", afterJoin.await(1, TimeUnit.SECONDS));
+            if (closeFailure.get() != null) {
+                throw new AssertionError("close failed", closeFailure.get());
+            }
+            Assert.assertFalse("the recovery driver must be dead after the second join",
+                    driverAliveAfterJoin.get());
+            Assert.assertFalse("the recovery driver must remain quiescent after close",
+                    recoveryThread.isAlive());
+            Assert.assertTrue("the caller's interrupt must be restored after the shutdown protocol",
+                    callerInterruptRestored.get());
+        } finally {
+            releaseWait.countDown();
+            recoveryThread.interrupt();
+            closeThread.join(TimeUnit.SECONDS.toMillis(10));
+            pool.close();
+        }
+    }
+
     @Test
     public void testDirectRecoveryThreadCreationFailureClosesPrewarmedDelegates() throws Throwable {
         createCandidateSlot("default-2");

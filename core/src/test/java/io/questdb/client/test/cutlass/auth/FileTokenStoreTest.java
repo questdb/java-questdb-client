@@ -1816,16 +1816,21 @@ public class FileTokenStoreTest {
             TokenStoreKey key = sampleKey();
             store.save(key, sampleToken("ACCESS-1", "REFRESH-1"));
 
-            // Files a stranger owns, chosen to sit either side of the shape test: a plain name, a name that
-            // is hex but too short to be a fingerprint, a full-length hex name that is not a fingerprint of
-            // ANY key, and a foreign temp. (No uppercase-hex case: the store renders its digests lowercase,
-            // but on a case-insensitive filesystem such a name is the same file as the real entry, so the
-            // assertion would be about the filesystem rather than about the filter.)
+            // Entries chosen to pin both sides of the shape test: plain and short-hex JSON names must
+            // survive, while a different full-length fingerprint is indistinguishable from an entry this
+            // store wrote for another key and must be discarded with the real entry. The foreign temp pins
+            // the same hash-prefix requirement on the .tmp arm. (No uppercase-hex case: the store renders
+            // its digests lowercase, but on a case-insensitive filesystem such a name is the same file as
+            // the real entry, so the assertion would be about the filesystem rather than about the filter.)
             Path plainJson = dir.resolve("my-important-settings.json");
             Path shortHexJson = dir.resolve("abc123.json");
+            Path otherFingerprintJson = dir.resolve("a".repeat(64) + ".json");
             Path foreignTemp = dir.resolve("scratch-notes.tmp");
+            Assert.assertNotEquals("the full-length fixture must not be the sample key's entry",
+                    tokenFile(dir, key), otherFingerprintJson);
             Files.write(plainJson, "{\"keep\":true}".getBytes(StandardCharsets.UTF_8));
             Files.write(shortHexJson, "{\"keep\":true}".getBytes(StandardCharsets.UTF_8));
+            Files.write(otherFingerprintJson, "{\"discard\":true}".getBytes(StandardCharsets.UTF_8));
             Files.write(foreignTemp, "keep".getBytes(StandardCharsets.UTF_8));
 
             Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxrwxrwx"));
@@ -1839,6 +1844,9 @@ public class FileTokenStoreTest {
                     Files.exists(plainJson));
             Assert.assertTrue("a short hex name is not a 64-char fingerprint: " + shortHexJson.getFileName(),
                     Files.exists(shortHexJson));
+            Assert.assertFalse("a different store-shaped JSON entry must be discarded: "
+                            + otherFingerprintJson.getFileName(),
+                    Files.exists(otherFingerprintJson));
             Assert.assertTrue("a foreign .tmp is not a store write temp: " + foreignTemp.getFileName(),
                     Files.exists(foreignTemp));
         });

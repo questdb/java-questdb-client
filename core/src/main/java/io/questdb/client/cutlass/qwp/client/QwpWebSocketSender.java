@@ -1278,18 +1278,18 @@ public class QwpWebSocketSender implements Sender {
         if (!closed) {
             closed = true;
             // Interrupt-neutral for the duration, the same shape QwpQueryClient.close() and
-            // FileTokenStore.load()/save() use. PoolHousekeeper.stop() and
-            // SenderPool.stopStartupRecoveryDriver() escalate to Thread.interrupt() when their join
-            // times out, and the thread they interrupt is the one that then runs senderPool.reapIdle()
-            // and the startup-recovery step's finally -- both of which close a delegate. A CARRIED flag
-            // is fatal to that close: CountDownLatch.await(t, u) tests Thread.interrupted() before it
+            // FileTokenStore.load()/save() use. PoolHousekeeper.stop() interrupts a housekeeper blocked in
+            // a pooled credential pull, while SenderPool's provider-free private driver may interrupt an
+            // unexpected overrun in a direct recovery operation. The interrupted thread can then run
+            // senderPool.reapIdle() or a startup-recovery step's finally, both of which close a delegate.
+            // A CARRIED flag is fatal to that close: CountDownLatch.await(t, u) tests Thread.interrupted() before it
             // ever consults the latch, so CursorWebSocketSendLoop.close()'s shutdown await would throw
             // having waited 0 ms, take the failed-stop path, and report the SF slot flock still held --
             // the exact outcome the interrupt was added to prevent. Worse, that path re-asserts the
             // flag, so every remaining delegate in the same reap sweep failed the same way.
             //
-            // Clearing it here restores the intended meaning: the interrupt breaks the wait it was
-            // aimed at (a credential pull between steps), and the teardown that follows runs normally.
+            // Clearing it here restores the intended meaning: the interrupt breaks the operation it was
+            // aimed at, and the teardown that follows runs normally.
             // An interrupt delivered DURING this close still lands on the await and still takes the
             // failed-stop branch, which is correct -- that one really is 'we could not join'.
             final boolean wasInterrupted = Thread.interrupted();

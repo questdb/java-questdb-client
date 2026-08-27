@@ -602,14 +602,18 @@ public class LineHttpSenderErrorResponseTest {
     @Test(timeout = 30_000)
     public void testServerJsonErrorControlCharsAreEscaped() throws Exception {
         assertMemoryLeak(() -> {
-            // the server's error body carries control characters as JSON escapes: an ESC and a newline in
-            // the message, and an ESC in the errorId. The lexer decodes them to real bytes, so the sender's
-            // error rendering is what must neutralize them
+            // Feed REAL control bytes into the structured-error fields. JsonLexer currently also decodes
+            // valid JSON escapes, but spelling these as \\u001b/\\n on the wire would let the pre-decoding
+            // implementation pass with drainAndReset's old plain put(): the six printable escape characters
+            // were already safe. Raw bytes make this test discriminate on putAsPrintable itself. The parser
+            // deliberately accepts this malformed-JSON input so the sender can still render a hostile server
+            // response safely.
+            String esc = String.valueOf((char) 0x1b);
             String errorBody = "{"
                     + "\"code\":\"invalid\","
-                    + "\"message\":\"bad\\u001b[m\\nthing\","
+                    + "\"message\":\"bad" + esc + "[m\nthing\","
                     + "\"line\":42,"
-                    + "\"errorId\":\"E\\u001bID\""
+                    + "\"errorId\":\"E" + esc + "ID\""
                     + "}";
             // a chunked 400 with Content-Type application/json drives the flush failure through the sender's
             // JSON error parser (a 4xx response is asserted to be chunked before parsing)
@@ -635,6 +639,8 @@ public class LineHttpSenderErrorResponseTest {
                         // ...but no raw control byte reaches the message: no ESC (ANSI injection) and no
                         // newline (log-line forging); both arrive escaped instead
                         Assert.assertTrue("the decoded ESC must be escaped, not raw: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the decoded newline must be escaped, not raw: " + msg,
+                                msg.contains("\\u000a"));
                         Assert.assertFalse("a raw ESC must not leak into the message: " + msg, msg.indexOf(0x1b) >= 0);
                         Assert.assertFalse("a raw newline must not leak into the message: " + msg, msg.indexOf('\n') >= 0);
                     }

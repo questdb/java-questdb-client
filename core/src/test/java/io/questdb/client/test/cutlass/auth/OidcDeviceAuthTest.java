@@ -29,7 +29,6 @@ import io.questdb.client.cutlass.auth.DeviceAuthorizationChallenge;
 import io.questdb.client.cutlass.auth.DeviceCodePrompt;
 import io.questdb.client.cutlass.auth.OidcAuthException;
 import io.questdb.client.cutlass.auth.OidcDeviceAuth;
-import io.questdb.client.cutlass.json.JsonException;
 import io.questdb.client.cutlass.http.client.Fragment;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.Response;
@@ -2648,25 +2647,21 @@ public class OidcDeviceAuthTest {
         assertMemoryLeak(() -> {
             // A real id_token (a JWT with group claims) runs to several KB, and a single JSON string value
             // can arrive split across HTTP response fragments. OidcDeviceAuth must size its JSON lexer so
-            // such a split value still parses. This mirrors OidcDeviceAuth's production sizing
-            // (JSON_LEXER_CACHE_SIZE / JSON_LEXER_MAX_VALUE_BYTES); the original (1024, 1024) sizing
-            // rejected a >1024-byte split value with "String is too long".
-            String json = "{\"id_token\":\"" + TestUtils.repeat("a", 4000) + "\"}";
-            int len = json.length();
-            int split = "{\"id_token\":\"".length() + 1300; // boundary inside the value, past the old 1024 limit
-            long address = TestUtils.toMemory(json);
-            try {
-                try {
-                    parseSplitValue(1024, address, split, len);
-                    Assert.fail("the original 1024-byte cache limit must reject a split multi-KB token value");
-                } catch (JsonException expected) {
-                    Assert.assertTrue(expected.getFlyweightMessage().toString(),
-                            expected.getFlyweightMessage().toString().contains("String is too long"));
+            // such a split value still parses. Drive the production OidcDeviceAuth instance rather than a
+            // test-local JsonLexer configured with the same literal: reverting JSON_LEXER_MAX_VALUE_BYTES
+            // to its old 1024 value must make this flow fail with "String is too long". MockOidcServer emits
+            // 64-byte HTTP chunks, so the 4 KiB value necessarily exercises the lexer's split-value cache.
+            String idToken = TestUtils.repeat("a", 4000);
+            MockOidcServer.Handler handler = (method, path, body) -> {
+                if (DEVICE_PATH.equals(path)) {
+                    return MockOidcServer.json(200, deviceAuthorizationJson(1, 300));
                 }
-                // the sizing OidcDeviceAuth now uses parses the same split value
-                parseSplitValue(1 << 20, address, split, len);
-            } finally {
-                Unsafe.free(address, len, MemoryTag.NATIVE_DEFAULT);
+                return MockOidcServer.chunkedJson(200, tokenJson("ACCESS-LARGE", idToken, null, 3600));
+            };
+            try (MockOidcServer server = new MockOidcServer(handler);
+                 OidcDeviceAuth auth = newAuth(server, true, noopPrompt())) {
+                Assert.assertEquals("the production lexer must return the complete split id_token",
+                        idToken, auth.signIn());
             }
         });
     }
@@ -4613,14 +4608,6 @@ public class OidcDeviceAuthTest {
     private static DeviceCodePrompt noopPrompt() {
         return challenge -> {
         };
-    }
-
-    private static void parseSplitValue(int cacheSizeLimit, long address, int split, int len) throws JsonException {
-        try (JsonLexer lexer = new JsonLexer(1024, cacheSizeLimit)) {
-            lexer.parse(address, address + split, NOOP_JSON_PARSER);
-            lexer.parse(address + split, address + len, NOOP_JSON_PARSER);
-            lexer.parseLast();
-        }
     }
 
     /**

@@ -126,8 +126,12 @@ final class PoolHousekeeper {
      * Waits up to the supplied budget without letting cancellation skip the caller's remaining shutdown
      * work. Every {@link InterruptedException} clears the caller's flag, so remember it and spend only the
      * remainder of the original budget before handing the information back to {@link #stop()}.
+     * <p>
+     * Package-private so SenderPool's direct recovery driver can use the same deadline-preserving shutdown
+     * primitive. Keeping the two stop paths identical matters when an interrupt arrives during the first
+     * join: it must be remembered without skipping the target interrupt and second join that follow.
      */
-    private static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
+    static boolean joinIgnoringCallerInterrupts(Thread target, long timeoutMillis) {
         final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         final long deadlineNanos = System.nanoTime() + timeoutNanos;
         boolean callerWasInterrupted = false;
