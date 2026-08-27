@@ -299,6 +299,78 @@ public class OidcDeviceAuthPersistenceTest {
     }
 
     @Test(timeout = 30_000)
+    public void testCloseWaitsForCustomStoreClearToDeleteCredential() throws Exception {
+        assertMemoryLeak(() -> {
+            FakeTokenStore store = new FakeTokenStore();
+            store.stored = new PersistedToken(
+                    "ACCESS-STALE", null, "REFRESH-SECRET",
+                    System.currentTimeMillis() + 300_000, 300_000);
+            store.clearEntered = new CountDownLatch(1);
+            store.releaseClear = new CountDownLatch(1);
+            AtomicReference<Throwable> clearFailure = new AtomicReference<>();
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            AtomicBoolean clearInterruptedAtReturn = new AtomicBoolean();
+
+            OidcDeviceAuth auth = OidcDeviceAuth.builder()
+                    .clientId("questdb")
+                    .deviceAuthorizationEndpoint("http://127.0.0.1:1/device")
+                    .tokenEndpoint("http://127.0.0.1:1/token")
+                    .tokenStore(store)
+                    .build();
+            Thread clearer = new Thread(() -> {
+                try {
+                    auth.clearCache();
+                } catch (Throwable e) {
+                    clearFailure.set(e);
+                } finally {
+                    clearInterruptedAtReturn.set(Thread.currentThread().isInterrupted());
+                }
+            }, "oidc-custom-store-clearer");
+            Thread closer = new Thread(() -> {
+                try {
+                    auth.close();
+                } catch (Throwable e) {
+                    closeFailure.set(e);
+                }
+            }, "oidc-custom-store-closer");
+            clearer.setDaemon(true);
+            closer.setDaemon(true);
+
+            try {
+                clearer.start();
+                Assert.assertTrue("custom clear did not start", store.clearEntered.await(10, TimeUnit.SECONDS));
+                closer.start();
+                awaitOidcCloseLockWait(closer);
+
+                Assert.assertNotNull("the credential must remain while its backend deletion is in flight",
+                        store.stored);
+                Assert.assertFalse("close() must not interrupt an arbitrary custom TokenStore.clear()",
+                        store.clearInterrupted.get());
+
+                store.releaseClear.countDown();
+                clearer.join(10_000L);
+                closer.join(10_000L);
+            } finally {
+                store.releaseClear.countDown();
+                clearer.interrupt();
+                closer.interrupt();
+                clearer.join(10_000L);
+                closer.join(10_000L);
+                auth.close();
+            }
+
+            Assert.assertFalse("custom clear did not finish", clearer.isAlive());
+            Assert.assertFalse("close did not finish after custom clear", closer.isAlive());
+            Assert.assertNull("custom clear failed", clearFailure.get());
+            Assert.assertNull("close failed", closeFailure.get());
+            Assert.assertFalse("custom clear must not inherit close()'s cancellation signal",
+                    clearInterruptedAtReturn.get());
+            Assert.assertNull("both calls returned while the persisted credential remained reloadable",
+                    store.stored);
+        });
+    }
+
+    @Test(timeout = 30_000)
     public void testCloseInterruptsClearCacheWaitingBehindPeerInstance() throws Exception {
         assertMemoryLeak(() -> {
             Path dir = storeDir();
@@ -2170,6 +2242,25 @@ public class OidcDeviceAuthPersistenceTest {
         Assert.fail("clearCache() never reached FileTokenStore's interruptible process-lock wait");
     }
 
+    private static void awaitOidcCloseLockWait(Thread thread) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() - deadlineNanos < 0) {
+            boolean inClose = false;
+            for (StackTraceElement frame : thread.getStackTrace()) {
+                if (OidcDeviceAuth.class.getName().equals(frame.getClassName())
+                        && "close".equals(frame.getMethodName())) {
+                    inClose = true;
+                    break;
+                }
+            }
+            if (thread.getState() == Thread.State.WAITING && inClose) {
+                return;
+            }
+            Thread.sleep(5L);
+        }
+        Assert.fail("close() never waited for the custom TokenStore.clear() call");
+    }
+
     private static OidcDeviceAuth.Builder baseBuilder(MockOidcServer server) {
         return OidcDeviceAuth.builder()
                 .clientId("questdb")
@@ -2260,6 +2351,8 @@ public class OidcDeviceAuthPersistenceTest {
         // preserved as the caller's cancellation signal; OidcDeviceAuth uses action entry to distinguish this
         // from a refresh that ran and failed
         boolean cancelWaitInsteadOfRunning;
+        CountDownLatch clearEntered;
+        final AtomicBoolean clearInterrupted = new AtomicBoolean();
         // number of leading load() calls to fail before the first one is allowed to succeed; models a
         // transient store fault (an interrupted channel, a momentary IO error), as opposed to a store that
         // simply has nothing to return
@@ -2270,6 +2363,7 @@ public class OidcDeviceAuthPersistenceTest {
         PersistedToken loadReturns;
         PersistedToken peerInstallsOnLock;
         CountDownLatch releaseInLock;
+        CountDownLatch releaseClear;
         PersistedToken stored;
         RuntimeException throwAfterAction;
         RuntimeException throwBeforeAction;
@@ -2277,6 +2371,16 @@ public class OidcDeviceAuthPersistenceTest {
         @Override
         public void clear(TokenStoreKey key) {
             clears.incrementAndGet();
+            if (clearEntered != null) {
+                clearEntered.countDown();
+                try {
+                    releaseClear.await();
+                } catch (InterruptedException e) {
+                    clearInterrupted.set(true);
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("custom token-store deletion was interrupted", e);
+                }
+            }
             stored = null;
         }
 

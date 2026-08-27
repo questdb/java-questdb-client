@@ -1289,21 +1289,23 @@ public class QwpWebSocketSender implements Sender {
             // flag, so every remaining delegate in the same reap sweep failed the same way.
             //
             // Clearing it here restores the intended meaning: the interrupt breaks the operation it was
-            // aimed at, and the teardown that follows runs normally.
-            // An interrupt delivered DURING this close still lands on the await and still takes the
-            // failed-stop branch, which is correct -- that one really is 'we could not join'.
-            final boolean wasInterrupted = Thread.interrupted();
+            // aimed at, and the teardown that follows runs normally. drainOnClose() also records and consumes
+            // an interrupt delivered while it is pacing that wait; restoring it before the I/O-loop shutdown
+            // would make the next CountDownLatch.await fail at 0ms after a successful ACK drain. Carry both
+            // observations to this outer boundary, after every teardown wait. An interrupt that instead lands
+            // during the I/O-loop shutdown still reaches that await and takes its genuine failed-stop branch.
+            final boolean[] restoreInterrupt = {Thread.interrupted()};
             try {
-                close0();
+                close0(restoreInterrupt);
             } finally {
-                if (wasInterrupted) {
+                if (restoreInterrupt[0]) {
                     Thread.currentThread().interrupt();
                 }
             }
         }
     }
 
-    private void close0() {
+    private void close0(boolean[] restoreInterrupt) {
         Runnable hook = closeStartedHook;
         closeStartedHook = null;
         if (hook != null) {
@@ -1421,7 +1423,7 @@ public class QwpWebSocketSender implements Sender {
                 //    an error the user already handled). Otherwise the
                 //    drain keeps the loud safety net and surfaces it.
                 if (closeFlushTimeoutMillis > 0L) {
-                    drainOnClose(terminalOwnedByCustomHandler);
+                    drainOnClose(terminalOwnedByCustomHandler, restoreInterrupt);
                 }
             }
         } catch (Throwable t) {
@@ -3877,11 +3879,12 @@ public class QwpWebSocketSender implements Sender {
      *   double-signalled either.</li>
      * </ul>
      *
-     * @param errorOwnedByCustomHandler whether the async dispatcher has
-     *                                  already delivered a terminal to a
+     * @param errorOwnedByCustomHandler whether the async dispatcher has already delivered a terminal to a
      *                                  user-installed handler
+     * @param restoreInterrupt          close()-scoped carrier that restores any consumed interrupt only after
+     *                                  the remaining teardown waits have completed
      */
-    private void drainOnClose(boolean errorOwnedByCustomHandler) {
+    private void drainOnClose(boolean errorOwnedByCustomHandler, boolean[] restoreInterrupt) {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
@@ -3915,15 +3918,15 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
-        boolean restoreInterrupt = Thread.interrupted();
+        restoreInterrupt[0] |= Thread.interrupted();
         try {
             while (cursorEngine.ackedFsn() < target) {
                 // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
                 // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
                 // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
-                // next paced wait, remember it, and restore the flag once when the drain exits.
+                // next paced wait, remember it, and restore the flag once the whole close exits.
                 if (Thread.interrupted()) {
-                    restoreInterrupt = true;
+                    restoreInterrupt[0] = true;
                 }
                 // Stop on a latched terminal (acks will never reach target);
                 // surface it only when no other channel already delivered it.
@@ -3957,9 +3960,10 @@ public class QwpWebSocketSender implements Sender {
                 java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
             }
         } finally {
-            if (restoreInterrupt) {
-                Thread.currentThread().interrupt();
-            }
+            // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but
+            // before it exits. Keep teardown interrupt-neutral and hand the signal back only at close()'s outer
+            // boundary, after cursorSendLoop.close() and drainerPool.close() have spent their join budgets.
+            restoreInterrupt[0] |= Thread.interrupted();
         }
     }
 

@@ -232,11 +232,11 @@ public class OidcDeviceAuth implements QuietCloseable {
     // interactive flow, getToken() uses tryLock so the flush path never stalls behind a sign-in
     private final ReentrantLock lock = new ReentrantLock();
     private final Object tokenStoreWaiterGuard = new Object();
-    // The thread currently entering or waiting in TokenStore.inLock(), or running TokenStore.clear(), whose SPI
-    // does not expose the lock-acquired boundary. Deliberately narrower than the instance lock hold: close() may
-    // interrupt a coordinating store operation, but must not leave an interrupt on a thread doing an ordinary
-    // load/save or about to return a cached token. The refresh action clears the marker as soon as inLock()
-    // acquires its lock; clear keeps it for the whole best-effort call so close cannot miss its internal wait.
+    // The thread currently entering or waiting in TokenStore.inLock(), or running the bundled
+    // FileTokenStore.clear(). Deliberately narrower than the instance lock hold: close() may interrupt a
+    // coordinating store operation, but must not leave an interrupt on a thread doing an ordinary load/save or
+    // about to return a cached token. The refresh action clears the marker as soon as inLock() acquires its lock;
+    // FileTokenStore.clear() keeps it for the whole call because that implementation is interrupt-neutral.
     private Thread tokenStoreWaiterThread;
     private final DeviceCodePrompt prompt;
     private final StringSink responseStatus = new StringSink();
@@ -487,11 +487,16 @@ public class OidcDeviceAuth implements QuietCloseable {
             if (tokenStore != null) {
                 // FileTokenStore.clear() coordinates with a peer refresh through the same interruptible
                 // per-identity lock as tryRefreshCoordinated(). Publish this caller too, otherwise close()
-                // sees no waiter and blocks on this instance lock for the peer's whole refresh. TokenStore's
-                // clear SPI has no callback at the exact lock-acquired boundary, so keep the marker for the
-                // whole best-effort clear; a close racing ordinary clear I/O is cancellation of this operation,
-                // not an interrupt leaked into an unrelated cached-token return.
-                publishTokenStoreWaiter();
+                // sees no waiter and blocks on this instance lock for the peer's whole refresh. The bundled
+                // store makes its whole clear interrupt-neutral: even when cancellation abandons coordination,
+                // it still erases the entry before restoring the signal. Do NOT publish an arbitrary TokenStore
+                // clear here. The public SPI also covers keychains and vaults whose interruptible backend call
+                // may abort deletion; close() must wait for those implementations rather than return while the
+                // credential this explicit sign-out was meant to remove remains reloadable.
+                final boolean interruptibleClear = tokenStore instanceof FileTokenStore;
+                if (interruptibleClear) {
+                    publishTokenStoreWaiter();
+                }
                 try {
                     try {
                         tokenStore.clear(storeKey);
@@ -499,7 +504,9 @@ public class OidcDeviceAuth implements QuietCloseable {
                         warnPersistence("clear", e);
                     }
                 } finally {
-                    clearTokenStoreWaiter();
+                    if (interruptibleClear) {
+                        clearTokenStoreWaiter();
+                    }
                 }
             }
             // do not reload the entry we just removed on the next signIn()/getToken()
@@ -534,11 +541,13 @@ public class OidcDeviceAuth implements QuietCloseable {
     @Override
     public void close() {
         // Flag cancellation before taking the lock, then interrupt only a thread published for a coordinating
-        // store-lock operation. Refresh publishes the exact TokenStore.inLock() acquisition boundary; clear()
-        // covers its whole SPI call because that boundary is not exposed. Publishing every instance-lock holder
-        // would also interrupt ordinary store reads and cached-token returns, leaking close()'s cancellation
-        // signal into unrelated caller work after a successful getToken(). The lock acquire must still succeed
-        // before native resources are freed, so other in-flight work is waited out as before.
+        // store-lock operation. Refresh publishes the exact TokenStore.inLock() acquisition boundary; the
+        // bundled FileTokenStore covers its whole interrupt-neutral clear call. Custom clear implementations
+        // are waited out because interrupting a keychain/vault delete can leave the credential reloadable.
+        // Publishing every instance-lock holder would also interrupt ordinary store reads and cached-token
+        // returns, leaking close()'s cancellation signal into unrelated caller work after a successful
+        // getToken(). The lock acquire must still succeed before native resources are freed, so other in-flight
+        // work is waited out as before.
         closed = true;
         synchronized (tokenStoreWaiterGuard) {
             Thread waiter = tokenStoreWaiterThread;

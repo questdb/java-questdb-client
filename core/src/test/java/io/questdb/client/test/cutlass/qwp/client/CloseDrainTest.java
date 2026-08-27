@@ -161,6 +161,47 @@ public class CloseDrainTest {
         }
     }
 
+    @Test(timeout = 30_000L)
+    public void testInterruptDuringSuccessfulCloseDrainIsRestoredAfterTeardown() throws Exception {
+        DelayingAckHandler handler = new DelayingAckHandler(800L);
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                    "ws::addr=localhost:" + server.getPort() + ";");
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+            sender.setCloseDrainWaitingHook(() -> {
+                // PoolHousekeeper.stop() uses this signal after its first join budget. The close drain owns it
+                // while waiting for the ACK; later teardown waits must not mistake the carried signal for a new
+                // failure to stop their own worker.
+                Thread.currentThread().interrupt();
+            });
+
+            Throwable closeFailure = null;
+            boolean interruptedAtReturn;
+            try {
+                sender.close();
+            } catch (Throwable t) {
+                closeFailure = t;
+            } finally {
+                interruptedAtReturn = Thread.currentThread().isInterrupted();
+                Thread.interrupted();
+            }
+
+            Assert.assertNull("an interrupt consumed by a successful ACK drain poisoned later teardown",
+                    closeFailure);
+            Assert.assertTrue("close() must return its consumed cancellation signal to the caller",
+                    interruptedAtReturn);
+            Assert.assertTrue("the delayed ACK must have completed the close drain", handler.nextSeq.get() >= 1L);
+            Assert.assertTrue("successful ACK drain must release its slot before close returns",
+                    sender.isSlotLockReleased());
+            Assert.assertTrue("all close-owned resources must be released before close returns",
+                    sender.isCloseCleanupComplete());
+        }
+    }
+
     @Test
     public void testCloseStartedHookRunsAfterClosedStateTransition() throws Exception {
         QwpWebSocketSender sender = QwpWebSocketSender.createForTesting("localhost", 1);

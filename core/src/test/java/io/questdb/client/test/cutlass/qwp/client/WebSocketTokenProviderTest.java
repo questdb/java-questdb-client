@@ -31,12 +31,16 @@ import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.HandOffCharSequence;
 import org.junit.Assert;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -60,6 +64,9 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * Each test runs under {@code assertMemoryLeak} so the sender's native buffers are proven freed on close.
  */
 public class WebSocketTokenProviderTest {
+
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test(timeout = 30_000)
     public void testProviderBufferMutatedDuringTheHandshakeCannotSplice() throws Exception {
@@ -563,6 +570,88 @@ public class WebSocketTokenProviderTest {
                     sender.flush();
                     waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
                 }
+            }
+        });
+    }
+
+    @Test(timeout = 60_000)
+    public void testRepeated401sWithDynamicTokenDoNotTerminateLiveSenderAndRecover() throws Exception {
+        assertMemoryLeak(() -> {
+            // This composes the production foreground path all the way from a dynamic HTTP token provider,
+            // through real 401 upgrade responses, to the live store-and-forward engine. Unit tests of the
+            // orphan drainer's dynamic-credential policy cannot catch the running sender accidentally adopting
+            // the orphan-only quarantine policy: that would latch TERMINAL/DATA_LOSS, drop .failed, and kill the
+            // producer once the ordinary reconnect budget elapsed.
+            final long budgetMillis = 300;
+            final String senderId = "live-dynamic-401";
+            AtomicInteger tokenPulls = new AtomicInteger();
+            AtomicReference<SenderError> terminalOrDataLoss = new AtomicReference<>();
+            DropAfterFirstAckHandler handler = new DropAfterFirstAckHandler();
+            Path sfDir = temp.newFolder("live-dynamic-401-sf").toPath();
+            Path failedSentinel = sfDir.resolve(senderId).resolve(".failed");
+
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                try (Sender sender = Sender.builder(Sender.Transport.WEBSOCKET)
+                        .address("localhost:" + server.getPort())
+                        .storeAndForwardDir(sfDir.toString())
+                        .senderId(senderId)
+                        .reconnectInitialBackoffMillis(20)
+                        .reconnectMaxBackoffMillis(20)
+                        .reconnectMaxDurationMillis(budgetMillis)
+                        .errorHandler(error -> {
+                            if (error.getAppliedPolicy() == SenderError.Policy.TERMINAL
+                                    || error.getCategory() == SenderError.Category.DATA_LOSS) {
+                                terminalOrDataLoss.compareAndSet(null, error);
+                            }
+                        })
+                        .httpTokenProvider(() -> "TOKEN-" + tokenPulls.incrementAndGet())
+                        .build()) {
+                    try {
+                        Assert.assertEquals("Bearer TOKEN-1",
+                                server.pollAuthorizationHeader(5, TimeUnit.SECONDS));
+
+                        // The existing connection still accepts and ACKs batch 1, then drops. Every reconnect
+                        // from that point receives a genuine HTTP 401 after pulling a fresh token.
+                        server.setRejectWithStatus(401, "Unauthorized");
+                        sender.table("foo").longColumn("v", 1L).atNow();
+                        sender.flush();
+                        waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
+
+                        int pullsAtOutageStart = tokenPulls.get();
+                        Thread.sleep(budgetMillis * 4);
+                        Assert.assertTrue("the live sender must keep retrying 401s beyond its reconnect budget",
+                                tokenPulls.get() > pullsAtOutageStart);
+                        Assert.assertNull("dynamic-token 401s must not become TERMINAL or DATA_LOSS",
+                                terminalOrDataLoss.get());
+                        Assert.assertFalse("a live dynamic-token outage must not quarantine the active slot",
+                                Files.exists(failedSentinel));
+
+                        // A producer call made while the 401 outage is still active must remain usable. Once the
+                        // server accepts the next rotated token, this buffered batch must drain normally.
+                        sender.table("foo").longColumn("v", 2L).atNow();
+                        sender.flush();
+                        Assert.assertNull("the producer must survive the extended 401 outage",
+                                terminalOrDataLoss.get());
+
+                        server.setRejectWithStatus(0, null);
+                        waitFor(() -> handler.totalBinaryReceived.get() >= 2, 15_000);
+                        Assert.assertNull("recovery must not leave a terminal or data-loss report",
+                                terminalOrDataLoss.get());
+                        Assert.assertFalse("recovery must leave no .failed sentinel",
+                                Files.exists(failedSentinel));
+                    } finally {
+                        // Let sender.close() reconnect and finish its cleanup even when an assertion above fails.
+                        server.setRejectWithStatus(0, null);
+                    }
+                }
+
+                Assert.assertNull("close must not synthesize a terminal or data-loss report",
+                        terminalOrDataLoss.get());
+                Assert.assertFalse("the recovered sender must close without a .failed sentinel",
+                        Files.exists(failedSentinel));
             }
         });
     }
