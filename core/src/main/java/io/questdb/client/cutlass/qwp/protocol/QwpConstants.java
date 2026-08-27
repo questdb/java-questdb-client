@@ -96,10 +96,11 @@ public final class QwpConstants {
      * Compatibility: servers released before QuestDB 10.0.0 cap their
      * dictionary at 1,000,000, and QWP has no wire-level negotiation of the
      * limit -- a dictionary this client lets grow past 1M is rejected by
-     * those servers as a terminal parse error. Unreachable on defaults
-     * ({@code symbol_dict_reset} recycles at 100k), but a sender configured
-     * with the recycle off (or a threshold above 1M) against a pre-10.0.0
-     * server must keep its symbol cardinality below the old 1M cap.
+     * those servers as a terminal parse error. Reachable on defaults: each
+     * recycle raises the re-arm bar to twice the dictionary size at the
+     * swap, capped at half of this constant, so an unbounded-cardinality
+     * producer's dictionary grows to 1M entries per epoch. Only 10.0.0+
+     * servers are supported.
      */
     public static final int MAX_SYMBOL_DICTIONARY_SIZE = 2_000_000;
     /**

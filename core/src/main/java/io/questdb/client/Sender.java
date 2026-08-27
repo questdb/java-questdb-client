@@ -1630,25 +1630,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 try (SlotLock logicalSlotLock = slotPath == null
                         ? null
                         : SlotLock.acquireLogical(slotPath)) {
-                    // The constructor's own recovery seed can also fail terminally, and
-                    // not only as UnreplayableSlotException: when SegmentRing.openExisting
-                    // had to skip an unreadable segment it throws SfRecoveryException (it
-                    // constructs UnreplayableSlotException nowhere), and where it cannot
-                    // even prove the chain's identity -- no manifest -- it quarantines the
-                    // corrupt files and returns an EMPTY recovery rather than refusing.
-                    // Either way the frame range cannot be shown already-acked, so recovery
-                    // sets the slot aside rather than risk seeding the ack cursor past
-                    // frames that were never delivered. All three types below are load
-                    // bearing; narrowing this catch to UnreplayableSlotException would
-                    // restore the permanent build() brick for the segment-skip case. That verdict gets
-                    // the exact same quarantine-and-continue treatment as the connect()-time
-                    // verdict below -- constructing cursorEngine is not inside the loop below,
-                    // so a throw here would otherwise escape build() entirely, uncaught.
-                    // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
-                    // (not just the unreadable segment file) before building the replacement
-                    // at the original slotPath, so the replacement starts on a genuinely empty
-                    // directory with nothing left to skip -- it cannot throw the same way
-                    // twice, which is what makes looping unnecessary here.
+                    // Recovery-verdict handling lives in constructEngineOnSlotLocked.
                     ConstructedEngine constructed = constructEngineOnSlotLocked(
                             sfDir, senderId, slotPath,
                             actualSfMaxSegmentBytes, actualSfMaxTotalBytes,
@@ -1942,7 +1924,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
         /**
          * Number of distinct symbols the sender's dictionary may accumulate before
-         * {@link #symbolDictReset(boolean)} triggers a recycle. Must be greater than
+         * {@link #symbolDictReset(boolean)} triggers a recycle. Each recycle raises
+         * the effective bar to {@code max(threshold, 2 x dictionary size at the swap)},
+         * capped at half of {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}, so a
+         * bounded live set larger than the threshold recycles once and settles
+         * instead of recycling on every refill. Must be greater than
          * {@code 0} and no larger than {@link QwpConstants#MAX_SYMBOL_DICTIONARY_SIZE}.
          * <p>
          * Default {@code 100_000}. WebSocket transport only.
@@ -3259,9 +3245,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             // frames that were never delivered. All three types below are load
             // bearing; narrowing this catch to UnreplayableSlotException would
             // restore the permanent build() brick for the segment-skip case. That verdict gets
-            // the exact same quarantine-and-continue treatment as the connect()-time
-            // verdict below -- constructing cursorEngine is not inside the loop below,
-            // so a throw here would otherwise escape build() entirely, uncaught.
+            // the same quarantine-and-continue treatment as build()'s connect()-time
+            // verdict; for build() the construction runs outside its retry loop, and
+            // for a recycle rebuild there is no loop at all.
             // quarantineTornSlot(null, ...) renames the WHOLE slot directory aside
             // (not just the unreadable segment file) before building the replacement
             // at the original slotPath, so the replacement starts on a genuinely empty
