@@ -538,14 +538,6 @@ public class QwpWebSocketSender implements Sender {
     // first recycle commits. volatile: this is public API (see
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
     private volatile long symbolDictEpoch;
-    // Incremented once per completed symbol-dictionary recycle swap, beside
-    // symbolDictEpoch (recycleForDictReset step 6). The two move together
-    // today -- the only way symbolDictEpoch advances is through a committed
-    // recycle swap -- but they count different things (dictionary generation
-    // vs. completed swaps) and are incremented independently in case a
-    // future change ever rolls the epoch by some path other than a recycle.
-    // volatile for the same reason as symbolDictEpoch.
-    private volatile long symbolDictResetsPerformed;
     private long reconnectInitialBackoffMillis =
             CursorWebSocketSendLoop.DEFAULT_RECONNECT_INITIAL_BACKOFF_MILLIS;
     private long reconnectMaxBackoffMillis =
@@ -2300,32 +2292,11 @@ public class QwpWebSocketSender implements Sender {
      * concurrent read sees the latest write the producer thread completed,
      * but there is no atomicity across the three symbol-dictionary-recycle
      * counters -- a reader on another thread can observe this one already
-     * advanced while {@link #getSymbolDictResetsPerformed()} still reflects
-     * the prior value, even though the producer thread writes them on
-     * adjacent lines.
+     * advanced while {@link #getSymbolDictResetStarvationTimeouts()} still
+     * reflects an older value; there is no atomicity across the counters.
      */
     public long getSymbolDictEpoch() {
         return symbolDictEpoch;
-    }
-
-    /**
-     * Number of symbol-dictionary recycle swaps this sender has completed.
-     * Incremented alongside {@link #getSymbolDictEpoch()} at step 6 of
-     * {@link #recycleForDictReset()} -- after the engine rebuild (step 4) has
-     * already succeeded, so, like the epoch counter, a step-4 rebuild failure
-     * leaves this un-bumped while a step-7 reconnect failure still leaves it
-     * incremented (the swap has already committed by then).
-     * Also like the epoch counter, it is scoped to the sender's whole lifetime
-     * and never resets. The two counts move together today -- the
-     * only way the epoch advances is through a completed recycle swap -- but
-     * they are defined, and incremented, independently: this one counts
-     * completed swaps, {@code getSymbolDictEpoch()} counts the dictionary
-     * generation. They would diverge if a future change ever rolled the
-     * epoch by some path other than a recycle swap. Same thread-safety
-     * caveat as {@link #getSymbolDictEpoch()}.
-     */
-    public long getSymbolDictResetsPerformed() {
-        return symbolDictResetsPerformed;
     }
 
     /**
@@ -2334,7 +2305,7 @@ public class QwpWebSocketSender implements Sender {
      * written only from the producer thread inside
      * {@link #maybeBlockForStarvedReset()}: same thread-safety caveat as
      * {@link #getSymbolDictEpoch()} -- a concurrent read sees the latest
-     * completed write, with no atomicity across the three counters.
+     * completed write, with no atomicity across the two counters.
      */
     public long getSymbolDictResetStarvationTimeouts() {
         return symbolDictResetStarvationTimeouts;
@@ -2461,8 +2432,7 @@ public class QwpWebSocketSender implements Sender {
      * Reads the live cursor I/O loop, which a symbol-dictionary recycle
      * rebuilds, so the count restarts at 0 on every recycle: a monitor
      * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()} /
-     * {@link #getSymbolDictResetsPerformed()}, which never reset.
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalFramesReplayed() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2476,8 +2446,7 @@ public class QwpWebSocketSender implements Sender {
      * Reads the live cursor I/O loop, which a symbol-dictionary recycle
      * rebuilds, so the count restarts at 0 on every recycle: a monitor
      * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()} /
-     * {@link #getSymbolDictResetsPerformed()}, which never reset.
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalFramesSent() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2493,8 +2462,7 @@ public class QwpWebSocketSender implements Sender {
      * Reads the live cursor I/O loop, which a symbol-dictionary recycle
      * rebuilds, so the count restarts at 0 on every recycle: a monitor
      * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()} /
-     * {@link #getSymbolDictResetsPerformed()}, which never reset.
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalReconnectAttempts() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2508,8 +2476,7 @@ public class QwpWebSocketSender implements Sender {
      * Reads the live cursor I/O loop, which a symbol-dictionary recycle
      * rebuilds, so the count restarts at 0 on every recycle: a monitor
      * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()} /
-     * {@link #getSymbolDictResetsPerformed()}, which never reset.
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalReconnectsSucceeded() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -2523,8 +2490,7 @@ public class QwpWebSocketSender implements Sender {
      * Reads the live cursor I/O loop, which a symbol-dictionary recycle
      * rebuilds, so the count restarts at 0 on every recycle: a monitor
      * differencing it across one sees a negative delta. Correlate with the
-     * lifetime-scoped {@link #getSymbolDictEpoch()} /
-     * {@link #getSymbolDictResetsPerformed()}, which never reset.
+     * lifetime-scoped {@link #getSymbolDictEpoch()}, which never resets.
      */
     public long getTotalServerErrors() {
         CursorWebSocketSendLoop l = cursorSendLoop;
@@ -5057,7 +5023,6 @@ public class QwpWebSocketSender implements Sender {
         currentBatchMaxSymbolId = -1;
         lastCommitBoundaryFsn = -1L;
         symbolDictEpoch++;
-        symbolDictResetsPerformed++;
         resetArmed = false;
         manualResetRequested = false;
         // Anti-thrash floor: see resetFloorSymbols.
@@ -5314,10 +5279,10 @@ public class QwpWebSocketSender implements Sender {
      * deferred to the I/O thread) leaves a fully coherent sender that is
      * merely disconnected: {@code connected == false}, loop and client already
      * closed and nulled by {@link #ensureConnected()}'s own catch, the fresh
-     * engine attached, and the step-6 counters ({@link #symbolDictEpoch},
-     * {@link #symbolDictResetsPerformed}) correctly left incremented because
-     * the swap really did happen. It rethrows loudly to the triggering caller
-     * but the sender stays usable, and the ordinary
+     * engine attached, and the step-6 epoch counter ({@link #symbolDictEpoch})
+     * correctly left incremented because the swap really did happen. It
+     * rethrows loudly to the triggering caller but the sender stays usable,
+     * and the ordinary
      * {@code sendRow() -> ensureConnected()} path retries the deferred setup
      * -- and only that -- on the next send. Nothing can fire a second swap
      * meanwhile: the fresh dictionary is below threshold,

@@ -229,7 +229,6 @@ public class SymbolDictRecycleOutageTest {
                             ws.wasEverConnected());
                     Assert.assertEquals("the swap must commit exactly one epoch",
                             1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
                     Assert.assertFalse("a committed swap disarms", ws.isResetArmed());
 
                     // Producer keeps working against the dead endpoint: the
@@ -251,7 +250,6 @@ public class SymbolDictRecycleOutageTest {
                                 sender.awaitAckedFsn(fsn2, 10_000));
                         Assert.assertEquals("the recovery reconnects only -- no second swap",
                                 1, ws.getSymbolDictEpoch());
-                        Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
                         Assert.assertEquals("the fresh connection's first frame must carry a "
                                         + "fresh (empty) dictionary, not a, b",
                                 0, revivedHandler.firstFrameDeltaStart);

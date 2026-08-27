@@ -60,8 +60,8 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * engine simply degrades again on its own first append: a normal, catchable
  * {@link LineSenderException}, not a latched {@code recycleFailure} terminal state.
  * <p>
- * Also covers the three permanent recycle-metrics getters ({@code getSymbolDictEpoch()},
- * {@code getSymbolDictResetsPerformed()}, {@code getSymbolDictResetStarvationTimeouts()}).
+ * Also covers the two permanent recycle-metrics getters ({@code getSymbolDictEpoch()},
+ * {@code getSymbolDictResetStarvationTimeouts()}).
  */
 public class SymbolDictRecycleHealingTest {
 
@@ -80,7 +80,6 @@ public class SymbolDictRecycleHealingTest {
                 try (Sender sender = Sender.fromConfig(cfg)) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     Assert.assertEquals(0, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(0, ws.getSymbolDictResetsPerformed());
                     Assert.assertEquals(0, ws.getSymbolDictResetStarvationTimeouts());
 
                     sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
@@ -92,7 +91,6 @@ public class SymbolDictRecycleHealingTest {
                     // Ring drained -> this table() call recycles synchronously: epoch 1.
                     sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow();
                     Assert.assertEquals(1, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
                     Assert.assertEquals("no starvation wait was deliberately triggered",
                             0, ws.getSymbolDictResetStarvationTimeouts());
 
@@ -110,7 +108,6 @@ public class SymbolDictRecycleHealingTest {
                     // Ring drained again -> second recycle: epoch 2.
                     sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();
                     Assert.assertEquals(2, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(2, ws.getSymbolDictResetsPerformed());
                     Assert.assertEquals("still no starvation wait was deliberately triggered",
                             0, ws.getSymbolDictResetStarvationTimeouts());
 
@@ -193,7 +190,6 @@ public class SymbolDictRecycleHealingTest {
                     sender.table("m").symbol("s", "b").longColumn("v", 2L).atNow();
                     Assert.assertFalse("recycle must disarm", sender.isResetArmed());
                     Assert.assertEquals(1, sender.getSymbolDictEpoch());
-                    Assert.assertEquals(1, sender.getSymbolDictResetsPerformed());
 
                     // The rebuilt engine re-derives delta-dict mode from scratch (a fresh,
                     // empty dictionary always opens cleanly at construction -- see this
@@ -293,7 +289,6 @@ public class SymbolDictRecycleHealingTest {
                     sender.resetSymbolDictionary();
                     sender.table("m").symbol("s", "b").longColumn("v", 2L).atNow();
                     Assert.assertEquals(1, sender.getSymbolDictEpoch());
-                    Assert.assertEquals(1, sender.getSymbolDictResetsPerformed());
 
                     // Construction alone never touches mmap (see this test's javadoc), so the
                     // fresh engine transiently re-derives delta mode before its first append.

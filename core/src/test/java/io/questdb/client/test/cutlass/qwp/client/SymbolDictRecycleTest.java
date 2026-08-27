@@ -403,7 +403,6 @@ public class SymbolDictRecycleTest {
                     }
                     // NOT latched, and the swap did NOT commit.
                     Assert.assertEquals(0, ws.getSymbolDictEpoch());
-                    Assert.assertEquals(0, ws.getSymbolDictResetsPerformed());
                     // The next call resumes the pending recycle with the real
                     // factory and completes it.
                     sender.table("t").symbol("s", "post").longColumn("v", 1L).atNow();
@@ -749,7 +748,7 @@ public class SymbolDictRecycleTest {
                     String[] live = {"s0", "s1", "s2", "s3", "s4", "s5"};
                     sendLiveSet(sender, live);              // registers 6 distinct -> arms
                     sender.table("t");                       // barrier -> recycle #1
-                    Assert.assertEquals(1, ws.getSymbolDictResetsPerformed());
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
                     // Refill from the SAME live pool three times over: 6 is above
                     // the threshold but below the doubled floor (12) -> no re-arm.
                     for (int pass = 0; pass < 3; pass++) {
@@ -757,7 +756,7 @@ public class SymbolDictRecycleTest {
                         sender.table("t");
                     }
                     Assert.assertEquals("a bounded live set must not re-trigger the recycle",
-                            1, ws.getSymbolDictResetsPerformed());
+                            1, ws.getSymbolDictEpoch());
                     // Genuine growth past the floor DOES re-arm: 12 fresh symbols.
                     String[] grown = new String[12];
                     for (int i = 0; i < 12; i++) {
@@ -765,7 +764,7 @@ public class SymbolDictRecycleTest {
                     }
                     sendLiveSet(sender, grown);
                     sender.table("t");
-                    Assert.assertEquals(2, ws.getSymbolDictResetsPerformed());
+                    Assert.assertEquals(2, ws.getSymbolDictEpoch());
                 }
             }
         });
