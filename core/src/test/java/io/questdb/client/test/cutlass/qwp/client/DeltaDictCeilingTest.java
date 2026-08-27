@@ -99,11 +99,13 @@ public class DeltaDictCeilingTest {
     }
 
     /**
-     * A threshold configured AT the cap, with automatic reset DISABLED, must
-     * behave exactly like the undecorated cap: the refusal still fires, and
-     * its message still names the reset valve even though this particular
-     * sender has it switched off -- the valve is documented for senders that
-     * want it, not conditioned on this sender having chosen it.
+     * A threshold configured AT its own cap (half of the producer-side
+     * {@code MAX_SYMBOL_DICTIONARY_SIZE}), with automatic reset DISABLED,
+     * must behave exactly like the undecorated cap: the refusal still fires
+     * once the dictionary itself reaches {@code MAX_SYMBOL_DICTIONARY_SIZE},
+     * and its message still names the reset valve even though this
+     * particular sender has it switched off -- the valve is documented for
+     * senders that want it, not conditioned on this sender having chosen it.
      * <p>
      * Out of scope here: whether {@code symbol_dict_reset=off} actually keeps
      * {@code armIfEligible()} from arming. That only runs from the tail of a
@@ -124,7 +126,7 @@ public class DeltaDictCeilingTest {
                 Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
 
                 try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + port
-                        + ";symbol_dict_reset=off;symbol_dict_reset_threshold=" + MAX_SYMBOL_DICTIONARY_SIZE + ";")) {
+                        + ";symbol_dict_reset=off;symbol_dict_reset_threshold=" + (MAX_SYMBOL_DICTIONARY_SIZE / 2) + ";")) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     GlobalSymbolDictionary dict = ws.getGlobalSymbolDictionaryForTest();
                     for (int i = 0; i < MAX_SYMBOL_DICTIONARY_SIZE; i++) {
