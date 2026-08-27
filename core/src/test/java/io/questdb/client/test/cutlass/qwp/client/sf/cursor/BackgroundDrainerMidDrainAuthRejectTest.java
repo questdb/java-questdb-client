@@ -89,6 +89,7 @@ import static org.junit.Assert.fail;
  */
 public class BackgroundDrainerMidDrainAuthRejectTest {
 
+    private static final long ACK_OBSERVATION_DELAY_MILLIS = 800L;
     private static final long FAST_BACKOFF_MAX_MILLIS = 4L;
     private static final long FAST_BACKOFF_MILLIS = 1L;
     private static final long RECONNECT_MAX_DURATION_MILLIS = 25L;
@@ -132,7 +133,11 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
             Map<Integer, Long> drops = new HashMap<>();
             drops.put(1, 0L); // connection 1 acks one frame, then drops -> into window 1
             drops.put(2, 1L); // connection 2 is the delivering session -> advances, then drops into window 2
-            try (TestWebSocketServer server = new TestWebSocketServer(new ScriptedAckHandler(drops, -1, 0L), true)) {
+            // Keep the delivering connection alive briefly after its progress ack. Closing it immediately
+            // races the drainer's 50ms ack poll: the second 401 window can begin before noteAckProgress()
+            // observes the new watermark, making two separate windows look like one continuous episode.
+            try (TestWebSocketServer server = new TestWebSocketServer(
+                    new ScriptedAckHandler(drops, 2, ACK_OBSERVATION_DELAY_MILLIS), true)) {
                 server.start();
                 assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 ScriptedWireFactory factory = new ScriptedWireFactory(server.getPort(),
@@ -177,7 +182,8 @@ public class BackgroundDrainerMidDrainAuthRejectTest {
             drops.put(2, 1L);
             // connection 2 - the delivering session - acks its progress and then lingers before it drops,
             // putting real wall clock between the two rejection windows (see ScriptedAckHandler).
-            try (TestWebSocketServer server = new TestWebSocketServer(new ScriptedAckHandler(drops, 2, 800L), true)) {
+            try (TestWebSocketServer server = new TestWebSocketServer(
+                    new ScriptedAckHandler(drops, 2, ACK_OBSERVATION_DELAY_MILLIS), true)) {
                 server.start();
                 assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
                 // Window 2 is long enough to reach the attempt threshold on its own, so the attempt
