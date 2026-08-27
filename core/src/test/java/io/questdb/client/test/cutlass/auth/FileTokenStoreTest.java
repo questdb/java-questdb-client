@@ -68,6 +68,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+import static io.questdb.client.test.tools.TestUtils.repeat;
 
 /**
  * Coverage for {@link FileTokenStore}.
@@ -1824,7 +1825,7 @@ public class FileTokenStoreTest {
             // the real entry, so the assertion would be about the filesystem rather than about the filter.)
             Path plainJson = dir.resolve("my-important-settings.json");
             Path shortHexJson = dir.resolve("abc123.json");
-            Path otherFingerprintJson = dir.resolve("a".repeat(64) + ".json");
+            Path otherFingerprintJson = dir.resolve(repeat("a", 64) + ".json");
             Path foreignTemp = dir.resolve("scratch-notes.tmp");
             Assert.assertNotEquals("the full-length fixture must not be the sample key's entry",
                     tokenFile(dir, key), otherFingerprintJson);
