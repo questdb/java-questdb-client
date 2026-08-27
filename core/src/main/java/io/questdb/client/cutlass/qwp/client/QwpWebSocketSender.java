@@ -504,6 +504,7 @@ public class QwpWebSocketSender implements Sender {
     // RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS); non-final only so tests can
     // shrink it to drive the timeout branch.
     private long recycleDeferredCloseMaxWaitMillis = RECYCLE_DEFERRED_CLOSE_MAX_WAIT_MILLIS;
+    private long recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     // Set (once) by completeRecycleRebuild when a rebuilt engine recovered
     // UNACKED frames from the slot the outgoing close was supposed to have
     // emptied -- the one failure that proves the fully-drained close contract
@@ -4912,25 +4913,32 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Exhausting {@link #recycleDeferredCloseMaxWaitMillis} throws; the
      * recycle stays pending ({@link RecycleResume#REBUILD}) and the next send
-     * retries the await. Before throwing, hand the still-locked engine to
-     * {@link #retainedEngine} so a pool re-probe
-     * ({@link #isSlotLockReleased()}) can still recover the slot's capacity
-     * if the worker ever exits.
+     * probes the close again. The budget is spent once per pending close: a
+     * resume while the worker is still wedged rethrows without parking, so a
+     * stalled worker costs the producer one bounded wait, not one per call.
+     * Before throwing, hand the still-locked engine to {@link #retainedEngine}
+     * so a pool re-probe ({@link #isSlotLockReleased()}) can still recover the
+     * slot's capacity if the worker ever exits.
      */
     private void awaitDeferredEngineClose(CursorSendEngine outgoing) {
         if (outgoing.isCloseCompleted()) {
+            recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
             return;
         }
-        LOG.warn("symbol dictionary recycle waiting for a deferred engine close: the SF worker "
-                + "did not quiesce, so the slot lock is still held [maxWaitMillis={}]",
-                recycleDeferredCloseMaxWaitMillis);
-        Runnable witness = deferredCloseParkWitness;
-        if (witness != null) {
-            witness.run();
+        if (recycleDeferredCloseDeadlineNanos == Long.MIN_VALUE) {
+            LOG.warn("symbol dictionary recycle waiting for a deferred engine close: the SF worker "
+                    + "did not quiesce, so the slot lock is still held [maxWaitMillis={}]",
+                    recycleDeferredCloseMaxWaitMillis);
+            Runnable witness = deferredCloseParkWitness;
+            if (witness != null) {
+                witness.run();
+            }
+            recycleDeferredCloseDeadlineNanos = System.nanoTime()
+                    + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         }
-        long deadlineNanos = System.nanoTime() + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         while (!outgoing.isCloseCompleted()) {
-            if (System.nanoTime() >= deadlineNanos) {
+            outgoing.ensureFlockReleaseRetryScheduled();
+            if (System.nanoTime() >= recycleDeferredCloseDeadlineNanos) {
                 retainedEngine = outgoing;
                 slotLockReleased = false;
                 throw new LineSenderException("symbol dictionary recycle could not yet reclaim "
@@ -4939,9 +4947,9 @@ public class QwpWebSocketSender implements Sender {
                         + " ms (SF worker stalled); the recycle stays pending and is retried "
                         + "on the next send");
             }
-            outgoing.ensureFlockReleaseRetryScheduled();
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
         }
+        recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     }
 
     private void closeRecoveredEngine(CursorSendEngine recovered) {

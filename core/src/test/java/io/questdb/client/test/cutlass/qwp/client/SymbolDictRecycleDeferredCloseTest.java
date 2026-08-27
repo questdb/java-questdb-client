@@ -248,7 +248,7 @@ public class SymbolDictRecycleDeferredCloseTest {
                         Assert.assertTrue("worker never reached the wedge hook",
                                 workerBlocked.await(5, TimeUnit.SECONDS));
                         manager.setWorkerJoinTimeoutMillis(50L);
-                        ws.setRecycleDeferredCloseMaxWaitMillisForTesting(150L);
+                        ws.setRecycleDeferredCloseMaxWaitMillisForTesting(1_000L);
 
                         sender.resetSymbolDictionary();
                         Assert.assertTrue(ws.isResetArmed());
@@ -263,11 +263,13 @@ public class SymbolDictRecycleDeferredCloseTest {
                         }
 
                         // The await runs at step 3, before the step-6 swap: no
-                        // epoch may have committed, and every later entry point
-                        // re-runs the await and throws the same transient
-                        // verdict for as long as the worker stays wedged.
+                        // epoch may have committed. The budget is spent once per
+                        // pending close: every later entry point probes the
+                        // close, throws the same transient verdict and does NOT
+                        // park again for as long as the worker stays wedged.
                         Assert.assertEquals("the swap must not have committed",
                                 0, ws.getSymbolDictEpoch());
+                        long t0 = System.nanoTime();
                         try {
                             sender.table("t");
                             Assert.fail("expected the retried await to throw again");
@@ -275,6 +277,10 @@ public class SymbolDictRecycleDeferredCloseTest {
                             TestUtils.assertContains(e.getMessage(),
                                     "deferred close did not release the slot lock");
                         }
+                        long retryMs = (System.nanoTime() - t0) / 1_000_000L;
+                        Assert.assertTrue("a resume while the worker is still wedged must fail "
+                                + "fast (the await budget is already spent), took " + retryMs + "ms",
+                                retryMs < 500L);
                         Assert.assertFalse("the slot flock is still held by the wedged engine",
                                 ws.isSlotLockReleased());
 
