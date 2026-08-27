@@ -424,8 +424,19 @@ public class SymbolDictRecycleDeferredCloseTest {
                         }
                         Assert.assertTrue("deferred cleanup did not complete after the release",
                                 outgoing.isCloseCompleted());
+                        Assert.assertTrue("a pool-style re-probe of the retained outgoing engine "
+                                + "latches the late release", ws.isSlotLockReleased());
+                        QwpWebSocketSender.EngineRebuildFactory real = ws.getEngineRebuildFactoryForTesting();
+                        AtomicBoolean releasedDuringRebuild = new AtomicBoolean(true);
+                        ws.setEngineRebuildFactory(() -> {
+                            releasedDuringRebuild.set(ws.isSlotLockReleased());
+                            return real.rebuild();
+                        });
                         sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
                         Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                        Assert.assertFalse("the stale release latch must be cleared before the "
+                                + "rebuild takes the flock", releasedDuringRebuild.get());
+                        Assert.assertFalse("the rebuilt engine holds the flock", ws.isSlotLockReleased());
 
                         long fsn2 = sender.flushAndGetSequence();
                         Assert.assertTrue("post-resume batch must still get acked",

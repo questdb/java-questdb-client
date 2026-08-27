@@ -4985,6 +4985,13 @@ public class QwpWebSocketSender implements Sender {
             recyclePendingOutgoing = null;
             retainedEngine = null;
         }
+        // The rebuild below takes the slot flock again; a stale true (an
+        // isSlotLockReleased() re-probe of the outgoing engine while the
+        // recycle stayed pending) no longer describes this sender's state.
+        slotLockReleased = false;
+        // Replace the dictionary, don't clear(). Allocated before anything
+        // acquires the slot, so an allocation failure leaves nothing to unwind.
+        GlobalSymbolDictionary fresh = new GlobalSymbolDictionary(Math.max(dictSizeAtSwap, 64));
         // step 4: rebuild the engine on the now-empty slot.
         CursorSendEngine rebuilt = rebuildEngineOrAbandon(
                 "symbol dictionary recycle could not rebuild its engine; retried on the next send");
@@ -5021,8 +5028,7 @@ public class QwpWebSocketSender implements Sender {
         // run with cursorSendLoop == null, which step 2 guarantees and the
         // step-7 reconnect below only undoes afterwards.
         rollFsnEpochBase(recyclePendingLastPublishedFsn);
-        // Replace the dictionary, don't clear().
-        globalSymbolDictionary = new GlobalSymbolDictionary(Math.max(dictSizeAtSwap, 64));
+        globalSymbolDictionary = fresh;
         sentMaxSymbolId = -1;
         currentBatchMaxSymbolId = -1;
         lastCommitBoundaryFsn = -1L;
@@ -5042,10 +5048,6 @@ public class QwpWebSocketSender implements Sender {
         cursorEngine = rebuilt;
         ownsCursorEngine = true;
         cursorEngine.setSlotLockReleaseListener(this::onSlotLockReleased);
-        // The fresh engine holds the slot flock again; a stale true (an
-        // isSlotLockReleased() re-probe of the outgoing engine while the
-        // recycle stayed pending) no longer describes this sender's state.
-        slotLockReleased = false;
         recycleResume = RecycleResume.NONE;
         recyclePendingLastPublishedFsn = -1L;
         // step 7: reconnect (the swap has already committed).
