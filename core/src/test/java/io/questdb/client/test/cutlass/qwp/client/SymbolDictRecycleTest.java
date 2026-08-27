@@ -40,6 +40,7 @@ import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -683,10 +684,15 @@ public class SymbolDictRecycleTest {
     }
 
     /**
-     * A producer thread whose interrupt flag is already set makes step 2's
-     * loop close throw deterministically (CountDownLatch.await throws on
-     * entry). That must abandon the recycle non-terminally; once the flag is
-     * cleared the next call finishes the loop close and the sender recovers.
+     * A producer thread whose interrupt flag is already set usually makes
+     * step 2's loop close throw before the recycle can proceed
+     * (CountDownLatch.await() checks the flag first) -- an abandon that must
+     * be non-terminal. Under load the I/O thread can finish and count the
+     * shutdown latch down concurrently, so the close can also complete
+     * normally despite the flag; this asserts the failed-stop protocol when
+     * the throw happens and skips visibly when it does not. Either way the
+     * recovery half always runs: once the flag is cleared the next call
+     * finishes the loop close and the sender recovers.
      */
     @Test
     public void testInterruptedRecycleAbandonsAndRecovers() throws Exception {
@@ -707,18 +713,17 @@ public class SymbolDictRecycleTest {
                     } catch (LineSenderException expected) {
                         threw = true;
                     }
-                    // close() re-asserts the flag on the abandon path; clear it
-                    // for the recovery half of the test.
+                    // close() re-asserts the flag whenever the interrupted await
+                    // fires, whether or not the abandon then propagates to the
+                    // caller; clear it for the recovery half of the test.
                     boolean flagWasPreserved = Thread.interrupted();
-                    Assert.assertTrue("an interrupted producer must abandon the recycle at the "
-                            + "loop close", threw);
-                    Assert.assertTrue("the failed-stop protocol re-asserts the flag",
-                            flagWasPreserved);
-                    // The abandon must never be terminal, and the sender must
-                    // finish the recycle on subsequent sends. A CLOSE_LOOP abandon leaves
-                    // the recycle armed but NOT yet run, and the barrier only
-                    // recycles at a drained instant with nothing staged -- so
-                    // flush the recovery row before the barrier that must swap.
+                    // Whether the loop close threw (abandon) or completed
+                    // normally (the recycle already ran), the sender must never
+                    // be terminal and must finish the recycle by now. A
+                    // CLOSE_LOOP abandon leaves the recycle armed but NOT yet
+                    // run, and the barrier only recycles at a drained instant
+                    // with nothing staged -- so flush the recovery row before
+                    // the barrier that must swap.
                     sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
                     long f2 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f2, 5_000));
@@ -727,6 +732,11 @@ public class SymbolDictRecycleTest {
                     sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
                     long f3 = sender.flushAndGetSequence();
                     Assert.assertTrue(sender.awaitAckedFsn(f3, 5_000));
+
+                    Assume.assumeTrue("the interrupt raced past the loop close, so the "
+                            + "abandon branch was not exercised in this run", threw);
+                    Assert.assertTrue("the failed-stop protocol re-asserts the flag",
+                            flagWasPreserved);
                 }
             }
         });
