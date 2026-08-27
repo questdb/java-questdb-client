@@ -339,7 +339,7 @@ public class SymbolDictRecycleHealingTest {
     /**
      * Widest {@code QwpWebSocketSender.connect(...)} overload with everything but the
      * fault-injecting engine and the reset threshold pinned to defaults -- mirrors
-     * {@code SymbolDictRecycleArmingTest.testArmsInFullDictMode}. {@code Sender.fromConfig} has
+     * {@code SymbolDictRecycleArmingTest.testDoesNotArmWithoutRebuildFactory}. {@code Sender.fromConfig} has
      * no {@code FilesFacade} seam, so this is the only way to combine a custom facade with a
      * custom low threshold; it leaves {@code engineRebuildFactory} null, same as every other
      * {@code connect(...)} overload, so callers that need a working recycle must install one

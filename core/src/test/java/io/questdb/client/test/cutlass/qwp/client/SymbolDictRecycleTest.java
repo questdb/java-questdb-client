@@ -165,7 +165,7 @@ public class SymbolDictRecycleTest {
 
                 // Threshold-based arming needs a custom low threshold, only reachable (without
                 // routing through Sender.build(), which WOULD install a factory) via the
-                // widest connect() overload -- mirrors SymbolDictRecycleArmingTest.testArmsInFullDictMode.
+                // widest connect() overload -- mirrors SymbolDictRecycleArmingTest.testDoesNotArmWithoutRebuildFactory.
                 CursorSendEngine engine = new CursorSendEngine(
                         null, 4L * 1024 * 1024, 128L * 1024 * 1024,
                         CursorSendEngine.DEFAULT_APPEND_DEADLINE_NANOS);
