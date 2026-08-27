@@ -2288,12 +2288,9 @@ public class QwpWebSocketSender implements Sender {
      * latch: the swap already committed by then) still leaves this
      * incremented. Unlike the per-send-loop
      * {@code getTotal*} counters, it is scoped to the sender's whole lifetime
-     * and never resets. volatile: a
-     * concurrent read sees the latest write the producer thread completed,
-     * but there is no atomicity across the two symbol-dictionary-recycle
-     * counters -- a reader on another thread can observe this one already
-     * advanced while {@link #getSymbolDictResetStarvationTimeouts()} still
-     * reflects an older value; there is no atomicity across the counters.
+     * and never resets. volatile: a concurrent read sees the latest write the
+     * producer thread completed; there is no atomicity between this counter
+     * and {@link #getSymbolDictResetStarvationTimeouts()}.
      */
     public long getSymbolDictEpoch() {
         return symbolDictEpoch;
@@ -2985,9 +2982,11 @@ public class QwpWebSocketSender implements Sender {
     /**
      * Installs the factory a symbol-dictionary recycle uses to rebuild its
      * cursor engine on the emptied slot ({@code Sender.build()} installs the
-     * builder's). {@code null} disarms the recycle: {@link #armIfEligible()}
-     * never arms a sender that cannot rebuild. May be called before or after
-     * connect; takes effect at the next recycle.
+     * builder's). {@code null} stops future arming ({@link #armIfEligible()}
+     * never arms a sender that cannot rebuild) but does not cancel a recycle
+     * that is already armed or pending, so it must not be cleared while one
+     * is. May be called before or after connect; takes effect at the next
+     * flush-tail arming check.
      *
      * @throws LineSenderException if the sender is closed
      */
@@ -4183,10 +4182,12 @@ public class QwpWebSocketSender implements Sender {
         long boundary = Math.max(lastCommitBoundaryFsn, cursorEngine.recoveredCommitBoundaryFsn());
         long target = Math.min(published, boundary);
         if (target < published) {
+            long externalTarget = fsnEpochBase + target;
+            long externalPublished = fsnEpochBase + published;
             LOG.warn("close() abandoning {} uncommitted deferred frame(s) [commitBoundaryFsn={}, publishedFsn={}] "
                             + "-- their transaction was never committed; the server rolls their rows back. "
                             + "Call flush() before close() to commit, or ignore if the abort is intentional.",
-                    published - target, target, published);
+                    published - target, externalTarget, externalPublished);
         }
         if (cursorEngine.ackedFsn() >= target) {
             return;
@@ -4864,7 +4865,7 @@ public class QwpWebSocketSender implements Sender {
      * Since the recycle feature is default-on and {@code
      * resetSymbolDictionary()} is a public advisory API, arming a sender with
      * no way to ever act on the request would leave {@code isResetArmed()}
-     * reading true forever alongside a permanently-0 resets counter,
+     * reading true forever alongside a permanently-0 epoch counter,
      * misleading monitoring.
      * <p>
      * Called from two safe points only: the tail of
