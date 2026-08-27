@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
@@ -33,7 +34,10 @@ import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderConnectionDispatcher;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -451,6 +455,83 @@ public class SymbolDictRecycleTest {
     }
 
     /**
+     * The builder's rebuild factory ({@code Sender.build()}) is the half that
+     * actually forwards the live handler into {@code constructEngineOnSlot} ->
+     * {@code quarantineTornSlot}, and that hand-off is only observable when a
+     * rebuild really has a slot to set aside: the notification is dispatched
+     * synchronously from inside the rebuild, to whatever handler it was handed.
+     * Step 3's fully-drained close leaves the slot empty, so the fixture plants
+     * {@code SegmentSkipQuarantineTest}'s tainted slot -- several never-acked
+     * segments with the oldest one's magic overwritten, so recovery must skip
+     * it -- into that empty slot just before the real factory runs. The sender
+     * is built with no error handler at all, so a regression that forwarded the
+     * BUILD-time handler instead of the live one would leave the recycle green
+     * and the data-loss notification nowhere.
+     */
+    @Test
+    public void testRebuildTimeQuarantineReachesTheHandlerInstalledAfterBuild() throws Exception {
+        assertMemoryLeak(() -> {
+            String taintedSfDir = temporaryFolder.newFolder("rebuild-quarantine-tainted").getAbsolutePath();
+            writeSlotWithCorruptedOldestSegment(taintedSfDir);
+            final String taintedSlot = taintedSfDir + "/default";
+
+            String sfDir = temporaryFolder.newFolder("rebuild-quarantine-live").getAbsolutePath();
+            final String slotPath = sfDir + "/default";
+            final List<SenderError> errors = new CopyOnWriteArrayList<>();
+            try (TestWebSocketServer server = ackingServer()) {
+                try (Sender sender = Sender.fromConfig("ws::addr=localhost:" + server.getPort()
+                        + ";sf_dir=" + sfDir + ";")) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    ws.setErrorHandler(errors::add);
+
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+
+                    final QwpWebSocketSender.EngineRebuildFactory real = ws.getEngineRebuildFactoryForTesting();
+                    ws.setEngineRebuildFactory(new QwpWebSocketSender.EngineRebuildFactory() {
+                        @Override
+                        public CursorSendEngine rebuild() {
+                            plantSlotContents(taintedSlot, slotPath);
+                            return real.rebuild();
+                        }
+
+                        @Override
+                        public CursorSendEngine rebuild(SenderErrorHandler liveHandler) {
+                            plantSlotContents(taintedSlot, slotPath);
+                            return real.rebuild(liveHandler);
+                        }
+                    });
+
+                    sender.resetSymbolDictionary();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    Assert.assertEquals("the recycle must have committed", 1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue(sender.awaitAckedFsn(sender.flushAndGetSequence(), 5_000));
+                }
+            }
+
+            SenderError quarantine = null;
+            for (int i = 0, n = errors.size(); i < n; i++) {
+                if (errors.get(i).getCategory() == SenderError.Category.DATA_LOSS) {
+                    quarantine = errors.get(i);
+                    break;
+                }
+            }
+            Assert.assertNotNull("the rebuild's quarantine must reach the handler installed AFTER "
+                    + "build(); it is the only programmatic channel telling the application that "
+                    + "the set-aside bytes need resending [errors=" + errors + ']', quarantine);
+            Assert.assertTrue("the notification must name where the bytes went [msg="
+                            + quarantine.getServerMessage() + ']',
+                    quarantine.getServerMessage() != null
+                            && quarantine.getServerMessage().contains("slot set aside at"));
+            Assert.assertNotNull("getQuarantinedPath() is the programmatic answer to \"where are "
+                    + "my bytes\"", quarantine.getQuarantinedPath());
+            Assert.assertTrue("the quarantined path must name the set-aside dir [path="
+                            + quarantine.getQuarantinedPath() + ']',
+                    quarantine.getQuarantinedPath().contains("unreplayable-"));
+        });
+    }
+
+    /**
      * A producer thread whose interrupt flag is already set makes step 2's
      * loop close throw deterministically (CountDownLatch.await throws on
      * entry). That must abandon the recycle non-terminally; once the flag is
@@ -573,6 +654,94 @@ public class SymbolDictRecycleTest {
         }
         Collections.sort(names);
         return names;
+    }
+
+    /**
+     * Overwrites the 4-byte {@code FILE_MAGIC} field at offset 0 so
+     * {@code MmapSegment.openExisting} throws at the magic check, landing in
+     * {@code SegmentRing}'s per-file skip arm without disturbing any other byte.
+     * {@code SegmentSkipQuarantineTest}'s technique, unchanged.
+     */
+    private static void corruptMagic(String path) {
+        int fd = Files.openRW(path);
+        Assert.assertTrue("openRW failed", fd >= 0);
+        long buf = Unsafe.malloc(4, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().putInt(buf, 0xBADBAD00);
+            Files.write(fd, buf, 4, 0);
+        } finally {
+            Unsafe.free(buf, 4, MemoryTag.NATIVE_DEFAULT);
+            Files.close(fd);
+        }
+    }
+
+    /**
+     * Copies a slot's recoverable content into {@code slotPath}, creating it if
+     * the outgoing close removed it. Both lock files are left behind: the
+     * directory-local {@code .lock} belongs to the engine about to be built,
+     * and the logical lock lives outside the slot directory entirely.
+     */
+    private static void plantSlotContents(String sourceSlot, String slotPath) {
+        try {
+            java.nio.file.Path target = Paths.get(slotPath);
+            java.nio.file.Files.createDirectories(target);
+            java.nio.file.DirectoryStream<java.nio.file.Path> entries =
+                    java.nio.file.Files.newDirectoryStream(Paths.get(sourceSlot));
+            try {
+                for (java.nio.file.Path entry : entries) {
+                    String name = entry.getFileName().toString();
+                    if (".lock".equals(name) || ".lock.pid".equals(name)) {
+                        continue;
+                    }
+                    java.nio.file.Files.copy(entry, target.resolve(name),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                entries.close();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("could not plant the slot contents", e);
+        }
+    }
+
+    /**
+     * {@code SegmentSkipQuarantineTest}'s fixture, written under {@code sfDir}:
+     * a real slot produced against a never-acking server so several segments
+     * survive on disk unacked, with the oldest one's magic bytes then
+     * overwritten. {@code sf_max_segment_bytes} forces a genuine rotation, so
+     * the corruption is a skip among data-bearing survivors rather than the
+     * only file present.
+     */
+    private static void writeSlotWithCorruptedOldestSegment(String sfDir) throws Exception {
+        try (TestWebSocketServer silent = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+        })) {
+            silent.start();
+            Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+            String pad = TestUtils.repeat("x", 64);
+            String cfg = "ws::addr=localhost:" + silent.getPort()
+                    + ";sf_dir=" + sfDir
+                    + ";sf_max_segment_bytes=512"
+                    + ";close_flush_timeout_millis=0;";
+            try (Sender s = Sender.fromConfig(cfg)) {
+                for (int i = 0; i < 20; i++) {
+                    s.table("foo").stringColumn("p", pad).longColumn("v", i).atNow();
+                    s.flush();
+                }
+            }
+        }
+        String slot = sfDir + "/default";
+        String oldest = slot + "/sf-initial.sfa";
+        Assert.assertTrue("setup: nothing acked, so sf-initial.sfa must survive", Files.exists(oldest));
+        int segments = 0;
+        List<String> names = listDir(slot);
+        for (int i = 0, n = names.size(); i < n; i++) {
+            if (names.get(i).endsWith(".sfa")) {
+                segments++;
+            }
+        }
+        Assert.assertTrue("setup: the slot must hold more than one segment so the corruption is a "
+                + "skip among survivors [names=" + names + ']', segments > 1);
+        corruptMagic(oldest);
     }
 
     private static String cfg(TestWebSocketServer server) {

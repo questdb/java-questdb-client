@@ -55,13 +55,12 @@ public class SymbolDictRecycleStep7FaultTest {
     /**
      * Pins that a step-7 (reconnect) failure does NOT latch the sender
      * terminal: the swap has committed, the sender is coherent and merely
-     * disconnected, and the next send retries the deferred setup. The test
-     * the PR body credited was deleted by commit 6793928a.
+     * disconnected, and the next send retries the deferred setup.
      */
     @Test
     public void testStep7FailureDoesNotLatchAndRecovers() throws Exception {
         assertMemoryLeak(() -> {
-            String sfDir = temporaryFolder.newFolder("step7-c5").getAbsolutePath();
+            String sfDir = temporaryFolder.newFolder("step7-reconnect").getAbsolutePath();
             try (TestWebSocketServer server = ackingServer()) {
                 try (Sender sender = Sender.fromConfig(cfg(server, sfDir))) {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
@@ -105,7 +104,7 @@ public class SymbolDictRecycleStep7FaultTest {
     @Test
     public void testPostFailedReconnectDeltaCoversStagedSymbolIds() throws Exception {
         assertMemoryLeak(() -> {
-            String sfDir = temporaryFolder.newFolder("step7-c4").getAbsolutePath();
+            String sfDir = temporaryFolder.newFolder("step7-staged-ids").getAbsolutePath();
             CapturingAckHandler handler = new CapturingAckHandler();
             try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
                 server.start();

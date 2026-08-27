@@ -448,7 +448,7 @@ public class SymbolDictRecycleRefusalTest {
      * call recycles -- observed here to fire deterministically, not
      * probabilistically, once those guards clear. It is compatible with
      * {@code reset()}'s own reclaim: the swap replaces the whole dictionary
-     * object outright (step 5 of {@code recycleForDictReset()}), so
+     * object outright (step 6 of {@code recycleForDictReset()}), so
      * whatever {@code truncateTo} did to the outgoing instance is moot --
      * the swap subsumes it.
      */

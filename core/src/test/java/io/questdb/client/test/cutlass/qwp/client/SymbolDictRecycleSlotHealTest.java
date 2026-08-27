@@ -57,7 +57,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
  * The two verdicts {@code QwpWebSocketSender.completeRecycleRebuild} reaches
- * when the recycle's step-5 rebuild comes back
+ * when the recycle's step-4 rebuild comes back
  * {@code wasRecoveredFromDisk()} -- i.e. when the outgoing engine's
  * fully-drained close did NOT leave the slot empty.
  * <ul>

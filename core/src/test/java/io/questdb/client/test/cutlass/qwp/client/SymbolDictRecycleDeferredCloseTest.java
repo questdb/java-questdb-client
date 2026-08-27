@@ -249,7 +249,7 @@ public class SymbolDictRecycleDeferredCloseTest {
                                     "deferred close did not release the slot lock");
                         }
 
-                        // The await runs at step 3, before the step-5 swap: no
+                        // The await runs at step 3, before the step-6 swap: no
                         // epoch may have committed, and every later entry point
                         // re-runs the await and throws the same transient
                         // verdict for as long as the worker stays wedged.

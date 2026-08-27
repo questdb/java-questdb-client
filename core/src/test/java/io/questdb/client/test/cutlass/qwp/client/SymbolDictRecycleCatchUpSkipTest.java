@@ -71,7 +71,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * No production change is expected to make these pass. A failure here means
  * either the fresh-mirror seeding regressed (a post-recycle connection
  * started paying for catch-up again) or the recycle's {@code
- * sentMaxSymbolId} reset ({@code recycleForDictReset()}'s step 5) leaked
+ * sentMaxSymbolId} reset ({@code recycleForDictReset()}'s step 6) leaked
  * onto the ordinary reconnect path, which today never touches that
  * baseline.
  */
@@ -174,7 +174,7 @@ public class SymbolDictRecycleCatchUpSkipTest {
                     // initial-connect path, guarded by the connected flag, and never
                     // fires here), so the producer's baseline (c, d already at ids 0, 1)
                     // survives the wire boundary and e resumes at id 2. Only
-                    // recycleForDictReset()'s step 5 ever zeroes that baseline; a
+                    // recycleForDictReset()'s step 6 ever zeroes that baseline; a
                     // regression that folded the reset into a path this reconnect DOES
                     // run would re-ship the whole dictionary from deltaStart 0.
                     sender.table("t").symbol("s", "e").longColumn("v", 4L).atNow();

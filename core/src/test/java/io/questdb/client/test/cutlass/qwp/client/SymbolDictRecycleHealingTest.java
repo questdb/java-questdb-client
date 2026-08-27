@@ -54,7 +54,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * full self-sufficient frames ({@code QwpWebSocketSender.disableDeltaDict}, e.g. after a
  * recognised mmap access fault on the persisted dictionary -- see {@link MmapFaultDegradesTest})
  * is not stuck there forever. {@code recycleForDictReset()} rebuilds the cursor engine from
- * scratch (step 5), and a fresh engine re-derives {@code deltaDictEnabled} independently of
+ * scratch (step 4), and a fresh engine re-derives {@code deltaDictEnabled} independently of
  * whatever the outgoing epoch's engine decided -- so once the underlying fault clears, the
  * next recycle heals the sender back into delta mode. If the fault has not cleared, the fresh
  * engine simply degrades again on its own first append: a normal, catchable
