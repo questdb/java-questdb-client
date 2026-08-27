@@ -3936,7 +3936,7 @@ public class QwpWebSocketSender implements Sender {
      * refuses further use. Every OTHER recycle failure -- a wedged SF worker,
      * an interrupted producer thread, a momentary rebuild fault, a
      * post-cleanup fsync warning, a failed step-7 reconnect -- is transient:
-     * it throws to the triggering caller, leaves the counters un-bumped and
+     * it throws to the triggering caller, leaves the counter un-bumped and
      * the recycle pending ({@link #recycleResume}), and the next send
      * finishes the swap. Checked by
      * {@link #table(CharSequence)}, the flush-family
@@ -4961,7 +4961,7 @@ public class QwpWebSocketSender implements Sender {
      * The recycle's tail: await the outgoing engine's (possibly deferred)
      * close, rebuild a fresh engine on the emptied slot, and only then
      * commit the swap -- roll the FSN base, install the fresh dictionary,
-     * advance the counters, wire the engine, reconnect. Every phase before
+     * advance the counter, wire the engine, reconnect. Every phase before
      * the commit is idempotent, so both {@link #recycleForDictReset()} and a
      * REBUILD resume run this; a transient throw leaves
      * {@code recycleResume == REBUILD} for the next attempt. Only a rebuild
@@ -5239,10 +5239,10 @@ public class QwpWebSocketSender implements Sender {
      *       (replaced, not cleared -- nothing else retains the old instance),
      *       both symbol-id watermarks reset, {@code lastCommitBoundaryFsn}
      *       reset (it held a raw old-epoch FSN that does not survive the
-     *       roll), the epoch counter and the completed-swap counter both
-     *       advanced, the arming flags consumed, the anti-thrash floor
-     *       raised, {@code deltaDictEnabled} re-derived from the fresh
-     *       engine (the healing half of the recycle contract -- see
+     *       roll), the epoch counter advanced, the arming flags consumed,
+     *       the anti-thrash floor raised, {@code deltaDictEnabled}
+     *       re-derived from the fresh engine (the healing half of the
+     *       recycle contract -- see
      *       {@link #disableDeltaDict}), and the fresh engine's
      *       slot-lock-release listener rewired, mirroring (not calling)
      *       {@link #setCursorEngine} -- that method's guards refuse a second
@@ -5253,7 +5253,7 @@ public class QwpWebSocketSender implements Sender {
      * </ol>
      * This method runs steps 1-3 and hands steps 4-7 to
      * {@link #completeRecycleRebuild(int, long)}. The producer-visible swap
-     * (dictionary, counters, epoch) commits only once a fresh engine stands on
+     * (dictionary, epoch) commits only once a fresh engine stands on
      * the emptied slot, and a throw before that point no longer kills the
      * sender: every frame that existed before this call was already proven
      * acked, so nothing is at risk, and the recycle simply records how far it
