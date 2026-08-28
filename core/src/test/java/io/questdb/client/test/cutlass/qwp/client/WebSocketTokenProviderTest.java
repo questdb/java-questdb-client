@@ -620,10 +620,18 @@ public class WebSocketTokenProviderTest {
                         sender.flush();
                         waitFor(() -> handler.totalBinaryReceived.get() >= 1, 5_000);
 
+                        // Do not start the dwell witness from the original connection's frame: its handler
+                        // records that frame before ACKing and closing the socket, so a delayed close could
+                        // consume most of the sleep before the first 401 even occurred. Two fully written
+                        // rejects prove the reconnect loop processed the first 401 and began another attempt.
+                        waitFor(() -> server.statusRejectCount() >= 2, 5_000);
                         int pullsAtOutageStart = tokenPulls.get();
+                        int rejectsAtOutageStart = server.statusRejectCount();
                         Thread.sleep(budgetMillis * 4);
                         Assert.assertTrue("the live sender must keep retrying 401s beyond its reconnect budget",
                                 tokenPulls.get() > pullsAtOutageStart);
+                        Assert.assertTrue("the server must keep returning 401s throughout the extended outage",
+                                server.statusRejectCount() > rejectsAtOutageStart);
                         Assert.assertNull("dynamic-token 401s must not become TERMINAL or DATA_LOSS",
                                 terminalOrDataLoss.get());
                         Assert.assertFalse("a live dynamic-token outage must not quarantine the active slot",

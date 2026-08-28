@@ -74,6 +74,11 @@ public class TestWebSocketServer implements Closeable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
+    // Number of arbitrary HTTP-status rejects that were fully written to the
+    // client. Tests use this rather than an observed token pull: the provider
+    // runs before the upgrade response arrives, so a pull alone does not prove
+    // that the reconnect loop has entered its rejection episode.
+    private final AtomicInteger statusRejectCount = new AtomicInteger();
     // Monotonic count of completed handshakes over the server's lifetime. Unlike
     // liveConnections it never decrements, so a test can confirm how many clients
     // connected even after they have all disconnected.
@@ -250,6 +255,13 @@ public class TestWebSocketServer implements Closeable {
      */
     public int roleRejectCount() {
         return roleRejectCount.get();
+    }
+
+    /**
+     * Number of arbitrary HTTP-status reject responses sent over the server's lifetime.
+     */
+    public int statusRejectCount() {
+        return statusRejectCount.get();
     }
 
     /**
@@ -612,6 +624,7 @@ public class TestWebSocketServer implements Closeable {
                         "\r\n";
                 out.write(sb.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
+                statusRejectCount.incrementAndGet();
                 return false;
             }
             // Role-aware reject path: emit a 421 Misdirected Request +
