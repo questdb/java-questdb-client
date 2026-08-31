@@ -79,6 +79,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * QWP v1 WebSocket client sender for streaming data to QuestDB.
@@ -145,7 +146,15 @@ public class QwpWebSocketSender implements Sender {
     // enough window to preserve the trailing category distribution.
     private static final int MIN_ERROR_INBOX_CAPACITY = 16;
     private static final String WRITE_PATH = "/write/v4";
-    private final String authorizationHeader;
+    // Yields the Authorization header value presented on each WebSocket upgrade. A constant for a
+    // fixed token or Basic credential; for an httpTokenProvider it pulls a freshly refreshed token,
+    // so the initial connect and every reconnect re-handshake carry the current token. May be null
+    // when no auth is configured. Evaluated once per (re)connect round in buildAndConnect, before the
+    // endpoint walk (not once per endpoint); a throwing provider is wrapped as
+    // QwpCredentialUnavailableException: the foreground/SYNC initial connect fails fast with the provider's
+    // own exception, while the running background drainer treats it as a transient outage and retries it
+    // indefinitely (never bounded by the reconnect budget, never terminal) per store-and-forward Invariant B.
+    private final Supplier<String> authorizationHeaderSupplier;
     private final int autoFlushBytes;
     private final long autoFlushIntervalNanos;
     // Auto-flush configuration
@@ -410,14 +419,14 @@ public class QwpWebSocketSender implements Sender {
             int autoFlushRows,
             int autoFlushBytes,
             long autoFlushIntervalNanos,
-            String authorizationHeader
+            Supplier<String> authorizationHeaderSupplier
     ) {
         if (endpoints == null || endpoints.isEmpty()) {
             throw new IllegalArgumentException("endpoints must be non-empty");
         }
         this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.hostTracker = new QwpHostHealthTracker(this.endpoints.size());
-        this.authorizationHeader = authorizationHeader;
+        this.authorizationHeaderSupplier = authorizationHeaderSupplier;
         this.tlsConfig = tlsConfig;
         this.encoder = new QwpWebSocketEncoder(DEFAULT_BUFFER_SIZE);
         this.tableBuffers = new CharSequenceObjHashMap<>();
@@ -700,8 +709,8 @@ public class QwpWebSocketSender implements Sender {
             long durableAckKeepaliveIntervalMillis,
             long authTimeoutMs
     ) {
-        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, authorizationHeader,
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
                 requestDurableAck, cursorEngine,
                 closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
@@ -711,9 +720,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Multi-endpoint variant that also accepts the async connection-event
-     * listener and its dispatcher inbox capacity. Uses the default
-     * poison-frame detector threshold.
+     * Constant-credential form of the connection-listener variant below, kept so callers compiled against
+     * the {@code String authorizationHeader} signature keep linking after the parameter became a
+     * {@link Supplier}. Wraps the header with {@link #fixedAuthHeader(String)}, which also tags it as a
+     * CONSTANT credential for the store-and-forward drainer's terminal policy -- the same thing the older
+     * signature implied.
+     * <p>
+     * A rotating credential goes to {@code connectWithCredentialSupplier} instead, which carries a distinct
+     * name precisely so this form keeps its exact descriptor and a bare {@code null} credential stays
+     * unambiguous.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -737,8 +752,51 @@ public class QwpWebSocketSender implements Sender {
             SenderConnectionListener connectionListener,
             int connectionListenerInboxCapacity
     ) {
-        return connect(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
-                autoFlushIntervalNanos, authorizationHeader, requestDurableAck,
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity);
+    }
+
+    /**
+     * Multi-endpoint variant that also accepts the async connection-event
+     * listener and its dispatcher inbox capacity. Uses the default
+     * poison-frame detector threshold.
+     * <p>
+     * Named apart from {@code connect} rather than overloading it: the constant-credential
+     * {@code connect(..., String, ...)} form must keep its exact descriptor for callers compiled against
+     * it, and a {@code String} / {@code Supplier<String>} overload pair of equal arity makes a bare
+     * {@code null} credential argument ambiguous -- neither parameter type is more specific than the
+     * other. A distinct name keeps both forms callable with no cast.
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck,
                 cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis,
                 reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
                 initialConnectMode, errorHandler, errorInboxCapacity,
@@ -750,10 +808,15 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Master connect overload — also accepts the poison-frame detector
-     * threshold ({@code max_frame_rejections}): consecutive server-active
-     * rejections of the same head-of-line frame, with no ack progress in
-     * between, before the loop escalates to a typed terminal.
+     * Constant-credential form of the master overload below, kept so callers compiled against the
+     * {@code String authorizationHeader} signature keep linking after the parameter became a
+     * {@link Supplier}. Wraps the header with {@link #fixedAuthHeader(String)}, which also tags it as a
+     * CONSTANT credential for the store-and-forward drainer's terminal policy -- the same thing the older
+     * signature implied.
+     * <p>
+     * A rotating credential goes to {@code connectWithCredentialSupplier} instead, which carries a distinct
+     * name precisely so this form keeps its exact descriptor and a bare {@code null} credential stays
+     * unambiguous.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
@@ -780,10 +843,58 @@ public class QwpWebSocketSender implements Sender {
             long poisonMinEscalationWindowMillis,
             long catchUpCapGapMinEscalationWindowMillis
     ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis);
+    }
+
+    /**
+     * Master connect entry point — also accepts the poison-frame detector
+     * threshold ({@code max_frame_rejections}): consecutive server-active
+     * rejections of the same head-of-line frame, with no ack progress in
+     * between, before the loop escalates to a typed terminal.
+     * <p>
+     * Named apart from {@code connect} for the reason given on
+     * {@link #connectWithCredentialSupplier(List, ClientTlsConfiguration, int, int, long, Supplier,
+     * boolean, CursorSendEngine, long, long, long, long, Sender.InitialConnectMode, SenderErrorHandler,
+     * int, long, long, int, SenderConnectionListener, int)}.
+     */
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
-                authorizationHeader
+                authorizationHeaderSupplier
         );
         try {
             sender.requestDurableAck = requestDurableAck;
@@ -850,7 +961,7 @@ public class QwpWebSocketSender implements Sender {
         return new QwpWebSocketSender(
                 singleEndpoint(host, port), null,
                 DEFAULT_AUTO_FLUSH_ROWS, DEFAULT_AUTO_FLUSH_BYTES, DEFAULT_AUTO_FLUSH_INTERVAL_NANOS,
-                authorizationHeader
+                fixedAuthHeader(authorizationHeader)
         );
     }
 
@@ -876,6 +987,26 @@ public class QwpWebSocketSender implements Sender {
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
                 null
         );
+    }
+
+    /**
+     * Wraps a CONSTANT {@code Authorization} header value as a supplier, tagged so the store-and-forward
+     * drainer can tell it apart from an {@code httpTokenProvider}-backed rotating credential. Callers that
+     * synthesize a fixed header (a static bearer token, a Basic credential) must route it through here
+     * rather than through a bare lambda, or the drainer misreads the credential as rotating.
+     * <p>
+     * The distinction is load-bearing for the orphan drainer's terminal policy. A {@code 401} against a
+     * fixed credential is a permanent misconfiguration, so quarantining the slot immediately is right. The
+     * same {@code 401} against a rotating credential can be a recoverable window - clock skew past the
+     * token's skew margin, a mid-flight revocation, an identity provider rotating its signing keys - where
+     * a later attempt carrying a freshly pulled token succeeds. See
+     * {@code BackgroundDrainer.connectWithDurableAckRetry}.
+     *
+     * @param header the constant header value, or null when no credential is configured
+     * @return a tagged supplier yielding {@code header}, or null when {@code header} is null
+     */
+    public static Supplier<String> fixedAuthHeader(String header) {
+        return header == null ? null : new FixedAuthHeader(header);
     }
 
     @Override
@@ -1146,205 +1277,233 @@ public class QwpWebSocketSender implements Sender {
     public void close() {
         if (!closed) {
             closed = true;
-            Runnable hook = closeStartedHook;
-            closeStartedHook = null;
-            if (hook != null) {
-                try {
-                    hook.run();
-                } catch (Throwable t) {
-                    // A test witness must never prevent production resource cleanup.
-                    LOG.error("Error in close-started test hook: {}", String.valueOf(t));
-                }
-            }
-            boolean ioThreadStopped = true;
-            // Captures the first error from the flush/drain path AND any
-            // secondary errors from cleanup steps (added via addSuppressed).
-            // Silently swallowing any of these would hide latched terminal
-            // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
-            // SCHEMA_MISMATCH HALT) from users who only call close() and
-            // never call flush() afterwards.
-            Throwable terminalError = null;
-            // Snapshot the exact terminal error instance that a user-thread
-            // API call ALREADY caught (via flush()/at()) before close() ran.
-            // If flushPendingRows/drainOnClose below also rethrow the same
-            // instance, dropping it at the final rethrow avoids
-            // try-with-resources self-suppression: Throwable.addSuppressed
-            // raises IllegalArgumentException when primary == suppressed.
-            // Must stay this single read: the snapshot needs the identity of
-            // the error the user already owns, and only
-            // getSynchronouslySurfacedError() holds it. Deriving it from two
-            // separate latch reads races the I/O thread -- a terminal latched
-            // between the reads would be adopted as user-owned and silently
-            // dropped (see CloseOwnershipRaceTest).
-            Throwable alreadyOwnedByUser = cursorSendLoop != null
-                    ? cursorSendLoop.getSynchronouslySurfacedError() : null;
-
+            // Interrupt-neutral for the duration, the same shape QwpQueryClient.close() and
+            // FileTokenStore.load()/save() use. PoolHousekeeper.stop() interrupts a housekeeper blocked in
+            // a pooled credential pull, while SenderPool's provider-free private driver may interrupt an
+            // unexpected overrun in a direct recovery operation. The interrupted thread can then run
+            // senderPool.reapIdle() or a startup-recovery step's finally, both of which close a delegate.
+            // A CARRIED flag is fatal to that close: CountDownLatch.await(t, u) tests Thread.interrupted() before it
+            // ever consults the latch, so CursorWebSocketSendLoop.close()'s shutdown await would throw
+            // having waited 0 ms, take the failed-stop path, and report the SF slot flock still held --
+            // the exact outcome the interrupt was added to prevent. Worse, that path re-asserts the
+            // flag, so every remaining delegate in the same reap sweep failed the same way.
+            //
+            // Clearing it here restores the intended meaning: the interrupt breaks the operation it was
+            // aimed at, and the teardown that follows runs normally. drainOnClose() also records and consumes
+            // an interrupt delivered while it is pacing that wait; restoring it before the I/O-loop shutdown
+            // would make the next CountDownLatch.await fail at 0ms after a successful ACK drain. Carry both
+            // observations to this outer boundary, after every teardown wait. An interrupt that instead lands
+            // during the I/O-loop shutdown still reaches that await and takes its genuine failed-stop branch.
+            final boolean[] restoreInterrupt = {Thread.interrupted()};
             try {
-                // Only drain when both the engine and the I/O loop are wired
-                // up — close() is also called from createForTesting() teardown
-                // and from connect() rollback paths where one or both may be null.
-                if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
-                    // 1) Flush user-thread state into the engine (encoded
-                    //    rows -> mmap'd / malloc'd ring). After this, the
-                    //    cursor engine's publishedFsn reflects the final
-                    //    target the I/O loop must drive ackedFsn up to.
-                    //    A pre-flight rejection means this batch cannot fit
-                    //    the current cap however it is split. It is
-                    //    RETAINED by design so it can go out once a
-                    //    larger-cap node is reached -- but on close there is
-                    //    no later flush, and letting the throw escape here
-                    //    skips sendCommitMessage, sealAndSwapBuffer and
-                    //    drainOnClose, abandoning every row an earlier
-                    //    successful flush already published. The message
-                    //    that path emits tells the caller to close the
-                    //    sender to discard the batch, so honour that:
-                    //    discard it, remember the error, and let the rest of
-                    //    close() run. rethrowTerminal below still surfaces it.
-                    try {
-                        flushPendingRows(deferCommit);
-                    } catch (BatchTooLargeForCapException e) {
-                        resetTableBuffersAfterFlush();
-                        terminalError = captureCloseError(terminalError, e);
-                    } catch (Throwable t) {
-                        // Same reasoning as the pre-flight rejection above, for the
-                        // failures a size check cannot see: sealAndSwapBuffer's
-                        // buffer-recycle timeout and appendBlocking's backpressure
-                        // deadline. Letting those escape to the outer catch skipped
-                        // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
-                        // flush that had already published deferred dictionary chunks
-                        // left their group open forever, and every row an EARLIER
-                        // successful flush published was abandoned unacked. The batch is
-                        // NOT discarded here (unlike the over-cap case, this failure is
-                        // not a verdict on the batch's contents), but the rest of close()
-                        // must still run. rethrowTerminal below surfaces it.
-                        terminalError = captureCloseError(terminalError, t);
-                    }
-                    if (!deferCommit && hasDeferredMessages) {
-                        sendCommitMessage();
-                    }
-                    if (activeBuffer != null && activeBuffer.hasData()) {
-                        sealAndSwapBuffer();
-                        if (!deferCommit) {
-                            lastCommitBoundaryFsn = cursorEngine.publishedFsn();
-                        }
-                    }
-                    // 2) Safety-net rethrow: surface the latched terminal
-                    //    error only when no other channel has already
-                    //    delivered THIS terminal to the user. "Already
-                    //    delivered" means either the producer thread saw it
-                    //    synchronously via flush()/append() (checkUnsurfacedError
-                    //    is silent in that case) or the async dispatcher
-                    //    actually delivered the latched terminal to a
-                    //    user-installed custom handler
-                    //    (hasDeliveredTerminalToCustomHandler, checked here).
-                    //    The test is terminal-specific on purpose: an earlier
-                    //    routine RETRIABLE rejection delivered to the
-                    //    handler must NOT suppress a later genuine TERMINAL
-                    //    error (the "any error ever" flag did, silently
-                    //    losing it). It also stays false when the terminal
-                    //    reached only the default handler after a
-                    //    setErrorHandler(null) revert, or is still
-                    //    queued/abandoned behind a slow handler -- so a
-                    //    config-string-only caller, and a reverting caller,
-                    //    both still get the loud rethrow on shutdown.
-                    boolean terminalOwnedByCustomHandler = errorDispatcher != null
-                            && errorDispatcher.hasDeliveredTerminalToCustomHandler();
-                    if (!terminalOwnedByCustomHandler) {
-                        cursorSendLoop.checkUnsurfacedError();
-                    }
-                    // 3) Bounded drain: block until the server has ACK'd
-                    //    everything we just published, or until the
-                    //    configured timeout elapses. closeFlushTimeoutMillis
-                    //    <= 0 opts out (fast close, may lose memory-mode
-                    //    data on JVM exit). Pass the same ownership flag the
-                    //    step-2 safety net used: when the custom handler
-                    //    already owns THIS terminal, the drain must stop on it
-                    //    without re-throwing (re-throwing would double-signal
-                    //    an error the user already handled). Otherwise the
-                    //    drain keeps the loud safety net and surfaces it.
-                    if (closeFlushTimeoutMillis > 0L) {
-                        drainOnClose(terminalOwnedByCustomHandler);
-                    }
-                }
-            } catch (Throwable t) {
-                terminalError = t;
-            }
-
-            // Shut down the I/O thread before closing the socket or buffers
-            // it may be using. Must run even if the flush above failed.
-            if (cursorSendLoop != null) {
-                try {
-                    cursorSendLoop.close();
-                } catch (Throwable e) {
-                    ioThreadStopped = false;
-                    LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
-                    terminalError = captureCloseError(terminalError, e);
+                close0(restoreInterrupt);
+            } finally {
+                if (restoreInterrupt[0]) {
+                    Thread.currentThread().interrupt();
                 }
             }
-            // Drainer pool closes after the foreground I/O loop is wound
-            // down. Drainers share buildAndConnect's endpoint walk and
-            // hostTracker state with the foreground (never its observable
-            // connection state or event stream), but their
-            // connect gate is their own stop flag — NOT the foreground
-            // loop's liveness — so the pool's graceful-drain window below
-            // still lets in-flight drainers finish (including reconnects)
-            // even though cursorSendLoop is already stopped.
-            if (drainerPool != null) {
-                try {
-                    drainerPool.close();
-                } catch (Throwable e) {
-                    LOG.error("Error closing drainer pool: {}", String.valueOf(e));
-                    terminalError = captureCloseError(terminalError, e);
-                }
-            }
-
-            // Always free resources the I/O thread never touches:
-            // encoder and table buffers are user-thread-only.
-            try {
-                encoder.close();
-                ObjList<CharSequence> keys = tableBuffers.keys();
-                for (int i = 0, n = keys.size(); i < n; i++) {
-                    CharSequence key = keys.getQuick(i);
-                    if (key != null) {
-                        Misc.free(tableBuffers.get(key));
-                    }
-                }
-                tableBuffers.clear();
-            } catch (Throwable t) {
-                LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
-                terminalError = captureCloseError(terminalError, t);
-            }
-
-            if (!ioThreadStopped) {
-                // The worker may still touch every resource below. Hand the
-                // complete sender-owned tail to its exit path rather than
-                // permanently leaking everything except the engine. The
-                // callback is idempotence-gated by closeRemainingResources().
-                if (ownsCursorEngine && cursorEngine != null) {
-                    retainedEngine = cursorEngine;
-                }
-                Runnable closeCallback = () -> closeRemainingResources(null);
-                if (cursorSendLoop != null && cursorSendLoop.delegateClose(closeCallback)) {
-                    rethrowTerminal(terminalError);
-                    return;
-                }
-                // The worker exited between close() failing and delegation.
-                // Cleanup is safe here and its failures remain suppressed on
-                // the original close error.
-                terminalError = closeRemainingResources(terminalError);
-            } else {
-                terminalError = closeRemainingResources(terminalError);
-            }
-
-            // If close() ended up holding the same instance the user already
-            // caught earlier, suppress the rethrow. The user's catch block
-            // wraps close() (try-with-resources), and Throwable refuses
-            // self-suppression.
-            if (terminalError != null && terminalError == alreadyOwnedByUser) {
-                terminalError = null;
-            }
-            rethrowTerminal(terminalError);
         }
+    }
+
+    private void close0(boolean[] restoreInterrupt) {
+        Runnable hook = closeStartedHook;
+        closeStartedHook = null;
+        if (hook != null) {
+            try {
+                hook.run();
+            } catch (Throwable t) {
+                // A test witness must never prevent production resource cleanup.
+                LOG.error("Error in close-started test hook: {}", String.valueOf(t));
+            }
+        }
+        boolean ioThreadStopped = true;
+        // Captures the first error from the flush/drain path AND any
+        // secondary errors from cleanup steps (added via addSuppressed).
+        // Silently swallowing any of these would hide latched terminal
+        // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
+        // SCHEMA_MISMATCH HALT) from users who only call close() and
+        // never call flush() afterwards.
+        Throwable terminalError = null;
+        // Snapshot the exact terminal error instance that a user-thread
+        // API call ALREADY caught (via flush()/at()) before close() ran.
+        // If flushPendingRows/drainOnClose below also rethrow the same
+        // instance, dropping it at the final rethrow avoids
+        // try-with-resources self-suppression: Throwable.addSuppressed
+        // raises IllegalArgumentException when primary == suppressed.
+        // Must stay this single read: the snapshot needs the identity of
+        // the error the user already owns, and only
+        // getSynchronouslySurfacedError() holds it. Deriving it from two
+        // separate latch reads races the I/O thread -- a terminal latched
+        // between the reads would be adopted as user-owned and silently
+        // dropped (see CloseOwnershipRaceTest).
+        Throwable alreadyOwnedByUser = cursorSendLoop != null
+                ? cursorSendLoop.getSynchronouslySurfacedError() : null;
+
+        try {
+            // Only drain when both the engine and the I/O loop are wired
+            // up — close() is also called from createForTesting() teardown
+            // and from connect() rollback paths where one or both may be null.
+            if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
+                // 1) Flush user-thread state into the engine (encoded
+                //    rows -> mmap'd / malloc'd ring). After this, the
+                //    cursor engine's publishedFsn reflects the final
+                //    target the I/O loop must drive ackedFsn up to.
+                //    A pre-flight rejection means this batch cannot fit
+                //    the current cap however it is split. It is
+                //    RETAINED by design so it can go out once a
+                //    larger-cap node is reached -- but on close there is
+                //    no later flush, and letting the throw escape here
+                //    skips sendCommitMessage, sealAndSwapBuffer and
+                //    drainOnClose, abandoning every row an earlier
+                //    successful flush already published. The message
+                //    that path emits tells the caller to close the
+                //    sender to discard the batch, so honour that:
+                //    discard it, remember the error, and let the rest of
+                //    close() run. rethrowTerminal below still surfaces it.
+                try {
+                    flushPendingRows(deferCommit);
+                } catch (BatchTooLargeForCapException e) {
+                    resetTableBuffersAfterFlush();
+                    terminalError = captureCloseError(terminalError, e);
+                } catch (Throwable t) {
+                    // Same reasoning as the pre-flight rejection above, for the
+                    // failures a size check cannot see: sealAndSwapBuffer's
+                    // buffer-recycle timeout and appendBlocking's backpressure
+                    // deadline. Letting those escape to the outer catch skipped
+                    // sendCommitMessage, sealAndSwapBuffer and drainOnClose -- so a
+                    // flush that had already published deferred dictionary chunks
+                    // left their group open forever, and every row an EARLIER
+                    // successful flush published was abandoned unacked. The batch is
+                    // NOT discarded here (unlike the over-cap case, this failure is
+                    // not a verdict on the batch's contents), but the rest of close()
+                    // must still run. rethrowTerminal below surfaces it.
+                    terminalError = captureCloseError(terminalError, t);
+                }
+                if (!deferCommit && hasDeferredMessages) {
+                    sendCommitMessage();
+                }
+                if (activeBuffer != null && activeBuffer.hasData()) {
+                    sealAndSwapBuffer();
+                    if (!deferCommit) {
+                        lastCommitBoundaryFsn = cursorEngine.publishedFsn();
+                    }
+                }
+                // 2) Safety-net rethrow: surface the latched terminal
+                //    error only when no other channel has already
+                //    delivered THIS terminal to the user. "Already
+                //    delivered" means either the producer thread saw it
+                //    synchronously via flush()/append() (checkUnsurfacedError
+                //    is silent in that case) or the async dispatcher
+                //    actually delivered the latched terminal to a
+                //    user-installed custom handler
+                //    (hasDeliveredTerminalToCustomHandler, checked here).
+                //    The test is terminal-specific on purpose: an earlier
+                //    routine RETRIABLE rejection delivered to the
+                //    handler must NOT suppress a later genuine TERMINAL
+                //    error (the "any error ever" flag did, silently
+                //    losing it). It also stays false when the terminal
+                //    reached only the default handler after a
+                //    setErrorHandler(null) revert, or is still
+                //    queued/abandoned behind a slow handler -- so a
+                //    config-string-only caller, and a reverting caller,
+                //    both still get the loud rethrow on shutdown.
+                boolean terminalOwnedByCustomHandler = errorDispatcher != null
+                        && errorDispatcher.hasDeliveredTerminalToCustomHandler();
+                if (!terminalOwnedByCustomHandler) {
+                    cursorSendLoop.checkUnsurfacedError();
+                }
+                // 3) Bounded drain: block until the server has ACK'd
+                //    everything we just published, or until the
+                //    configured timeout elapses. closeFlushTimeoutMillis
+                //    <= 0 opts out (fast close, may lose memory-mode
+                //    data on JVM exit). Pass the same ownership flag the
+                //    step-2 safety net used: when the custom handler
+                //    already owns THIS terminal, the drain must stop on it
+                //    without re-throwing (re-throwing would double-signal
+                //    an error the user already handled). Otherwise the
+                //    drain keeps the loud safety net and surfaces it.
+                if (closeFlushTimeoutMillis > 0L) {
+                    drainOnClose(terminalOwnedByCustomHandler, restoreInterrupt);
+                }
+            }
+        } catch (Throwable t) {
+            terminalError = t;
+        }
+
+        // Shut down the I/O thread before closing the socket or buffers
+        // it may be using. Must run even if the flush above failed.
+        if (cursorSendLoop != null) {
+            try {
+                cursorSendLoop.close();
+            } catch (Throwable e) {
+                ioThreadStopped = false;
+                LOG.error("Error closing cursor send loop: {}", String.valueOf(e));
+                terminalError = captureCloseError(terminalError, e);
+            }
+        }
+        // Drainer pool closes after the foreground I/O loop is wound
+        // down. Drainers share buildAndConnect's endpoint walk and
+        // hostTracker state with the foreground (never its observable
+        // connection state or event stream), but their
+        // connect gate is their own stop flag — NOT the foreground
+        // loop's liveness — so the pool's graceful-drain window below
+        // still lets in-flight drainers finish (including reconnects)
+        // even though cursorSendLoop is already stopped.
+        if (drainerPool != null) {
+            try {
+                drainerPool.close();
+            } catch (Throwable e) {
+                LOG.error("Error closing drainer pool: {}", String.valueOf(e));
+                terminalError = captureCloseError(terminalError, e);
+            }
+        }
+
+        // Always free resources the I/O thread never touches:
+        // encoder and table buffers are user-thread-only.
+        try {
+            encoder.close();
+            ObjList<CharSequence> keys = tableBuffers.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                CharSequence key = keys.getQuick(i);
+                if (key != null) {
+                    Misc.free(tableBuffers.get(key));
+                }
+            }
+            tableBuffers.clear();
+        } catch (Throwable t) {
+            LOG.error("Error closing encoder or table buffers: {}", String.valueOf(t));
+            terminalError = captureCloseError(terminalError, t);
+        }
+
+        if (!ioThreadStopped) {
+            // The worker may still touch every resource below. Hand the
+            // complete sender-owned tail to its exit path rather than
+            // permanently leaking everything except the engine. The
+            // callback is idempotence-gated by closeRemainingResources().
+            if (ownsCursorEngine && cursorEngine != null) {
+                retainedEngine = cursorEngine;
+            }
+            Runnable closeCallback = () -> closeRemainingResources(null);
+            if (cursorSendLoop != null && cursorSendLoop.delegateClose(closeCallback)) {
+                rethrowTerminal(terminalError);
+                return;
+            }
+            // The worker exited between close() failing and delegation.
+            // Cleanup is safe here and its failures remain suppressed on
+            // the original close error.
+            terminalError = closeRemainingResources(terminalError);
+        } else {
+            terminalError = closeRemainingResources(terminalError);
+        }
+
+        // If close() ended up holding the same instance the user already
+        // caught earlier, suppress the rethrow. The user's catch block
+        // wraps close() (try-with-resources), and Throwable refuses
+        // self-suppression.
+        if (terminalError != null && terminalError == alreadyOwnedByUser) {
+            terminalError = null;
+        }
+        rethrowTerminal(terminalError);
     }
 
     @TestOnly
@@ -1977,6 +2136,23 @@ public class QwpWebSocketSender implements Sender {
         currentTableBufferSnapshotBytes = buffer.getBufferedBytes();
         currentTableName = tableName;
         return buffer;
+    }
+
+    /**
+     * Test seam over {@link #hasDynamicCredential()}: whether this sender's configured
+     * credential is re-derived per handshake (an {@code httpTokenProvider}) rather than
+     * captured once (an {@code httpToken} or {@code httpUsernamePassword}).
+     * <p>
+     * The tag is set by the builder, several classes away from the orphan drainer whose
+     * terminal policy consumes it, and a mis-tag is silent at build time. Tagging a
+     * rotating credential as fixed makes the first {@code 401} of an orphan drain drop a
+     * {@code .failed} sentinel that nothing in production clears -- replayable rows
+     * abandoned for good over a token the next pull would have refreshed. Hence a seam a
+     * test can assert on a real, built sender.
+     */
+    @TestOnly
+    public boolean isCredentialDynamic() {
+        return hasDynamicCredential();
     }
 
     /**
@@ -2653,12 +2829,15 @@ public class QwpWebSocketSender implements Sender {
             // Install the user listener as the pool's submit-time default so
             // the drainers submitted below observe it from their first event.
             drainerPool.setListener(this.drainerListener);
-            // Route drainer data-loss reports through the sender's own error
+            // Route the drainers' reports through the sender's own error
             // dispatcher: async, bounded, and contained exactly like every
-            // other SenderError. The dispatcher field is read lazily because
-            // it is created on connect, which can complete after this pool is
-            // built; a null dispatcher (never connected) leaves the site's own
-            // LOG line as the only announcement, same as before this sink.
+            // other SenderError. Two kinds arrive -- the data-loss report when a
+            // drainer abandons a slot, and the non-terminal faults its drain loop
+            // rides out (above all a credential the token provider cannot supply,
+            // which nothing else would ever surface). The dispatcher field is read
+            // lazily because it is created on connect, which can complete after
+            // this pool is built; a null dispatcher (never connected) leaves the
+            // site's own LOG line as the only announcement, same as before this sink.
             drainerPool.setErrorSink(err -> {
                 SenderErrorDispatcher d = errorDispatcher;
                 if (d != null) {
@@ -2966,11 +3145,6 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
-     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
-     * Production path delegates to {@link WebSocketClientFactory}; tests may
-     * install {@link #clientFactoryOverride} to substitute a stub.
-     */
-    /**
      * Best-effort close for a client being abandoned because a JVM Error is
      * about to be rethrown: under OOM {@code close()} itself can throw, and a
      * secondary failure must not mask the original Error. {@code close()} is
@@ -2984,6 +3158,11 @@ public class QwpWebSocketSender implements Sender {
         }
     }
 
+    /**
+     * Builds the per-attempt WebSocket client for {@link #buildAndConnect}.
+     * Production path delegates to {@link WebSocketClientFactory}; tests may
+     * install {@link #clientFactoryOverride} to substitute a stub.
+     */
     private WebSocketClient newWebSocketClient() {
         java.util.function.Supplier<WebSocketClient> override = clientFactoryOverride;
         if (override != null) {
@@ -3125,6 +3304,55 @@ public class QwpWebSocketSender implements Sender {
         HttpClientException terminalUpgradeError = null;
         QwpIngressRoleRejectedException lastRoleReject = null;
         Endpoint lastEndpoint = null;
+        // Honor a close/stop that raced this (re)connect before doing any work - a token pull can make a
+        // blocking network call - mirroring the per-endpoint check at the top of the walk below. Use the
+        // context's abort gate, not the foreground loop's state: a background drainer must still be able to
+        // (re)connect during the sender's close sequence, when the foreground loop is already stopped.
+        if (ctx.isAborted()) {
+            throw new LineSenderException(ctx.abortMessage());
+        }
+        // Resolve the Authorization header ONCE per (re)connect round, before the endpoint walk. For an
+        // httpTokenProvider this queries the provider a single time - a fresh token per handshake round, as the
+        // javadoc documents - NOT once per endpoint: a token-provider failure is cluster-wide (a failed silent
+        // refresh, or not signed in), not a per-endpoint transport fault, so re-querying it per endpoint would
+        // hammer the token endpoint with the same dead credential and mislabel the failure as "all endpoints
+        // unreachable". A throw here is wrapped as QwpCredentialUnavailableException (below): the
+        // foreground/SYNC initial connect unwraps it and fails fast with the provider's own message, while the
+        // running background drainer treats it as a transient outage and retries it indefinitely with capped
+        // backoff (never bounded by the reconnect budget, never terminal), so even a persistent credential
+        // outage keeps the buffered rows in store-and-forward rather than terminating the sender (Invariant B).
+        // Mirrors QwpQueryClient, which likewise resolves the credential once before its endpoint walk.
+        // Publish this thread as being inside the pull BEFORE making it, then re-check cancellation, exactly
+        // as the per-endpoint connect below does with the WebSocketClient. The pull is the one blocking call
+        // in the walk that cancel()'s closeTraffic() cannot reach - it runs caller-supplied HttpTokenProvider
+        // code - and it can outlast close()'s shutdown budget, so cancel() breaks it with an interrupt
+        // instead. Skipped on the foreground path, where cancellation is null and close() is not racing us.
+        if (cancellation != null) {
+            cancellation.publishCredentialPull(Thread.currentThread());
+            if (cancellation.isCancelled()) {
+                cancellation.clearCredentialPull();
+                throw new LineSenderException(ctx.abortMessage());
+            }
+        }
+        final String authHeader;
+        try {
+            authHeader = authorizationHeaderSupplier == null ? null : authorizationHeaderSupplier.get();
+        } catch (RuntimeException e) {
+            // Tag the failure CLASS so each context applies the right policy: a credential we cannot acquire is
+            // not a transport outage. A foreground/SYNC connect unwraps this and rethrows the provider's own
+            // exception, so build() surfaces the provider's error directly rather than an internal wrapper. The
+            // running background drainer, by contrast, treats it as a transient outage and retries it
+            // indefinitely under Invariant B -- never bounding it by the reconnect budget, never latching a
+            // terminal -- so a recoverable credential outage never drops a producer store-and-forward promised
+            // to keep alive.
+            throw new QwpCredentialUnavailableException(e);
+        } finally {
+            // Drop the marker as soon as the pull returns, so a later cancel() cannot interrupt this thread
+            // at an arbitrary point in the walk. Mirrors ConnectCancellation.clear() for the in-flight client.
+            if (cancellation != null) {
+                cancellation.clearCredentialPull();
+            }
+        }
         while (true) {
             if (ctx.isAborted()) {
                 throw new LineSenderException(ctx.abortMessage());
@@ -3164,7 +3392,10 @@ public class QwpWebSocketSender implements Sender {
                 }
                 newClient.connect(ep.host, ep.port);
                 int upgradeTimeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
-                newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authorizationHeader);
+                // Present the header resolved once above for this handshake. On a failover to a later endpoint
+                // the same round's token is reused (a token is cluster-wide), so the provider is queried once
+                // per reconnect round, not once per endpoint.
+                newClient.upgrade(WRITE_PATH, upgradeTimeoutMs, authHeader);
                 if (cancellation != null) {
                     // connect()+upgrade() completed: this client is no longer
                     // blocking, so drop it from the in-flight handle before it
@@ -3648,11 +3879,12 @@ public class QwpWebSocketSender implements Sender {
      *   double-signalled either.</li>
      * </ul>
      *
-     * @param errorOwnedByCustomHandler whether the async dispatcher has
-     *                                  already delivered a terminal to a
+     * @param errorOwnedByCustomHandler whether the async dispatcher has already delivered a terminal to a
      *                                  user-installed handler
+     * @param restoreInterrupt          close()-scoped carrier that restores any consumed interrupt only after
+     *                                  the remaining teardown waits have completed
      */
-    private void drainOnClose(boolean errorOwnedByCustomHandler) {
+    private void drainOnClose(boolean errorOwnedByCustomHandler, boolean[] restoreInterrupt) {
         if (closeFlushTimeoutMillis <= 0L) {
             return;
         }
@@ -3686,37 +3918,52 @@ public class QwpWebSocketSender implements Sender {
             }
         }
         long deadlineNanos = System.nanoTime() + closeFlushTimeoutMillis * 1_000_000L;
-        while (cursorEngine.ackedFsn() < target) {
-            // Stop on a latched terminal (acks will never reach target);
-            // surface it only when no other channel already delivered it.
-            if (errorOwnedByCustomHandler) {
-                if (cursorSendLoop.getTerminalError() != null) {
-                    return;
+        restoreInterrupt[0] |= Thread.interrupted();
+        try {
+            while (cursorEngine.ackedFsn() < target) {
+                // PoolHousekeeper.stop() escalates to interrupt when this close runs past its join budget. A carried
+                // interrupt makes parkNanos return immediately without clearing the flag, turning the remainder of a
+                // close drain (up to 60s by default) into a full-core spin. Consume any later interrupt before the
+                // next paced wait, remember it, and restore the flag once the whole close exits.
+                if (Thread.interrupted()) {
+                    restoreInterrupt[0] = true;
                 }
-            } else {
-                cursorSendLoop.checkError();
+                // Stop on a latched terminal (acks will never reach target);
+                // surface it only when no other channel already delivered it.
+                if (errorOwnedByCustomHandler) {
+                    if (cursorSendLoop.getTerminalError() != null) {
+                        return;
+                    }
+                } else {
+                    cursorSendLoop.checkError();
+                }
+                if (System.nanoTime() >= deadlineNanos) {
+                    long acked = cursorEngine.ackedFsn();
+                    // Name the outage the I/O thread is riding out, when there is one. A
+                    // foreground sender now retries endpoint-policy rejections indefinitely,
+                    // so a revoked token reaches the operator HERE, and blaming timeout
+                    // tuning for what is actually an auth failure would misdirect them.
+                    CursorWebSocketSendLoop loop = cursorSendLoop;
+                    Throwable outage = loop == null ? null : loop.lastReconnectError();
+                    LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
+                            closeFlushTimeoutMillis, target, acked,
+                            outage == null ? "" : "; wire is not draining: " + outage.getMessage());
+                    throw new LineSenderException("close() drain timed out after ")
+                            .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
+                            .put(target).put(", ackedFsn=").put(acked)
+                            .put("] - server did not acknowledge ")
+                            .put(target - acked)
+                            .put(outage == null
+                                    ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
+                                    : " pending batches; the wire is not draining: " + outage.getMessage());
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
             }
-            if (System.nanoTime() >= deadlineNanos) {
-                long acked = cursorEngine.ackedFsn();
-                // Name the outage the I/O thread is riding out, when there is one. A
-                // foreground sender now retries endpoint-policy rejections indefinitely,
-                // so a revoked token reaches the operator HERE, and blaming timeout
-                // tuning for what is actually an auth failure would misdirect them.
-                CursorWebSocketSendLoop loop = cursorSendLoop;
-                Throwable outage = loop == null ? null : loop.lastReconnectError();
-                LOG.warn("close() drain timed out after {}ms [target={} acked={}], pending data may be lost{}",
-                        closeFlushTimeoutMillis, target, acked,
-                        outage == null ? "" : "; wire is not draining: " + outage.getMessage());
-                throw new LineSenderException("close() drain timed out after ")
-                        .put(closeFlushTimeoutMillis).put(" ms [targetFsn=")
-                        .put(target).put(", ackedFsn=").put(acked)
-                        .put("] - server did not acknowledge ")
-                        .put(target - acked)
-                        .put(outage == null
-                                ? " pending batches; data may be lost (use larger closeFlushTimeoutMillis or smaller batches)"
-                                : " pending batches; the wire is not draining: " + outage.getMessage());
-            }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        } finally {
+            // Close the last-iteration race: an interrupt can land after the loop observes its final ACK but
+            // before it exits. Keep teardown interrupt-neutral and hand the signal back only at close()'s outer
+            // boundary, after cursorSendLoop.close() and drainerPool.close() have spent their join budgets.
+            restoreInterrupt[0] |= Thread.interrupted();
         }
     }
 
@@ -3798,6 +4045,11 @@ public class QwpWebSocketSender implements Sender {
             default:
                 try {
                     client = reconnectFactory.reconnect();
+                } catch (QwpCredentialUnavailableException e) {
+                    // The caller configured the token provider, so surface the provider's own exception (and
+                    // its message) rather than the internal marker: a credential failure on a foreground
+                    // connect is the caller's to see, not a transport-shaped wrapper.
+                    throw e.providerFailure();
                 } catch (RuntimeException e) {
                     throw e;
                 } catch (Exception e) {
@@ -4378,6 +4630,29 @@ public class QwpWebSocketSender implements Sender {
     }
 
     /**
+     * On-wire byte cost of one symbol-dictionary entry, exactly as
+     * {@code NativeBufferWriter.putString} writes it: {@code [varint utf8Len][utf8]}.
+     * Both of that method's branches (the ASCII fast path, which reserves
+     * {@code varintSize(charLen) == varintSize(utf8Len)}, and the two-pass fallback)
+     * produce this size, so the chunker below sizes frames against the same
+     * arithmetic the encoder will use rather than an independent estimate.
+     */
+    private int dictionaryEntryWireBytes(int id) {
+        int utf8Len = NativeBufferWriter.utf8Length(globalSymbolDictionary.getSymbol(id));
+        return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
+    }
+
+    /**
+     * Whether the {@code Authorization} header is re-derived on every handshake from a caller-supplied
+     * token provider, rather than being a constant captured once. A rotating credential makes a
+     * {@code 401} potentially recoverable, which the orphan drainer's terminal policy depends on; see
+     * {@link #fixedAuthHeader(String)}.
+     */
+    private boolean hasDynamicCredential() {
+        return authorizationHeaderSupplier != null && !(authorizationHeaderSupplier instanceof FixedAuthHeader);
+    }
+
+    /**
      * Writes the ids the surviving frames contributed above the persisted prefix back
      * into {@code .symbol-dict}, immediately, before any new frame can be published.
      * <p>
@@ -4401,19 +4676,6 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * Healing here, eagerly and in full, restores the invariant before the window opens.
      */
-    /**
-     * On-wire byte cost of one symbol-dictionary entry, exactly as
-     * {@code NativeBufferWriter.putString} writes it: {@code [varint utf8Len][utf8]}.
-     * Both of that method's branches (the ASCII fast path, which reserves
-     * {@code varintSize(charLen) == varintSize(utf8Len)}, and the two-pass fallback)
-     * produce this size, so the chunker below sizes frames against the same
-     * arithmetic the encoder will use rather than an independent estimate.
-     */
-    private int dictionaryEntryWireBytes(int id) {
-        int utf8Len = NativeBufferWriter.utf8Length(globalSymbolDictionary.getSymbol(id));
-        return NativeBufferWriter.varintSize(utf8Len) + utf8Len;
-    }
-
     private void healPersistedDictionary(PersistedSymbolDict pd) {
         if (pd == null || !deltaDictEnabled) {
             return;
@@ -5045,7 +5307,10 @@ public class QwpWebSocketSender implements Sender {
             if (name.length() > MAX_TABLE_NAME_LENGTH) {
                 throw new LineSenderException("table name too long [maxLength=" + MAX_TABLE_NAME_LENGTH + "]");
             }
-            throw new LineSenderException("table name contains illegal characters: " + name);
+            // sanitize the rejected name before it reaches the message (and any log/terminal): a name that
+            // failed validation can carry BOM/bidi/zero-width/control chars that would otherwise reorder, hide
+            // or forge what a human reads, matching how the ILP name/error render escapes untrusted text
+            throw new LineSenderException("table name contains illegal characters: ").putAsPrintable(name);
         }
     }
 
@@ -5056,6 +5321,24 @@ public class QwpWebSocketSender implements Sender {
         public Endpoint(String host, int port) {
             this.host = host;
             this.port = port;
+        }
+    }
+
+    /**
+     * A constant {@code Authorization} header value. Its identity as a type - not the value it yields - is
+     * what {@link #hasDynamicCredential()} reads, so the drainer can apply the right terminal policy to a
+     * {@code 401}. See {@link #fixedAuthHeader(String)}.
+     */
+    private static final class FixedAuthHeader implements Supplier<String> {
+        private final String header;
+
+        private FixedAuthHeader(String header) {
+            this.header = header;
+        }
+
+        @Override
+        public String get() {
+            return header;
         }
     }
 
@@ -5084,6 +5367,11 @@ public class QwpWebSocketSender implements Sender {
 
         String abortMessage() {
             return abortCheck != null ? abortMessage : "sender closed during connect";
+        }
+
+        @Override
+        public boolean hasDynamicCredential() {
+            return QwpWebSocketSender.this.hasDynamicCredential();
         }
 
         /**

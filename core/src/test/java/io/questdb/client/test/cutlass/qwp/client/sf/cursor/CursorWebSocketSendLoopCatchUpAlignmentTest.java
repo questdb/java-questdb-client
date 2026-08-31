@@ -1535,23 +1535,6 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
     }
 
     /**
-     * Reassembles the frames captured since the last call through the same
-     * {@link QwpWireTestUtils#accumulateDeltaDictionary} the end-to-end tests'
-     * handler uses -- with {@code allowGap=true}, so a hole surfaces as a null
-     * entry here instead of raising {@code DictionaryGapException} the way a
-     * real server now would -- and asserts the result is the seeded dictionary,
-     * dense and in order.
-     * <p>
-     * This is what frame counting cannot do. A catch-up split ships its chunks as
-     * {@code [deltaStart, deltaStart+count)} ranges that must tile {@code [0, n)}
-     * exactly; an off-by-one in the walk's start id keeps the frame COUNT intact
-     * while overlapping a range (an id silently takes its neighbour's symbol) or
-     * skipping one (surfaced here as a null entry; against a real server that id
-     * would instead be REJECTED as a dictionary gap). Comparing the reassembled
-     * dictionary catches all three shapes -- overlap, gap and shift -- because it
-     * compares content per id, not just the ranges.
-     */
-    /**
      * As {@link #assertCatchUpReassembles(CatchUpCapturingClient, String...)}, but for
      * {@link #captureCatchUpFrames} / {@link #captureCatchUpFramesWithOneLargeSymbol},
      * which return the captured frames directly instead of a client -- and where the
@@ -1572,6 +1555,23 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
         }
     }
 
+    /**
+     * Reassembles the frames captured since the last call through the same
+     * {@link QwpWireTestUtils#accumulateDeltaDictionary} the end-to-end tests'
+     * handler uses -- with {@code allowGap=true}, so a hole surfaces as a null
+     * entry here instead of raising {@code DictionaryGapException} the way a
+     * real server now would -- and asserts the result is the seeded dictionary,
+     * dense and in order.
+     * <p>
+     * This is what frame counting cannot do. A catch-up split ships its chunks as
+     * {@code [deltaStart, deltaStart+count)} ranges that must tile {@code [0, n)}
+     * exactly; an off-by-one in the walk's start id keeps the frame COUNT intact
+     * while overlapping a range (an id silently takes its neighbour's symbol) or
+     * skipping one (surfaced here as a null entry; against a real server that id
+     * would instead be REJECTED as a dictionary gap). Comparing the reassembled
+     * dictionary catches all three shapes -- overlap, gap and shift -- because it
+     * compares content per id, not just the ranges.
+     */
     private static void assertCatchUpReassembles(CatchUpCapturingClient client, String... expected) {
         List<String> rebuilt = new ArrayList<>();
         for (byte[] frame : client.capturedFrames) {

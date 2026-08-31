@@ -55,11 +55,25 @@ import java.util.concurrent.atomic.AtomicLong;
  * that don't exit in time (typically parked in a blocking native connect
  * that neither unpark nor interrupt cancels) are left to finish on their
  * own — the pool's underlying executor uses daemon threads so they don't
- * block JVM exit. An interrupted {@code close()} skips the graceful
- * window: every active drainer is stop-signaled immediately, then the
- * executor is shut down hard. A drainer cut down mid-drain exits STOPPED
- * with its unacked rows still in SF — re-adopted by the next orphan scan,
- * never dropped.
+ * block JVM exit. A drainer cut down mid-drain exits STOPPED with its
+ * unacked rows still in SF — re-adopted by the next orphan scan, never
+ * dropped.
+ * <p>
+ * An interrupt that lands <i>during</i> the graceful window ends it: every
+ * active drainer is stop-signaled immediately, then the executor is shut
+ * down hard. An interrupt the caller merely <i>arrives</i> with does not,
+ * and the usual caller is the one that carries one — a task cancelled by
+ * {@code ExecutorService.shutdownNow()} closing its {@code QuestDB} handle.
+ * {@link io.questdb.client.cutlass.qwp.client.QwpWebSocketSender#close()}
+ * clears the flag for the duration of its close and restores it on the way
+ * out, because a carried flag used to make every wait beneath it throw on
+ * arrival — which is how a reap sweep came to report slots with their SF
+ * flock still held. The graceful window therefore runs in full on that
+ * path, and a cancelled close costs up to
+ * {@code GRACEFUL_DRAIN_MILLIS + STOP_GRACE_MILLIS} per sender that has an
+ * orphan drainer actively delivering. That is the intended trade: the
+ * split stop above already exempts drainers that are merely retrying a
+ * connect, so what is waited on is a drainer with rows on the wire.
  */
 public final class BackgroundDrainerPool implements QuietCloseable {
 

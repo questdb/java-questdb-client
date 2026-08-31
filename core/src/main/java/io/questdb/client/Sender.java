@@ -77,6 +77,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 /**
  * Influx Line Protocol client to feed data to a remote QuestDB instance.
@@ -1091,6 +1092,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         private String httpSettingsPath;
         private int httpTimeout = PARAMETER_NOT_SET_EXPLICITLY;
         private String httpToken;
+        private HttpTokenProvider httpTokenProvider;
         // Drives the initial-connect strategy. null means "not set
         // explicitly", which build() resolves to SYNC when any reconnect_*
         // knob was tuned by the user, otherwise OFF. SYNC retries on the
@@ -1449,7 +1451,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     tlsConfig = new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode == TlsValidationMode.DEFAULT ? ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL : ClientTlsConfiguration.TLS_VALIDATION_MODE_NONE);
                 }
                 return AbstractLineHttpSender.createLineSender(hosts, ports, httpPath, httpClientConfiguration, tlsConfig, actualAutoFlushRows, httpToken,
-                        username, password, maxNameLength, actualMaxRetriesNanos, maxBackoffMillis, actualMinRequestThroughput, actualAutoFlushIntervalMillis, protocolVersion);
+                        username, password, maxNameLength, actualMaxRetriesNanos, maxBackoffMillis, actualMinRequestThroughput, actualAutoFlushIntervalMillis, protocolVersion, httpTokenProvider);
             }
 
             if (protocol == PROTOCOL_WEBSOCKET) {
@@ -1463,7 +1465,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                         ? DEFAULT_WS_AUTO_FLUSH_INTERVAL_NANOS
                         : TimeUnit.MILLISECONDS.toNanos(autoFlushIntervalMillis);
 
-                String wsAuthHeader = buildWebSocketAuthHeader();
+                Supplier<String> wsAuthHeader = buildWebSocketAuthHeader();
 
                 ClientTlsConfiguration wsTlsConfig = null;
                 if (tlsEnabled) {
@@ -1689,7 +1691,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                     // still rescue, so build() waits for that verdict rather than pre-judging it.
                     while (connected == null) {
                         try {
-                            connected = QwpWebSocketSender.connect(
+                            connected = QwpWebSocketSender.connectWithCredentialSupplier(
                                     wsEndpoints,
                                     wsTlsConfig,
                                     actualAutoFlushRows,
@@ -2287,10 +2289,72 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             if (this.httpToken != null) {
                 throw new LineSenderException("token was already configured");
             }
+            if (this.httpTokenProvider != null) {
+                throw new LineSenderException("token provider was already configured");
+            }
             if (Chars.isBlank(token)) {
                 throw new LineSenderException("token cannot be empty nor null");
             }
             this.httpToken = token;
+            return this;
+        }
+
+        /**
+         * Supplies the HTTP authentication token from a provider queried as the sender builds each request,
+         * instead of a fixed {@link #httpToken(String) token} captured once, so a long-lived sender follows
+         * token refreshes - e.g. an OIDC device-flow token: {@code .httpTokenProvider(auth::getToken)}.
+         * <br>
+         * Over HTTP the provider is not called at build time: the first call happens when the first row is
+         * started, then once per flush. Over WebSocket it depends on whether the initial connect is eager.
+         * With an EAGER initial connect (the default, and any {@code initial_connect_retry} other than
+         * {@code async}) the handshake runs during {@code build()} and queries the provider once for it;
+         * under {@code lazy_connect=true} - or {@code initial_connect_retry=async} - the ingest side connects
+         * asynchronously, so {@code build()} pulls nothing and a provider failure surfaces through the error
+         * inbox rather than from {@code build()}. Either way the provider is queried again once per reconnect
+         * handshake, so a refreshed token is presented each time the link is (re)established; an
+         * already-established WebSocket is not re-authenticated mid-stream. The two transports differ in
+         * mechanism but both keep the producer alive across a sustained token outage: over HTTP a failed pull
+         * leaves the request token-pending and is retried on the next row; over WebSocket an EAGER initial
+         * handshake fails fast when no token can be obtained, after which a pull that keeps failing on later
+         * reconnects is retried indefinitely, with the buffered rows held in store-and-forward, until a token
+         * is available again. A token outage does not terminate a running WebSocket sender, just as a
+         * persistent transport reconnect failure does not (store-and-forward Invariant B).
+         * <br>
+         * Over HTTP the token is pulled once per request and written into the request buffer ahead of the
+         * buffered rows, so a token refresh is picked up on the next new batch after a successful flush. A
+         * failed flush preserves the buffer - token included - for a later retry and re-sends it verbatim
+         * rather than re-pulling the token, so a flush that keeps failing until the already-pulled token
+         * expires is then rejected (for example a {@code 401}); recover by discarding the buffered rows (close
+         * and rebuild the sender) so the next request pulls a fresh token.
+         * <br>
+         * A lazily-signing-in provider can therefore be wired before the interactive sign-in completes over HTTP,
+         * where the first pull is deferred to the first row, and over WebSocket under {@code lazy_connect=true}
+         * (or {@code initial_connect_retry=async}), where nothing is pulled at build time either. What does
+         * require a token up front is an EAGER WebSocket connect: its initial handshake pulls one during
+         * {@code build()}, so that {@code build()} (or, over HTTP, the first row) fails when none can be
+         * obtained. Running on the send/flush and reconnect paths, the provider must
+         * return promptly and must not block on interactive input (see {@link HttpTokenProvider}). Supported
+         * over HTTP and WebSocket transport, and mutually exclusive with {@link #httpToken(String)} and
+         * {@link #httpUsernamePassword(String, String)}.
+         *
+         * @param httpTokenProvider supplies the current HTTP authentication token
+         * @return this instance for method chaining
+         */
+        public LineSenderBuilder httpTokenProvider(HttpTokenProvider httpTokenProvider) {
+            if (this.username != null) {
+                throw new LineSenderException("authentication username was already configured ")
+                        .put("[username=").put(this.username).put("]");
+            }
+            if (this.httpToken != null) {
+                throw new LineSenderException("token was already configured");
+            }
+            if (this.httpTokenProvider != null) {
+                throw new LineSenderException("token provider was already configured");
+            }
+            if (httpTokenProvider == null) {
+                throw new LineSenderException("token provider cannot be null");
+            }
+            this.httpTokenProvider = httpTokenProvider;
             return this;
         }
 
@@ -2318,6 +2382,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             }
             if (httpToken != null) {
                 throw new LineSenderException("token authentication is already configured");
+            }
+            if (httpTokenProvider != null) {
+                throw new LineSenderException("token provider authentication is already configured");
             }
             this.username = username;
             this.password = password;
@@ -3357,13 +3424,34 @@ public interface Sender extends Closeable, ArraySender<Sender> {
             ports.add(port);
         }
 
-        private String buildWebSocketAuthHeader() {
+        private Supplier<String> buildWebSocketAuthHeader() {
+            // A constant credential goes through fixedAuthHeader, not a bare lambda: the tag is what lets
+            // the store-and-forward drainer tell a permanently-wrong password from a rotating token that a
+            // fresh pull can repair, and so decide whether a 401 may quarantine an orphan slot for good.
             if (username != null && password != null) {
                 String credentials = username + ":" + password;
-                return "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+                String header = "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+                return QwpWebSocketSender.fixedAuthHeader(header);
             }
             if (httpToken != null) {
-                return "Bearer " + httpToken;
+                String header = "Bearer " + httpToken;
+                return QwpWebSocketSender.fixedAuthHeader(header);
+            }
+            if (httpTokenProvider != null) {
+                // pull a fresh token at each (re)handshake so a long-lived WebSocket follows token
+                // refreshes; validateToken rejects a null/empty/blank return, or a token carrying a
+                // control or non-ASCII char (both forbidden by the HttpTokenProvider contract), rather
+                // than send a malformed or CR/LF-injected "Bearer " header
+                final HttpTokenProvider provider = httpTokenProvider;
+                return () -> {
+                    // snapshot before validating: the concatenation below re-reads the sequence, and a
+                    // provider is free to reuse a mutable buffer, so validating the live sequence checks
+                    // bytes the header need not carry. See HttpTokenProvider.validateToken.
+                    CharSequence pulled = provider.getToken();
+                    CharSequence token = pulled == null ? null : pulled.toString();
+                    HttpTokenProvider.validateToken(token);
+                    return "Bearer " + token;
+                };
             }
             return null;
         }
@@ -4343,6 +4431,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 if (httpToken != null) {
                     throw new LineSenderException("HTTP token authentication is not supported for TCP protocol");
                 }
+                if (httpTokenProvider != null) {
+                    throw new LineSenderException("HTTP token provider authentication is not supported for TCP protocol");
+                }
                 if (retryTimeoutMillis != PARAMETER_NOT_SET_EXPLICITLY) {
                     throw new LineSenderException("retrying is not supported for TCP protocol");
                 }
@@ -4367,6 +4458,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                 }
                 if (httpToken != null) {
                     throw new LineSenderException("HTTP token authentication is not supported for UDP transport");
+                }
+                if (httpTokenProvider != null) {
+                    throw new LineSenderException("HTTP token provider authentication is not supported for UDP transport");
                 }
                 if (username != null || password != null) {
                     throw new LineSenderException("username/password authentication is not supported for UDP transport");

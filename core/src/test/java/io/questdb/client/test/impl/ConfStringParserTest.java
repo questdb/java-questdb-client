@@ -82,6 +82,13 @@ public final class ConfStringParserTest {
             pos = ConfStringParser.value(config, pos, sink);
             Assert.assertTrue(pos < 0);
             TestUtils.assertContains(sink, "invalid character");
+            // ...and that the offending char is RENDERED as an escape rather than spliced in raw. This is
+            // the only production caller of putAsPrintable(char), and asserting the prefix alone let that
+            // overload emit anything at all: a config string carrying an ESC or a bidi override would then
+            // rewrite the terminal of whoever read the parse error.
+            TestUtils.assertContains(sink, String.format("\\u%04x", badChar));
+            Assert.assertTrue("the raw control char must not reach the message",
+                    sink.toString().indexOf(badChar) < 0);
             TestUtils.assertContains(sink, "at position 11");
             assertNoNext(config, pos);
         }

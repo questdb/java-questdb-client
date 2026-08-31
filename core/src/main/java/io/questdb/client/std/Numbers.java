@@ -343,6 +343,28 @@ public final class Numbers {
         return parseHexLong(sequence, 0, sequence.length());
     }
 
+    /**
+     * Parses a hexadecimal sequence into a long, reading a full-width 16-digit word as its
+     * TWO'S-COMPLEMENT value: {@code ffffffffffffffff} is {@code -1}, not an error. This matches
+     * {@link #parseHexInt(CharSequence, int, int)} beside it and the server-side {@code io.questdb.std.Numbers}
+     * of the same name, whose {@code Long256} decoding depends on the wrap.
+     * <p>
+     * <b>Anything longer than 16 significant digits silently discards its high bits</b>, and a caller
+     * parsing a COUNT it did not choose must bound the digits itself rather than lean on this method to
+     * do it. Each overflow residue breaks a length-prefixed format its own way, and
+     * {@code AbstractChunkedResponse} is the worked example: an HTTP chunk size of
+     * {@code 8000000000000000} wraps negative and hangs a framing state machine, one of
+     * {@code 10000000000000000} wraps to zero and reads as the terminal chunk (a truncated body reported
+     * as complete), and longer values wrap to short positive counts that mis-frame everything after them.
+     * It guards by counting significant digits BEFORE calling here, which is the only form that works -
+     * the zero residue is indistinguishable from a genuine {@code 0} once parsed.
+     *
+     * @param sequence the characters to parse
+     * @param lo       inclusive start
+     * @param hi       exclusive end
+     * @return the parsed value, wrapping on overflow
+     * @throws NumericException if the sequence is empty or holds a non-hex character
+     */
     public static long parseHexLong(CharSequence sequence, int lo, int hi) throws NumericException {
         if (hi == 0) {
             throw NumericException.instance().put("empty hex string");

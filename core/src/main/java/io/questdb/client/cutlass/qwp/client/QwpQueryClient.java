@@ -25,10 +25,12 @@
 package io.questdb.client.cutlass.qwp.client;
 
 import io.questdb.client.ClientTlsConfiguration;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.cutlass.http.client.HttpClientException;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketClientFactory;
 import io.questdb.client.cutlass.http.client.WebSocketFrameHandler;
+import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.impl.ConfigString;
 import io.questdb.client.impl.ConfigView;
@@ -293,6 +295,11 @@ public class QwpQueryClient implements QuietCloseable {
     private boolean tlsEnabled;
     // Only meaningful when tlsEnabled. Default is full validation against the JVM's trust store.
     private int tlsValidationMode = ClientTlsConfiguration.TLS_VALIDATION_MODE_FULL;
+    // Supplies a fresh Bearer token at each WebSocket upgrade (the initial
+    // connect and every failover reconnect), so a long-lived client follows
+    // token rotation. Mutually exclusive with the fixed authorizationHeader
+    // synthesized by withBearerToken/withBasicAuth; null when unset.
+    private HttpTokenProvider tokenProvider;
     private char[] trustStorePassword;
     private String trustStorePath;
     private volatile WebSocketClient webSocketClient;
@@ -645,6 +652,26 @@ public class QwpQueryClient implements QuietCloseable {
         }
         connected = false;
         lastCloseTimedOut = false;
+        // Teardown must not be cancellable by a flag the CALLER merely arrived with. Thread.join(long)
+        // throws InterruptedException the instant the calling thread's flag is set, WITHOUT ever looking
+        // at whether the I/O thread has exited -- so a carried flag turns the join below into an
+        // immediate throw and takes the "could not join" return, skipping closePool() and
+        // webSocketClient.close(). Those are the only frees for sendScratch, the decoder and the
+        // batch-buffer pool, and there is no second attempt to preserve them for: closedFlag was CAS'd
+        // on entry, so every later close() returns at the guard above, and a pooled worker has already
+        // been removed from QueryClientPool.all by reapIdle() before shutdown() gets here, so the pool's
+        // own close() never sees it either. The leak is permanent and silent.
+        //
+        // This is not hypothetical: PoolHousekeeper.stop() interrupts the housekeeper thread to break a
+        // recovery build's credential pull, and that same thread runs queryPool.reapIdle() straight
+        // afterwards with the flag still set.
+        //
+        // Clear it for the duration and restore it in the finally -- the interrupt-neutral shape
+        // FileTokenStore.load()/save() already use, and bounded by shutdownJoinMs. The timeout branch
+        // below is unaffected: with the flag cleared the join really waits, so a genuinely stuck I/O
+        // thread still takes the leak-rather-than-SIGSEGV path, and an interrupt delivered DURING the
+        // wait still means "we could not join" and still returns.
+        final boolean wasInterrupted = Thread.interrupted();
         try {
             if (ioThread != null) {
                 ioThread.shutdown();
@@ -693,6 +720,11 @@ public class QwpQueryClient implements QuietCloseable {
             // (submitQuery copies its bytes into sendScratch), so it is safe to free
             // even when we otherwise leak the I/O thread and buffer pool.
             bindValues.close();
+            if (wasInterrupted) {
+                // Hand the caller's cancellation back exactly as it arrived. Restoring it here rather
+                // than earlier keeps it out of the joins above, which is the whole point.
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -713,6 +745,11 @@ public class QwpQueryClient implements QuietCloseable {
      * observed so callers can distinguish "no primary available" from "all
      * endpoints unreachable" (the latter surfaces as a plain
      * {@link HttpClientException}).
+     * <p>
+     * A configured token provider is queried once here, before the walk. A
+     * provider failure (not signed in, a failed silent refresh, a rejected
+     * token) is cluster-wide, so it fails fast with the provider's own error
+     * rather than being retried across endpoints as a transport failure.
      */
     public synchronized void connect() {
         if (closedFlag.get()) {
@@ -731,6 +768,12 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastObservedMismatch = null;
         QwpIngressRoleRejectedException lastUpgradeRoleReject = null;
         Throwable lastTransportError = null;
+        // Resolve the bearer credential once, before the endpoint walk: a token is cluster-wide, so a
+        // token-provider failure (not signed in, a failed silent refresh, a rejected token) is not a
+        // per-endpoint transport fault. Resolving here lets it propagate as the provider's own error
+        // instead of being folded into "all endpoints unreachable", and avoids re-querying the provider
+        // once per endpoint.
+        String authHeader = resolveAuthorizationHeader();
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
@@ -738,7 +781,7 @@ public class QwpQueryClient implements QuietCloseable {
             }
             Endpoint ep = endpoints.get(i);
             try {
-                connectToEndpoint(ep);
+                connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
                 throw ae;
@@ -895,11 +938,12 @@ public class QwpQueryClient implements QuietCloseable {
     /**
      * Test-only hook: the synthesized {@code Authorization} header value
      * ({@code Basic ...} or {@code Bearer ...}), or null when no credentials
-     * were configured.
+     * were configured. When a token provider is configured, queries it and
+     * validates the returned token, exactly as a real upgrade would.
      */
     @TestOnly
     public String getAuthorizationHeaderForTest() {
-        return authorizationHeader;
+        return resolveAuthorizationHeader();
     }
 
     /**
@@ -1082,6 +1126,9 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBasicAuth(String username, String password) {
         checkPreConnect("withBasicAuth");
+        if (tokenProvider != null) {
+            throw new IllegalStateException("withBasicAuth cannot be combined with withBearerTokenProvider");
+        }
         if (username == null || password == null) {
             throw new IllegalArgumentException("username and password must not be null");
         }
@@ -1099,10 +1146,43 @@ public class QwpQueryClient implements QuietCloseable {
      */
     public QwpQueryClient withBearerToken(String token) {
         checkPreConnect("withBearerToken");
+        if (tokenProvider != null) {
+            throw new IllegalStateException("withBearerToken cannot be combined with withBearerTokenProvider");
+        }
         if (token == null) {
             throw new IllegalArgumentException("token must not be null");
         }
         this.authorizationHeader = "Bearer " + token;
+        return this;
+    }
+
+    /**
+     * Configures HTTP Bearer authentication with a token supplied on demand by
+     * {@code provider}, instead of the fixed token captured once by
+     * {@link #withBearerToken(String)}. The provider is queried for a fresh
+     * token at every WebSocket upgrade -- the initial {@link #connect()} and
+     * each failover reconnect -- so a long-lived client keeps working as the
+     * token rotates (for example an OIDC device-flow token:
+     * {@code .withBearerTokenProvider(auth::getToken)}).
+     * <p>
+     * {@link HttpTokenProvider#getToken()} runs on the connect and reconnect
+     * paths, so it must return promptly and must not block on interactive
+     * input; a quick silent refresh is fine. Each returned token is validated
+     * ({@link HttpTokenProvider#validateToken(CharSequence)}) before it is sent,
+     * and a provider that throws fails that connection attempt. Mutually
+     * exclusive with {@link #withBearerToken(String)} and
+     * {@link #withBasicAuth(String, String)}. Must be called before
+     * {@link #connect}.
+     */
+    public QwpQueryClient withBearerTokenProvider(HttpTokenProvider provider) {
+        checkPreConnect("withBearerTokenProvider");
+        if (provider == null) {
+            throw new IllegalArgumentException("provider must not be null");
+        }
+        if (authorizationHeader != null) {
+            throw new IllegalStateException("withBearerTokenProvider cannot be combined with withBearerToken or withBasicAuth");
+        }
+        this.tokenProvider = provider;
         return this;
     }
 
@@ -1458,7 +1538,7 @@ public class QwpQueryClient implements QuietCloseable {
         currentEndpointIndex = -1;
     }
 
-    private void connectToEndpoint(Endpoint ep) {
+    private void connectToEndpoint(Endpoint ep, String authHeader) {
         if (tlsEnabled) {
             webSocketClient = WebSocketClientFactory.newTlsInstance(
                     new ClientTlsConfiguration(trustStorePath, trustStorePassword, tlsValidationMode));
@@ -1470,7 +1550,7 @@ public class QwpQueryClient implements QuietCloseable {
         webSocketClient.setQwpAcceptEncoding(buildAcceptEncodingHeader());
         webSocketClient.setQwpMaxBatchRows(maxBatchRows);
         webSocketClient.setConnectTimeout(connectTimeoutMs);
-        runUpgradeWithTimeout(ep);
+        runUpgradeWithTimeout(ep, authHeader);
         negotiatedQwpVersion = webSocketClient.getServerQwpVersion();
         negotiatedZstdLevel = webSocketClient.getServerNegotiatedZstdLevel();
 
@@ -1789,6 +1869,10 @@ public class QwpQueryClient implements QuietCloseable {
         QwpServerInfo lastMismatch = null;
         Throwable lastError = null;
         boolean retriedAfterReset = false;
+        // Resolve the bearer credential once per reconnect, before the endpoint walk, for the same
+        // reason as connect(): a provider failure is cluster-wide, so surface it directly rather than
+        // as a per-endpoint transport error retried across every host.
+        String authHeader = resolveAuthorizationHeader();
         while (true) {
             int i = hostTracker.pickNext();
             if (i < 0) {
@@ -1801,7 +1885,7 @@ public class QwpQueryClient implements QuietCloseable {
             }
             Endpoint ep = endpoints.get(i);
             try {
-                connectToEndpoint(ep);
+                connectToEndpoint(ep, authHeader);
             } catch (QwpAuthFailedException ae) {
                 cleanupFailedConnect();
                 throw ae;
@@ -1846,6 +1930,34 @@ public class QwpQueryClient implements QuietCloseable {
                         + ", lastError=" + (lastError == null ? "<none>" : lastError.getMessage()) + ']');
     }
 
+    private String resolveAuthorizationHeader() {
+        // With a token provider, query it once per connect()/reconnect (the caller resolves before the
+        // endpoint walk) so a reconnect presents a freshly refreshed token; validateToken rejects a
+        // null/empty/blank return, or one carrying a control or non-ASCII character, before it reaches
+        // the "Bearer " header. A provider that throws (a failed silent refresh, or not signed in yet)
+        // fails connect()/reconnect as a LineSenderException, preserving the provider failure as its cause.
+        if (tokenProvider != null) {
+            CharSequence pulled;
+            try {
+                pulled = tokenProvider.getToken();
+            } catch (LineSenderException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new LineSenderException(
+                        e.getMessage() == null
+                                ? "token provider failed to supply a credential"
+                                : e.getMessage(),
+                        e);
+            }
+            // snapshot before validating, for the reason HttpTokenProvider.validateToken gives: the
+            // concatenation below re-reads the sequence, and the provider may be reusing its buffer
+            CharSequence token = pulled == null ? null : pulled.toString();
+            HttpTokenProvider.validateToken(token);
+            return "Bearer " + token;
+        }
+        return authorizationHeader;
+    }
+
     private long resolveQueryFlags(boolean resetSymbolDict) {
         if (!resetSymbolDict) {
             return 0L;
@@ -1856,7 +1968,7 @@ public class QwpQueryClient implements QuietCloseable {
                 : 0L;
     }
 
-    private void runUpgradeWithTimeout(Endpoint ep) {
+    private void runUpgradeWithTimeout(Endpoint ep, String authHeader) {
         // Connect first, OUTSIDE the upgrade try. A connect-phase failure --
         // including a connect_timeout overage flagged via flagAsTimeout() -- must
         // keep its own message ("connect timed out ...") and must NOT be relabeled
@@ -1867,7 +1979,7 @@ public class QwpQueryClient implements QuietCloseable {
 
         int timeoutMs = (int) Math.min(authTimeoutMs, Integer.MAX_VALUE);
         try {
-            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authorizationHeader);
+            webSocketClient.upgrade(DEFAULT_ENDPOINT_PATH, timeoutMs, authHeader);
         } catch (HttpClientException ex) {
             if (ex.isTimeout()) {
                 // Reachable only for an upgrade/auth-phase timeout now, so the

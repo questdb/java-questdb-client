@@ -33,6 +33,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.NativeBufferWriter;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -87,16 +88,6 @@ import java.util.concurrent.locks.LockSupport;
 public final class CursorWebSocketSendLoop implements QuietCloseable {
 
     /**
-     * Default cadence for the keepalive PING the I/O loop emits while
-     * waiting on STATUS_DURABLE_ACK frames. See
-     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
-     * server only flushes pending durable-ack frames on inbound recv
-     * events, so an opted-in idle client has to prod it. {@code 200} ms
-     * trades one PING per 200 ms per idle opted-in connection for
-     * sub-second confirmation latency once the upload completes
-     * server-side. {@code 0} or negative disables the keepalive entirely.
-     */
-    /**
      * Bounded-await backstop for {@link #close()}: the maximum time close()
      * waits for the I/O thread to stop (count down {@code shutdownLatch})
      * before it loud-fails and delegates final teardown to the I/O thread's
@@ -119,6 +110,16 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
      * rather than waiting it out.
      */
     public static final long DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS = 30_000L;
+    /**
+     * Default cadence for the keepalive PING the I/O loop emits while
+     * waiting on STATUS_DURABLE_ACK frames. See
+     * {@link #sendDurableAckKeepaliveIfDue()} for the rationale: the OSS
+     * server only flushes pending durable-ack frames on inbound recv
+     * events, so an opted-in idle client has to prod it. {@code 200} ms
+     * trades one PING per 200 ms per idle opted-in connection for
+     * sub-second confirmation latency once the upload completes
+     * server-side. {@code 0} or negative disables the keepalive entirely.
+     */
     public static final long DEFAULT_DURABLE_ACK_KEEPALIVE_INTERVAL_MILLIS = 200L;
     public static final long DEFAULT_PARK_NANOS = 50_000L; // 50us idle backoff
     /**
@@ -437,6 +438,17 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     // is why a revoked token surfaced to operators as "sf_max_total_bytes too small".
     private volatile Throwable lastReconnectError;
     private volatile Thread ioThread;
+    // Typed marker for a ROTATING-credential auth terminal (401/403): set (before the
+    // terminalError latch, so a checkError() caller that observes the latch is guaranteed to
+    // observe this marker too) when a mid-drain reconnect sweep on an ORPHAN drainer whose
+    // credential is dynamic (reconnectFactory.hasDynamicCredential()) threw QwpAuthFailedException.
+    // The orphan drainer consults it to route such a rejection into its bounded rotating-401
+    // ride-out (BackgroundDrainer.connectWithDurableAckRetry) instead of quarantining the slot on
+    // the first rejection: the header is re-derived from the token provider every attempt, so a 401
+    // can be a self-healing window that a freshly pulled token clears -- the same reasoning the
+    // capability-gap recycle rests on. A CONSTANT credential never sets it (it stays fatal), and
+    // foreground reconnects never set it either. Write-once alongside terminalError.
+    private volatile QwpAuthFailedException authTerminal;
     // Typed marker for a durable-ack CAPABILITY-GAP terminal: set (before the
     // terminalError latch, so a checkError() caller that observes the latch is
     // guaranteed to observe this marker too) when a reconnect sweep threw
@@ -1038,6 +1050,19 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 LOG.error("{} hit terminal upgrade error, won't retry: {}",
                         contextLabel, e.getMessage());
                 throw e;
+            } catch (QwpCredentialUnavailableException e) {
+                // A credential the client cannot ACQUIRE (the configured token provider threw) is NOT a
+                // transport outage: retrying the connect cannot conjure a token the provider will not hand
+                // over, so fail fast with the provider's own exception rather than burn the whole connect
+                // budget treating it as a reachable-server problem (which would block build() for up to
+                // maxDurationMillis, default 5 min, and surface a transport-shaped wrapper). Mirrors the
+                // foreground OFF-mode connect (QwpWebSocketSender) and the background reconnect loop above,
+                // which both give credential acquisition its own terminal handling; only this SYNC
+                // initial-connect path lacked it. QwpCredentialUnavailableException is a LineSenderException,
+                // disjoint from the HttpClientException-based terminal set above, so it reaches here.
+                LOG.error("{} could not acquire a credential, won't retry: {}",
+                        contextLabel, e.getMessage());
+                throw e.providerFailure();
             } catch (Throwable e) {
                 if (e instanceof Error) {
                     // JVM/programming failure (OOM, LinkageError): not a
@@ -1174,6 +1199,22 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             synchronouslySurfacedError = e;
             throw e;
         }
+    }
+
+    /**
+     * The typed rotating-credential auth terminal (401/403), or {@code null} if the loop's terminal
+     * (if any) is a different failure class. Non-null only after {@link #checkError()} started
+     * throwing: the marker is written before the {@code terminalError} latch, both on the I/O thread.
+     * <p>
+     * Consumer contract: the orphan drainer ({@code BackgroundDrainer}) checks this after a
+     * {@code checkError()} throw to route a mid-drain 401/403 against a ROTATING credential into its
+     * bounded rotating-401 ride-out (the header is re-derived per attempt, so the rejection can be a
+     * self-healing window a freshly pulled token clears) rather than quarantining the slot. A constant
+     * credential never sets it. Package-private on purpose -- the foreground sender must not branch
+     * on it.
+     */
+    QwpAuthFailedException authTerminal() {
+        return authTerminal;
     }
 
     /**
@@ -1709,11 +1750,13 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // INVARIANT B: a store-and-forward loop must NEVER terminate on a
         // wall-clock reconnect budget. A replica-only / all-endpoints-replica
         // window is TRANSIENT -- a replica gets promoted, a primary reappears --
-        // so this background loop retries for as long as it is running, backing
-        // off between attempts. Endpoint-policy failures (auth / non-421
-        // upgrade / durable-ack capability gap) are terminal only for orphan
-        // drainers. Foreground senders retry them from asynchronous startup onward
-        // so a credential or cluster capability rotation cannot stop the producer. SF
+        // and so is a token-provider failure -- the IdP becomes reachable again,
+        // or the user completes an interactive sign-in -- so this background loop
+        // retries all of them for as long as it is running, backing off between
+        // attempts. Endpoint-policy failures (auth / non-421 upgrade /
+        // durable-ack capability gap) are terminal only for orphan drainers.
+        // Foreground senders retry them from asynchronous startup onward so a
+        // credential or cluster capability rotation cannot stop the producer. SF
         // exhaustion is surfaced to the PRODUCER as append backpressure, never
         // here. reconnect_max_duration_millis is intentionally NOT consulted by
         // THIS loop. Its holders pass it explicitly where it does apply: the
@@ -1781,11 +1824,37 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 resetCatchUpCapGapEpisode();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
                 if (endpointPolicyFailureIsTerminal()) {
-                    // Orphans return control to their quarantine owner.
-                    // WebSocketUpgradeException reaching here is always non-421:
-                    // role rejects are classified into the transient branch below.
-                    LOG.error("terminal upgrade error during {} -- won't retry: {}",
-                            phase, e.getMessage());
+                    // A 401/403 against a ROTATING credential on an orphan drainer is NOT uniformly
+                    // fatal: the Authorization header is re-derived from the caller's token provider on
+                    // every attempt, so the rejection can be a self-healing window (a revocation landing
+                    // mid-flight, the IdP rotating signing keys, clock skew past the token's own margin)
+                    // that a freshly pulled token clears. Hand it back as a RECOVERABLE auth-terminal --
+                    // exactly as a capability gap does -- so BackgroundDrainer recycles it through
+                    // connectWithDurableAckRetry()'s bounded rotating-401 ride-out instead of
+                    // quarantining on the first rejection and permanently abandoning replayable data.
+                    // A CONSTANT credential (or a non-421 upgrade reject) is uniformly rejected across
+                    // the cluster and stays fatal. This gates on reconnectPolicy == ORPHAN, so an
+                    // INITIALIZING foreground 401 (endpointPolicyFailureIsTerminal via !hasEverConnected)
+                    // is never masked and still reaches the caller.
+                    final boolean rotatingCredentialReject = reconnectPolicy == ReconnectPolicy.ORPHAN
+                            && e instanceof QwpAuthFailedException
+                            && reconnectFactory.hasDynamicCredential();
+                    if (rotatingCredentialReject) {
+                        if (terminalError == null) {
+                            // Publish the marker before terminalError, the volatile first-writer-wins
+                            // latch the owner observes -- same ordering as capabilityGapTerminal.
+                            authTerminal = (QwpAuthFailedException) e;
+                        }
+                        LOG.warn("rotating credential rejected during {} -- handing the slot back to the "
+                                        + "drainer to retry with a freshly pulled token: {}",
+                                phase, e.getMessage());
+                    } else {
+                        // Orphans return control to their quarantine owner.
+                        // WebSocketUpgradeException reaching here is always non-421:
+                        // role rejects are classified into the transient branch below.
+                        LOG.error("terminal upgrade error during {} -- won't retry: {}",
+                                phase, e.getMessage());
+                    }
                     long fromFsn = engine.ackedFsn() + 1L;
                     long toFsn = Math.max(fromFsn, engine.publishedFsn());
                     SenderError err = new SenderError(
@@ -1856,6 +1925,41 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                             phase, attempts, e.getMessage());
                     lastLogNanos = now;
                 }
+            } catch (QwpCredentialUnavailableException e) {
+                // The token provider threw instead of returning a credential (a failed silent refresh, an
+                // interactive sign-in in progress on another thread, or not signed in yet). In the RUNNING
+                // background drainer this is a TRANSIENT outage like any other under Invariant B: the provider
+                // hands over a token again once the IdP is reachable or the user finishes signing in, and the
+                // un-acked rows stay safe in on-disk SF meanwhile. So retry indefinitely with capped backoff --
+                // NEVER bound by a wall-clock budget and NEVER latch a terminal, which would drop a producer
+                // that store-and-forward promised to keep alive on a recoverable fault. The foreground/SYNC
+                // initial connect still fails fast with the provider's own exception (connectWithRetry, and the
+                // OFF-mode connect in QwpWebSocketSender), because a connectivity error is only the caller's to
+                // see DURING initialization, not after the drainer is running.
+                //
+                // Ends any open cap-gap episode like every other unrelated reconnect state: we never reached a
+                // node to observe its batch cap, so this outage's wall clock must not accrue toward the orphan
+                // cap-gap dwell (see MAX_CATCHUP_CAP_GAP_ATTEMPTS).
+                resetCatchUpCapGapEpisode();
+                lastReconnectError = e;
+                // Retrying must not be programmatically INVISIBLE, exactly as for the auth/upgrade and
+                // durable-ack policy failures above: a revoked refresh token or a permanently unreachable IdP
+                // is not self-healing, yet flush() keeps returning success while SF absorbs the rows. Without
+                // this dispatch the only signal is a throttled slf4j WARN - and this library ships embedded,
+                // frequently with no binding configured - until SF fills and the failure resurfaces as ring
+                // backpressure, pointing the operator at disk sizing instead of at their credentials. It stays
+                // RETRIABLE, not TERMINAL: the handler learns the wire is down while the producer stays alive
+                // and no data is at risk (Invariant B).
+                dispatchRetriedEndpointPolicyFailure(
+                        SenderError.Category.SECURITY_ERROR, "credential-unavailable: " + e.getMessage());
+                long now = System.nanoTime();
+                if (now - lastLogNanos >= RECONNECT_LOG_THROTTLE_NANOS) {
+                    LOG.warn("{} attempt {}: the token provider failed ({}); retrying with capped backoff -- "
+                                    + "the sender keeps buffering to SF and recovers once a token is available",
+                            phase, attempts, e.getMessage());
+                    lastLogNanos = now;
+                }
+                // fall through to the shared capped-backoff block
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
                 // Role mismatch: every reachable endpoint role-rejected the
                 // upgrade -- right now they are all replicas / primary-catchup.
@@ -3528,6 +3632,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         WebSocketClient reconnect() throws Exception;
 
         /**
+         * Whether this factory re-derives its {@code Authorization} header from a caller-supplied token
+         * provider on every attempt, rather than presenting a constant captured once.
+         * <p>
+         * The orphan drainer's terminal policy reads this. A {@code 401} against a CONSTANT credential is a
+         * permanent misconfiguration, so quarantining the slot on the first one is correct. Against a
+         * ROTATING credential the same {@code 401} can be a recoverable window - clock skew past the
+         * token's own skew margin, a revocation landing mid-flight, an identity provider rotating signing
+         * keys - and a later attempt carries a freshly pulled token, so quarantining immediately would
+         * abandon replayable data permanently on a fault that heals itself.
+         * <p>
+         * Default: {@code false}, the conservative answer. A factory that cannot tell (a test double, a
+         * transport with no credential at all) keeps the pre-existing fail-fast behaviour.
+         */
+        default boolean hasDynamicCredential() {
+            return false;
+        }
+
+        /**
          * Cancellable variant of {@link #reconnect()}. The loop passes a
          * per-attempt {@link ConnectCancellation} so a transport that blocks
          * inside a native connect can publish the in-flight client to the
@@ -3581,9 +3703,31 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         // Latched once close() requested cancellation. Written by the owner
         // thread (cancel); read by the I/O thread's pre-connect guard.
         private volatile boolean cancelled;
+        // The I/O thread while it is inside a credential pull -- the one
+        // blocking call in the connect walk that closeTraffic() cannot reach,
+        // because it runs caller-supplied HttpTokenProvider code. Written by
+        // the I/O thread only (publishCredentialPull/clearCredentialPull);
+        // read by the owner thread (cancel). null when no pull is in flight.
+        private volatile Thread credentialPullThread;
+
+        public void clearCredentialPull() {
+            credentialPullThread = null;
+        }
 
         public boolean isCancelled() {
             return cancelled;
+        }
+
+        /**
+         * I/O-thread hook: record this thread as being about to enter a
+         * credential pull, BEFORE the blocking call. Pairs with
+         * {@link #cancel()} the same way {@link #publish(WebSocketClient)}
+         * does, except the break lever is an interrupt rather than
+         * {@code closeTraffic()} -- a token provider is caller code and owns
+         * no socket the sender can shut down.
+         */
+        public void publishCredentialPull(Thread thread) {
+            credentialPullThread = thread;
         }
 
         /**
@@ -3622,6 +3766,24 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             WebSocketClient c = inFlight;
             if (c != null) {
                 c.closeTraffic();
+            }
+            // A credential pull is caller code, so closeTraffic() cannot reach it, yet it can block far
+            // longer than close()'s shutdown budget: OidcDeviceAuth.getToken() waits up to
+            // 6 x httpTimeoutMillis (180s by default) behind a peer's silent refresh, against a 30s
+            // DEFAULT_CLOSE_SHUTDOWN_AWAIT_MILLIS. During an IdP outage the drainer sits inside a pull for
+            // most of every retry cycle, so close() lands there routinely, not just in a narrow race. An
+            // interrupt is the only lever that reaches a Java-level wait; OidcDeviceAuth converts it into a
+            // provider failure, which the reconnect loop treats as a transient outage and then observes the
+            // abort. Fires while the connect walk is inside its credential-pull window, which the walk enters
+            // whenever it carries a cancellation -- including with no token provider configured, since it
+            // publishes the marker before it looks at the supplier. That costs nothing: close() sets
+            // running=false before cancel(), so every path a late interrupt can reach is already winding down,
+            // and the I/O thread's exit is native frees plus a latch countdown, none of it interruptible.
+            // It does NOT cover a provider stalled in an OS-level TCP connect, which ignores interrupts --
+            // close() still loud-fails on its budget there, as it did before.
+            Thread t = credentialPullThread;
+            if (t != null) {
+                t.interrupt();
             }
         }
     }

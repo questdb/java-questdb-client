@@ -385,6 +385,106 @@ try (QuestDB db = QuestDB.connect("wss::addr=localhost:9000;tls_verify=unsafe_of
 }
 ```
 
+### OIDC Sign-In (Device Flow)
+
+For QuestDB Enterprise instances secured with OIDC, `OidcDeviceAuth` signs a user in interactively using the [OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628). It works from environments that have no local browser — a remote notebook kernel, a container, a headless job — because the user authorizes on any device (laptop or phone) while the process only makes outbound calls to the identity provider.
+
+On first use it prints a verification URL and a short code, and opens the URL in your default browser when one is available; authorize there (or open the URL on any device, such as your phone), enter the code, and the token is cached in memory and refreshed silently on later calls.
+
+```java
+import io.questdb.client.QuestDB;
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.auth.OidcDeviceAuth;
+
+// Discover the client id, scope and endpoints from the QuestDB server's /settings:
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB("https://questdb.example.com:9000")) {
+    auth.signIn(); // sign in once: prompts on first use, then caches and refreshes
+
+    // The provider is shared by the ingest and query pools. It is queried for
+    // every initial WebSocket upgrade and reconnect, so both pools follow token
+    // rotation without putting a credential in the configuration string.
+    try (QuestDB db = QuestDB.connect(
+            "wss::addr=questdb.example.com:9000;",
+            auth::getToken)) {
+        try (Sender sender = db.borrowSender()) {
+            sender.table("trades")
+                    .symbol("symbol", "ETH-USD")
+                    .doubleColumn("price", 2615.54)
+                    .atNow();
+        }
+        // db.borrowQuery() uses the same provider for query connections.
+    }
+}
+```
+
+For a standalone sender, use `httpTokenProvider(auth::getToken)` for the same rotating-token behavior. A fixed `httpToken(token)` or `token=` connect-string value captures the token once, so a client that reconnects after that token expires starts failing authentication. Hand rotating credentials to the provider API, not a `Sender.fromConfig(...)` string or the `QDB_CLIENT_CONF` environment variable, which are easily logged, persisted, or left in shell history.
+
+`getToken()` sits on a hot path — it is called once per ILP flush and once per WebSocket upgrade or reconnect — so a credential failure is rate-limited rather than retried on every call. When a silent refresh fails, `getToken()` does not attempt another one for 5 seconds: calls inside that window fail immediately, asking for an interactive `signIn()`, instead of hitting the identity provider again. Without that guard a producer retrying its rows would drive one token-endpoint round trip per flush, blocking the producer thread for each one and hitting the provider hard enough to trip its rate limits and lengthen the very outage being retried. Only a real refresh attempt arms the guard, and an explicit `signIn()` or `clearCache()` clears it outright. It is deliberately short — a stampede guard, not a circuit breaker — so a credential that comes back within seconds is picked up on the first call after the window rather than on the first call after it recovers.
+
+By default the prompt prints the verification URL and code to `System.out` **and** tries to open the URL in your default browser. The browser open is best-effort: it only opens an `http(s)` URL, is skipped on a headless host or a JVM without the `java.desktop` module, and never blocks sign-in (the client declares `requires static java.desktop`, so the module is optional at run time and its absence can never break module resolution; a modular application therefore gets the browser launch only when `java.desktop` is in its own module graph) — the URL and code are always printed too, so a remote or browserless process still works. To disable the browser launch for a whole process (a server, automation, CI), set the system property `-Dquestdb.client.oidc.open.browser=false`. To print only (no browser) for a single client, pass `DeviceCodePrompt.SYSTEM_OUT`; to render the challenge yourself (a clickable link or QR code in a notebook), pass any `DeviceCodePrompt`:
+
+```java
+// print only, do not open a browser:
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().prompt(DeviceCodePrompt.SYSTEM_OUT))) {
+    auth.signIn();
+}
+```
+
+The same token can be presented to QuestDB over any auth path the server already validates:
+
+- **REST API:** send it as an `Authorization: Bearer <token>` header (`auth.getAuthorizationHeaderValue()` returns the full value).
+- **PG-wire:** connect as user `_sso` with the token as the password (requires `acl.oidc.pg.token.as.password.enabled=true` on the server).
+
+To configure the identity provider explicitly instead of discovering it from the server:
+
+```java
+OidcDeviceAuth auth = OidcDeviceAuth.builder()
+        .clientId("questdb")
+        .deviceAuthorizationEndpoint("https://idp.example.com/as/device_authz.oauth2")
+        .tokenEndpoint("https://idp.example.com/as/token.oauth2")
+        .scope("openid groups")
+        .groupsInToken(true) // matches acl.oidc.groups.encoded.in.token on the server
+        .build();
+```
+
+Discovery via `fromQuestDB(...)` reads the OIDC client id, scope, audience and endpoints from the server's `/settings`, and the identity provider's client must have the device authorization grant enabled. When the server does not advertise its device authorization endpoint (today's servers), pin the identity provider by its issuer so the client can discover the endpoint from the issuer's `.well-known/openid-configuration` document:
+
+```java
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().issuer("https://idp.example.com"))) {
+    auth.signIn();
+}
+```
+
+The identity provider's device authorization and token endpoints must use `https` — a loopback endpoint (`localhost` or `127.0.0.0/8`) may use `http`, since the request never leaves the host — so the device code and refresh token are never sent in cleartext. That is a rule about the *scheme*: the trust anchor is `tlsConfig`, and one `OidcDeviceAuth` carries a single one, so `ClientTlsConfiguration.INSECURE_NO_VALIDATION` — reached for to talk to a QuestDB server with a self-signed certificate — also stops the client validating the *identity provider's* certificate on the legs that carry the device code and the refresh token. Point `tlsConfig` at a trust store rather than disabling validation whenever an identity provider is involved. `allowInsecureTransport(true)` relaxes only the QuestDB `/settings` link (for local development against an `http` QuestDB server), e.g. `OidcDeviceAuth.fromQuestDB(url, new OidcDeviceAuth.DiscoveryOptions().allowInsecureTransport(true))`; it never relaxes the identity provider endpoints, matching the Python client.
+
+`fromQuestDB(...)` takes the identity provider endpoints from the server's unauthenticated `/settings`, so it trusts that server to designate where you sign in: a spoofed, compromised, or man-in-the-middled server could redirect the sign-in to an attacker-controlled identity provider. Only use it against a server you trust, reached over `https`. Passing an issuer hardens this: the token and device authorization endpoints are then pinned to the issuer's origin (and, when the issuer has a path, an endpoint advertised by `/settings` must also be under that path — so a tampered `/settings` cannot redirect to a different tenant on a path-based provider such as Keycloak `…/realms/{realm}`), and an endpoint outside it is rejected; the issuer itself comes from you out of band, so a tampered `/settings` cannot move it. When `.well-known` discovery is needed, the document must also return the exact issuer prefix used to retrieve it before any discovered endpoint is accepted. When the server is not trusted, configure the identity provider explicitly with `OidcDeviceAuth.builder()` (optionally with `.issuer(...)`) instead of discovering it.
+
+#### Persisting the Token Across Restarts
+
+By default the token lives in memory only, so a process that restarts has to run the device flow again. Pass a `TokenStore` to persist it; the restarted process then resumes from the saved refresh token — a silent call to the token endpoint — instead of prompting the user again:
+
+```java
+import io.questdb.client.cutlass.auth.FileTokenStore;
+
+try (OidcDeviceAuth auth = OidcDeviceAuth.fromQuestDB(
+        "https://questdb.example.com:9000",
+        new OidcDeviceAuth.DiscoveryOptions().tokenStore(FileTokenStore.atDefaultLocation()))) {
+    auth.signIn(); // prompts the first time; after a restart it refreshes silently from the saved token
+}
+```
+
+`FileTokenStore.atDefaultLocation()` writes one file per OIDC configuration under `${user.home}/.questdb/oidc-tokens/` (override the directory with the `questdb.client.oidc.token.store.dir` system property). The file name is a hash of the endpoints, client id, scope, audience and groups-in-token mode — the *configuration*, not the person who signed in through it, since none of those fields names a subject. Entries for different servers, providers or client configurations therefore stay separate, but **two people signing in through the same configuration share one entry**: whoever signs in last overwrites the previous token, so a store represents a single active login. If more than one application user has to be signed in at the same time, give each their own store — `FileTokenStore.at(dir)` on a per-user directory, or a per-user `questdb.client.oidc.token.store.dir` — rather than relying on the file name to separate them. The default location is already per OS user, so this only arises when one OS user (a shared service account, a multi-tenant process) signs in as several people. After a restart, `getToken()` also works as the first call — no explicit `signIn()` needed — which suits a long-lived `Sender` built with `httpTokenProvider(auth::getToken)`. `clearCache()` removes the persisted entry and forces a fresh sign-in next time.
+
+A store read that *throws* — an unreadable file after a `chmod` or a uid change in a container, `EIO`/`ESTALE` on an NFS home — is not fatal and does not disable persistence for the life of the process, but it is not retried on every call either, since `getToken()` would otherwise pay a blocking file open and a `WARN` line per ILP flush, forever. The first failure is retried immediately, so a one-shot fault (notably a carried interrupt flag, which makes the channel underneath `FileTokenStore` throw on a thread that merely carries it) recovers on the next call; each consecutive failure after that backs off 5 seconds, doubling to a 60 second cap. A store that simply has nothing to return is unaffected — `load` reports that by returning `null` rather than by throwing, and the client stops asking.
+
+The token is stored as **plaintext JSON protected by file permissions** — `0600` file, `0700` directory on POSIX systems (Linux, macOS), the same approach `gcloud`, `aws` and `gh` take. On Windows these POSIX permissions cannot be enforced, so the file currently relies on the user-profile directory's default ACL (owner-only ACL hardening is a follow-up); the client logs a one-line warning through SLF4J at `WARN` the first time it cannot enforce them (the library ships `slf4j-api` only, so this - and every other client warning - is discarded unless your application supplies an SLF4J binding). Enabling persistence therefore writes a long-lived refresh token to disk: anyone who can read the file holds a credential until it expires or is revoked. To encrypt it at rest, supply your own `TokenStore` (backed by an OS keychain or a secrets manager) instead of `FileTokenStore`. A persisted file is treated as untrusted input on load, but it is **not cryptographically authenticated** — there is no MAC or signature over its contents. Anyone who can write the file can therefore substitute a well-formed entry of their own, and the client will adopt it and present those tokens: the file permissions, not the file format, are what protect it. What the load path rejects is corruption and mix-ups rather than forgery — an oversized, malformed or unparseable file; an entry whose recorded client id, endpoints, scope, audience or groups-in-token mode does not match the identity being loaded; an entry carrying no usable token; and a token with control or non-ASCII characters, which is never placed on the wire — with the recorded expiry and lifetime clamped rather than trusted. In each case the client falls back to a refresh or an interactive sign-in. On POSIX the container is checked too: if the directory was writable by other local users, it is tightened back to `0700` and **every** entry in it is discarded — not just the one being read, since the tightening is what destroys the evidence, so anything left behind would look protected to the next load. Each identity then signs in again. Inside those permissions, though, the client cannot tell a planted credential from its own.
+
+`FileTokenStore` is safe to share between processes that sign in as the same identity: each update is written atomically (so a concurrent reader never sees a half-written credential), and when the identity provider rotates the refresh token on each refresh, the read-refresh-write is serialized across processes with a lock file so they do not race each other into an unnecessary re-prompt. The lock file's staleness is judged by its modification time, so this coordination assumes the processes share a clock — a single machine, or machines with synchronized clocks; under significant clock skew (for example a store directory on NFS shared across hosts) a live lock can be mis-judged stale or a dead one never expire. `clearCache()` removes the persisted entry under the same lock, but across processes it is best-effort: a peer that still holds a live in-memory token may legitimately re-persist afterwards (it always forces a fresh sign-in for the calling process).
+
 ### Explicit Timestamps
 
 ```java

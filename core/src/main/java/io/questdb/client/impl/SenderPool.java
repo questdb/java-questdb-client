@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderError;
@@ -154,6 +155,7 @@ public final class SenderPool implements AutoCloseable {
     private final BackgroundDrainerListener drainerListener;
     private final SenderErrorHandler errorHandler;
     private final long idleTimeoutMillis;
+    private final HttpTokenProvider tokenProvider;
     // Delivery channel for recovery-delegate errors that pass the
     // isRecoveryEventUserRelevant filter. Pool-owned so a slow user handler
     // can never stall the recovery driver / housekeeper thread or overrun
@@ -354,7 +356,7 @@ public final class SenderPool implements AutoCloseable {
             long maxLifetimeMillis
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
-                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null, null, null, null, null);
+                idleTimeoutMillis, maxLifetimeMillis, null, false, null, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor exposing the senderFactory seam: production builds
@@ -397,7 +399,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null, null, null, null, null);
+                deferStartupRecovery, null, null, null, null, null, null, null, null);
     }
 
     // Test-only constructor adding a deterministic fault hook for the ownership
@@ -416,7 +418,7 @@ public final class SenderPool implements AutoCloseable {
     ) {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
-                deferStartupRecovery, null, null, null, postFactoryHook, null, null, null);
+                deferStartupRecovery, null, null, null, postFactoryHook, null, null, null, null);
     }
 
     @TestOnly
@@ -433,6 +435,7 @@ public final class SenderPool implements AutoCloseable {
         return new SenderPool(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 Long.MAX_VALUE, Long.MAX_VALUE, senderFactory, false,
                 null, null, null, null, recoveryThreadFactory, recoveryWaiter,
+                null,
                 beforeFailedRecoveryJoinHook);
     }
 
@@ -457,7 +460,27 @@ public final class SenderPool implements AutoCloseable {
         this(configurationString, minSize, maxSize, acquireTimeoutMillis,
                 idleTimeoutMillis, maxLifetimeMillis, senderFactory,
                 deferStartupRecovery, errorHandler, connectionListener,
-                drainerListener, null, null, null, null);
+                drainerListener, null);
+    }
+
+    SenderPool(
+            String configurationString,
+            int minSize,
+            int maxSize,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            IntFunction<Sender> senderFactory,
+            boolean deferStartupRecovery,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener,
+            HttpTokenProvider tokenProvider
+    ) {
+        this(configurationString, minSize, maxSize, acquireTimeoutMillis,
+                idleTimeoutMillis, maxLifetimeMillis, senderFactory,
+                deferStartupRecovery, errorHandler, connectionListener,
+                drainerListener, null, null, null, tokenProvider, null);
     }
 
     private SenderPool(
@@ -475,6 +498,7 @@ public final class SenderPool implements AutoCloseable {
             Runnable postFactoryHook,
             ThreadFactory recoveryThreadFactory,
             Runnable recoveryWaiter,
+            HttpTokenProvider tokenProvider,
             Runnable beforeFailedRecoveryJoinHook
     ) {
         if (minSize < 0 || maxSize < 1 || minSize > maxSize) {
@@ -483,6 +507,7 @@ public final class SenderPool implements AutoCloseable {
         this.errorHandler = errorHandler;
         this.connectionListener = connectionListener;
         this.drainerListener = drainerListener;
+        this.tokenProvider = tokenProvider;
         this.senderFactory = senderFactory != null ? senderFactory : this::defaultSender;
         // An injected factory (tests) drives recovery too, preserving the
         // white-box recovery seam; production recovery forces OFF-mode connects
@@ -511,6 +536,11 @@ public final class SenderPool implements AutoCloseable {
         // us whether SF is on and, if so, the base slot id to derive
         // per-sender ids from.
         Sender.LineSenderBuilder probe = Sender.builder(configurationString);
+        if (tokenProvider != null) {
+            // Validate fixed-config credentials vs. the provider even when the
+            // pool is fully lazy and no sender is built yet.
+            probe.httpTokenProvider(tokenProvider);
+        }
         this.storeAndForward = probe.isStoreAndForwardEnabled();
         this.slotBaseId = this.storeAndForward ? probe.getConfiguredSenderId() : null;
         this.sfDir = this.storeAndForward ? probe.getConfiguredSfDir() : null;
@@ -730,7 +760,12 @@ public final class SenderPool implements AutoCloseable {
      * minutes-long block a {@code reconnect_*}-tuned config used to cause (M1).
      * One residual window remains and is NOT closed here: a single in-flight
      * connect to a black-holed/firewalled host blocks on the OS connect timeout
-     * (the transport exposes no application-level connect timeout to clamp it).
+     * (the transport exposes no application-level connect timeout to clamp it)
+     * and the stop path's interrupt cannot break that syscall. Only a deferred,
+     * PoolHousekeeper-driven pool can carry a token provider: QuestDBImpl is the
+     * sole caller of that constructor and passes {@code deferStartupRecovery=true}.
+     * Its potentially much longer credential pull is therefore interrupted by
+     * {@link PoolHousekeeper#stop()}, never by this pool's private-driver stop.
      * If {@code close()} lands during that one connect, its driver join can
      * still time out and the detached build releases the slot flock shortly
      * after {@code close()} returns. No data is lost (the slot stays durable on
@@ -1675,13 +1710,33 @@ public final class SenderPool implements AutoCloseable {
             if (beforeStartupRecoveryJoinHook != null) {
                 beforeStartupRecoveryJoinHook.run();
             }
+            // A private startup-recovery driver and a token provider are mutually exclusive by construction:
+            // QuestDBImpl passes deferStartupRecovery=true on the only path that supplies a provider. This
+            // escalation therefore does NOT break credential pulls (PoolHousekeeper.stop() owns that live
+            // protection). It is still a last resort for an unexpected interruptible overrun in a direct
+            // driver's build, drain, or teardown after the closed signal and normal unpark failed to stop it.
+            //
+            // Keep the whole two-join protocol interrupt-neutral. A carried caller flag, or an interrupt
+            // delivered DURING the first join, must be remembered without jumping past the target interrupt
+            // and second join; restore it only once the shutdown protocol has completed.
+            boolean callerWasInterrupted = Thread.interrupted();
             try {
-                startupRecoveryThread.join(PoolHousekeeper.STOP_TIMEOUT_MILLIS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            if (afterStartupRecoveryJoinHook != null) {
-                afterStartupRecoveryJoinHook.run();
+                callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                        startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                if (startupRecoveryThread.isAlive()) {
+                    // The closed flag reaches the driver only between operations. Interrupt an overrun and
+                    // spend a second bounded join giving its finally/close path time to release the slot flock.
+                    startupRecoveryThread.interrupt();
+                    callerWasInterrupted |= PoolHousekeeper.joinIgnoringCallerInterrupts(
+                            startupRecoveryThread, PoolHousekeeper.STOP_TIMEOUT_MILLIS);
+                }
+                if (afterStartupRecoveryJoinHook != null) {
+                    afterStartupRecoveryJoinHook.run();
+                }
+            } finally {
+                if (callerWasInterrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
@@ -1993,6 +2048,13 @@ public final class SenderPool implements AutoCloseable {
         return builder;
     }
 
+    private Sender.LineSenderBuilder applyTokenProvider(Sender.LineSenderBuilder builder) {
+        if (tokenProvider != null) {
+            builder.httpTokenProvider(tokenProvider);
+        }
+        return builder;
+    }
+
     // Applies the user-supplied ingest callbacks to a sender builder. Null
     // callbacks are skipped so the sender keeps its loud-not-silent default.
     private Sender.LineSenderBuilder applyUserCallbacks(Sender.LineSenderBuilder builder) {
@@ -2021,7 +2083,7 @@ public final class SenderPool implements AutoCloseable {
 
     private Sender buildManagedSlotSender(int slotIndex, boolean forRecovery) {
         if (!storeAndForward) {
-            return applyUserCallbacks(Sender.builder(configurationString)).build();
+            return applyUserCallbacks(applyTokenProvider(Sender.builder(configurationString))).build();
         }
         // Give this pooled sender its own slot dir <sf_dir>/<base>-<index>
         // so concurrent SF senders sharing one sf_dir never collide on
@@ -2089,6 +2151,7 @@ public final class SenderPool implements AutoCloseable {
         // SenderErrorDispatcher so a slow handler cannot stall the recovery
         // driver or housekeeper thread. connectionListener and drainerListener
         // remain unset on recovery builds.
+        builder = applyTokenProvider(builder);
         return (forRecovery ? applyRecoveryCallbacks(builder) : applyUserCallbacks(builder)).build();
     }
 

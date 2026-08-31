@@ -24,12 +24,15 @@
 
 package io.questdb.client.test;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QuestDB;
 import io.questdb.client.QuestDBBuilder;
 import io.questdb.client.Sender;
 import io.questdb.client.test.cutlass.qwp.client.TestPorts;
 import org.junit.Assert;
 import org.junit.Test;
+
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * {@code lazy_connect=true} makes a {@link QuestDB} facade tolerate the server
@@ -73,6 +76,42 @@ public class QuestDBLazyConnectTest {
                 // acceptable: flush against the never-up server
             }
         }
+    }
+
+    @Test(timeout = 30_000)
+    public void testLazyConnectBuildsAndWritesDespiteAFailingTokenProvider() {
+        int port = TestPorts.findUnusedPort();
+        // lazy_connect and httpTokenProvider are both documented, and their COMBINATION decides who sees a
+        // credential failure at startup - but nothing drove them together. The contract: connectivity and
+        // credential errors are the caller's problem only DURING initialization, and under lazy_connect
+        // there is no eager initialization to fail. The ingest side resolves to ASYNC (client is null, no
+        // pull at build) and the read pool defaults to min=0, so build() must return and a write must
+        // buffer even though this provider can supply nothing at all.
+        //
+        // Getting this wrong is a data-loss shape, not an inconvenience: a producer that hard-fails at
+        // build() instead of buffering drops the rows store-and-forward promised to keep.
+        AtomicInteger pulls = new AtomicInteger();
+        HttpTokenProvider failing = () -> {
+            pulls.incrementAndGet();
+            throw new IllegalStateException("not signed in yet");
+        };
+        try (QuestDB db = QuestDB.connect("ws::addr=localhost:" + port
+                + ";lazy_connect=true;reconnect_max_duration_millis=200"
+                + ";reconnect_initial_backoff_millis=10;reconnect_max_backoff_millis=50"
+                + ";close_flush_timeout_millis=0;", failing)) {
+            Sender sender = db.borrowSender();
+            Assert.assertNotNull("build() must not fail-fast on a provider that cannot supply a token yet",
+                    sender);
+            sender.table("t").longColumn("v", 1L).atNow();
+            try {
+                sender.close();
+            } catch (RuntimeException ignored) {
+                // acceptable: the close-flush runs against a server that never came up
+            }
+        }
+        // Deliberately not asserting a pull count. The async connect thread may or may not have attempted
+        // one by now, and that timing is not the contract - what is, is that neither build() nor the write
+        // above surfaced the provider's failure to the caller.
     }
 
     @Test(timeout = 30_000)

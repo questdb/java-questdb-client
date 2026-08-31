@@ -114,6 +114,59 @@ public class SlotLockReleasedContractTest {
     }
 
     /**
+     * Interrupt-neutrality: a CARRIED interrupt flag must not turn a healthy {@code close()} into a
+     * failed stop.
+     * <p>
+     * {@code PoolHousekeeper.stop()} interrupts a housekeeper blocked in a pooled credential pull.
+     * {@code SenderPool.stopStartupRecoveryDriver()} has no token provider by construction, but can likewise
+     * interrupt an unexpected overrun in its direct recovery driver. Those threads then run
+     * {@code senderPool.reapIdle()} or a startup-recovery step's {@code finally}, both of which close a
+     * delegate. That makes a carried flag ordinary on this path rather than exotic.
+     * <p>
+     * It is also fatal if unhandled: {@code CountDownLatch.await(t, u)} tests {@code Thread.interrupted()}
+     * before it ever consults the latch, so the shutdown await returns instantly, {@code close()} takes the
+     * failed-stop branch, and the slot is reported as still flocked -- the exact outcome the interrupt was
+     * added to prevent. The failed-stop branch re-asserts the flag, so in a reap sweep every remaining
+     * delegate failed the same way.
+     * <p>
+     * Asserted on both halves, because clearing the flag and forgetting to restore it would pass a
+     * released-lock check while silently eating the caller's cancellation.
+     */
+    @Test
+    public void testCarriedInterruptNeitherFailsCloseNorRetainsTheSlotLock() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler())) {
+                int port = server.getPort();
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                String cfg = "ws::addr=localhost:" + port + ";close_flush_timeout_millis=2000;";
+                QwpWebSocketSender wss = (QwpWebSocketSender) Sender.fromConfig(cfg);
+                wss.table("t").longColumn("v", 1L).atNow();
+                wss.flush();
+
+                final boolean flagSurvived;
+                Thread.currentThread().interrupt();
+                try {
+                    wss.close();
+                    flagSurvived = Thread.currentThread().isInterrupted();
+                } finally {
+                    // never let it escape into the next test on a reused JUnit thread
+                    Thread.interrupted();
+                }
+
+                Assert.assertTrue(
+                        "close() must restore the caller's interrupt flag, not consume it",
+                        flagSurvived);
+                Assert.assertTrue(
+                        "a carried interrupt must not make a healthy close() report its slot lock retained",
+                        wss.isSlotLockReleased());
+            }
+        });
+    }
+
+
+    /**
      * Leak path: when {@code close()} cannot wind the I/O loop down it bails
      * out via the {@code !ioThreadStopped} early-return and must leave the slot
      * lock reported as NOT released.
@@ -368,12 +421,16 @@ public class SlotLockReleasedContractTest {
                 wss.setCursorEngine(engine, true);
                 wss.setCursorSendLoopForTesting(loop);
 
-                // Drive the real early-bail close() on a thread whose pending
-                // interrupt lands in loop.close()'s shutdownLatch.await().
+                // Drive the real early-bail close() through the loop's own bounded-await backstop.
+                // NOT by handing the closer a pending interrupt: close() is interrupt-neutral (it clears a
+                // CARRIED flag and restores it on the way out), because the pool threads that close
+                // delegates are the same ones PoolHousekeeper.stop() interrupts. Shrinking the backstop
+                // reaches the same failed-stop branch deterministically and without a 30s wait, which is
+                // exactly what this seam exists for.
+                loop.setShutdownAwaitTimeoutMillis(200L);
                 AtomicReference<Throwable> closeFailure = new AtomicReference<>();
                 QwpWebSocketSender wssRef = wss;
                 Thread closer = new Thread(() -> {
-                    Thread.currentThread().interrupt();
                     try {
                         wssRef.close();
                     } catch (Throwable t) {
@@ -524,9 +581,11 @@ public class SlotLockReleasedContractTest {
                 Assert.assertNotNull(errorDispatcherThread);
                 Assert.assertNotNull(progressDispatcherThread);
 
+                // Bounded-await backstop rather than a pending interrupt on the closer -- see the sibling
+                // test above: close() is interrupt-neutral, so a carried flag no longer short-circuits it.
+                loop.setShutdownAwaitTimeoutMillis(200L);
                 AtomicReference<Throwable> closeFailure = new AtomicReference<>();
                 Thread closer = new Thread(() -> {
-                    Thread.currentThread().interrupt();
                     try {
                         sender.close();
                     } catch (Throwable t) {

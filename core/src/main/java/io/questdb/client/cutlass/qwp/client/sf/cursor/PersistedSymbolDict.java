@@ -979,14 +979,6 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
-     * Validates every chunk and copies the entries of each proven-good one into
-     * {@code dstAddr}, in a single pass. {@code dstAddr} must have room for {@code len}
-     * bytes -- the entry region is a subset of the file, so that always suffices.
-     * Stops at the first chunk that is torn, fails its CRC, or is internally
-     * inconsistent, exactly as the two-pass version did, so the trusted prefix is
-     * unchanged.
-     */
-    /**
      * Stats {@code filePath} and, when the stat fails, captures {@code errno} with NO
      * intervening call.
      * <p>
@@ -1019,6 +1011,14 @@ public final class PersistedSymbolDict implements QuietCloseable {
         }
     }
 
+    /**
+     * Validates every chunk and copies the entries of each proven-good one into
+     * {@code dstAddr}, in a single pass. {@code dstAddr} must have room for {@code len}
+     * bytes -- the entry region is a subset of the file, so that always suffices.
+     * Stops at the first chunk that is torn, fails its CRC, or is internally
+     * inconsistent, exactly as the two-pass version did, so the trusted prefix is
+     * unchanged.
+     */
     private static RecoveryScan scanAndCopyRecoveredChunks(long inputAddr, int len, long dstAddr) {
         Varint v = new Varint();
         int count = 0;

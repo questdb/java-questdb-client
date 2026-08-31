@@ -27,9 +27,11 @@ package io.questdb.client.cutlass.line.http;
 import io.questdb.client.BuildInformationHolder;
 import io.questdb.client.ClientTlsConfiguration;
 import io.questdb.client.HttpClientConfiguration;
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.Sender;
 import io.questdb.client.cairo.TableUtils;
 import io.questdb.client.cutlass.http.HttpConstants;
+import io.questdb.client.cutlass.http.HttpException;
 import io.questdb.client.cutlass.http.HttpKeywords;
 import io.questdb.client.cutlass.http.client.Fragment;
 import io.questdb.client.cutlass.http.client.HttpClient;
@@ -57,10 +59,13 @@ import io.questdb.client.std.str.StringSink;
 import io.questdb.client.std.str.Utf8Sequence;
 import io.questdb.client.std.str.Utf8s;
 import org.jetbrains.annotations.TestOnly;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 
 public abstract class AbstractLineHttpSender implements Sender {
+    private static final Logger LOG = LoggerFactory.getLogger(AbstractLineHttpSender.class);
     private static final String PATH = "/write?precision=n";
     private static final int RETRY_BACKOFF_MULTIPLIER = 2;
     private static final int RETRY_INITIAL_BACKOFF_MS = 10;
@@ -82,12 +87,15 @@ public abstract class AbstractLineHttpSender implements Sender {
     private final CharSequence questDBVersion;
     private final Rnd rnd;
     private final StringSink sink = new StringSink();
+    private final String userAgent;
     private final String username;
     protected HttpClient.Request request;
     private HttpClient client;
     private boolean closed;
     private int currentAddressIndex;
     private long flushAfterNanos = Long.MAX_VALUE;
+    private HttpTokenProvider httpTokenProvider;
+    private boolean isTokenPending;
     private JsonErrorParser jsonErrorParser;
     private boolean lastFlushFailed;
     private long pendingRows;
@@ -200,6 +208,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                     : HttpClientFactory.newPlainTextInstance(clientConfiguration);
         }
         this.questDBVersion = new BuildInformationHolder().getSwVersion();
+        // precompute the User-Agent header value once: newRequest() runs on every flush, so concatenating it
+        // there would allocate a String each time
+        this.userAgent = "QuestDB/java/" + questDBVersion;
         this.request = newRequest();
         this.maxNameLength = maxNameLength;
         this.rnd = rnd;
@@ -225,8 +236,37 @@ public abstract class AbstractLineHttpSender implements Sender {
     ) {
         return createLineSender(new ObjList<>(host), IntList.createWithValues(port), path, clientConfiguration, tlsConfig, autoFlushRows, authToken, username, password, maxNameLength, maxRetriesNanos, maxBackoffMillis, minRequestThroughput,
                 flushIntervalNanos,
-                protocolVersion
+                protocolVersion,
+                null
         );
+    }
+
+    /**
+     * Provider-less form of the overload below, kept so callers compiled against the pre-{@code
+     * httpTokenProvider} signature keep linking. Mirrors the single-host overload above, which delegates
+     * with the same {@code null} provider.
+     */
+    @SuppressWarnings("unused")
+    public static AbstractLineHttpSender createLineSender(
+            ObjList<String> hosts,
+            IntList ports,
+            String path,
+            HttpClientConfiguration clientConfiguration,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            String authToken,
+            String username,
+            String password,
+            int maxNameLength,
+            long maxRetriesNanos,
+            int maxBackoffMillis,
+            long minRequestThroughput,
+            long flushIntervalNanos,
+            int protocolVersion
+    ) {
+        return createLineSender(hosts, ports, path, clientConfiguration, tlsConfig, autoFlushRows,
+                authToken, username, password, maxNameLength, maxRetriesNanos, maxBackoffMillis,
+                minRequestThroughput, flushIntervalNanos, protocolVersion, null);
     }
 
     public static AbstractLineHttpSender createLineSender(
@@ -244,7 +284,8 @@ public abstract class AbstractLineHttpSender implements Sender {
             int maxBackoffMillis,
             long minRequestThroughput,
             long flushIntervalNanos,
-            int protocolVersion
+            int protocolVersion,
+            HttpTokenProvider httpTokenProvider
     ) {
         HttpClient cli = null;
         Rnd rnd = new Rnd(NanosecondClockImpl.INSTANCE.getTicks(), MicrosecondClockImpl.INSTANCE.getTicks());
@@ -297,7 +338,16 @@ public abstract class AbstractLineHttpSender implements Sender {
                         } else {
                             lastErrorSink.clear();
                         }
-                        chunkedResponseToSink(response, lastErrorSink);
+                        // This error-body read is bounded at request_timeout. The construct-time probe does
+                        // catch a read abort in the retry loop below, but it does NOT absorb it into extra
+                        // retries: retry_timeout (maxRetriesNanos, 10s default) is smaller than a single
+                        // attempt's bound (request_timeout, 30s default). The probe's no-arg reads -
+                        // response.await() above and the recv() inside parser.parse() - each bound the WHOLE
+                        // call on elapsed time at request_timeout, so after the first attempt aborts nowNanos
+                        // has already passed the retry deadline (armed at first-failure nowNanos +
+                        // maxRetriesNanos). The probe therefore runs at most two attempts (initial + one retry)
+                        // before build() throws "Failed to detect server line protocol version".
+                        chunkedResponseToSink(response, lastErrorSink, clientConfiguration.getTimeout());
                     } catch (HttpClientException e) {
                         if (lastErrorSink == null) {
                             lastErrorSink = new StringSink();
@@ -329,14 +379,17 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (protocolVersion == PROTOCOL_VERSION_NOT_SET_EXPLICIT) {
             Misc.free(cli);
             if (lastErrorSink != null) {
-                throw new LineSenderException("Failed to detect server line protocol version: " + lastErrorSink);
+                // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                // a hostile or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                throw new LineSenderException("Failed to detect server line protocol version: ").putAsPrintable(lastErrorSink);
             }
             throw new LineSenderException("Failed to detect server line protocol version");
         }
 
+        final AbstractLineHttpSender sender;
         switch (protocolVersion) {
             case PROTOCOL_VERSION_V1:
-                return new LineHttpSenderV1(
+                sender = new LineHttpSenderV1(
                         hosts,
                         ports,
                         path,
@@ -355,8 +408,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             case PROTOCOL_VERSION_V2:
-                return new LineHttpSenderV2(
+                sender = new LineHttpSenderV2(
                         hosts,
                         ports,
                         path,
@@ -375,8 +429,9 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             case PROTOCOL_VERSION_V3:
-                return new LineHttpSenderV3(
+                sender = new LineHttpSenderV3(
                         hosts,
                         ports,
                         path,
@@ -395,9 +450,22 @@ public abstract class AbstractLineHttpSender implements Sender {
                         currentAddressIndex,
                         rnd
                 );
+                break;
             default:
                 throw new LineSenderException("Unsupported protocol version: " + protocolVersion);
         }
+        if (httpTokenProvider != null) {
+            // The constructor built the initial request before the provider was wired (httpTokenProvider was
+            // still null, so it took the no-auth path with withContent). Rebuild it via the deferred path now
+            // that the provider is set: this leaves the request at the header stage with the token pending,
+            // matching the reset() path, so the first row's stampTokenIfPending() finishes it (appends the auth
+            // header + withContent()) without a second client.newRequest(). Deferring the first getToken() off
+            // the build path also lets a lazily-signing-in provider (e.g. OidcDeviceAuth::getToken) be wired
+            // before sign-in completes, keeping the token pull on the use/flush path the provider documents.
+            sender.httpTokenProvider = httpTokenProvider;
+            sender.request = sender.newRequest();
+        }
+        return sender;
     }
 
     public static boolean isNotFound(DirectUtf8Sequence statusCode) {
@@ -409,20 +477,10 @@ public abstract class AbstractLineHttpSender implements Sender {
 
     @Override
     public void atNow() {
-        switch (state) {
-            case EMPTY:
-                throw new LineSenderException("no table name was provided");
-            case TABLE_NAME_SET:
-                throw new LineSenderException("no symbols or columns were provided");
-            case ADDING_SYMBOLS:
-            case ADDING_COLUMNS:
-                request.put('\n');
-                state = RequestState.EMPTY;
-                break;
-        }
-        if (rowAdded()) {
-            flush();
-        }
+        // validateRowStarted() rejects EMPTY and TABLE_NAME_SET, so only ADDING_SYMBOLS and ADDING_COLUMNS
+        // reach the terminator write
+        validateRowStarted();
+        terminateRow();
     }
 
     @Override
@@ -439,6 +497,12 @@ public abstract class AbstractLineHttpSender implements Sender {
     @Override
     public void cancelRow() {
         validateNotClosed();
+        // While isTokenPending, newRequest() has left the request at the header stage: withContent() has not
+        // run, contentStart is still the -1 sentinel, and no row bytes exist to trim. trimContentToLen is
+        // guarded against exactly that state and no-ops, so this needs no second guard of its own - one that
+        // could never be observed to be missing, since the other one masks it. The guard that survives is
+        // the one that protects every caller of an exported method, not just this one; it is pinned by
+        // HttpClientRequestTrimTest. Do not re-add a check here: add coverage there instead.
         request.trimContentToLen(rowBookmark);
         state = RequestState.EMPTY;
     }
@@ -455,7 +519,7 @@ public abstract class AbstractLineHttpSender implements Sender {
                 flush0(true);
             }
         } finally {
-            Misc.free(jsonErrorParser);
+            jsonErrorParser = Misc.free(jsonErrorParser);
             closed = true;
             client = Misc.free(client);
         }
@@ -483,6 +547,9 @@ public abstract class AbstractLineHttpSender implements Sender {
 
     @TestOnly
     public void putRawMessage(Utf8Sequence msg) {
+        // stamp the deferred provider token (like table() does) so a raw message sent as the first row
+        // carries it; a no-op when no provider is configured
+        stampTokenIfPending();
         request.put(msg); // message must include trailing \n
         state = RequestState.EMPTY;
         if (rowAdded()) {
@@ -539,6 +606,9 @@ public abstract class AbstractLineHttpSender implements Sender {
         if (table.length() == 0) {
             throw new LineSenderException("table name cannot be empty");
         }
+        // stamp the deferred provider token before the first row of this request, so the send carries it;
+        // a no-op once the token has been stamped or when no provider is configured
+        stampTokenIfPending();
         // set bookmark at start of the line.
         rowBookmark = request.getContentLength();
         state = RequestState.TABLE_NAME_SET;
@@ -553,13 +623,13 @@ public abstract class AbstractLineHttpSender implements Sender {
         return Math.min(retryMaxBackoffMs, backoff * RETRY_BACKOFF_MULTIPLIER);
     }
 
-    private static void chunkedResponseToSink(HttpClient.ResponseHeaders response, StringSink sink) {
+    private static void chunkedResponseToSink(HttpClient.ResponseHeaders response, StringSink sink, int timeoutMillis) {
         if (!response.isChunked()) {
             return;
         }
         Response chunkedRsp = response.getResponse();
         Fragment fragment;
-        while ((fragment = chunkedRsp.recv()) != null) {
+        while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
             sink.putNonAscii(fragment.lo(), fragment.hi());
         }
     }
@@ -600,13 +670,13 @@ public abstract class AbstractLineHttpSender implements Sender {
         return HttpKeywords.isClose(connectionHeader);
     }
 
-    private void consumeChunkedResponse(HttpClient.ResponseHeaders response) {
+    private void consumeChunkedResponse(HttpClient.ResponseHeaders response, int timeoutMillis) {
         if (!response.isChunked()) {
             return;
         }
         Response chunkedRsp = response.getResponse();
         //noinspection StatementWithEmptyBody
-        while ((chunkedRsp.recv()) != null) {
+        while ((chunkedRsp.recv(timeoutMillis)) != null) {
             // we don't care about the response, just consume it, so it won't stay in the socket receive buffer
         }
     }
@@ -668,12 +738,54 @@ public abstract class AbstractLineHttpSender implements Sender {
                     throw new HttpClientException("Request timed out");
                 }
 
+                // Bounded on ELAPSED time, not per socket read - see HttpClient.ResponseHeaders.await(int).
+                // That makes a head which dribbles but keeps making progress abort here, where base ran on
+                // with it, and this is the third body-read-shaped change on this path that an existing
+                // non-OIDC sender can observe (the other two are consumeChunkedResponse below and
+                // throwOnHttpErrorResponse).
+                //
+                // It differs from both in what it can conclude: NO STATUS HAS BEEN READ yet, so unlike the
+                // 2xx drain - which knows the server committed and reports success - and unlike the error
+                // arm - which has a verdict to surface - this abort says nothing about whether the batch
+                // landed. It falls to the HttpClientException arm and retries, which is the only available
+                // answer, and the retry spends the pre-existing ILP-over-HTTP at-least-once window: against
+                // a table without DEDUP keys a peer that dribbles a head past the budget duplicates rows.
+                // Reaching it needs an intermediary; QuestDB's own /write answers 204 with a small head.
+                // Pinned by LineHttpSenderErrorResponseTest#testDribbledResponseHeadFailsTheFlushWithinTheRetryBudget.
                 response.await(remainingMillis);
                 DirectUtf8Sequence statusCode = response.getStatusCode();
                 if (isSuccessResponse(statusCode)) {
-                    consumeChunkedResponse(response); // if any
-                    if (keepAliveDisabled(response)) {
-                        // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
+                    // pass the whole per-flush budget (base + throughput extension) as EACH recv() read's
+                    // timeout, NOT the raw request_timeout: recv() otherwise inherits defaultTimeout, so a
+                    // tuned-low request_timeout paired with request_min_throughput would abort a large,
+                    // still-progressing chunked body. This bounds each read, not the whole body cumulatively -
+                    // fine here because the ILP server is trusted (unlike OidcDeviceAuth.parseBody, which also
+                    // caps total bytes and elapsed time against an untrusted identity provider).
+                    // A 2xx IS the commit: the server already has these rows. Draining its response body
+                    // afterwards is only bookkeeping to keep the connection reusable, so a failure there must
+                    // not escape into the catch below, which treats HttpClientException as a transport error
+                    // and re-sends the whole batch -- duplicate rows on data the server accepted. Base could
+                    // not reach this, because recv() re-armed its timeout on every socket read and a
+                    // dribbling-but-progressing body never aborted; bounding the whole call means it now can.
+                    // On abort the body is left unconsumed, which would mis-frame the next response on this
+                    // connection, so drop the connection and report the flush as what it was: a success.
+                    boolean drained = true;
+                    try {
+                        consumeChunkedResponse(response, actualTimeoutMillis); // if any
+                    } catch (HttpClientException e) {
+                        // The flush already SUCCEEDED - a 2xx IS the commit - so this changes no outcome,
+                        // only the connection: unconsumed bytes would mis-frame the next response on it, so
+                        // it is dropped below and the next flush reconnects. That cost is otherwise
+                        // invisible - a server or intermediary that dribbles every response turns into one
+                        // reconnect per flush, and the only symptom is churn nothing explains. DEBUG, not
+                        // WARN: the handling is correct and a legitimately slow body is not a fault.
+                        drained = false;
+                        LOG.debug("could not drain the response body after a successful flush; dropping the "
+                                        + "connection so the next response cannot be mis-framed [reason={}]",
+                                e.getMessage());
+                    }
+                    // Server has HTTP keep-alive disabled, and it's closing this TCP connection.
+                    if (!drained || keepAliveDisabled(response)) {
                         client.disconnect();
                     }
                     lastFlushFailed = false;
@@ -692,15 +804,46 @@ public abstract class AbstractLineHttpSender implements Sender {
                             : retryingDeadlineNanos;
                     if (nowNanos >= retryingDeadlineNanos) {
                         // throw, but do not reset - a caller can try to flush later
-                        throwOnHttpErrorResponse(statusCode, response, true);
+                        throwOnHttpErrorResponse(statusCode, response, true, actualTimeoutMillis);
                     }
                     client.disconnect(); // forces reconnect, just in case
                     retryBackoff = backoff(rnd, retryBackoff, maxBackoffMillis);
                     continue;
                 }
-                throwOnHttpErrorResponse(statusCode, response, false);
+                throwOnHttpErrorResponse(statusCode, response, false, actualTimeoutMillis);
+            } catch (HttpException e) {
+                // An unparseable response head: response.await() above hands it to HttpHeaderParser, which
+                // rejects a header block past its fixed 4096-byte buffer (an intermediary stacking
+                // Set-Cookie/CSP), a malformed Content-Length, or a status line that is not HTTP/1.x.
+                // HttpException is a SIBLING of HttpClientException, not a subclass, so it used to escape
+                // both arms - taking with it the client.disconnect() that keeps the next flush off a
+                // connection holding a half-read response, and leaving flush() throwing a raw
+                // HttpException rather than the LineSenderException its contract promises.
+                //
+                // Handled here rather than in the retry arm below, because it is not a transport failure
+                // and must not be retried. HttpHeaderParser only runs on bytes that ARRIVED, so this is
+                // positive evidence the server answered - the same evidence the 2xx drain arm above treats
+                // as decisive - and the head is chosen by an intermediary, not by chance: the next attempt
+                // parses the same block and fails identically. Retrying spent the whole budget re-sending a
+                // batch the server had already taken (measured: 16 sends over ~11s per flush at the default
+                // budget, against 1 before HttpException reached the arm), which for a table without DEDUP
+                // keys is 15 extra copies of every row.
+                //
+                // Disconnect anyway: the half-read response would mis-frame the next one on this
+                // connection. lastFlushFailed suppresses the close-time re-flush for the same reason - the
+                // server already has these rows.
+                lastFlushFailed = true;
+                client.disconnect();
+                LineSenderException headEx = new LineSenderException("Could not flush buffer: http");
+                if (isTls) {
+                    headEx.put('s');
+                }
+                headEx.put("://");
+                headEx.put(currentHost()).put(':').put(currentPort()).put(this.path);
+                headEx.put(" Malformed HTTP response head").put(": ").put(e.getMessage());
+                throw headEx;
             } catch (HttpClientException e) {
-                // this is a network error, we can retry
+                // this is a network error, we can retry.
                 lastFlushFailed = true;
                 client.disconnect(); // forces reconnect
                 long nowNanos = System.nanoTime();
@@ -730,9 +873,21 @@ public abstract class AbstractLineHttpSender implements Sender {
         HttpClient.Request r = client.newRequest(currentHost(), currentPort())
                 .POST()
                 .url(path)
-                .header("User-Agent", "QuestDB/java/" + questDBVersion);
+                .header("User-Agent", userAgent);
         if (username != null) {
             r.authBasic(username, password);
+        } else if (httpTokenProvider != null) {
+            // Do NOT pull the token here (the construct / flush-completion path): getToken() can throw (not
+            // signed in yet, or a failed silent refresh), and a throw after client.newRequest() reset the
+            // shared request would corrupt the sender, turning an already-successful flush into an exception.
+            // Leave the request at the header stage (no withContent() yet) with the token pending, so the first
+            // row's stampTokenIfPending() appends the Authorization header + withContent() on THIS request
+            // WITHOUT a second client.newRequest() - the request line and headers are written once per flush,
+            // not twice. bufferView() reads empty meanwhile (contentStart is -1, so getContentLength() is 0).
+            isTokenPending = true;
+            rowBookmark = r.getContentLength();
+            state = RequestState.EMPTY;
+            return r;
         } else if (authToken != null) {
             r.authToken(authToken);
         }
@@ -766,21 +921,98 @@ public abstract class AbstractLineHttpSender implements Sender {
         return pendingRows == autoFlushRows;
     }
 
-    private void throwOnHttpErrorResponse(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable) {
+    private void stampTokenIfPending() {
+        if (isTokenPending) {
+            // The construct/flush path deferred the token so a lazily-signing-in provider (e.g.
+            // OidcDeviceAuth::getToken) could be wired before sign-in completed, and so a provider failure
+            // never strikes after a successful send. The caller is now starting the first row, so finish the
+            // request newRequest() left at the header stage: pull a fresh token (so a long-lived sender
+            // follows token rotation), then append the Authorization header + withContent() on THIS request -
+            // no second client.newRequest(), so the request line and headers are written once, not twice.
+            //
+            // The throwing operations run BEFORE the request is mutated: a getToken()/validateToken() throw
+            // (not signed in yet, a failed refresh, or a rejected token) leaves isTokenPending set and the
+            // request untouched at the header stage, so the next row retries cleanly - the sender is never left
+            // corrupted. Validate EVERY pulled token, not just a changed instance: HttpTokenProvider.getToken()
+            // makes no immutability promise, so a provider that reuses one CharSequence buffer (the idiomatic
+            // zero-alloc style) and mutates its content between flushes must be re-checked, or a mutated token
+            // could splice a CR/LF into the "Authorization: Bearer" header (request.authToken writes it verbatim,
+            // with no CR/LF filtering). The scan is O(token length) and is dwarfed by the flush's network
+            // round-trip; the WebSocket auth path validates on every pull for the same reason.
+            CharSequence pulled;
+            try {
+                pulled = httpTokenProvider.getToken();
+            } catch (LineSenderException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                throw new LineSenderException(
+                        e.getMessage() == null
+                                ? "token provider failed to supply a credential"
+                                : e.getMessage(),
+                        e);
+            }
+            // Snapshot BEFORE validating, so the bytes that are checked are the bytes that are sent. Without
+            // it validateToken scans the provider's sequence and authToken then re-reads it - two reads of a
+            // buffer the provider owns and, per the paragraph above, is invited to reuse. A mutation landing
+            // between them passes the check and splices the mutated content, CR/LF included, into the
+            // Authorization header. One String per FLUSH (not per row), dwarfed by the round-trip that
+            // follows. Null-safe: a null pull must still reach validateToken's "null or empty" message
+            // rather than NPE here.
+            CharSequence token = pulled == null ? null : pulled.toString();
+            HttpTokenProvider.validateToken(token);
+            request.authToken(token);
+            request.withContent();
+            rowBookmark = request.getContentLength();
+            state = RequestState.EMPTY;
+            isTokenPending = false;
+        }
+    }
+
+    private void throwOnHttpErrorResponse(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable, int timeoutMillis) {
+        // The STATUS is the verdict; the body is detail for the message. A body read that aborts must not
+        // escape into flush0's catch, which treats HttpClientException as a transport failure: a definitive
+        // 401/403/405 would be reclassified as a network error, retried for the whole retry budget, and
+        // finally surfaced as "Connection Failed: timed out reading the chunked response body" with the real
+        // status nowhere in it. Report the status we already have instead, and say the body was unreadable
+        // rather than inventing detail. LineSenderException is a sibling of HttpClientException, not a
+        // subclass, so the intended throw passes through this catch untouched.
+        try {
+            throwOnHttpErrorResponse0(statusCode, response, retryable, timeoutMillis);
+        } catch (HttpClientException e) {
+            client.disconnect();
+            // Carry the reason across. The status is the verdict, but WHY the body could not be read is the
+            // actionable half, and the three shapes call for different responses: "timed out reading the
+            // chunked response body" points at the flush timeout, "peer disconnect [errno=54]" at the
+            // connection, "malformed chunk size" at an intermediary mangling the framing. Binding e and
+            // dropping it left an operator a status and no way to tell those apart, on a path that has
+            // already disconnected. Plain put, not putAsPrintable: HttpClientException's messages are
+            // client-authored constants plus an errno, so unlike the status beside them they carry no
+            // server-supplied bytes.
+            final String reason = e.getMessage();
+            throw new LineSenderException("Could not flush buffer: could not read the error response body", retryable)
+                    .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence())
+                    .put(", reason=").put(reason != null ? reason : "<none>")
+                    .put(']');
+        }
+    }
+
+    private void throwOnHttpErrorResponse0(DirectUtf8Sequence statusCode, HttpClient.ResponseHeaders response, boolean retryable, int timeoutMillis) {
         CharSequence statusAscii = statusCode.asAsciiCharSequence();
         if (Chars.equals("405", statusAscii)) {
-            consumeChunkedResponse(response);
+            consumeChunkedResponse(response, timeoutMillis);
             client.disconnect();
             throw new LineSenderException("Could not flush buffer: HTTP endpoint does not support ILP. [http-status=405]", retryable);
         }
         if (Chars.equals("401", statusAscii) || Chars.equals("403", statusAscii)) {
             sink.clear();
-            chunkedResponseToSink(response, sink);
+            chunkedResponseToSink(response, sink, timeoutMillis);
             LineSenderException ex = new LineSenderException("Could not flush buffer: HTTP endpoint authentication error", retryable);
             if (sink.length() > 0) {
-                ex = ex.put(": ").put(sink);
+                // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                ex = ex.put(": ").putAsPrintable(sink);
             }
-            ex.put(" [http-status=").put(statusAscii).put(']');
+            ex.put(" [http-status=").putAsPrintable(statusAscii).put(']');
             client.disconnect();
             throw ex;
         }
@@ -790,17 +1022,20 @@ public abstract class AbstractLineHttpSender implements Sender {
                 jsonErrorParser = new JsonErrorParser();
             }
             jsonErrorParser.reset();
-            LineSenderException ex = jsonErrorParser.toException(response.getResponse(), statusCode, retryable);
+            LineSenderException ex = jsonErrorParser.toException(response.getResponse(), statusCode, retryable, timeoutMillis);
             client.disconnect();
             throw ex;
         }
         // ok, no JSON, let's do something more generic
         sink.clear();
-        sink.put("Could not flush buffer: ");
-        chunkedResponseToSink(response, sink);
-        sink.put(" [http-status=").put(statusCode).put(']');
+        chunkedResponseToSink(response, sink, timeoutMillis);
+        // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+        // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+        LineSenderException ex = new LineSenderException("Could not flush buffer: ", retryable)
+                .putAsPrintable(sink)
+                .put(" [http-status=").putAsPrintable(statusCode.asAsciiCharSequence()).put(']');
         client.disconnect();
-        throw new LineSenderException(sink, retryable);
+        throw ex;
     }
 
     private void validateNotClosed() {
@@ -855,6 +1090,45 @@ public abstract class AbstractLineHttpSender implements Sender {
             throw new LineSenderException("column name contains an illegal char: '\\n', '\\r', '?', '.', ','" +
                     ", ''', '\"', '\\', '/', ':', ')', '(', '+', '-', '*' '%%', '~', or a non-printable char: ")
                     .putAsPrintable(name);
+        }
+    }
+
+    /**
+     * Writes the row terminator and closes the row, WITHOUT re-checking that a row was started - the caller
+     * has already done it.
+     * <p>
+     * {@link #at(long, java.time.temporal.ChronoUnit)} and {@link #at(java.time.Instant)} must validate
+     * before they write the timestamp, not after: a rejected row would otherwise leave a stray timestamp in
+     * the request buffer for the next row to inherit. They used to follow that write with {@code atNow()},
+     * which validated the very same state a second time - nothing between the two calls can change it, since
+     * only {@code table()}, a column write and this method touch {@code state} - so every explicit-timestamp
+     * row paid for a second switch on the hot ingestion path. They call this instead.
+     */
+    protected void terminateRow() {
+        request.put('\n');
+        state = RequestState.EMPTY;
+        if (rowAdded()) {
+            flush();
+        }
+    }
+
+    /**
+     * Rejects a row terminator that no row precedes. Subclasses MUST call this before writing the first byte
+     * of a terminator, not after: with an httpTokenProvider configured, newRequest() leaves the request at the
+     * header stage (withContent() deferred until the first row stamps the Authorization header), so a write
+     * that lands here while the state is EMPTY goes into the HTTP HEADER block, not the request body. Those
+     * bytes then start a line that folds the following "Authorization: Bearer ..." into the previous header
+     * (RFC 7230 obs-fold), and the request ships with no credential at all. cancelRow() cannot undo it either:
+     * trimContentToLen only rewinds within the content section.
+     */
+    protected void validateRowStarted() {
+        switch (state) {
+            case EMPTY:
+                throw new LineSenderException("no table name was provided");
+            case TABLE_NAME_SET:
+                throw new LineSenderException("no symbols or columns were provided");
+            default:
+                break;
         }
     }
 
@@ -968,16 +1242,16 @@ public abstract class AbstractLineHttpSender implements Sender {
         private void drainAndReset(LineSenderException sink, DirectUtf8Sequence httpStatus) {
             assert state == State.INIT;
 
-            sink.put(messageSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence());
+            sink.putAsPrintable(messageSink).put(" [http-status=").putAsPrintable(httpStatus.asAsciiCharSequence());
             if (codeSink.length() != 0 || errorIdSink.length() != 0 || lineSink.length() != 0) {
                 if (errorIdSink.length() != 0) {
-                    sink.put(", id: ").put(errorIdSink);
+                    sink.put(", id: ").putAsPrintable(errorIdSink);
                 }
                 if (codeSink.length() != 0) {
-                    sink.put(", code: ").put(codeSink);
+                    sink.put(", code: ").putAsPrintable(codeSink);
                 }
                 if (lineSink.length() != 0) {
-                    sink.put(", line: ").put(lineSink);
+                    sink.put(", line: ").putAsPrintable(lineSink);
                 }
             }
             sink.put(']');
@@ -994,10 +1268,10 @@ public abstract class AbstractLineHttpSender implements Sender {
             jsonSink.clear();
         }
 
-        LineSenderException toException(Response chunkedRsp, DirectUtf8Sequence httpStatus, boolean retryable) {
+        LineSenderException toException(Response chunkedRsp, DirectUtf8Sequence httpStatus, boolean retryable, int timeoutMillis) {
             Fragment fragment;
             LineSenderException exception = new LineSenderException("Could not flush buffer: ", retryable);
-            while ((fragment = chunkedRsp.recv()) != null) {
+            while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
                 try {
                     jsonSink.putNonAscii(fragment.lo(), fragment.hi());
                     lexer.parse(fragment.lo(), fragment.hi(), this);
@@ -1005,10 +1279,12 @@ public abstract class AbstractLineHttpSender implements Sender {
                     // we failed to parse JSON, but we still want to show the error message.
                     // if we cannot parse it then we show the whole response as is.
                     // let's make sure we have the whole message - there might be more chunks
-                    while ((fragment = chunkedRsp.recv()) != null) {
+                    while ((fragment = chunkedRsp.recv(timeoutMillis)) != null) {
                         jsonSink.putNonAscii(fragment.lo(), fragment.hi());
                     }
-                    exception.put(jsonSink).put(" [http-status=").put(httpStatus.asAsciiCharSequence()).put(']');
+                    // sanitize the raw server body before it reaches the exception message (and any log/terminal):
+                    // an untrusted or proxied endpoint must not splice control, ANSI or bidi chars into the render
+                    exception.putAsPrintable(jsonSink).put(" [http-status=").putAsPrintable(httpStatus.asAsciiCharSequence()).put(']');
                     reset();
                     return exception;
                 }

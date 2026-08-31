@@ -78,6 +78,52 @@ public class QueryWorkerTest {
     }
 
     /**
+     * {@code shutdown()} clears the caller's interrupt for the whole teardown and hands it back at the
+     * end. The clear is what stops every {@code join()} below throwing on arrival instead of waiting;
+     * the hand-back is what keeps the flag a cancellation signal for whoever set it.
+     * <p>
+     * This pins the hand-back and the thread teardown. It does NOT pin the clear itself: the only
+     * observable difference there is whether {@code join()} waited, and with {@code thread.interrupt()}
+     * fired immediately before it the dispatch thread is already on its way out, so any assertion on
+     * "still alive on return" is a race rather than a check. That half would need a dispatch thread with a
+     * controllable exit latency, which is a production seam this does not justify.
+     */
+    @Test(timeout = 30_000)
+    public void testShutdownHandsBackACarriedInterrupt() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A null client is enough: shutdown()'s cancel() and close() calls NPE and are swallowed by
+            // their own catch (Throwable), which is the documented best-effort teardown, and the dispatch
+            // thread this asserts on does not touch the client while parked.
+            QueryWorker worker = new QueryWorker(null, null, 0);
+            // start()/shutdown() are package-private; reached the same way the sibling tests in this class
+            // reach bumpGeneration() and isCurrentThreadWorker(), rather than widening them for a test
+            Method start = QueryWorker.class.getDeclaredMethod("start");
+            start.setAccessible(true);
+            Method shutdown = QueryWorker.class.getDeclaredMethod("shutdown");
+            shutdown.setAccessible(true);
+            start.invoke(worker);
+
+            Field threadField = QueryWorker.class.getDeclaredField("thread");
+            threadField.setAccessible(true);
+            Thread dispatch = (Thread) threadField.get(worker);
+            Assert.assertTrue("the dispatch thread must be running before shutdown", dispatch.isAlive());
+
+            Thread.currentThread().interrupt();
+            try {
+                shutdown.invoke(worker);
+                Assert.assertTrue("shutdown() must hand the caller's cancellation back, or the pool loop "
+                        + "that set it silently loses its stop signal", Thread.currentThread().isInterrupted());
+            } finally {
+                // do not leak the flag into the next test
+                Thread.interrupted();
+            }
+
+            dispatch.join(TimeUnit.SECONDS.toMillis(10));
+            Assert.assertFalse("shutdown() must not leave its dispatch thread running", dispatch.isAlive());
+        });
+    }
+
+    /**
      * Regression test for the shutdown-vs-dispatch race in
      * {@code QueryWorker.runLoop()}. If {@code shuttingDown} flips to true
      * after {@code dispatch()} has set {@code current = q} but before the

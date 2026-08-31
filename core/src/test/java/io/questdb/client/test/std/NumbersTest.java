@@ -271,6 +271,32 @@ public class NumbersTest {
     }
 
     @Test
+    public void testParseHexLongWrapsOnOverflowAndCallersBoundIt() {
+        // Two's-complement, like parseHexInt beside it and the server-side Numbers of the same name, whose
+        // Long256 decoding depends on the wrap. io.questdb.client.std is an exported package, so this is a
+        // shipped contract and not an internal detail.
+        assertEquals(Long.MAX_VALUE, Numbers.parseHexLong("7fffffffffffffff"));
+        assertEquals(0L, Numbers.parseHexLong("0"));
+        assertEquals(0xacL, Numbers.parseHexLong("ac"));
+        // leading zeros carry no magnitude
+        assertEquals(1L, Numbers.parseHexLong("000000000000000000001"));
+        // range form
+        assertEquals(0xf0L, Numbers.parseHexLong("xxF0yy", 2, 4));
+
+        // The wrap itself, in the three shapes that break a length-prefixed format differently. Pinning the
+        // VALUES rather than a rejection is the point: a caller that parses a count it did not choose has
+        // to bound the digits before it gets here, because none of these is distinguishable afterwards -
+        // 10000000000000000 in particular is indistinguishable from a genuine 0.
+        assertEquals(Long.MIN_VALUE, Numbers.parseHexLong("8000000000000000")); // negative residue
+        assertEquals(0L, Numbers.parseHexLong("10000000000000000"));            // zero residue
+        assertEquals(1L, Numbers.parseHexLong("10000000000000001"));            // positive residue
+        assertEquals(-1L, Numbers.parseHexLong("ffffffffffffffff"));            // the full-width word
+
+        // an empty sequence is still an error rather than a zero
+        assertHexLongRejected("");
+    }
+
+    @Test
     public void testIntEdge() {
         Numbers.append(sink, Integer.MAX_VALUE);
         assertEquals(Integer.MAX_VALUE, Numbers.parseInt(sink));
@@ -709,6 +735,14 @@ public class NumbersTest {
             Numbers.parseLong(input);
             Assert.fail();
         } catch (NumericException ignore) {
+        }
+    }
+
+    private static void assertHexLongRejected(String hex) {
+        try {
+            long parsed = Numbers.parseHexLong(hex);
+            Assert.fail("expected [" + hex + "] to be rejected, got " + parsed);
+        } catch (NumericException expected) {
         }
     }
 }

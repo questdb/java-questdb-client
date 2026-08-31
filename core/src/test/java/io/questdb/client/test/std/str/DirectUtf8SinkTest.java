@@ -39,6 +39,10 @@ import java.nio.charset.StandardCharsets;
 
 public class DirectUtf8SinkTest extends AbstractTest {
 
+    // DirectByteSink.implCreate allocates at least this much however small a capacity it is asked for, so a
+    // test that means to exercise growth has to write past it
+    private static final int MIN_ALLOCATED_CAPACITY = 32;
+
     @Test
     public void testAsAsciiCharSequence() {
         try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
@@ -118,6 +122,78 @@ public class DirectUtf8SinkTest extends AbstractTest {
             TestUtils.assertEquals(expectedBytes, srcSink);
             destSink.put(srcSink);
             TestUtils.assertEquals(expectedBytes, destSink);
+        }
+    }
+
+    @Test
+    public void testPutByteArrayRange() {
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            final byte[] src = "abcdefgh".getBytes(StandardCharsets.UTF_8);
+
+            // a partial range [2, 5) copies exactly "cde"
+            sink.put(src, 2, 5);
+            Assert.assertEquals(3, sink.size());
+            TestUtils.assertEquals("cde".getBytes(StandardCharsets.UTF_8), sink);
+            // the bulk overload sets the ascii hint to false conservatively, even for ascii bytes
+            Assert.assertFalse(sink.isAscii());
+
+            // an empty range [3, 3) is a no-op
+            final int sizeBefore = sink.size();
+            sink.put(src, 3, 3);
+            Assert.assertEquals(sizeBefore, sink.size());
+
+            // a full range [0, len) appends the whole array
+            sink.clear();
+            sink.put(src, 0, src.length);
+            Assert.assertEquals(src.length, sink.size());
+            TestUtils.assertEquals(src, sink);
+        }
+    }
+
+    @Test
+    public void testPutByteArrayRangeGrowsTheSink() {
+        // DirectByteSink's native create allocates a MINIMUM of 32 bytes however small a capacity it is
+        // asked for, so a handful of bytes into a new DirectUtf8Sink(4) never reallocates - the sibling test
+        // above used to claim it did. Cross the floor for real: a range longer than 32 bytes must reallocate
+        // mid-copy, and the whole payload must survive that move, contiguous and in order.
+        final byte[] src = new byte[MIN_ALLOCATED_CAPACITY * 4];
+        for (int i = 0; i < src.length; i++) {
+            src[i] = (byte) ('a' + (i % 26));
+        }
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            // seed a few bytes first, so the growing copy has existing content to preserve rather than
+            // starting from an empty sink
+            sink.put(src, 0, 3);
+            final int lo = 3;
+            final int hi = lo + MIN_ALLOCATED_CAPACITY + 17; // comfortably past the floor, and not a round number
+            sink.put(src, lo, hi);
+
+            Assert.assertTrue("preconditions: the payload must exceed the 32-byte floor",
+                    sink.size() > MIN_ALLOCATED_CAPACITY);
+            Assert.assertEquals(3 + (hi - lo), sink.size());
+            final byte[] expected = new byte[3 + (hi - lo)];
+            System.arraycopy(src, 0, expected, 0, 3);
+            System.arraycopy(src, lo, expected, 3, hi - lo);
+            TestUtils.assertEquals(expected, sink);
+
+            // and it keeps growing across repeated appends, not just the first reallocation
+            for (int i = 0; i < 8; i++) {
+                sink.put(src, 0, src.length);
+            }
+            Assert.assertEquals(3 + (hi - lo) + 8 * src.length, sink.size());
+            Assert.assertEquals((byte) src[0], sink.byteAt(3 + (hi - lo)));
+        }
+    }
+
+    @Test
+    public void testPutByteArrayRangeRejectsBadBounds() {
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(4)) {
+            final byte[] src = {1, 2, 3};
+            // a bad range must throw rather than run an unchecked native copy (asserts are off in client apps)
+            assertBadRange(sink, src, -1, 2); // lo < 0
+            assertBadRange(sink, src, 0, 4);  // hi > len
+            assertBadRange(sink, src, 2, 1);  // lo > hi
+            Assert.assertEquals("a rejected put must not advance the sink", 0, sink.size());
         }
     }
 
@@ -205,6 +281,15 @@ public class DirectUtf8SinkTest extends AbstractTest {
             sink.put(str);
             final byte[] expectedBytes = str.getBytes(StandardCharsets.UTF_8);
             TestUtils.assertEquals(expectedBytes, sink);
+        }
+    }
+
+    private static void assertBadRange(DirectUtf8Sink sink, byte[] src, int lo, int hi) {
+        try {
+            sink.put(src, lo, hi);
+            Assert.fail("expected IndexOutOfBoundsException for lo=" + lo + ", hi=" + hi);
+        } catch (IndexOutOfBoundsException expected) {
+            // ok: the public overload range-checks before the native copy
         }
     }
 

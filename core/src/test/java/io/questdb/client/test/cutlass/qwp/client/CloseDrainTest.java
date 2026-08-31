@@ -29,15 +29,19 @@ import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -154,6 +158,47 @@ public class CloseDrainTest {
                     "close() took only " + elapsedMs + "ms — did not wait for ACK; "
                             + "drain timeout is broken or never enabled",
                     elapsedMs >= ackDelayMs / 2);
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    public void testInterruptDuringSuccessfulCloseDrainIsRestoredAfterTeardown() throws Exception {
+        DelayingAckHandler handler = new DelayingAckHandler(800L);
+        try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(
+                    "ws::addr=localhost:" + server.getPort() + ";");
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+            sender.setCloseDrainWaitingHook(() -> {
+                // PoolHousekeeper.stop() uses this signal after its first join budget. The close drain owns it
+                // while waiting for the ACK; later teardown waits must not mistake the carried signal for a new
+                // failure to stop their own worker.
+                Thread.currentThread().interrupt();
+            });
+
+            Throwable closeFailure = null;
+            boolean interruptedAtReturn;
+            try {
+                sender.close();
+            } catch (Throwable t) {
+                closeFailure = t;
+            } finally {
+                interruptedAtReturn = Thread.currentThread().isInterrupted();
+                Thread.interrupted();
+            }
+
+            Assert.assertNull("an interrupt consumed by a successful ACK drain poisoned later teardown",
+                    closeFailure);
+            Assert.assertTrue("close() must return its consumed cancellation signal to the caller",
+                    interruptedAtReturn);
+            Assert.assertTrue("the delayed ACK must have completed the close drain", handler.nextSeq.get() >= 1L);
+            Assert.assertTrue("successful ACK drain must release its slot before close returns",
+                    sender.isSlotLockReleased());
+            Assert.assertTrue("all close-owned resources must be released before close returns",
+                    sender.isCloseCleanupComplete());
         }
     }
 
@@ -307,6 +352,73 @@ public class CloseDrainTest {
                     elapsedMs >= timeoutMs);
             Assert.assertTrue("close() exceeded the bounded timeout by too much: " + elapsedMs + "ms",
                     elapsedMs < timeoutMs * 4);
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    public void testInterruptedCloseDrainRemainsPaced() throws Exception {
+        ThreadMXBean threadMxBean = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue("current-thread CPU time is required for this regression",
+                threadMxBean.isCurrentThreadCpuTimeSupported());
+        if (!threadMxBean.isThreadCpuTimeEnabled()) {
+            threadMxBean.setThreadCpuTimeEnabled(true);
+        }
+
+        final long timeoutMillis = 750L;
+        try (TestWebSocketServer server = new TestWebSocketServer(new SilentHandler())) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            String cfg = "ws::addr=localhost:" + server.getPort()
+                    + ";close_flush_timeout_millis=" + timeoutMillis + ";";
+            QwpWebSocketSender sender = (QwpWebSocketSender) Sender.fromConfig(cfg);
+            sender.table("foo").longColumn("v", 1L).atNow();
+            sender.flush();
+
+            AtomicBoolean drainReached = new AtomicBoolean();
+            AtomicLong closeCpuNanos = new AtomicLong(-1L);
+            AtomicLong closeWallNanos = new AtomicLong(-1L);
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            sender.setCloseDrainWaitingHook(() -> {
+                drainReached.set(true);
+                // PoolHousekeeper.stop() applies this escalation after its first join budget expires.
+                Thread.currentThread().interrupt();
+            });
+            Thread closer = new Thread(() -> {
+                long cpuStart = threadMxBean.getCurrentThreadCpuTime();
+                long wallStart = System.nanoTime();
+                try {
+                    sender.close();
+                } catch (Throwable t) {
+                    closeFailure.set(t);
+                } finally {
+                    closeWallNanos.set(System.nanoTime() - wallStart);
+                    closeCpuNanos.set(threadMxBean.getCurrentThreadCpuTime() - cpuStart);
+                    Thread.interrupted();
+                }
+            }, "interrupted-close-drain");
+            try {
+                closer.start();
+                closer.join(10_000L);
+            } finally {
+                if (closer.isAlive()) {
+                    closer.interrupt();
+                    closer.join(10_000L);
+                }
+                sender.close();
+            }
+
+            Assert.assertFalse("interrupted close drain did not finish", closer.isAlive());
+            Assert.assertTrue("close never reached a real unacknowledged drain target", drainReached.get());
+            Assert.assertTrue("silent server must end in the configured drain timeout",
+                    closeFailure.get() instanceof LineSenderException
+                            && closeFailure.get().getMessage().contains("drain timed out"));
+            long wallMillis = TimeUnit.NANOSECONDS.toMillis(closeWallNanos.get());
+            long cpuMillis = TimeUnit.NANOSECONDS.toMillis(closeCpuNanos.get());
+            Assert.assertTrue("close drain returned before its timeout [wallMillis=" + wallMillis + ']',
+                    wallMillis >= timeoutMillis);
+            Assert.assertTrue("interrupted close drain spun instead of parking [cpuMillis=" + cpuMillis
+                            + ", wallMillis=" + wallMillis + ']',
+                    cpuMillis < timeoutMillis / 2);
         }
     }
 

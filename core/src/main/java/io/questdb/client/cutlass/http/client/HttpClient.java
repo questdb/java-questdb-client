@@ -83,16 +83,40 @@ public abstract class HttpClient implements QuietCloseable {
 
     public HttpClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         this.nf = configuration.getNetworkFacade();
-        this.socket = socketFactory.newInstance(nf, LOG);
         this.defaultTimeout = configuration.getTimeout();
         this.connectTimeout = configuration.getConnectTimeout();
         this.bufferSize = configuration.getInitialRequestBufferSize();
         this.maxBufferSize = configuration.getMaximumRequestBufferSize();
         this.responseParserBufSize = configuration.getResponseBufferSize();
         this.fixBrokenConnection = configuration.fixBrokenConnection();
-        this.bufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseHeaders = new ResponseHeaders(responseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        // Stage every acquisition and roll the lot back on any throw. A constructor that fails partway
+        // leaves an object nobody can close: it never reaches the caller, so no finally, no try-with-resources
+        // and no close() ever runs on it, and whatever it had already taken is lost for the life of the
+        // process. The two mallocs and ResponseHeaders' own buffer are native, so the loss is native memory,
+        // and the trigger is the same condition that makes these fail in the first place - memory pressure, or
+        // fd exhaustion in the socket factory. Retrying then compounds it. Kqueue already guards its
+        // constructor this way; this one did not.
+        Socket stagedSocket = null;
+        long stagedBufLo = 0;
+        long stagedResponseParserBufLo = 0;
+        try {
+            stagedSocket = socketFactory.newInstance(nf, LOG);
+            stagedBufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
+            stagedResponseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseHeaders = new ResponseHeaders(stagedResponseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        } catch (Throwable t) {
+            if (stagedResponseParserBufLo != 0) {
+                Unsafe.free(stagedResponseParserBufLo, responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (stagedBufLo != 0) {
+                Unsafe.free(stagedBufLo, bufferSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            Misc.free(stagedSocket);
+            throw t;
+        }
+        this.socket = stagedSocket;
+        this.bufLo = stagedBufLo;
+        this.responseParserBufLo = stagedResponseParserBufLo;
     }
 
     @Override
@@ -329,8 +353,22 @@ public abstract class HttpClient implements QuietCloseable {
             }
         }
 
+        /**
+         * The address of the request's content section, or {@code 0} when no content section has been
+         * started - deliberately NOT the {@code -1} sentinel the field carries in that state.
+         * <p>
+         * Callers pair this with {@link #getContentLength()}, which already reports 0 for the same state, so
+         * handing back {@code -1} here produced a view that is empty by length but whose base address is a
+         * non-zero, unusable pointer: a {@code ptr() != 0} test reads as true, and pointer arithmetic on it
+         * is nonsense. That state became reachable when withContent() started being deferred - an ILP
+         * request with an httpTokenProvider sits at the header stage until the first row stamps the
+         * Authorization header - so {@code Sender.bufferView()} returned it between every flush and the next
+         * row. {@code trimContentToLen} was guarded against the same sentinel; this accessor was not.
+         *
+         * @return the content-section address, or 0 when there is no content section
+         */
         public long getContentStart() {
-            return contentStart;
+            return contentStart < 0 ? 0 : contentStart;
         }
 
         public long getPtr() {
@@ -547,7 +585,27 @@ public abstract class HttpClient implements QuietCloseable {
             return ss.toString();
         }
 
+        /**
+         * Rewinds the write pointer to {@code contentLen} bytes into the content section, discarding
+         * whatever was written past it.
+         * <p>
+         * A request that has not reached {@code withContent()} yet has no content section to rewind, and
+         * the sentinel guard below is the only thing standing between that state and a SIGSEGV: without it
+         * the pointer becomes {@code -1 + contentLen} and the next write to the buffer takes the process
+         * down. That state is ordinary, not exotic - an ILP request with an {@code httpTokenProvider} sits
+         * at the header stage between every flush and the next row - and {@code Request} is exported, so an
+         * external caller can reach it too. {@code HttpClientRequestTrimTest} pins it.
+         *
+         * @param contentLen the content length to rewind to
+         */
         public void trimContentToLen(int contentLen) {
+            if (contentStart < 0) {
+                // withContent() has not started a content section yet, so contentStart is the -1 sentinel
+                // and contentStart + contentLen would be a negative, invalid write pointer that the next
+                // write would segfault on. Nothing has been written into a content section, so there is
+                // nothing to trim.
+                return;
+            }
             ptr = contentStart + contentLen;
         }
 
@@ -853,9 +911,20 @@ public abstract class HttpClient implements QuietCloseable {
 
         public ResponseHeaders(long respParserBufLo, int respParserBufSize, int defaultTimeout, int headerBufSize, ObjectPool<DirectUtf8String> pool) {
             super(headerBufSize, pool);
-            this.defaultTimeout = defaultTimeout;
-            this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
-            this.chunkedResponse = new ChunkedResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+            // super() mallocs the header parse buffer as its FIRST statement, so from here on this object owns
+            // native memory while still being unreachable by anyone who could free it. A heap OOM in either
+            // allocation below would strand those bytes past the enclosing constructor's catch (Throwable),
+            // which frees only what IT staged - it never holds a reference to a ResponseHeaders that failed
+            // to finish constructing. Same rule as out there: whoever took it frees it when construction
+            // cannot complete.
+            try {
+                this.defaultTimeout = defaultTimeout;
+                this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+                this.chunkedResponse = new ChunkedResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+            } catch (Throwable t) {
+                super.close(); // gated on headerPtr != 0, so it is safe and idempotent
+                throw t;
+            }
         }
 
         public void await() {
@@ -865,8 +934,26 @@ public abstract class HttpClient implements QuietCloseable {
         public void await(int timeout) {
             int totalBytesReceived = 0;
             long unprocessedLo = responseParserBufLo;
+            // A positive timeout bounds the whole call, not each socket read - the same rule
+            // AbstractResponse.recv and AbstractChunkedResponse.recv apply to the BODY, and for the same
+            // reason. recvOrDie returns 0 whenever a read produced no application bytes (an incomplete TLS
+            // record that decrypts to nothing is the common case, and the IDP endpoints are required to be
+            // https), and a 0 leaves totalBytesReceived unmoved, so the loop neither advances the header
+            // parser nor fills its buffer: without one shared deadline it re-arms the full timeout forever
+            // and never reaches the "header is too large" escape either. That put no bound at all on
+            // OidcDeviceAuth's postForm/fetchJson, which read this head from an untrusted identity provider
+            // on the getToken() flush path. A non-positive timeout keeps the legacy "no bound" behaviour.
+            final boolean bounded = timeout > 0;
+            final long startNanos = bounded ? System.nanoTime() : 0L;
             while (isIncomplete()) {
-                final int len = recvOrDie(responseParserBufLo + totalBytesReceived, timeout);
+                int callTimeout = timeout;
+                if (bounded) {
+                    callTimeout = timeout - (int) ((System.nanoTime() - startNanos) / 1_000_000L);
+                    if (callTimeout <= 0) {
+                        throw new HttpClientException("timed out reading the response head");
+                    }
+                }
+                final int len = recvOrDie(responseParserBufLo + totalBytesReceived, callTimeout);
                 if (len > 0) {
                     totalBytesReceived += len;
                     unprocessedLo = parse(unprocessedLo, responseParserBufLo + totalBytesReceived, false, true);

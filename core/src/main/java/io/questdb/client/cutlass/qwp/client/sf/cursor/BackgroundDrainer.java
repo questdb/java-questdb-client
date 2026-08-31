@@ -29,6 +29,7 @@ import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.qwp.client.QwpAuthFailedException;
+import io.questdb.client.cutlass.qwp.client.QwpCredentialUnavailableException;
 import io.questdb.client.cutlass.qwp.client.QwpDurableAckMismatchException;
 import io.questdb.client.cutlass.qwp.client.QwpIngressRoleRejectedException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -40,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 
 /**
  * Empties one orphan slot, then exits. Owned by
@@ -92,6 +94,70 @@ public final class BackgroundDrainer implements Runnable {
      * cluster-wide misconfig hang the drainer forever.
      */
     public static final int DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS = 16;
+    /**
+     * Attempt threshold for {@code 401}/{@code 403} rejections an orphan drainer rides out before it
+     * may quarantine the slot, when - and only when - the credential is a ROTATING one
+     * ({@link CursorWebSocketSendLoop.ReconnectFactory#hasDynamicCredential()}). Against a constant
+     * credential a rejection stays terminal on the first sweep, as it always was.
+     * <p>
+     * The attempt threshold is necessary but not sufficient: the rejection must also PERSIST for at least
+     * the dwell returned by {@link #dynamicCredentialAuthDwellNanos(long)} - {@code
+     * reconnectMaxDurationMillis}, clamped so an unbounded configuration cannot disable the escalation -
+     * measured from the first rejection of the current uninterrupted run. A transient in between (role
+     * reject, transport, credential-unavailable) restarts that measurement, because time the drainer spent
+     * unable to reach anyone is not time the credential spent rejected. This wall-clock floor gives IdP
+     * signing-key and resource-server JWKS caches time to converge even when capped backoff can accumulate
+     * six attempts in only a few seconds. A credential that stays rejected still reaches a human after both
+     * thresholds are met rather than pinning the slot and a drainer-pool worker forever.
+     * Note it cannot repair a PERSISTENT clock skew: the provider keeps serving the same cached token, so
+     * those sweeps eventually exhaust both thresholds and quarantine, which is the right end state for a
+     * condition that is not healing.
+     */
+    public static final int DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS = 6;
+    /**
+     * Hard ceiling on rotating-credential {@code 401}/{@code 403} rejections within one no-ack-progress
+     * episode, whatever the dwell says.
+     * <p>
+     * The dwell is a wall clock anchored at the first rejection of the current run, and the
+     * capability-gap, role-reject and transport arms all rewind that anchor - deliberately, so an
+     * unrelated outage cannot satisfy the floor for free. The attempt threshold beside it is only ever
+     * reset by real ack progress. That asymmetry is what the gate needs in the ordinary case and what
+     * breaks it in the pathological one: a cluster that ALTERNATES - reject, blip, reject, blip - rewinds
+     * the anchor before every rejection, so the elapsed dwell is always ~0, the AND can never be
+     * satisfied, and the ride-out never ends. The drainer then sweeps forever with no ack progress: no
+     * {@code .failed} sentinel, no {@code DATA_LOSS} report, the slot lock held, and one worker of a
+     * fixed-size {@link BackgroundDrainerPool} pinned for the life of the process - the exact outcome
+     * {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} exists to prevent, reached by a different route.
+     * <p>
+     * An attempt cap is the right backstop precisely because nothing rewinds it: it shares the attempt
+     * counter's episode scope, so it bounds the ride-out however the rejections are spaced. It is set far
+     * above {@link #DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS} on purpose - the dwell decides every
+     * case that is not pathological, and this only ever fires when the dwell has been rendered
+     * unsatisfiable.
+     */
+    public static final int MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE = 256;
+    /**
+     * Ceiling on the rotating-credential {@code 401}/{@code 403} wall-clock dwell, independent of the user
+     * knob it is otherwise derived from.
+     * <p>
+     * The dwell is an AND with the attempt threshold - both must be exhausted before an orphan slot is
+     * quarantined - and it is taken from {@code reconnect_max_duration_millis}, which is validated only as
+     * {@code > 0} and whose documented way to ask a reconnect never to give up is {@code Long.MAX_VALUE}.
+     * {@code TimeUnit} saturates that, so the dwell conjunct became unsatisfiable and the ride-out never
+     * ended: the drainer swept forever, never wrote the {@code .failed} sentinel, never reported
+     * {@code DATA_LOSS}, and pinned the slot lock plus one worker of a FIXED-size
+     * {@link BackgroundDrainerPool} for the life of the process, starving every other orphan slot. The
+     * capability-gap gate below survives the same saturation because it is an OR; this gate cannot be an OR
+     * without losing the dwell floor that stops a healing credential being abandoned in the seconds capped
+     * backoff needs to spend six attempts, so it is clamped instead.
+     * <p>
+     * Set to the DEFAULT reconnect budget rather than a new figure: five minutes is already what this design
+     * calls a settle budget, and a larger configured value is a statement about reconnect persistence, not
+     * about how long a credential failure may stay hidden from an operator. A smaller configured value is
+     * honoured as-is, so tuning down still works.
+     */
+    public static final long MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS =
+            CursorWebSocketSendLoop.DEFAULT_RECONNECT_MAX_DURATION_MILLIS;
     private static final Logger LOG = LoggerFactory.getLogger(BackgroundDrainer.class);
     /** How often to wake and re-check ackedFsn vs target. */
     private static final long POLL_NANOS = 50_000_000L; // 50 ms
@@ -113,6 +179,36 @@ public final class BackgroundDrainer implements Runnable {
     private final long sfMaxTotalBytes;
     private final String slotPath;
     private final long syncIntervalNanos;
+    /**
+     * Escalation counters for the two bounded ride-outs, held per DRAIN rather than per call, plus the
+     * ack watermark that scopes them.
+     * <p>
+     * The counters were locals of {@link #connectWithDurableAckRetry()}, which {@link #run()} re-enters
+     * after every mid-drain terminal - so each recycle refilled the budget it is supposed to spend. A
+     * cluster that flaps (connect accepted, drop, {@code 401}, recycle, repeat) looped forever with no ack
+     * progress: the escalation never arrived, the slot lock was never released, and one of {@code
+     * max_background_drainers} workers - four by default - stayed pinned, so four such slots starve every
+     * other orphan slot of a drainer. No data is lost, but none is delivered either, and no operator ever
+     * sees the quarantine.
+     * <p>
+     * "No ack progress" is the actual condition, and {@code ackProgressWatermark} is what measures it.
+     * Spanning the whole drain instead over-counts in the opposite direction: a drain that connects,
+     * DELIVERS, then meets a later gap accumulates both runs toward one threshold, so 16 sweeps that were
+     * never consecutive quarantine a slot the cluster is still draining - abandoning replayable rows behind
+     * a {@code .failed} sentinel nothing in production clears. Both terminals are documented as CONSECUTIVE
+     * sweeps, so {@link #noteAckProgress(long)} ends the episode the moment the wire delivers anything: a
+     * durable ack past this watermark is positive proof the cluster accepted us, which is strictly stronger
+     * evidence than the role-reject and transport arms that already reset these. A flap that delivers
+     * nothing never advances the watermark and still escalates on schedule.
+     * <p>
+     * The wall-clock helpers beside them ({@code capabilityGapElapsedNanos}, {@code lastCapabilityGapNanos})
+     * deliberately stay per-call: they measure an UNINTERRUPTED run, and a successful connect plus a drain
+     * is an interruption, so a fresh call should start their accounting over.
+     */
+    private long ackProgressWatermark = Long.MIN_VALUE;
+    private int capabilityGapAttempts;
+    private int dynamicCredentialAuthAttempts;
+    private long firstDynamicCredentialAuthFailureNanos;
     /** Latest known {@code engine.ackedFsn()}; published for visibility. */
     private volatile long ackedFsn = -1L;
     /**
@@ -121,10 +217,15 @@ public final class BackgroundDrainer implements Runnable {
      * reference an already-closed engine once the drain ends.
      */
     private volatile CursorSendEngine engineForTesting;
-    // Sink for SenderError.dataLoss reports fired when this drainer
-    // permanently abandons a slot behind a .failed sentinel. Volatile for the
-    // same reason as `listener`: applied by the pool at submit time, read on
-    // the drainer thread. Null means the abandonment is announced only via
+    @TestOnly
+    private Consumer<CursorWebSocketSendLoop> afterAckPollHookForTesting;
+    // Sink for this drainer's SenderError reports. Two feeds: the dataLoss fired
+    // when it permanently abandons a slot behind a .failed sentinel, and the
+    // non-TERMINAL reports of the drain loop itself -- an unobtainable credential
+    // above all, plus the server rejections it replays through -- which run()
+    // forwards by handing the loop a SenderErrorDispatcher over this sink.
+    // Volatile for the same reason as `listener`: applied by the pool at submit
+    // time, read on the drainer thread. Null means both are announced only via
     // LOG -- a NOP for apps without an slf4j binding -- which is exactly the
     // silence this sink exists to break.
     private volatile SenderErrorHandler errorSink;
@@ -254,6 +355,23 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * The effective wall-clock dwell the rotating-credential {@code 401} ride-out uses: the configured
+     * reconnect budget, clamped to {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} so that an
+     * "effectively unbounded" configuration cannot disable the escalation entirely.
+     * <p>
+     * Public and pure so the clamp can be asserted directly. The alternative - proving it end to end - means
+     * waiting out the ceiling, which is five minutes of wall clock in a test.
+     *
+     * @param reconnectMaxDurationMillis the configured {@code reconnect_max_duration_millis}
+     * @return the dwell in nanoseconds, always finite
+     */
+    public static long dynamicCredentialAuthDwellNanos(long reconnectMaxDurationMillis) {
+        return Math.min(
+                TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis),
+                TimeUnit.MILLISECONDS.toNanos(MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS));
+    }
+
+    /**
      * Budgeted connect with retry on whole-cluster durable-ack unavailability:
      * the initial connect, and re-entered from {@link #run()} whenever a
      * mid-drain reconnect sweep hits the same capability gap (each re-entry
@@ -281,8 +399,9 @@ public final class BackgroundDrainer implements Runnable {
      * transport error -- are retried indefinitely (Invariant B) and never
      * consume the budget. Either transient restarts the attempt count and wall
      * clock so only uninterrupted capability-gap sweeps can escalate.
-     * Genuine terminals (auth failure, non-421 upgrade reject) preserve
-     * the original behavior: mark failed, exit.
+     * Genuine terminals (a constant-credential auth failure, a rotating-credential
+     * auth failure that exhausts both its attempt threshold and wall-clock floor,
+     * or a non-421 upgrade reject) mark the slot failed and exit.
      *
      * @return a fresh durable-ack-capable client, or {@code null} if
      *         {@link #outcome} has been set to FAILED or STOPPED
@@ -301,10 +420,27 @@ public final class BackgroundDrainer implements Runnable {
         // intervening role or transport state resets the episode: after the
         // cluster leaves the capability-gap state, later gaps must establish a
         // fresh consecutive run before quarantine is permitted.
-        int capabilityGapAttempts = 0;
+        // (capabilityGapAttempts is a field - see its declaration)
+        // 401/403 sweeps ridden out so far, counted only for a ROTATING credential (see
+        // DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS). Not reset by the transient arms below, so a
+        // credential alternating rejected/unreachable inside ONE connect attempt cannot refill it and
+        // stall the quarantine an operator needs to see - unlike the capability-gap episode, and unlike
+        // the dwell anchor beside it, which does restart because it measures persistence rather than
+        // count.
+        //
+        // It is a FIELD, so a mid-drain recycle cannot refill it - see its declaration.
+        // (dynamicCredentialAuthAttempts is a field)
+        // The rotating-auth wall-clock floor is anchored at the first 401/403 of the CURRENT run of
+        // rejections: a transient class in between (role reject, transport, credential-unavailable) restarts
+        // it, because the dwell measures how long the rejection persisted, not how long the drainer has been
+        // running. A recycle is NOT such an interruption for this anchor: it is a field, so the dwell spans
+        // recycles, which is what lets a flapping credential reach the escalation at all - the attempt
+        // threshold alone cannot, because the gate is an AND. The attempt threshold, unlike this, never
+        // resets during the drain. A zero value means no rejection has been observed.
+        // (firstDynamicCredentialAuthFailureNanos is a field)
         // Wall-clock time accumulated across uninterrupted gap-to-gap
         // intervals of the current episode; escalates once it reaches
-        // capabilityGapBudgetNanos (or the attempt cap fires first).
+        // reconnectBudgetNanos (or the attempt cap fires first).
         long capabilityGapElapsedNanos = 0L;
         // Timestamp of the previous capability-gap sweep; 0 = the next gap
         // charges nothing because a fresh episode is starting.
@@ -318,8 +454,13 @@ public final class BackgroundDrainer implements Runnable {
         // more tolerance would buy exactly none. TimeUnit clamps at Long.MAX_VALUE, which
         // is the intended "effectively unbounded". CursorWebSocketSendLoop's dwell
         // conversion guards the same way for the same reason.
-        final long capabilityGapBudgetNanos =
+        final long reconnectBudgetNanos =
                 TimeUnit.MILLISECONDS.toNanos(reconnectMaxDurationMillis);
+        // The rotating-401 gate needs its own, clamped copy: it is an AND, so an unbounded value there is
+        // not "effectively unbounded" but "never escalates". The capability-gap gate below keeps the raw
+        // budget - it is an OR, so its attempt cap fires regardless.
+        final long dynamicCredentialAuthDwellNanos =
+                dynamicCredentialAuthDwellNanos(reconnectMaxDurationMillis);
         // Observability-only counter for the transient all-replica window;
         // never consulted for escalation (Invariant B).
         int roleRejectAttempts = 0;
@@ -338,17 +479,74 @@ public final class BackgroundDrainer implements Runnable {
             try {
                 return clientFactory.reconnect();
             } catch (QwpAuthFailedException | WebSocketUpgradeException e) {
-                // Genuinely non-retriable across the cluster (auth 401/403, or a
-                // non-421 upgrade reject): waiting will not fix it, so quarantine
-                // immediately under the orphan reconnect policy.
-                String msg = e.getMessage();
-                LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
-                lastErrorMessage = msg;
-                String reason = "auth/upgrade: " + msg;
-                OrphanScanner.markFailed(slotPath, reason);
-                dispatchDataLoss(reason);
-                outcome = DrainOutcome.FAILED;
-                return null;
+                // A non-421 upgrade reject, and a 401/403 against a CONSTANT credential, are genuinely
+                // non-retriable across the cluster: waiting will not fix them, so quarantine immediately
+                // under the orphan reconnect policy.
+                //
+                // A 401/403 against a ROTATING credential is a different condition. The header is
+                // re-derived from the caller's token provider on every sweep, so the rejection can be a
+                // window that heals itself, and the next sweep carries a freshly pulled token. Quarantining
+                // on the first one would permanently abandon replayable data - nothing in production clears
+                // the .failed sentinel - on a fault that repairs itself. Require BOTH enough rejection
+                // attempts and a minimum wall-clock dwell before quarantine: capped backoff can otherwise spend
+                // the attempt threshold in seconds, far sooner than IdP signing-key/JWKS caches commonly
+                // converge.
+                boolean retryDynamicCredentialAuth = false;
+                long dynamicCredentialAuthElapsedNanos = 0L;
+                if (e instanceof QwpAuthFailedException && clientFactory.hasDynamicCredential()) {
+                    dynamicCredentialAuthAttempts++;
+                    long now = System.nanoTime();
+                    if (firstDynamicCredentialAuthFailureNanos == 0L) {
+                        firstDynamicCredentialAuthFailureNanos = now;
+                    }
+                    dynamicCredentialAuthElapsedNanos = now - firstDynamicCredentialAuthFailureNanos;
+                    // Both thresholds still gate the quarantine - a healing credential is never abandoned
+                    // early - but the dwell is the CLAMPED one, so a saturated reconnect_max_duration_millis
+                    // cannot make the second conjunct unsatisfiable and turn "ride it out" into "never
+                    // escalate". See MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS.
+                    // The AND of the two thresholds, under a cap that nothing can rewind. The transient
+                    // arms below deliberately restart the dwell anchor, so an ALTERNATING cluster -
+                    // reject, blip, reject, blip - re-anchors before every rejection and leaves the
+                    // elapsed dwell permanently at ~0, making the AND unsatisfiable and the ride-out
+                    // endless. The attempt counter shares this episode's scope (only ack progress clears
+                    // it), so capping on it bounds the ride-out however the rejections are spaced while
+                    // leaving the dwell to decide every non-pathological case. See
+                    // MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE.
+                    retryDynamicCredentialAuth =
+                            (dynamicCredentialAuthAttempts < DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS
+                                    || dynamicCredentialAuthElapsedNanos < dynamicCredentialAuthDwellNanos)
+                                    && dynamicCredentialAuthAttempts < MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS_PER_EPISODE;
+                }
+                if (retryDynamicCredentialAuth) {
+                    lastErrorMessage = e.getMessage();
+                    // An auth rejection is unrelated to any open durable-ack episode: we reached a node and
+                    // it refused the credential, which says nothing about its batch cap. Restart the episode
+                    // so a later gap gets its full settle budget, exactly as the transport arm below does.
+                    capabilityGapAttempts = 0;
+                    capabilityGapElapsedNanos = 0L;
+                    lastCapabilityGapNanos = 0L;
+                    // the CLAMPED dwell, which is the one the gate above just applied. Reporting the raw
+                    // reconnect_max_duration_millis here was misleading exactly where the clamp matters: a
+                    // saturated budget rendered as "dwell 12ms/9223372036854775807ms", telling an operator the
+                    // ride-out would never end when it was in fact bounded at the ceiling.
+                    LOG.warn("drainer slot {} attempt {} (threshold {}, dwell {}ms/{}ms): "
+                                    + "the rotating credential was rejected ({}); retrying with a freshly pulled "
+                                    + "token after backoff",
+                            slotPath, dynamicCredentialAuthAttempts,
+                            DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS,
+                            dynamicCredentialAuthElapsedNanos / 1_000_000L,
+                            dynamicCredentialAuthDwellNanos / 1_000_000L, e.getMessage());
+                    // fall through to the shared capped-backoff block
+                } else {
+                    String msg = e.getMessage();
+                    LOG.error("drainer terminal upgrade/auth error for slot {}: {}", slotPath, msg);
+                    lastErrorMessage = msg;
+                    String reason = "auth/upgrade: " + msg;
+                    OrphanScanner.markFailed(slotPath, reason);
+                    dispatchDataLoss(reason);
+                    outcome = DrainOutcome.FAILED;
+                    return null;
+                }
             } catch (QwpRoleMismatchException | QwpIngressRoleRejectedException e) {
                 // INVARIANT B: every reachable endpoint is a REPLICA right now.
                 // A replica is promotable and a primary will reappear, so this is
@@ -365,6 +563,16 @@ public final class BackgroundDrainer implements Runnable {
                 capabilityGapAttempts = 0;
                 capabilityGapElapsedNanos = 0L;
                 lastCapabilityGapNanos = 0L;
+                // The rotating-401 dwell measures how long the REJECTION has persisted, so time spent in
+                // an unrelated state is not part of it. Restart its anchor for the same reason the
+                // capability-gap episode restarts above: without this, a 401, then an outage outlasting the
+                // dwell, then a sixth rejection satisfies both thresholds at once and quarantines a slot on
+                // a credential that was only rejected for seconds - abandoning replayable rows behind a
+                // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
+                // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
+                // the clamped dwell (MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS) keeps the escalation reachable
+                // regardless of what reconnect_max_duration_millis is set to.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 BackgroundDrainerListener l = listener;
                 if (l != null) {
                     try {
@@ -388,6 +596,14 @@ public final class BackgroundDrainer implements Runnable {
                 // stays terminal for the drainer -- give the cluster a bounded
                 // settle budget (rolling upgrade), then quarantine the slot.
                 capabilityGapAttempts++;
+                // Symmetry with the arm above, which restarts the capability-gap episode because an auth
+                // rejection says nothing about a node's batch cap: a capability gap says nothing about the
+                // credential either. We reached a node and it answered - it simply cannot do durable ack -
+                // so this is not time the credential spent REJECTED, and charging it to the rotating-401
+                // dwell would let a rolling upgrade satisfy that floor for free. The settle budget below can
+                // legitimately run for the whole reconnect budget, which is exactly the span the dwell is
+                // meant to require of an uninterrupted rejection.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 long now = System.nanoTime();
                 if (lastCapabilityGapNanos != 0L) {
                     // Charge only the interval since the PREVIOUS gap sweep,
@@ -399,7 +615,7 @@ public final class BackgroundDrainer implements Runnable {
                 lastCapabilityGapNanos = now;
                 long elapsedMs = capabilityGapElapsedNanos / 1_000_000L;
                 boolean exhausted = capabilityGapAttempts >= DEFAULT_MAX_DURABLE_ACK_MISMATCH_ATTEMPTS
-                        || capabilityGapElapsedNanos >= capabilityGapBudgetNanos;
+                        || capabilityGapElapsedNanos >= reconnectBudgetNanos;
                 BackgroundDrainerListener l = listener;
                 if (exhausted) {
                     LOG.error("drainer giving up on slot {} after {} durable-ack-mismatch attempts ({}ms): {}",
@@ -455,6 +671,11 @@ public final class BackgroundDrainer implements Runnable {
                 // WebSocketUpgradeException) and is intentionally retried under
                 // Invariant B -- but it is NOT a transport outage, so log it
                 // truthfully below rather than mislabelling it "cluster unreachable".
+                // The same holds for a credential the client cannot ACQUIRE
+                // (QwpCredentialUnavailableException extends LineSenderException, so it
+                // matches none of the typed arms above): retried indefinitely here, for
+                // the reason CursorWebSocketSendLoop's matching arm spells out, but
+                // named for what it is.
                 lastErrorMessage = t.getMessage();
                 // This unrelated state breaks the consecutive capability-gap
                 // run. Restart both halves of the settle budget so a later gap
@@ -462,6 +683,16 @@ public final class BackgroundDrainer implements Runnable {
                 capabilityGapAttempts = 0;
                 capabilityGapElapsedNanos = 0L;
                 lastCapabilityGapNanos = 0L;
+                // The rotating-401 dwell measures how long the REJECTION has persisted, so time spent in
+                // an unrelated state is not part of it. Restart its anchor for the same reason the
+                // capability-gap episode restarts above: without this, a 401, then an outage outlasting the
+                // dwell, then a sixth rejection satisfies both thresholds at once and quarantines a slot on
+                // a credential that was only rejected for seconds - abandoning replayable rows behind a
+                // .failed sentinel nothing in production clears. The attempt counter deliberately does NOT
+                // reset (a credential alternating rejected/unreachable must not refill it indefinitely), and
+                // the clamped dwell (MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS) keeps the escalation reachable
+                // regardless of what reconnect_max_duration_millis is set to.
+                firstDynamicCredentialAuthFailureNanos = 0L;
                 long nowWarn = System.nanoTime();
                 if (nowWarn - lastTransportWarnNanos >= 5_000_000_000L) {
                     if (t instanceof QwpVersionMismatchException) {
@@ -477,6 +708,18 @@ public final class BackgroundDrainer implements Runnable {
                         LOG.warn("drainer slot {}: every reachable endpoint advertises an unsupported "
                                         + "QWP protocol version ({}); retrying (rolling-upgrade window) -- "
                                         + "if this persists the client is version-incompatible with the cluster",
+                                slotPath, t.getMessage());
+                    } else if (t instanceof QwpCredentialUnavailableException) {
+                        // Nothing was attempted on the wire: the configured token provider
+                        // threw instead of handing over a credential (a failed silent
+                        // refresh, a revoked or expired refresh token, an unreachable IdP,
+                        // or an interactive sign-in not finished yet). The cluster may be
+                        // perfectly healthy, so "cluster unreachable" sends the operator
+                        // after a network fault that does not exist while the slot's rows
+                        // sit undrained. Point at the credential instead.
+                        LOG.warn("drainer slot {}: the token provider failed to supply a credential ({}); "
+                                        + "retrying after backoff -- the slot stays un-drained until a token "
+                                        + "is available",
                                 slotPath, t.getMessage());
                     } else {
                         LOG.warn("drainer slot {}: cluster unreachable ({}), retrying after backoff",
@@ -497,7 +740,7 @@ public final class BackgroundDrainer implements Runnable {
             long sleepMillis = backoffMillis + jitter;
             if (boundedByBudget) {
                 sleepMillis = Math.min(sleepMillis,
-                        Math.max(0L, (capabilityGapBudgetNanos - capabilityGapElapsedNanos) / 1_000_000L));
+                        Math.max(0L, (reconnectBudgetNanos - capabilityGapElapsedNanos) / 1_000_000L));
             }
             if (sleepMillis > 0L && !stopRequested) {
                 long parkDeadlineNanos = System.nanoTime() + sleepMillis * 1_000_000L;
@@ -548,6 +791,27 @@ public final class BackgroundDrainer implements Runnable {
     }
 
     /**
+     * Pre-ages the rotating-credential rejection anchor so a test can reach the
+     * {@link #MAX_DYNAMIC_CREDENTIAL_AUTH_DWELL_MILLIS} ceiling without waiting it out in real time.
+     * <p>
+     * The clamp on the connect loop's dwell is otherwise unobservable end to end. Every other drainer test
+     * configures a dwell far below the ceiling, where {@code Math.min} returns its first argument either
+     * way, so the loop reverting to the raw budget leaves them all green - while a saturated
+     * {@code reconnect_max_duration_millis} makes the gate's second conjunct unsatisfiable and an orphan
+     * drainer sweeps forever, pinning the slot lock and one pool worker. Proving it honestly instead means
+     * waiting out the ceiling, which is five minutes of wall clock per run.
+     *
+     * @param ageNanos how long ago the current run of rejections should appear to have begun
+     */
+    @TestOnly
+    public void ageDynamicCredentialAuthAnchorForTesting(long ageNanos) {
+        long anchor = System.nanoTime() - ageNanos;
+        // 0 is the "no rejection observed yet" sentinel, and the connect loop overwrites it on the next
+        // rejection - which would silently undo the ageing and make the test pass for the wrong reason.
+        firstDynamicCredentialAuthFailureNanos = anchor != 0L ? anchor : 1L;
+    }
+
+    /**
      * Engine this drainer constructed, or {@code null} until {@link #run()}
      * gets past engine construction. The reference outlives the drain, so
      * tests can read construction-time state (it may be closed by then).
@@ -555,6 +819,16 @@ public final class BackgroundDrainer implements Runnable {
     @TestOnly
     public CursorSendEngine getEngineForTesting() {
         return engineForTesting;
+    }
+
+    /**
+     * Installs a test-only hook after the drain loop reads {@code ackedFsn} but before it checks the loop's
+     * terminal latch. This makes the late-ack ordering deterministic without changing either production
+     * thread's publication order.
+     */
+    @TestOnly
+    public void setAfterAckPollHookForTesting(Consumer<CursorWebSocketSendLoop> hook) {
+        afterAckPollHookForTesting = hook;
     }
 
     /**
@@ -618,6 +892,31 @@ public final class BackgroundDrainer implements Runnable {
         }
     }
 
+    /**
+     * Ends any open escalation episode once the wire has durably acked something new. Both bounded
+     * ride-outs are documented as CONSECUTIVE sweeps, and a durable ack past the watermark is the
+     * cluster accepting this drainer - stronger evidence than a role reject or a transport error, both
+     * of which already reset these counters. Without it the two per-drain counters span every session of
+     * the drain, so a rolling upgrade that delivers between two gap windows accumulates both toward one
+     * threshold and quarantines a slot that was still draining.
+     * <p>
+     * Runs on the drainer thread only, from {@link #run()}'s poll loop, so the plain field reads and
+     * writes need no synchronisation. Deliberately NOT called from {@link #connectWithDurableAckRetry()}:
+     * a successful connect on its own delivers nothing, and treating it as progress would restore the
+     * per-call refill that let a flapping cluster recycle forever.
+     *
+     * @param acked the engine's current durable-ack watermark
+     */
+    private void noteAckProgress(long acked) {
+        if (acked <= ackProgressWatermark) {
+            return;
+        }
+        ackProgressWatermark = acked;
+        capabilityGapAttempts = 0;
+        dynamicCredentialAuthAttempts = 0;
+        firstDynamicCredentialAuthFailureNanos = 0L;
+    }
+
     @Override
     public void run() {
         runnerThread = Thread.currentThread();
@@ -625,6 +924,12 @@ public final class BackgroundDrainer implements Runnable {
         CursorSendEngine engine = null;
         WebSocketClient client = null;
         CursorWebSocketSendLoop loop = null;
+        // Async delivery arm for the drain loop's own SenderError reports. Built
+        // only when a sink is installed, and only once per run() -- it outlives
+        // the mid-drain loop recycles below, which would otherwise churn a thread
+        // per wire session. Closed by the finally, after loop.close(), so errors
+        // dispatched during the loop's shutdown still reach the sink.
+        SenderErrorDispatcher loopErrorDispatcher = null;
         try {
             // Scanner results are only snapshots. Serialize adoption against
             // a producer's close -> quarantine rename -> fresh-slot recreate
@@ -762,20 +1067,66 @@ public final class BackgroundDrainer implements Runnable {
                 outcome = DrainOutcome.SUCCESS;
                 return;
             }
+            // Seed the progress watermark from what a previous run already durably acked, so only acks
+            // THIS drain earns count as progress. Seeding from the -1 field default would make the first
+            // poll of a partially-drained slot read as progress and hand back a budget the initial connect
+            // had legitimately spent.
+            ackProgressWatermark = engine.ackedFsn();
             client = connectWithDurableAckRetry();
             if (client == null) {
                 // outcome already set (FAILED or STOPPED); markFailed sentinel
                 // already dropped on the FAILED path.
                 return;
             }
-            // One iteration per wire session. Re-entered ONLY when a mid-drain
-            // reconnect sweep hit a durable-ack CAPABILITY gap: that is the
-            // exact rolling-upgrade condition the settle budget in
-            // connectWithDurableAckRetry() exists for, so it must not
-            // quarantine on the first sweep the way the initial-connect path
-            // never does. The engine stays alive across sessions (it holds the
-            // slot lock; only loop + client are recycled), and target remains
-            // valid -- the slot is orphaned, nothing appends to it.
+            // Read the sink once: like `listener` it is volatile because the pool
+            // applies it at submit time and it is consumed on the drainer thread.
+            SenderErrorHandler sink = errorSink;
+            if (sink != null) {
+                // The I/O thread must never run the sink inline -- it is caller-supplied
+                // code and may block -- so it reaches the sink through the same bounded,
+                // drop-oldest, off-thread arm the foreground sender uses.
+                //
+                // TERMINAL is dropped on the way through: on an ORPHAN loop it does not
+                // mean what it means to a foreground producer. It is the loop handing the
+                // slot back to this drainer, which then decides -- ride the fault out and
+                // finish the drain, or quarantine and report the abandonment itself with
+                // dispatchDataLoss. Forwarding it would announce a dead producer for a
+                // rotating credential the very next sweep accepts, and would double-report
+                // the quarantine the drainer already names. Everything the loop rides out
+                // (RETRIABLE / RETRIABLE_OTHER) has no such owner and is forwarded verbatim.
+                loopErrorDispatcher = new SenderErrorDispatcher(
+                        err -> {
+                            if (err.getAppliedPolicy() != SenderError.Policy.TERMINAL) {
+                                // This sink belongs to the live sender, while err's FSNs belong to the orphan
+                                // engine being drained. Strip that foreign correlation span before forwarding;
+                                // otherwise an operator can join it to unrelated live rows with the same FSNs.
+                                sink.onError(new SenderError(
+                                        err.getCategory(),
+                                        err.getAppliedPolicy(),
+                                        err.getServerStatusByte(),
+                                        err.getServerMessage(),
+                                        err.getMessageSequence(),
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        err.getTableName(),
+                                        err.getDetectedAtNanos()));
+                            }
+                        },
+                        SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");
+            }
+
+            // One iteration per wire session. Re-entered on either of the two
+            // RECOVERABLE mid-drain terminals the recycle branch below tests
+            // for -- a durable-ack CAPABILITY gap, or a 401/403 against a
+            // ROTATING credential. Both are conditions a later sweep can clear
+            // (a rolling upgrade settling; the next pulled token being
+            // accepted), so neither may quarantine on its first sweep the way
+            // the initial-connect path never does; connectWithDurableAckRetry()
+            // owns the bounded budget for each. Every other wire error still
+            // quarantines the slot without re-entering. The engine stays alive
+            // across sessions (it holds the slot lock; only loop + client are
+            // recycled), and target remains valid -- the slot is orphaned,
+            // nothing appends to it.
             drain:
             while (!stopRequested) {
                 loop = new CursorWebSocketSendLoop(
@@ -790,16 +1141,32 @@ public final class BackgroundDrainer implements Runnable {
                         poisonMinEscalationWindowMillis,
                         catchUpCapGapMinEscalationWindowMillis,
                         CursorWebSocketSendLoop.ReconnectPolicy.ORPHAN);
+                // Without this the loop's ridden-out reports -- above all
+                // "credential-unavailable", the one endpoint-policy failure an ORPHAN
+                // loop retries rather than latching -- are dispatched into a null, and
+                // the outage is announced only by a throttled slf4j WARN, which is a
+                // NOP in an app with no binding configured. The foreground sender wires
+                // the same arm (QwpWebSocketSender.ensureConnected, where it builds the
+                // loop); an orphan drainer rides out the same faults and
+                // must be just as observable, or a revoked token reads as a disk-sizing
+                // problem once SF fills. Null when no sink is installed, which
+                // setErrorDispatcher accepts and dispatchError treats as before.
+                loop.setErrorDispatcher(loopErrorDispatcher);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {
                     long acked = engine.ackedFsn();
+                    noteAckProgress(acked);
                     this.ackedFsn = acked;
                     if (acked >= target) {
                         outcome = DrainOutcome.SUCCESS;
                         LOG.info("drainer fully drained slot {} (target={}, acked={})",
                                 slotPath, target, acked);
                         return;
+                    }
+                    Consumer<CursorWebSocketSendLoop> afterAckPollHook = afterAckPollHookForTesting;
+                    if (afterAckPollHook != null) {
+                        afterAckPollHook.accept(loop);
                     }
                     try {
                         loop.checkError();
@@ -814,17 +1181,45 @@ public final class BackgroundDrainer implements Runnable {
                         if (t.getCause() instanceof Error) {
                             throw (Error) t.getCause();
                         }
-                        if (loop.capabilityGapTerminal() != null) {
-                            // Capability gap mid-drain: recycle the wire, NOT
-                            // the slot. connectWithDurableAckRetry() owns the
-                            // episode budget (16 consecutive gap sweeps /
-                            // wall clock) and drops the sentinel itself if the
-                            // gap persists. The loop's own failed sweep is not
-                            // counted toward the fresh episode -- an off-by-one
-                            // that is immaterial at budget 16.
-                            LOG.warn("drainer slot {}: durable-ack capability gap "
-                                            + "mid-drain ({}), re-entering settle budget",
-                                    slotPath, t.getMessage());
+                        if (loop.capabilityGapTerminal() != null || loop.authTerminal() != null) {
+                            // The I/O thread publishes a durable ack before it latches a later terminal.
+                            // That publication can land after the poll at the top of this iteration but
+                            // before checkError() observes the terminal. Re-read here so recycling the wire
+                            // cannot carry a spent escalation budget across progress we actually made.
+                            long ackedAfterTerminal = engine.ackedFsn();
+                            noteAckProgress(ackedAfterTerminal);
+                            this.ackedFsn = ackedAfterTerminal;
+                            if (ackedAfterTerminal >= target) {
+                                outcome = DrainOutcome.SUCCESS;
+                                LOG.info("drainer fully drained slot {} before recoverable terminal "
+                                                + "(target={}, acked={})",
+                                        slotPath, target, ackedAfterTerminal);
+                                return;
+                            }
+                            // Mid-drain RECOVERABLE terminal: recycle the wire, NOT
+                            // the slot. connectWithDurableAckRetry() owns the matching
+                            // bounded budget and drops the sentinel itself if the
+                            // condition persists, so a fault that heals -- a rolling
+                            // upgrade settling, or a rotating credential's next token
+                            // being accepted -- never abandons replayable data on its
+                            // first sweep. The loop's own failed sweep is not counted
+                            // toward the fresh budget -- an off-by-one immaterial at
+                            // either budget. Two classes route here:
+                            //   - capability gap: the 16 consecutive-sweep / wall-clock
+                            //     settle budget.
+                            //   - rotating-credential 401/403 (authTerminal): the
+                            //     DEFAULT_MAX_DYNAMIC_CREDENTIAL_AUTH_ATTEMPTS ride-out.
+                            //     Only an ORPHAN loop with a dynamic credential sets it;
+                            //     a constant credential stays fatal and quarantines below.
+                            if (loop.authTerminal() != null) {
+                                LOG.warn("drainer slot {}: rotating credential rejected mid-drain ({}), "
+                                                + "re-entering the rotating-401 ride-out",
+                                        slotPath, t.getMessage());
+                            } else {
+                                LOG.warn("drainer slot {}: durable-ack capability gap "
+                                                + "mid-drain ({}), re-entering settle budget",
+                                        slotPath, t.getMessage());
+                            }
                             try {
                                 loop.close();
                             } catch (Throwable closeFailure) {
@@ -938,6 +1333,41 @@ public final class BackgroundDrainer implements Runnable {
                     LOG.warn("drainer slot {}: I/O thread did not stop during close ({}); "
                                     + "delegating client/engine teardown to its exit path",
                             slotPath, e.getMessage());
+                }
+            }
+            if (loopErrorDispatcher != null) {
+                // After loop.close() so anything the I/O loop reported on its way
+                // out is still admitted, and before the sink can outlive this run.
+                // Safe on the failed-stop path above too: a still-live I/O thread's
+                // later offer() is rejected by the closed dispatcher rather than
+                // resurrecting its delivery thread.
+                //
+                // Interrupt-neutral for this ONE call, then restored. Everything above
+                // deliberately runs with the flag set -- stopRequestedOrInterrupted() leaves
+                // it so loop.close()'s latch await throws rather than blocking on a wedged
+                // I/O thread -- but SenderErrorDispatcher.close() drains by joining its
+                // delivery thread against a refreshed deadline, and its catch re-asserts the
+                // flag before looping. Arriving with the flag set makes Thread.join(millis)
+                // throw on arrival on every pass, so the loop BUSY-SPINS for as long as the
+                // delivery thread stays alive, capped at the 100ms drain deadline.
+                //
+                // It still drains correctly -- join() returns normally the moment the thread
+                // is no longer alive, so neither the wait's duration nor which errors get
+                // delivered changes. What changes is the cost: measured at 15k-53k join
+                // attempts, one core pinned for that window, per closing drainer, and
+                // max_background_drainers is 4 by default. Same clear-and-restore the sibling
+                // teardowns use (QueryWorker.shutdown, QwpQueryClient.close,
+                // QwpWebSocketSender.close).
+                final boolean wasInterrupted = Thread.interrupted();
+                try {
+                    loopErrorDispatcher.close();
+                } catch (Throwable e) {
+                    LOG.warn("drainer slot {}: error dispatcher close failed ({})",
+                            slotPath, e.getMessage());
+                } finally {
+                    if (wasInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             }
             if (client != null && ioThreadStopped) {
