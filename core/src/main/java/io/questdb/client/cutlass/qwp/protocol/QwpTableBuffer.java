@@ -63,8 +63,10 @@ public class QwpTableBuffer implements QuietCloseable {
     private static final int MAX_COLUMN_NAME_LENGTH = 127;
     private final LowerCaseCharSequenceIntHashMap columnNameToIndex;
     private final ObjList<ColumnBuffer> columns;
+    private final Owner owner;
     private final QwpWebSocketSender sender;
     private final String tableName;
+    private long baselineBytes; // storage retained by empty columns after reset() (e.g. var-width seed offsets)
     private QwpColumnDef[] cachedColumnDefs;
     private int columnAccessCursor; // tracks expected next column index
     private boolean columnDefsCacheValid;
@@ -74,7 +76,7 @@ public class QwpTableBuffer implements QuietCloseable {
     private int rowCount;
 
     public QwpTableBuffer(String tableName) {
-        this(tableName, null);
+        this(tableName, (QwpWebSocketSender) null);
     }
 
     /**
@@ -82,10 +84,25 @@ public class QwpTableBuffer implements QuietCloseable {
      * {@link ColumnBuffer#addSymbol(CharSequence)} needs the sender to
      * call {@link QwpWebSocketSender#getOrAddGlobalSymbol(CharSequence)}, registering
      * the symbol in the global dictionary shared with the server.
+     * The sender is also registered as the buffer's {@link Owner}.
      */
     public QwpTableBuffer(String tableName, QwpWebSocketSender sender) {
+        this(tableName, sender, sender);
+    }
+
+    /**
+     * Use this constructor overload for owners that derive state from the
+     * buffer but do not use the global symbol dictionary (symbol columns fall
+     * back to the per-buffer dictionary).
+     */
+    public QwpTableBuffer(String tableName, Owner owner) {
+        this(tableName, null, owner);
+    }
+
+    private QwpTableBuffer(String tableName, QwpWebSocketSender sender, Owner owner) {
         this.tableName = tableName;
         this.sender = sender;
+        this.owner = owner;
         this.columns = new ObjList<>();
         this.columnNameToIndex = new LowerCaseCharSequenceIntHashMap();
         this.rowCount = 0;
@@ -118,8 +135,15 @@ public class QwpTableBuffer implements QuietCloseable {
     /**
      * Clears the buffer completely, including column definitions.
      * Frees all off-heap memory.
+     * <p>
+     * The registered {@link Owner} is notified before any column state is
+     * released, so it can drop cached {@link ColumnBuffer} references and
+     * repair bookkeeping derived from the buffer's pre-clear contents.
      */
     public void clear() {
+        if (owner != null) {
+            owner.onTableBufferClear(this);
+        }
         for (int i = 0, n = columns.size(); i < n; i++) {
             columns.get(i).close();
         }
@@ -132,11 +156,24 @@ public class QwpTableBuffer implements QuietCloseable {
         rowCount = 0;
         columnDefsCacheValid = false;
         cachedColumnDefs = null;
+        baselineBytes = 0;
     }
 
     @Override
     public void close() {
         clear();
+    }
+
+    /**
+     * Bytes of storage the columns retained through the last {@link #reset()}
+     * (var-width columns re-seed a 4-byte initial offset entry, for example).
+     * These bytes are part of {@link #getBufferedBytes()} but predate any row
+     * committed since the reset, so an owner accounting for committed-row
+     * bytes must exclude them: contribution = committed bytes - baseline.
+     * Zero for a freshly created or {@link #clear()}ed buffer.
+     */
+    public long getBaselineBytes() {
+        return baselineBytes;
     }
 
     /**
@@ -342,6 +379,7 @@ public class QwpTableBuffer implements QuietCloseable {
         committedColumnCount = columns.size();
         inProgressColumnCount = 0;
         rowCount = 0;
+        baselineBytes = getBufferedBytes();
     }
 
     public void retainInProgressRow(
@@ -517,6 +555,18 @@ public class QwpTableBuffer implements QuietCloseable {
             default:
                 return 0;
         }
+    }
+
+    /**
+     * A sender that owns this buffer and derives state from it: cached
+     * {@link ColumnBuffer} references, pending-byte/row accounting, datagram
+     * size estimates. {@link #clear()} closes every column buffer at once,
+     * which invalidates all of that derived state, so it notifies the owner
+     * <em>before</em> releasing anything -- the callback may still read the
+     * buffer's pre-clear row count and byte sizes.
+     */
+    public interface Owner {
+        void onTableBufferClear(QwpTableBuffer buffer);
     }
 
     /**

@@ -270,6 +270,45 @@ public class QwpUdpSenderTest {
     }
 
     @Test
+    public void testAtMicrosRecoversAfterTableBufferClear() throws Exception {
+        assertUdpSenderRecoversAfterTableBufferClear(ChronoUnit.MICROS);
+    }
+
+    @Test
+    public void testAtNanosRecoversAfterTableBufferClear() throws Exception {
+        assertUdpSenderRecoversAfterTableBufferClear(ChronoUnit.NANOS);
+    }
+
+    @Test
+    public void testTableBufferClearInvalidatesHeadroomBaseEstimate() throws Exception {
+        assertMemoryLeak(() -> {
+            // Same column count before and after clear(), but a far longer
+            // column name: a stale base estimate cached for the old schema
+            // (keyed by column count alone) would under-estimate the new one.
+            String longName = repeat('n', 120);
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .atNow();
+                sender.currentTableBufferForTest().clear();
+
+                sender.table("t")
+                        .longColumn(longName, 2)
+                        .atNow();
+                long estimate = sender.committedDatagramEstimateForTest();
+                sender.flush();
+
+                int actual = nf.lengths.get(nf.lengths.size() - 1);
+                Assert.assertTrue(
+                        "estimate must cover the rebuilt schema [estimate=" + estimate + ", actual=" + actual + "]",
+                        estimate >= actual
+                );
+            }
+        });
+    }
+
+    @Test
     public void testAtNanosOversizeFailureRollsBackWithoutLeakingTimestampState() throws Exception {
         assertMemoryLeak(() -> {
             String large = repeat('x', 5000);
@@ -1953,6 +1992,32 @@ public class QwpUdpSenderTest {
                 );
             }
         }
+    }
+
+    private static void assertUdpSenderRecoversAfterTableBufferClear(ChronoUnit unit) throws Exception {
+        assertMemoryLeak(() -> {
+            CapturingNetworkFacade nf = new CapturingNetworkFacade();
+            try (QwpUdpSender sender = new QwpUdpSender(nf, 0, 0, 9000, 1, 1024 * 1024)) {
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .at(1_000_000L, unit);
+                Assert.assertTrue(sender.committedDatagramEstimateForTest() > 0);
+
+                // Raw clear() discards the buffered row; the sender must drop
+                // its cached designated-timestamp column and datagram estimate.
+                sender.currentTableBufferForTest().clear();
+                Assert.assertEquals(0, sender.committedDatagramEstimateForTest());
+
+                sender.table("t")
+                        .longColumn("a", 2)
+                        .at(2_000_000L, unit);
+                sender.flush();
+            }
+
+            assertRowsEqual(Collections.singletonList(
+                    decodedRow("t", "a", 2L, "", 2_000_000L)
+            ), decodeRows(nf.packets));
+        });
     }
 
     private static void assertNullableArrayNullState(QwpTableBuffer.ColumnBuffer column) {

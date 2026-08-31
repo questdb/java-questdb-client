@@ -67,7 +67,7 @@ import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.*;
  * state until commit, so committed table data can be flushed without replaying
  * the row back into column storage.
  */
-public class QwpUdpSender implements Sender {
+public class QwpUdpSender implements Sender, QwpTableBuffer.Owner {
     private static final int ADAPTIVE_HEADROOM_EWMA_SHIFT = 2;
     private static final Logger LOG = LoggerFactory.getLogger(QwpUdpSender.class);
     private static final int MAX_TABLE_NAME_LENGTH = 127;
@@ -193,6 +193,27 @@ public class QwpUdpSender implements Sender {
     public void cancelRow() {
         checkNotClosed();
         rollbackCurrentRowToCommittedState();
+    }
+
+    /**
+     * {@link QwpTableBuffer.Owner} callback: the buffer is about to close all
+     * of its column buffers, so drop cached column references, in-progress
+     * column states, and the committed datagram estimate derived from it.
+     * The table's adaptive headroom state must go too: its base-estimate
+     * cache and EWMA samples are keyed by column count alone, which is only
+     * sound while columns are add-only — clear() can replace the schema with
+     * a different one of the same size.
+     */
+    @Override
+    public void onTableBufferClear(QwpTableBuffer buffer) {
+        if (buffer == currentTableBuffer) {
+            clearTransientRowState();
+            resetCommittedDatagramEstimate();
+        }
+        TableHeadroomState headroomState = tableHeadroomStates.get(buffer.getTableName());
+        if (headroomState != null) {
+            headroomState.reset();
+        }
     }
 
     @Override
@@ -580,7 +601,7 @@ public class QwpUdpSender implements Sender {
             currentTableName = currentTableBuffer.getTableName();
         } else {
             currentTableName = tableName.toString();
-            currentTableBuffer = new QwpTableBuffer(currentTableName);
+            currentTableBuffer = new QwpTableBuffer(currentTableName, this);
             tableBuffers.put(currentTableName, currentTableBuffer);
         }
         currentTableHeadroomState = tableHeadroomStates.get(currentTableName);
@@ -1488,6 +1509,15 @@ public class QwpUdpSender implements Sender {
                 return 0;
             }
             return Math.max(lastRowDatagramGrowth, ewmaRowDatagramGrowth);
+        }
+
+        void reset() {
+            cachedBaseEstimate = -1;
+            cachedBaseEstimateColumnCount = -1;
+            committedSampleCount = 0;
+            ewmaRowDatagramGrowth = 0;
+            lastRowDatagramGrowth = 0;
+            schemaColumnCount = -1;
         }
 
         void recordCommittedRow(int currentSchemaColumnCount, long rowDatagramGrowth) {

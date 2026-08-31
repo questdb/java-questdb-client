@@ -168,6 +168,212 @@ public class QwpWebSocketSenderTest {
     }
 
     @Test
+    public void testAtMicrosRecoversAfterTableBufferClear() throws Exception {
+        assertTimestampCacheInvalidatedAfterTableBufferClear(ChronoUnit.MICROS);
+    }
+
+    @Test
+    public void testAtNanosRecoversAfterTableBufferClear() throws Exception {
+        assertTimestampCacheInvalidatedAfterTableBufferClear(ChronoUnit.NANOS);
+    }
+
+    @Test
+    public void testClearOfUnrelatedBufferIsLocalToThatBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+
+                // Give both tables var-width schemas that survive reset()
+                // with unaccounted seed offset bytes.
+                sender.table("a").stringColumn("s", "x").at(1, ChronoUnit.MICROS);
+                sender.table("b").stringColumn("s", "y").at(2, ChronoUnit.MICROS);
+                QwpTableBuffer a = sender.getTableBuffer("a");
+                QwpTableBuffer b = sender.getTableBuffer("b");
+                sender.reset();
+
+                sender.table("a").stringColumn("s", "z").at(3, ChronoUnit.MICROS);
+                long pendingBytesBefore = sender.getPendingBytes();
+
+                // Clearing rowless "b" must not disturb "a"'s accounting.
+                b.clear();
+                Assert.assertEquals(pendingBytesBefore, sender.getPendingBytes());
+                Assert.assertEquals(1, sender.getPendingRowCount());
+
+                // Clearing "a" must remove exactly its accounted share.
+                a.clear();
+                Assert.assertEquals(0, sender.getPendingBytes());
+                Assert.assertEquals(0, sender.getPendingRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testClearOfEmptyVarWidthTableKeepsPendingBytesIntact() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+
+                sender.table("a")
+                        .stringColumn("s", "x")
+                        .at(1, ChronoUnit.MICROS);
+                QwpTableBuffer a = sender.getTableBuffer("a");
+
+                // reset() keeps "a"'s var-width column, which retains seed
+                // offset bytes that are not part of the pending accounting
+                sender.reset();
+                Assert.assertTrue(a.getBufferedBytes() > 0);
+
+                sender.table("b")
+                        .longColumn("v", 1)
+                        .at(2, ChronoUnit.MICROS);
+                long pendingBytesBefore = sender.getPendingBytes();
+
+                a.clear(); // contributed nothing since reset()
+
+                Assert.assertEquals(pendingBytesBefore, sender.getPendingBytes());
+                Assert.assertEquals(1, sender.getPendingRowCount());
+            }
+        });
+    }
+
+    @Test
+    public void testClearOfCurrentTableBufferDiscardsUnfinishedRow() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+                QwpTableBuffer buffer = sender.getTableBuffer("t");
+
+                sender.table("t")
+                        .stringColumn("s", "committed")
+                        .at(1, ChronoUnit.MICROS);
+                sender.table("t").stringColumn("s", "unfinished");
+                buffer.clear();
+
+                Assert.assertEquals(0, buffer.getRowCount());
+                Assert.assertEquals(0, sender.getPendingRowCount());
+                Assert.assertEquals(0, sender.getPendingBytes());
+
+                sender.table("t")
+                        .stringColumn("s", "after")
+                        .at(2, ChronoUnit.MICROS);
+
+                Assert.assertEquals(1, buffer.getRowCount());
+                Assert.assertEquals(1, sender.getPendingRowCount());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+            }
+        });
+    }
+
+    @Test
+    public void testClearOfNonCurrentTableBufferRepairsPendingAccounting() throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+
+                sender.table("t1")
+                        .longColumn("a", 1)
+                        .at(1, ChronoUnit.MICROS);
+                QwpTableBuffer t1 = sender.getTableBuffer("t1");
+
+                sender.table("t2")
+                        .longColumn("b", 2)
+                        .at(2, ChronoUnit.MICROS);
+
+                t1.clear(); // t2 is the current table
+
+                Assert.assertEquals(0, t1.getRowCount());
+                Assert.assertEquals(1, sender.getPendingRowCount());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+
+                // the cleared table stays usable
+                sender.table("t1")
+                        .longColumn("a", 3)
+                        .at(3, ChronoUnit.MICROS);
+
+                Assert.assertEquals(1, t1.getRowCount());
+                Assert.assertEquals(2, sender.getPendingRowCount());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+            }
+        });
+    }
+
+    @Test
+    public void testFlushReanchorsPendingBytesAtVarWidthBaseline() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = new TestWebSocketServer(
+                    new TestWebSocketServer.WebSocketServerHandler() {
+                    })) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+
+                CursorSendEngine engine = new CursorSendEngine(null, 4L * 1024 * 1024);
+                try (QwpWebSocketSender sender = QwpWebSocketSender.connect(
+                        "localhost",
+                        server.getPort(),
+                        null,
+                        Integer.MAX_VALUE,
+                        0,
+                        0L,
+                        null,
+                        false,
+                        engine,
+                        0L)) {
+                    sender.table("t")
+                            .stringColumn("s", "before")
+                            .at(1, ChronoUnit.MICROS);
+                    sender.flush();
+
+                    QwpTableBuffer buffer = sender.getTableBuffer("t");
+                    long baselineBytes = buffer.getBaselineBytes();
+                    Assert.assertTrue(
+                            "flush must retain var-width seed storage",
+                            baselineBytes > 0);
+                    Assert.assertEquals(baselineBytes, sender.totalBufferedBytes());
+                    Assert.assertEquals(0, sender.getPendingBytes());
+
+                    sender.table("t")
+                            .stringColumn("s", "after")
+                            .at(2, ChronoUnit.MICROS);
+
+                    Assert.assertEquals(
+                            sender.totalBufferedBytes() - baselineBytes,
+                            sender.getPendingBytes());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAtMicrosRecoversAfterOversizeRowRollback() throws Exception {
+        assertTimestampCacheInvalidatedAfterOversizeRowRollback(ChronoUnit.MICROS);
+    }
+
+    @Test
+    public void testAtNanosRecoversAfterOversizeRowRollback() throws Exception {
+        assertTimestampCacheInvalidatedAfterOversizeRowRollback(ChronoUnit.NANOS);
+    }
+
+    @Test
     public void testBinaryColumnAfterCloseThrows() throws Exception {
         assertMemoryLeak(() -> {
             QwpWebSocketSender sender = createUnconnectedSender();
@@ -831,6 +1037,68 @@ public class QwpWebSocketSenderTest {
                     "expected message to mention 'closed', got: " + e.getMessage(),
                     e.getMessage() != null && e.getMessage().contains("closed"));
         }
+    }
+
+    private static void assertTimestampCacheInvalidatedAfterTableBufferClear(ChronoUnit unit) throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+
+                sender.table("t")
+                        .longColumn("a", 1)
+                        .stringColumn("s", "before")
+                        .at(1, unit);
+
+                sender.getTableBuffer("t").clear();
+
+                sender.table("t")
+                        .longColumn("a", 2)
+                        .stringColumn("s", "after")
+                        .at(2, unit);
+
+                QwpTableBuffer tableBuffer = sender.getTableBuffer("t");
+                Assert.assertEquals(1, tableBuffer.getRowCount());
+                Assert.assertEquals(1, sender.getPendingRowCount());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+            }
+        });
+    }
+
+    private static void assertTimestampCacheInvalidatedAfterOversizeRowRollback(ChronoUnit unit) throws Exception {
+        assertMemoryLeak(() -> {
+            try (QwpWebSocketSender sender = QwpWebSocketSender.createForTesting(
+                    "localhost",
+                    9000,
+                    Integer.MAX_VALUE,
+                    0,
+                    0L)) {
+                sender.setConnectedForTest(true);
+                sender.applyServerBatchSizeLimit(17);
+
+                try {
+                    sender.table("t")
+                            .longColumn("a", 1)
+                            .longColumn("b", 2)
+                            .at(1, unit);
+                    Assert.fail("Expected oversized row rejection");
+                } catch (LineSenderException e) {
+                    Assert.assertTrue(e.getMessage().contains("row too large"));
+                }
+
+                sender.table("t")
+                        .longColumn("a", 3)
+                        .at(2, unit);
+
+                QwpTableBuffer tableBuffer = sender.getTableBuffer("t");
+                Assert.assertEquals(1, tableBuffer.getRowCount());
+                Assert.assertEquals(sender.totalBufferedBytes(), sender.getPendingBytes());
+            }
+        });
     }
 
     private static MicrobatchBuffer getMicrobatchBuffer(QwpWebSocketSender sender, String fieldName) throws Exception {
