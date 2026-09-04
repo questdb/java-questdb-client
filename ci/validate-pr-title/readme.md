@@ -12,6 +12,16 @@ Run by [.github/workflows/pr_title.yml](../../.github/workflows/pr_title.yml) on
 pull requests and on merge groups. It authenticates with the workflow's own
 `GITHUB_TOKEN`, so it needs no bot account and no personal access token.
 
+The tests live in a second workflow,
+[pr_title_rules.yml](../../.github/workflows/pr_title_rules.yml), rather than
+alongside the job that posts the status. Run as a step of that job, a failing or
+flaky test stops check.js from running at all, no status is posted, and the pull
+request sits behind a check that is merely missing. A path filter runs them only
+when this folder or either workflow changes, which also keeps a second
+near-identical row off every unrelated pull request: the workflow name and the
+status context are both "PR title", so every job here costs a row that reads like
+the verdict.
+
 ## Replacing Danger
 
 This used to run [Danger JS](https://danger.systems/js/), which read the title and
