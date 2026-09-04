@@ -39,16 +39,21 @@ perf(sql): improve pattern matching performance for SELECT sub-queries
 \`\`\`
 `.trim();
 
-/* The basic valid PR title formats are:
- * 1. allowedType(allowedSubtype): optional description
- * 2. allowedType: optional description
+/* The valid PR title formats are:
+ * 1. allowedType(allowedSubType): description
+ * 2. build: description
  *
+ * Note that format 2 is available to `build` alone. Every other type has to name
+ * a subType, so `feat: thing` is rejected while `build: 6.6` is accepted.
+ *
+ * A `!` before the colon is the Conventional Commits marker for a breaking
+ * change, as in `feat(qwp)!: ...`, and is accepted on either format.
  * consult ./validate.test.js for a full list
  * */
 const prTitleRegex = new RegExp(
   `^(((?:${allowedTypes.join("|")})\\((?:${allowedSubTypes.join(
     "|",
-  )})\\))|build): .*`,
+  )})\\))|build)!?: .*`,
 );
 
 function validate({ title, onError }) {
