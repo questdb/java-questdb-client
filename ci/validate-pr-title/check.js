@@ -15,11 +15,11 @@ const MARKER = "<!-- pr-title-check -->";
 
 // The commit status context. Danger posted "Danger" here, but nothing required
 // that string: the branch protection on main requires only the four Azure
-// contexts, so the rename costs nothing and no open pull request is left waiting
-// on a check that stopped reporting. The OSS copy is stuck with "Danger" because
-// its master ruleset does name that exact string. Making this a required check is
-// a branch-protection edit, and until then a rejection is visible but not
-// blocking, which is what Danger already was here.
+// contexts, so the rename cost nothing and left no open pull request waiting on a
+// check that stopped reporting. The OSS copy posts the same string, but there it
+// is named by the master ruleset, so renaming it takes a matching ruleset edit.
+// Making this a required check is a branch-protection edit, and until then a
+// rejection is visible but not blocking, which is what Danger already was here.
 const CONTEXT = "PR title";
 
 const apiUrl = process.env.GITHUB_API_URL || "https://api.github.com";

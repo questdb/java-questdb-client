@@ -22,12 +22,16 @@ same work on the workflow's own token, and `dangerfile.js` and the `yarn global 
 danger` step are gone. Once this has settled, `DANGER_GITHUB_TOKEN` can be deleted
 from the repository secrets.
 
-The status context is `PR title` rather than the `Danger` that Danger posted. That
-rename is safe here because the branch protection on `main` requires only the four
-`questdb.java-questdb-client` Azure contexts, so nothing waits on `Danger`. The
-copy in questdb/questdb cannot do the same: its `master` ruleset names `Danger`
-exactly, and renaming it there without editing the ruleset in the same change
-blocks every pull request.
+The status context is `PR title` rather than the `Danger` that Danger posted. The
+rename was free here: the branch protection on `main` requires only the four
+`questdb.java-questdb-client` Azure contexts, so nothing ever waited on `Danger`,
+and every open pull request that carried one carried a green one. questdb/questdb
+moved to the same name, but had to pay for it — its `master` ruleset names the
+context, so the rename had to be paired with a ruleset edit, and the gap between
+the two is a gap in which nothing can merge.
+
+That is the difference to keep in mind before renaming this one again: here the
+string is free, there it is a contract with the ruleset.
 
 The subType list is deliberately shorter than the server repositories': this is a
 client, so `sql`, `wal`, `repl` and the rest are rejected on purpose.
