@@ -1905,6 +1905,10 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * once it reaches {@link #symbolDictResetThreshold(int)} distinct symbols,
          * so a long-lived sender's dictionary does not grow without bound.
          * <p>
+         * The recycle itself runs at a {@code table()} call that finds the backlog
+         * already acknowledged, so under sustained load it may be deferred
+         * indefinitely (see {@link Sender#resetSymbolDictionary()}).
+         * <p>
          * Switching it off also disables the manual valve:
          * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
          * because arming gates on this knob.

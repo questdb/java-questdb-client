@@ -140,7 +140,9 @@ public class QwpWebSocketSender implements Sender {
     public static final int DEFAULT_BACKGROUND_CONNECT_TIMEOUT_MS = 15_000;
     // Default for symbol_dict_reset -- periodic symbol-dictionary recycling is
     // on by default so a long-lived sender's dictionary does not grow without
-    // bound.
+    // bound. The recycle runs at a table() call that finds the backlog
+    // acknowledged, so under sustained load it may be deferred indefinitely
+    // (see Sender#resetSymbolDictionary()).
     public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
     // Default for symbol_dict_reset_max_wait_millis: 0 -- opportunistic-only.
     // The recycle runs only when a table() call finds the backlog already
@@ -453,13 +455,15 @@ public class QwpWebSocketSender implements Sender {
     // registered, bounding unbounded dictionary growth on a long-lived sender
     // (connect-string key symbol_dict_reset).
     private boolean resetEnabled = DEFAULT_SYMBOL_DICT_RESET_ENABLED;
-    // Once a recycle has been armed longer than this window without an
-    // opportunistic (idle) drain, the next row-start call (table()) blocks
-    // the calling thread for up to this many millis waiting for the backlog
-    // to drain, then recycles; on timeout that call gives up (still armed,
-    // retried opportunistically later) instead of blocking further. 0
-    // disables blocking entirely -- opportunistic-only (connect-string key
-    // symbol_dict_reset_max_wait_millis).
+    // Default 0: opportunistic-only, never blocks the calling thread -- the
+    // recycle then only ever runs once a row-start call (table()) finds the
+    // backlog already drained. A positive value is an explicit opt-in bounded
+    // wait: once a recycle has been armed longer than this window without an
+    // opportunistic (idle) drain, the next table() call blocks the calling
+    // thread for up to this many millis waiting for the backlog to drain,
+    // then recycles; on timeout that call gives up (still armed, retried
+    // opportunistically later) instead of blocking further (connect-string
+    // key symbol_dict_reset_max_wait_millis).
     private long resetMaxWaitMillis = DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
     // Distinct-symbol count that triggers a recycle once resetEnabled is on
     // (connect-string key symbol_dict_reset_threshold).
@@ -487,8 +491,9 @@ public class QwpWebSocketSender implements Sender {
     // by the recycle trigger; set only from armIfEligible's two safe call
     // points (the tail of resetTableBuffersAfterFlush, and
     // resetSymbolDictionary() when no flush is in flight), never on the
-    // per-symbol registration path.
-    private boolean resetArmed;
+    // per-symbol registration path. volatile: isResetArmed() is a documented
+    // monitoring surface; a monitoring thread is its obvious reader.
+    private volatile boolean resetArmed;
     // Cleared on the false -> true armed transition; maybeBlockForStarvedReset's
     // opportunistic-wait step sets it once it has waited out its window for
     // THIS arm cycle, so a subsequent forced-wait check does not re-wait.
@@ -2570,6 +2575,12 @@ public class QwpWebSocketSender implements Sender {
      * {@link #maybeBlockForStarvedReset()}: same thread-safety caveat as
      * {@link #getSymbolDictEpoch()} -- a concurrent read sees the latest
      * completed write, with no atomicity across the two counters.
+     * <p>
+     * This counts only the opt-in bounded wait: at the default
+     * {@code symbol_dict_reset_max_wait_millis=0} the wait never runs, so this
+     * counter is structurally 0 regardless of how long a recycle stays armed.
+     * 0 does NOT mean "no starvation" -- sample {@link #isResetArmed()}
+     * alongside {@link #getSymbolDictEpoch()} instead.
      */
     public long getSymbolDictResetStarvationTimeouts() {
         return symbolDictResetStarvationTimeouts;
@@ -5219,11 +5230,14 @@ public class QwpWebSocketSender implements Sender {
      * mid-row or mid-encode would observe a dictionary size that has not yet
      * settled for this batch.
      * <p>
-     * Arming is only ever consumed from {@code table(CharSequence)}'s
+     * Arming is only ever triggered from {@code table(CharSequence)}'s
      * row-start hook: a producer that stops calling {@code table()}, or whose
      * {@code table()} calls never observe a drained ring, stays armed
-     * indefinitely -- by design; see {@code Sender#resetSymbolDictionary()}'s
-     * documented trigger contract.
+     * indefinitely -- by design; see {@link Sender#resetSymbolDictionary()}'s
+     * documented trigger contract. A pending resume ({@link #resumeRecycleIfPending()})
+     * may still complete an already-triggered recycle from a later
+     * {@code flush()}-driven {@code ensureConnected()} call, with no fresh
+     * {@code table()} call involved.
      */
     private void armIfEligible() {
         boolean shouldArm = resetEnabled
@@ -5790,10 +5804,15 @@ public class QwpWebSocketSender implements Sender {
             // degrade to the plain baseline drop, never leave this arm
             // reachable with a null loop.
             recycleResume = RecycleResume.NONE;
-            if (deltaDictEnabled && serverMaxBatchSize > 0 && sentMaxSymbolId >= 0) {
+            // Snapshot the volatile cap ONCE, as flushPendingRows and sendRow do:
+            // serverMaxBatchSize can drop mid-stream via applyServerBatchSizeLimit,
+            // and re-reading it between the guard and the publish call could size
+            // the chunks against a cap that changed underneath them.
+            int cap = serverMaxBatchSize;
+            if (deltaDictEnabled && cap > 0 && sentMaxSymbolId >= 0) {
                 Runnable commitFault = resumeCommitFaultForTesting;
                 try {
-                    publishDictionaryChunks(serverMaxBatchSize, 0, sentMaxSymbolId);
+                    publishDictionaryChunks(cap, 0, sentMaxSymbolId);
                     if (commitFault != null) {
                         commitFault.run();
                     }
@@ -5812,6 +5831,12 @@ public class QwpWebSocketSender implements Sender {
                     // ahead of the ring's partial coverage, and the next flush
                     // would trip the server's gap check. The Error itself is
                     // never swallowed.
+                    // The drop is safe even though [0..sentMaxSymbolId] is now
+                    // ringed: in SF mode pd.size() >= sentMaxSymbolId+1 keeps
+                    // reclaimUnsentSymbolIds's floor above every ringed id; in
+                    // memory mode there is no crash-replay contract, and any
+                    // post-reset redefinition is FIFO-ordered after these
+                    // rowless chunk frames -- either way nothing is invalidated.
                     if (hasDeferredMessages) {
                         commitOrphanedDictionaryChunks(e);
                     }
@@ -5827,6 +5852,12 @@ public class QwpWebSocketSender implements Sender {
                     // fires only when a chunk publish throws), so close the
                     // deferred group's commit debt here -- an open group would
                     // clamp ackedFsn for the connection's whole life.
+                    // The drop is safe even though [0..sentMaxSymbolId] is now
+                    // ringed: in SF mode pd.size() >= sentMaxSymbolId+1 keeps
+                    // reclaimUnsentSymbolIds's floor above every ringed id; in
+                    // memory mode there is no crash-replay contract, and any
+                    // post-reset redefinition is FIFO-ordered after these
+                    // rowless chunk frames -- either way nothing is invalidated.
                     if (hasDeferredMessages) {
                         commitOrphanedDictionaryChunks(t);
                     }
@@ -6167,9 +6198,11 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * All-or-nothing in both directions. Every entry is validated against the cap
      * BEFORE any chunk is published, so a symbol too large to ship at all throws with
-     * nothing on the ring; and the sole caller only reaches here once it has proven
-     * the batch's bodies fit an empty delta, so a batch that will be rejected never
-     * publishes a chunk either.
+     * nothing on the ring; and neither caller publishes a chunk for a batch that will
+     * be rejected: the full-dict fallback caller ({@code flushPendingRows}) has
+     * already proven the batch's bodies fit an empty delta before calling here, and
+     * the delta-mode resume caller ({@code resumeRecycleIfPending}) ships no data
+     * frames in the group at all, so there is nothing to prove.
      */
     private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
         // Delta-mode callers (the CLOSE_LOOP resume re-registration) may only
