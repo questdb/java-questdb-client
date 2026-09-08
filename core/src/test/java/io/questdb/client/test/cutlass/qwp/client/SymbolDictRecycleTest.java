@@ -801,6 +801,116 @@ public class SymbolDictRecycleTest {
     }
 
     /**
+     * When the resume's re-registration fails after its chunks are already on
+     * the ring, it must degrade to the shipped behaviour -- drop the baseline,
+     * stay usable -- AND close the chunks' deferred-commit group itself: a
+     * commit failure is not covered by publishDictionaryChunks' internal
+     * orphan handling, and an open group clamps ackedFsn forever. This test
+     * does NOT claim the fallback heals the over-cap population -- there the
+     * next flush is still rejected; it pins that the failure path wedges
+     * nothing and the sender keeps working where it can.
+     */
+    @Test(timeout = 60_000L)
+    public void testResumePublishFailureFallsBackToBaselineDrop() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("resume-fallback").toString();
+            ChunkCaptureHandler handler = new ChunkCaptureHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                // The resume's re-registration only sizes chunks when
+                // serverMaxBatchSize > 0; an unadvertised cap degrades to the
+                // plain baseline drop before the fault seam is even reached.
+                server.setAdvertisedMaxBatchSize(4096);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
+                    Assert.assertTrue(ws.getSentMaxSymbolIdForTesting() >= 0);
+
+                    ws.forceCloseLoopAbandonForTesting();
+                    ws.setResumeCommitFaultForTesting(() -> {
+                        throw new RuntimeException("injected resume-commit fault");
+                    });
+                    try {
+                        // The resume degrades inside this call; it must NOT throw.
+                        sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                    } finally {
+                        ws.setResumeCommitFaultForTesting(null);
+                    }
+                    Assert.assertEquals("fallback must drop the baseline",
+                            -1, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("fallback must close the chunks' deferred group",
+                            ws.hasDeferredMessagesForTesting());
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("next send must work (full re-registration path)",
+                            sender.awaitAckedFsn(fsn, 10_000));
+                }
+            }
+        });
+    }
+
+    /**
+     * The mirror of {@link #testResumePublishFailureFallsBackToBaselineDrop()}
+     * for the resume's Error arm: an Error injected between the chunk publish
+     * and the commit must still close the chunks' deferred-commit group and
+     * drop the baseline (the Error arm rethrows instead of swallowing, but it
+     * closes the same debt the Throwable arm does), and the Error itself must
+     * propagate out of {@code table()} rather than being absorbed.
+     */
+    @Test(timeout = 60_000L)
+    public void testResumeCommitErrorStillClosesDebt() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("resume-commit-error").toString();
+            ChunkCaptureHandler handler = new ChunkCaptureHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.setAdvertisedMaxBatchSize(4096);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
+                    Assert.assertTrue(ws.getSentMaxSymbolIdForTesting() >= 0);
+
+                    ws.forceCloseLoopAbandonForTesting();
+                    ws.setResumeCommitFaultForTesting(() -> {
+                        throw new AssertionError("injected resume-commit error");
+                    });
+                    try {
+                        try {
+                            // The resume's Error arm rethrows: this call must propagate
+                            // the injected Error, not swallow it.
+                            sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                            Assert.fail("the Error must propagate");
+                        } catch (AssertionError expected) {
+                            Assert.assertTrue("propagated Error must be the injected one [msg="
+                                            + expected.getMessage() + ']',
+                                    expected.getMessage() != null
+                                            && expected.getMessage().contains("injected resume-commit error"));
+                        }
+                    } finally {
+                        ws.setResumeCommitFaultForTesting(null);
+                    }
+                    Assert.assertEquals("the Error arm must drop the baseline too",
+                            -1, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("the Error arm must close the chunks' deferred group too",
+                            ws.hasDeferredMessagesForTesting());
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("next send must work (full re-registration path)",
+                            sender.awaitAckedFsn(fsn, 10_000));
+                }
+            }
+        });
+    }
+
+    /**
      * A live symbol set larger than the threshold must not thrash the
      * recycle: after a swap, re-arming requires the dictionary to reach
      * max(threshold, 2 * size-at-swap).
