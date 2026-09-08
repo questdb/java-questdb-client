@@ -7,6 +7,7 @@ package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
 import java.util.ArrayDeque;
 
@@ -29,6 +30,18 @@ public final class SchemaRejectionState {
         if (tail != null && tail.active) {
             throw new IllegalStateException("previous lease is still active");
         }
+        if (tail != null) {
+            // The returned handle can no longer observe an owned exception. Keep
+            // only the range needed to classify a delayed rejection, and combine
+            // completed borrows instead of retaining one object per borrow until ACK.
+            if (failedGeneration == tail.generation) {
+                failedGeneration = -1L;
+            }
+            tail.generation = -1L;
+            tail.failure = null;
+            tail.rawError = null;
+            mergeReturnedTail();
+        }
         leases.addLast(new Lease(generation, firstFsn, transactional));
     }
 
@@ -49,6 +62,9 @@ public final class SchemaRejectionState {
             leases.removeLast();
             return null;
         }
+        int flags = lease.transactional && engine != null ? engine.liveQwpFrameFlags(publishedFsn) : -1;
+        lease.endsWithCommit = !lease.transactional
+                || (flags >= 0 && (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0);
         sealIfNeeded(lease, publishedFsn);
         if (failedGeneration == generation) {
             failedGeneration = -1L;
@@ -93,7 +109,7 @@ public final class SchemaRejectionState {
             owner = new Lease(-1L, spanStart, recovered);
             owner.active = false;
             owner.endFsn = recovered ? recoveredTip : rejectedFsn;
-        } else if (owner.rawError == null) {
+        } else if (owner.generation >= 0 && owner.rawError == null) {
             owner.rawError = rawError;
             failedGeneration = owner.generation;
         }
@@ -127,7 +143,6 @@ public final class SchemaRejectionState {
             throw new IllegalStateException("retirement range changed");
         }
         acknowledgedThrough(lastFsn);
-        pending.owner.retired = true;
         pending = null;
         stopFsn = -1L;
         prune(lastFsn);
@@ -160,7 +175,7 @@ public final class SchemaRejectionState {
             if (flags < 0) {
                 throw new IllegalStateException("missing frame while resolving transaction at FSN " + fsn);
             }
-            if ((flags & io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT) == 0) {
+            if ((flags & QwpConstants.FLAG_DEFER_COMMIT) == 0) {
                 return fsn;
             }
         }
@@ -198,10 +213,26 @@ public final class SchemaRejectionState {
         return null;
     }
 
+    private void mergeReturnedTail() {
+        Lease tail = leases.removeLast();
+        Lease previous = leases.peekLast();
+        if (previous != null && previous.transactional == tail.transactional
+                && previous.endFsn + 1 == tail.firstFsn && previous.endsWithCommit
+                && (pending == null || pending.owner != previous)) {
+            // Normal pool return publishes a commit before ending the lease.
+            // Its frame flags preserve each transaction's boundary in a merged
+            // range. An unfinished failed transaction must keep its own end,
+            // and an in-flight retirement must retain its owner object.
+            tail.firstFsn = previous.firstFsn;
+            leases.removeLast();
+        }
+        leases.addLast(tail);
+    }
+
     private void prune(long fsn) {
         while (true) {
             Lease head = leases.peekFirst();
-            if (head == null || head.active || (head.rawError != null && !head.retired) || head.endFsn > fsn) {
+            if (head == null || head.active || (pending != null && pending.owner == head) || head.endFsn > fsn) {
                 return;
             }
             leases.removeFirst();
@@ -236,14 +267,14 @@ public final class SchemaRejectionState {
     }
 
     private static final class Lease {
-        private final long firstFsn;
-        private final long generation;
+        private long firstFsn;
+        private long generation;
         private final boolean transactional;
         private boolean active = true;
         private long endFsn = -1L;
+        private boolean endsWithCommit;
         private LineSenderServerException failure;
         private SenderError rawError;
-        private boolean retired;
 
         private Lease(long generation, long firstFsn, boolean transactional) {
             this.generation = generation;

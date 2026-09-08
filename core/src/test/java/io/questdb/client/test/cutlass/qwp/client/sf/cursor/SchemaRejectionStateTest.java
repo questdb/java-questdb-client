@@ -16,11 +16,138 @@ import org.junit.Test;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
 
+import java.lang.reflect.Field;
+import java.util.Collection;
+
 import static org.junit.Assert.*;
 
 public class SchemaRejectionStateTest {
     @Rule
     public final TemporaryFolder temp = new TemporaryFolder();
+
+    @Test
+    public void testUnackedOrdinaryBorrowsRetainBoundedHistory() throws Exception {
+        SchemaRejectionState state = new SchemaRejectionState();
+        for (int i = 0; i < 20_000; i++) {
+            state.beginLease(i, i, false);
+            state.endLease(i, i);
+        }
+        assertEquals(2, retainedRanges(state));
+        state.beginLease(20_000, 20_000, false);
+        assertTrue(state.reject(10_000, 10_000, error(10_000)));
+        assertEquals(10_000, state.sealedRange().lastFsn);
+        assertFalse(state.hasOwnedFailure(20_000));
+        assertNull(state.ownedFailure(20_000, 20_000));
+    }
+
+    @Test
+    public void testUnackedTransactionalBorrowsPreserveCommitBoundaries() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+            SchemaRejectionState state = new SchemaRejectionState();
+            state.setEngine(engine);
+            for (int i = 0; i < 20_000; i++) {
+                state.beginLease(i, 2L * i, true);
+                append(engine, true);
+                append(engine, false);
+                state.endLease(i, 2L * i + 1);
+            }
+            assertEquals(2, retainedRanges(state));
+            state.beginLease(20_000, 40_000, true);
+            assertTrue(state.reject(20_000, 20_000, error(20_000)));
+            assertEquals(20_001, state.sealedRange().lastFsn);
+            assertFalse(state.hasOwnedFailure(20_000));
+            state.completeRetirement(20_001);
+            assertTrue(state.reject(20_002, 20_002, error(20_002)));
+            assertEquals(20_003, state.sealedRange().lastFsn);
+            assertFalse(state.hasOwnedFailure(20_000));
+        }
+    }
+
+    @Test
+    public void testUnfinishedReturnedTransactionCannotConsumeLaterBorrow() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+            SchemaRejectionState state = new SchemaRejectionState();
+            state.setEngine(engine);
+            state.beginLease(1, 0, true);
+            append(engine, true);
+            append(engine, true);
+            state.endLease(1, 1);
+            state.beginLease(2, 2, true);
+            append(engine, false);
+            state.endLease(2, 2);
+            state.beginLease(3, 3, true);
+            assertTrue(state.reject(0, 0, error(0)));
+            assertEquals(1, state.sealedRange().lastFsn);
+            assertFalse(state.hasOwnedFailure(3));
+        }
+    }
+
+    @Test
+    public void testPendingRetirementSurvivesBorrowHistoryCompaction() throws Exception {
+        SchemaRejectionState state = new SchemaRejectionState();
+        state.beginLease(1, 0, false);
+        state.endLease(1, 0);
+        assertTrue(state.reject(0, 0, error(0)));
+        for (int i = 2; i < 20_000; i++) {
+            state.beginLease(i, i - 1, false);
+            state.endLease(i, i - 1);
+        }
+        assertEquals(3, retainedRanges(state));
+        assertEquals(0, state.sealedRange().lastFsn);
+        state.completeRetirement(0);
+        state.beginLease(20_000, 19_999, false);
+        assertEquals(2, retainedRanges(state));
+        assertTrue(state.reject(1, 1, error(1)));
+        assertEquals(1, state.sealedRange().lastFsn);
+        assertFalse(state.hasOwnedFailure(20_000));
+    }
+
+    @Test
+    public void testCompactionIntoPendingOwnerPreservesItsRangeAndNextBorrowFailure() {
+        SchemaRejectionState state = new SchemaRejectionState();
+        state.beginLease(1, 0, false);
+        state.endLease(1, 0);
+        state.beginLease(2, 1, false);
+        assertTrue(state.reject(1, 1, error(1)));
+        LineSenderServerException failure = state.ownedFailure(2, 1);
+        assertSame(failure, state.endLease(2, 1));
+
+        // The failed returned lease absorbs the older range while its
+        // retirement is still pending. The notification must remain [1, 1].
+        state.beginLease(3, 2, false);
+        assertEquals(1, state.sealedRange().firstFsn);
+        assertEquals(1, state.sealedRange().lastFsn);
+        assertFalse(state.hasOwnedFailure(2));
+        assertFalse(state.hasOwnedFailure(3));
+        state.completeRetirement(1);
+        assertTrue(state.reject(2, 2, error(2)));
+        assertTrue(state.hasOwnedFailure(3));
+        LineSenderServerException nextFailure = state.ownedFailure(3, 2);
+        assertNotSame(failure, nextFailure);
+        assertEquals(2, nextFailure.getServerError().getRejectedFsn());
+    }
+
+    @Test
+    public void testEmptyBorrowsDoNotRetainHistoryBehindUnackedRange() throws Exception {
+        SchemaRejectionState state = new SchemaRejectionState();
+        state.beginLease(0, 0, false);
+        state.endLease(0, 0);
+        for (int i = 1; i < 20_000; i++) {
+            state.beginLease(i, 1, false);
+            state.endLease(i, 0);
+        }
+        assertEquals(1, retainedRanges(state));
+        state.acknowledgedThrough(0);
+        state.beginLease(20_000, 1, false);
+        state.endLease(20_000, 0);
+        assertEquals(0, retainedRanges(state));
+    }
+
+    private static int retainedRanges(SchemaRejectionState state) throws Exception {
+        Field field = SchemaRejectionState.class.getDeclaredField("leases");
+        field.setAccessible(true);
+        return ((Collection<?>) field.get(state)).size();
+    }
 
     @Test
     public void testRecoveredGroupRetiresThroughCloserRegardlessOfNewLeaseMode() throws Exception {

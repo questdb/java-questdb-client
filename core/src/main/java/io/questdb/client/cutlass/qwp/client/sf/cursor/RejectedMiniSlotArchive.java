@@ -253,11 +253,29 @@ public final class RejectedMiniSlotArchive {
                 int type = ff.findType(find);
                 rc = ff.findNext(find);
                 if (type != Files.DT_DIR || name == null || !name.startsWith(prefix)) continue;
+                int separator = name.indexOf('-', prefix.length());
+                if (separator < 0) continue;
+                long archiveFrom;
+                long archiveTo;
+                try {
+                    archiveFrom = Long.parseLong(name.substring(prefix.length(), separator));
+                    archiveTo = Long.parseLong(name.substring(separator + 1));
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+                // Completed archives have canonical range names. Filter before
+                // opening metadata: a damaged, already-drained archive is not
+                // evidence about this recovered tail and must not block startup.
+                if (archiveFrom < 0 || archiveTo < archiveFrom
+                        || !name.equals(prefix + archiveFrom + '-' + archiveTo)
+                        || archiveTo < fromFsn || archiveFrom > toFsn) {
+                    continue;
+                }
                 String path = rejectedRoot + '/' + name;
                 Metadata metadata = readMetadata(ff, path);
                 if (!slotId.equals(metadata.slotId) || !epoch.equals(metadata.epoch)
-                        || metadata.toFsn < fromFsn || metadata.fromFsn > toFsn) {
-                    continue;
+                        || metadata.fromFsn != archiveFrom || metadata.toFsn != archiveTo) {
+                    throw new UnreplayableSlotException("rejected mini-slot directory identity mismatch " + path);
                 }
                 validate(ff, path, metadata);
                 SenderError error = new SenderError(
@@ -335,6 +353,13 @@ public final class RejectedMiniSlotArchive {
                     || watermark == null || watermark.read() != actual.fromFsn - 1L) {
                 throw new UnreplayableSlotException("invalid rejected mini-slot boundaries " + dir);
             }
+        } catch (MmapSegmentCorruptionException e) {
+            // Positively identified archive corruption is a terminal recovery
+            // verdict too. Operational read/mmap failures retain their type.
+            UnreplayableSlotException failure = new UnreplayableSlotException(
+                    "corrupt rejected mini-slot " + dir + ": " + e.getMessage());
+            failure.initCause(e);
+            throw failure;
         }
         if (actual.hasDictionary) {
             try (PersistedSymbolDict ignored = PersistedSymbolDict.open(ff, dir)) {

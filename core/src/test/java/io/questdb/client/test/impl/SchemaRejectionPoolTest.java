@@ -25,7 +25,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
+import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -35,6 +37,69 @@ import java.util.concurrent.atomic.AtomicReference;
 public class SchemaRejectionPoolTest {
     @Rule
     public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
+
+    @Test
+    public void testNoAckBorrowsRetainBoundedSchemaHistory() throws Exception {
+        assertNoAckBorrowHistory(SenderError.Policy.REJECT_AND_CONTINUE, false);
+        assertNoAckBorrowHistory(SenderError.Policy.REJECT_AND_CONTINUE, true);
+    }
+
+    @Test
+    public void testTerminalPolicyDoesNotAllocateSchemaHistory() throws Exception {
+        assertNoAckBorrowHistory(SenderError.Policy.TERMINAL, false);
+        assertNoAckBorrowHistory(SenderError.Policy.TERMINAL, true);
+    }
+
+    private void assertNoAckBorrowHistory(SenderError.Policy policy, boolean transactional) throws Exception {
+        CountDownLatch received = new CountDownLatch(1);
+        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
+            @Override
+            public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                received.countDown(); // Deliberately never ACK.
+            }
+        })) {
+            server.start();
+            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+            // Exercise both memory queues and disk-backed outage buffering.
+            String storage = transactional ? "sf_dir=" + temp.newFolder().getAbsolutePath()
+                    + ";sf_durability=periodic;sf_sync_interval_millis=1000;" : "";
+            try (QuestDB db = QuestDB.builder()
+                    .fromConfig("ws::addr=localhost:" + server.getPort()
+                            + ";close_flush_timeout_millis=0;auto_flush_rows=1;auto_flush_bytes=off;transaction="
+                            + (transactional ? "on" : "off") + ";" + storage)
+                    .senderPoolSize(1).queryPoolMin(0).queryPoolMax(1)
+                    .schemaMismatchPolicy(policy).dlqEnabled(false).build()) {
+                Object delegate = null;
+                for (int i = 0; i < 20_000; i++) {
+                    try (Sender sender = db.borrowSender()) {
+                        Object borrowedDelegate = field(field(sender, "slot"), "delegate");
+                        if (delegate == null) {
+                            delegate = borrowedDelegate;
+                        } else {
+                            Assert.assertSame("all borrows must reuse the same slot", delegate, borrowedDelegate);
+                        }
+                        sender.table("unacked").longColumn("value", i).atNow();
+                    }
+                }
+                Assert.assertTrue(received.await(5, TimeUnit.SECONDS));
+                CursorSendEngine engine = (CursorSendEngine) field(delegate, "cursorEngine");
+                Assert.assertEquals(-1, engine.ackedFsn());
+                Assert.assertTrue("every borrow must publish data", engine.publishedFsn() >= 19_999);
+                Object state = field(delegate, "schemaRejectionState");
+                if (policy == SenderError.Policy.TERMINAL) {
+                    Assert.assertNull(state);
+                } else {
+                    Assert.assertEquals(2, ((Collection<?>) field(state, "leases")).size());
+                }
+            }
+        }
+    }
+
+    private static Object field(Object object, String name) throws Exception {
+        Field field = object.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(object);
+    }
 
     @Test
     public void testRecoveredPreservedOrphanReportsAsynchronouslyBeforeRetirement() throws Exception {
@@ -289,6 +354,11 @@ public class SchemaRejectionPoolTest {
 
     @Test
     public void testRejectionAfterReturnDoesNotFailNextBorrow() throws Exception {
+        assertRejectionAfterReturnDoesNotFailNextBorrow(false);
+        assertRejectionAfterReturnDoesNotFailNextBorrow(true);
+    }
+
+    private static void assertRejectionAfterReturnDoesNotFailNextBorrow(boolean transactional) throws Exception {
         CountDownLatch firstReceived = new CountDownLatch(1);
         CountDownLatch rejectNow = new CountDownLatch(1);
         CountDownLatch reported = new CountDownLatch(1);
@@ -317,7 +387,9 @@ public class SchemaRejectionPoolTest {
             server.start();
             Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
             try (QuestDB db = QuestDB.builder()
-                    .fromConfig("ws::addr=localhost:" + server.getPort() + ";close_flush_timeout_millis=0;")
+                    .fromConfig("ws::addr=localhost:" + server.getPort()
+                            + ";close_flush_timeout_millis=0;auto_flush_rows=1;auto_flush_bytes=off;transaction="
+                            + (transactional ? "on" : "off") + ";")
                     .senderPoolSize(1).queryPoolMin(0).queryPoolMax(1)
                     .schemaMismatchPolicy(SenderError.Policy.REJECT_AND_CONTINUE).dlqEnabled(false)
                     .errorHandler(error -> { rejection.set(error); reported.countDown(); }).build()) {
@@ -326,14 +398,23 @@ public class SchemaRejectionPoolTest {
                     a.flush();
                     Assert.assertTrue(firstReceived.await(5, TimeUnit.SECONDS));
                 }
+                // Move the rejected borrow into a compacted historical range.
+                for (int i = 0; i < 20; i++) {
+                    try (Sender intervening = db.borrowSender()) {
+                        intervening.table("good").longColumn("value", i).atNow();
+                    }
+                }
                 try (Sender b = db.borrowSender()) {
                     b.table("good").longColumn("value", 42).atNow();
-                    long target = b.flushAndGetSequence();
+                    b.flush();
+                    long target = ((CursorSendEngine) field(field(field(b, "slot"), "delegate"), "cursorEngine"))
+                            .publishedFsn();
                     rejectNow.countDown();
                     Assert.assertTrue("later borrow must drain past old rejection", b.awaitAckedFsn(target, 10_000));
                     Assert.assertTrue(reported.await(5, TimeUnit.SECONDS));
                     Assert.assertEquals(SenderError.Policy.REJECT_AND_CONTINUE, rejection.get().getAppliedPolicy());
                     Assert.assertEquals(0, rejection.get().getRejectedFsn());
+                    Assert.assertEquals(transactional ? 1 : 0, rejection.get().getToFsn());
                 }
             } finally {
                 rejectNow.countDown();

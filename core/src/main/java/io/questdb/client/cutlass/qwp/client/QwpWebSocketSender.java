@@ -412,7 +412,7 @@ public class QwpWebSocketSender implements Sender {
     private boolean dlqEnabled = true;
     private String dlqDir;
     private SchemaPreserver schemaPreserver;
-    private final SchemaRejectionState schemaRejectionState = new SchemaRejectionState();
+    private SchemaRejectionState schemaRejectionState;
     private long schemaLeaseGeneration;
     private boolean schemaLeaseStarted;
     private LineSenderServerException observedSchemaFailure;
@@ -2849,6 +2849,12 @@ public class QwpWebSocketSender implements Sender {
     }
 
     public void beginSchemaLease(long generation) {
+        if (schemaMismatchPolicy != SenderError.Policy.REJECT_AND_CONTINUE) {
+            return;
+        }
+        if (schemaRejectionState == null) {
+            schemaRejectionState = new SchemaRejectionState();
+        }
         schemaLeaseGeneration = generation;
         observedSchemaFailure = null;
         schemaRejectionState.beginLease(generation, publishedSchemaFsn() + 1, transactional);
@@ -4312,12 +4318,26 @@ public class QwpWebSocketSender implements Sender {
             // frees the mirror via its loopNeverRan path; it also closes the shared
             // client, so the client.close() below is a safe idempotent no-op.
             if (cursorSendLoop != null) {
-                cursorSendLoop.close();
-                cursorSendLoop = null;
+                try {
+                    cursorSendLoop.close();
+                    cursorSendLoop = null;
+                } catch (Throwable closeFailure) {
+                    if (closeFailure != t) t.addSuppressed(closeFailure);
+                }
             }
             if (client != null) {
-                client.close();
-                client = null;
+                try {
+                    client.close();
+                    client = null;
+                } catch (Throwable closeFailure) {
+                    if (closeFailure != t) t.addSuppressed(closeFailure);
+                }
+            }
+            if (t instanceof UnreplayableSlotException) {
+                // Startup also validates archives needed by orphan retirement.
+                // Sender.build() must receive this type to quarantine the slot;
+                // wrapping it would make every build retry fail on the same bytes.
+                throw (UnreplayableSlotException) t;
             }
             Endpoint ep = currentEndpoint();
             LineSenderException ex = new LineSenderException(t);

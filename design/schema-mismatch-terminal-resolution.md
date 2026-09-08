@@ -208,9 +208,17 @@ FSN at borrow; failed/observed state and the return-side end snapshot above
 are also required. Use the highest already published FSN plus one as the start. Row-level calls in
 `QwpWebSocketSender.checkConnectionError` and the `PooledSender` wrapper both
 check it, since row calls poll the delegate directly. Empty borrows retain no
-lease record. Publishing leases remain until resolved progress passes them;
-active-lease lookup is constant time, while historical rejection attribution
-scans retained leases. A long ACK stall can therefore retain many small records.
+lease record. `TERMINAL` does not allocate schema ownership state. Under
+`REJECT_AND_CONTINUE`, the next borrow removes the returned handle's generation
+and exception and coalesces adjacent returned ranges with the same transaction
+mode. Ordinary ranges can always coalesce; transactional ranges can coalesce
+only across a commit-bearing return boundary. The queued frame flags still
+identify each closed transaction's end. An unfinished failed transaction keeps
+its own end boundary, and a pending retirement keeps its owner object until
+completion. Thus normal publishing borrows during an ACK stall retain one
+historical range plus the current or most recently returned lease, rather than
+one record per borrow. Active-lease lookup remains constant time. Resolved
+progress prunes obsolete ranges.
 
 An owned rejection fails the handle. Every subsequent publish, wait and drain
 on that handle throws the same `LineSenderServerException` until the handle is
@@ -417,6 +425,14 @@ the directory's rejection metadata and retire the tail. For an orphan-only slot,
 retain that notification and retire locally before attempting a connection. An
 unreachable server must not prevent this socket-free cleanup; callback execution
 remains asynchronous.
+
+Startup filters completed archive directories by their canonical slot, epoch
+and FSN range before opening metadata. Damage in an unrelated, already-drained
+archive cannot block recovery. An overlapping archive must pass metadata,
+directory identity and replay-file validation. Proven corruption preserves the
+`UnreplayableSlotException` type through startup cleanup so `Sender.build()`
+can quarantine the whole slot, report `DATA_LOSS` and continue on a fresh one.
+Operational storage failures do not become corruption verdicts.
 
 With export disabled, a persistent schema fault retires indefinitely with one
 paced report per span and no circuit breaker. That is the accepted cost of
