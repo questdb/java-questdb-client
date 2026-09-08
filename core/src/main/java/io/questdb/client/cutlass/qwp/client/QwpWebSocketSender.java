@@ -5233,11 +5233,17 @@ public class QwpWebSocketSender implements Sender {
             recycleDeferredCloseDeadlineNanos = System.nanoTime()
                     + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         }
+        // Same interrupt policy as maybeBlockForStarvedReset: clear per park
+        // iteration, restore on the throw exit, swallow on the completed exit.
+        boolean wasInterrupted = false;
         while (!outgoing.isCloseCompleted()) {
             outgoing.ensureFlockReleaseRetryScheduled();
             if (System.nanoTime() >= recycleDeferredCloseDeadlineNanos) {
                 retainedEngine = outgoing;
                 slotLockReleased = false;
+                if (wasInterrupted) {
+                    Thread.currentThread().interrupt();
+                }
                 throw new LineSenderException("symbol dictionary recycle could not yet reclaim "
                         + "its slot: the engine's deferred close did not release the "
                         + "slot lock within " + recycleDeferredCloseMaxWaitMillis
@@ -5245,6 +5251,7 @@ public class QwpWebSocketSender implements Sender {
                         + "on the next send");
             }
             java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+            wasInterrupted |= Thread.interrupted();
         }
         recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     }
@@ -5453,19 +5460,43 @@ public class QwpWebSocketSender implements Sender {
         }
         starvationWaitDoneThisArm = true;
         long deadlineNanos = System.nanoTime() + resetMaxWaitMillis * 1_000_000L;
-        while (!isRingDrained()) {
-            cursorEngine.checkDurability();
-            if (cursorSendLoop != null) {
-                cursorSendLoop.checkError();
+        // parkNanos returns immediately while the thread's interrupt flag is
+        // set. Clear the flag each time a park returns so the wait keeps its
+        // time budget instead of busy-spinning; restore it on the timeout and
+        // throw exits only. The drained exit deliberately swallows it (the
+        // flock-release retry driver's policy): a restored flag would make
+        // recycleForDictReset()'s loop-close join observe the interrupt and
+        // abandon the recycle this wait just earned.
+        boolean wasInterrupted = false;
+        try {
+            while (!isRingDrained()) {
+                cursorEngine.checkDurability();
+                if (cursorSendLoop != null) {
+                    cursorSendLoop.checkError();
+                }
+                checkConnectionError();
+                if (System.nanoTime() >= deadlineNanos) {
+                    symbolDictResetStarvationTimeouts++;
+                    LOG.warn("symbol dictionary reset starved: backlog not drained within {} ms; "
+                            + "staying armed", resetMaxWaitMillis);
+                    if (wasInterrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return;
+                }
+                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                wasInterrupted |= Thread.interrupted();
             }
-            checkConnectionError();
-            if (System.nanoTime() >= deadlineNanos) {
-                symbolDictResetStarvationTimeouts++;
-                LOG.warn("symbol dictionary reset starved: backlog not drained within {} ms; "
-                        + "staying armed", resetMaxWaitMillis);
-                return;
+        } catch (Error e) {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+            throw e;
+        } catch (RuntimeException e) {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
         }
         recycleForDictReset();
     }

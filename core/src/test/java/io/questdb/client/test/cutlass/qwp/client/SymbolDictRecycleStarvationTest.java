@@ -454,6 +454,110 @@ public class SymbolDictRecycleStarvationTest {
     }
 
     /**
+     * An interrupt flag set when the bounded wait begins must not leak into
+     * {@code recycleForDictReset()} once the ring drains: the swap's step-2
+     * loop-close join would observe it and manufacture a CLOSE_LOOP abandon
+     * out of a recycle that was otherwise home free. The wait clears the flag
+     * per park iteration (so it also cannot busy-spin) and swallows it on the
+     * drained exit, mirroring CursorSendEngine's flock-release retry driver.
+     */
+    @Test(timeout = 60_000L)
+    public void testInterruptDuringWaitDoesNotManufactureAbandon() throws Exception {
+        assertMemoryLeak(() -> {
+            GatedAckHandler handler = new GatedAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                long maxWaitMillis = 2_000;
+                String cfg = "ws::addr=localhost:" + server.getPort()
+                        + ";symbol_dict_reset_threshold=2"
+                        + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("must be armed after crossing threshold=2", ws.isResetArmed());
+
+                    // Let the armed-window guard elapse so the call below enters the wait.
+                    Thread.sleep(maxWaitMillis + 50);
+
+                    long releaseDelayMs = 150;
+                    Thread releaser = new Thread(() -> {
+                        try {
+                            Thread.sleep(releaseDelayMs);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        handler.releaseAcks();
+                    });
+                    releaser.start();
+
+                    boolean leftoverFlag;
+                    try {
+                        Thread.currentThread().interrupt(); // flag set at park entry
+                        sender.table("t"); // waits ~releaseDelayMs, then must recycle cleanly
+                    } finally {
+                        leftoverFlag = Thread.interrupted(); // read AND clear for JUnit's sake
+                        releaser.join();
+                    }
+                    Assert.assertFalse("the drained exit must swallow the interrupt -- a restored "
+                            + "flag would poison the swap's loop-close join", leftoverFlag);
+                    Assert.assertFalse("recycle must complete, not abandon", ws.isResetArmed());
+                    Assert.assertEquals(1L, ws.getSymbolDictEpoch());
+                    Assert.assertEquals(0L, ws.getSymbolDictResetStarvationTimeouts());
+                }
+            }
+        });
+    }
+
+    /**
+     * The timeout exit of the bounded wait must RESTORE the interrupt flag it
+     * cleared to keep its budget -- the caller's interrupt is not the wait's
+     * to eat when the wait achieved nothing.
+     */
+    @Test(timeout = 60_000L)
+    public void testInterruptedWaitTimesOutAndRestoresFlag() throws Exception {
+        assertMemoryLeak(() -> {
+            GatedAckHandler handler = new GatedAckHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                long maxWaitMillis = 300;
+                String cfg = "ws::addr=localhost:" + server.getPort()
+                        + ";symbol_dict_reset_threshold=2"
+                        + ";symbol_dict_reset_max_wait_millis=" + maxWaitMillis + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    sender.flush();
+                    Assert.assertTrue(ws.isResetArmed());
+                    Thread.sleep(maxWaitMillis + 50);
+
+                    boolean flagAfter;
+                    long elapsedMs;
+                    try {
+                        Thread.currentThread().interrupt();
+                        long t0 = System.nanoTime();
+                        sender.table("t"); // acks never come: must wait out the deadline
+                        elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+                    } finally {
+                        flagAfter = Thread.interrupted(); // read AND clear for JUnit's sake
+                    }
+                    Assert.assertTrue("timeout exit must restore the interrupt flag", flagAfter);
+                    Assert.assertTrue("must wait out the deadline, not spin out early: got "
+                            + elapsedMs + "ms", elapsedMs >= maxWaitMillis - 50);
+                    Assert.assertEquals(1L, ws.getSymbolDictResetStarvationTimeouts());
+                    Assert.assertTrue(ws.isResetArmed());
+                    handler.releaseAcks(); // or close()'s drain hangs on the gated acks
+                }
+            }
+        });
+    }
+
+    /**
      * Receives frames but withholds every ack until {@link #releaseAcks()} is
      * called, so a starvation wait provably has an unacknowledged target to
      * wait on. Mirrors {@code CloseDrainTest.GatedAckHandler} /
