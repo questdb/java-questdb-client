@@ -48,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.client.cutlass.qwp.protocol.QwpConstants.FLAG_DEFER_COMMIT;
 import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
 
 /**
@@ -469,6 +470,83 @@ public class SymbolDictRecycleCrashWindowsTest {
         });
     }
 
+    /**
+     * (e): a CLOSE_LOOP abandon's resume re-registration rings its deferred
+     * chunk group plus commit, and a further data frame joins them, before the
+     * fresh loop's reconnect ever lands. The resume's re-registration is
+     * crash-safe: chunks + commit go on the SF ring as one deferred group, so
+     * a process death before the reconnect replays the group WHOLE -- a
+     * server modelling the real deferred-ack contract (no ack for
+     * {@code FLAG_DEFER_COMMIT} frames until the group commits) acks
+     * everything only because the commit frame is there to close it.
+     */
+    @Test(timeout = 60_000L)
+    public void testAbandonedResumeGroupSurvivesCrashReplay() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("crash-e-resume-rereg").toString();
+
+            // Phase 1: establish a delta baseline, kill the endpoint, abandon at
+            // CLOSE_LOOP, let the resume ring its chunks + commit, add a data
+            // frame referencing an old id, then "crash" (zero flush budget).
+            AckAllHandler phase1 = new AckAllHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(phase1)) {
+                // The resume's re-registration only sizes chunks when
+                // serverMaxBatchSize > 0 (see resumeRecycleIfPending); an
+                // unadvertised cap degrades to the plain baseline drop, same as
+                // full-dict mode. Advertise a generous cap so this test actually
+                // exercises the re-registration path (precedent: CloseDrainTest).
+                server.setAdvertisedMaxBatchSize(4096);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir
+                        + ";close_flush_timeout_millis=0;";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
+                    Assert.assertTrue(ws.getSentMaxSymbolIdForTesting() >= 0);
+
+                    server.close(); // endpoint gone: everything from here stays ringed
+                    ws.forceCloseLoopAbandonForTesting();
+                    sender.table("t"); // resume runs here: rings chunks + commit
+                    // The crash-simulated close below (flush budget 0) and a recovered
+                    // delta slot's OWN reconnect catch-up (CursorWebSocketSendLoop's
+                    // sentDictCount/hasReplayDictionaryDependency mirror, seeded from
+                    // the persisted .symbol-dict) both independently backstop the
+                    // dictionary outcome phase 2 observes below -- so drain()/dict()
+                    // alone cannot pin whether the resume itself actually closed its
+                    // own debt (verified by mutation: deleting resumeRecycleIfPending's
+                    // sendCommitMessage() call still leaves phase 2 green, because
+                    // close()'s own redundant "!deferCommit && hasDeferredMessages"
+                    // safety net and the reconnect catch-up both paper over it). This
+                    // synchronous check is what actually pins the resume's own success,
+                    // exactly as SymbolDictRecycleTest#testCloseLoopAbandonReregistersBaseline
+                    // does for the same-process case.
+                    Assert.assertFalse("the resume must close its own deferred group before "
+                                    + "the crash window closes over it",
+                            ws.hasDeferredMessagesForTesting());
+                    sender.table("t").symbol("s", "a").longColumn("v", 3L).atNow(); // joins the group on the ring
+                    sender.flush(); // the data frame joins them on the ring
+                } // close(): flush budget 0 -- the slot is left as a crash would leave it
+            }
+
+            // Phase 2: a fresh sender on the same slot replays the ring against a
+            // server that withholds acks for deferred frames until their commit.
+            DeferAwareCaptureHandler phase2 = new DeferAwareCaptureHandler();
+            try (TestWebSocketServer revived = startedServer(phase2)) {
+                String cfg2 = "ws::addr=localhost:" + revived.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender replayer = Sender.fromConfig(cfg2)) {
+                    Assert.assertTrue("the recovered ring -- deferred chunk group, commit, data "
+                            + "frame -- must drain whole", replayer.drain(10_000));
+                }
+                Assert.assertEquals("the replayed group must re-register the old ids ahead of "
+                        + "the data frames", Arrays.asList("a", "b"), phase2.dict());
+            }
+        });
+    }
+
     /** Sorted list of entry names directly inside {@code dir} (no recursion, no "."/".."). */
     private static List<String> listDir(String dir) {
         List<String> names = new ArrayList<>();
@@ -601,6 +679,37 @@ public class SymbolDictRecycleCrashWindowsTest {
             }
             try {
                 client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * Real deferred-ack contract plus dictionary capture: withholds the ack
+     * for any frame carrying {@code FLAG_DEFER_COMMIT} (the group is still
+     * open), acks everything else, and accumulates the delta dictionary in
+     * arrival order. Single-connection semantics only -- sufficient here
+     * since recovery replays on one connection.
+     */
+    private static class DeferAwareCaptureHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final List<String> dict = new ArrayList<>();
+        private final AtomicLong nextSeq = new AtomicLong(0);
+
+        synchronized List<String> dict() {
+            return new ArrayList<>(dict);
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            long seq = nextSeq.getAndIncrement();
+            boolean deferred = data.length > 5 && (data[5] & FLAG_DEFER_COMMIT) != 0;
+            if (deferred) {
+                return; // withhold: the group is still open
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(seq));
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
