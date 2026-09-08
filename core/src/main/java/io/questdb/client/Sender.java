@@ -275,9 +275,15 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     void atNow();
 
     /**
-     * Block until the server has acknowledged every frame up to {@code targetFsn},
+     * Block until every frame up to {@code targetFsn} is resolved,
      * or until {@code timeoutMillis} elapses. Pair with {@link #flushAndGetSequence()}
      * to obtain {@code targetFsn} for a specific flush.
+     * <br>
+     * Resolution includes server acknowledgements, schema-rejected ranges retired by
+     * {@link SenderError.Policy#REJECT_AND_CONTINUE}, and recovered orphan tails.
+     * A successful wait is progress, not proof that every row was ingested. A pooled
+     * sender may wait for an earlier borrow's FSN; an error owned by the current
+     * borrow still throws. Observe the error handler for earlier rejected ranges.
      * <br>
      * When {@code request_durable_ack=on} (Enterprise primary replication), {@code targetFsn}
      * advances after durable upload to object storage, not on the ordinary commit ACK.
@@ -288,7 +294,7 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      *
      * @param targetFsn     FSN to wait for; typically the return value of {@link #flushAndGetSequence()}
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the current state without blocking
-     * @return {@code true} if the server has acknowledged up to {@code targetFsn} on return, {@code false} on timeout
+     * @return {@code true} if the queue has resolved up to {@code targetFsn}, {@code false} on timeout
      * @throws LineSenderException if the transport has latched a terminal error
      */
     default boolean awaitAckedFsn(long targetFsn, long timeoutMillis) {
@@ -503,8 +509,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
      * @param timeoutMillis upper bound on the wait; {@code <= 0} returns the
      *                      current state without blocking (the flush still
      *                      happens before the check)
-     * @return {@code true} if the server has acknowledged every published
-     *         frame on return, {@code false} on timeout
+     * @return {@code true} if every published frame is resolved on return,
+     *         {@code false} on timeout
      * @throws LineSenderException if the transport has latched a terminal error
      */
     default boolean drain(long timeoutMillis) {
@@ -610,14 +616,16 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     }
 
     /**
-     * Highest frame sequence number (FSN) the server has acknowledged.
+     * Highest contiguous resolved frame sequence number (FSN). Includes server
+     * acknowledgements and locally retired schema-rejected ranges or orphan tails;
+     * this is queue progress, not a count of successfully ingested rows.
      * Returns {@code -1} when no batch has been published yet, and on transports that
      * do not track FSNs (HTTP, TCP, UDP).
      * <br>
      * Snapshot accessor: for a bounded blocking wait, use
      * {@link #awaitAckedFsn(long, long)}.
      *
-     * @return highest acknowledged FSN, or {@code -1} if none or unsupported
+     * @return highest resolved FSN, or {@code -1} if none or unsupported
      */
     default long getAckedFsn() {
         return -1L;
@@ -1082,6 +1090,9 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         // Optional user-supplied async error handler. When null, the sender
         // uses DefaultSenderErrorHandler.INSTANCE (loud-not-silent log).
         private io.questdb.client.SenderErrorHandler errorHandler;
+        private SenderError.Policy schemaMismatchPolicy = SenderError.Policy.REJECT_AND_CONTINUE;
+        private boolean dlqEnabled = true;
+        private String dlqDir;
         // Bounded inbox capacity for the async error dispatcher.
         // PARAMETER_NOT_SET_EXPLICITLY → spec default (256).
         private int errorInboxCapacity = PARAMETER_NOT_SET_EXPLICITLY;
@@ -1714,7 +1725,8 @@ public interface Sender extends Closeable, ArraySender<Sender> {
                                     actualConnectionListenerInboxCapacity,
                                     actualMaxFrameRejections,
                                     actualPoisonMinEscalationWindowMillis,
-                                    actualCatchUpCapGapMinEscalationWindowMillis
+                                    actualCatchUpCapGapMinEscalationWindowMillis,
+                                    schemaMismatchPolicy, dlqEnabled, dlqDir, transactional
                             );
                         } catch (UnreplayableSlotException e) {
                             // The one failure build() recovers from. The slot's frames reference ids
@@ -2130,10 +2142,46 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         }
 
         /**
+         * Select schema-mismatch handling. REJECT_AND_CONTINUE fails the owning
+         * handle and retires its rejected prefix; the underlying slot continues.
+         * TERMINAL retains queued frames and halts the slot.
+         */
+        public LineSenderBuilder schemaMismatchPolicy(SenderError.Policy policy) {
+            if (policy != SenderError.Policy.TERMINAL && policy != SenderError.Policy.REJECT_AND_CONTINUE) {
+                throw new IllegalArgumentException("schema mismatch policy must be TERMINAL or REJECT_AND_CONTINUE");
+            }
+            schemaMismatchPolicy = policy;
+            return this;
+        }
+
+        /**
+         * Enable preserved copies before schema retirement (default: enabled for disk queues).
+         * Disabling preservation accepts permanent loss of retired rows.
+         */
+        public LineSenderBuilder dlqEnabled(boolean enabled) {
+            dlqEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Set the raw-copy base directory, including for memory-only queues.
+         * Copies live under directory/slot/rejected and are never automatically deleted.
+         * The asynchronous error names the completed directory.
+         */
+        public LineSenderBuilder dlqDirectory(String directory) {
+            if (directory == null || directory.isEmpty()) {
+                throw new IllegalArgumentException("DLQ directory must not be empty");
+            }
+            dlqDir = directory;
+            return this;
+        }
+
+        /**
          * Sets the async error handler invoked for every server-side rejection.
          * The handler runs on a dedicated daemon dispatcher thread, never on the
          * I/O thread or producer thread. Slow handlers do not stall publishing;
-         * if the bounded inbox fills up, surplus notifications are dropped
+         * schema rejections use a separate 256-entry queue that pauses retirement when full.
+         * For other categories, if the bounded inbox fills up, surplus notifications are dropped
          * (visible via {@code QwpWebSocketSender.getDroppedErrorNotifications()}).
          *
          * <p>WebSocket transport only; setting on other transports throws.

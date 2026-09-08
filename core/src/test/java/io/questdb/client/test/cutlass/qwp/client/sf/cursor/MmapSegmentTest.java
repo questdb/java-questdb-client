@@ -221,6 +221,37 @@ public class MmapSegmentTest {
     }
 
     @Test
+    public void testLiveFrameLookupCacheRetainsBoundsAndCorruptionChecks() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            long payload = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+            try (MmapSegment segment = MmapSegment.createInMemory(10L, 4096L)) {
+                java.lang.reflect.Method payloadLength = MmapSegment.class
+                        .getDeclaredMethod("liveFramePayloadLength", long.class);
+                payloadLength.setAccessible(true);
+                for (int i = 0; i < 4; i++) {
+                    assertTrue(segment.tryAppend(payload, i + 1) >= 0);
+                }
+
+                assertEquals(1, ((Integer) payloadLength.invoke(segment, 10L)).intValue());
+                assertEquals(3, ((Integer) payloadLength.invoke(segment, 12L)).intValue());
+                assertEquals(3, ((Integer) payloadLength.invoke(segment, 12L)).intValue());
+                assertEquals(2, ((Integer) payloadLength.invoke(segment, 11L)).intValue());
+                assertEquals(4, ((Integer) payloadLength.invoke(segment, 13L)).intValue());
+                assertEquals(-1, ((Integer) payloadLength.invoke(segment, 9L)).intValue());
+                assertEquals(-1, ((Integer) payloadLength.invoke(segment, 14L)).intValue());
+
+                // A cached offset is still validated before use.
+                long fourthOffset = MmapSegment.HEADER_SIZE
+                        + 3L * MmapSegment.FRAME_HEADER_SIZE + 1L + 2L + 3L;
+                Unsafe.getUnsafe().putInt(segment.address() + fourthOffset + 4, Integer.MAX_VALUE);
+                assertEquals(-1, ((Integer) payloadLength.invoke(segment, 13L)).intValue());
+            } finally {
+                Unsafe.free(payload, 16, MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
     public void testSegmentWithAnUnknownVersionIsRefused() throws Exception {
         // The version byte survives the barrier removal precisely so a real future
         // format change can be refused rather than misread. Task 14 relies on it.

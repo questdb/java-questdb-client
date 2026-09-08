@@ -229,6 +229,10 @@ public final class BackgroundDrainer implements Runnable {
     // LOG -- a NOP for apps without an slf4j binding -- which is exactly the
     // silence this sink exists to break.
     private volatile SenderErrorHandler errorSink;
+    private volatile SenderErrorHandler schemaErrorSink;
+    private SenderError.Policy schemaMismatchPolicy = SenderError.Policy.TERMINAL;
+    private boolean schemaPreservationEnabled;
+    private String schemaPreservationDirectory;
     private volatile String lastErrorMessage;
     /**
      * Optional observer for durable-ack-unavailable transients and the
@@ -930,6 +934,8 @@ public final class BackgroundDrainer implements Runnable {
         // per wire session. Closed by the finally, after loop.close(), so errors
         // dispatched during the loop's shutdown still reach the sink.
         SenderErrorDispatcher loopErrorDispatcher = null;
+        SchemaPreserver schemaPreserver = null;
+        SchemaRejectionState schemaRejectionState = null;
         try {
             // Scanner results are only snapshots. Serialize adoption against
             // a producer's close -> quarantine rename -> fresh-slot recreate
@@ -1051,14 +1057,100 @@ public final class BackgroundDrainer implements Runnable {
                 return;
             }
             engineForTesting = engine;
+            if (schemaMismatchPolicy == SenderError.Policy.REJECT_AND_CONTINUE) {
+                schemaRejectionState = new SchemaRejectionState();
+                if (schemaPreservationEnabled) {
+                    String slotId = java.nio.file.Paths.get(slotPath).getFileName().toString();
+                    String epoch = SlotEpoch.openOrCreate(
+                            io.questdb.client.std.FilesFacade.INSTANCE,
+                            slotPath,
+                            engine.freshFsnNamespace());
+                    String destination = schemaPreservationDirectory == null
+                            ? slotPath
+                            : java.nio.file.Paths.get(schemaPreservationDirectory, slotId).toString();
+                    try {
+                        java.nio.file.Files.createDirectories(java.nio.file.Paths.get(destination));
+                    } catch (java.io.IOException e) {
+                        throw new SfOperationalException(
+                                "could not create schema preservation destination " + destination, e);
+                    }
+                    SchemaPreserver.probeDestination(
+                            io.questdb.client.std.FilesFacade.INSTANCE, destination);
+                    RejectedMiniSlotArchive.cleanupTemporaryDirectories(
+                            io.questdb.client.std.FilesFacade.INSTANCE, destination, slotId, epoch);
+                    schemaPreserver = new SchemaPreserver(
+                            io.questdb.client.std.FilesFacade.INSTANCE,
+                            destination,
+                            slotId,
+                            epoch);
+                }
+            }
             if (logicalSlotLock != null) {
                 logicalSlotLock.close();
                 logicalSlotLock = null;
             }
+            // Read the sink once: like `listener` it is volatile because the pool
+            // applies it at submit time and it is consumed on the drainer thread.
+            SenderErrorHandler sink = errorSink;
+            SenderErrorHandler schemaSink = schemaErrorSink;
+            if (sink != null || schemaSink != null) {
+                // The I/O thread must never run the sink inline -- it is caller-supplied
+                // code and may block -- so it reaches the sink through the same bounded,
+                // drop-oldest, off-thread arm the foreground sender uses.
+                //
+                // TERMINAL is dropped on the way through: on an ORPHAN loop it does not
+                // mean what it means to a foreground producer. It is the loop handing the
+                // slot back to this drainer, which then decides -- ride the fault out and
+                // finish the drain, or quarantine and report the abandonment itself with
+                // dispatchDataLoss. Forwarding it would announce a dead producer for a
+                // rotating credential the very next sweep accepts, and would double-report
+                // the quarantine the drainer already names. Everything the loop rides out
+                // (RETRIABLE / RETRIABLE_OTHER) has no such owner and is forwarded verbatim.
+                loopErrorDispatcher = new SenderErrorDispatcher(
+                        err -> {
+                            if (err.getAppliedPolicy() == SenderError.Policy.REJECT_AND_CONTINUE) {
+                                if (schemaSink != null) {
+                                    // A preserved schema report carries orphan-slot-local FSNs and the
+                                    // ready archive path. Keep both intact: this dispatcher is already
+                                    // the asynchronous delivery boundary, so another bounded hop could
+                                    // drop the report after retirement has made replay impossible.
+                                    schemaSink.onError(err);
+                                }
+                            } else if (err.getAppliedPolicy() != SenderError.Policy.TERMINAL && sink != null) {
+                                // This sink belongs to the live sender, while err's FSNs belong to the orphan
+                                // engine being drained. Strip that foreign correlation span before forwarding;
+                                // otherwise an operator can join it to unrelated live rows with the same FSNs.
+                                sink.onError(new SenderError(
+                                        err.getCategory(),
+                                        err.getAppliedPolicy(),
+                                        err.getServerStatusByte(),
+                                        err.getServerMessage(),
+                                        err.getMessageSequence(),
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        SenderError.NO_MESSAGE_SEQUENCE,
+                                        err.getTableName(),
+                                        err.getDetectedAtNanos()));
+                            }
+                        },
+                        SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");
+            }
+
             // A recovered deferred-only tail is an aborted transaction and can
             // be retired locally once everything below it is already ACKed.
             // Do this before opening a socket: auth/upgrade failures must not
             // quarantine a slot that has no wire-visible work left.
+            if (schemaPreserver != null && engine.recoveredOrphanTipFsn() >= 0
+                    && engine.ackedFsn() >= engine.recoveredCommitBoundaryFsn()) {
+                SenderError recovered = schemaPreserver.findRecoveredOrphanReport(
+                        engine.recoveredCommitBoundaryFsn() + 1L, engine.recoveredOrphanTipFsn());
+                if (recovered != null && (loopErrorDispatcher == null
+                        || !loopErrorDispatcher.tryOfferSchema(recovered))) {
+                    lastErrorMessage = "could not retain recovered schema report before orphan retirement";
+                    LOG.warn("drainer slot {}: {}", slotPath, lastErrorMessage);
+                    outcome = DrainOutcome.FAILED;
+                    return;
+                }
+            }
             engine.retireRecoveredOrphanTailIfReady();
             long target = engine.publishedFsn();
             if (engine.ackedFsn() >= target) {
@@ -1078,43 +1170,6 @@ public final class BackgroundDrainer implements Runnable {
                 // already dropped on the FAILED path.
                 return;
             }
-            // Read the sink once: like `listener` it is volatile because the pool
-            // applies it at submit time and it is consumed on the drainer thread.
-            SenderErrorHandler sink = errorSink;
-            if (sink != null) {
-                // The I/O thread must never run the sink inline -- it is caller-supplied
-                // code and may block -- so it reaches the sink through the same bounded,
-                // drop-oldest, off-thread arm the foreground sender uses.
-                //
-                // TERMINAL is dropped on the way through: on an ORPHAN loop it does not
-                // mean what it means to a foreground producer. It is the loop handing the
-                // slot back to this drainer, which then decides -- ride the fault out and
-                // finish the drain, or quarantine and report the abandonment itself with
-                // dispatchDataLoss. Forwarding it would announce a dead producer for a
-                // rotating credential the very next sweep accepts, and would double-report
-                // the quarantine the drainer already names. Everything the loop rides out
-                // (RETRIABLE / RETRIABLE_OTHER) has no such owner and is forwarded verbatim.
-                loopErrorDispatcher = new SenderErrorDispatcher(
-                        err -> {
-                            if (err.getAppliedPolicy() != SenderError.Policy.TERMINAL) {
-                                // This sink belongs to the live sender, while err's FSNs belong to the orphan
-                                // engine being drained. Strip that foreign correlation span before forwarding;
-                                // otherwise an operator can join it to unrelated live rows with the same FSNs.
-                                sink.onError(new SenderError(
-                                        err.getCategory(),
-                                        err.getAppliedPolicy(),
-                                        err.getServerStatusByte(),
-                                        err.getServerMessage(),
-                                        err.getMessageSequence(),
-                                        SenderError.NO_MESSAGE_SEQUENCE,
-                                        SenderError.NO_MESSAGE_SEQUENCE,
-                                        err.getTableName(),
-                                        err.getDetectedAtNanos()));
-                            }
-                        },
-                        SenderErrorDispatcher.DEFAULT_CAPACITY, "qdb-sf-drainer-error-dispatcher");
-            }
-
             // One iteration per wire session. Re-entered on either of the two
             // RECOVERABLE mid-drain terminals the recycle branch below tests
             // for -- a durable-ack CAPABILITY gap, or a 401/403 against a
@@ -1152,6 +1207,9 @@ public final class BackgroundDrainer implements Runnable {
                 // problem once SF fills. Null when no sink is installed, which
                 // setErrorDispatcher accepts and dispatchError treats as before.
                 loop.setErrorDispatcher(loopErrorDispatcher);
+                loop.setSchemaRejectionState(schemaRejectionState);
+                loop.setSchemaMismatchPolicy(schemaMismatchPolicy);
+                loop.setSchemaPreserver(schemaPreserver);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {
@@ -1278,6 +1336,10 @@ public final class BackgroundDrainer implements Runnable {
             lastErrorMessage = t.getMessage();
             outcome = DrainOutcome.FAILED;
             throw t;
+        } catch (SfOperationalException t) {
+            lastErrorMessage = t.getMessage();
+            LOG.error("drainer storage temporarily unavailable for slot {}: {}", slotPath, lastErrorMessage, t);
+            outcome = DrainOutcome.FAILED;
         } catch (Throwable t) {
             String msg = t.getMessage();
             if (slotPath != null) {
@@ -1383,14 +1445,13 @@ public final class BackgroundDrainer implements Runnable {
             if (engine != null) {
                 // Failed-stop hand-off: delegateEngineClose() makes the I/O
                 // thread run engine.close() strictly after its last engine
-                // access, releasing the slot lock as soon as the stuck wire
-                // call resolves — deferred teardown, never abandoned. The
+                // access, releasing the slot lock once blocked network or
+                // preservation I/O completes — deferred teardown, never abandoned. The
                 // false return covers the race where the thread exited
                 // between the failed close() and now: then it is safe (and
                 // necessary) to close the engine here.
-                if (ioThreadStopped || !loop.delegateEngineClose()) {
+                if (ioThreadStopped || loop == null || !loop.delegateEngineClose()) {
                     try {
-                        // engine.close() releases the slot lock too.
                         engine.close();
                     } catch (Throwable ignored) {
                     }
@@ -1414,6 +1475,26 @@ public final class BackgroundDrainer implements Runnable {
 
     public void setErrorSink(SenderErrorHandler errorSink) {
         this.errorSink = errorSink;
+    }
+
+    /** Configures schema rejection before this drainer is submitted. */
+    public void configureSchemaMismatch(
+            SenderError.Policy policy,
+            boolean preserve,
+            String directory,
+            SenderErrorHandler effectiveHandler
+    ) {
+        if (policy != SenderError.Policy.TERMINAL
+                && policy != SenderError.Policy.REJECT_AND_CONTINUE) {
+            throw new IllegalArgumentException(
+                    "schema mismatch policy must be TERMINAL or REJECT_AND_CONTINUE");
+        }
+        this.schemaMismatchPolicy = policy;
+        this.schemaPreservationEnabled = preserve;
+        this.schemaPreservationDirectory = directory;
+        this.schemaErrorSink = effectiveHandler != null
+                ? effectiveHandler
+                : DefaultSenderErrorHandler.INSTANCE;
     }
 
     /**

@@ -25,6 +25,8 @@
 package io.questdb.client.impl;
 
 import io.questdb.client.Sender;
+import io.questdb.client.LineSenderServerException;
+import io.questdb.client.cutlass.qwp.client.QwpWebSocketSender;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
 import io.questdb.client.std.Decimal128;
@@ -154,6 +156,23 @@ public final class PooledSender implements Sender {
         if (generation != slot.generation()) {
             return;
         }
+        Sender delegate = slot.live(generation);
+        QwpWebSocketSender qwp = delegate instanceof QwpWebSocketSender ? (QwpWebSocketSender) delegate : null;
+        if (qwp != null && qwp.hasOwnedSchemaFailure()) {
+            LineSenderServerException failure;
+            try {
+                failure = qwp.releaseFailedSchemaLease();
+                qwp.checkSchemaSlotHealth();
+            } catch (RuntimeException | Error operationalFailure) {
+                slot.pool().discardBroken(this);
+                throw operationalFailure;
+            }
+            slot.pool().giveBack(this);
+            if (failure != null) {
+                throw failure;
+            }
+            return;
+        }
         // Track normal completion rather than catching a specific throwable
         // type. flush() can exit abnormally with an Error (AssertionError
         // under -ea, OutOfMemoryError, ...) as well as a RuntimeException;
@@ -169,6 +188,16 @@ public final class PooledSender implements Sender {
             slot.live(generation).flush();
             flushed = true;
         } finally {
+            if (!flushed && qwp != null && qwp.hasOwnedSchemaFailure()) {
+                try {
+                    qwp.releaseFailedSchemaLease();
+                    qwp.checkSchemaSlotHealth();
+                    flushed = true;
+                } catch (RuntimeException | Error operationalFailure) {
+                    slot.pool().discardBroken(this);
+                    throw operationalFailure;
+                }
+            }
             if (flushed) {
                 slot.pool().giveBack(this);
             } else {

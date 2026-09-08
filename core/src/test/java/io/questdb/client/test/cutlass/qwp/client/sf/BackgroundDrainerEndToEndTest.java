@@ -25,6 +25,8 @@
 package io.questdb.client.test.cutlass.qwp.client.sf;
 
 import io.questdb.client.Sender;
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
 import io.questdb.client.std.Files;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
@@ -42,8 +44,10 @@ import java.nio.ByteOrder;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * End-to-end coverage of the background drainer adopting an orphan slot.
@@ -71,6 +75,68 @@ public class BackgroundDrainerEndToEndTest {
     @After
     public void tearDown() {
         if (sfDir != null) rmDirRec(sfDir);
+    }
+
+    @Test
+    public void testDrainerPreservesAndReportsSchemaRejectedSpan() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (TestWebSocketServer silent = new TestWebSocketServer(new SilentHandler())) {
+                silent.start();
+                Assert.assertTrue(silent.awaitStart(5, TimeUnit.SECONDS));
+                String ghostConfig = "ws::addr=localhost:" + silent.getPort()
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=ghost;close_flush_timeout_millis=0;";
+                try (Sender ghost = Sender.fromConfig(ghostConfig)) {
+                    ghost.table("bad").stringColumn("value", "wrong").atNow();
+                    Assert.assertEquals(0L, ghost.flushAndGetSequence());
+                }
+            }
+
+            CountDownLatch reported = new CountDownLatch(1);
+            AtomicReference<SenderError> captured = new AtomicReference<>();
+            AtomicLong nextSequence = new AtomicLong();
+            try (TestWebSocketServer rejecting = new TestWebSocketServer(
+                    new TestWebSocketServer.WebSocketServerHandler() {
+                @Override
+                public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+                    long sequence = nextSequence.getAndIncrement();
+                    try {
+                        client.sendBinary(QwpWireTestUtils.buildNack(
+                                sequence, WebSocketResponse.STATUS_SCHEMA_MISMATCH));
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            })) {
+                rejecting.start();
+                Assert.assertTrue(rejecting.awaitStart(5, TimeUnit.SECONDS));
+                String primaryConfig = "ws::addr=localhost:" + rejecting.getPort()
+                        + ";sf_dir=" + sfDir
+                        + ";sender_id=primary;drain_orphans=true;max_background_drainers=1;";
+                try (Sender ignored = Sender.builder(primaryConfig)
+                        .schemaMismatchPolicy(SenderError.Policy.REJECT_AND_CONTINUE)
+                        .dlqEnabled(true)
+                        .errorHandler(error -> {
+                            if (error.getAppliedPolicy() == SenderError.Policy.REJECT_AND_CONTINUE) {
+                                captured.set(error);
+                                reported.countDown();
+                            }
+                        })
+                        .build()) {
+                    Assert.assertTrue("schema rejection callback", reported.await(10, TimeUnit.SECONDS));
+                }
+            }
+
+            SenderError error = captured.get();
+            Assert.assertNotNull(error);
+            Assert.assertEquals(SenderError.Category.SCHEMA_MISMATCH, error.getCategory());
+            Assert.assertEquals(0L, error.getRejectedFsn());
+            Assert.assertEquals(0L, error.getFromFsn());
+            Assert.assertEquals(0L, error.getToFsn());
+            Assert.assertNotNull("archive must be published before callback", error.getRejectedPath());
+            Assert.assertTrue(java.nio.file.Files.isDirectory(Paths.get(error.getRejectedPath())));
+            Assert.assertFalse(Files.exists(sfDir + "/ghost/" + OrphanScanner.FAILED_SENTINEL_NAME));
+        });
     }
 
     @Test

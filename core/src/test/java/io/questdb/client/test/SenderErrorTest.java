@@ -57,11 +57,12 @@ public class SenderErrorTest {
     @Test
     public void testAllPoliciesEnumerable() {
         SenderError.Policy[] policies = SenderError.Policy.values();
-        Assert.assertEquals(4, policies.length);
+        Assert.assertEquals(5, policies.length);
         Assert.assertEquals(SenderError.Policy.RETRIABLE, SenderError.Policy.valueOf("RETRIABLE"));
         Assert.assertEquals(SenderError.Policy.RETRIABLE_OTHER, SenderError.Policy.valueOf("RETRIABLE_OTHER"));
         Assert.assertEquals(SenderError.Policy.TERMINAL, SenderError.Policy.valueOf("TERMINAL"));
         Assert.assertEquals(SenderError.Policy.ABANDONED, SenderError.Policy.valueOf("ABANDONED"));
+        Assert.assertEquals(SenderError.Policy.REJECT_AND_CONTINUE, SenderError.Policy.valueOf("REJECT_AND_CONTINUE"));
     }
 
     @Test

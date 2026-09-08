@@ -24,6 +24,7 @@
 
 package io.questdb.client.cutlass.qwp.client.sf.cursor;
 
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Crc32c;
 import io.questdb.client.std.Files;
 import io.questdb.client.std.FilesFacade;
@@ -106,6 +107,12 @@ public final class MmapSegment implements QuietCloseable {
     // ring monitor. volatile is the cheapest correct fix.
     private volatile long frameCount;
     private long mmapAddress;
+    // Cold live-frame lookups normally walk forward by FSN (archive/rejection
+    // scans). Remember one validated frame so each lookup does not rescan the
+    // immutable published prefix from HEADER_SIZE. These fields are accessed
+    // under SegmentRing's monitor; the producer never touches them.
+    private long liveLookupIndex;
+    private long liveLookupOffset = HEADER_SIZE;
     // publishedCursor: written by producer, read by consumer (I/O thread). Volatile
     // because the consumer must see writes in publication order — once the
     // producer bumps publishedCursor, every byte before it is fully written.
@@ -750,6 +757,72 @@ public final class MmapSegment implements QuietCloseable {
      */
     public long frameCount() {
         return frameCount;
+    }
+
+    int liveFramePayloadLength(long fsn) {
+        long offset = liveFrameOffset(fsn);
+        return offset < 0 ? -1 : Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+    }
+
+    boolean copyLiveFrame(long fsn, long dstAddr, int dstCapacity) {
+        long offset = liveFrameOffset(fsn);
+        if (offset < 0) {
+            return false;
+        }
+        int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+        if (payloadLen > dstCapacity) {
+            throw new IllegalArgumentException("destination is too small [required="
+                    + payloadLen + ", capacity=" + dstCapacity + ']');
+        }
+        if (payloadLen > 0) {
+            Unsafe.getUnsafe().copyMemory(mmapAddress + offset + FRAME_HEADER_SIZE, dstAddr, payloadLen);
+        }
+        return true;
+    }
+
+    int liveQwpFrameFlags(long fsn) {
+        long offset = liveFrameOffset(fsn);
+        if (offset < 0) {
+            return -1;
+        }
+        int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+        long payload = mmapAddress + offset + FRAME_HEADER_SIZE;
+        if (payloadLen < QwpConstants.HEADER_SIZE
+                || Unsafe.getUnsafe().getInt(payload) != QwpConstants.MAGIC_MESSAGE) {
+            return -1;
+        }
+        return Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS) & 0xff;
+    }
+
+    private long liveFrameOffset(long fsn) {
+        long index = fsn - baseSeq;
+        long frames = frameCount;
+        if (index < 0 || index >= frames) {
+            return -1L;
+        }
+        long published = publishedCursor;
+        long i = 0;
+        long offset = HEADER_SIZE;
+        if (index >= liveLookupIndex) {
+            i = liveLookupIndex;
+            offset = liveLookupOffset;
+        }
+        for (; i <= index; i++) {
+            if (offset + FRAME_HEADER_SIZE > published) {
+                return -1L;
+            }
+            int payloadLen = Unsafe.getUnsafe().getInt(mmapAddress + offset + 4);
+            if (payloadLen < 0 || payloadLen > published - offset - FRAME_HEADER_SIZE) {
+                return -1L;
+            }
+            if (i == index) {
+                liveLookupIndex = i;
+                liveLookupOffset = offset;
+                return offset;
+            }
+            offset += FRAME_HEADER_SIZE + payloadLen;
+        }
+        return -1L;
     }
 
     /**

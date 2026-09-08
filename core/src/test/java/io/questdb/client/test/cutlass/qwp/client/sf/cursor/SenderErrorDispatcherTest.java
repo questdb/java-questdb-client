@@ -38,6 +38,45 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class SenderErrorDispatcherTest {
 
     @Test
+    public void testSchemaCapacityIncludesExecutingCallbackAndSurvivesOverflow() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch delivered = new CountDownLatch(256);
+        AtomicInteger schemaCalls = new AtomicInteger();
+        try (SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(error -> {
+            if (error.getAppliedPolicy() == SenderError.Policy.REJECT_AND_CONTINUE) {
+                if (schemaCalls.getAndIncrement() == 0) {
+                    entered.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                delivered.countDown();
+            }
+        }, 2)) {
+            try {
+                Assert.assertTrue(dispatcher.tryOfferSchema(buildError(0).withRejectionSpan(0, 0)));
+                Assert.assertTrue(entered.await(5, TimeUnit.SECONDS));
+                for (int i = 1; i < 256; i++) {
+                    Assert.assertTrue(dispatcher.tryOfferSchema(buildError(i).withRejectionSpan(i, i)));
+                }
+                Assert.assertEquals(256, dispatcher.getPendingSchemaNotifications());
+                Assert.assertFalse(dispatcher.tryOfferSchema(buildError(256).withRejectionSpan(256, 256)));
+                for (int i = 0; i < 100; i++) {
+                    dispatcher.offer(buildError(i));
+                }
+                Assert.assertEquals(256, dispatcher.getPendingSchemaNotifications());
+            } finally {
+                release.countDown();
+            }
+            Assert.assertTrue(delivered.await(5, TimeUnit.SECONDS));
+            Assert.assertEquals(256, schemaCalls.get());
+        }
+    }
+
+    @Test
     public void testCloseDrainsRemainingEntries() {
         // After close(), entries already in the queue should still be
         // delivered (within the drain deadline). Spec: "drains remaining

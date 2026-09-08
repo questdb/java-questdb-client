@@ -25,6 +25,7 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.DefaultHttpClientConfiguration;
+import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.QwpRoleMismatchException;
@@ -32,6 +33,8 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaRejectionState;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.PlainSocketFactory;
 import io.questdb.client.std.Files;
@@ -124,6 +127,48 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             replayStart - client.framesSent, loop.fsnAtZero());
                 } finally {
                     loop.close(); // frees the seeded mirror + the stub client's buffers
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDiskSuccessorDictionarySurvivesSkippedDeltaCarrier() throws Exception {
+        assertSkippedDeltaCarrierKeepsSuccessorReplayable(false);
+    }
+
+    @Test
+    public void testMemorySuccessorDictionarySurvivesSkippedDeltaCarrier() throws Exception {
+        assertSkippedDeltaCarrierKeepsSuccessorReplayable(true);
+    }
+
+    @Test
+    public void testSealedSchemaRangeStopsAndSelfAcknowledges() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine engine = new CursorSendEngine(null, 16_384)) {
+                appendDeltaDictFrame(engine, 0, 'a');
+                appendDeltaDictFrame(engine, 1, 'b');
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.beginLease(1, 0, false);
+                SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                        SenderError.Policy.REJECT_AND_CONTINUE, 7, "mismatch", 1,
+                        1, 1, "tab", System.nanoTime());
+                assertTrue(state.reject(1, 0, error));
+                SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(ignored -> { });
+                CursorWebSocketSendLoop loop = newLoop(engine, client);
+                try {
+                    loop.setSchemaRejectionState(state);
+                    loop.setErrorDispatcher(dispatcher);
+                    loop.positionCursorForStartForTest();
+                    assertTrue(loop.trySendOneForTest());
+                    assertEquals(1, engine.ackedFsn());
+                    assertEquals(2, loop.getSchemaFramesRetired());
+                    assertEquals(-1, state.stopFsn());
+                    assertEquals(Arrays.asList("a", "b"), readMirrorSymbols(loop));
+                } finally {
+                    loop.close();
+                    dispatcher.close();
                 }
             }
         });
@@ -1191,6 +1236,37 @@ public class CursorWebSocketSendLoopCatchUpAlignmentTest {
                             loop.catchUpCapGapFirstNanos() > staleAnchor[0]);
                     assertEquals("test must observe gaps, the unrelated state, and a new gap",
                             maxAttempts + 1, reconnectCalls[0]);
+                } finally {
+                    loop.close();
+                }
+            }
+        });
+    }
+
+    private void assertSkippedDeltaCarrierKeepsSuccessorReplayable(boolean memory) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            CatchUpCapturingClient client = new CatchUpCapturingClient(0);
+            try (CursorSendEngine closeableEngine = memory
+                    ? new CursorSendEngine(null, 16_384)
+                    : newEngine()) {
+                appendDeltaDictFrame(closeableEngine, 0, 'a'); // carrier to retire
+                appendDeltaDictFrame(closeableEngine, 1, 'b'); // surviving successor
+                assertEquals(QwpConstants.FLAG_DELTA_SYMBOL_DICT & 0xff,
+                        closeableEngine.liveQwpFrameFlags(0));
+                assertEquals(-1, closeableEngine.liveQwpFrameFlags(2));
+                CursorWebSocketSendLoop loop = newLoop(closeableEngine, client);
+                try {
+                    loop.catchUpSkippedRangeForTest(0, 0);
+                    assertEquals(Arrays.asList("a"), readMirrorSymbols(loop));
+
+                    // The successor starts at id 1. Folding it after the skipped
+                    // carrier is the same contiguity check trySendOne applies and
+                    // proves the carrier's symbol was not lost from catch-up state.
+                    loop.catchUpSkippedRangeForTest(1, 1);
+                    assertEquals(Arrays.asList("a", "b"), readMirrorSymbols(loop));
+
+                    invokeSetWireBaselineWithCatchUp(loop, 2L);
+                    assertCatchUpReassembles(client, "a", "b");
                 } finally {
                     loop.close();
                 }

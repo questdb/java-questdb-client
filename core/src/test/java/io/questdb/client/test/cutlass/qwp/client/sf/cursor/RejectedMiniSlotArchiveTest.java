@@ -1,0 +1,219 @@
+/*******************************************************************************
+ * Copyright (c) 2014-2026 QuestDB
+ * Licensed under the Apache License, Version 2.0.
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
+
+import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.client.std.FilesFacade;
+import io.questdb.client.std.MemoryTag;
+import io.questdb.client.std.Unsafe;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.fail;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
+
+public class RejectedMiniSlotArchiveTest {
+    private Path root;
+
+    @Before
+    public void setUp() throws Exception {
+        root = Files.createTempDirectory("qdb-rejected-mini-slot-");
+    }
+
+    @After
+    public void tearDown() throws Exception {
+        if (root != null) {
+            try (java.util.stream.Stream<Path> paths = Files.walk(root)) {
+                paths.sorted(Comparator.reverseOrder()).forEach(p -> {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) { }
+                });
+            }
+        }
+    }
+
+    @Test
+    public void testEpochSurvivesReopenAndRejectsCorruption() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String slot = Files.createDirectory(root.resolve("slot")).toString();
+        String first = SlotEpoch.openOrCreate(ff, slot);
+        assertEquals(first, SlotEpoch.openOrCreate(ff, slot));
+        assertEquals(first, SlotEpoch.read(ff, slot + '/' + SlotEpoch.FILE_NAME));
+        String reset = SlotEpoch.openOrCreate(ff, slot, true);
+        assertFalse(first.equals(reset));
+        assertEquals(reset, SlotEpoch.openOrCreate(ff, slot, false));
+    }
+
+    @Test
+    public void testCleanEngineCloseEndsEpochLifecycle() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String slot = Files.createDirectory(root.resolve("clean-close-slot")).toString();
+        try (CursorSendEngine engine = new CursorSendEngine(slot, 4096)) {
+            SlotEpoch.openOrCreate(ff, slot, engine.freshFsnNamespace());
+            assertTrue(ff.exists(slot + '/' + SlotEpoch.FILE_NAME));
+        }
+        assertFalse(ff.exists(slot + '/' + SlotEpoch.FILE_NAME));
+    }
+
+    @Test
+    public void testRecoveryFindsOnlyCurrentEpochAndScopedTempCleanup() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String source = Files.createDirectory(root.resolve("recovery-source")).toString();
+        String epoch = SlotEpoch.openOrCreate(ff, source);
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, true, "zero");
+            SenderError error = rejection(0).withRejectionSpan(0, 0);
+            RejectedMiniSlotArchive.Result result = RejectedMiniSlotArchive.preserve(
+                    ff, engine, null, source, "slot-recovery", epoch, error);
+            SenderError recovered = RejectedMiniSlotArchive.findOverlapping(
+                    ff, source, "slot-recovery", epoch, 0, 0);
+            assertNotNull(recovered);
+            assertEquals(result.path, recovered.getRejectedPath());
+            assertEquals(0, recovered.getRejectedFsn());
+            assertEquals(null, RejectedMiniSlotArchive.findOverlapping(
+                    ff, source, "slot-recovery", java.util.UUID.randomUUID().toString(), 0, 0));
+
+            Path rejected = Path.of(source, "rejected");
+            Path ours = Files.createDirectory(rejected.resolve(
+                    ".tmp-slot-recovery-" + epoch + "-fsn-0-0-dead"));
+            Files.createFile(ours.resolve(RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
+            Path other = Files.createDirectory(rejected.resolve(
+                    ".tmp-other-" + epoch + "-fsn-0-0-live"));
+            RejectedMiniSlotArchive.cleanupTemporaryDirectories(
+                    ff, source, "slot-recovery", epoch);
+            assertFalse(Files.exists(ours));
+            assertTrue(Files.exists(other));
+        }
+    }
+
+    @Test
+    public void testPreservedSubsetReopensWithDictionarySupersetAndWorkingCopyKeepsArchive() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String source = Files.createDirectory(root.resolve("source")).toString();
+        String dictDir = Files.createDirectory(root.resolve("dict")).toString();
+        String epoch = SlotEpoch.openOrCreate(ff, source);
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096);
+             PersistedSymbolDict dictionary = PersistedSymbolDict.openClean(dictDir)) {
+            dictionary.appendSymbol("zero");
+            dictionary.appendSymbol("one");
+            dictionary.appendSymbol("unused-superset-entry");
+            appendDeltaFrame(engine, 0, true, "zero");
+            appendDeltaFrame(engine, 1, true, "one");
+            String serverMessage = "column mismatch ".repeat(2048);
+            SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                    SenderError.Policy.REJECT_AND_CONTINUE, 3, serverMessage, 1,
+                    0, 1, "tab", 42).withRejectionSpan(0, 1);
+            RejectedMiniSlotArchive.Result result = RejectedMiniSlotArchive.preserve(
+                    ff, engine, dictionary, source, "slot-0", epoch, error);
+            assertFalse(result.reused);
+            assertTrue(result.bytesWritten > 0);
+
+            RejectedMiniSlotArchive.Metadata metadata = RejectedMiniSlotArchive.readMetadata(ff, result.path);
+            assertEquals(0, metadata.fromFsn);
+            assertEquals(1, metadata.toFsn);
+            assertEquals(serverMessage, metadata.message);
+
+            try (MmapSegment segment = MmapSegment.openExisting(result.path + '/'
+                    + RejectedMiniSlotArchive.SEGMENT_FILE_NAME)) {
+                long second = MmapSegment.HEADER_SIZE;
+                second += MmapSegment.FRAME_HEADER_SIZE
+                        + Unsafe.getUnsafe().getInt(segment.address() + second + 4);
+                long payload = segment.address() + second + MmapSegment.FRAME_HEADER_SIZE;
+                assertEquals(0, Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
+                        & QwpConstants.FLAG_DEFER_COMMIT);
+            }
+
+            RejectedMiniSlotArchive.Result reused = RejectedMiniSlotArchive.preserve(
+                    ff, engine, dictionary, source, "slot-0", epoch, error);
+            assertTrue(reused.reused);
+
+            String working = root.resolve("working").toString();
+            RejectedMiniSlotArchive.copyToWorkingDirectory(ff, result.path, working);
+            assertTrue(ff.exists(result.path + '/' + RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
+            try (CursorSendEngine replay = new CursorSendEngine(working, 4096)) {
+                assertEquals(1, replay.publishedFsn());
+                assertEquals(-1, replay.ackedFsn());
+            }
+            assertTrue(ff.exists(result.path + '/' + RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
+        }
+    }
+
+    @Test
+    public void testSynchronousPreserverReturnsCompleteCopy() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String source = Files.createDirectory(root.resolve("sync-source")).toString();
+        String epoch = SlotEpoch.openOrCreate(ff, source);
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, true, "zero");
+            SchemaPreserver preserver = new SchemaPreserver(ff, source, "slot-sync", epoch);
+            RejectedMiniSlotArchive.Result result = preserver.preserve(engine,
+                    rejection(0), new byte[]{4, 'z', 'e', 'r', 'o'}, 1);
+            assertNotNull(RejectedMiniSlotArchive.readMetadata(ff, result.path));
+            try (PersistedSymbolDict dictionary = PersistedSymbolDict.open(ff, result.path)) {
+                assertNotNull(dictionary);
+                assertEquals(1, dictionary.size());
+            }
+        }
+    }
+
+    @Test
+    public void testSynchronousPreserverPropagatesFailure() throws Exception {
+        FilesFacade ff = FilesFacade.INSTANCE;
+        String source = Files.createDirectory(root.resolve("sync-failure")).toString();
+        String epoch = SlotEpoch.openOrCreate(ff, source);
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            SchemaPreserver preserver = new SchemaPreserver(ff, source, "slot-failure", epoch);
+            try {
+                preserver.preserve(engine, rejection(0), null, 0);
+                fail("missing source frame must fail preservation");
+            } catch (io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException expected) {
+                assertEquals(-1, engine.ackedFsn());
+            }
+        }
+    }
+
+    private static SenderError rejection(long fsn) {
+        return new SenderError(SenderError.Category.SCHEMA_MISMATCH,
+                SenderError.Policy.REJECT_AND_CONTINUE, 3, "column mismatch", fsn,
+                fsn, fsn, "tab", 42);
+    }
+
+    private static void appendDeltaFrame(CursorSendEngine engine, int deltaStart,
+                                         boolean deferred, String symbol) {
+        byte[] utf8 = symbol.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int size = QwpConstants.HEADER_SIZE + 2 + 1 + utf8.length;
+        long buf = Unsafe.malloc(size, MemoryTag.NATIVE_DEFAULT);
+        try {
+            Unsafe.getUnsafe().setMemory(buf, size, (byte) 0);
+            Unsafe.getUnsafe().putInt(buf, QwpConstants.MAGIC_MESSAGE);
+            Unsafe.getUnsafe().putByte(buf + QwpConstants.HEADER_OFFSET_FLAGS,
+                    (byte) (QwpConstants.FLAG_DELTA_SYMBOL_DICT
+                            | (deferred ? QwpConstants.FLAG_DEFER_COMMIT : 0)));
+            long p = buf + QwpConstants.HEADER_SIZE;
+            Unsafe.getUnsafe().putByte(p, (byte) deltaStart);
+            Unsafe.getUnsafe().putByte(p + 1, (byte) 1);
+            Unsafe.getUnsafe().putByte(p + 2, (byte) utf8.length);
+            Unsafe.getUnsafe().copyMemory(utf8, Unsafe.BYTE_OFFSET, null, p + 3, utf8.length);
+            engine.appendBlocking(buf, size);
+        } finally {
+            Unsafe.free(buf, size, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+}

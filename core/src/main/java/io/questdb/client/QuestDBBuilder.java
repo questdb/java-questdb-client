@@ -72,6 +72,9 @@ public final class QuestDBBuilder {
     private SenderConnectionListener connectionListener;
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
+    private SenderError.Policy schemaMismatchPolicy = SenderError.Policy.REJECT_AND_CONTINUE;
+    private boolean dlqEnabled = true;
+    private String dlqDir;
     private long housekeeperIntervalMillis = UNSET;
     private HttpTokenProvider httpTokenProvider;
     private String config;
@@ -167,6 +170,41 @@ public final class QuestDBBuilder {
     }
 
     /**
+         * Select schema-mismatch handling. REJECT_AND_CONTINUE fails the owning
+         * handle and retires its rejected prefix; the underlying slot continues.
+         * TERMINAL retains queued frames and halts the slot.
+         */
+    public QuestDBBuilder schemaMismatchPolicy(SenderError.Policy policy) {
+        if (policy != SenderError.Policy.TERMINAL && policy != SenderError.Policy.REJECT_AND_CONTINUE) {
+            throw new IllegalArgumentException("schema mismatch policy must be TERMINAL or REJECT_AND_CONTINUE");
+        }
+        schemaMismatchPolicy = policy;
+        return this;
+    }
+
+    /**
+         * Enable preserved copies before schema retirement (default: enabled for disk queues).
+         * Disabling preservation accepts permanent loss of retired rows.
+         */
+    public QuestDBBuilder dlqEnabled(boolean enabled) {
+        dlqEnabled = enabled;
+        return this;
+    }
+
+    /**
+         * Set the raw-copy base directory, including for memory-only queues.
+         * Copies live under directory/slot/rejected and are never automatically deleted.
+         * The asynchronous error names the completed directory.
+         */
+    public QuestDBBuilder dlqDirectory(String directory) {
+        if (directory == null || directory.isEmpty()) {
+            throw new IllegalArgumentException("DLQ directory must not be empty");
+        }
+        dlqDir = directory;
+        return this;
+    }
+
+    /**
      * Builds the {@link QuestDB} handle. Validates both connect strings up
      * front -- so a malformed config fails here even when both pools have
      * {@code min == 0} and nothing connects -- then eagerly creates {@code min}
@@ -235,10 +273,10 @@ public final class QuestDBBuilder {
                 maxLifetimeMillis,
                 housekeeperIntervalMillis,
                 queryCloseTimeoutMillis,
-                httpTokenProvider,
+                null, null, httpTokenProvider,
                 errorHandler,
                 connectionListener,
-                drainerListener
+                drainerListener, schemaMismatchPolicy, dlqEnabled, dlqDir
         );
     }
 

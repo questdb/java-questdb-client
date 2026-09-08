@@ -32,6 +32,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -104,6 +106,9 @@ public final class SenderErrorDispatcher implements QuietCloseable {
     // the sole producer, the dispatcher is the sole consumer; close() also
     // enqueues POISON, but only once and under `lock`.
     private final LinkedBlockingDeque<SenderError> inbox;
+    private final ArrayBlockingQueue<SenderError> schemaInbox = new ArrayBlockingQueue<>(DEFAULT_CAPACITY);
+    // Includes the callback currently executing; ordinary deque overflow cannot evict these.
+    private final AtomicInteger schemaPending = new AtomicInteger();
     // Threads are started lazily under this monitor; takes the same role as
     // SegmentManager.start() — first offer() that observes a null thread
     // wins the race to spawn it.
@@ -162,7 +167,7 @@ public final class SenderErrorDispatcher implements QuietCloseable {
             //noinspection ResultOfMethodCallIgnored
             inbox.offer(POISON);
             Thread t = dispatcherThread;
-            if (t != null) {
+            if (t != null && t != Thread.currentThread()) {
                 long deadline = System.nanoTime() + DRAIN_DEADLINE_NANOS;
                 long remainingMillis;
                 while ((remainingMillis = (deadline - System.nanoTime()) / 1_000_000L) > 0) {
@@ -306,11 +311,38 @@ public final class SenderErrorDispatcher implements QuietCloseable {
         return true;
     }
 
+    /** Retains a schema notification without dropping; false leaves retirement pending. */
+    public boolean tryOfferSchema(SenderError error) {
+        if (closed || error == null) {
+            return false;
+        }
+        int count;
+        do {
+            count = schemaPending.get();
+            if (count >= DEFAULT_CAPACITY) {
+                return false;
+            }
+        } while (!schemaPending.compareAndSet(count, count + 1));
+        if (closed || !schemaInbox.offer(error)) {
+            schemaPending.decrementAndGet();
+            return false;
+        }
+        startDispatcherIfNeeded();
+        return true;
+    }
+
+    public int getPendingSchemaNotifications() {
+        return schemaPending.get();
+    }
+
     private void dispatchLoop() {
-        while (!closed || !inbox.isEmpty()) {
-            SenderError err;
+        while (!closed || !inbox.isEmpty() || !schemaInbox.isEmpty()) {
+            SenderError err = schemaInbox.poll();
+            boolean schema = err != null;
             try {
-                err = inbox.poll(100, TimeUnit.MILLISECONDS);
+                if (err == null) {
+                    err = inbox.poll(10, TimeUnit.MILLISECONDS);
+                }
             } catch (InterruptedException e) {
                 if (closed) {
                     return;
@@ -344,6 +376,10 @@ public final class SenderErrorDispatcher implements QuietCloseable {
                 h.onError(err);
             } catch (Throwable t) {
                 LOG.error("SenderErrorHandler threw on {}: {}", err, t.getMessage(), t);
+            } finally {
+                if (schema) {
+                    schemaPending.decrementAndGet();
+                }
             }
         }
     }

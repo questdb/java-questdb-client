@@ -699,6 +699,59 @@ public final class PersistedSymbolDict implements QuietCloseable {
     }
 
     /**
+     * Copies the complete committed dictionary prefix into a fresh dictionary
+     * file under {@code targetDir} and makes that copy durable. The source
+     * monitor is held while the prefix boundary and bytes are copied, so a
+     * concurrent symbol append is wholly before or wholly after the snapshot.
+     *
+     * @return number of bytes written, including the dictionary header
+     */
+    public synchronized long snapshotTo(String targetDir) {
+        if (closed) {
+            throw new IllegalStateException("symbol dictionary is closed");
+        }
+        String targetPath = targetDir + "/" + FILE_NAME;
+        int targetFd = ff.openRWExclusive(targetPath);
+        if (targetFd < 0) {
+            throw new SfOperationalException("could not create symbol dictionary snapshot " + targetPath);
+        }
+        long copyLen = appendOffset;
+        long scratch = 0L;
+        boolean success = false;
+        try {
+            if (!ff.allocate(targetFd, copyLen)) {
+                throw new SfOperationalException("could not allocate symbol dictionary snapshot " + targetPath);
+            }
+            int scratchSize = (int) Math.min(64 * 1024L, Math.max(copyLen, 1L));
+            scratch = Unsafe.malloc(scratchSize, MemoryTag.NATIVE_DEFAULT);
+            long offset = 0L;
+            while (offset < copyLen) {
+                int chunk = (int) Math.min(scratchSize, copyLen - offset);
+                if (ff.read(fd, scratch, chunk, offset) != chunk) {
+                    throw new SfOperationalException("short read copying symbol dictionary " + filePath);
+                }
+                if (ff.write(targetFd, scratch, chunk, offset) != chunk) {
+                    throw new SfOperationalException("short write copying symbol dictionary snapshot " + targetPath);
+                }
+                offset += chunk;
+            }
+            if (ff.fsync(targetFd) != 0) {
+                throw new SfOperationalException("could not sync symbol dictionary snapshot " + targetPath);
+            }
+            success = true;
+            return copyLen;
+        } finally {
+            if (scratch != 0L) {
+                Unsafe.free(scratch, (int) Math.min(64 * 1024L, Math.max(copyLen, 1L)), MemoryTag.NATIVE_DEFAULT);
+            }
+            ff.close(targetFd);
+            if (!success) {
+                ff.remove(targetPath);
+            }
+        }
+    }
+
+    /**
      * Base address of the loaded entry region -- the concatenated
      * {@code [len][utf8]} bytes of every recovered symbol in id order, exactly as a
      * delta section carries them (chunk headers and CRCs stripped). Zero when

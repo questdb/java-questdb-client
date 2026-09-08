@@ -29,6 +29,7 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderConnectionEvent;
 import io.questdb.client.SenderConnectionListener;
 import io.questdb.client.SenderError;
+import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderErrorHandler;
 import io.questdb.client.SenderProgressHandler;
 import io.questdb.client.cairo.TableUtils;
@@ -39,10 +40,13 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaRejectionState;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderConnectionListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.DefaultSenderErrorHandler;
@@ -404,6 +408,14 @@ public class QwpWebSocketSender implements Sender {
     // explicit flush() triggers the server-side commit. Enables accumulating
     // arbitrarily large datasets that exceed the server's recv buffer.
     private boolean transactional;
+    private SenderError.Policy schemaMismatchPolicy = SenderError.Policy.REJECT_AND_CONTINUE;
+    private boolean dlqEnabled = true;
+    private String dlqDir;
+    private SchemaPreserver schemaPreserver;
+    private final SchemaRejectionState schemaRejectionState = new SchemaRejectionState();
+    private long schemaLeaseGeneration;
+    private boolean schemaLeaseStarted;
+    private LineSenderServerException observedSchemaFailure;
     // Server-advertised hard cap on QWP ingest payload bytes, captured from
     // X-QWP-Max-Batch-Size on each successful FOREGROUND handshake (a
     // background drainer's endpoint cap is irrelevant to the producer's wire). 0 when the server
@@ -891,6 +903,36 @@ public class QwpWebSocketSender implements Sender {
             long poisonMinEscalationWindowMillis,
             long catchUpCapGapMinEscalationWindowMillis
     ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes, autoFlushIntervalNanos, authorizationHeaderSupplier, requestDurableAck, cursorEngine, closeFlushTimeoutMillis, reconnectMaxDurationMillis, reconnectInitialBackoffMillis, reconnectMaxBackoffMillis, initialConnectMode, errorHandler, errorInboxCapacity, durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs, connectionListener, connectionListenerInboxCapacity, maxFrameRejections, poisonMinEscalationWindowMillis, catchUpCapGapMinEscalationWindowMillis,
+                SenderError.Policy.REJECT_AND_CONTINUE, true, null, false);
+    }
+
+    public static QwpWebSocketSender connectWithCredentialSupplier(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            Supplier<String> authorizationHeaderSupplier,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis,
+            SenderError.Policy schemaMismatchPolicy, boolean dlqEnabled, String dlqDir, boolean transactional
+    ) {
         QwpWebSocketSender sender = new QwpWebSocketSender(
                 endpoints, tlsConfig,
                 autoFlushRows, autoFlushBytes, autoFlushIntervalNanos,
@@ -922,6 +964,8 @@ public class QwpWebSocketSender implements Sender {
             if (cursorEngine != null) {
                 sender.setCursorEngine(cursorEngine, true);
             }
+            sender.setTransactional(transactional);
+            sender.configureSchemaMismatch(schemaMismatchPolicy, dlqEnabled, dlqDir);
             sender.ensureConnected();
         } catch (Throwable t) {
             // Preserve t's IDENTITY through the rollback. Sender.build() routes on the
@@ -1323,7 +1367,8 @@ public class QwpWebSocketSender implements Sender {
         // SenderError HALTs (server-side rejections like MESSAGE_TOO_BIG,
         // SCHEMA_MISMATCH HALT) from users who only call close() and
         // never call flush() afterwards.
-        Throwable terminalError = null;
+        boolean schemaFailedOnClose = hasOwnedSchemaFailure();
+        Throwable terminalError = schemaFailedOnClose ? releaseFailedSchemaLease() : null;
         // Snapshot the exact terminal error instance that a user-thread
         // API call ALREADY caught (via flush()/at()) before close() ran.
         // If flushPendingRows/drainOnClose below also rethrow the same
@@ -1343,7 +1388,7 @@ public class QwpWebSocketSender implements Sender {
             // Only drain when both the engine and the I/O loop are wired
             // up — close() is also called from createForTesting() teardown
             // and from connect() rollback paths where one or both may be null.
-            if (connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
+            if (!schemaFailedOnClose && connectionError.get() == null && cursorEngine != null && cursorSendLoop != null) {
                 // 1) Flush user-thread state into the engine (encoded
                 //    rows -> mmap'd / malloc'd ring). After this, the
                 //    cursor engine's publishedFsn reflects the final
@@ -2166,6 +2211,33 @@ public class QwpWebSocketSender implements Sender {
         return deltaDictEnabled;
     }
 
+    /** Frames resolved locally after schema rejection; these were not accepted by the server. */
+    public long getSchemaFramesRetired() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        return loop == null ? 0 : loop.getSchemaFramesRetired();
+    }
+
+    public long getSchemaRejections() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        return loop == null ? 0 : loop.getSchemaRejections();
+    }
+
+    public long getDlqWriteFailures() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        return loop == null ? 0 : loop.getDlqWriteFailures();
+    }
+
+    public long getDlqFilesWritten() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        return loop == null ? 0 : loop.getDlqFilesWritten();
+    }
+
+    /** Cumulative preserved bytes. Monitor together with destination free space. */
+    public long getDlqBytesWritten() {
+        CursorWebSocketSendLoop loop = cursorSendLoop;
+        return loop == null ? 0 : loop.getDlqBytesWritten();
+    }
+
     /**
      * Total binary frames whose ACKs have been received and applied.
      */
@@ -2678,6 +2750,11 @@ public class QwpWebSocketSender implements Sender {
                     progressHandler, SenderProgressDispatcher.DEFAULT_CAPACITY);
         }
         loop.setConnectionDispatcher(connectionDispatcher);
+        if (!schemaLeaseStarted) {
+            beginSchemaLease(0L);
+        }
+        loop.setSchemaRejectionState(schemaRejectionState);
+        loop.setSchemaMismatchPolicy(schemaMismatchPolicy);
         loop.setErrorDispatcher(errorDispatcher);
         loop.setProgressDispatcher(progressDispatcher);
     }
@@ -2736,6 +2813,129 @@ public class QwpWebSocketSender implements Sender {
                     + MIN_ERROR_INBOX_CAPACITY + ", was " + capacity);
         }
         this.errorInboxCapacity = capacity;
+    }
+
+    /** Internal recovery barrier: local retirement counts as progress, never acceptance. */
+    public boolean drainResolved(long timeoutMillis) {
+        if (closed) {
+            throw new LineSenderException("Sender is closed");
+        }
+        if (cursorEngine == null) {
+            return true;
+        }
+        long target = cursorEngine.publishedFsn();
+        long deadline = System.nanoTime() + Math.max(0L, timeoutMillis) * 1_000_000L;
+        while (cursorEngine.ackedFsn() < target) {
+            if (closed) {
+                throw new LineSenderException("Sender is closed");
+            }
+            cursorEngine.checkDurability();
+            if (cursorSendLoop != null) {
+                cursorSendLoop.checkError();
+            }
+            if (timeoutMillis <= 0 || System.nanoTime() >= deadline) {
+                return false;
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+        }
+        return true;
+    }
+
+    /** Internal pool lifecycle: end the initial standalone observation before borrowing. */
+    public void prepareSchemaPoolSlot() {
+        if (schemaLeaseStarted) {
+            schemaRejectionState.endLease(schemaLeaseGeneration, publishedSchemaFsn());
+        }
+    }
+
+    public void beginSchemaLease(long generation) {
+        schemaLeaseGeneration = generation;
+        observedSchemaFailure = null;
+        schemaRejectionState.beginLease(generation, publishedSchemaFsn() + 1, transactional);
+        schemaLeaseStarted = true;
+    }
+
+    public LineSenderServerException endSchemaLease() {
+        if (schemaLeaseStarted) {
+            LineSenderServerException failure = schemaRejectionState.endLease(
+                    schemaLeaseGeneration, publishedSchemaFsn());
+            return failure == observedSchemaFailure ? null : failure;
+        }
+        return null;
+    }
+
+    public boolean hasOwnedSchemaFailure() {
+        return schemaLeaseStarted && schemaRejectionState.hasOwnedFailure(schemaLeaseGeneration);
+    }
+
+    /** Discards only this failed producer's local work; the queue remains usable. */
+    public LineSenderServerException releaseFailedSchemaLease() {
+        LineSenderServerException failure = schemaRejectionState.ownedFailure(
+                schemaLeaseGeneration, publishedSchemaFsn());
+        resetTableBuffersAfterFlush();
+        if (activeBuffer != null) {
+            activeBuffer.reset();
+        }
+        hasDeferredMessages = false;
+        endSchemaLease();
+        return failure == observedSchemaFailure ? null : failure;
+    }
+
+    /** Pool return must not hide a storage or transport failure behind a lease-local rejection. */
+    public void checkSchemaSlotHealth() {
+        LineSenderException failure = connectionError.get();
+        if (failure != null) {
+            throw failure;
+        }
+        if (cursorEngine != null) {
+            cursorEngine.checkDurability();
+        }
+        if (cursorSendLoop != null) {
+            cursorSendLoop.checkError();
+        }
+    }
+
+    private long publishedSchemaFsn() {
+        return cursorEngine == null ? -1L : cursorEngine.publishedFsn();
+    }
+
+    private void checkSchemaFailure() {
+        if (hasOwnedSchemaFailure()) {
+            LineSenderServerException failure = schemaRejectionState.ownedFailure(
+                    schemaLeaseGeneration, publishedSchemaFsn());
+            if (failure != null) {
+                observedSchemaFailure = failure;
+                throw failure;
+            }
+        }
+    }
+
+    /** Configure before connecting so recovered data uses the selected policy. */
+    public void configureSchemaMismatch(SenderError.Policy policy, boolean preserve, String directory) {
+        if (policy != SenderError.Policy.TERMINAL && policy != SenderError.Policy.REJECT_AND_CONTINUE) {
+            throw new IllegalArgumentException("schema mismatch policy must be TERMINAL or REJECT_AND_CONTINUE");
+        }
+        this.schemaMismatchPolicy = policy;
+        this.dlqEnabled = preserve;
+        this.dlqDir = directory;
+        if (policy == SenderError.Policy.REJECT_AND_CONTINUE && preserve
+                && cursorEngine != null && (cursorEngine.sfDir() != null || directory != null)) {
+            String source = cursorEngine.sfDir();
+            String slotId = source == null ? "memory" : java.nio.file.Paths.get(source).getFileName().toString();
+            String epoch = source == null ? java.util.UUID.randomUUID().toString()
+                    : SlotEpoch.openOrCreate(io.questdb.client.std.FilesFacade.INSTANCE, source, cursorEngine.freshFsnNamespace());
+            String destination = directory == null ? source : java.nio.file.Paths.get(directory, slotId).toString();
+            try {
+                java.nio.file.Files.createDirectories(java.nio.file.Paths.get(destination));
+            } catch (java.io.IOException e) {
+                throw new LineSenderException(e).put("could not create schema preservation destination ").put(destination);
+            }
+            SchemaPreserver.probeDestination(io.questdb.client.std.FilesFacade.INSTANCE, destination);
+            io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive.cleanupTemporaryDirectories(
+                    io.questdb.client.std.FilesFacade.INSTANCE, destination, slotId, epoch);
+            schemaPreserver = new SchemaPreserver(io.questdb.client.std.FilesFacade.INSTANCE,
+                    destination, slotId, epoch);
+        }
     }
 
     public void setTransactional(boolean transactional) {
@@ -2881,6 +3081,7 @@ public class QwpWebSocketSender implements Sender {
                             poisonMinEscalationWindowMillis,
                             catchUpCapGapMinEscalationWindowMillis);
             ref[0] = drainer;
+            drainer.configureSchemaMismatch(schemaMismatchPolicy, dlqEnabled, dlqDir, errorHandler);
             drainerPool.submit(drainer);
         }
     }
@@ -3647,6 +3848,7 @@ public class QwpWebSocketSender implements Sender {
     }
 
     private void checkConnectionError() {
+        checkSchemaFailure();
         LineSenderException error = connectionError.get();
         if (error != null) {
             // Refresh the stack so subsequent public API calls point at the
@@ -4078,6 +4280,12 @@ public class QwpWebSocketSender implements Sender {
             if (errorDispatcher == null) {
                 errorDispatcher = new SenderErrorDispatcher(errorHandler, errorInboxCapacity);
             }
+            if (!schemaLeaseStarted) {
+                beginSchemaLease(0L);
+            }
+            cursorSendLoop.setSchemaRejectionState(schemaRejectionState);
+            cursorSendLoop.setSchemaMismatchPolicy(schemaMismatchPolicy);
+            cursorSendLoop.setSchemaPreserver(schemaPreserver);
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the

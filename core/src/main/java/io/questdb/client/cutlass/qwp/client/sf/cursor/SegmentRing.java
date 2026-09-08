@@ -1299,6 +1299,21 @@ public final class SegmentRing implements QuietCloseable {
         return segment;
     }
 
+    synchronized int liveFramePayloadLength(long fsn) {
+        MmapSegment segment = findSegmentContaining0(fsn);
+        return segment == null ? -1 : segment.liveFramePayloadLength(fsn);
+    }
+
+    synchronized boolean copyLiveFrame(long fsn, long dstAddr, int dstCapacity) {
+        MmapSegment segment = findSegmentContaining0(fsn);
+        return segment != null && segment.copyLiveFrame(fsn, dstAddr, dstCapacity);
+    }
+
+    synchronized int liveQwpFrameFlags(long fsn) {
+        MmapSegment segment = findSegmentContaining0(fsn);
+        return segment == null ? -1 : segment.liveQwpFrameFlags(fsn);
+    }
+
     /**
      * Oldest sealed segment, or {@code null} if the sealed list is empty.
      * Used by the I/O loop's "current was trimmed out from under us"
