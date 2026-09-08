@@ -142,14 +142,14 @@ public class QwpWebSocketSender implements Sender {
     // on by default so a long-lived sender's dictionary does not grow without
     // bound.
     public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
-    // Default for symbol_dict_reset_max_wait_millis: once a recycle has been
-    // armed longer than this window without an opportunistic (idle) drain,
-    // the next row-start call (table()) blocks the calling thread for up to
-    // this many millis waiting for the backlog to drain, then recycles; on
-    // timeout that call gives up (still armed, retried opportunistically
-    // later) instead of blocking further. 0 disables blocking entirely --
-    // opportunistic-only.
-    public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 30_000L;
+    // Default for symbol_dict_reset_max_wait_millis: 0 -- opportunistic-only.
+    // The recycle runs only when a table() call finds the backlog already
+    // drained; it never blocks the producing thread. A positive value is an
+    // explicit opt-in: once a recycle has been armed longer than that window
+    // without an opportunistic drain, the next table() call blocks for up to
+    // that many millis waiting for the backlog to drain, then recycles; on
+    // timeout that call gives up (still armed, retried opportunistically).
+    public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 0L;
     // Default for symbol_dict_reset_threshold: distinct-symbol count that
     // triggers a recycle once symbol_dict_reset is on.
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
@@ -2492,7 +2492,6 @@ public class QwpWebSocketSender implements Sender {
      * {@link #armIfEligible()} at the tail of every flush (and immediately by
      * {@link #resetSymbolDictionary()} when no row or flush is in progress).
      */
-    @TestOnly
     public boolean isResetArmed() {
         return resetArmed;
     }

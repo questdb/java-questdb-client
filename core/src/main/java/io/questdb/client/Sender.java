@@ -1953,19 +1953,28 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Upper bound, in milliseconds, on how long a triggered symbol-dictionary
          * recycle stays armed before it may block the calling thread to force
-         * progress. Once a recycle has been armed for longer than this window
-         * without an opportunistic (idle) drain, the NEXT row-start call
-         * ({@code table(...)}) blocks the calling thread for up to this many
-         * millis waiting for the outstanding backlog to drain, then recycles
-         * before returning. If the backlog still has not drained by the
-         * deadline, that call gives up (logging a warning) and returns without
-         * blocking further -- the recycle stays armed and is retried
-         * opportunistically on a later {@code table(...)} call that happens to
-         * find the backlog already drained. {@code 0} disables blocking
-         * entirely (opportunistic-only): the recycle then only ever runs when a
-         * {@code table(...)} call finds the backlog already drained on its own.
+         * progress. {@code 0} -- the default -- disables blocking entirely
+         * (opportunistic-only): the recycle then only ever runs when a
+         * {@code table(...)} call finds the backlog already drained on its own,
+         * and under sustained load it may be deferred indefinitely.
          * <p>
-         * Default {@code 30_000} (30 s). WebSocket transport only.
+         * A positive value is an explicit trade: once a recycle has been armed
+         * for longer than this window without an opportunistic (idle) drain, the
+         * NEXT row-start call ({@code table(...)}) BLOCKS the producing thread
+         * for up to this many millis waiting for the outstanding backlog to
+         * drain, then recycles before returning. If the backlog still has not
+         * drained by the deadline, that call gives up (logging a warning) and
+         * the recycle stays armed for a later opportunistic retry. At most one
+         * blocking wait happens per armed window.
+         * <p>
+         * To detect a recycle that never finds its drained instant at the
+         * default, sample {@code QwpWebSocketSender.isResetArmed()} together
+         * with {@code getSymbolDictEpoch()}: armed staying {@code true} while
+         * the epoch does not advance means no row start ever observes a drained
+         * backlog. Either pass a positive value here, or drain explicitly
+         * ({@code drain(...)}) at a quiet point of your choosing.
+         * <p>
+         * Default {@code 0} (opportunistic-only). WebSocket transport only.
          */
         public LineSenderBuilder symbolDictResetMaxWaitMillis(long maxWaitMillis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {
