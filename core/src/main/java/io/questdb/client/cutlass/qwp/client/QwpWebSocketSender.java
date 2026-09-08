@@ -5234,24 +5234,37 @@ public class QwpWebSocketSender implements Sender {
                     + recycleDeferredCloseMaxWaitMillis * 1_000_000L;
         }
         // Same interrupt policy as maybeBlockForStarvedReset: clear per park
-        // iteration, restore on the throw exit, swallow on the completed exit.
+        // iteration, restore on ALL throw exits (the deadline throw included
+        // -- LineSenderException is a RuntimeException, so the catch below
+        // covers it too; a stray throw from isCloseCompleted() or
+        // ensureFlockReleaseRetryScheduled() is covered the same way), and
+        // swallow on the completed exit.
         boolean wasInterrupted = false;
-        while (!outgoing.isCloseCompleted()) {
-            outgoing.ensureFlockReleaseRetryScheduled();
-            if (System.nanoTime() >= recycleDeferredCloseDeadlineNanos) {
-                retainedEngine = outgoing;
-                slotLockReleased = false;
-                if (wasInterrupted) {
-                    Thread.currentThread().interrupt();
+        try {
+            while (!outgoing.isCloseCompleted()) {
+                outgoing.ensureFlockReleaseRetryScheduled();
+                if (System.nanoTime() >= recycleDeferredCloseDeadlineNanos) {
+                    retainedEngine = outgoing;
+                    slotLockReleased = false;
+                    throw new LineSenderException("symbol dictionary recycle could not yet reclaim "
+                            + "its slot: the engine's deferred close did not release the "
+                            + "slot lock within " + recycleDeferredCloseMaxWaitMillis
+                            + " ms (SF worker stalled); the recycle stays pending and is retried "
+                            + "on the next send");
                 }
-                throw new LineSenderException("symbol dictionary recycle could not yet reclaim "
-                        + "its slot: the engine's deferred close did not release the "
-                        + "slot lock within " + recycleDeferredCloseMaxWaitMillis
-                        + " ms (SF worker stalled); the recycle stays pending and is retried "
-                        + "on the next send");
+                java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
+                wasInterrupted |= Thread.interrupted();
             }
-            java.util.concurrent.locks.LockSupport.parkNanos(50_000L);
-            wasInterrupted |= Thread.interrupted();
+        } catch (Error e) {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
+        } catch (RuntimeException e) {
+            if (wasInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
         }
         recycleDeferredCloseDeadlineNanos = Long.MIN_VALUE;
     }
