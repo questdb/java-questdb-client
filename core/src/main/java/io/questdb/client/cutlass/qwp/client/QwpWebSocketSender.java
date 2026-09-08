@@ -543,6 +543,10 @@ public class QwpWebSocketSender implements Sender {
     // catch that closes and nulls the fresh loop, i.e. the failed-reconnect
     // state SymbolDictRecycleStep7FaultTest pins.
     private Runnable loopStartFault;
+    // Test seam: runs between the CLOSE_LOOP resume's chunk publish and its
+    // commit, so a commit-path failure is reachable deterministically.
+    @TestOnly
+    private volatile Runnable resumeCommitFaultForTesting;
     // Incremented once per completed symbol-dictionary recycle. 0 until the
     // first recycle commits. volatile: this is public API (see
     // getSymbolDictEpoch()), and a monitoring thread is its obvious reader.
@@ -2277,6 +2281,39 @@ public class QwpWebSocketSender implements Sender {
     @TestOnly
     public CursorSendEngine getCursorEngineForTesting() {
         return cursorEngine;
+    }
+
+    @TestOnly
+    public int getSentMaxSymbolIdForTesting() {
+        return sentMaxSymbolId;
+    }
+
+    @TestOnly
+    public boolean hasDeferredMessagesForTesting() {
+        return hasDeferredMessages;
+    }
+
+    /**
+     * Fabricates the state a step-2 close failure leaves behind -- an
+     * abandoned recycle parked at CLOSE_LOOP -- on a loop that is genuinely
+     * closed, so the resume's re-close converges instantly instead of
+     * depending on the interrupt race the Assume-gated abandon test drives.
+     * The loop reference is deliberately KEPT (the resume re-closes it).
+     */
+    @TestOnly
+    public void forceCloseLoopAbandonForTesting() {
+        if (cursorSendLoop == null) {
+            throw new IllegalStateException("connect and publish first: the CLOSE_LOOP arm needs a loop");
+        }
+        cursorSendLoop.close();
+        hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
+        connected = false;
+        recycleResume = RecycleResume.CLOSE_LOOP;
+    }
+
+    @TestOnly
+    public void setResumeCommitFaultForTesting(Runnable fault) {
+        this.resumeCommitFaultForTesting = fault;
     }
 
     /**
@@ -5734,22 +5771,60 @@ public class QwpWebSocketSender implements Sender {
             hasLoopEverConnected |= cursorSendLoop.hasEverConnected();
             cursorSendLoop = null;
             client = null;
-            // The dead loop took its catch-up mirror with it. The fresh loop
-            // ensureConnected() builds next seeds its mirror only from the
-            // engine's construction-time recovered dictionary (recoveredSize():
-            // 0 for an engine built on an empty slot, N for one that recovered
-            // a slot at Sender.build()), never from what the dead loop had
-            // already shipped. sentMaxSymbolId is the producer's model of the
-            // loop's coverage (it normally survives a reconnect precisely
-            // because the SAME loop re-registers from its mirror), so it has to
-            // drop with the mirror; a recovered engine's N-entry prefix is
-            // re-shipped once and discarded as already known. Nothing is
-            // invalidated by the drop: the barrier proved the ring drained
-            // before step 2, and every publish path runs ensureConnected() --
-            // hence this resume -- first, so no frame referencing those ids can
-            // be waiting to replay.
-            sentMaxSymbolId = -1;
+            // The dead loop took its catch-up mirror with it, but the ring can
+            // carry what the mirror had: re-register [0..sentMaxSymbolId] as
+            // deferred dictionary chunks plus the commit that closes their
+            // group -- the same shape the chunk fallback ships. The fresh loop
+            // ensureConnected() builds next replays them in order ahead of any
+            // data frame, so the server's dictionary is rebuilt before a row
+            // can reference an old id, and the baseline survives instead of
+            // degrading every later flush to a full re-registration (which a
+            // dictionary over the server batch cap can never ship at all).
+            // recycleResume is cleared BEFORE the publish: a throw below must
+            // degrade to the plain baseline drop, never leave this arm
+            // reachable with a null loop.
             recycleResume = RecycleResume.NONE;
+            if (deltaDictEnabled && serverMaxBatchSize > 0 && sentMaxSymbolId >= 0) {
+                Runnable commitFault = resumeCommitFaultForTesting;
+                try {
+                    publishDictionaryChunks(serverMaxBatchSize, 0, sentMaxSymbolId);
+                    if (commitFault != null) {
+                        commitFault.run();
+                    }
+                    sendCommitMessage();
+                    // sentMaxSymbolId is KEPT: the ring now carries what the
+                    // dead loop's mirror had.
+                } catch (Error e) {
+                    // publishDictionaryChunks closed its own chunk debt before
+                    // rethrowing. Drop the baseline too: a survivor would see
+                    // a kept watermark ahead of the ring's partial coverage,
+                    // and the next flush would trip the server's gap check.
+                    sentMaxSymbolId = -1;
+                    throw e;
+                } catch (Throwable t) {
+                    // Cap rejection, seal/buffer-recycle timeout, or
+                    // appendBlocking's backpressure deadline (no drainer is
+                    // attached here, so a full ring parks until the deadline):
+                    // degrade to the plain baseline drop. A failure of
+                    // sendCommitMessage itself is NOT covered by
+                    // publishDictionaryChunks' internal orphan handling (that
+                    // fires only when a chunk publish throws), so close the
+                    // deferred group's commit debt here -- an open group would
+                    // clamp ackedFsn for the connection's whole life.
+                    if (hasDeferredMessages) {
+                        commitOrphanedDictionaryChunks(t);
+                    }
+                    sentMaxSymbolId = -1;
+                    LOG.warn("symbol dictionary re-registration after an abandoned recycle "
+                            + "failed; falling back to a full re-registration on the next "
+                            + "flush [epoch={}]", symbolDictEpoch, t);
+                }
+            } else {
+                // Full-dict mode has no cross-batch dictionary state to
+                // preserve, and an unknown server cap cannot size chunks:
+                // same drop as before.
+                sentMaxSymbolId = -1;
+            }
             return;
         }
         // REBUILD
@@ -6068,10 +6143,11 @@ public class QwpWebSocketSender implements Sender {
      * whole, in order, and {@code RecoveredFrameAnalysis} folds the chunks' deltas
      * before it reaches the data frames.
      * <p>
-     * The baseline is deliberately NOT persisted into {@code sentMaxSymbolId}: full-dict
-     * mode carries no cross-batch dictionary state, so every batch re-registers. That
-     * keeps the bandwidth cost full-dict mode already accepts, and keeps each batch
-     * independently replayable.
+     * For the full-dict caller the baseline is deliberately NOT persisted into
+     * {@code sentMaxSymbolId}: full-dict mode carries no cross-batch dictionary
+     * state, so every batch re-registers. The delta-mode caller (the CLOSE_LOOP
+     * resume) keeps its baseline itself -- these chunks re-register exactly the
+     * ids that baseline already covers.
      * <p>
      * All-or-nothing in both directions. Every entry is validated against the cap
      * BEFORE any chunk is published, so a symbol too large to ship at all throws with
@@ -6080,7 +6156,13 @@ public class QwpWebSocketSender implements Sender {
      * publishes a chunk either.
      */
     private void publishDictionaryChunks(int cap, int from, int batchMaxId) {
-        assert !deltaDictEnabled;
+        // Delta-mode callers (the CLOSE_LOOP resume re-registration) may only
+        // ship ids the write-ahead persist already made durable -- guaranteed
+        // by persistNewSymbolsBeforePublish's ordering. The full-dict fallback
+        // caller and the degraded delta->full state (a persist failure flipped
+        // deltaDictEnabled off while pd froze) ship self-sufficient chunk
+        // groups and carry no such contract.
+        assert !deltaDictEnabled || isChunkRangeDurable(batchMaxId);
         // Pass one: prove every entry is shippable on its own, before anything
         // reaches the ring. A symbol wider than the cap cannot be split across
         // frames, so it can never be registered and the batch is unshippable --
@@ -6139,6 +6221,14 @@ public class QwpWebSocketSender implements Sender {
             LOG.debug("Registered symbol dictionary in chunks [from={}, to={}, cap={}]",
                     from, batchMaxId, cap);
         }
+    }
+
+    private boolean isChunkRangeDurable(int batchMaxId) {
+        if (cursorEngine == null) {
+            return true;
+        }
+        PersistedSymbolDict pd = cursorEngine.getPersistedSymbolDict();
+        return pd == null || pd.size() > batchMaxId;
     }
 
     /**

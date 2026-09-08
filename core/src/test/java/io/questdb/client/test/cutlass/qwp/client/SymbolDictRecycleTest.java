@@ -743,6 +743,64 @@ public class SymbolDictRecycleTest {
     }
 
     /**
+     * A CLOSE_LOOP abandon must not degrade every later flush to a full
+     * re-registration (which a dictionary over the server batch cap can never
+     * ship at all). The resume re-registers [0..sentMaxSymbolId] as deferred
+     * dictionary chunks plus the commit that closes their group; the fresh
+     * loop replays them ahead of any data frame, so the first data frame
+     * keeps its delta baseline.
+     */
+    @Test(timeout = 60_000L)
+    public void testCloseLoopAbandonReregistersBaseline() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("close-loop-rereg").toString();
+            ChunkCaptureHandler handler = new ChunkCaptureHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                // The CLOSE_LOOP resume's re-registration only sizes chunks when
+                // serverMaxBatchSize > 0 (see resumeRecycleIfPending); an
+                // unadvertised cap degrades to the plain baseline drop, same as
+                // full-dict mode. Advertise a generous cap so this test actually
+                // exercises the re-registration path (precedent: CloseDrainTest).
+                server.setAdvertisedMaxBatchSize(4096);
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir + ";";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    Assert.assertTrue("precondition: SF slot must give delta mode",
+                            ws.isDeltaDictEnabledForTest());
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 2L).atNow();
+                    sender.flush();
+                    Assert.assertTrue("setup: baseline must be established", sender.drain(5_000));
+                    int n = ws.getSentMaxSymbolIdForTesting();
+                    Assert.assertTrue("setup: delta baseline advanced", n >= 0);
+
+                    ws.forceCloseLoopAbandonForTesting();
+
+                    // The resume runs at this table() call: chunks + commit go on
+                    // the ring; the row's NEW symbol makes the data frame carry a
+                    // delta whose start proves the baseline survived.
+                    sender.table("t").symbol("s", "c").longColumn("v", 3L).atNow();
+                    Assert.assertEquals("baseline must survive the abandon",
+                            n, ws.getSentMaxSymbolIdForTesting());
+                    Assert.assertFalse("the chunks' deferred group must be closed",
+                            ws.hasDeferredMessagesForTesting());
+
+                    long fsn = sender.flushAndGetSequence();
+                    Assert.assertTrue("the post-abandon batch must land", sender.awaitAckedFsn(fsn, 10_000));
+                    Assert.assertEquals("re-registered chunks then the new symbol, in order",
+                            Arrays.asList("a", "b", "c"), handler.dict());
+                    Assert.assertTrue("chunk frames must precede the first data frame",
+                            handler.chunkFramesBeforeFirstData > 0);
+                    Assert.assertEquals("first data frame must keep the delta baseline",
+                            n + 1, handler.firstDataFrameDeltaStart);
+                }
+            }
+        });
+    }
+
+    /**
      * A live symbol set larger than the threshold must not thrash the
      * recycle: after a swap, re-arming requires the dictionary to reach
      * max(threshold, 2 * size-at-swap).
@@ -1043,6 +1101,56 @@ public class SymbolDictRecycleTest {
                 if (QwpWireTestUtils.hasDelta(data)) {
                     int[] pos = {HEADER_SIZE};
                     conn2FirstFrameDeltaStart = QwpWireTestUtils.readVarint(data, pos);
+                }
+            }
+            try {
+                client.sendBinary(QwpWireTestUtils.buildAck(nextSeq.getAndIncrement()));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * Tracks the most recent connection only (identity-keyed, like
+     * OutageRecycleHandler): accumulates the dictionary in arrival order,
+     * counts table-less delta frames (dictionary chunks) seen before the
+     * first data frame, and records the first data frame's delta start.
+     * Acks everything.
+     */
+    private static class ChunkCaptureHandler implements TestWebSocketServer.WebSocketServerHandler {
+        private final List<String> dict = new ArrayList<>();
+        private final AtomicLong nextSeq = new AtomicLong(0);
+        private TestWebSocketServer.ClientHandler currentClient;
+        private boolean seenFirstDataFrame;
+        volatile int chunkFramesBeforeFirstData;
+        volatile int firstDataFrameDeltaStart = -1;
+
+        synchronized List<String> dict() {
+            return new ArrayList<>(dict);
+        }
+
+        @Override
+        public synchronized void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
+            if (currentClient != client) {
+                currentClient = client;
+                dict.clear();
+                nextSeq.set(0);
+                seenFirstDataFrame = false;
+                chunkFramesBeforeFirstData = 0;
+                firstDataFrameDeltaStart = -1;
+            }
+            QwpWireTestUtils.accumulateDeltaDictionary(data, dict);
+            boolean isDataFrame = QwpWireTestUtils.tableCount(data) > 0;
+            if (!seenFirstDataFrame) {
+                if (isDataFrame) {
+                    seenFirstDataFrame = true;
+                    if (QwpWireTestUtils.hasDelta(data)) {
+                        int[] pos = {HEADER_SIZE};
+                        firstDataFrameDeltaStart = QwpWireTestUtils.readVarint(data, pos);
+                    }
+                } else if (QwpWireTestUtils.hasDelta(data)) {
+                    chunkFramesBeforeFirstData++;
                 }
             }
             try {
