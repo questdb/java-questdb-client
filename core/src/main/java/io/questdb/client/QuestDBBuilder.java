@@ -73,6 +73,7 @@ public final class QuestDBBuilder {
     private BackgroundDrainerListener drainerListener;
     private SenderErrorHandler errorHandler;
     private long housekeeperIntervalMillis = UNSET;
+    private HttpTokenProvider httpTokenProvider;
     private String config;
     private long idleTimeoutMillis = UNSET;
     private long maxLifetimeMillis = UNSET;
@@ -186,6 +187,11 @@ public final class QuestDBBuilder {
         }
         ConfigString cs = ConfigString.parse(config);
         ConfigView view = new ConfigView(cs);
+        if (httpTokenProvider != null
+                && (view.has("token") || view.has("username") || view.has("password"))) {
+            throw new IllegalArgumentException(
+                    "httpTokenProvider cannot be combined with token, username, or password in the configuration");
+        }
         // Validate the single cluster config exactly as both pools will, but
         // without connecting: the full Sender parse plus validateParameters
         // (ingress value keys are registry-STRING, so only the real parse
@@ -229,6 +235,7 @@ public final class QuestDBBuilder {
                 maxLifetimeMillis,
                 housekeeperIntervalMillis,
                 queryCloseTimeoutMillis,
+                httpTokenProvider,
                 errorHandler,
                 connectionListener,
                 drainerListener
@@ -297,6 +304,34 @@ public final class QuestDBBuilder {
             throw new IllegalArgumentException("housekeeperIntervalMillis must be >= 100");
         }
         this.housekeeperIntervalMillis = millis;
+        return this;
+    }
+
+    /**
+     * Supplies the bearer token on demand to every pooled ingest and query
+     * connection. The provider is queried for each initial WebSocket upgrade
+     * and reconnect, so a rotating token such as
+     * {@code OidcDeviceAuth::getToken} remains usable for the lifetime of this
+     * handle. Different pooled connections may call it concurrently, so it
+     * must be thread-safe.
+     * <p>
+     * The provider runs on connection/reconnection paths and must not perform
+     * interactive sign-in. Call {@code OidcDeviceAuth.signIn()} before
+     * {@link #build()} when no persisted token is available. The builder and
+     * resulting {@link QuestDB} handle do not own or close the provider.
+     * <p>
+     * Mutually exclusive with {@code token}, {@code username}, and
+     * {@code password} in the configuration string.
+     *
+     * @param tokenProvider supplies the current bearer token without the
+     *                      {@code "Bearer "} prefix
+     * @return this instance for method chaining
+     */
+    public QuestDBBuilder httpTokenProvider(HttpTokenProvider tokenProvider) {
+        if (tokenProvider == null) {
+            throw new IllegalArgumentException("httpTokenProvider must not be null");
+        }
+        this.httpTokenProvider = tokenProvider;
         return this;
     }
 

@@ -42,7 +42,9 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>The {@code [fromFsn, toFsn]} span is the load-bearing correlation key — join it to
  * whatever the producer thread logged alongside the published-sequence value returned by
- * the sender to identify the rejected data.
+ * the sender to identify the rejected data. Background orphan-drainer reports use
+ * {@link #NO_MESSAGE_SEQUENCE} for both bounds because those FSNs belong to another sender
+ * engine and must not be joined to the live producer's rows.
  *
  * @see SenderErrorHandler
  * @see LineSenderServerException
@@ -151,7 +153,8 @@ public final class SenderError {
 
     /**
      * @return inclusive lower bound of the FSN span for the rejected batch — correlation key for producer-side logs.
-     * For {@link Category#DATA_LOSS} this is {@link #NO_MESSAGE_SEQUENCE} — the abandoned span is unknown at quarantine time.
+     * For {@link Category#DATA_LOSS} and background orphan-drainer reports this is
+     * {@link #NO_MESSAGE_SEQUENCE} — the span is unknown or does not belong to the live sender.
      */
     public long getFromFsn() {
         return fromFsn;
@@ -202,7 +205,8 @@ public final class SenderError {
 
     /**
      * @return inclusive upper bound of the FSN span for the rejected batch.
-     * For {@link Category#DATA_LOSS} this is {@link #NO_MESSAGE_SEQUENCE} — the abandoned span is unknown at quarantine time.
+     * For {@link Category#DATA_LOSS} and background orphan-drainer reports this is
+     * {@link #NO_MESSAGE_SEQUENCE} — the span is unknown or does not belong to the live sender.
      */
     public long getToFsn() {
         return toFsn;

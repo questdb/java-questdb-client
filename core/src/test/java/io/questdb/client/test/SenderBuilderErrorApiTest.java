@@ -230,11 +230,89 @@ public class SenderBuilderErrorApiTest {
 
     @Test
     public void testCategoryAndPolicyAreStillEnumerable() {
-        // Cross-check that the enum surface is fully reachable from
-        // user-side code via the builder import path.
-        SenderError.Category c = SenderError.Category.SCHEMA_MISMATCH;
-        SenderError.Policy p = SenderError.Policy.RETRIABLE;
-        Assert.assertNotNull(c);
-        Assert.assertNotNull(p);
+        // Cross-check that the user-facing SenderError enum surface is intact, driven by NAME strings the
+        // compiler does not resolve, so a rename or removal fails this test at RUNTIME (valueOf throws
+        // IllegalArgumentException). Using a compiled constant reference (SenderError.Category.SCHEMA_MISMATCH) as
+        // the expected value instead would only fail to COMPILE on a rename - the source, not the assertion,
+        // would break - so it would test nothing at runtime.
+        Assert.assertEquals("SCHEMA_MISMATCH", SenderError.Category.valueOf("SCHEMA_MISMATCH").name());
+        Assert.assertEquals("RETRIABLE", SenderError.Policy.valueOf("RETRIABLE").name());
+    }
+
+    @Test
+    public void testHttpTokenProviderIsMutuallyExclusiveWithOtherAuth() {
+        // a provider cannot be combined with a static token or username/password, in either order
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpToken("static").httpTokenProvider(() -> "dynamic");
+            Assert.fail("expected token-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token was already configured"));
+        }
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpTokenProvider(() -> "dynamic").httpToken("static");
+            Assert.fail("expected token-provider-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider was already configured"));
+        }
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpUsernamePassword("u", "p").httpTokenProvider(() -> "dynamic");
+            Assert.fail("expected username-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("username was already configured"));
+        }
+    }
+
+    @Test
+    public void testHttpTokenProviderNullRejectedAndExclusiveWithLaterUsernamePassword() {
+        // a null provider is rejected up front
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000").httpTokenProvider(null);
+            Assert.fail("expected a null provider to be rejected");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider cannot be null"));
+        }
+        // the reverse of the mutual-exclusion case above: provider first, then username/password. This hits a
+        // distinct guard in httpUsernamePassword(), which the provider-then-token / token-then-provider /
+        // username-then-provider orderings above do not reach
+        try {
+            Sender.builder(Sender.Transport.HTTP).address("localhost:9000")
+                    .httpTokenProvider(() -> "dynamic").httpUsernamePassword("u", "p");
+            Assert.fail("expected token-provider-already-configured");
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("token provider authentication is already configured"));
+        }
+    }
+
+    @Test
+    public void testHttpTokenProviderAcceptedForWebSocket() {
+        // the provider is supported over WebSocket (queried at each upgrade handshake): it must pass
+        // build-time validation and fail only on the connection itself, never with a "not supported"
+        // rejection. 127.0.0.1:1 is refused promptly, and InitialConnectMode defaults to OFF (fail fast).
+        try (Sender ignored = Sender.builder(Sender.Transport.WEBSOCKET).address("127.0.0.1:1")
+                .httpTokenProvider(() -> "dynamic").build()) {
+            Assert.fail("expected a connection failure against a dead address");
+        } catch (LineSenderException e) {
+            Assert.assertFalse(e.getMessage(), e.getMessage().contains("not supported for WebSocket"));
+        }
+    }
+
+    @Test
+    public void testHttpTokenProviderRejectedForTcpAndUdp() {
+        // TCP uses challenge-response key auth and UDP has no auth; neither carries a bearer token,
+        // so both must reject the provider at build time
+        assertProviderRejected(Sender.Transport.TCP, "token provider authentication is not supported for TCP protocol");
+        assertProviderRejected(Sender.Transport.UDP, "token provider authentication is not supported for UDP transport");
+    }
+
+    private static void assertProviderRejected(Sender.Transport transport, String expectedMessage) {
+        try (Sender ignored = Sender.builder(transport).address("localhost:9009")
+                .httpTokenProvider(() -> "dynamic").build()) {
+            Assert.fail("expected the token provider to be rejected for " + transport);
+        } catch (LineSenderException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
+        }
     }
 }

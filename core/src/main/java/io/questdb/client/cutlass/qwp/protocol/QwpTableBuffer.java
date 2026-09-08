@@ -222,10 +222,13 @@ public class QwpTableBuffer implements QuietCloseable {
             inProgressColumnCount++;
             return col;
         }
-        throw new LineSenderException(
-                name.length() > MAX_COLUMN_NAME_LENGTH ? "column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]"
-                        : "column name contains illegal characters: " + name
-        );
+        if (name.length() > MAX_COLUMN_NAME_LENGTH) {
+            throw new LineSenderException("column name too long [maxLength=" + MAX_COLUMN_NAME_LENGTH + "]");
+        }
+        // sanitize the rejected name before it reaches the message (and any log/terminal): a name that failed
+        // validation can carry BOM/bidi/zero-width/control chars that would otherwise reorder, hide or forge what
+        // a human reads, matching how the ILP name/error render escapes untrusted text
+        throw new LineSenderException("column name contains illegal characters: ").putAsPrintable(name);
     }
 
     public ColumnBuffer getOrCreateDesignatedTimestampColumn(byte type) {

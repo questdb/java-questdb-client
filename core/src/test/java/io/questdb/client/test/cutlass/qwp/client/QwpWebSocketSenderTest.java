@@ -833,6 +833,30 @@ public class QwpWebSocketSenderTest {
         }
     }
 
+    @Test
+    public void testIllegalTableNameIsEscapedInTheMessage() throws Exception {
+        assertMemoryLeak(() -> {
+            // A rejected table name is attacker-influenced text on its way to a log line or a terminal, so
+            // it is escaped rather than concatenated. Three of the four callsites that do this are covered -
+            // QwpUdpSender and QwpTableBuffer by QwpUdpSenderTest, the ILP names by AbstractLineSender's
+            // tests - and this one, the WebSocket sender's own check, was not: its message could regress to
+            // a raw concatenation with the suite still green.
+            try (QwpWebSocketSender sender = createUnconnectedSender()) {
+                try {
+                    sender.table("bad" + (char) 0x01 + "name");
+                    Assert.fail("an illegal table name must be rejected");
+                } catch (LineSenderException e) {
+                    final String message = e.getMessage();
+                    Assert.assertTrue(message, message.contains("table name contains illegal characters"));
+                    Assert.assertTrue("the offending char must be escaped: " + message,
+                            message.contains("\\u0001"));
+                    Assert.assertTrue("the raw control char must not reach the message",
+                            message.indexOf(0x01) < 0);
+                }
+            }
+        });
+    }
+
     private static MicrobatchBuffer getMicrobatchBuffer(QwpWebSocketSender sender, String fieldName) throws Exception {
         Field field = QwpWebSocketSender.class.getDeclaredField(fieldName);
         field.setAccessible(true);

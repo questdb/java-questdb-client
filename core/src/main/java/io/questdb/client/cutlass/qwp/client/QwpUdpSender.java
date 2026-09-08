@@ -1413,7 +1413,10 @@ public class QwpUdpSender implements Sender {
             if (name.length() > MAX_TABLE_NAME_LENGTH) {
                 throw new LineSenderException("table name too long [maxLength=" + MAX_TABLE_NAME_LENGTH + "]");
             }
-            throw new LineSenderException("table name contains illegal characters: " + name);
+            // sanitize the rejected name before it reaches the message (and any log/terminal): a name that
+            // failed validation can carry BOM/bidi/zero-width/control chars that would otherwise reorder, hide
+            // or forge what a human reads, matching how the ILP name/error render escapes untrusted text
+            throw new LineSenderException("table name contains illegal characters: ").putAsPrintable(name);
         }
     }
 

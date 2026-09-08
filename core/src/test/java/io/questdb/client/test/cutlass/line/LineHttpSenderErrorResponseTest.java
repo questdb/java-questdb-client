@@ -1,0 +1,723 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.client.test.cutlass.line;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import io.questdb.client.Sender;
+import io.questdb.client.cutlass.line.LineSenderException;
+import io.questdb.client.test.cutlass.auth.MockOidcServer;
+import org.junit.Assert;
+import org.junit.Test;
+import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
+
+/**
+ * Verifies that the error body a QuestDB HTTP endpoint returns on a failed flush is rendered safely
+ * into the {@link LineSenderException} message. A JSON error body has its string escapes resolved by the
+ * lexer, so a {@code message} or {@code errorId} field arrives fully decoded; an auth (401/403) body, a
+ * non-JSON body, and a body that fails to parse as JSON are echoed verbatim. In every case a hostile or
+ * proxied endpoint could otherwise smuggle real control characters, ANSI escapes or bidi overrides that
+ * forge a log line or rewrite a terminal when the exception text is printed. The sender must escape them,
+ * just as it does for column names in an error message.
+ * <p>
+ * The dangerous bytes are built at runtime via {@code (char) 0x1b} (ESC) and {@code (char) 0x202e} (a
+ * right-to-left override), so this source file stays pure ASCII and carries none of the chars it guards.
+ */
+public class LineHttpSenderErrorResponseTest {
+
+    // ESC: the lead byte of an ANSI escape sequence (terminal hijack)
+    private static final char ESC = 0x1b;
+    // U+202E RIGHT-TO-LEFT OVERRIDE: reorders displayed text (visual spoofing)
+    private static final char RLO = 0x202e;
+
+    @Test(timeout = 30_000)
+    public void testMalformedResponseHeadOnFlushFailsOnceWithoutResending() throws Exception {
+        assertMemoryLeak(() -> {
+            // HttpHeaderParser rejects a response head it cannot parse - here a header block past its fixed
+            // 4096-byte buffer, the shape an intermediary stacking Set-Cookie/CSP produces - by throwing
+            // HttpException, a SIBLING of HttpClientException rather than a subclass. Uncaught it escaped
+            // flush0 entirely, taking with it the client.disconnect() that keeps the next flush off a
+            // connection holding a half-read response, and left flush() throwing a raw HttpException
+            // instead of the LineSenderException its contract promises.
+            //
+            // Caught, but NOT retried. The parser only ever runs on bytes that arrived, so the server
+            // answered: the batch is delivered, and the head is chosen by an intermediary, so the next
+            // attempt parses the same block and fails the same way. Routing it to the transport arm made a
+            // committed batch re-send until the retry budget ran out.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                StringBuilder padding = new StringBuilder();
+                for (int i = 0; i < 5000; i++) {
+                    padding.append('A');
+                }
+                return MockOidcServer.raw("HTTP/1.1 204 No Content\r\n"
+                        + "X-Pad: " + padding + "\r\n\r\n");
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // only the flush hits the mock
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(5_000)                   // a budget a re-send would visibly spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    try {
+                        sender.flush();
+                        Assert.fail("an unparseable response head must fail the flush");
+                    } catch (LineSenderException e) {
+                        // the documented type, and a message that names what went wrong rather than
+                        // reporting a transport failure that did not happen
+                        Assert.assertTrue(e.getMessage(),
+                                e.getMessage().contains("Malformed HTTP response head"));
+                        Assert.assertFalse("a head an intermediary will re-send identically is not retryable",
+                                e.isRetryable());
+                    }
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    Assert.assertEquals("a batch the server already answered must be sent exactly once",
+                            1, requests.get());
+                    Assert.assertTrue("returned too slowly to have failed without retrying: "
+                            + elapsedMillis + "ms", elapsedMillis < 5_000);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testMalformedResponseHeadSuppressesTheReflushOnClose() throws Exception {
+        assertMemoryLeak(() -> {
+            // The HttpException arm sets lastFlushFailed = true so close()'s auto-flush cannot re-send the
+            // batch: the parser only runs on bytes that arrived, so the server already received these rows,
+            // and a close-time re-send would duplicate every one of them on a table without DEDUP keys. The
+            // sibling above disables auto-flush and asserts inside the try, so close()'s suppression gate is
+            // never reached there; this leaves auto-flush ON (the default) so close() calls flush0(true), and
+            // asserts the batch is not sent a second time.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                StringBuilder padding = new StringBuilder();
+                for (int i = 0; i < 5000; i++) {
+                    padding.append('A');
+                }
+                return MockOidcServer.raw("HTTP/1.1 204 No Content\r\n"
+                        + "X-Pad: " + padding + "\r\n\r\n");
+            })) {
+                Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // only the flush hits the mock
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(5_000)
+                        // auto-flush left ON (the default): close() runs flush0(true), so its gate is exercised
+                        .build();
+                try {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("an unparseable response head must fail the flush");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue(e.getMessage(), e.getMessage().contains("Malformed HTTP response head"));
+                    }
+                    Assert.assertEquals("the failed flush sent the batch once", 1, requests.get());
+                } finally {
+                    // close() auto-flushes; lastFlushFailed must suppress it. Should a regression drop that
+                    // flag, the re-send hits the same malformed head and close() itself throws - either way
+                    // the counter has already reached 2, which the assertion below turns into a clear failure.
+                    try {
+                        sender.close();
+                    } catch (LineSenderException ignore) {
+                        // a re-send that fails still reached the server and incremented the counter
+                    }
+                }
+                Assert.assertEquals("close() must not re-send a batch the server already answered",
+                        1, requests.get());
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testProtocolDetectionErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // when the caller does not pin a protocol version, build() probes the server for one; a
+            // non-success, non-404 probe response body is captured into the "Failed to detect server line
+            // protocol version" exception. A hostile or proxied endpoint must not splice control, ANSI or
+            // bidi chars into that message any more than into a flush error
+            String errorBody = "probe denied " + ESC + "[2J forged\n" + RLO + "moc.live";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try {
+                    // no protocolVersion(...) -> build() runs the detection probe; retryTimeoutMillis(0) makes
+                    // it give up after the first failed probe instead of retrying to a deadline
+                    Sender.builder(Sender.Transport.HTTP)
+                            .address("127.0.0.1:" + server.port())
+                            .retryTimeoutMillis(0)
+                            .build()
+                            .close();
+                    Assert.fail("expected protocol detection to fail and surface the server body");
+                } catch (LineSenderException e) {
+                    String msg = e.getMessage();
+                    Assert.assertTrue(msg, msg.contains("Failed to detect server line protocol version"));
+                    Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("probe denied"));
+                    Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                    Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                    Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                    Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
+                    Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDribbledBodyUnderA2xxDoesNotResendTheBatch() throws Exception {
+        assertMemoryLeak(() -> {
+            // A flush whose response BODY dribbles (chunked headers sent, then the chunk-size line one byte at
+            // a time, never completing) aborts the read on the configured request timeout: the no-arg recv()
+            // the flush uses bounds the WHOLE body read, not each socket read. Drives that bound end to end
+            // over a real socket from a real flush (the Response classes are unit-tested in isolation; the ILP
+            // flush path - consumeChunkedResponse -> recv() - is covered here). Without the whole-read bound
+            // the dribble would re-arm the per-read timeout forever and this test would hit its @Test timeout.
+            //
+            // The status here is 200, so the server ALREADY COMMITTED these rows. The abort must therefore not
+            // reach flush0's catch, which treats HttpClientException as a transport error and re-sends the
+            // whole batch - duplicate rows on data the server accepted, with a retry budget that keeps trying.
+            // The bound is what made this reachable at all: base re-armed per socket read, so a
+            // dribbling-but-progressing body never aborted here.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble();
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(1_000)                    // the whole-body-read bound the no-arg recv() applies
+                        .retryTimeoutMillis(3_000)                   // a budget a re-send would visibly spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    sender.flush();
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // aborted on the ~1s whole-read bound. The mock dribbles for ~10s, so a per-read re-arm
+                    // would not abort until ~11s (then the 30s @Test timeout); the < 5s ceiling fails on that
+                    // path while giving the 1s bound generous CI headroom.
+                    Assert.assertTrue("returned too fast to be the 1s read bound: " + elapsedMillis + "ms", elapsedMillis >= 500);
+                    Assert.assertTrue("returned too slowly - re-armed per-read, or retried? " + elapsedMillis + "ms", elapsedMillis < 5_000);
+                    Assert.assertEquals("a committed batch must be sent exactly once; a drain failure after a "
+                            + "2xx must not re-send it", 1, requests.get());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDribbledResponseHeadFailsTheFlushWithinTheRetryBudget() throws Exception {
+        assertMemoryLeak(() -> {
+            // The response HEAD read is bounded on elapsed time the same way the body read is, and the two
+            // sibling tests above cover only the body. The head bound is the one existing non-OIDC senders
+            // are most exposed to, because it precedes every response, including the 204 QuestDB's own
+            // /write answers with.
+            //
+            // What separates it from the body cases: at the point await() aborts, NO STATUS HAS BEEN READ.
+            // So unlike the 2xx drain arm - which knows the server committed and reports success - and
+            // unlike the error arm - which has a verdict to surface - this abort carries no information
+            // about whether the batch landed. flush0 classifies it as a transport failure and retries,
+            // which is the only thing it can do, and the pre-existing ILP-over-HTTP at-least-once window
+            // is what that retry spends. Against a table without DEDUP keys, a peer that dribbles a head
+            // past the budget can therefore duplicate rows.
+            //
+            // This pins the two properties that keep that bounded and diagnosable: the flush TERMINATES on
+            // the retry budget instead of running on with the dribble, and it reports a transport timeout
+            // rather than something the operator cannot act on. Base could not reach it at all - await()
+            // re-armed its timeout on every socket read, so a head making progress never aborted.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribbleHead();
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(500)                      // the whole-head-read bound
+                        .retryTimeoutMillis(2_000)                   // and the budget the retries spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    try {
+                        sender.flush();
+                        Assert.fail("a head that never completes must fail the flush");
+                    } catch (LineSenderException e) {
+                        Assert.assertTrue("the operator must be told this was a transport timeout, not "
+                                        + "handed a bare parse error: " + e.getMessage(),
+                                e.getMessage().contains("timed out"));
+                        Assert.assertTrue("a head-read abort carries no status, so it stays retryable - "
+                                        + "unlike a malformed head, which is a verdict",
+                                e.isRetryable());
+                    }
+                    long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                    // The mock dribbles for ~10s. A per-read re-arm would not abort until then, and the
+                    // 30s @Test timeout would fire instead of this ceiling.
+                    Assert.assertTrue("the head bound must fire, not run on with the dribble: "
+                            + elapsedMillis + "ms", elapsedMillis < 15_000);
+                    Assert.assertTrue("the flush must retry within its budget rather than give up on the "
+                                    + "first abort, and must stop when the budget is spent: "
+                                    + requests.get() + " sends",
+                            requests.get() >= 1 && requests.get() < 20);
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDrainAbortAfterA2xxDropsTheConnection() throws Exception {
+        assertMemoryLeak(() -> {
+            // The other half of the drain-abort contract, and the half nothing pinned. Its sibling above
+            // covers ONE flush and proves the abort does not re-send it. This covers the flush AFTER it,
+            // which is the only place the `!drained` term of the disconnect can be observed at all.
+            //
+            // The abort leaves the response body unconsumed, so the socket still carries the first
+            // response's chunk-size digits. Without the disconnect the next flush writes onto it and its
+            // await() reads those digits instead of a status line: the header block never completes, so
+            // await() spends its whole bound and throws HttpClientException, which flush0 classifies as a
+            // transport error and RETRIES. Measured against this fixture: three sends for two flushes -
+            // one extra copy of a batch the server had already committed, which is the duplicate-row harm
+            // the surrounding arm exists to prevent, arriving by the one route it does not guard against.
+            //
+            // So the request count is what goes red, and it is asserted first. The connection count is
+            // NOT a discriminator here and is not claimed as one - it is 2 either way, because the failed
+            // second flush disconnects and reconnects on its own before retrying. It is asserted anyway,
+            // as the direct statement of the guard: one flush, one connection.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble();
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1) // skip the build-time probe: only the flush hits the dribble
+                        .httpTimeoutMillis(1_000)                    // the whole-body-read bound each drain aborts on
+                        .retryTimeoutMillis(3_000)                   // a budget a re-send would visibly spend
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush();
+
+                    // The second flush is what needs a clean socket. Without the disconnect it lands on the
+                    // poisoned one and throws instead of succeeding.
+                    sender.table("t").longColumn("v", 2L).atNow();
+                    sender.flush();
+
+                    Assert.assertEquals("two flushes, two sends: a drain abort leaves the body unconsumed, so "
+                                    + "a reused socket fails the next flush's header read and it retries - "
+                                    + "re-sending a batch the server had already committed",
+                            2, requests.get());
+                    Assert.assertEquals("and each flush went out on its own connection", 2,
+                            server.connectionsAccepted());
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDrainFailureAfterASuccessfulFlushReportsItsReason() throws Exception {
+        assertMemoryLeak(() -> {
+            // A 2xx IS the commit, so a body-drain abort after it changes no outcome - but it does drop the
+            // connection, because unconsumed bytes would mis-frame the next response. Against a server that
+            // dribbles every response that is one reconnect per flush, and the catch used to bind the
+            // exception and discard it, leaving the churn with nothing to explain it.
+            ch.qos.logback.classic.Logger senderLog =
+                    (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(
+                            "io.questdb.client.cutlass.line.http.AbstractLineHttpSender");
+            ListAppender<ILoggingEvent> appender = new ListAppender<>();
+            appender.start();
+            Level saved = senderLog.getLevel();
+            senderLog.setLevel(Level.ALL);
+            senderLog.addAppender(appender);
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.dribble(200))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(3_000)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    sender.flush(); // the 2xx committed; only the drain aborts
+                }
+                String drainLine = null;
+                for (ILoggingEvent event : appender.list) {
+                    if (event.getFormattedMessage().contains("could not drain the response body")) {
+                        drainLine = event.getFormattedMessage();
+                        break;
+                    }
+                }
+                Assert.assertNotNull("a drain abort that drops the connection must say so; logged: "
+                        + appender.list, drainLine);
+                Assert.assertTrue("and it must carry WHY, not just that it happened: " + drainLine,
+                        drainLine.contains("reason=") && !drainLine.contains("reason=null"));
+            } finally {
+                senderLog.detachAppender(appender);
+                senderLog.setLevel(saved);
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testDribbledBodyUnderAnErrorStatusStillSurfacesTheStatus() throws Exception {
+        assertMemoryLeak(() -> {
+            // The mirror of the 2xx case on the error path. The STATUS is the verdict; the body is only detail
+            // for the message. Reading that body can now abort on the whole-read bound, and if the abort
+            // escapes it reaches flush0's catch, which reclassifies a definitive 401 as a transport failure:
+            // the sender then burns the whole retry budget re-sending against an endpoint that will keep
+            // refusing, and finally reports "Connection Failed", with the real status nowhere in the message.
+            AtomicInteger requests = new AtomicInteger();
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> {
+                requests.incrementAndGet();
+                return MockOidcServer.dribble(401);
+            })) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .httpTimeoutMillis(1_000)
+                        .retryTimeoutMillis(3_000)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    long startNanos = System.nanoTime();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the 401 to surface");
+                    } catch (LineSenderException e) {
+                        long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                        String msg = e.getMessage();
+                        Assert.assertTrue("the real status must reach the caller: " + msg,
+                                msg.contains("http-status=401"));
+                        Assert.assertFalse("a definitive 401 must not be reported as a transport failure: " + msg,
+                                msg.contains("Connection Failed"));
+                        // and WHY the body could not be read, which is the half the status cannot supply:
+                        // a read that timed out, a peer that vanished and a mangled chunk all arrive here
+                        // as the same status, and only this tells an operator which one to act on
+                        Assert.assertTrue("the reason the body read failed must reach the caller: " + msg,
+                                msg.contains("reason=") && !msg.contains("reason=<none>"));
+                        Assert.assertTrue("and it must be the read abort, not something invented: " + msg,
+                                msg.contains("timed out"));
+                        Assert.assertTrue("a definitive status must not spend the retry budget: "
+                                + elapsedMillis + "ms", elapsedMillis < 3_000);
+                        Assert.assertEquals("a definitive status must not be retried", 1, requests.get());
+                        // The classification has to survive the wrapper too, not just the message. This is
+                        // the one throw site that builds its exception from the status alone, having failed
+                        // to read the body, so it re-passes `retryable` by hand - and a caller acting on
+                        // isRetryable() would re-flush forever into a 401 that keeps refusing. The `true`
+                        // direction is pinned by LineSenderExceptionRetryableTest, which is what makes this
+                        // assertFalse mean "classified permanent" rather than "not classified at all".
+                        Assert.assertFalse("a 401 must stay non-retryable through the unreadable-body wrapper",
+                                e.isRetryable());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerAuthErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a 401/403 body is echoed into the exception verbatim (read as raw bytes, not through the JSON
+            // parser), so a hostile or proxied endpoint could splice raw control, ANSI or bidi chars straight
+            // into the LineSenderException; the sender must escape them just like the JSON-field path
+            String errorBody = "denied " + ESC + "[2J forged\n" + RLO + "moc.live";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(401, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's auth error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("authentication error"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("denied"));
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerErrorStatusLineControlCharsAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // the HTTP status-line token is echoed into the exception as "[http-status=...]". The header parser
+            // copies it verbatim between the two spaces, so a hostile or proxied endpoint can smuggle control or
+            // ANSI bytes there; a non-3-char token bypasses the numeric status checks and reaches the generic
+            // error path, so the status render must escape them too, not just the body. A bidi override is a
+            // multi-byte char the raw-response writer's US-ASCII encoding would drop, so this case uses an ESC;
+            // the bidi cases above cover the body
+            String body = "upstream error";
+            // a malformed status code "400<ESC>[m" (6 chars, not 3) carries an ESC between the two spaces;
+            // text/plain keeps it off the JSON parser, so it reaches the generic path that renders the status
+            String rawResponse = "HTTP/1.1 400" + ESC + "[m FORGED\r\n"
+                    + "Content-Type: text/plain\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(body.length()) + "\r\n" + body + "\r\n"
+                    + "0\r\n\r\n";
+            try (MockOidcServer server = new MockOidcServer((method, path, b) -> MockOidcServer.raw(rawResponse))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        // the ESC smuggled into the status token arrives escaped, never as a raw byte that
+                        // could drive an ANSI terminal sequence
+                        Assert.assertTrue("the status-line ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertFalse("a raw ESC must not leak from the status line: " + msg, msg.indexOf(0x1b) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerJsonErrorBidiAndZeroWidthAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // beyond C0 controls, a hostile or proxied endpoint can smuggle bidi overrides and zero-width
+            // characters (as JSON \\uXXXX escapes the lexer decodes) that reorder or hide text in a terminal.
+            // The sender must escape these too, matching the OIDC display sanitizer, so the rendered message
+            // cannot be visually spoofed
+            String errorBody = "{"
+                    + "\"code\":\"invalid\","
+                    + "\"message\":\"safe\\u202ehidden\\u200bend\","
+                    + "\"line\":1,"
+                    + "\"errorId\":\"E1\""
+                    + "}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's JSON error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        // the visible text survives, but the bidi override (U+202E) and the zero-width space
+                        // (U+200B) arrive escaped, never as raw code points that could reorder or hide text
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("safe"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("hidden"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertTrue("the zero-width space must be escaped: " + msg, msg.contains("\\u200b"));
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                        Assert.assertFalse("a raw zero-width space must not leak: " + msg, msg.indexOf(0x200b) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testQuestDbRowErrorRendersTheDecodedNewlineAsAnEscape() throws Exception {
+        assertMemoryLeak(() -> {
+            // Pins the rendering of the single most common ILP failure. QuestDB's own
+            // LineHttpProcessorState builds its error as error.put("\nerror in line ")... - a REAL newline -
+            // and escapeJsonStr sends it as the JSON escape \n. Before the lexer decoded escapes the client
+            // copied those two characters through verbatim; now it decodes them to a newline and
+            // putAsPrintable re-escapes it, so the text a user (and their log scraper) sees changed from
+            // a two-character JSON escape to a six-character unicode escape. Neither form leaks a raw
+            // newline, which is the point of putAsPrintable, but the
+            // rendering is user-visible and nothing pinned it: the sibling tests here assert only that
+            // fragments either side of the newline survive, which holds under both.
+            String errorBody = "{"
+                    + "\"code\":\"invalid\","
+                    + "\"message\":\"invalid field format\\nerror in line 1: table: t, column: v\","
+                    + "\"line\":1,"
+                    + "\"errorId\":\"ABC-1\""
+                    + "}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's row error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue("the newline must render as its unicode escape: " + msg,
+                                msg.contains("invalid field format\\u000aerror in line 1: table: t, column: v"));
+                        Assert.assertFalse("the raw JSON escape must not survive undecoded: " + msg,
+                                msg.contains("format\\nerror"));
+                        Assert.assertFalse("and no raw newline may reach the message: " + msg,
+                                msg.indexOf('\n') >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerJsonErrorControlCharsAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // Feed REAL control bytes into the structured-error fields. JsonLexer currently also decodes
+            // valid JSON escapes, but spelling these as \\u001b/\\n on the wire would let the pre-decoding
+            // implementation pass with drainAndReset's old plain put(): the six printable escape characters
+            // were already safe. Raw bytes make this test discriminate on putAsPrintable itself. The parser
+            // deliberately accepts this malformed-JSON input so the sender can still render a hostile server
+            // response safely.
+            String esc = String.valueOf((char) 0x1b);
+            String errorBody = "{"
+                    + "\"code\":\"invalid\","
+                    + "\"message\":\"bad" + esc + "[m\nthing\","
+                    + "\"line\":42,"
+                    + "\"errorId\":\"E" + esc + "ID\""
+                    + "}";
+            // a chunked 400 with Content-Type application/json drives the flush failure through the sender's
+            // JSON error parser (a 4xx response is asserted to be chunked before parsing)
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        // an explicit protocol version keeps build() from probing the server, so the only
+                        // request is the flush below
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's JSON error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        // the decoded message text survives...
+                        Assert.assertTrue("decoded message text must be preserved: " + msg, msg.contains("bad"));
+                        Assert.assertTrue("decoded message text must be preserved: " + msg, msg.contains("thing"));
+                        Assert.assertTrue("errorId must be present with its ESC escaped: " + msg, msg.contains("id: E\\u001bID"));
+                        // ...but no raw control byte reaches the message: no ESC (ANSI injection) and no
+                        // newline (log-line forging); both arrive escaped instead
+                        Assert.assertTrue("the decoded ESC must be escaped, not raw: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the decoded newline must be escaped, not raw: " + msg,
+                                msg.contains("\\u000a"));
+                        Assert.assertFalse("a raw ESC must not leak into the message: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw newline must not leak into the message: " + msg, msg.indexOf('\n') >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerMalformedJsonErrorBodyControlAndBidiAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a body sent as application/json but not parseable as a QuestDB error object (a proxy/WAF page,
+            // or an unexpected first key) makes the JSON parser throw; the fallback renders the raw body, which
+            // must still be escaped. The unexpected first key "forged" forces the parse failure; the ESC and
+            // bidi override ride in the value and must surface escaped, not raw
+            String errorBody = "{\"forged\":\"x " + ESC + "[2J y " + RLO + " z\"}";
+            try (MockOidcServer server = new MockOidcServer((method, path, body) -> MockOidcServer.chunkedJson(400, errorBody))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the malformed server response to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        // the raw body is shown (so the user can diagnose the unexpected response)...
+                        Assert.assertTrue("the raw body must be preserved: " + msg, msg.contains("forged"));
+                        // ...but the smuggled control and bidi chars arrive escaped, never raw
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertTrue("the bidi override must be escaped: " + msg, msg.contains("\\u202e"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw bidi override must not leak: " + msg, msg.indexOf(0x202e) >= 0);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test(timeout = 30_000)
+    public void testServerNonJsonErrorBodyControlCharsAreEscaped() throws Exception {
+        assertMemoryLeak(() -> {
+            // a proxy or WAF can return a non-JSON error body (here text/plain) with raw ANSI/control bytes;
+            // it reaches the generic error path, which must escape them before they hit a log or terminal.
+            // The body is all ASCII (a real ESC and a newline) so it survives the raw response writer's
+            // US-ASCII encoding; bidi is covered by the auth/malformed cases above
+            String body = "upstream down " + ESC + "[31m forged\nsecond line";
+            // hand-craft a chunked text/plain response: the generic path only reads the body when chunked, and
+            // a non-application/json content type keeps it off the JSON parser
+            String rawResponse = "HTTP/1.1 400 Bad Request\r\n"
+                    + "Content-Type: text/plain\r\n"
+                    + "Transfer-Encoding: chunked\r\n\r\n"
+                    + Integer.toHexString(body.length()) + "\r\n" + body + "\r\n"
+                    + "0\r\n\r\n";
+            try (MockOidcServer server = new MockOidcServer((method, path, b) -> MockOidcServer.raw(rawResponse))) {
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP)
+                        .address("127.0.0.1:" + server.port())
+                        .protocolVersion(Sender.PROTOCOL_VERSION_V1)
+                        .disableAutoFlush()
+                        .build()) {
+                    sender.table("t").longColumn("v", 1L).atNow();
+                    try {
+                        sender.flush();
+                        Assert.fail("expected the server's non-JSON error to surface as a LineSenderException");
+                    } catch (LineSenderException e) {
+                        String msg = e.getMessage();
+                        Assert.assertTrue(msg, msg.contains("Could not flush buffer"));
+                        Assert.assertTrue("visible text must be preserved: " + msg, msg.contains("upstream down"));
+                        Assert.assertTrue("the ESC must be escaped: " + msg, msg.contains("\\u001b"));
+                        Assert.assertFalse("a raw ESC must not leak: " + msg, msg.indexOf(0x1b) >= 0);
+                        Assert.assertFalse("a raw newline must not leak: " + msg, msg.indexOf('\n') >= 0);
+                    }
+                }
+            }
+        });
+    }
+}

@@ -24,6 +24,7 @@
 
 package io.questdb.client.impl;
 
+import io.questdb.client.HttpTokenProvider;
 import io.questdb.client.QuestDB;
 import io.questdb.client.Query;
 import io.questdb.client.Sender;
@@ -70,8 +71,31 @@ public final class QuestDBImpl implements QuestDB {
     ) {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
-                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null,
+                housekeeperIntervalMillis, queryCloseTimeoutMillis, null,
                 errorHandler, connectionListener, drainerListener);
+    }
+
+    public QuestDBImpl(
+            String ingestConfig,
+            String queryConfig,
+            int senderMin,
+            int senderMax,
+            int queryMin,
+            int queryMax,
+            long acquireTimeoutMillis,
+            long idleTimeoutMillis,
+            long maxLifetimeMillis,
+            long housekeeperIntervalMillis,
+            long queryCloseTimeoutMillis,
+            HttpTokenProvider tokenProvider,
+            SenderErrorHandler errorHandler,
+            SenderConnectionListener connectionListener,
+            BackgroundDrainerListener drainerListener
+    ) {
+        this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
+                acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
+                housekeeperIntervalMillis, queryCloseTimeoutMillis, null, null,
+                tokenProvider, errorHandler, connectionListener, drainerListener);
     }
 
     // Test-only constructor exposing the senderFactory and connectHook seams:
@@ -98,7 +122,7 @@ public final class QuestDBImpl implements QuestDB {
         this(ingestConfig, queryConfig, senderMin, senderMax, queryMin, queryMax,
                 acquireTimeoutMillis, idleTimeoutMillis, maxLifetimeMillis,
                 housekeeperIntervalMillis, QueryClientPool.DEFAULT_CLOSE_QUERY_TIMEOUT_MILLIS,
-                senderFactory, connectHook, null, null, null);
+                senderFactory, connectHook, null, null, null, null);
     }
 
     // Full constructor adding the ingest-side errorHandler/connectionListener/
@@ -120,6 +144,7 @@ public final class QuestDBImpl implements QuestDB {
             long queryCloseTimeoutMillis,
             IntFunction<Sender> senderFactory,
             Consumer<QwpQueryClient> connectHook,
+            HttpTokenProvider tokenProvider,
             SenderErrorHandler errorHandler,
             SenderConnectionListener connectionListener,
             BackgroundDrainerListener drainerListener
@@ -135,10 +160,10 @@ public final class QuestDBImpl implements QuestDB {
                     // build() never blocks on a slow / reachable-but-not-acking
                     // server; the housekeeper drives it via runStartupRecoveryStep().
                     true,
-                    errorHandler, connectionListener, drainerListener);
+                    errorHandler, connectionListener, drainerListener, tokenProvider);
             builtQueryPool = new QueryClientPool(
                     queryConfig, queryMin, queryMax, acquireTimeoutMillis,
-                    idleTimeoutMillis, maxLifetimeMillis, connectHook);
+                    idleTimeoutMillis, maxLifetimeMillis, connectHook, null, tokenProvider);
             builtQueryPool.closeQueryTimeoutMillis(queryCloseTimeoutMillis);
             builtHousekeeper = new PoolHousekeeper(builtSenderPool, builtQueryPool, housekeeperIntervalMillis);
             builtHousekeeper.start();

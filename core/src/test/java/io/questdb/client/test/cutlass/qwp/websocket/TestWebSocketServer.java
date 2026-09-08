@@ -42,8 +42,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -55,6 +57,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class TestWebSocketServer implements Closeable {
     private static final Logger LOG = LoggerFactory.getLogger(TestWebSocketServer.class);
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    // Authorization header value captured from each well-formed upgrade request ("" when absent), in
+    // arrival order. Tests poll this to assert the token a provider supplied at each (re)handshake.
+    private final BlockingQueue<String> capturedAuthHeaders = new LinkedBlockingQueue<>();
     private final List<ClientHandler> clients = new CopyOnWriteArrayList<>();
     private final boolean emitDurableAckHeader;
     private final WebSocketServerHandler handler;
@@ -69,6 +74,11 @@ public class TestWebSocketServer implements Closeable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ServerSocket serverSocket;
     private final CountDownLatch startLatch = new CountDownLatch(1);
+    // Number of arbitrary HTTP-status rejects that were fully written to the
+    // client. Tests use this rather than an observed token pull: the provider
+    // runs before the upgrade response arrives, so a pull alone does not prove
+    // that the reconnect loop has entered its rejection episode.
+    private final AtomicInteger statusRejectCount = new AtomicInteger();
     // Monotonic count of completed handshakes over the server's lifetime. Unlike
     // liveConnections it never decrements, so a test can confirm how many clients
     // connected even after they have all disconnected.
@@ -233,10 +243,25 @@ public class TestWebSocketServer implements Closeable {
     }
 
     /**
+     * Authorization header value seen on the next upgrade handshake ("" if the request carried none),
+     * in arrival order. Blocks up to the timeout for a handshake to arrive; returns null on timeout.
+     */
+    public String pollAuthorizationHeader(long timeout, TimeUnit unit) throws InterruptedException {
+        return capturedAuthHeaders.poll(timeout, unit);
+    }
+
+    /**
      * Number of HTTP 421 role-reject responses sent over the server's lifetime.
      */
     public int roleRejectCount() {
         return roleRejectCount.get();
+    }
+
+    /**
+     * Number of arbitrary HTTP-status reject responses sent over the server's lifetime.
+     */
+    public int statusRejectCount() {
+        return statusRejectCount.get();
     }
 
     /**
@@ -557,6 +582,7 @@ public class TestWebSocketServer implements Closeable {
             }
 
             String key = null;
+            String authorization = "";
             String[] lines = request.toString().split("\r\n");
             if (lines.length > 0) {
                 // GET <path> HTTP/1.1
@@ -566,15 +592,18 @@ public class TestWebSocketServer implements Closeable {
                 }
             }
             for (String line : lines) {
-                if (line.toLowerCase().startsWith("sec-websocket-key:")) {
+                String lower = line.toLowerCase();
+                if (lower.startsWith("sec-websocket-key:")) {
                     key = line.substring(18).trim();
-                    break;
+                } else if (lower.startsWith("authorization:")) {
+                    authorization = line.substring("authorization:".length()).trim();
                 }
             }
 
             if (key == null) {
                 return false;
             }
+            capturedAuthHeaders.add(authorization);
 
             // Read-path reject: drop the egress upgrade before the 101 so the
             // query pool's connect fails fast, while ingest write-path upgrades
@@ -595,6 +624,7 @@ public class TestWebSocketServer implements Closeable {
                         "\r\n";
                 out.write(sb.getBytes(StandardCharsets.US_ASCII));
                 out.flush();
+                statusRejectCount.incrementAndGet();
                 return false;
             }
             // Role-aware reject path: emit a 421 Misdirected Request +
