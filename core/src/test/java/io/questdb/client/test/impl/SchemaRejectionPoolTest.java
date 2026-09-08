@@ -75,7 +75,8 @@ public class SchemaRejectionPoolTest {
                     }).build()) {
                 Assert.assertTrue(reported.await(5, TimeUnit.SECONDS));
                 Assert.assertNotSame(Thread.currentThread(), callbackThread.get());
-                Assert.assertEquals(archive, error.get().getRejectedPath());
+                Assert.assertEquals(java.nio.file.Paths.get(archive),
+                        java.nio.file.Paths.get(error.get().getRejectedPath()));
                 Assert.assertEquals(0, sender.getAckedFsn());
             }
         }
