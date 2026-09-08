@@ -993,7 +993,57 @@ public class QwpWebSocketSender implements Sender {
      * <p>
      * A rotating credential goes to {@code connectWithCredentialSupplier} instead, which carries a distinct
      * name precisely so this form keeps its exact descriptor and a bare {@code null} credential stays
-     * unambiguous.
+     * unambiguous. Symbol-dictionary recycling defaults to
+     * {@link #DEFAULT_SYMBOL_DICT_RESET_ENABLED} / {@link #DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS} /
+     * {@link #DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS}; the overload below takes those knobs explicitly.
+     */
+    public static QwpWebSocketSender connect(
+            List<Endpoint> endpoints,
+            ClientTlsConfiguration tlsConfig,
+            int autoFlushRows,
+            int autoFlushBytes,
+            long autoFlushIntervalNanos,
+            String authorizationHeader,
+            boolean requestDurableAck,
+            CursorSendEngine cursorEngine,
+            long closeFlushTimeoutMillis,
+            long reconnectMaxDurationMillis,
+            long reconnectInitialBackoffMillis,
+            long reconnectMaxBackoffMillis,
+            Sender.InitialConnectMode initialConnectMode,
+            SenderErrorHandler errorHandler,
+            int errorInboxCapacity,
+            long durableAckKeepaliveIntervalMillis,
+            long authTimeoutMs,
+            int connectTimeoutMs,
+            SenderConnectionListener connectionListener,
+            int connectionListenerInboxCapacity,
+            int maxFrameRejections,
+            long poisonMinEscalationWindowMillis,
+            long catchUpCapGapMinEscalationWindowMillis
+    ) {
+        return connectWithCredentialSupplier(endpoints, tlsConfig, autoFlushRows, autoFlushBytes,
+                autoFlushIntervalNanos, fixedAuthHeader(authorizationHeader),
+                requestDurableAck, cursorEngine,
+                closeFlushTimeoutMillis, reconnectMaxDurationMillis,
+                reconnectInitialBackoffMillis, reconnectMaxBackoffMillis,
+                initialConnectMode, errorHandler, errorInboxCapacity,
+                durableAckKeepaliveIntervalMillis, authTimeoutMs, connectTimeoutMs,
+                connectionListener, connectionListenerInboxCapacity,
+                maxFrameRejections, poisonMinEscalationWindowMillis,
+                catchUpCapGapMinEscalationWindowMillis,
+                DEFAULT_SYMBOL_DICT_RESET_ENABLED,
+                DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS,
+                DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS);
+    }
+
+    /**
+     * As the twenty-three-arg {@code connect} overload above, but also accepts the symbol-dictionary
+     * recycle knobs ({@code symbol_dict_reset}, {@code symbol_dict_reset_threshold},
+     * {@code symbol_dict_reset_max_wait_millis}) explicitly instead of defaulting them -- the
+     * constant-credential counterpart to the master {@code connectWithCredentialSupplier} overload below.
+     * A distinct (wider) arity, not a retyped signature, so callers compiled against the twenty-three-arg
+     * form keep linking.
      */
     public static QwpWebSocketSender connect(
             List<Endpoint> endpoints,
