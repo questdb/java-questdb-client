@@ -16,12 +16,14 @@ import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
+import io.questdb.client.test.tools.TestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Comparator;
 
 import static org.junit.Assert.assertEquals;
@@ -90,7 +92,7 @@ public class RejectedMiniSlotArchiveTest {
             assertEquals(null, RejectedMiniSlotArchive.findOverlapping(
                     ff, source, "slot-recovery", java.util.UUID.randomUUID().toString(), 0, 0));
 
-            Path rejected = Path.of(source, "rejected");
+            Path rejected = Paths.get(source, "rejected");
             Path ours = Files.createDirectory(rejected.resolve(
                     ".tmp-slot-recovery-" + epoch + "-fsn-0-0-dead"));
             Files.createFile(ours.resolve(RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
@@ -116,7 +118,7 @@ public class RejectedMiniSlotArchiveTest {
             dictionary.appendSymbol("unused-superset-entry");
             appendDeltaFrame(engine, 0, true, "zero");
             appendDeltaFrame(engine, 1, true, "one");
-            String serverMessage = "column mismatch ".repeat(2048);
+            String serverMessage = TestUtils.repeat("column mismatch ", 2048);
             SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
                     SenderError.Policy.REJECT_AND_CONTINUE, 3, serverMessage, 1,
                     0, 1, "tab", 42).withRejectionSpan(0, 1);
