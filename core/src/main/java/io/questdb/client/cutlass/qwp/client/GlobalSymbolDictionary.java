@@ -158,7 +158,8 @@ public class GlobalSymbolDictionary {
                             + "columns instead of symbol. The automatic dictionary reset "
                             + "(symbol_dict_reset, symbol_dict_reset_threshold) and "
                             + "Sender.resetSymbolDictionary() avoid this cap, but both act only "
-                            + "on senders created via Sender.build()/fromConfig().");
+                            + "on senders created via Sender.build()/fromConfig(), and the reset "
+                            + "itself runs at a table() call once the backlog is acknowledged.");
         }
 
         // Assign new ID — toString() only for new symbols that must be stored

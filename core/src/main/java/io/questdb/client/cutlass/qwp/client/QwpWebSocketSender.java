@@ -5218,6 +5218,12 @@ public class QwpWebSocketSender implements Sender {
      * per-symbol registration path ({@link #getOrAddGlobalSymbol}) -- arming
      * mid-row or mid-encode would observe a dictionary size that has not yet
      * settled for this batch.
+     * <p>
+     * Arming is only ever consumed from {@code table(CharSequence)}'s
+     * row-start hook: a producer that stops calling {@code table()}, or whose
+     * {@code table()} calls never observe a drained ring, stays armed
+     * indefinitely -- by design; see {@code Sender#resetSymbolDictionary()}'s
+     * documented trigger contract.
      */
     private void armIfEligible() {
         boolean shouldArm = resetEnabled

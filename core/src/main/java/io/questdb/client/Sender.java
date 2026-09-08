@@ -696,9 +696,11 @@ public interface Sender extends Closeable, ArraySender<Sender> {
 
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. The reset
-     * happens at the next safe point (all published data acknowledged, no row
-     * in progress); it may be deferred indefinitely under sustained load. No-op
-     * on transports without a symbol dictionary.
+     * runs at the next {@code table(...)} call that finds all published data
+     * acknowledged and no row in progress; it may be deferred indefinitely
+     * under sustained load. {@code table(...)} is the only trigger point: a
+     * caller that never starts another row never recycles. No-op on
+     * transports without a symbol dictionary.
      * <p>
      * Also a permanent no-op on a sender configured with
      * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
