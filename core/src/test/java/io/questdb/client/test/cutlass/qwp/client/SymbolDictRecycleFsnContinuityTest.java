@@ -373,6 +373,65 @@ public class SymbolDictRecycleFsnContinuityTest {
         });
     }
 
+    /**
+     * The epoch base must ACCUMULATE across recycles: after recycle k the
+     * base equals the sum of every prior epoch's (lastPublishedFsn + 1), so
+     * external FSNs stay gapless-monotone forever. Two real recycles with
+     * different frame counts make the second base a discriminator: a base
+     * that is merely re-assigned (= instead of +=) still passes every
+     * "greater than" check but fails the exact equalities below. Arming uses
+     * resetSymbolDictionary() so the test does not depend on threshold or
+     * anti-thrash floor arithmetic; auto-flush stays off so no interval
+     * flush can inject frames on a slow CI box. WebSocket rejects
+     * {@code auto_flush=off} outright (it also zeroes the auto-flush
+     * interval, which {@code validateParameters} disallows for this
+     * transport), so this pins the same large-finite-interval idiom already
+     * used by {@code DeltaDictRecoveryTest} / {@code SelfSufficientFramesTest}
+     * to fully suppress auto-flush on WS.
+     */
+    @Test(timeout = 60_000L)
+    public void testEpochBaseAccumulatesAcrossTwoRealRecycles() throws Exception {
+        assertMemoryLeak(() -> {
+            try (TestWebSocketServer server = ackingServer()) {
+                String config = cfg(server) + "auto_flush_bytes=off;auto_flush_rows=1000000;auto_flush_interval=60000;";
+                try (QwpWebSocketSender ws = (QwpWebSocketSender) Sender.fromConfig(config)) {
+                    // Epoch 0: exactly TWO published frames (raw 0 and 1).
+                    ws.table("t").longColumn("v", 1L).atNow();
+                    ws.flush();
+                    ws.table("t").longColumn("v", 2L).atNow();
+                    long ext1 = ws.flushAndGetSequence();
+                    Assert.assertTrue(ws.drain(5_000));
+
+                    ws.resetSymbolDictionary(); // arms immediately: nothing in flight
+                    ws.table("t");              // drained barrier -> recycle #1
+                    Assert.assertEquals(1, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("base after one recycle is lastExternal+1",
+                            ext1 + 1, ws.getFsnEpochBaseForTesting());
+
+                    // Epoch 1: exactly THREE published frames (raw 0..2) -- a
+                    // DIFFERENT count, so the two epochs' contributions differ.
+                    ws.table("t").longColumn("v", 3L).atNow();
+                    ws.flush();
+                    ws.table("t").longColumn("v", 4L).atNow();
+                    ws.flush();
+                    ws.table("t").longColumn("v", 5L).atNow();
+                    long ext2 = ws.flushAndGetSequence();
+                    Assert.assertTrue(ws.drain(5_000));
+
+                    ws.resetSymbolDictionary();
+                    ws.table("t");              // recycle #2
+                    Assert.assertEquals(2, ws.getSymbolDictEpoch());
+                    Assert.assertEquals("bases must accumulate: (L1+1)+(L2+1), i.e. lastExternal+1 "
+                            + "of the SECOND epoch", ext2 + 1, ws.getFsnEpochBaseForTesting());
+
+                    // And the next published frame lands exactly there.
+                    ws.table("t").longColumn("v", 6L).atNow();
+                    Assert.assertEquals(ext2 + 1, ws.flushAndGetSequence());
+                }
+            }
+        });
+    }
+
     private static TestWebSocketServer ackingServer() throws Exception {
         TestWebSocketServer server = new TestWebSocketServer(new AckAllHandler());
         server.start();
