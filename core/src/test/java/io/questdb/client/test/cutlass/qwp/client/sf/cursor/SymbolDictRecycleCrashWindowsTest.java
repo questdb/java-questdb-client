@@ -69,7 +69,7 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  * 7. reconnect (ensureConnected())
  * </pre>
  * This suite pins what a restarted sender recovers if the process dies at each
- * of four points around that sequence:
+ * of five points around that sequence:
  * <ul>
  *     <li>(a) {@link #testCrashBeforeRecycleStartsRecoversAckedResidueOnly()} --
  *     before step 2. The pre-recycle epoch's slot holds fully-acked residue.</li>
@@ -82,6 +82,12 @@ import static io.questdb.client.test.tools.TestUtils.assertMemoryLeak;
  *     -- ordinary mid-operation crash recovery, but performed one epoch INTO the
  *     post-recycle steady state, to prove the epoch swap left nothing behind
  *     that could corrupt ordinary backlog replay.</li>
+ *     <li>(e) {@link #testAbandonedResumeGroupSurvivesCrashReplay()} -- not a
+ *     {@code recycleForDictReset()} crash window at all, but the sibling
+ *     CLOSE_LOOP-abandon resume path in {@code resumeRecycleIfPending()}: the
+ *     resume's own re-registered chunk group plus commit ring, a further
+ *     data frame joins them, and the process crashes before the fresh loop's
+ *     reconnect ever lands.</li>
  * </ul>
  *
  * <h2>Why these are simulated, not paused mid-sequence</h2>
@@ -473,12 +479,23 @@ public class SymbolDictRecycleCrashWindowsTest {
     /**
      * (e): a CLOSE_LOOP abandon's resume re-registration rings its deferred
      * chunk group plus commit, and a further data frame joins them, before the
-     * fresh loop's reconnect ever lands. The resume's re-registration is
-     * crash-safe: chunks + commit go on the SF ring as one deferred group, so
-     * a process death before the reconnect replays the group WHOLE -- a
-     * server modelling the real deferred-ack contract (no ack for
-     * {@code FLAG_DEFER_COMMIT} frames until the group commits) acks
-     * everything only because the commit frame is there to close it.
+     * fresh loop's reconnect ever lands, then the process crashes. A fresh
+     * sender on the same slot must recover and replay everything correctly.
+     * <p>
+     * What the drain + dict-order outcome below actually proves: the resume's
+     * chunk frames genuinely persisted to the SF ring and survive a
+     * close/reopen cycle, and a fresh connection replays them, in order,
+     * ahead of the data frame, against a server that strictly withholds acks
+     * for any {@code FLAG_DEFER_COMMIT} frame until the group commits -- so a
+     * malformed or missing commit that left the group open would hang the
+     * drain. It does NOT, by itself, isolate whether the resume's OWN commit
+     * closed that group -- two independent, pre-existing mechanisms
+     * (close()'s own redundant commit-closing safety net, and the recovered
+     * slot's reconnect dictionary catch-up) would produce the same drain/dict
+     * outcome even if the resume's commit were missing entirely. Isolating
+     * the resume's own commit is what the synchronous
+     * {@code hasDeferredMessagesForTesting()} assertion right after the
+     * resume runs, below, is for.
      */
     @Test(timeout = 60_000L)
     public void testAbandonedResumeGroupSurvivesCrashReplay() throws Exception {
@@ -690,7 +707,13 @@ public class SymbolDictRecycleCrashWindowsTest {
      * for any frame carrying {@code FLAG_DEFER_COMMIT} (the group is still
      * open), acks everything else, and accumulates the delta dictionary in
      * arrival order. Single-connection semantics only -- sufficient here
-     * since recovery replays on one connection.
+     * since recovery replays on one connection: {@code dict} is never reset
+     * per-connection (unlike, e.g., {@code AckFirstConnectionSilentAfterHandler}'s
+     * {@code currentClient} tracking above), so the caller must never let
+     * phase 2's sender reconnect against this handler, or a second
+     * connection's entries would append onto the first's instead of starting
+     * fresh -- a mismatch that should fail loudly at the assertion, not
+     * silently, if some future edit introduces a reconnect.
      */
     private static class DeferAwareCaptureHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final List<String> dict = new ArrayList<>();
