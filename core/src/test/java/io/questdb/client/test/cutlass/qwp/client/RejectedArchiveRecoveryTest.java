@@ -7,6 +7,7 @@ package io.questdb.client.test.cutlass.qwp.client;
 
 import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
@@ -63,12 +64,23 @@ public class RejectedArchiveRecoveryTest {
         Path slot = Files.createDirectory(base.resolve("saved"));
         String archive;
         try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
+            // Keep fixture construction independent of the manager's ACK-persistence tick.
+            engine.getManagerForTesting().close();
             String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, slot.toString(), engine.freshFsnNamespace());
             append(engine, false);
             archive = preserve(engine, slot, epoch, 0);
             assertTrue(engine.acknowledge(0));
             append(engine, true); // Uncommitted orphan tail at FSN 1 forces the startup archive scan.
             if (overlaps) archive = preserve(engine, slot, epoch, 1);
+        }
+        // FSN 0 is the drained prefix of this fixture. acknowledge() only
+        // advances the live ring; a partially drained close need not persist
+        // that watermark. Write it explicitly so orphan validation happens
+        // during build(), rather than after replay ACKs on the I/O thread.
+        try (AckWatermark watermark = AckWatermark.open(slot.toString())) {
+            assertNotNull(watermark);
+            watermark.write(0);
+            watermark.sync();
         }
         Path archiveFile = Paths.get(archive, damaged ? damagedFile : RejectedMiniSlotArchive.METADATA_FILE_NAME);
         byte[] archiveBytes = Files.readAllBytes(archiveFile);
@@ -100,6 +112,8 @@ public class RejectedArchiveRecoveryTest {
                             if (error.getCategory() == SenderError.Category.DATA_LOSS) quarantines.incrementAndGet();
                             if (error.getCategory() == SenderError.Category.SCHEMA_MISMATCH) schemaReported.countDown();
                         }).build()) {
+                    assertEquals("quarantine must complete during build", damaged && overlaps ? 1 : 0,
+                            quarantines.get());
                     sender.table("healthy").longColumn("value", attempt).atNow();
                     long target = sender.flushAndGetSequence();
                     assertTrue("new rows must drain after recovery", sender.awaitAckedFsn(target, 5_000));
