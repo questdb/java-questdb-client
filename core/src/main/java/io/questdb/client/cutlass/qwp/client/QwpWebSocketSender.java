@@ -5795,10 +5795,20 @@ public class QwpWebSocketSender implements Sender {
                     // sentMaxSymbolId is KEPT: the ring now carries what the
                     // dead loop's mirror had.
                 } catch (Error e) {
-                    // publishDictionaryChunks closed its own chunk debt before
-                    // rethrowing. Drop the baseline too: a survivor would see
-                    // a kept watermark ahead of the ring's partial coverage,
-                    // and the next flush would trip the server's gap check.
+                    // publishDictionaryChunks closes its own chunk debt when the
+                    // Error originates INSIDE it, but an Error from the
+                    // commitFault seam or from sendCommitMessage() lands here
+                    // AFTER publishDictionaryChunks already returned with chunks
+                    // on the ring and hasDeferredMessages set -- close that debt
+                    // too (best-effort, commitOrphanedDictionaryChunks never
+                    // throws) exactly as the Throwable arm does. Drop the
+                    // baseline either way: a survivor would see a kept watermark
+                    // ahead of the ring's partial coverage, and the next flush
+                    // would trip the server's gap check. The Error itself is
+                    // never swallowed.
+                    if (hasDeferredMessages) {
+                        commitOrphanedDictionaryChunks(e);
+                    }
                     sentMaxSymbolId = -1;
                     throw e;
                 } catch (Throwable t) {
