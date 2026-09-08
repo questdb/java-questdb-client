@@ -378,6 +378,71 @@ public class SymbolDictRecycleOutageTest {
         });
     }
 
+    /**
+     * Invariant B's seed: a 401 handshake rejection AFTER a recycle is
+     * transient only because the swap seeds the fresh loop with
+     * markEverConnected() -- without it, the fresh loop would classify the
+     * same 401 as a pre-first-connect endpoint-policy failure and latch a
+     * terminal, turning a transient auth blip into data loss.
+     */
+    @Test(timeout = 60_000L)
+    public void testPostRecycleEndpointPolicyRejectionIsTransient() throws Exception {
+        assertMemoryLeak(() -> {
+            String sfDir = temporaryFolder.getRoot().toPath().resolve("post-recycle-401").toString();
+            AckAllHandler handler = new AckAllHandler();
+            try (TestWebSocketServer server = new TestWebSocketServer(handler)) {
+                server.start();
+                Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
+                String cfg = "ws::addr=localhost:" + server.getPort() + ";sf_dir=" + sfDir
+                        + ";symbol_dict_reset_threshold=2;";
+                try (Sender sender = Sender.fromConfig(cfg)) {
+                    QwpWebSocketSender ws = (QwpWebSocketSender) sender;
+                    sender.table("t").symbol("s", "a").longColumn("v", 1L).atNow();
+                    sender.table("t").symbol("s", "b").longColumn("v", 1L).atNow();
+                    long fsn1 = sender.flushAndGetSequence();
+                    Assert.assertTrue("setup: arm batch must be acked", sender.awaitAckedFsn(fsn1, 5_000));
+                    Assert.assertTrue(ws.isResetArmed());
+
+                    // Every handshake from here on is met with 401 -- including
+                    // the fresh post-recycle loop's very first connect.
+                    server.setRejectWithStatus(401, "Unauthorized");
+
+                    sender.table("t").symbol("s", "c").longColumn("v", 2L).atNow(); // recycle fires here
+                    Assert.assertEquals("the swap itself needs no connection", 1, ws.getSymbolDictEpoch());
+                    Assert.assertTrue("the seed must survive the swap", ws.wasEverConnected());
+
+                    // Producing keeps working: the rejection is transient under
+                    // Invariant B, so rows buffer and nothing latches.
+                    long fsn2 = sender.flushAndGetSequence();
+
+                    // The fresh loop's connect is deferred to its own I/O thread
+                    // and races this thread, so wait for the server to actually
+                    // observe (and reject) at least one handshake before checking
+                    // anything below -- otherwise this thread could relent before
+                    // the fresh loop's first attempt ever reaches the wire, and
+                    // the assertions that follow would pass without exercising
+                    // the 401 path at all.
+                    long rejectDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                    while (server.statusRejectCount() == 0 && System.nanoTime() < rejectDeadline) {
+                        Thread.sleep(2);
+                    }
+                    Assert.assertTrue("the fresh post-recycle loop must actually hit the 401 "
+                                    + "before this test can exercise Invariant B's seed",
+                            server.statusRejectCount() > 0);
+                    Assert.assertNull("must not latch a terminal on a post-recycle 401",
+                            ws.getLastTerminalError());
+
+                    // Clear BEFORE close() -- drainOnClose would otherwise burn its
+                    // whole flush budget against the rejecting server.
+                    server.setRejectWithStatus(0, null);
+                    Assert.assertTrue("buffered rows must land once the endpoint relents",
+                            sender.awaitAckedFsn(fsn2, 10_000));
+                    Assert.assertTrue(ws.wasEverConnected());
+                }
+            }
+        });
+    }
+
     /** ACKs every frame it receives immediately; does not otherwise inspect the wire. */
     private static class AckAllHandler implements TestWebSocketServer.WebSocketServerHandler {
         private final AtomicLong nextSeq = new AtomicLong(0);
