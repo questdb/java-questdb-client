@@ -141,17 +141,26 @@ public class QwpWebSocketSender implements Sender {
     // Default for symbol_dict_reset -- periodic symbol-dictionary recycling is
     // on by default so a long-lived sender's dictionary does not grow without
     // bound. The recycle runs at a table() call that finds the backlog
-    // acknowledged, so under sustained load it may be deferred indefinitely
-    // (see Sender#resetSymbolDictionary()).
+    // acknowledged; DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS bounds how long
+    // an armed recycle may wait for that instant before one table() call
+    // pauses to drain the backlog itself (see Sender#resetSymbolDictionary()).
     public static final boolean DEFAULT_SYMBOL_DICT_RESET_ENABLED = true;
-    // Default for symbol_dict_reset_max_wait_millis: 0 -- opportunistic-only.
-    // The recycle runs only when a table() call finds the backlog already
-    // drained; it never blocks the producing thread. A positive value is an
-    // explicit opt-in: once a recycle has been armed longer than that window
-    // without an opportunistic drain, the next table() call blocks for up to
-    // that many millis waiting for the backlog to drain, then recycles; on
-    // timeout that call gives up (still armed, retried opportunistically).
-    public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 0L;
+    // Default for symbol_dict_reset_max_wait_millis: 2 s. Once a recycle has
+    // been armed that long without a table() call finding the backlog already
+    // drained, the next table() call blocks the producing thread for up to
+    // that long waiting for the backlog to drain, then recycles. A producer
+    // that keeps a few frames in flight at every row start (a continuous
+    // stream) never exposes a drained instant on its own; on a healthy link
+    // the pause is one ack round trip, since the paused producer stops
+    // refilling the ring. On timeout the call gives up (still armed, retried
+    // only at a later drained table() call): the wait runs at most once per
+    // armed window, so an outage costs the producer one bounded pause. Kept
+    // well below QuestDBBuilder.DEFAULT_ACQUIRE_TIMEOUT_MILLIS (5 s): a
+    // pooled sender inherits an armed recycle at give-back, and a borrower
+    // paying this wait while holding its lease must release before other
+    // threads' acquire attempts expire. 0 disables the wait entirely
+    // (opportunistic-only).
+    public static final long DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS = 2_000L;
     // Default for symbol_dict_reset_threshold: distinct-symbol count that
     // triggers a recycle once symbol_dict_reset is on.
     public static final int DEFAULT_SYMBOL_DICT_RESET_THRESHOLD_SYMBOLS = 100_000;
@@ -455,15 +464,16 @@ public class QwpWebSocketSender implements Sender {
     // registered, bounding unbounded dictionary growth on a long-lived sender
     // (connect-string key symbol_dict_reset).
     private boolean resetEnabled = DEFAULT_SYMBOL_DICT_RESET_ENABLED;
-    // Default 0: opportunistic-only, never blocks the calling thread -- the
-    // recycle then only ever runs once a row-start call (table()) finds the
-    // backlog already drained. A positive value is an explicit opt-in bounded
-    // wait: once a recycle has been armed longer than this window without an
-    // opportunistic (idle) drain, the next table() call blocks the calling
-    // thread for up to this many millis waiting for the backlog to drain,
-    // then recycles; on timeout that call gives up (still armed, retried
-    // opportunistically later) instead of blocking further (connect-string
-    // key symbol_dict_reset_max_wait_millis).
+    // Bounded wait for a starved recycle: once a recycle has been armed
+    // longer than this window without an opportunistic (idle) drain, the next
+    // table() call blocks the calling thread for up to this many millis
+    // waiting for the backlog to drain, then recycles; on timeout that call
+    // gives up (still armed, retried opportunistically later) instead of
+    // blocking further, and no second wait runs until a swap commits. 0
+    // disables the wait: the recycle then only ever runs once a row-start
+    // call (table()) finds the backlog already drained (connect-string key
+    // symbol_dict_reset_max_wait_millis; default
+    // DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS).
     private long resetMaxWaitMillis = DEFAULT_SYMBOL_DICT_RESET_MAX_WAIT_MILLIS;
     // Distinct-symbol count that triggers a recycle once resetEnabled is on
     // (connect-string key symbol_dict_reset_threshold).
@@ -2576,11 +2586,17 @@ public class QwpWebSocketSender implements Sender {
      * {@link #getSymbolDictEpoch()} -- a concurrent read sees the latest
      * completed write, with no atomicity across the two counters.
      * <p>
-     * This counts only the opt-in bounded wait: at the default
-     * {@code symbol_dict_reset_max_wait_millis=0} the wait never runs, so this
-     * counter is structurally 0 regardless of how long a recycle stays armed.
-     * 0 does NOT mean "no starvation" -- sample {@link #isResetArmed()}
-     * alongside {@link #getSymbolDictEpoch()} instead.
+     * The wait runs at most once per armed window, so this advances by at
+     * most one per recycle that had to be forced: a count that keeps growing
+     * while {@link #getSymbolDictEpoch()} keeps advancing means recycles are
+     * completing, but each one first had to pause the producer; a count that
+     * stops growing while {@link #isResetArmed()} stays {@code true} and the
+     * epoch does not advance means the one wait this armed window gets has
+     * already timed out and the recycle now depends on a row start finding
+     * the backlog drained on its own. At {@code symbol_dict_reset_max_wait_millis=0}
+     * the wait never runs and this counter is structurally 0, so 0 does NOT
+     * mean "no starvation" -- sample {@link #isResetArmed()} alongside
+     * {@link #getSymbolDictEpoch()} instead.
      */
     public long getSymbolDictResetStarvationTimeouts() {
         return symbolDictResetStarvationTimeouts;

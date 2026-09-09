@@ -697,10 +697,13 @@ public interface Sender extends Closeable, ArraySender<Sender> {
     /**
      * Advisory request to start a fresh symbol-dictionary epoch. The reset
      * runs at the next {@code table(...)} call that finds all published data
-     * acknowledged and no row in progress; it may be deferred indefinitely
-     * under sustained load. {@code table(...)} is the only trigger point: a
-     * caller that never starts another row never recycles. No-op on
-     * transports without a symbol dictionary.
+     * acknowledged and no row in progress. A request outstanding longer than
+     * {@link LineSenderBuilder#symbolDictResetMaxWaitMillis(long)} pauses one
+     * {@code table(...)} call for up to that long to drain the backlog; if
+     * the backlog still does not drain, the request stays pending and may be
+     * deferred indefinitely under sustained saturation. {@code table(...)}
+     * is the only trigger point: a caller that never starts another row
+     * never recycles. No-op on transports without a symbol dictionary.
      * <p>
      * Also a permanent no-op on a sender configured with
      * {@code symbol_dict_reset=off} ({@link LineSenderBuilder#symbolDictReset(boolean)}):
@@ -1906,8 +1909,12 @@ public interface Sender extends Closeable, ArraySender<Sender> {
          * so a long-lived sender's dictionary does not grow without bound.
          * <p>
          * The recycle itself runs at a {@code table()} call that finds the backlog
-         * already acknowledged, so under sustained load it may be deferred
-         * indefinitely (see {@link Sender#resetSymbolDictionary()}).
+         * already acknowledged. A recycle armed longer than
+         * {@link #symbolDictResetMaxWaitMillis(long)} without such a call pauses
+         * one {@code table()} call for up to that long to drain the backlog; if
+         * the backlog still does not drain, the recycle stays armed and under
+         * sustained saturation may be deferred indefinitely (see
+         * {@link Sender#resetSymbolDictionary()}).
          * <p>
          * Switching it off also disables the manual valve:
          * {@link Sender#resetSymbolDictionary()} becomes a permanent no-op,
@@ -1959,28 +1966,37 @@ public interface Sender extends Closeable, ArraySender<Sender> {
         /**
          * Upper bound, in milliseconds, on how long a triggered symbol-dictionary
          * recycle stays armed before it may block the calling thread to force
-         * progress. {@code 0} -- the default -- disables blocking entirely
-         * (opportunistic-only): the recycle then only ever runs when a
-         * {@code table(...)} call finds the backlog already drained on its own,
-         * and under sustained load it may be deferred indefinitely.
+         * progress. Once a recycle has been armed for longer than this window
+         * without an opportunistic (idle) drain, the NEXT row-start call
+         * ({@code table(...)}) BLOCKS the producing thread for up to this many
+         * millis waiting for the outstanding backlog to drain, then recycles
+         * before returning. A producer that keeps frames in flight at every row
+         * start never exposes a drained instant on its own; on a healthy link
+         * the pause is about one acknowledgement round trip, because the paused
+         * producer stops refilling the backlog. If the backlog still has not
+         * drained by the deadline (an outage, or a producer that outruns the
+         * wire), that call gives up (logging a warning) and the recycle stays
+         * armed for a later opportunistic retry. At most one blocking wait
+         * happens per armed window, so an outage costs the producer one bounded
+         * pause, and a timeout during that one wait leaves the recycle waiting
+         * for a row start that finds the backlog drained on its own.
          * <p>
-         * A positive value is an explicit trade: once a recycle has been armed
-         * for longer than this window without an opportunistic (idle) drain, the
-         * NEXT row-start call ({@code table(...)}) BLOCKS the producing thread
-         * for up to this many millis waiting for the outstanding backlog to
-         * drain, then recycles before returning. If the backlog still has not
-         * drained by the deadline, that call gives up (logging a warning) and
-         * the recycle stays armed for a later opportunistic retry. At most one
-         * blocking wait happens per armed window.
+         * {@code 0} disables blocking entirely (opportunistic-only): the recycle
+         * then only ever runs when a {@code table(...)} call finds the backlog
+         * already drained, and under sustained load it may be deferred
+         * indefinitely. To detect a recycle that never finds its drained
+         * instant, sample {@code QwpWebSocketSender.isResetArmed()} together
+         * with {@code getSymbolDictEpoch()} and
+         * {@code getSymbolDictResetStarvationTimeouts()}: armed staying
+         * {@code true} while the epoch does not advance means no row start
+         * observes a drained backlog. Either raise this value, or drain
+         * explicitly ({@code drain(...)}) at a quiet point of your choosing.
          * <p>
-         * To detect a recycle that never finds its drained instant at the
-         * default, sample {@code QwpWebSocketSender.isResetArmed()} together
-         * with {@code getSymbolDictEpoch()}: armed staying {@code true} while
-         * the epoch does not advance means no row start ever observes a drained
-         * backlog. Either pass a positive value here, or drain explicitly
-         * ({@code drain(...)}) at a quiet point of your choosing.
+         * The default is kept below the sender pool's acquire timeout: a pooled
+         * sender inherits an armed recycle at give-back, and the next borrower
+         * may pay this wait while holding its lease.
          * <p>
-         * Default {@code 0} (opportunistic-only). WebSocket transport only.
+         * Default {@code 2_000}. WebSocket transport only.
          */
         public LineSenderBuilder symbolDictResetMaxWaitMillis(long maxWaitMillis) {
             if (protocol != PARAMETER_NOT_SET_EXPLICITLY && protocol != PROTOCOL_WEBSOCKET) {

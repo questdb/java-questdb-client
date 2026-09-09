@@ -285,7 +285,7 @@ public class LineSenderBuilderWebSocketTest extends AbstractTest {
                     QwpWebSocketSender ws = (QwpWebSocketSender) sender;
                     Assert.assertTrue(ws.isSymbolDictResetEnabled());
                     Assert.assertEquals(100_000, ws.getSymbolDictResetThreshold());
-                    Assert.assertEquals(0L, ws.getSymbolDictResetMaxWaitMillis());
+                    Assert.assertEquals(2_000L, ws.getSymbolDictResetMaxWaitMillis());
                 }
             }
         });
