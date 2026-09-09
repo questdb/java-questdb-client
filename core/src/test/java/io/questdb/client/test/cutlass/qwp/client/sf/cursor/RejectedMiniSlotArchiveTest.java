@@ -6,219 +6,55 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.SenderError;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentException;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.PersistedSymbolDict;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegmentCorruptionException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.UnreplayableSlotException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.SfRecoveryException;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
-import io.questdb.client.test.tools.TestUtils;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
-import org.junit.After;
-import org.junit.Before;
+import io.questdb.client.test.tools.TestUtils;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Comparator;
+import java.util.Properties;
+import java.util.concurrent.atomic.AtomicInteger;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
+import static org.junit.Assert.*;
 
 public class RejectedMiniSlotArchiveTest {
-    private Path root;
-
-    @Before
-    public void setUp() throws Exception {
-        root = Files.createTempDirectory("qdb-rejected-mini-slot-");
-    }
-
-    @After
-    public void tearDown() throws Exception {
-        if (root != null) {
-            try (java.util.stream.Stream<Path> paths = Files.walk(root)) {
-                paths.sorted(Comparator.reverseOrder()).forEach(p -> {
-                    try { Files.deleteIfExists(p); } catch (Exception ignored) { }
-                });
-            }
-        }
-    }
+    @Rule
+    public final TemporaryFolder temp = TemporaryFolder.builder().assureDeletion().build();
 
     @Test
-    public void testEpochSurvivesReopenAndRejectsCorruption() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String slot = Files.createDirectory(root.resolve("slot")).toString();
-        String first = SlotEpoch.openOrCreate(ff, slot);
-        assertEquals(first, SlotEpoch.openOrCreate(ff, slot));
-        assertEquals(first, SlotEpoch.read(ff, slot + '/' + SlotEpoch.FILE_NAME));
-        String reset = SlotEpoch.openOrCreate(ff, slot, true);
-        assertFalse(first.equals(reset));
-        assertEquals(reset, SlotEpoch.openOrCreate(ff, slot, false));
-    }
-
-    @Test
-    public void testCleanEngineCloseEndsEpochLifecycle() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String slot = Files.createDirectory(root.resolve("clean-close-slot")).toString();
-        try (CursorSendEngine engine = new CursorSendEngine(slot, 4096)) {
-            SlotEpoch.openOrCreate(ff, slot, engine.freshFsnNamespace());
-            assertTrue(ff.exists(slot + '/' + SlotEpoch.FILE_NAME));
-        }
-        assertFalse(ff.exists(slot + '/' + SlotEpoch.FILE_NAME));
-    }
-
-    @Test
-    public void testRecoveryFindsOnlyCurrentEpochAndScopedTempCleanup() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("recovery-source")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
+    public void testPreservedSubsetReplaysWithDictionaryAndKeepsArchive() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        byte[] dict = {4, 'z', 'e', 'r', 'o', 3, 'o', 'n', 'e', 6, 'u', 'n', 'u', 's', 'e', 'd'};
         try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            appendDeltaFrame(engine, 0, true, "zero");
-            SenderError error = rejection(0).withRejectionSpan(0, 0);
-            RejectedMiniSlotArchive.Result result = RejectedMiniSlotArchive.preserve(
-                    ff, engine, null, source, "slot-recovery", epoch, error);
-            SenderError recovered = RejectedMiniSlotArchive.findOverlapping(
-                    ff, source, "slot-recovery", epoch, 0, 0);
-            assertNotNull(recovered);
-            assertEquals(result.path, recovered.getRejectedPath());
-            assertEquals(0, recovered.getRejectedFsn());
-            assertEquals(null, RejectedMiniSlotArchive.findOverlapping(
-                    ff, source, "slot-recovery", java.util.UUID.randomUUID().toString(), 0, 0));
-
-            Path rejected = Paths.get(source, "rejected");
-            Path ours = Files.createDirectory(rejected.resolve(
-                    ".tmp-slot-recovery-" + epoch + "-fsn-0-0-dead"));
-            Files.createFile(ours.resolve(RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
-            Path other = Files.createDirectory(rejected.resolve(
-                    ".tmp-other-" + epoch + "-fsn-0-0-live"));
-            RejectedMiniSlotArchive.cleanupTemporaryDirectories(
-                    ff, source, "slot-recovery", epoch);
-            assertFalse(Files.exists(ours));
-            assertTrue(Files.exists(other));
-        }
-    }
-
-    @Test
-    public void testRecoveryDoesNotReadDamagedArchivesOutsideRequestedRange() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("unrelated-archives")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
-        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            for (int i = 0; i < 3; i++) appendDeltaFrame(engine, i, true, "symbol" + i);
-            for (long fsn : new long[]{0, 2}) {
-                String archive = RejectedMiniSlotArchive.preserve(
-                        ff, engine, null, source, "slot", epoch, rejection(fsn)).path;
-                Files.write(Paths.get(archive, RejectedMiniSlotArchive.METADATA_FILE_NAME), new byte[]{0});
-            }
-            assertNull(RejectedMiniSlotArchive.findOverlapping(ff, source, "slot", epoch, 1, 1));
-            // Corruption still fails closed when its range is actually needed.
-            try {
-                RejectedMiniSlotArchive.findOverlapping(ff, source, "slot", epoch, 0, 0);
-                fail("overlapping damaged metadata must not be ignored");
-            } catch (UnreplayableSlotException expected) {
-                assertTrue(expected.getMessage().contains("invalid rejection metadata size"));
-            }
-        }
-    }
-
-    @Test
-    public void testRecoveryRequiresMetadataToMatchDirectoryRange() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("mismatched-archive")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
-        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            appendDeltaFrame(engine, 0, true, "zero");
-            String archive = RejectedMiniSlotArchive.preserve(
-                    ff, engine, null, source, "slot", epoch, rejection(0)).path;
-            Files.move(Paths.get(archive), Paths.get(source, "rejected", "slot-" + epoch + "-fsn-0-1"));
-            try {
-                RejectedMiniSlotArchive.findOverlapping(ff, source, "slot", epoch, 1, 1);
-                fail("overlapping directory with contradictory metadata must fail closed");
-            } catch (UnreplayableSlotException expected) {
-                assertTrue(expected.getMessage().contains("directory identity mismatch"));
-            }
-        }
-    }
-
-    @Test
-    public void testRecoveryIgnoresNoncanonicalDirectoryNames() throws Exception {
-        String source = Files.createDirectory(root.resolve("noncanonical-archives")).toString();
-        String epoch = java.util.UUID.randomUUID().toString();
-        Path rejected = Files.createDirectory(Paths.get(source, "rejected"));
-        String prefix = "slot-" + epoch + "-fsn-";
-        for (String suffix : new String[]{"", "0", "0-0-extra", "-1-0", "2-1", "00-1", "+0-1",
-                "0-9223372036854775808"}) {
-            Files.createDirectory(rejected.resolve(prefix + suffix));
-        }
-        assertNull(RejectedMiniSlotArchive.findOverlapping(
-                FilesFacade.INSTANCE, source, "slot", epoch, 0, Long.MAX_VALUE));
-    }
-
-    @Test
-    public void testArchiveReadFailureIsNotReclassifiedAsCorruption() throws Exception {
-        String source = Files.createDirectory(root.resolve("archive-read-failure")).toString();
-        String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, source);
-        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            appendDeltaFrame(engine, 0, true, "zero");
-            String archive = RejectedMiniSlotArchive.preserve(
-                    FilesFacade.INSTANCE, engine, null, source, "slot", epoch, rejection(0)).path;
-            MmapSegmentException failure = new MmapSegmentException("injected operational read failure");
-            FilesFacade ff = new DelegatingFilesFacade() {
-                @Override
-                public int openRW(String path) {
-                    if (path.equals(archive + '/' + RejectedMiniSlotArchive.SEGMENT_FILE_NAME)) throw failure;
-                    return super.openRW(path);
-                }
-            };
-            try {
-                RejectedMiniSlotArchive.findOverlapping(ff, source, "slot", epoch, 0, 0);
-                fail("operational read failure must propagate");
-            } catch (MmapSegmentException expected) {
-                assertSame(failure, expected);
-            }
-            assertTrue(Files.isDirectory(Paths.get(archive)));
-        }
-    }
-
-    @Test
-    public void testPreservedSubsetReopensWithDictionarySupersetAndWorkingCopyKeepsArchive() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("source")).toString();
-        String dictDir = Files.createDirectory(root.resolve("dict")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
-        try (CursorSendEngine engine = new CursorSendEngine(source, 4096);
-             PersistedSymbolDict dictionary = PersistedSymbolDict.openClean(dictDir)) {
-            dictionary.appendSymbol("zero");
-            dictionary.appendSymbol("one");
-            dictionary.appendSymbol("unused-superset-entry");
             appendDeltaFrame(engine, 0, true, "zero");
             appendDeltaFrame(engine, 1, true, "one");
-            String serverMessage = TestUtils.repeat("column mismatch ", 2048);
+            String message = TestUtils.repeat("mismatch: \u00e9\n\\=", 8192);
             SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
-                    SenderError.Policy.REJECT_AND_CONTINUE, 3, serverMessage, 1,
-                    0, 1, "tab", 42).withRejectionSpan(0, 1);
-            RejectedMiniSlotArchive.Result result = RejectedMiniSlotArchive.preserve(
-                    ff, engine, dictionary, source, "slot-0", epoch, error);
-            assertFalse(result.reused);
+                    SenderError.Policy.REJECT_AND_CONTINUE, 3, message, 1, 0, 1, "tab", 42);
+            RejectedMiniSlotArchive writer = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source);
+            RejectedMiniSlotArchive.Result result = writer.preserve(engine, error, dict, 3);
             assertTrue(result.bytesWritten > 0);
-
-            RejectedMiniSlotArchive.Metadata metadata = RejectedMiniSlotArchive.readMetadata(ff, result.path);
-            assertEquals(0, metadata.fromFsn);
-            assertEquals(1, metadata.toFsn);
-            assertEquals(serverMessage, metadata.message);
-
+            Properties metadata = new Properties();
+            try (java.io.InputStream input = Files.newInputStream(Paths.get(result.path,
+                    RejectedMiniSlotArchive.METADATA_FILE_NAME))) {
+                metadata.load(input);
+            }
+            assertEquals("0", metadata.getProperty("fromFsn"));
+            assertEquals("1", metadata.getProperty("toFsn"));
+            assertEquals(message, metadata.getProperty("message"));
             try (MmapSegment segment = MmapSegment.openExisting(result.path + '/'
                     + RejectedMiniSlotArchive.SEGMENT_FILE_NAME)) {
                 long second = MmapSegment.HEADER_SIZE;
@@ -228,52 +64,184 @@ public class RejectedMiniSlotArchiveTest {
                 assertEquals(0, Unsafe.getUnsafe().getByte(payload + QwpConstants.HEADER_OFFSET_FLAGS)
                         & QwpConstants.FLAG_DEFER_COMMIT);
             }
-
-            RejectedMiniSlotArchive.Result reused = RejectedMiniSlotArchive.preserve(
-                    ff, engine, dictionary, source, "slot-0", epoch, error);
-            assertTrue(reused.reused);
-
-            String working = root.resolve("working").toString();
-            RejectedMiniSlotArchive.copyToWorkingDirectory(ff, result.path, working);
-            assertTrue(ff.exists(result.path + '/' + RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
+            String working = Paths.get(source, "working").toString();
+            copyArchive(result.path, working);
             try (CursorSendEngine replay = new CursorSendEngine(working, 4096)) {
                 assertEquals(1, replay.publishedFsn());
                 assertEquals(-1, replay.ackedFsn());
+                assertEquals(3, replay.getPersistedSymbolDict().size());
+                replay.acknowledge(1);
             }
-            assertTrue(ff.exists(result.path + '/' + RejectedMiniSlotArchive.SEGMENT_FILE_NAME));
+            assertTrue(Files.exists(Paths.get(result.path, RejectedMiniSlotArchive.SEGMENT_FILE_NAME)));
+            assertEquals(-1, engine.ackedFsn());
         }
     }
 
     @Test
-    public void testSynchronousPreserverReturnsCompleteCopy() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("sync-source")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
+    public void testSameRangeIsReusedAcrossWriterRestart() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        String namespace = RejectedMiniSlotArchive.namespaceForSource(source);
+        RejectedMiniSlotArchive.Result first;
         try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            appendDeltaFrame(engine, 0, true, "zero");
-            SchemaPreserver preserver = new SchemaPreserver(ff, source, "slot-sync", epoch);
-            RejectedMiniSlotArchive.Result result = preserver.preserve(engine,
-                    rejection(0), new byte[]{4, 'z', 'e', 'r', 'o'}, 1);
-            assertNotNull(RejectedMiniSlotArchive.readMetadata(ff, result.path));
-            try (PersistedSymbolDict dictionary = PersistedSymbolDict.open(ff, result.path)) {
-                assertNotNull(dictionary);
-                assertEquals(1, dictionary.size());
+            appendDeltaFrame(engine, 0, false, "zero");
+            first = new RejectedMiniSlotArchive(
+                    FilesFacade.INSTANCE, source, namespace).preserve(engine, rejection(0), null, 0);
+            assertFalse(first.reused);
+        }
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            RejectedMiniSlotArchive.Result second = new RejectedMiniSlotArchive(
+                    FilesFacade.INSTANCE, source, namespace).preserve(engine, rejection(0), null, 0);
+            assertTrue(second.reused);
+            assertEquals(first.path, second.path);
+            assertEquals(0, second.bytesWritten);
+            try (java.util.stream.Stream<Path> archives = Files.list(Paths.get(source, "rejected"))) {
+                assertEquals(1, archives.count());
             }
         }
     }
 
     @Test
-    public void testSynchronousPreserverPropagatesFailure() throws Exception {
-        FilesFacade ff = FilesFacade.INSTANCE;
-        String source = Files.createDirectory(root.resolve("sync-failure")).toString();
-        String epoch = SlotEpoch.openOrCreate(ff, source);
+    public void testFreshFsnNamespaceDoesNotReuseOldRange() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        String namespace = RejectedMiniSlotArchive.namespaceForSource(source);
+        String first;
+        long firstGeneration;
         try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
-            SchemaPreserver preserver = new SchemaPreserver(ff, source, "slot-failure", epoch);
+            appendDeltaFrame(engine, 0, false, "first");
+            firstGeneration = engine.findSegmentContaining(0).generationToken();
+            first = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source, namespace)
+                    .preserve(engine, rejection(0), null, 0).path;
+            engine.acknowledge(0);
+        }
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, false, "second");
+            assertNotEquals(firstGeneration, engine.findSegmentContaining(0).generationToken());
+            RejectedMiniSlotArchive writer = new RejectedMiniSlotArchive(
+                    FilesFacade.INSTANCE, source, namespace);
+            assertNull(writer.findRecoveredOrphanReport(engine, 0, 0));
+            RejectedMiniSlotArchive.Result second = writer.preserve(engine, rejection(0), null, 0);
+            assertFalse(second.reused);
+            assertNotEquals(first, second.path);
+        }
+    }
+
+    @Test
+    public void testRecoveredLookupCleansOnlyExactStagingDirectory() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, false, "zero");
+            RejectedMiniSlotArchive writer = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source);
+            Path completed = Paths.get(writer.preserve(engine, rejection(0), null, 0).path);
+            Path otherWriter = Paths.get(new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source,
+                    RejectedMiniSlotArchive.namespaceForSource(null))
+                    .preserve(engine, rejection(0), null, 0).path);
+            Path staging = completed.resolveSibling(".tmp-" + completed.getFileName());
+            Files.move(completed, staging);
+            Path unrelated = Files.createDirectories(Paths.get(source, "rejected", ".tmp-unrelated"));
+            Files.write(unrelated.resolve("keep"), new byte[]{1});
+
+            assertNull(new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source)
+                    .findRecoveredOrphanReport(engine, 0, 0));
+            assertFalse(Files.exists(staging));
+            assertTrue(Files.isDirectory(otherWriter));
+            assertArrayEquals(new byte[]{1}, Files.readAllBytes(unrelated.resolve("keep")));
+        }
+        assertNotEquals(RejectedMiniSlotArchive.namespaceForSource(null),
+                RejectedMiniSlotArchive.namespaceForSource(null));
+    }
+
+    @Test
+    public void testParentSyncRetryDoesNotCopyAgain() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        AtomicInteger publications = new AtomicInteger();
+        AtomicInteger rootSyncs = new AtomicInteger();
+        FilesFacade ff = new DelegatingFilesFacade() {
+            @Override
+            public int rename(String from, String to) {
+                int result = super.rename(from, to);
+                if (result == 0) publications.incrementAndGet();
+                return result;
+            }
+            @Override
+            public int fsyncDir(String dir) {
+                if (dir.equals(source + "/rejected") && rootSyncs.incrementAndGet() <= 2) return -1;
+                return super.fsyncDir(dir);
+            }
+        };
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, false, "zero");
+            RejectedMiniSlotArchive writer = new RejectedMiniSlotArchive(ff, source);
+            for (int attempt = 0; attempt < 2; attempt++) {
+                try {
+                    writer.preserve(engine, rejection(0), null, 0);
+                    fail("directory barrier must gate successful preservation");
+                } catch (SfOperationalException expected) {
+                    assertEquals(-1, engine.ackedFsn());
+                }
+            }
+            RejectedMiniSlotArchive.Result result = writer.preserve(engine, rejection(0), null, 0);
+            assertEquals(1, publications.get());
+            assertTrue(Files.exists(Paths.get(result.path, RejectedMiniSlotArchive.METADATA_FILE_NAME)));
+        }
+    }
+
+    @Test
+    public void testFailedCopyCleansOnlyItsOwnStagingDirectory() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        Path rejected = Files.createDirectory(Paths.get(source, "rejected"));
+        Path other = Files.createDirectory(rejected.resolve(".tmp-another-writer"));
+        Files.write(other.resolve("keep"), new byte[]{1});
+        AtomicInteger attempts = new AtomicInteger();
+        FilesFacade ff = new DelegatingFilesFacade() {
+            @Override
+            public int openRWExclusive(String path) {
+                if (path.endsWith(RejectedMiniSlotArchive.METADATA_FILE_NAME) && attempts.getAndIncrement() == 0) return -1;
+                return super.openRWExclusive(path);
+            }
+        };
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, false, "zero");
+            RejectedMiniSlotArchive writer = new RejectedMiniSlotArchive(ff, source);
             try {
-                preserver.preserve(engine, rejection(0), null, 0);
-                fail("missing source frame must fail preservation");
-            } catch (io.questdb.client.cutlass.qwp.client.sf.cursor.SfOperationalException expected) {
+                writer.preserve(engine, rejection(0), null, 0);
+                fail("injected metadata write failure");
+            } catch (SfOperationalException expected) {
                 assertEquals(-1, engine.ackedFsn());
+            }
+            try (java.util.stream.Stream<Path> children = Files.list(rejected)) {
+                assertEquals(1, children.count());
+            }
+            writer.preserve(engine, rejection(0), null, 0);
+            assertArrayEquals(new byte[]{1}, Files.readAllBytes(other.resolve("keep")));
+        }
+    }
+
+    @Test
+    public void testExistingRecoveryReaderRejectsDamagedArchiveCopy() throws Exception {
+        String source = temp.newFolder().getAbsolutePath();
+        try (CursorSendEngine engine = new CursorSendEngine(source, 4096)) {
+            appendDeltaFrame(engine, 0, false, "zero");
+            String archive = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, source)
+                    .preserve(engine, rejection(0), null, 0).path;
+            Path segment = Paths.get(archive, RejectedMiniSlotArchive.SEGMENT_FILE_NAME);
+            byte[] bytes = Files.readAllBytes(segment);
+            bytes[0] ^= 1;
+            Files.write(segment, bytes);
+            String working = source + "/working";
+            copyArchive(archive, working);
+            try (CursorSendEngine ignored = new CursorSendEngine(working, 4096)) {
+                fail("damaged archive must not replay");
+            } catch (MmapSegmentCorruptionException | SfRecoveryException expected) {
+                assertArrayEquals(bytes, Files.readAllBytes(segment));
+            }
+        }
+    }
+
+    private static void copyArchive(String archive, String working) throws Exception {
+        Path target = Files.createDirectory(Paths.get(working));
+        try (java.util.stream.Stream<Path> files = Files.list(Paths.get(archive))) {
+            for (Path file : (Iterable<Path>) files::iterator) {
+                Files.copy(file, target.resolve(file.getFileName()));
             }
         }
     }

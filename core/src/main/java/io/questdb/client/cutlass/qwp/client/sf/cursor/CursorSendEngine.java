@@ -1302,18 +1302,6 @@ public final class CursorSendEngine implements QuietCloseable {
                                 "could not fsync SF slot directory after segment cleanup");
                     } else {
                         AckWatermark.removeOrphan(filesFacade, sfDir);
-                        // The next engine starts a new FSN namespace. Keep its
-                        // archive identity distinct from this drained one.
-                        String epochPath = sfDir + '/' + SlotEpoch.FILE_NAME;
-                        if (filesFacade.exists(epochPath)) {
-                            if (!filesFacade.remove(epochPath)) {
-                                durabilityFailure = new IllegalStateException(
-                                        "could not remove drained SF slot epoch");
-                            } else if (filesFacade.fsyncDir(sfDir) != 0) {
-                                durabilityFailure = new IllegalStateException(
-                                        "could not fsync SF slot directory after epoch cleanup");
-                            }
-                        }
                     }
                 } else {
                     LOG.warn("close-time segment cleanup incomplete on slot {}; retaining the ack "
@@ -1863,11 +1851,6 @@ public final class CursorSendEngine implements QuietCloseable {
      */
     public boolean wasRecoveredFromDisk() {
         return wasRecoveredFromDisk;
-    }
-
-    /** True when construction created a new FSN namespace rather than recovering one. */
-    public boolean freshFsnNamespace() {
-        return sfDir != null && !wasRecoveredFromDisk;
     }
 
     /**

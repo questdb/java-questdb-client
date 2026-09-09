@@ -11,14 +11,12 @@ import io.questdb.client.cutlass.http.client.WebSocketClient;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaRejectionState;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotLock;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.network.PlainSocketFactory;
-import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
@@ -77,8 +75,7 @@ public class CursorWebSocketSendLoopSchemaPreservationCloseTest {
                         SenderError.Policy.REJECT_AND_CONTINUE, 3, "mismatch", 0,
                         0, 0, "tab", System.nanoTime())));
                 loop.setSchemaRejectionState(state);
-                loop.setSchemaPreserver(new SchemaPreserver(ff, directory, "slot",
-                        SlotEpoch.openOrCreate(FilesFacade.INSTANCE, directory)));
+                loop.setRejectionArchive(new RejectedMiniSlotArchive(ff, directory));
                 loop.setErrorDispatcher(dispatcher);
                 loop.setShutdownAwaitTimeoutMillis(25);
                 loop.start();

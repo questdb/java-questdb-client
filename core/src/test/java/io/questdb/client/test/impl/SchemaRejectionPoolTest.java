@@ -11,12 +11,6 @@ import io.questdb.client.Sender;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
-import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
-import io.questdb.client.std.FilesFacade;
-import io.questdb.client.std.MemoryTag;
-import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.cutlass.qwp.client.QwpWireTestUtils;
 import io.questdb.client.test.cutlass.qwp.websocket.TestWebSocketServer;
 import org.junit.Assert;
@@ -27,7 +21,6 @@ import org.junit.rules.TemporaryFolder;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
-import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -89,7 +82,8 @@ public class SchemaRejectionPoolTest {
                 if (policy == SenderError.Policy.TERMINAL) {
                     Assert.assertNull(state);
                 } else {
-                    Assert.assertEquals(2, ((Collection<?>) field(state, "leases")).size());
+                    Assert.assertNotNull(field(state, "current"));
+                    Assert.assertNull(field(state, "pending"));
                 }
             }
         }
@@ -99,52 +93,6 @@ public class SchemaRejectionPoolTest {
         Field field = object.getClass().getDeclaredField(name);
         field.setAccessible(true);
         return field.get(object);
-    }
-
-    @Test
-    public void testRecoveredPreservedOrphanReportsAsynchronouslyBeforeRetirement() throws Exception {
-        String base = temp.newFolder("recovered").getAbsolutePath();
-        String slot = Files.createDirectory(java.nio.file.Paths.get(base, "saved")).toString();
-        String archive;
-        try (CursorSendEngine engine = new CursorSendEngine(slot, 1 << 20)) {
-            String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, slot, engine.freshFsnNamespace());
-            long frame = Unsafe.malloc(QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
-            try {
-                Unsafe.getUnsafe().setMemory(frame, QwpConstants.HEADER_SIZE, (byte) 0);
-                Unsafe.getUnsafe().putInt(frame, QwpConstants.MAGIC_MESSAGE);
-                Unsafe.getUnsafe().putByte(frame + QwpConstants.HEADER_OFFSET_FLAGS, QwpConstants.FLAG_DEFER_COMMIT);
-                engine.appendBlocking(frame, QwpConstants.HEADER_SIZE);
-            } finally {
-                Unsafe.free(frame, QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
-            }
-            SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
-                    SenderError.Policy.REJECT_AND_CONTINUE, 3, "schema rejected", 0, 0, 0, null, 1);
-            archive = RejectedMiniSlotArchive.preserve(FilesFacade.INSTANCE, engine, null,
-                    slot, "saved", epoch, error).path;
-        }
-        CountDownLatch reported = new CountDownLatch(1);
-        AtomicReference<SenderError> error = new AtomicReference<>();
-        AtomicReference<Thread> callbackThread = new AtomicReference<>();
-        try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
-            public void onBinaryMessage(TestWebSocketServer.ClientHandler client, byte[] data) {
-                throw new AssertionError("orphan frames must be retired without sending");
-            }
-        })) {
-            server.start();
-            Assert.assertTrue(server.awaitStart(5, TimeUnit.SECONDS));
-            try (Sender sender = Sender.builder("ws::addr=localhost:" + server.getPort() + ";sf_dir=" + base + ";")
-                    .senderId("saved").errorHandler(e -> {
-                        error.set(e);
-                        callbackThread.set(Thread.currentThread());
-                        reported.countDown();
-                    }).build()) {
-                Assert.assertTrue(reported.await(5, TimeUnit.SECONDS));
-                Assert.assertNotSame(Thread.currentThread(), callbackThread.get());
-                Assert.assertEquals(java.nio.file.Paths.get(archive),
-                        java.nio.file.Paths.get(error.get().getRejectedPath()));
-                Assert.assertEquals(0, sender.getAckedFsn());
-            }
-        }
     }
 
     @Test
@@ -398,7 +346,7 @@ public class SchemaRejectionPoolTest {
                     a.flush();
                     Assert.assertTrue(firstReceived.await(5, TimeUnit.SECONDS));
                 }
-                // Move the rejected borrow into a compacted historical range.
+                // Let several borrowers publish before the old rejection arrives.
                 for (int i = 0; i < 20; i++) {
                     try (Sender intervening = db.borrowSender()) {
                         intervening.table("good").longColumn("value", i).atNow();

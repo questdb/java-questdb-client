@@ -326,7 +326,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
     private final AtomicLong dlqWriteFailures = new AtomicLong();
     private volatile SenderError.Policy schemaMismatchPolicy = SenderError.Policy.TERMINAL;
     private volatile SchemaRejectionState schemaRejectionState;
-    private volatile SchemaPreserver schemaPreserver;
+    private volatile RejectedMiniSlotArchive schemaPreserver;
     private SenderError preservedSchemaNotification;
     private long preparedSchemaFirstFsn = -1L;
     private long preparedSchemaLastFsn = -1L;
@@ -1597,7 +1597,7 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         this.schemaMismatchPolicy = policy;
     }
 
-    public void setSchemaPreserver(SchemaPreserver preserver) {
+    public void setRejectionArchive(RejectedMiniSlotArchive preserver) {
         this.schemaPreserver = preserver;
     }
 
@@ -2294,10 +2294,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
             if (engine.acknowledge(fsn)) {
                 totalDurableTrimAdvances.incrementAndGet();
                 dispatchProgress(fsn);
-                SchemaRejectionState state = schemaRejectionState;
-                if (state != null) {
-                    state.acknowledgedThrough(fsn);
-                }
             }
         }
     }
@@ -3791,11 +3787,11 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         if (engine.ackedFsn() < orphanSkipStartFsn - 1L) {
             return false;
         }
-        SchemaPreserver preserver = schemaPreserver;
-        if (preserver != null) {
+        RejectedMiniSlotArchive archive = schemaPreserver;
+        if (archive != null) {
             if (!recoveredOrphanReportLookedUp) {
-                recoveredOrphanReport = preserver.findRecoveredOrphanReport(
-                        orphanSkipStartFsn, orphanSkipTipFsn);
+                recoveredOrphanReport = archive.findRecoveredOrphanReport(
+                        engine, orphanSkipStartFsn, orphanSkipTipFsn);
                 recoveredOrphanReportLookedUp = true;
             }
             if (recoveredOrphanReport != null) {
@@ -3830,18 +3826,18 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
         SenderError notification = preservedSchemaNotification != null
                 ? preservedSchemaNotification
                 : range.error;
-        SchemaPreserver preserver = schemaPreserver;
+        RejectedMiniSlotArchive preserver = schemaPreserver;
+        try {
+            prepareSkippedRange(range);
+        } catch (LineSenderException e) {
+            LOG.error("could not retain dictionary coverage for schema-rejected range [{}, {}]; "
+                            + "keeping queued bytes and stopping the sender",
+                    range.firstFsn, range.lastFsn, e);
+            recordFatal(e);
+            dispatchError(range.error.withAppliedPolicy(SenderError.Policy.TERMINAL));
+            return false;
+        }
         if (preserver != null && preservedSchemaNotification == null) {
-            try {
-                prepareSkippedRange(range);
-            } catch (LineSenderException e) {
-                LOG.error("could not retain dictionary coverage for schema-rejected range [{}, {}]; "
-                                + "keeping queued bytes and stopping the sender",
-                        range.firstFsn, range.lastFsn, e);
-                recordFatal(e);
-                dispatchError(range.error.withAppliedPolicy(SenderError.Policy.TERMINAL));
-                return false;
-            }
             byte[] dictionary = snapshotSentDictionary();
             final RejectedMiniSlotArchive.Result result;
             try {
@@ -3879,17 +3875,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 // close() may have stopped the loop while the synchronous copy
                 // was blocked in storage. Keep the source range mapped and let
                 // the existing delegated I/O-thread cleanup release the engine.
-                return false;
-            }
-        } else {
-            try {
-                prepareSkippedRange(range);
-            } catch (LineSenderException e) {
-                LOG.error("could not retain dictionary coverage for schema-rejected range [{}, {}]; "
-                                + "keeping queued bytes and stopping the sender",
-                        range.firstFsn, range.lastFsn, e);
-                recordFatal(e);
-                dispatchError(range.error.withAppliedPolicy(SenderError.Policy.TERMINAL));
                 return false;
             }
         }
@@ -4240,10 +4225,6 @@ public final class CursorWebSocketSendLoop implements QuietCloseable {
                 long ackFsn = clampAckBeforeSchemaStop(fsnAtZero + capped);
                 if (engine.acknowledge(ackFsn)) {
                     dispatchProgress(ackFsn);
-                    SchemaRejectionState state = schemaRejectionState;
-                    if (state != null) {
-                        state.acknowledgedThrough(ackFsn);
-                    }
                 }
                 return;
             }

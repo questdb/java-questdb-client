@@ -10,7 +10,6 @@ import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
@@ -31,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
 
@@ -44,52 +44,76 @@ public class RejectedArchiveRecoveryTest {
     }
 
     @Test(timeout = 30_000)
-    public void testDamagedOverlappingArchiveQuarantinesOnceAndBuildsContinue() throws Exception {
+    public void testDamagedOverlappingArchiveDoesNotAffectQueue() throws Exception {
         assertRepeatedBuilds(RejectedMiniSlotArchive.METADATA_FILE_NAME, true);
     }
 
     @Test(timeout = 30_000)
-    public void testIntactOverlappingArchiveReportsAndBuildsContinue() throws Exception {
+    public void testPublishedArchiveReconstructsCallbackBeforeOrphanRetirement() throws Exception {
         assertRepeatedBuilds(null, true);
     }
 
     @Test(timeout = 30_000)
-    public void testDamagedOverlappingArchiveSegmentQuarantinesOnce() throws Exception {
+    public void testDamagedOverlappingArchiveSegmentDoesNotAffectQueue() throws Exception {
         assertRepeatedBuilds(RejectedMiniSlotArchive.SEGMENT_FILE_NAME, true);
+    }
+
+    @Test(timeout = 30_000)
+    public void testMismatchedArchiveBoundaryDoesNotAffectQueue() throws Exception {
+        assertRepeatedBuilds(AckWatermark.FILE_NAME, true);
     }
 
     private void assertRepeatedBuilds(String damagedFile, boolean overlaps) throws Exception {
         boolean damaged = damagedFile != null;
         Path base = temp.newFolder().toPath();
         Path slot = Files.createDirectory(base.resolve("saved"));
+        // Residue from the original PR and a crashed writer is output only.
+        Path oldEpoch = slot.resolve(".slot-epoch");
+        Files.write(oldEpoch, new byte[]{0});
+        Path staging = Files.createDirectories(slot.resolve("rejected/.tmp-legacy-writer"));
+        Path oldMetadata = staging.resolve("rejection-meta.bin");
+        Files.write(oldMetadata, new byte[]{1});
         String archive;
         try (CursorSendEngine engine = new CursorSendEngine(slot.toString(), 4096)) {
             // Keep fixture construction independent of the manager's ACK-persistence tick.
             engine.getManagerForTesting().close();
-            String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, slot.toString(), engine.freshFsnNamespace());
             append(engine, false);
-            archive = preserve(engine, slot, epoch, 0);
+            archive = preserve(engine, slot, 0);
             assertTrue(engine.acknowledge(0));
-            append(engine, true); // Uncommitted orphan tail at FSN 1 forces the startup archive scan.
-            if (overlaps) archive = preserve(engine, slot, epoch, 1);
+            append(engine, true); // Uncommitted orphan tail at FSN 1.
+            if (overlaps) archive = preserve(engine, slot, 1);
         }
         // FSN 0 is the drained prefix of this fixture. acknowledge() only
         // advances the live ring; a partially drained close need not persist
-        // that watermark. Write it explicitly so orphan validation happens
-        // during build(), rather than after replay ACKs on the I/O thread.
+        // that watermark. Write it explicitly so the orphan can retire during
+        // build(), rather than after replay ACKs on the I/O thread.
         try (AckWatermark watermark = AckWatermark.open(slot.toString())) {
             assertNotNull(watermark);
             watermark.write(0);
             watermark.sync();
         }
         Path archiveFile = Paths.get(archive, damaged ? damagedFile : RejectedMiniSlotArchive.METADATA_FILE_NAME);
-        byte[] archiveBytes = Files.readAllBytes(archiveFile);
         if (damaged) {
-            archiveBytes[0] ^= 1; // Corrupt metadata CRC or segment magic, retaining the remaining bytes.
-            Files.write(archiveFile, archiveBytes);
+            if (RejectedMiniSlotArchive.SEGMENT_FILE_NAME.equals(damagedFile)) {
+                // Keep the valid file size while corrupting the segment header.
+                byte[] archiveBytes = Files.readAllBytes(archiveFile);
+                archiveBytes[0] ^= 1;
+                Files.write(archiveFile, archiveBytes);
+            } else if (AckWatermark.FILE_NAME.equals(damagedFile)) {
+                try (AckWatermark archiveWatermark = AckWatermark.open(archive)) {
+                    assertNotNull(archiveWatermark);
+                    archiveWatermark.write(1); // Structurally valid, but expected boundary is 0.
+                    archiveWatermark.sync();
+                }
+            } else {
+                Files.write(archiveFile, new byte[]{0});
+            }
         }
+        byte[] archiveBytes = Files.readAllBytes(archiveFile);
         AtomicInteger quarantines = new AtomicInteger();
+        AtomicInteger schemaReports = new AtomicInteger();
         CountDownLatch schemaReported = new CountDownLatch(1);
+        AtomicReference<SenderError> recoveredReport = new AtomicReference<>();
         Map<TestWebSocketServer.ClientHandler, Long> sequences = new ConcurrentHashMap<>();
         try (TestWebSocketServer server = new TestWebSocketServer(new TestWebSocketServer.WebSocketServerHandler() {
             @Override
@@ -110,16 +134,18 @@ public class RejectedArchiveRecoveryTest {
                                 + ";sf_dir=" + base + ";close_flush_timeout_millis=0;")
                         .senderId("saved").errorHandler(error -> {
                             if (error.getCategory() == SenderError.Category.DATA_LOSS) quarantines.incrementAndGet();
-                            if (error.getCategory() == SenderError.Category.SCHEMA_MISMATCH) schemaReported.countDown();
+                            if (error.getCategory() == SenderError.Category.SCHEMA_MISMATCH) {
+                                recoveredReport.set(error);
+                                schemaReports.incrementAndGet();
+                                schemaReported.countDown();
+                            }
                         }).build()) {
-                    assertEquals("quarantine must complete during build", damaged && overlaps ? 1 : 0,
+                    assertEquals("archives must never quarantine a live queue", 0,
                             quarantines.get());
                     sender.table("healthy").longColumn("value", attempt).atNow();
                     long target = sender.flushAndGetSequence();
                     assertTrue("new rows must drain after recovery", sender.awaitAckedFsn(target, 5_000));
-                    if (attempt == 0 && !damaged && overlaps) {
-                        assertTrue(schemaReported.await(5, TimeUnit.SECONDS));
-                    }
+
                 } catch (RuntimeException e) {
                     failures.add(e);
                 }
@@ -127,23 +153,31 @@ public class RejectedArchiveRecoveryTest {
             assertTrue("all three builds must succeed: " + failures, failures.isEmpty());
         }
         Path quarantined = base.resolve("saved.unreplayable-0");
-        if (damaged && overlaps) {
-            assertEquals(1, quarantines.get());
-            assertTrue(Files.exists(quarantined.resolve(".failed")));
-            assertArrayEquals(archiveBytes, Files.readAllBytes(quarantined.resolve(slot.relativize(archiveFile))));
-            assertFalse(Files.exists(base.resolve("saved.unreplayable-1")));
+        assertEquals(0, quarantines.get());
+        if (overlaps && !damaged) {
+            assertTrue("published archive report must precede orphan retirement",
+                    schemaReported.await(5, TimeUnit.SECONDS));
+            assertEquals(1, schemaReports.get());
+            SenderError report = recoveredReport.get();
+            assertNotNull(report);
+            assertEquals(1, report.getFromFsn());
+            assertEquals(1, report.getToFsn());
+            assertEquals(1, report.getRejectedFsn());
+            assertEquals(archive, report.getRejectedPath());
         } else {
-            assertEquals(0, quarantines.get());
-            assertFalse(Files.exists(quarantined));
-            assertArrayEquals(archiveBytes, Files.readAllBytes(archiveFile));
+            assertEquals(1, schemaReported.getCount());
+            assertEquals(0, schemaReports.get());
         }
+        assertFalse(Files.exists(quarantined));
+        assertArrayEquals(archiveBytes, Files.readAllBytes(archiveFile));
+        assertArrayEquals(new byte[]{0}, Files.readAllBytes(oldEpoch));
+        assertArrayEquals(new byte[]{1}, Files.readAllBytes(oldMetadata));
     }
 
-    private static String preserve(CursorSendEngine engine, Path slot, String epoch, long fsn) {
+    private static String preserve(CursorSendEngine engine, Path slot, long fsn) {
         SenderError error = new SenderError(SenderError.Category.SCHEMA_MISMATCH,
                 SenderError.Policy.REJECT_AND_CONTINUE, 3, "schema rejected", fsn, fsn, fsn, null, 1);
-        return RejectedMiniSlotArchive.preserve(FilesFacade.INSTANCE, engine, null,
-                slot.toString(), "saved", epoch, error).path;
+        return new RejectedMiniSlotArchive(FilesFacade.INSTANCE, slot.toString()).preserve(engine, error, null, 0).path;
     }
 
     private static void append(CursorSendEngine engine, boolean deferred) {

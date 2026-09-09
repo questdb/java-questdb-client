@@ -170,14 +170,25 @@ options. A configured destination is checked at build time; later storage
 failures pause retirement and retry the copy while keeping the source frames.
 A second schema rejection while an earlier range is pending, or an invalid
 retirement range/dictionary, logs an error and falls back to `TERMINAL`.
-Preserved copies use the
-binary store-and-forward format, with rejection metadata; they are not JSON.
+Preserved payloads use the binary store-and-forward format; `rejection.properties`
+contains human-readable error metadata. A source queue namespace, the source
+segment's persisted generation token, and the exact FSN range determine the archive
+directory. A retry or restart for that same live range removes its exact crashed
+staging directory and reuses a structurally valid completed copy.
+
+Startup does not scan archive directories. If recovery finds an orphan tail, it
+checks only that range's deterministic archive path. A completed copy whose
+metadata, segment, manifest, watermark, and optional dictionary validate produces
+an asynchronous `SenderError` before the tail retires. A missing or damaged copy
+is ignored so archive output cannot block live-queue recovery. Unrelated and
+legacy `.tmp-*` directories are left untouched. A crash before publication or
+after retirement but before callback delivery can still lose the notification.
 Copy an archive to a separate working directory before replaying it, because
 normal queue cleanup removes drained data. Replay after fixing the schema can
 duplicate rows that the server committed before the error.
 
-Copies are never automatically deleted and can contain a full symbol dictionary
-each. Quarantining a damaged slot also moves its archives; use the `DATA_LOSS`
+Completed copies are never automatically deleted and can contain a full symbol dictionary
+each. Quarantining a damaged live slot also moves its archives; use the `DATA_LOSS`
 event's quarantine path to locate copies whose reported paths have moved.
 Monitor `getDlqBytesWritten()`, `getDlqFilesWritten()` and free disk space
 (the counters are available on `QwpWebSocketSender`). TLS does not encrypt these

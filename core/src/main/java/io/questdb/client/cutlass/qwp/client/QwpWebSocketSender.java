@@ -40,8 +40,7 @@ import io.questdb.client.cutlass.http.client.WebSocketUpgradeException;
 import io.questdb.client.cutlass.line.LineSenderException;
 import io.questdb.client.cutlass.line.array.DoubleArray;
 import io.questdb.client.cutlass.line.array.LongArray;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerListener;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainerPool;
@@ -411,7 +410,7 @@ public class QwpWebSocketSender implements Sender {
     private SenderError.Policy schemaMismatchPolicy = SenderError.Policy.REJECT_AND_CONTINUE;
     private boolean dlqEnabled = true;
     private String dlqDir;
-    private SchemaPreserver schemaPreserver;
+    private RejectedMiniSlotArchive schemaPreserver;
     private SchemaRejectionState schemaRejectionState;
     private long schemaLeaseGeneration;
     private boolean schemaLeaseStarted;
@@ -2928,19 +2927,16 @@ public class QwpWebSocketSender implements Sender {
                 && cursorEngine != null && (cursorEngine.sfDir() != null || directory != null)) {
             String source = cursorEngine.sfDir();
             String slotId = source == null ? "memory" : java.nio.file.Paths.get(source).getFileName().toString();
-            String epoch = source == null ? java.util.UUID.randomUUID().toString()
-                    : SlotEpoch.openOrCreate(io.questdb.client.std.FilesFacade.INSTANCE, source, cursorEngine.freshFsnNamespace());
             String destination = directory == null ? source : java.nio.file.Paths.get(directory, slotId).toString();
+            String archiveNamespace = RejectedMiniSlotArchive.namespaceForSource(source);
             try {
                 java.nio.file.Files.createDirectories(java.nio.file.Paths.get(destination));
             } catch (java.io.IOException e) {
                 throw new LineSenderException(e).put("could not create schema preservation destination ").put(destination);
             }
-            SchemaPreserver.probeDestination(io.questdb.client.std.FilesFacade.INSTANCE, destination);
-            io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive.cleanupTemporaryDirectories(
-                    io.questdb.client.std.FilesFacade.INSTANCE, destination, slotId, epoch);
-            schemaPreserver = new SchemaPreserver(io.questdb.client.std.FilesFacade.INSTANCE,
-                    destination, slotId, epoch);
+            RejectedMiniSlotArchive.probeDestination(io.questdb.client.std.FilesFacade.INSTANCE, destination);
+            schemaPreserver = new RejectedMiniSlotArchive(io.questdb.client.std.FilesFacade.INSTANCE,
+                    destination, archiveNamespace);
         }
     }
 
@@ -4291,7 +4287,7 @@ public class QwpWebSocketSender implements Sender {
             }
             cursorSendLoop.setSchemaRejectionState(schemaRejectionState);
             cursorSendLoop.setSchemaMismatchPolicy(schemaMismatchPolicy);
-            cursorSendLoop.setSchemaPreserver(schemaPreserver);
+            cursorSendLoop.setRejectionArchive(schemaPreserver);
             cursorSendLoop.setErrorDispatcher(errorDispatcher);
             // Symmetric progress dispatcher: lazy-allocated mirror of the
             // error path. Wired before start() for the same reason -- the
@@ -4334,7 +4330,7 @@ public class QwpWebSocketSender implements Sender {
                 }
             }
             if (t instanceof UnreplayableSlotException) {
-                // Startup also validates archives needed by orphan retirement.
+                // Preserve typed failures from live-queue recovery.
                 // Sender.build() must receive this type to quarantine the slot;
                 // wrapping it would make every build retry fail on the same bytes.
                 throw (UnreplayableSlotException) t;

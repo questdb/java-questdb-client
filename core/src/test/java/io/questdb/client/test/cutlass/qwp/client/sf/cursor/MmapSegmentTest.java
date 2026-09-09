@@ -204,8 +204,10 @@ public class MmapSegmentTest {
         assertEquals(1, MmapSegment.VERSION);
         TestUtils.assertMemoryLeak(() -> {
             String path = tmpDir + "/seg-header.sfa";
+            long generationToken;
             try (MmapSegment seg = MmapSegment.create(path, 7L, 4096L)) {
                 assertEquals(7L, seg.baseSeq());
+                generationToken = seg.generationToken();
             }
             byte[] bytes = java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(path));
             java.nio.ByteBuffer header = java.nio.ByteBuffer
@@ -216,7 +218,38 @@ public class MmapSegmentTest {
             assertEquals("flags", 0, header.get(5));
             assertEquals("reserved", 0, header.getShort(6));
             assertEquals(7L, header.getLong(8));
-            assertTrue("createdMicros must be stamped", header.getLong(16) > 0L);
+            assertEquals(generationToken, header.getLong(16));
+        });
+    }
+
+    @Test
+    public void testFreshSegmentsHaveDistinctGenerationTokens() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (MmapSegment firstDisk = MmapSegment.create(tmpDir + "/generation-1.sfa", 0L, 4096L);
+                 MmapSegment secondDisk = MmapSegment.create(tmpDir + "/generation-2.sfa", 0L, 4096L);
+                 MmapSegment firstMemory = MmapSegment.createInMemory(0L, 4096L);
+                 MmapSegment secondMemory = MmapSegment.createInMemory(0L, 4096L)) {
+                assertNotEquals(firstDisk.generationToken(), secondDisk.generationToken());
+                assertNotEquals(firstMemory.generationToken(), secondMemory.generationToken());
+            }
+        });
+    }
+
+    @Test
+    public void testLegacyCreationTimestampIsReadAsOpaqueGenerationToken() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String path = tmpDir + "/legacy-generation.sfa";
+            try (MmapSegment ignored = MmapSegment.create(path, 7L, 4096L)) {
+                // Close before replacing the token with a legacy timestamp value.
+            }
+            long legacyTimestamp = 1_234_567_890L;
+            try (RandomAccessFile file = new RandomAccessFile(path, "rw")) {
+                file.seek(16L);
+                file.writeLong(Long.reverseBytes(legacyTimestamp));
+            }
+            try (MmapSegment reopened = MmapSegment.openExisting(path)) {
+                assertEquals(legacyTimestamp, reopened.generationToken());
+            }
         });
     }
 

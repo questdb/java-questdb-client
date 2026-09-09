@@ -16,8 +16,6 @@ import org.junit.Test;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
 
-import java.lang.reflect.Field;
-import java.util.Collection;
 
 import static org.junit.Assert.*;
 
@@ -26,13 +24,12 @@ public class SchemaRejectionStateTest {
     public final TemporaryFolder temp = new TemporaryFolder();
 
     @Test
-    public void testUnackedOrdinaryBorrowsRetainBoundedHistory() throws Exception {
+    public void testLateOrdinaryRejectionAfterManyBorrows() throws Exception {
         SchemaRejectionState state = new SchemaRejectionState();
         for (int i = 0; i < 20_000; i++) {
             state.beginLease(i, i, false);
             state.endLease(i, i);
         }
-        assertEquals(2, retainedRanges(state));
         state.beginLease(20_000, 20_000, false);
         assertTrue(state.reject(10_000, 10_000, error(10_000)));
         assertEquals(10_000, state.sealedRange().lastFsn);
@@ -41,7 +38,7 @@ public class SchemaRejectionStateTest {
     }
 
     @Test
-    public void testUnackedTransactionalBorrowsPreserveCommitBoundaries() throws Exception {
+    public void testLateTransactionalRejectionAfterManyBorrows() throws Exception {
         try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
             SchemaRejectionState state = new SchemaRejectionState();
             state.setEngine(engine);
@@ -51,8 +48,7 @@ public class SchemaRejectionStateTest {
                 append(engine, false);
                 state.endLease(i, 2L * i + 1);
             }
-            assertEquals(2, retainedRanges(state));
-            state.beginLease(20_000, 40_000, true);
+                state.beginLease(20_000, 40_000, true);
             assertTrue(state.reject(20_000, 20_000, error(20_000)));
             assertEquals(20_001, state.sealedRange().lastFsn);
             assertFalse(state.hasOwnedFailure(20_000));
@@ -71,19 +67,20 @@ public class SchemaRejectionStateTest {
             state.beginLease(1, 0, true);
             append(engine, true);
             append(engine, true);
+            assertTrue(state.reject(0, 0, error(0)));
+            assertNull(state.sealedRange());
             state.endLease(1, 1);
             state.beginLease(2, 2, true);
             append(engine, false);
             state.endLease(2, 2);
             state.beginLease(3, 3, true);
-            assertTrue(state.reject(0, 0, error(0)));
             assertEquals(1, state.sealedRange().lastFsn);
             assertFalse(state.hasOwnedFailure(3));
         }
     }
 
     @Test
-    public void testPendingRetirementSurvivesBorrowHistoryCompaction() throws Exception {
+    public void testPendingRetirementSurvivesManyBorrows() throws Exception {
         SchemaRejectionState state = new SchemaRejectionState();
         state.beginLease(1, 0, false);
         state.endLease(1, 0);
@@ -92,18 +89,16 @@ public class SchemaRejectionStateTest {
             state.beginLease(i, i - 1, false);
             state.endLease(i, i - 1);
         }
-        assertEquals(3, retainedRanges(state));
         assertEquals(0, state.sealedRange().lastFsn);
         state.completeRetirement(0);
         state.beginLease(20_000, 19_999, false);
-        assertEquals(2, retainedRanges(state));
         assertTrue(state.reject(1, 1, error(1)));
         assertEquals(1, state.sealedRange().lastFsn);
         assertFalse(state.hasOwnedFailure(20_000));
     }
 
     @Test
-    public void testCompactionIntoPendingOwnerPreservesItsRangeAndNextBorrowFailure() {
+    public void testPendingRangeAndNextBorrowHaveIndependentFailures() {
         SchemaRejectionState state = new SchemaRejectionState();
         state.beginLease(1, 0, false);
         state.endLease(1, 0);
@@ -112,8 +107,7 @@ public class SchemaRejectionStateTest {
         LineSenderServerException failure = state.ownedFailure(2, 1);
         assertSame(failure, state.endLease(2, 1));
 
-        // The failed returned lease absorbs the older range while its
-        // retirement is still pending. The notification must remain [1, 1].
+        // Reborrowing cannot replace the pending notification's original range.
         state.beginLease(3, 2, false);
         assertEquals(1, state.sealedRange().firstFsn);
         assertEquals(1, state.sealedRange().lastFsn);
@@ -128,7 +122,7 @@ public class SchemaRejectionStateTest {
     }
 
     @Test
-    public void testEmptyBorrowsDoNotRetainHistoryBehindUnackedRange() throws Exception {
+    public void testEmptyBorrowsDoNotOwnEarlierPublications() throws Exception {
         SchemaRejectionState state = new SchemaRejectionState();
         state.beginLease(0, 0, false);
         state.endLease(0, 0);
@@ -136,17 +130,8 @@ public class SchemaRejectionStateTest {
             state.beginLease(i, 1, false);
             state.endLease(i, 0);
         }
-        assertEquals(1, retainedRanges(state));
-        state.acknowledgedThrough(0);
         state.beginLease(20_000, 1, false);
         state.endLease(20_000, 0);
-        assertEquals(0, retainedRanges(state));
-    }
-
-    private static int retainedRanges(SchemaRejectionState state) throws Exception {
-        Field field = SchemaRejectionState.class.getDeclaredField("leases");
-        field.setAccessible(true);
-        return ((Collection<?>) field.get(state)).size();
     }
 
     @Test
@@ -248,7 +233,7 @@ public class SchemaRejectionStateTest {
     }
 
     @Test
-    public void testReturnedUnackedTransactionalLeaseRetainsOwnershipAndFinalEnd() {
+    public void testReturnedUnackedTransactionalLeaseReportsWithoutOwnedFailure() {
         SchemaRejectionState state = new SchemaRejectionState();
         state.beginLease(7, 10, true);
         state.endLease(7, 15);
@@ -256,10 +241,8 @@ public class SchemaRejectionStateTest {
         assertTrue(state.reject(12, 10, error(12)));
         assertEquals(10, state.stopFsn());
         assertEquals(15, state.sealedRange().lastFsn);
-        LineSenderServerException failure = state.ownedFailure(7, 99);
-        assertNotNull(failure);
-        assertEquals(10, failure.getServerError().getFromFsn());
-        assertEquals(15, failure.getServerError().getToFsn());
+        assertFalse(state.hasOwnedFailure(7));
+        assertNull(state.ownedFailure(7, 99));
     }
 
     @Test
@@ -290,6 +273,57 @@ public class SchemaRejectionStateTest {
             } finally {
                 Unsafe.free(frame, QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
             }
+        }
+    }
+
+    @Test
+    public void testUnclosedReturnDoesNotReleaseProducerOwnership() throws Exception {
+        try (CursorSendEngine engine = new CursorSendEngine(null, 4096)) {
+            SchemaRejectionState state = new SchemaRejectionState();
+            state.setEngine(engine);
+            state.beginLease(1, 0, true);
+            append(engine, true);
+            try {
+                state.endLease(1, 0);
+                fail("normal return needs a closer");
+            } catch (IllegalStateException expected) {
+                assertTrue(expected.getMessage().contains("no commit or rejection boundary"));
+            }
+            // Producer ownership remains intact; only sealing its rejection
+            // permits this unfinished transaction to be followed by a new borrow.
+            assertTrue(state.reject(0, 0, error(0)));
+            assertNotNull(state.endLease(1, 0));
+            state.beginLease(2, 1, true);
+            append(engine, false);
+            assertEquals(0, state.sealedRange().lastFsn);
+            assertFalse(state.hasOwnedFailure(2));
+        }
+    }
+
+    @Test
+    public void testReturnRacingRejectionNeverFailsNextBorrow() throws Exception {
+        java.util.concurrent.ExecutorService io = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            for (int i = 0; i < 500; i++) {
+                SchemaRejectionState state = new SchemaRejectionState();
+                state.beginLease(1, 0, false);
+                java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(2);
+                java.util.concurrent.Future<Boolean> rejected = io.submit(() -> {
+                    start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                    return state.reject(0, 0, error(0));
+                });
+                start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                LineSenderServerException returned = state.endLease(1, 0);
+                state.beginLease(2, 1, false);
+                assertTrue(rejected.get(5, java.util.concurrent.TimeUnit.SECONDS));
+                if (returned != null) assertEquals(0, returned.getServerError().getRejectedFsn());
+                assertFalse(state.hasOwnedFailure(2));
+                assertNull(state.ownedFailure(2, 1));
+                assertEquals(0, state.sealedRange().lastFsn);
+            }
+        } finally {
+            io.shutdownNow();
+            assertTrue(io.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS));
         }
     }
 

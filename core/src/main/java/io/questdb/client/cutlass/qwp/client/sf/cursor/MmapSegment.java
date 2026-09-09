@@ -36,7 +36,9 @@ import org.jetbrains.annotations.TestOnly;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.security.SecureRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * One mmap-backed SF segment file. The user thread (the single producer)
@@ -49,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * On-disk layout — header and frame format:
  * <pre>
  *   [u32 magic 'SF01'] [u8 ver=1] [u8 flags]   [u16 reserved=0]
- *   [u64 baseSeq]      [u64 createdMicros]                        24-byte header
+ *   [u64 baseSeq]      [u64 generationToken]                     24-byte header
  *   frame, frame, ...                                              each frame:
  *                                                                  [u32 crc32c]
  *                                                                  [u32 payloadLen]
@@ -76,6 +78,11 @@ public final class MmapSegment implements QuietCloseable {
     // soft downgrade (see syncPublished) and must not spam the log once per
     // barrier when RLIMIT_MEMLOCK or the platform says no.
     private static final AtomicBoolean MLOCK_REFUSAL_WARNED = new AtomicBoolean();
+    // Consecutive values cannot repeat within one JVM before 64-bit wrap. A
+    // cryptographically random starting point makes a collision with a token
+    // persisted by another process a 1-in-2^64 event for any fixed token.
+    private static final AtomicLong NEXT_GENERATION_TOKEN =
+            new AtomicLong(new SecureRandom().nextLong());
     private static final int RECOVERY_BUFFER_SIZE = 64 * 1024;
 
     private final FilesFacade filesFacade;
@@ -248,7 +255,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putByte(addr + 5, manifestRequired ? MANIFEST_REQUIRED_FLAG : (byte) 0); // flags
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0); // reserved
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
-            Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 16, nextGenerationToken());
             return new MmapSegment(ff, displayPath, fd, addr, sizeBytes, baseSeq,
                     HEADER_SIZE, 0, false, 0L);
         } catch (Throwable t) {
@@ -286,7 +293,7 @@ public final class MmapSegment implements QuietCloseable {
             Unsafe.getUnsafe().putByte(addr + 5, (byte) 0);
             Unsafe.getUnsafe().putShort(addr + 6, (short) 0);
             Unsafe.getUnsafe().putLong(addr + 8, baseSeq);
-            Unsafe.getUnsafe().putLong(addr + 16, Os.currentTimeMicros());
+            Unsafe.getUnsafe().putLong(addr + 16, nextGenerationToken());
             return new MmapSegment(null, null, -1, addr, sizeBytes, baseSeq,
                     HEADER_SIZE, 0, true, 0L);
         } catch (Throwable t) {
@@ -757,6 +764,15 @@ public final class MmapSegment implements QuietCloseable {
      */
     public long frameCount() {
         return frameCount;
+    }
+
+    /** Immutable, opaque segment generation token stored in the segment header. */
+    public long generationToken() {
+        return Unsafe.getUnsafe().getLong(mmapAddress + 16);
+    }
+
+    private static long nextGenerationToken() {
+        return NEXT_GENERATION_TOKEN.getAndIncrement();
     }
 
     int liveFramePayloadLength(long fsn) {

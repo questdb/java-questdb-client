@@ -43,10 +43,12 @@ import org.jetbrains.annotations.Nullable;
  *
  * <p>The {@code [fromFsn, toFsn]} span is the load-bearing correlation key — join it to
  * whatever the producer thread logged alongside the published-sequence value returned by
- * the sender to identify the rejected data. Schema archive reports from background orphan drainers retain that orphan's
- * local FSN span; use the archive path to identify its queue. Other background
- * reports use {@link #NO_MESSAGE_SEQUENCE}. Never join an orphan's FSNs to
- * the live producer's rows.
+ * the sender to identify the rejected data. A schema report recovered from a completed
+ * preserved copy retains the recovered queue's local FSN span; use the archive path to
+ * identify its queue. Such a report is reconstructed only for the exact still-live orphan
+ * range whose deterministic archive exists and passes structural validation. Other
+ * background reports use {@link #NO_MESSAGE_SEQUENCE}. Never join an orphan's FSNs to the
+ * live producer's rows.
  *
  * @see SenderErrorHandler
  * @see LineSenderServerException
@@ -146,7 +148,7 @@ public final class SenderError {
         return rejectedFsn;
     }
 
-    /** Completed preserved-copy directory, or null when no copy is available yet. */
+    /** Completed preserved-copy directory, or null when this report has no available copy. */
     public @Nullable String getRejectedPath() {
         return rejectedPath;
     }
@@ -190,7 +192,9 @@ public final class SenderError {
     }
 
     /**
-     * @return wall-clock-independent receipt time on the I/O thread, from {@link System#nanoTime()}.
+     * @return the value of {@link System#nanoTime()} when the original process received the
+     * rejection. A report reconstructed from a preserved copy retains that raw value; it cannot
+     * be compared or ordered against {@code nanoTime()} values from the recovering process.
      */
     public long getDetectedAtNanos() {
         return detectedAtNanos;
@@ -199,15 +203,17 @@ public final class SenderError {
     /**
      * @return inclusive lower bound of the FSN span for the rejected batch — correlation key for producer-side logs.
      * For {@link Category#DATA_LOSS} and non-schema background reports this is
-     * {@link #NO_MESSAGE_SEQUENCE}. Schema archive reports retain the orphan queue's local span.
+     * {@link #NO_MESSAGE_SEQUENCE}. Recovered schema reports retain the orphan queue's local span.
      */
     public long getFromFsn() {
         return fromFsn;
     }
 
     /**
-     * @return server's per-frame messageSequence as mirrored back in the rejection frame, or
-     * {@link #NO_MESSAGE_SEQUENCE} for {@link Category#PROTOCOL_VIOLATION} (WS close frames carry no QWP sequence).
+     * @return the server's per-frame message sequence mirrored in a live rejection, or
+     * {@link #NO_MESSAGE_SEQUENCE} when no QWP sequence exists. A schema report reconstructed
+     * from a preserved copy uses its persisted rejected FSN here because the original wire
+     * sequence is not stored; use {@link #getRejectedFsn()} for that local correlation value.
      */
     public long getMessageSequence() {
         return messageSequence;
@@ -251,7 +257,7 @@ public final class SenderError {
     /**
      * @return inclusive upper bound of the FSN span for the rejected batch.
      * For {@link Category#DATA_LOSS} and non-schema background reports this is
-     * {@link #NO_MESSAGE_SEQUENCE}. Schema archive reports retain the orphan queue's local span.
+     * {@link #NO_MESSAGE_SEQUENCE}. Recovered schema reports retain the orphan queue's local span.
      */
     public long getToFsn() {
         return toFsn;
@@ -355,7 +361,9 @@ public final class SenderError {
      * retire the affected span after preserving it when configured, notify the
      * handler, and fail its owning handle. Other errors replay, halt with bytes
      * retained, or report explicit abandonment. Rejection notifications are retained
-     * while running, but a process crash or shutdown can lose pending callbacks.
+     * while running. On restart, a completed preserved copy reconstructs a notification
+     * only for its exact still-live recovered orphan range; a crash or shutdown can still
+     * lose callbacks before publication or after retirement.
      *
      * <p>{@link Category#PROTOCOL_VIOLATION} is forced {@link #TERMINAL},
      * {@link Category#UNKNOWN} is forced {@link #RETRIABLE} (fail open: a

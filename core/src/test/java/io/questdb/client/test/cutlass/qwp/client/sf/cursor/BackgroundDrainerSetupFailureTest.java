@@ -25,17 +25,15 @@
 package io.questdb.client.test.cutlass.qwp.client.sf.cursor;
 
 import io.questdb.client.SenderError;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
-import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
-import io.questdb.client.std.FilesFacade;
-import java.util.concurrent.atomic.AtomicReference;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.AckWatermark;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.BackgroundDrainer;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.MmapSegment;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.OrphanScanner;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
+import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 import io.questdb.client.std.Files;
+import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.TestUtils;
@@ -46,6 +44,7 @@ import org.junit.Test;
 
 import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class BackgroundDrainerSetupFailureTest {
 
@@ -65,7 +64,7 @@ public class BackgroundDrainerSetupFailureTest {
     }
 
     @Test
-    public void testPreservedOrphanRetiresAndReportsWithoutConnecting() throws Exception {
+    public void testPreservedOrphanReportsBeforeRetirementWithoutConnecting() throws Exception {
         assertOrphanRetiresOffline(true);
     }
 
@@ -89,14 +88,10 @@ public class BackgroundDrainerSetupFailureTest {
                     Unsafe.free(frame, QwpConstants.HEADER_SIZE, MemoryTag.NATIVE_DEFAULT);
                 }
                 if (archive) {
-                    String epoch = SlotEpoch.openOrCreate(
-                            FilesFacade.INSTANCE, slotPath, original.freshFsnNamespace());
                     SenderError error = new SenderError(
                             SenderError.Category.SCHEMA_MISMATCH,
                             SenderError.Policy.REJECT_AND_CONTINUE, 3, "bad schema", 0, 0, 0, null, 1);
-                    archivedPath = RejectedMiniSlotArchive.preserve(
-                            FilesFacade.INSTANCE, original, null, slotPath,
-                            Paths.get(slotPath).getFileName().toString(), epoch, error).path;
+                    archivedPath = new RejectedMiniSlotArchive(FilesFacade.INSTANCE, slotPath).preserve(original, error, null, 0).path;
                 }
             }
             AtomicReference<SenderError> report = new AtomicReference<>();
@@ -110,9 +105,12 @@ public class BackgroundDrainerSetupFailureTest {
             Assert.assertEquals(BackgroundDrainer.DrainOutcome.SUCCESS, drainer.outcome());
             Assert.assertFalse(OrphanScanner.isCandidateOrphan(slotPath));
             if (archive) {
-                Assert.assertNotNull(report.get());
-                Assert.assertEquals(archivedPath, report.get().getRejectedPath());
-                Assert.assertNotSame(Thread.currentThread(), callbackThread.get());
+                SenderError recovered = report.get();
+                Assert.assertNotNull(recovered);
+                Assert.assertEquals(0, recovered.getFromFsn());
+                Assert.assertEquals(0, recovered.getToFsn());
+                Assert.assertEquals(archivedPath, recovered.getRejectedPath());
+                Assert.assertNotEquals(Thread.currentThread(), callbackThread.get());
                 Assert.assertTrue(java.nio.file.Files.isDirectory(Paths.get(archivedPath)));
             } else {
                 Assert.assertNull(report.get());

@@ -594,7 +594,7 @@ public final class SenderPool implements AutoCloseable {
                 throw new io.questdb.client.cutlass.line.LineSenderException(e)
                         .put("could not create schema preservation destination ").put(destination);
             }
-            io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver.probeDirectory(
+            io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive.probeDirectory(
                     io.questdb.client.std.FilesFacade.INSTANCE, destination);
         }
         this.slotInUse = this.storeAndForward ? new boolean[maxSize] : null;

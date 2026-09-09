@@ -9,14 +9,11 @@ import io.questdb.client.LineSenderServerException;
 import io.questdb.client.SenderError;
 import io.questdb.client.cutlass.qwp.protocol.QwpConstants;
 
-import java.util.ArrayDeque;
-
-/** Process-local lease ownership and one pending schema-retirement range. */
+/** Current borrow and one pending retirement. Returned borrows have no observation history. */
 public final class SchemaRejectionState {
-    private final ArrayDeque<Lease> leases = new ArrayDeque<>();
+    private Lease current;
     private Pending pending;
     private CursorSendEngine engine;
-    private volatile long acknowledgedFsn = -1L;
     private volatile long failedGeneration = -1L;
     private volatile long stopFsn = -1L;
 
@@ -25,24 +22,16 @@ public final class SchemaRejectionState {
     }
 
     public synchronized void beginLease(long generation, long firstFsn, boolean transactional) {
-        prune(acknowledgedFsn);
-        Lease tail = leases.peekLast();
-        if (tail != null && tail.active) {
-            throw new IllegalStateException("previous lease is still active");
-        }
-        if (tail != null) {
-            // The returned handle can no longer observe an owned exception. Keep
-            // only the range needed to classify a delayed rejection, and combine
-            // completed borrows instead of retaining one object per borrow until ACK.
-            if (failedGeneration == tail.generation) {
-                failedGeneration = -1L;
+        if (current != null) {
+            if (current.active) {
+                throw new IllegalStateException("previous lease is still active");
             }
-            tail.generation = -1L;
-            tail.failure = null;
-            tail.rawError = null;
-            mergeReturnedTail();
+            if (current.transactional != transactional) {
+                throw new IllegalStateException("transaction mode must remain fixed for a sender");
+            }
         }
-        leases.addLast(new Lease(generation, firstFsn, transactional));
+        failedGeneration = -1L;
+        current = new Lease(generation, firstFsn, transactional);
     }
 
     /**
@@ -51,21 +40,27 @@ public final class SchemaRejectionState {
      * {@code publishedFsn}.
      */
     public synchronized LineSenderServerException endLease(long generation, long publishedFsn) {
-        Lease lease = findGeneration(generation);
-        if (lease == null || !lease.active) {
+        Lease lease = current;
+        if (lease == null || lease.generation != generation || !lease.active) {
             return null;
         }
         lease.endFsn = publishedFsn;
-        lease.active = false;
-        if (publishedFsn < lease.firstFsn && lease.rawError == null) {
-            // Empty borrows carry no attribution history, even behind an unacked lease.
-            leases.removeLast();
-            return null;
-        }
-        int flags = lease.transactional && engine != null ? engine.liveQwpFrameFlags(publishedFsn) : -1;
-        lease.endsWithCommit = !lease.transactional
-                || (flags >= 0 && (flags & QwpConstants.FLAG_DEFER_COMMIT) == 0);
         sealIfNeeded(lease, publishedFsn);
+        // Pool return must close normal transactions. A failed open tail may
+        // return only after sealing the range which prevents its resurrection
+        // by the next borrow's commit. Check before giving up producer ownership.
+        if (engine != null && lease.transactional && publishedFsn >= lease.firstFsn
+                && publishedFsn > engine.ackedFsn()
+                && (pending == null || pending.lastFsn < publishedFsn)) {
+            int flags = engine.liveQwpFrameFlags(publishedFsn);
+            // ACK/trim can race this cold lookup. An already resolved closer
+            // needs no longer to be present in the ring.
+            if ((flags < 0 && publishedFsn > engine.ackedFsn())
+                    || (flags >= 0 && (flags & QwpConstants.FLAG_DEFER_COMMIT) != 0)) {
+                throw new IllegalStateException("returned transaction has no commit or rejection boundary");
+            }
+        }
+        lease.active = false;
         if (failedGeneration == generation) {
             failedGeneration = -1L;
         }
@@ -78,8 +73,8 @@ public final class SchemaRejectionState {
      * publication snapshot. Calls on one sender are single-producer by contract.
      */
     public synchronized LineSenderServerException ownedFailure(long generation, long publishedFsn) {
-        Lease lease = findGeneration(generation);
-        if (lease == null || lease.rawError == null) {
+        Lease lease = current;
+        if (lease == null || !lease.active || lease.generation != generation || lease.rawError == null) {
             return null;
         }
         sealIfNeeded(lease, publishedFsn);
@@ -92,11 +87,10 @@ public final class SchemaRejectionState {
 
     /** I/O-thread install. Returns false while an earlier retirement is pending. */
     public synchronized boolean reject(long rejectedFsn, long spanStart, SenderError rawError) {
-        prune(acknowledgedFsn);
         if (pending != null) {
             return false;
         }
-        Lease owner = findOwner(rejectedFsn);
+        Lease owner = current != null && current.active && rejectedFsn >= current.firstFsn ? current : null;
         if (owner == null) {
             // Transaction mode is not persisted. A recovered deferred group must
             // therefore be treated conservatively as transactional, regardless of
@@ -106,9 +100,10 @@ public final class SchemaRejectionState {
                     ? Math.max(engine.recoveredCommitBoundaryFsn(), engine.recoveredOrphanTipFsn())
                     : -1L;
             boolean recovered = rejectedFsn <= recoveredTip;
-            owner = new Lease(-1L, spanStart, recovered);
+            owner = new Lease(-1L, spanStart, recovered || (current != null && current.transactional));
             owner.active = false;
-            owner.endFsn = recovered ? recoveredTip : rejectedFsn;
+            owner.endFsn = recovered ? recoveredTip : current == null ? rejectedFsn
+                    : current.active ? current.firstFsn - 1L : current.endFsn;
         } else if (owner.generation >= 0 && owner.rawError == null) {
             owner.rawError = rawError;
             failedGeneration = owner.generation;
@@ -142,16 +137,8 @@ public final class SchemaRejectionState {
         if (pending == null || pending.lastFsn != lastFsn) {
             throw new IllegalStateException("retirement range changed");
         }
-        acknowledgedThrough(lastFsn);
         pending = null;
         stopFsn = -1L;
-        prune(lastFsn);
-    }
-
-    public void acknowledgedThrough(long fsn) {
-        if (fsn > acknowledgedFsn) {
-            acknowledgedFsn = fsn;
-        }
     }
 
     private void sealIfNeeded(Lease lease, long publishedFsn) {
@@ -191,54 +178,6 @@ public final class SchemaRejectionState {
         }
     }
 
-    private Lease findGeneration(long generation) {
-        Lease tail = leases.peekLast();
-        if (tail != null && tail.generation == generation) {
-            return tail;
-        }
-        for (Lease lease : leases) {
-            if (lease.generation == generation) {
-                return lease;
-            }
-        }
-        return null;
-    }
-
-    private Lease findOwner(long fsn) {
-        for (Lease lease : leases) {
-            if (fsn >= lease.firstFsn && (lease.active || fsn <= lease.endFsn)) {
-                return lease;
-            }
-        }
-        return null;
-    }
-
-    private void mergeReturnedTail() {
-        Lease tail = leases.removeLast();
-        Lease previous = leases.peekLast();
-        if (previous != null && previous.transactional == tail.transactional
-                && previous.endFsn + 1 == tail.firstFsn && previous.endsWithCommit
-                && (pending == null || pending.owner != previous)) {
-            // Normal pool return publishes a commit before ending the lease.
-            // Its frame flags preserve each transaction's boundary in a merged
-            // range. An unfinished failed transaction must keep its own end,
-            // and an in-flight retirement must retain its owner object.
-            tail.firstFsn = previous.firstFsn;
-            leases.removeLast();
-        }
-        leases.addLast(tail);
-    }
-
-    private void prune(long fsn) {
-        while (true) {
-            Lease head = leases.peekFirst();
-            if (head == null || head.active || (pending != null && pending.owner == head) || head.endFsn > fsn) {
-                return;
-            }
-            leases.removeFirst();
-        }
-    }
-
     public static final class Range {
         public final SenderError error;
         public final long firstFsn;
@@ -267,12 +206,11 @@ public final class SchemaRejectionState {
     }
 
     private static final class Lease {
-        private long firstFsn;
-        private long generation;
+        private final long firstFsn;
+        private final long generation;
         private final boolean transactional;
         private boolean active = true;
         private long endFsn = -1L;
-        private boolean endsWithCommit;
         private LineSenderServerException failure;
         private SenderError rawError;
 

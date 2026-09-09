@@ -34,11 +34,9 @@ import io.questdb.client.cutlass.qwp.client.WebSocketResponse;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorSendEngine;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.CursorWebSocketSendLoop;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaRejectionState;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SchemaPreserver;
+import io.questdb.client.cutlass.qwp.client.sf.cursor.RejectedMiniSlotArchive;
 import io.questdb.client.cutlass.qwp.client.sf.cursor.SenderErrorDispatcher;
-import io.questdb.client.cutlass.qwp.client.sf.cursor.SlotEpoch;
 import io.questdb.client.network.PlainSocketFactory;
-import io.questdb.client.std.FilesFacade;
 import io.questdb.client.std.MemoryTag;
 import io.questdb.client.std.Unsafe;
 import io.questdb.client.test.tools.DelegatingFilesFacade;
@@ -246,14 +244,13 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         0L, 0L, null, System.nanoTime());
                 assertTrue(state.reject(0L, 0L, error));
                 FailFirstTemporaryMkdirFacade ff = new FailFirstTemporaryMkdirFacade();
-                String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, tmpDir);
                 AtomicReference<SenderError> reported = new AtomicReference<>();
-                SchemaPreserver preserver = new SchemaPreserver(
-                        ff, tmpDir, "retry-slot", epoch);
+                RejectedMiniSlotArchive preserver = new RejectedMiniSlotArchive(
+                        ff, tmpDir);
                 try (SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(reported::set);
                      CursorWebSocketSendLoop loop = newDurableLoop(engine, new ArrayList<>())) {
                     loop.setSchemaRejectionState(state);
-                    loop.setSchemaPreserver(preserver);
+                    loop.setRejectionArchive(preserver);
                     loop.setErrorDispatcher(dispatcher);
 
                     assertFalse(loop.tryRetireSchemaRangeForTest());
@@ -288,8 +285,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         0L, 0L, null, System.nanoTime());
                 assertTrue(state.reject(0L, 0L, error));
                 CountingPreserveFacade ff = new CountingPreserveFacade(tmpDir + "/rejected");
-                String epoch = SlotEpoch.openOrCreate(FilesFacade.INSTANCE, tmpDir);
-                CountDownLatch handlerEntered = new CountDownLatch(1);
+                        CountDownLatch handlerEntered = new CountDownLatch(1);
                 CountDownLatch releaseHandler = new CountDownLatch(1);
                 try (SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(ignored -> {
                     handlerEntered.countDown();
@@ -305,7 +301,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
                         assertTrue(dispatcher.tryOfferSchema(error));
                     }
                     loop.setSchemaRejectionState(state);
-                    loop.setSchemaPreserver(new SchemaPreserver(ff, tmpDir, "fifo-slot", epoch));
+                    loop.setRejectionArchive(new RejectedMiniSlotArchive(ff, tmpDir));
                     loop.setErrorDispatcher(dispatcher);
 
                     assertFalse(loop.tryRetireSchemaRangeForTest());
@@ -339,9 +335,9 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
             try (CursorSendEngine engine = newEngine()) {
                 appendDeferredFrame(engine);
                 SchemaRejectionState state = new SchemaRejectionState();
-                state.setEngine(engine);
                 state.beginLease(1L, 0L, true);
-                state.endLease(1L, 1L); // recovered/advertised tail includes missing frame 1
+                state.endLease(1L, 1L); // Inject an advertised tail including missing frame 1.
+                state.setEngine(engine);
                 AtomicReference<SenderError> reported = new AtomicReference<>();
                 try (CursorWebSocketSendLoop loop = newDurableLoop(engine, clients);
                      SenderErrorDispatcher dispatcher = new SenderErrorDispatcher(reported::set)) {
@@ -1099,7 +1095,7 @@ public class CursorWebSocketSendLoopPoisonFrameTest {
 
         @Override
         public int mkdir(String path, int mode) {
-            if (!failed && path.contains("/rejected/.tmp-retry-slot-")) {
+            if (!failed && path.contains("/rejected/.tmp-")) {
                 failed = true;
                 return -1;
             }

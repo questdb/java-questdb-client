@@ -934,7 +934,7 @@ public final class BackgroundDrainer implements Runnable {
         // per wire session. Closed by the finally, after loop.close(), so errors
         // dispatched during the loop's shutdown still reach the sink.
         SenderErrorDispatcher loopErrorDispatcher = null;
-        SchemaPreserver schemaPreserver = null;
+        RejectedMiniSlotArchive schemaPreserver = null;
         SchemaRejectionState schemaRejectionState = null;
         try {
             // Scanner results are only snapshots. Serialize adoption against
@@ -1061,10 +1061,6 @@ public final class BackgroundDrainer implements Runnable {
                 schemaRejectionState = new SchemaRejectionState();
                 if (schemaPreservationEnabled) {
                     String slotId = java.nio.file.Paths.get(slotPath).getFileName().toString();
-                    String epoch = SlotEpoch.openOrCreate(
-                            io.questdb.client.std.FilesFacade.INSTANCE,
-                            slotPath,
-                            engine.freshFsnNamespace());
                     String destination = schemaPreservationDirectory == null
                             ? slotPath
                             : java.nio.file.Paths.get(schemaPreservationDirectory, slotId).toString();
@@ -1074,15 +1070,11 @@ public final class BackgroundDrainer implements Runnable {
                         throw new SfOperationalException(
                                 "could not create schema preservation destination " + destination, e);
                     }
-                    SchemaPreserver.probeDestination(
+                    RejectedMiniSlotArchive.probeDestination(
                             io.questdb.client.std.FilesFacade.INSTANCE, destination);
-                    RejectedMiniSlotArchive.cleanupTemporaryDirectories(
-                            io.questdb.client.std.FilesFacade.INSTANCE, destination, slotId, epoch);
-                    schemaPreserver = new SchemaPreserver(
-                            io.questdb.client.std.FilesFacade.INSTANCE,
-                            destination,
-                            slotId,
-                            epoch);
+                    schemaPreserver = new RejectedMiniSlotArchive(
+                            io.questdb.client.std.FilesFacade.INSTANCE, destination,
+                            RejectedMiniSlotArchive.namespaceForSource(slotPath));
                 }
             }
             if (logicalSlotLock != null) {
@@ -1142,7 +1134,7 @@ public final class BackgroundDrainer implements Runnable {
             if (schemaPreserver != null && engine.recoveredOrphanTipFsn() >= 0
                     && engine.ackedFsn() >= engine.recoveredCommitBoundaryFsn()) {
                 SenderError recovered = schemaPreserver.findRecoveredOrphanReport(
-                        engine.recoveredCommitBoundaryFsn() + 1L, engine.recoveredOrphanTipFsn());
+                        engine, engine.recoveredCommitBoundaryFsn() + 1L, engine.recoveredOrphanTipFsn());
                 if (recovered != null && (loopErrorDispatcher == null
                         || !loopErrorDispatcher.tryOfferSchema(recovered))) {
                     lastErrorMessage = "could not retain recovered schema report before orphan retirement";
@@ -1209,7 +1201,7 @@ public final class BackgroundDrainer implements Runnable {
                 loop.setErrorDispatcher(loopErrorDispatcher);
                 loop.setSchemaRejectionState(schemaRejectionState);
                 loop.setSchemaMismatchPolicy(schemaMismatchPolicy);
-                loop.setSchemaPreserver(schemaPreserver);
+                loop.setRejectionArchive(schemaPreserver);
                 loop.start();
 
                 while (!stopRequestedOrInterrupted()) {
